@@ -1,0 +1,89 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Aforo Usage Metering Lambda — processes API Gateway CloudWatch access logs
+  and forwards usage events to Aforo's ingestor service.
+
+Parameters:
+  AforoEndpoint:
+    Type: String
+    Description: Aforo usage ingestor batch endpoint URL
+    Default: https://ingest.aforo.ai/v1/ingest/batch
+  AforoApiKey:
+    Type: String
+    Description: Aforo API key for authentication
+    NoEcho: true
+  AforoTenantId:
+    Type: String
+    Description: Aforo tenant identifier
+  ApiGatewayLogGroupName:
+    Type: String
+    Description: CloudWatch log group for API Gateway access logs
+    Default: /aws/apigateway/aforo-access-logs
+  MetricNamePattern:
+    Type: String
+    Description: Template for metric name
+    Default: '{method} {path}'
+  QuantitySource:
+    Type: String
+    Description: Quantity source (1 = count, response_size = bytes)
+    Default: '1'
+    AllowedValues: ['1', 'response_size']
+  CustomerIdSource:
+    Type: String
+    Description: >-
+      Customer ID source. Only "consumer" is accepted — reads customer
+      identity from API Gateway's verified $context.identity.apiKey /
+      $context.identity.caller. "header" was removed 2026-04-23
+      (IDOR advisory hygiene — request headers are client-settable).
+    Default: consumer
+    AllowedValues: [consumer]
+
+Resources:
+  AforoMeteringFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: aforo-metering
+      Handler: index.handler
+      Runtime: nodejs20.x
+      Timeout: 30
+      MemorySize: 256
+      Description: Aforo usage metering - processes API Gateway access logs
+      Environment:
+        Variables:
+          AFORO_ENDPOINT: !Ref AforoEndpoint
+          AFORO_API_KEY: !Ref AforoApiKey
+          AFORO_TENANT_ID: !Ref AforoTenantId
+          METRIC_NAME_PATTERN: !Ref MetricNamePattern
+          QUANTITY_SOURCE: !Ref QuantitySource
+          CUSTOMER_ID_SOURCE: !Ref CustomerIdSource
+          FLUSH_COUNT: '50'
+          INCLUDE_METADATA: 'true'
+      Tags:
+        aforo-managed: 'true'
+        purpose: metering
+
+  AforoMeteringLogPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt AforoMeteringFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: !Sub logs.${AWS::Region}.amazonaws.com
+      SourceArn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ApiGatewayLogGroupName}:*
+
+  AforoMeteringSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    DependsOn: AforoMeteringLogPermission
+    Properties:
+      LogGroupName: !Ref ApiGatewayLogGroupName
+      FilterName: aforo-metering-filter
+      FilterPattern: ''
+      DestinationArn: !GetAtt AforoMeteringFunction.Arn
+
+Outputs:
+  FunctionArn:
+    Description: ARN of the Aforo metering Lambda function
+    Value: !GetAtt AforoMeteringFunction.Arn
+  FunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref AforoMeteringFunction

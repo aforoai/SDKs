@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Read Aforo JWT configuration from the organization-scoped KVM 'aforo-metering-config'.
+  Must run BEFORE AforoJwtValidation in the SharedFlow step order.
+
+  KVM entries required (add via Apigee Management API or Console):
+    aforo_jwks_uri    — JWKS endpoint URL
+                        e.g. https://auth.smartai.com/.well-known/jwks.json
+    aforo_jwt_issuer  — Expected issuer string
+                        e.g. https://auth.aforo.ai
+    aforo_redis_host  — (optional) Redis host for jti blocklist
+    aforo_redis_port  — (optional) Redis port (default 6379)
+-->
+<KeyValueMapOperations name="AforoJwtReadConfig" mapIdentifier="aforo-metering-config">
+    <DisplayName>Aforo JWT — Read Config from KVM</DisplayName>
+    <ExpiryTimeInSecs>300</ExpiryTimeInSecs>
+    <Scope>organization</Scope>
+    <Get assignTo="private.aforo_jwks_uri" index="1">
+        <Key><Parameter>aforo_jwks_uri</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo_jwt_issuer" index="1">
+        <Key><Parameter>aforo_jwt_issuer</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo_redis_host" index="1">
+        <Key><Parameter>aforo_redis_host</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo_redis_port" index="1">
+        <Key><Parameter>aforo_redis_port</Parameter></Key>
+    </Get>
+</KeyValueMapOperations>

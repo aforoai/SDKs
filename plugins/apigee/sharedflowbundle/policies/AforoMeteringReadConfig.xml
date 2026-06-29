@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Reads Aforo metering configuration from the organization-scoped KVM
+     'aforo-metering-config'. Values are stored as flow variables for use
+     by the JavaScript policy. -->
+<KeyValueMapOperations name="AforoMeteringReadConfig" mapIdentifier="aforo-metering-config">
+    <DisplayName>Aforo Metering - Read Config from KVM</DisplayName>
+    <ExpiryTimeInSecs>300</ExpiryTimeInSecs>
+    <Scope>organization</Scope>
+    <Get assignTo="aforo.endpoint">
+        <Key><Parameter>aforo_endpoint</Parameter></Key>
+    </Get>
+    <Get assignTo="aforo.apiKey">
+        <Key><Parameter>api_key</Parameter></Key>
+    </Get>
+    <Get assignTo="aforo.tenantId">
+        <Key><Parameter>tenant_id</Parameter></Key>
+    </Get>
+    <Get assignTo="aforo.metricNamePattern">
+        <Key><Parameter>metric_name_pattern</Parameter></Key>
+    </Get>
+    <Get assignTo="aforo.quantitySource">
+        <Key><Parameter>quantity_source</Parameter></Key>
+    </Get>
+    <Get assignTo="aforo.customerIdSource">
+        <Key><Parameter>customer_id_source</Parameter></Key>
+    </Get>
+    <Get assignTo="aforo.excludePaths">
+        <Key><Parameter>exclude_paths</Parameter></Key>
+    </Get>
+    <Get assignTo="aforo.excludeStatusCodes">
+        <Key><Parameter>exclude_status_codes</Parameter></Key>
+    </Get>
+    <Get assignTo="aforo.includeMetadata">
+        <Key><Parameter>include_metadata</Parameter></Key>
+    </Get>
+</KeyValueMapOperations>

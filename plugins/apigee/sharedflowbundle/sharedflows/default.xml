@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<SharedFlow name="default">
+    <!-- Step 1: Read all Aforo config from KVM (metering + JWT config) -->
+    <Step>
+        <Name>AforoMeteringReadConfig</Name>
+    </Step>
+
+    <!--
+      Steps 2-4: JWT Validation (runs BEFORE metering and margin guard)
+      Skip by setting flow variable aforo.jwt_validation_enabled = "false" in KVM.
+    -->
+    <Step>
+        <Name>AforoJwtReadConfig</Name>
+    </Step>
+    <Step>
+        <!-- RS256 signature verification + exp + iss check via Apigee built-in -->
+        <Name>AforoJwtValidation</Name>
+    </Step>
+    <Step>
+        <!-- Set X-Customer-Id, X-Tenant-Id, X-Key-Id, X-Scopes from verified claims -->
+        <Name>AforoJwtAssignHeaders</Name>
+    </Step>
+
+    <!-- Step 5: Margin guard pre-flight check (access phase, before metering) -->
+    <Step>
+        <Name>AforoMarginGuardCheck</Name>
+    </Step>
+    <Step>
+        <Name>AforoMarginGuardRaiseFault</Name>
+    </Step>
+
+    <!-- Steps 6-7: Metering (post-response) -->
+    <Step>
+        <Name>AforoMeteringBuildEvent</Name>
+    </Step>
+    <Step>
+        <Name>AforoMeteringSendEvent</Name>
+    </Step>
+</SharedFlow>

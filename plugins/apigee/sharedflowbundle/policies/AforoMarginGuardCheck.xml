@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+    JavaScript callout that invokes the margin guard quick-check endpoint.
+    Sets flow variables consumed by AforoMarginGuardRaiseFault policy.
+-->
+<Javascript continueOnError="true" enabled="true" timeLimit="200" name="AforoMarginGuardCheck">
+    <DisplayName>Aforo Margin Guard Check</DisplayName>
+    <Properties/>
+    <ResourceURL>jsc://aforo-margin-guard.js</ResourceURL>
+</Javascript>

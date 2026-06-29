@@ -1,0 +1,54 @@
+{
+  "name": "@aforo/mqtt-metering",
+  "version": "1.0.0",
+  "description": "Aforo MQTT Metering SDK — aedes broker hooks + mqtt.js client wrapper that meters PUBLISH/DELIVER/SUBSCRIBE/CONNECT/DISCONNECT events to Aforo.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "jest --testEnvironment=node",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "aforo",
+    "billing",
+    "mqtt",
+    "aedes",
+    "iot",
+    "metering",
+    "pub-sub"
+  ],
+  "author": "Aforo, Inc.",
+  "license": "MIT",
+  "peerDependencies": {
+    "mqtt": "^5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "aedes": {
+      "optional": true
+    },
+    "mqtt": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.0",
+    "@types/node": "^20.0.0",
+    "aedes": "^0.51.3",
+    "jest": "^29.7.0",
+    "mqtt": "^5.15.1",
+    "ts-jest": "^29.1.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

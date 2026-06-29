@@ -1,0 +1,88 @@
+# Aforo Pre-Flight Quota Check Policy for MuleSoft Anypoint
+#
+# Runs before routing to the backend API. Calls the usage-ingestor
+# /api/v1/quota/check endpoint synchronously.
+# Fail-open: if check fails or times out, request proceeds.
+#
+# Configuration properties:
+#   aforo.preflight.enabled: true | false
+#   aforo.preflight.url: Usage ingestor quota check URL
+#   aforo.preflight.timeoutMs: Max wait time in milliseconds (default: 50)
+#   aforo.preflight.fallback: "ALLOW" (default) or "DENY"
+#   aforo.apiKey: Aforo API key
+#   aforo.tenantId: Tenant identifier
+
+id: aforo-preflight-quota
+name: Aforo Pre-Flight Quota Check
+description: >
+  Synchronous pre-call quota check against the Aforo usage ingestor.
+  Enforces rate limits, wallet balance, and cumulative quotas at the
+  gateway level (sub-5ms target latency). Fail-open by default.
+category: Quality of Service
+type: custom
+resourceLevelSupported: true
+standalone: true
+# HARD PREREQUISITE: aforo-jwt-validation MUST run before this policy.
+# customerId used as the quota scope-ID comes from the verified JWT,
+# never from a client-settable request header. Closed 2026-04-23
+# (HIGH: prior documentation instructed implementers to read
+# X-Customer-Id from the request — a client-spoofable source).
+requiredCharacteristics:
+  - aforo-jwt-validated
+providedCharacteristics: []
+
+configuration:
+  - propertyName: enabled
+    name: Enable Pre-Flight Check
+    description: Enable or disable pre-flight quota checking
+    type: boolean
+    defaultValue: false
+    optional: true
+  - propertyName: preflightUrl
+    name: Quota Check URL
+    description: Full URL of the Aforo quota check endpoint
+    type: string
+    optional: false
+  - propertyName: timeoutMs
+    name: Timeout (ms)
+    description: Maximum wait time for the quota check call
+    type: int
+    defaultValue: 50
+    optional: true
+  - propertyName: cacheTtlMs
+    name: Cache TTL (ms)
+    description: How long to cache ALLOW decisions
+    type: int
+    defaultValue: 1000
+    optional: true
+  - propertyName: fallback
+    name: Fallback Decision
+    description: Decision when check fails ("ALLOW" or "DENY")
+    type: string
+    defaultValue: ALLOW
+    optional: true
+  - propertyName: apiKey
+    name: Aforo API Key
+    description: API key for authenticating with the Aforo ingestor
+    type: string
+    sensitive: true
+    optional: false
+  - propertyName: tenantId
+    name: Tenant ID
+    description: Aforo tenant identifier
+    type: string
+    optional: false
+
+# Implementation flow:
+# 1. Extract customer ID from the JWT-validated flow variable
+#    (vars.aforo.customerId, populated by aforo-jwt-validation).
+#    NEVER read X-Customer-Id from the request — it is client-settable
+#    and therefore spoofable. If vars.aforo.customerId is empty, skip
+#    the quota check (treat as anonymous / public endpoint) rather than
+#    fall back to a header-based source.
+# 2. Check ObjectStore cache for recent ALLOW decision — cache key MUST
+#    incorporate vars.aforo.customerId, not the request header, to
+#    prevent cache poisoning across customers.
+# 3. If cache miss: HTTP POST to preflightUrl with {customerId, metricName}
+# 4. Parse response: ALLOW → cache + proceed, DENY → return 429, WARN → add header + proceed
+# 5. On error/timeout: use fallback decision (default ALLOW)

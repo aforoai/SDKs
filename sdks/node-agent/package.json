@@ -1,0 +1,42 @@
+{
+  "name": "@aforoai/agent-metering",
+  "version": "1.0.0",
+  "description": "Aforo AI Agent Metering SDK — instrument agent runs (sessions, steps, tool calls) for billing and analytics",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "aforo",
+    "ai-agent",
+    "agent",
+    "metering",
+    "billing",
+    "claude",
+    "gpt",
+    "langchain",
+    "crewai",
+    "autogen"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aforoai/aforo-metering-sdks.git",
+    "directory": "node-agent"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.0.0",
+    "jest": "^29.7.0",
+    "@types/jest": "^29.5.0",
+    "ts-jest": "^29.1.0"
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "name": "@aforo/mcp-proxy",
+  "version": "1.0.0",
+  "description": "Aforo MCP Transport Proxy — transparent sidecar for metering stdio/SSE/HTTP MCP servers",
+  "license": "MIT",
+  "bin": {
+    "aforo-mcp-proxy": "./dist/bin/aforo-mcp-proxy.js"
+  },
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/src/index.js",
+      "require": "./dist/src/index.js",
+      "types": "./dist/src/index.d.ts"
+    }
+  },
+  "files": [
+    "dist/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/bin/aforo-mcp-proxy.js",
+    "test": "node --test dist/test/*.test.js",
+    "clean": "rm -rf dist/"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "eventsource": "^3.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/eventsource": "^3.0.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

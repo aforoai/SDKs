@@ -1,0 +1,49 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "Azure Policy that prevents deletion of APIM resources tagged with aforo-monetized=true"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Authorization/policyDefinitions",
+      "apiVersion": "2021-06-01",
+      "name": "aforo-deny-delete-monetized",
+      "properties": {
+        "displayName": "Aforo: Deny deletion of monetized API Management resources",
+        "description": "Prevents deletion of APIM APIs and products tagged as monetized by Aforo. Remove the tag in Aforo before deleting.",
+        "policyType": "Custom",
+        "mode": "All",
+        "parameters": {},
+        "policyRule": {
+          "if": {
+            "allOf": [
+              {
+                "field": "type",
+                "in": [
+                  "Microsoft.ApiManagement/service/apis",
+                  "Microsoft.ApiManagement/service/products"
+                ]
+              },
+              {
+                "field": "tags['aforo-monetized']",
+                "equals": "true"
+              },
+              {
+                "anyOf": [
+                  {
+                    "field": "actionType",
+                    "equals": "delete"
+                  }
+                ]
+              }
+            ]
+          },
+          "then": {
+            "effect": "deny"
+          }
+        }
+      }
+    }
+  ]
+}

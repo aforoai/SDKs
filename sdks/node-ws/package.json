@@ -1,0 +1,51 @@
+{
+  "name": "@aforo/ws-metering",
+  "version": "1.0.0",
+  "description": "Aforo WebSocket Metering SDK — wraps ws/Fastify-WebSocket/Socket.io connections to meter frames, bytes, and connection duration.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "jest --testEnvironment=node",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "aforo",
+    "billing",
+    "websocket",
+    "ws",
+    "metering",
+    "usage-based",
+    "streaming"
+  ],
+  "author": "Aforo, Inc.",
+  "license": "MIT",
+  "peerDependencies": {
+    "ws": "^8.0.0"
+  },
+  "peerDependenciesMeta": {
+    "ws": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.0",
+    "@types/node": "^20.0.0",
+    "@types/ws": "^8.18.1",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.0",
+    "typescript": "^5.0.0",
+    "ws": "^8.20.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

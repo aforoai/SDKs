@@ -1,0 +1,12 @@
+<!--
+  Aforo MCP Server Metering — Azure APIM Policy Fragment (legacy)
+
+  This file is kept for backward compatibility. The MCP detection logic
+  has been merged into the main outbound-policy.xml.
+  New deployments should use outbound-policy.xml which handles both
+  standard API and MCP Server metering in a single policy.
+-->
+<fragment>
+    <!-- Delegate to the unified outbound policy -->
+    <include-fragment fragment-id="aforo-metering" />
+</fragment>

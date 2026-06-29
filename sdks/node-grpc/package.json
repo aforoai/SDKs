@@ -1,0 +1,43 @@
+{
+  "name": "@aforo/grpc-metering",
+  "version": "1.0.0",
+  "description": "Aforo gRPC Metering SDK — wraps gRPC server handlers to auto-emit per-method billing events to Aforo's usage ingestor.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "jest --testEnvironment=node",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "aforo",
+    "billing",
+    "grpc",
+    "metering",
+    "usage-based"
+  ],
+  "author": "Aforo, Inc.",
+  "license": "MIT",
+  "peerDependencies": {
+    "@grpc/grpc-js": "^1.9.0"
+  },
+  "devDependencies": {
+    "@grpc/grpc-js": "^1.14.3",
+    "@types/jest": "^29.5.0",
+    "@types/node": "^20.0.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+    RaiseFault policy that returns 429 when margin guard blocks or throttles a request.
+    Triggered by flow variables set in AforoMarginGuardCheck JavaScript callout.
+-->
+<RaiseFault continueOnError="false" enabled="true" name="AforoMarginGuardRaiseFault">
+    <DisplayName>Aforo Margin Guard RaiseFault</DisplayName>
+    <Properties/>
+    <FaultResponse>
+        <Set>
+            <Headers>
+                <Header name="Content-Type">application/json</Header>
+                <Header name="X-Margin-Guard">{aforo.marginGuard.blocked == "true" ? "blocked" : "throttled"}</Header>
+                <Header name="X-Margin-Guard-Level">{aforo.marginGuard.level}</Header>
+                <Header name="Retry-After">{aforo.marginGuard.retryAfterSeconds}</Header>
+            </Headers>
+            <Payload contentType="application/json">{aforo.marginGuard.responseBody}</Payload>
+            <StatusCode>429</StatusCode>
+            <ReasonPhrase>Margin Guard</ReasonPhrase>
+        </Set>
+    </FaultResponse>
+    <Condition>(aforo.marginGuard.blocked == "true") or (aforo.marginGuard.throttled == "true")</Condition>
+</RaiseFault>

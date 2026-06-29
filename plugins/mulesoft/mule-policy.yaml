@@ -1,0 +1,152 @@
+# Aforo Metering — MuleSoft Custom Policy
+# Meters Standard API requests and MCP Server tool invocations.
+# Captures W3C trace context (traceparent, tracestate, x-trace-id, x-request-id).
+#
+# Configuration properties (set in Anypoint API Manager):
+#   aforo.endpoint       — Aforo ingestor batch URL
+#   aforo.apiKey          — Aforo API key
+#   aforo.tenantId        — Tenant identifier
+#   aforo.mcpEnabled      — Enable MCP detection (true/false)
+#   aforo.mcpProductId    — MCP product ID in Aforo
+
+id: aforo-metering
+name: Aforo Metering Policy
+description: Meters API requests and MCP Server tool invocations via Aforo billing
+category: Quality of Service
+type: custom
+resourceLevelSupported: true
+standalone: true
+# HARD PREREQUISITE: the aforo-jwt-validation policy MUST be applied on
+# every API before this policy. Anypoint API Manager enforces ordering
+# via the required/provided capability declaration below — a request
+# cannot reach this policy without vars.aforo.customerId and
+# vars.aforo.tenantId populated from a verified JWT. Closed 2026-04-23
+# (CRITICAL IDOR: prior versions trusted X-Client-Id request header).
+requiredCharacteristics:
+  - aforo-jwt-validated
+
+configuration:
+  - propertyName: aforo-endpoint
+    name: Aforo Endpoint
+    description: Aforo usage ingestor batch URL
+    type: string
+    optional: false
+  - propertyName: aforo-api-key
+    name: Aforo API Key
+    description: API key for Aforo authentication
+    type: string
+    optional: false
+    sensitive: true
+  - propertyName: aforo-tenant-id
+    name: Tenant ID
+    description: Aforo tenant identifier
+    type: string
+    optional: false
+  - propertyName: mcp-product-id
+    name: MCP Product ID
+    description: Aforo product ID for the MCP server
+    type: string
+    optional: true
+  - propertyName: mcp-enabled
+    name: MCP Detection Enabled
+    description: Enable MCP JSON-RPC tools/call detection
+    type: boolean
+    optional: true
+    defaultValue: false
+
+# DataWeave transformation for event extraction
+# Applied in the response phase (after upstream responds)
+#
+# Identity sourcing (post-2026-04-23 security fix):
+#   customerId — vars.aforo.customerId, set by aforo-jwt-validation policy
+#                from the validated JWT customer_id / sub claim
+#   tenantId   — vars.aforo.tenantId, set by aforo-jwt-validation policy
+#                from the validated JWT tenant_id claim
+#
+# Fail-closed: if either var is missing (which should be impossible
+# given requiredCharacteristics enforces JWT-validation ordering), this
+# policy emits an empty events array. The upstream request proceeds,
+# but no billing event is written. A request that cannot be attributed
+# to an authenticated customer must never be billed.
+template:
+  afterResponse: |
+    %dw 2.0
+    output application/json
+
+    var requestBody = try(() -> read(attributes.requestContent, "application/json")) default null
+    var isMcpToolCall = (
+      configuration.'mcp-enabled' == true and
+      attributes.method == "POST" and
+      requestBody != null and
+      requestBody.jsonrpc == "2.0" and
+      requestBody.method == "tools/call"
+    )
+    var toolName = if (isMcpToolCall) (requestBody.params.name default "unknown") else ""
+    var agentId = if (isMcpToolCall) (requestBody.params._meta.agent_id default "") else ""
+    var sessionId = attributes.headers.'Mcp-Session-Id' default ""
+
+    // Authenticated identity — set by aforo-jwt-validation policy.
+    // Never read X-Client-Id / X-Customer-Id / X-Tenant-Id from the
+    // request: they are client-settable and therefore spoofable.
+    var authenticatedCustomerId = vars.aforo.customerId default ""
+    var authenticatedTenantId = vars.aforo.tenantId default ""
+    var hasAuthenticatedIdentity = (authenticatedCustomerId != "") and (authenticatedTenantId != "")
+
+    ---
+    {
+      events: if (hasAuthenticatedIdentity) [
+        if (isMcpToolCall) {
+          customerId: authenticatedCustomerId,
+          tenantId: authenticatedTenantId,
+          metricName: "mcp_server.tool_invocations",
+          quantity: 1,
+          idempotencyKey: "mcp:mulesoft:" ++ (attributes.requestId default uuid()) ++ ":" ++ toolName ++ ":" ++ now() as String,
+          occurredAt: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"},
+          productType: "MCP_SERVER",
+          toolName: toolName,
+          agentId: agentId,
+          sessionId: sessionId,
+          executionStatus: if (attributes.statusCode >= 200 and attributes.statusCode < 300) "SUCCESS" else "ERROR",
+          executionDurationMs: attributes.responseTime default 0,
+          endpointPath: attributes.requestPath default "/",
+          httpMethod: attributes.method default "UNKNOWN",
+          statusCode: attributes.statusCode default 0,
+          responseTimeMs: attributes.responseTime default 0,
+          trace: {
+            traceparent: attributes.headers.'traceparent' default null,
+            tracestate: attributes.headers.'tracestate' default null,
+            xTraceId: attributes.headers.'x-trace-id' default null,
+            xRequestId: attributes.headers.'x-request-id' default null
+          },
+          metadata: {
+            gateway: "mulesoft",
+            productId: configuration.'mcp-product-id' default "",
+            status: attributes.statusCode,
+            path: attributes.requestPath
+          }
+        } else {
+          customerId: authenticatedCustomerId,
+          tenantId: authenticatedTenantId,
+          metricName: (attributes.method default "UNKNOWN") ++ " " ++ (attributes.requestPath default "/"),
+          quantity: 1,
+          idempotencyKey: attributes.requestId default uuid(),
+          occurredAt: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"},
+          endpointPath: attributes.requestPath default "/",
+          httpMethod: attributes.method default "UNKNOWN",
+          statusCode: attributes.statusCode default 0,
+          responseTimeMs: attributes.responseTime default 0,
+          trace: {
+            traceparent: attributes.headers.'traceparent' default null,
+            tracestate: attributes.headers.'tracestate' default null,
+            xTraceId: attributes.headers.'x-trace-id' default null,
+            xRequestId: attributes.headers.'x-request-id' default null
+          },
+          metadata: {
+            gateway: "mulesoft",
+            method: attributes.method,
+            path: attributes.requestPath,
+            status: attributes.statusCode
+          }
+        }
+      ] else []
+    }

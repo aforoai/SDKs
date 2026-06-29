@@ -1,0 +1,38 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Aforo Monetized Product Protection — IAM deny policy that prevents
+  deletion of API Gateway resources tagged with aforo-monetized=true.
+  Deploy alongside the main aforo-apigateway-role.yaml stack.
+
+Parameters:
+  AforoAccountId:
+    Type: String
+    Description: Aforo's AWS account ID
+
+Resources:
+  AforoDenyDeleteMonetizedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: aforo-deny-delete-monetized-apis
+      Description: Prevents deletion of API Gateway resources tagged as monetized by Aforo
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyDeleteMonetizedRestApis
+            Effect: Deny
+            Action:
+              - 'apigateway:DELETE'
+            Resource: !Sub 'arn:aws:apigateway:${AWS::Region}::/*'
+            Condition:
+              StringEquals:
+                'aws:ResourceTag/aforo-monetized': 'true'
+      Tags:
+        - Key: aforo-managed
+          Value: 'true'
+        - Key: purpose
+          Value: monetized-product-protection
+
+Outputs:
+  PolicyArn:
+    Description: ARN of the deny policy
+    Value: !Ref AforoDenyDeleteMonetizedPolicy

@@ -1,0 +1,158 @@
+<!--
+  Aforo Metering — Azure APIM Outbound Policy
+
+  Sends usage events to the Aforo ingestor after every API response.
+  Captures W3C trace context (traceparent, tracestate, x-trace-id, x-request-id).
+  Detects MCP JSON-RPC tools/call requests for MCP Server metering.
+
+  Prerequisites (Named Values):
+    - aforo-endpoint       — Aforo ingestor batch URL
+    - aforo-api-key        — Aforo API key
+    - aforo-tenant-id      — Tenant identifier
+    - aforo-mcp-product-id — MCP product ID (optional)
+    - aforo-mcp-enabled    — "true" to enable MCP detection (optional)
+
+  Usage:
+    <outbound>
+        <base />
+        <include-fragment fragment-id="aforo-metering" />
+    </outbound>
+-->
+<fragment>
+    <outbound>
+        <choose>
+            <!-- MCP JSON-RPC tools/call detection -->
+            <when condition="@("{{aforo-mcp-enabled}}" == "true" &&
+                              context.Request.Method == "POST" &&
+                              context.Request.Body != null &&
+                              context.Request.Body.As<string>(preserveContent: true).Contains("tools/call"))">
+                <send-one-way-request mode="new">
+                    <set-url>{{aforo-endpoint}}</set-url>
+                    <set-method>POST</set-method>
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-header name="Authorization" exists-action="override">
+                        <value>Bearer {{aforo-api-key}}</value>
+                    </set-header>
+                    <set-header name="X-Tenant-Id" exists-action="override">
+                        <value>{{aforo-tenant-id}}</value>
+                    </set-header>
+                    <set-body>@{
+                        var reqBody = context.Request.Body.As<JObject>(preserveContent: true);
+                        var toolName = "unknown";
+                        var agentId = "";
+
+                        if (reqBody != null && reqBody["method"]?.ToString() == "tools/call") {
+                            var paramz = reqBody["params"] as JObject;
+                            if (paramz != null) {
+                                toolName = paramz["name"]?.ToString() ?? "unknown";
+                                var meta = paramz["_meta"] as JObject;
+                                if (meta != null) {
+                                    agentId = meta["agent_id"]?.ToString() ?? "";
+                                }
+                            }
+                        }
+
+                        var sessionId = context.Request.Headers.GetValueOrDefault("Mcp-Session-Id", "");
+                        var path = context.Request.Url.Path;
+                        var method = context.Request.Method;
+                        var statusCode = context.Response.StatusCode;
+                        var latencyMs = (int)context.Elapsed.TotalMilliseconds;
+
+                        var evt = new JObject(
+                            new JProperty("events", new JArray(
+                                new JObject(
+                                    new JProperty("customerId",
+                                        context.Subscription != null ? context.Subscription.Id : "unknown"),
+                                    new JProperty("metricName", "mcp_server.tool_invocations"),
+                                    new JProperty("quantity", 1),
+                                    new JProperty("idempotencyKey",
+                                        "mcp:" + context.RequestId + ":" + toolName + ":" +
+                                        DateTime.UtcNow.Ticks),
+                                    new JProperty("occurredAt", DateTime.UtcNow.ToString("o")),
+                                    new JProperty("productType", "MCP_SERVER"),
+                                    new JProperty("toolName", toolName),
+                                    new JProperty("agentId", agentId),
+                                    new JProperty("sessionId", sessionId),
+                                    new JProperty("executionStatus",
+                                        statusCode >= 200 && statusCode < 300 ? "SUCCESS" : "ERROR"),
+                                    new JProperty("executionDurationMs", latencyMs),
+                                    new JProperty("endpointPath", path),
+                                    new JProperty("httpMethod", method),
+                                    new JProperty("statusCode", statusCode),
+                                    new JProperty("responseTimeMs", latencyMs),
+                                    new JProperty("trace", new JObject(
+                                        new JProperty("traceparent", context.Request.Headers.GetValueOrDefault("traceparent", null)),
+                                        new JProperty("tracestate", context.Request.Headers.GetValueOrDefault("tracestate", null)),
+                                        new JProperty("xTraceId", context.Request.Headers.GetValueOrDefault("x-trace-id", null)),
+                                        new JProperty("xRequestId", context.Request.Headers.GetValueOrDefault("x-request-id", null))
+                                    )),
+                                    new JProperty("metadata", new JObject(
+                                        new JProperty("gateway", "azure-apim"),
+                                        new JProperty("productId", "{{aforo-mcp-product-id}}")
+                                    ))
+                                )
+                            ))
+                        );
+                        return evt.ToString();
+                    }</set-body>
+                </send-one-way-request>
+            </when>
+            <otherwise>
+                <!-- Standard API metering -->
+                <send-one-way-request mode="new">
+                    <set-url>{{aforo-endpoint}}</set-url>
+                    <set-method>POST</set-method>
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-header name="Authorization" exists-action="override">
+                        <value>Bearer {{aforo-api-key}}</value>
+                    </set-header>
+                    <set-header name="X-Tenant-Id" exists-action="override">
+                        <value>{{aforo-tenant-id}}</value>
+                    </set-header>
+                    <set-body>@{
+                        var path = context.Request.Url.Path;
+                        var method = context.Request.Method;
+                        var statusCode = context.Response.StatusCode;
+                        var latencyMs = (int)context.Elapsed.TotalMilliseconds;
+
+                        var evt = new JObject(
+                            new JProperty("events", new JArray(
+                                new JObject(
+                                    new JProperty("customerId",
+                                        context.Subscription != null ? context.Subscription.Id : "unknown"),
+                                    new JProperty("metricName", method + " " + path),
+                                    new JProperty("quantity", 1),
+                                    new JProperty("idempotencyKey",
+                                        context.RequestId + ":" + DateTime.UtcNow.Ticks),
+                                    new JProperty("occurredAt", DateTime.UtcNow.ToString("o")),
+                                    new JProperty("endpointPath", path),
+                                    new JProperty("httpMethod", method),
+                                    new JProperty("statusCode", statusCode),
+                                    new JProperty("responseTimeMs", latencyMs),
+                                    new JProperty("trace", new JObject(
+                                        new JProperty("traceparent", context.Request.Headers.GetValueOrDefault("traceparent", null)),
+                                        new JProperty("tracestate", context.Request.Headers.GetValueOrDefault("tracestate", null)),
+                                        new JProperty("xTraceId", context.Request.Headers.GetValueOrDefault("x-trace-id", null)),
+                                        new JProperty("xRequestId", context.Request.Headers.GetValueOrDefault("x-request-id", null))
+                                    )),
+                                    new JProperty("metadata", new JObject(
+                                        new JProperty("gateway", "azure-apim"),
+                                        new JProperty("method", method),
+                                        new JProperty("path", path),
+                                        new JProperty("status", statusCode),
+                                        new JProperty("latency", latencyMs)
+                                    ))
+                                )
+                            ))
+                        );
+                        return evt.ToString();
+                    }</set-body>
+                </send-one-way-request>
+            </otherwise>
+        </choose>
+    </outbound>
+</fragment>

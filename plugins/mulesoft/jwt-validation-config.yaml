@@ -1,0 +1,191 @@
+# Aforo JWT Validation for MuleSoft Anypoint API Manager
+#
+# Validates RS256 JWTs issued by Aforo's OAuth token endpoint (org-service).
+# Apply this policy on your API in Anypoint API Manager BEFORE the
+# aforo-metering policy so that the metering policy can use the
+# validated identity variables (vars.aforo.tenantId, vars.aforo.customerId, etc.)
+#
+# Prerequisites:
+#   - Mule JWT Module in pom.xml:
+#       <dependency>
+#           <groupId>com.mulesoft.modules</groupId>
+#           <artifactId>mule-jwt-module</artifactId>
+#           <version>2.x.x</version>
+#           <classifier>mule-plugin</classifier>
+#       </dependency>
+#   - AFORO_JWKS_URI and AFORO_JWT_ISSUER configured as Anypoint Secrets
+#     (Runtime Secrets Manager) or as secure properties in your deployment.
+#
+# Flow variables set after successful validation:
+#   vars.aforo.tenantId      — from JWT tenant_id claim
+#   vars.aforo.customerId    — from JWT customer_id claim (falls back to sub)
+#   vars.aforo.keyId         — from JWT key_id claim
+#   vars.aforo.scopes        — from JWT scopes claim (space-separated string)
+#   vars.aforo.environment   — from JWT environment claim ("live" or "sandbox")
+#   vars.aforo.offeringIds   — from JWT offering_ids claim (JSON array string)
+#
+# On validation failure: raises HTTP 401 via error handler (see flow XML below).
+
+id: aforo-jwt-validation
+name: Aforo JWT Validation Policy
+description: Validates Aforo RS256 JWTs and propagates verified claims to upstream headers
+category: Security
+type: custom
+resourceLevelSupported: true
+standalone: true
+encryptionSupported: false
+# Declares the "aforo-jwt-validated" capability. Downstream Aforo policies
+# (metering, margin-guard, preflight-quota, mcp-metering) require this
+# capability so Anypoint API Manager enforces policy ordering — JWT
+# validation always runs before any policy that reads tenant/customer
+# identity.
+providedCharacteristics:
+  - aforo-jwt-validated
+
+# Policy configuration properties (set in Anypoint API Manager UI or YAML deployment)
+configuration:
+  - propertyName: jwks-uri
+    name: Aforo JWKS URI
+    description: >
+      Full URL of Aforo's JWKS endpoint. Typically:
+      https://auth.smartai.com/.well-known/jwks.json
+      (SmartAI configures the actual hostname when setting up their gateway integration)
+    type: string
+    optional: false
+
+  - propertyName: jwt-issuer
+    name: Expected JWT Issuer
+    description: >
+      The `iss` claim value to accept. Leave blank to skip issuer validation.
+      Recommended: https://auth.aforo.ai
+    type: string
+    optional: true
+    defaultValue: "https://auth.aforo.ai"
+
+  - propertyName: jwks-cache-ttl-seconds
+    name: JWKS Cache TTL (seconds)
+    description: How long to cache the JWKS response before re-fetching. Default is 3600 (1 hour).
+    type: integer
+    optional: true
+    defaultValue: 3600
+
+  - propertyName: redis-host
+    name: Redis Host (for jti blocklist)
+    description: >
+      ElastiCache / Redis Cluster host for jti blocklist and client revocation checks.
+      Leave blank to skip Redis blocklist check (fail-open).
+    type: string
+    optional: true
+
+  - propertyName: redis-port
+    name: Redis Port
+    description: Redis port (default 6379)
+    type: integer
+    optional: true
+    defaultValue: 6379
+
+  - propertyName: org-service-token-check-url
+    name: Org-Service Token Check URL
+    description: >
+      Internal URL for jti/client revocation check via org-service.
+      e.g. http://org-service:8086/internal/v1/auth/token-check
+      Used as an alternative to direct Redis access. If set, takes precedence over redis-host.
+    type: string
+    optional: true
+
+# Mule flow implementation (place in src/main/mule/aforo-jwt-validation.xml)
+# ────────────────────────────────────────────────────────────────────────────
+# The YAML above is the Anypoint policy descriptor.
+# The actual Mule flow XML follows inline as a comment block so teams can
+# paste it directly into their gateway project without a separate file.
+#
+# <flow name="aforo-jwt-validation-flow">
+#
+#   <!-- Step 1: Extract Bearer token from Authorization header -->
+#   <set-variable variableName="aforo.rawToken"
+#     value='#[attributes.headers["Authorization"] default ""]'/>
+#   <set-variable variableName="aforo.token"
+#     value='#[vars.aforo.rawToken replace /^[Bb]earer\s+/ with ""]'/>
+#
+#   <!-- Step 2: Validate JWT using Mule JWT Module -->
+#   <jwt:validate-jwt config-ref="Aforo-JWT-Config" token="#[vars.aforo.token]"
+#     doc:name="Validate Aforo JWT">
+#     <jwt:jwt-crypto-config>
+#       <jwt:rsa-key-config jwksUrl="${AFORO_JWKS_URI}"
+#                           jwksCacheAge="${config.jwks-cache-ttl-seconds}"/>
+#     </jwt:jwt-crypto-config>
+#     <jwt:validations>
+#       <jwt:is-not-expired/>
+#       <jwt:validate-claim claimName="iss" expectedValue="${AFORO_JWT_ISSUER}"
+#         failIfNotPresent="false"/>
+#     </jwt:validations>
+#   </jwt:validate-jwt>
+#
+#   <!-- Step 3: Extract claims into flow variables -->
+#   <set-variable variableName="aforo.tenantId"
+#     value='#[vars.claimsVar["tenant_id"] default ""]'/>
+#   <set-variable variableName="aforo.customerId"
+#     value='#[(vars.claimsVar["customer_id"] default vars.claimsVar["sub"]) default ""]'/>
+#   <set-variable variableName="aforo.keyId"
+#     value='#[vars.claimsVar["key_id"] default ""]'/>
+#   <set-variable variableName="aforo.scopes"
+#     value='#[
+#       vars.claimsVar["scopes"] match {
+#         case is Array -> vars.claimsVar["scopes"] joinBy " "
+#         else          -> (vars.claimsVar["scopes"] default "") as String
+#       }
+#     ]'/>
+#   <set-variable variableName="aforo.environment"
+#     value='#[vars.claimsVar["environment"] default "live"]'/>
+#   <set-variable variableName="aforo.offeringIds"
+#     value='#[write(vars.claimsVar["offering_ids"] default [], "application/json")]'/>
+#   <set-variable variableName="aforo.jti"
+#     value='#[vars.claimsVar["jti"] default ""]'/>
+#
+#   <!-- Step 4: Optional jti blocklist check via org-service sidecar
+#                (synchronous GET — fail-open on error) -->
+#   <http:request method="GET"
+#     url="${config.org-service-token-check-url}?jti=#[vars.aforo.jti]&amp;keyId=#[vars.aforo.keyId]"
+#     doc:name="Check jti Blocklist"
+#     config-ref="Org-Service-HTTP-Config"
+#     target="aforoJtiCheckResponse"
+#     targetValue="#[payload]">
+#     <error-handler>
+#       <!-- Fail-open: if org-service is unreachable, continue -->
+#       <on-error-continue type="HTTP:CONNECTIVITY, HTTP:TIMEOUT"/>
+#     </error-handler>
+#   </http:request>
+#
+#   <choice doc:name="Revocation Check">
+#     <when expression='#[(vars.aforoJtiCheckResponse.revoked default false) == true]'>
+#       <raise-error type="JWT:REVOKED" description="Token has been revoked"/>
+#     </when>
+#   </choice>
+#
+#   <!-- Step 5: Set verified identity headers for upstream service -->
+#   <set-variable variableName="aforo.upstreamHeaders" value='#[{
+#     "X-Customer-Id": vars.aforo.customerId,
+#     "X-Tenant-Id":   vars.aforo.tenantId,
+#     "X-Key-Id":      vars.aforo.keyId,
+#     "X-Scopes":      vars.aforo.scopes,
+#     "X-Environment": vars.aforo.environment
+#   }]'/>
+#
+# </flow>
+#
+# Error handler (in global error-handler or API gateway flow):
+#   <on-error-continue type="JWT:EXPIRED">
+#     <http:response status-code="401">
+#       <http:body><![CDATA[{"error":"invalid_token","error_description":"TOKEN_EXPIRED"}]]></http:body>
+#     </http:response>
+#   </on-error-continue>
+#   <on-error-continue type="JWT:INVALID_SIGNATURE">
+#     <http:response status-code="401">
+#       <http:body><![CDATA[{"error":"invalid_token","error_description":"INVALID_SIGNATURE"}]]></http:body>
+#     </http:response>
+#   </on-error-continue>
+#   <on-error-continue type="JWT:REVOKED">
+#     <http:response status-code="401">
+#       <http:body><![CDATA[{"error":"invalid_token","error_description":"TOKEN_REVOKED"}]]></http:body>
+#     </http:response>
+#   </on-error-continue>

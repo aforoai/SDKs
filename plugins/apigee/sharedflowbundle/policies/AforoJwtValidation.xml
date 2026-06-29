@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Aforo JWT Validation Policy for Apigee
+
+  Validates RS256 JWTs issued by Aforo's OAuth token endpoint.
+  Must run BEFORE the metering and margin-guard steps.
+
+  Prerequisites:
+    Add these entries to the KVM named 'aforo-metering-config' (organization scope):
+      aforo_jwks_uri  — e.g. https://auth.smartai.com/.well-known/jwks.json
+      aforo_jwt_issuer — e.g. https://auth.aforo.ai
+
+  The AforoJwtReadConfig policy (KeyValueMapOperations) must run before this
+  policy to populate the private.aforo_jwks_uri and private.aforo_jwt_issuer
+  flow variables.
+
+  On success, the following flow variables are set (accessible via {aforo.*}):
+    aforo.tenant_id     — from JWT claim tenant_id
+    aforo.customer_id   — from JWT claim customer_id
+    aforo.key_id        — from JWT claim key_id
+    aforo.scopes        — from JWT claim scopes
+    aforo.sub           — from JWT sub claim (customerId fallback)
+
+  On failure, Apigee raises a fault with HTTP 401 automatically.
+-->
+<VerifyJWT name="AforoJwtValidation">
+    <DisplayName>Aforo — Verify JWT</DisplayName>
+
+    <!--
+      Algorithm: RS256 (RSA + SHA-256).
+      Aforo's org-service signs all tokens with an RSA private key.
+      The corresponding public keys are exposed at the JWKS endpoint.
+    -->
+    <Algorithm>RS256</Algorithm>
+
+    <!--
+      Dynamic JWKS resolution.
+      The URI is read from the KVM via AforoJwtReadConfig (runs first in SharedFlow).
+      Apigee's VerifyJWT policy caches the JWKS automatically and refreshes on kid miss.
+    -->
+    <PublicKey>
+        <JWKS>
+            <URI ref="private.aforo_jwks_uri"/>
+        </JWKS>
+    </PublicKey>
+
+    <!--
+      Issuer validation.
+      Value read from KVM: aforo_jwt_issuer (e.g. "https://auth.aforo.ai").
+      Set ref to empty string in KVM to skip issuer check during development.
+    -->
+    <Issuer ref="private.aforo_jwt_issuer"/>
+
+    <!--
+      Aforo-specific claim extraction.
+      These claims are set as flow variables with the prefix `aforo.`
+      so downstream policies and the metering JS can reference them directly.
+    -->
+    <OutputClaims>
+        <Claim name="tenant_id"   variablePrefix="aforo" type="string"/>
+        <Claim name="customer_id" variablePrefix="aforo" type="string"/>
+        <Claim name="key_id"      variablePrefix="aforo" type="string"/>
+        <Claim name="scopes"      variablePrefix="aforo" type="string"/>
+        <Claim name="environment" variablePrefix="aforo" type="string"/>
+        <Claim name="sub"         variablePrefix="aforo" type="string"/>
+    </OutputClaims>
+
+    <!--
+      jti check: Apigee's built-in VerifyJWT does NOT support Redis-based jti blocklist.
+      The AforoJtiCheck JavaScript policy (below) handles that after this step.
+    -->
+</VerifyJWT>

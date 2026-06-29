@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<SharedFlowBundle revision="1" name="aforo-metering">
+    <DisplayName>Aforo Usage Metering</DisplayName>
+    <Description>Auto-captures API usage events and forwards them to Aforo's
+        usage ingestor service for billing and analytics. Runs in
+        PostClientFlow — zero latency impact on the API response.</Description>
+    <CreatedAt>1711036800000</CreatedAt>
+    <LastModifiedAt>1711036800000</LastModifiedAt>
+    <Policies>
+        <Policy>AforoMeteringReadConfig</Policy>
+        <Policy>AforoMeteringBuildEvent</Policy>
+        <Policy>AforoMeteringSendEvent</Policy>
+    </Policies>
+    <Resources>
+        <Resource>jsc://aforo-metering.js</Resource>
+    </Resources>
+    <SharedFlows>
+        <SharedFlow>default</SharedFlow>
+    </SharedFlows>
+</SharedFlowBundle>

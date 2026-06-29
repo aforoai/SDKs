@@ -1,0 +1,72 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Aforo API Gateway Integration — creates a cross-account IAM role that allows
+  Aforo to manage API Gateway resources (keys, usage plans, stages) in your
+  AWS account. Uses sts:AssumeRole with ExternalId for confused-deputy protection.
+
+Parameters:
+  ExternalId:
+    Type: String
+    Description: Unique external ID provided by Aforo (prevents confused deputy attacks)
+    AllowedPattern: '[a-f0-9-]+'
+    ConstraintDescription: Must be a valid UUID
+
+  AforoAccountId:
+    Type: String
+    Description: Aforo's AWS account ID (provided automatically)
+    Default: '000000000000'
+
+Resources:
+  AforoApiGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: aforo-apigateway-role
+      Description: Allows Aforo to manage API Gateway resources for usage metering and key provisioning
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AforoAccountId}:root'
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref ExternalId
+      Policies:
+        - PolicyName: AforoApiGatewayAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ApiGatewayManagement
+                Effect: Allow
+                Action:
+                  - 'apigateway:GET'
+                  - 'apigateway:POST'
+                  - 'apigateway:PUT'
+                  - 'apigateway:PATCH'
+                  - 'apigateway:DELETE'
+                Resource: !Sub 'arn:aws:apigateway:${AWS::Region}::/*'
+              - Sid: CloudWatchLogsRead
+                Effect: Allow
+                Action:
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                  - 'logs:GetLogEvents'
+                  - 'logs:PutSubscriptionFilter'
+                  - 'logs:DeleteSubscriptionFilter'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: aforo-managed
+          Value: 'true'
+        - Key: purpose
+          Value: api-gateway-integration
+
+Outputs:
+  RoleArn:
+    Description: IAM Role ARN — paste this into Aforo to complete the integration
+    Value: !GetAtt AforoApiGatewayRole.Arn
+
+  ExternalId:
+    Description: The ExternalId used for this role (for verification)
+    Value: !Ref ExternalId

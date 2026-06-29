@@ -1,0 +1,91 @@
+# Aforo Compound Metering Policy for MuleSoft Anypoint
+#
+# Extracts multiple metric measurements from API response bodies using
+# DataWeave expressions and emits compound usage events to the Aforo
+# usage ingestor service (async, zero latency impact).
+#
+# Configuration properties:
+#   aforo.compound.enabled: true | false
+#   aforo.compound.extractionPaths: JSON mapping DataWeave path → metric name
+#   aforo.compound.dimensionPaths: JSON mapping DataWeave path → dimension key
+#   aforo.ingestor.url: Aforo usage ingestor base URL
+#   aforo.apiKey: Aforo API key
+#   aforo.tenantId: Tenant identifier
+
+id: aforo-compound-metering
+name: Aforo Compound Metering
+description: >
+  Extracts multiple billable metrics from response bodies and emits
+  compound usage events to the Aforo billing platform.
+category: Quality of Service
+type: custom
+resourceLevelSupported: true
+standalone: true
+requiredCharacteristics: []
+providedCharacteristics: []
+
+configuration:
+  - propertyName: enabled
+    name: Enable Compound Metering
+    description: Enable or disable compound metric extraction
+    type: boolean
+    defaultValue: false
+    optional: true
+  - propertyName: extractionPaths
+    name: Response Extraction Paths
+    description: >
+      JSON mapping of JSONPath expressions to metric names.
+      Example: {"$.usage.prompt_tokens": "input-tokens", "$.usage.completion_tokens": "output-tokens"}
+    type: string
+    optional: true
+  - propertyName: dimensionPaths
+    name: Response Dimension Paths
+    description: >
+      JSON mapping of JSONPath expressions to dimension keys.
+      Example: {"$.model": "model-name", "$.region": "region"}
+    type: string
+    optional: true
+  - propertyName: ingestorUrl
+    name: Aforo Ingestor URL
+    description: Base URL of the Aforo usage ingestor service
+    type: string
+    optional: false
+  - propertyName: apiKey
+    name: Aforo API Key
+    description: API key for authenticating with the Aforo ingestor
+    type: string
+    sensitive: true
+    optional: false
+  - propertyName: tenantId
+    name: Tenant ID
+    description: Aforo tenant identifier
+    type: string
+    optional: false
+  - propertyName: bufferSize
+    name: Buffer Size
+    description: Number of compound events to buffer before flushing
+    type: int
+    defaultValue: 100
+    optional: true
+  - propertyName: flushIntervalMs
+    name: Flush Interval (ms)
+    description: Maximum time between buffer flushes in milliseconds
+    type: int
+    defaultValue: 5000
+    optional: true
+
+# Implementation in DataWeave + HTTP Requester
+# The Mule flow:
+# 1. After response, extract measurements via DataWeave transform
+# 2. If measurements exist, build compound event
+# 3. Buffer in ObjectStore (persistent, survives restarts)
+# 4. Flush via async HTTP POST to /api/v1/ingest/compound/batch
+#
+# DataWeave extraction example:
+#   %dw 2.0
+#   var paths = readUrl("classpath://config/extraction-paths.json", "application/json")
+#   var body = payload
+#   ---
+#   paths mapObject ((metricName, jsonPath) ->
+#     (metricName): body[jsonPath] default 0
+#   ) filterObject ((value) -> value > 0)

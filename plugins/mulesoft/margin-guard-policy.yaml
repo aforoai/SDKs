@@ -1,0 +1,173 @@
+# Aforo Margin Guard Pre-Flight Check — MuleSoft Anypoint Custom Policy
+#
+# Calls pricing-service /internal/v1/margin-guard/quick-check to determine
+# whether a request should be allowed, throttled (L2), or blocked (L3).
+#
+# Fail-open: if the check fails or times out, the request proceeds.
+#
+# Configuration properties:
+#   enabled: boolean (default: false)
+#   marginGuardUrl: string (pricing-service base URL)
+#   tenantId: string (tenant identifier)
+#   timeoutMs: integer (default: 50)
+#   cacheTtlMs: integer (default: 30000)
+#
+# Usage: Apply to APIs in Anypoint API Manager as a custom policy.
+
+id: aforo-margin-guard
+name: Aforo Margin Guard
+description: Pre-flight margin guard check — blocks or throttles requests when margin is too low
+category: Security
+type: custom
+resourceLevelSupported: true
+standalone: true
+# HARD PREREQUISITE: aforo-jwt-validation MUST run before this policy.
+# The cache key + margin-guard scope-ID must come from the JWT-verified
+# customer identity, never from a client-settable header. Closed
+# 2026-04-23 (HIGH: prior versions read x-customer-id from the request
+# header, allowing cache poisoning and cross-customer margin bypass).
+requiredCharacteristics:
+  - aforo-jwt-validated
+providedCharacteristics:
+  - aforo-margin-guard
+
+configuration:
+  - propertyName: enabled
+    name: Enable Margin Guard
+    description: Enable margin guard pre-flight check
+    type: boolean
+    defaultValue: false
+    optional: true
+  - propertyName: marginGuardUrl
+    name: Pricing Service URL
+    description: Base URL of the pricing-service (e.g. http://pricing:8083)
+    type: string
+    optional: false
+    sensitive: false
+  - propertyName: tenantId
+    name: Tenant ID
+    description: Aforo tenant identifier
+    type: string
+    optional: false
+  - propertyName: timeoutMs
+    name: Timeout (ms)
+    description: HTTP timeout for the quick-check call in milliseconds
+    type: int
+    defaultValue: 50
+    optional: true
+  - propertyName: cacheTtlMs
+    name: Cache TTL (ms)
+    description: Cache duration for margin guard decisions
+    type: int
+    defaultValue: 30000
+    optional: true
+
+# ── Request phase: check margin guard before routing to backend ──────────
+
+template:
+  beforeRequest:
+    - when:
+        condition: "#[configuration.enabled == true]"
+      then:
+        # Extract customer / tenant ID from JWT-validated flow variables.
+        # NEVER read x-customer-id / X-Tenant-Id from request headers —
+        # they are client-settable and therefore spoofable. Source of
+        # truth is aforo-jwt-validation (see requiredCharacteristics).
+        - set-variable:
+            variableName: mgCustomerId
+            value: "#[vars.aforo.customerId default '']"
+        # Tenant ID: prefer the JWT-validated var (most specific);
+        # fall back to admin-pinned configuration only if the JWT
+        # happened to not carry a tenant claim. Config is admin-pinned
+        # in Anypoint API Manager, not client-settable.
+        - set-variable:
+            variableName: mgTenantId
+            value: "#[(vars.aforo.tenantId default '') match { case t if t != '' -> t else -> (configuration.tenantId default '') }]"
+
+        # Skip margin-guard if JWT didn't yield an authenticated
+        # customerId. Anonymous / public endpoints legitimately hit this
+        # branch and bypass margin-guard by design.
+        - when:
+            condition: "#[vars.mgCustomerId != '' and vars.mgTenantId != '']"
+          then:
+            # Check ObjectStore cache first
+            - try:
+                - objectstore-retrieve:
+                    key: "#['mg:' ++ vars.mgTenantId ++ ':' ++ vars.mgCustomerId]"
+                    objectStore: "aforo-margin-guard-cache"
+                    target: mgCachedResult
+                - set-variable:
+                    variableName: mgResult
+                    value: "#[vars.mgCachedResult]"
+              catch:
+                # Cache miss — call pricing-service
+                - http-request:
+                    method: GET
+                    url: "#[configuration.marginGuardUrl ++ '/internal/v1/margin-guard/quick-check?tenantId=' ++ vars.mgTenantId ++ '&scopeType=CUSTOMER&scopeId=' ++ vars.mgCustomerId]"
+                    headers:
+                      Content-Type: "application/json"
+                      X-Tenant-Id: "#[vars.mgTenantId]"
+                    responseTimeout: "#[configuration.timeoutMs default 50]"
+                    target: mgHttpResponse
+                    continueOnError: true
+
+                - when:
+                    condition: "#[vars.mgHttpResponse.statusCode == 200]"
+                  then:
+                    - set-variable:
+                        variableName: mgResult
+                        value: "#[read(vars.mgHttpResponse.body, 'application/json')]"
+                    # Cache result
+                    - objectstore-store:
+                        key: "#['mg:' ++ vars.mgTenantId ++ ':' ++ vars.mgCustomerId]"
+                        value: "#[vars.mgResult]"
+                        objectStore: "aforo-margin-guard-cache"
+                        entryTtl: "#[configuration.cacheTtlMs default 30000]"
+                  otherwise:
+                    # Non-200 or error — fail-open
+                    - set-variable:
+                        variableName: mgResult
+                        value: "#[{allowed: true, level: 'NONE'}]"
+
+            # ── Enforce based on result ──────────────────────────
+            # L3 BLOCK
+            - when:
+                condition: "#[vars.mgResult.allowed == false and vars.mgResult.level == 'L3_BLOCK']"
+              then:
+                - set-response:
+                    statusCode: 429
+                    headers:
+                      Content-Type: "application/json"
+                      X-Margin-Guard: "blocked"
+                      X-Margin-Guard-Level: "L3"
+                      Retry-After: "#[vars.mgResult.retryAfterSeconds default 1800]"
+                    body: |
+                      #[output application/json --- {
+                        error: {
+                          code: "SERVICE_RESTRICTED_MARGIN",
+                          message: vars.mgResult.message default "Service restricted due to margin constraints.",
+                          retryAfterSeconds: vars.mgResult.retryAfterSeconds default 1800,
+                          supportUrl: "/portal/support"
+                        }
+                      }]
+
+            # L2 THROTTLE (probabilistic)
+            - when:
+                condition: "#[vars.mgResult.allowed == false and vars.mgResult.level == 'L2_THROTTLE' and random() * 100 >= (vars.mgResult.throttleRate default 50)]"
+              then:
+                - set-response:
+                    statusCode: 429
+                    headers:
+                      Content-Type: "application/json"
+                      X-Margin-Guard: "throttled"
+                      X-Margin-Guard-Level: "L2"
+                      Retry-After: "60"
+                    body: |
+                      #[output application/json --- {
+                        error: {
+                          code: "RATE_LIMITED_MARGIN",
+                          message: "Rate limited due to margin constraints. Please retry.",
+                          retryAfterSeconds: 60,
+                          dashboardUrl: "/portal/cost-explorer"
+                        }
+                      }]

@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Aforo Usage Metering — MuleSoft Policy Template
+
+  Runs in the outbound phase (after the API response). Uses an async scope
+  to fire a non-blocking HTTP POST to the Aforo ingestor service.
+  Zero latency impact on the API call.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+
+    <!-- HTTP requester for calling Aforo ingestor -->
+    <http:request-config name="aforo-metering-requester">
+        <http:request-connection host="${aforo_endpoint}" port="443" protocol="HTTPS">
+            <http:default-headers>
+                <http:default-header key="Content-Type" value="application/json" />
+                <http:default-header key="Authorization" value="Bearer ${api_key}" />
+                <http:default-header key="X-Tenant-Id" value="${tenant_id}" />
+            </http:default-headers>
+        </http:request-connection>
+    </http:request-config>
+
+    <!-- Policy source: runs after the API response is generated -->
+    <before-call>
+        <!-- No action before the API call -->
+    </before-call>
+
+    <after-call>
+        <!-- Async scope: non-blocking, doesn't affect API response time -->
+        <async>
+            <try>
+                <!-- Build the usage event payload -->
+                <set-variable variableName="metricName"
+                    value="#[
+                        ('${metric_name_pattern}' default '{method} {path}')
+                            replace '{method}' with (attributes.method default 'UNKNOWN')
+                            replace '{path}' with (attributes.requestPath default '/')
+                    ]" />
+
+                <set-variable variableName="quantity"
+                    value="#[
+                        if ('${quantity_source}' == 'response_size')
+                            sizeOf(payload default '') default 1
+                        else
+                            1
+                    ]" />
+
+                <set-variable variableName="customerId"
+                    value="#[
+                        if ('${customer_id_source}' == 'header')
+                            attributes.headers.'x-customer-id' default ''
+                        else
+                            authentication.clientId default ''
+                    ]" />
+
+                <set-payload value='#[output application/json ---
+                    {
+                        "events": [{
+                            "customerId": vars.customerId,
+                            "metricName": vars.metricName,
+                            "quantity": vars.quantity,
+                            "idempotencyKey": correlationId,
+                            "occurredAt": now() as String {format: "yyyy-MM-dd'\''T'\''HH:mm:ss.SSS'\''Z'\''"},
+                            ("metadata": {
+                                "gateway": "mulesoft",
+                                "method": attributes.method default "UNKNOWN",
+                                "path": attributes.requestPath default "/",
+                                "status": attributes.statusCode default 0,
+                                "latency": 0,
+                                "clientId": authentication.clientId default "",
+                                "apiId": attributes.headers.'\''x-api-id'\'' default "",
+                                "version": attributes.version default ""
+                            }) if (${include_metadata} default true)
+                        }]
+                    }
+                ]' />
+
+                <!-- Send to Aforo ingestor -->
+                <http:request config-ref="aforo-metering-requester"
+                              method="POST"
+                              path="/v1/ingest/batch">
+                    <http:response-validator>
+                        <http:success-status-code-validator values="200..299,400..499" />
+                    </http:response-validator>
+                </http:request>
+
+                <error-handler>
+                    <on-error-continue type="ANY">
+                        <logger level="WARN"
+                                message="[aforo-metering] Failed to send usage event: #[error.description]" />
+                    </on-error-continue>
+                </error-handler>
+            </try>
+        </async>
+    </after-call>
+</mule>

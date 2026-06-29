@@ -1,0 +1,26 @@
+{application, aforo_metering, [
+    {description, "Aforo MQTT Metering Plugin for EMQ X"},
+    {vsn, "1.0.0"},
+    {registered, []},
+    {mod, {aforo_metering_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        inets,
+        ssl,
+        emqx,
+        jsone
+    ]},
+    {env, []},
+    {modules, [
+        aforo_metering,
+        aforo_metering_app,
+        aforo_metering_sup,
+        aforo_metering_metrics,
+        aforo_metering_buffer,
+        aforo_metering_cache,
+        aforo_metering_customer_resolver
+    ]},
+    {licenses, ["MIT"]},
+    {links, [{"Aforo", "https://aforo.ai"}]}
+]}.

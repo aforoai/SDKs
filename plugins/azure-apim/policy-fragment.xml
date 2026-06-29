@@ -1,0 +1,76 @@
+<!--
+  Aforo Usage Metering — Azure APIM Outbound Policy Fragment
+
+  Apply this fragment in the <outbound> section of your APIM policy.
+  It fires a non-blocking POST to the Aforo ingestor after every response,
+  capturing usage data for billing and analytics.
+
+  Prerequisites:
+    Create these Named Values in your APIM instance:
+    - aforo-endpoint       (Aforo ingestor batch URL)
+    - aforo-api-key        (Aforo API key, mark as Secret)
+    - aforo-tenant-id      (Your Aforo tenant ID)
+
+  Usage in APIM policy:
+    <outbound>
+        <base />
+        <include-fragment fragment-id="aforo-metering" />
+    </outbound>
+
+  Or inline (copy the <send-one-way-request> block directly):
+-->
+<fragment>
+    <outbound>
+        <!--
+            send-one-way-request is ASYNC — it does NOT block the API response.
+            The response is already sent to the client before this executes.
+            If the Aforo endpoint is unreachable, the request is silently dropped.
+        -->
+        <send-one-way-request mode="new">
+            <set-url>{{aforo-endpoint}}</set-url>
+            <set-method>POST</set-method>
+            <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+            </set-header>
+            <set-header name="Authorization" exists-action="override">
+                <value>Bearer {{aforo-api-key}}</value>
+            </set-header>
+            <set-header name="X-Tenant-Id" exists-action="override">
+                <value>{{aforo-tenant-id}}</value>
+            </set-header>
+            <set-body>@{
+                var evt = new JObject(
+                    new JProperty("events", new JArray(
+                        new JObject(
+                            new JProperty("customerId",
+                                context.Subscription != null ? context.Subscription.Id : "unknown"),
+                            new JProperty("metricName",
+                                context.Request.Method + " " +
+                                (context.Operation != null ? context.Operation.UrlTemplate : context.Request.Url.Path)),
+                            new JProperty("quantity", 1),
+                            new JProperty("idempotencyKey", context.RequestId),
+                            new JProperty("occurredAt", DateTime.UtcNow.ToString("o")),
+                            new JProperty("metadata", new JObject(
+                                new JProperty("gateway", "azure-apim"),
+                                new JProperty("method", context.Request.Method),
+                                new JProperty("path",
+                                    context.Operation != null ? context.Operation.UrlTemplate : context.Request.Url.Path),
+                                new JProperty("status", context.Response.StatusCode),
+                                new JProperty("latency", context.Elapsed.TotalMilliseconds),
+                                new JProperty("product",
+                                    context.Product != null ? context.Product.Id : ""),
+                                new JProperty("subscription",
+                                    context.Subscription != null ? context.Subscription.Id : ""),
+                                new JProperty("operation",
+                                    context.Operation != null ? context.Operation.Id : ""),
+                                new JProperty("user",
+                                    context.User != null ? context.User.Id : "")
+                            ))
+                        )
+                    ))
+                );
+                return evt.ToString();
+            }</set-body>
+        </send-one-way-request>
+    </outbound>
+</fragment>

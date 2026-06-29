@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Aforo JWT — Assign Verified Claims as Upstream Headers
+
+  Runs AFTER AforoJwtValidation succeeds.
+  Overwrites any client-supplied identity headers with values from the
+  verified JWT claims. Upstream services can trust these headers because
+  they are only set after successful RS256 signature verification.
+
+  Headers set:
+    X-Customer-Id  — aforo.customer_id (falls back to aforo.sub)
+    X-Tenant-Id    — aforo.tenant_id
+    X-Key-Id       — aforo.key_id
+    X-Scopes       — aforo.scopes
+    X-Environment  — aforo.environment ("live" or "sandbox")
+-->
+<AssignMessage name="AforoJwtAssignHeaders">
+    <DisplayName>Aforo JWT — Assign Upstream Headers</DisplayName>
+    <Set>
+        <Headers>
+            <Header name="X-Customer-Id">{aforo.customer_id}</Header>
+            <Header name="X-Tenant-Id">{aforo.tenant_id}</Header>
+            <Header name="X-Key-Id">{aforo.key_id}</Header>
+            <Header name="X-Scopes">{aforo.scopes}</Header>
+            <Header name="X-Environment">{aforo.environment}</Header>
+        </Headers>
+    </Set>
+    <IgnoreUnresolvedVariables>true</IgnoreUnresolvedVariables>
+    <AssignTo createNew="false" transport="http" type="request"/>
+</AssignMessage>

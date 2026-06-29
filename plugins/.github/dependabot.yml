@@ -1,0 +1,24 @@
+# V113 SOC 2 CC8.1 (Phase 2, 2026-05-25): automated dependency update PRs.
+# Multi-gateway monorepo — each plugin uses different language/ecosystem.
+
+version: 2
+updates:
+  # AWS Lambda metering plugin (Node.js)
+  - package-ecosystem: "npm"
+    directory: "/aws-lambda"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "aws-lambda"]
+
+  # CI/CD workflows
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "github-actions"]
+
+  # NOTE: Kong (Lua), Apigee (JS callout — no package.json), Azure APIM
+  # (XML policy), MuleSoft (DataWeave) don't have Dependabot-supported
+  # package managers. Vulnerability tracking for those gateways relies on
+  # vendor release-notes monitoring + the security incident response
+  # runbook for CVE triage.

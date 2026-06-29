@@ -1,0 +1,38 @@
+# V113 SOC 2 CC8.1 (Phase 2, 2026-05-25): automated dependency update PRs
+# for the multi-package SDK monorepo. Each Node.js SDK directory has its
+# own scan entry so Dependabot opens focused per-package PRs.
+
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/node-graphql"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "node-sdk"]
+  - package-ecosystem: "npm"
+    directory: "/node-grpc"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "node-sdk"]
+  - package-ecosystem: "npm"
+    directory: "/node-mcp"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "node-sdk"]
+  - package-ecosystem: "npm"
+    directory: "/node-ws"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "node-sdk"]
+  - package-ecosystem: "npm"
+    directory: "/mcp-proxy"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "node-sdk"]
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "github-actions"]
+  # Python SDKs (pip ecosystem) — add per-subdir entries when each
+  # Python SDK folder is audited for requirements.txt / pyproject.toml shape.

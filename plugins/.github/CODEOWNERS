@@ -1,0 +1,11 @@
+# V113 SOC 2 CC8.1 (Phase 2, 2026-05-25): change-management — every PR
+# requires review by a code owner before merge. Combine with GitHub branch
+# protection ("Require review from Code Owners" + "Restrict pushes that
+# create matching branches") to enforce the gate operationally.
+#
+# Default owner: @jayaforo (founder + release manager). Update this file
+# to add per-directory owners as the team grows. The audit posture only
+# requires that SOMEONE is identified as code owner; granularity is a
+# refinement.
+
+* @jayaforo

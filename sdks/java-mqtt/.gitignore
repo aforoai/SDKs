@@ -1,0 +1,5 @@
+# Moquette in-memory broker persistence files — created by
+# AforoMqttIntegrationTest when it spins up an embedded broker on a
+# random port. Deliberately not cleaned up by the test (saves ~100ms per
+# run); gitignored here so they don't get accidentally committed.
+data/

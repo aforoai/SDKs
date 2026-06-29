@@ -1,0 +1,47 @@
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# ---- logs / temp ----
+*.log
+*.tmp
+*.tgz
+
+# ---- Node / TypeScript ----
+node_modules/
+dist/
+build/
+coverage/
+.turbo/
+.npm/
+*.tsbuildinfo
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.tox/
+.venv/
+venv/
+*.whl
+
+# ---- Java / Maven / Gradle ----
+target/
+*.class
+.gradle/
+out/
+
+# ---- Go ----
+bin/
+vendor/
+
+# ---- Erlang / rebar3 (EMQX plugin) ----
+_build/
+rebar.lock
+erl_crash.dump

@@ -1,0 +1,73 @@
+## Aforo MQTT Metering plugin — default configuration
+##
+## Override these values via the EMQ X dashboard, environment-variable
+## substitution (${VAR}), or by editing this file and rebuilding the
+## plugin tarball.
+
+aforo_metering {
+  ## Required: Aforo tenant identifier (sent as X-Tenant-Id header)
+  tenant_id = "tenant_default"
+
+  ## Required: Aforo product ID this broker instance is registered as
+  product_id = "prod_mqtt_default"
+
+  ## Required: Aforo API key (Bearer token for the ingestor)
+  api_key = "${AFORO_API_KEY}"
+
+  ## Aforo usage-ingestor batch endpoint
+  ingestor_url = "https://ingestor.aforo.ai/v1/ingest/events"
+
+  ## Flush when this many events are buffered (or at flush_interval_ms, whichever comes first)
+  flush_count = 500
+
+  ## Max milliseconds between flushes of a partial batch
+  flush_interval_ms = 3000
+
+  ## Emit one Aforo event per fanout delivery (mqtt_broker.deliver).
+  ## Off by default — high volume. Only enable when billing model
+  ## requires per-subscriber delivery counts (e.g. AWS IoT-style pricing).
+  emit_deliver = false
+
+  ## Topics to skip entirely (defaults cover EMQ X system + shared topics)
+  exclude_topics = ["$SYS/#", "$share/#"]
+
+  ## Maximum events held in the ETS buffer. When this cap is hit, the
+  ## oldest 50% are dropped (and counted via aforo.metering.events.dropped).
+  ## Bounds memory under sustained ingestor unreachability.
+  max_buffer_size = 50000
+
+  ## Circuit breaker — after this many consecutive flush failures, the
+  ## circuit opens and POSTs are skipped (events buffered subject to
+  ## the retention cap). After cooldown, one probe attempt is made;
+  ## on success the circuit closes, on failure it reopens.
+  circuit_failure_threshold = 5
+  circuit_cooldown_seconds  = 60
+
+  ## Customer-ID resolver backend. Selects how a customer ID is
+  ## extracted from the MQTT CONNECT info. Cached per (tenant, clientid)
+  ## via aforo_metering_cache (see customer_lookup.hit/miss counters).
+  ## Options:
+  ##   "username"        — MQTT CONNECT username (default)
+  ##   "clientid_prefix" — parse "cust_<id>_<rest>" from clientid
+  ##                       (separator configurable below)
+  ##   "jwt"             — decode JWT in MQTT 5 CONNECT
+  ##                       Authentication-Data property; reads claim
+  ##                       configured below
+  ##   "http"            — POST {clientId, username, tenantId} to the
+  ##                       configured auth-service URL; expects
+  ##                       {"customerId":"..."} in the response body
+  customer_resolver = "username"
+
+  ## Separator used by the clientid_prefix resolver — clientids of the
+  ## form `cust<sep><id><sep><rest>` are parsed to <id>.
+  customer_resolver_clientid_separator = "_"
+
+  ## JSON Web Token claim to read for the customer ID (jwt resolver).
+  ## Standard claims: "sub" (subject), "tenant_id", or any custom claim.
+  customer_resolver_jwt_claim = "sub"
+
+  ## URL of the auth service for the http resolver. Set to enable.
+  ## The resolver POSTs JSON {clientId, username, tenantId} with the
+  ## plugin's API key as Bearer token; expects {"customerId": "..."} back.
+  customer_resolver_http_url = ""
+}

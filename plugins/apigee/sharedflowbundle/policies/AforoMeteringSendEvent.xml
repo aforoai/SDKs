@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Sends the usage event payload to the Aforo ingestor service.
+     Uses ServiceCallout with continueOnError=true so API response
+     is never impacted by metering failures. -->
+<ServiceCallout name="AforoMeteringSendEvent" continueOnError="true">
+    <DisplayName>Aforo Metering - Send Event to Ingestor</DisplayName>
+    <Request variable="aforo.calloutRequest">
+        <Set>
+            <Verb>POST</Verb>
+            <Payload contentType="application/json">{aforo.eventPayload}</Payload>
+            <Headers>
+                <Header name="Content-Type">application/json</Header>
+                <Header name="Authorization">Bearer {aforo.apiKey}</Header>
+                <Header name="X-Tenant-Id">{aforo.tenantId}</Header>
+            </Headers>
+        </Set>
+    </Request>
+    <Response>aforo.calloutResponse</Response>
+    <HTTPTargetConnection>
+        <URL>{aforo.endpoint}</URL>
+        <Properties>
+            <Property name="connect.timeout.millis">5000</Property>
+            <Property name="io.timeout.millis">10000</Property>
+        </Properties>
+    </HTTPTargetConnection>
+</ServiceCallout>
