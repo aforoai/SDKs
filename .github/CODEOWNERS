@@ -1,0 +1,21 @@
+# Code owners for aforoai/SDKs.
+# These owners are requested for review automatically on matching changes.
+# NOTE: create the @aforoai/sdk-maintainers team (or replace with real handles).
+
+# Everything, by default
+*                                   @aforoai/sdk-maintainers
+
+# Language SDKs
+/aforo-metering-sdks/node*/         @aforoai/sdk-maintainers
+/aforo-metering-sdks/mcp-proxy/     @aforoai/sdk-maintainers
+/aforo-metering-sdks/python*/       @aforoai/sdk-maintainers
+/aforo-metering-sdks/java*/         @aforoai/sdk-maintainers
+/aforo-metering-sdks/go*/           @aforoai/sdk-maintainers
+
+# Gateway + broker plugins
+/aforo-gateway-plugins/             @aforoai/sdk-maintainers
+/aforo-emqx-plugin/                 @aforoai/sdk-maintainers
+
+# Release-critical: CI, release, versioning policy
+/.github/                           @aforoai/sdk-maintainers
+/VERSIONING.md                      @aforoai/sdk-maintainers

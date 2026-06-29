@@ -1,0 +1,37 @@
+name: Feature request
+description: Suggest a capability for an SDK or plugin.
+labels: ["enhancement", "triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: Lead with the job, not the solution — what does this unblock?
+    validations:
+      required: true
+  - type: dropdown
+    id: artifact
+    attributes:
+      label: Which artifact(s) would this touch?
+      multiple: true
+      options:
+        - "Node SDKs"
+        - "Python SDKs"
+        - "Java SDKs"
+        - "Go SDKs"
+        - "MCP / agent SDKs / proxy"
+        - "Gateway plugins (Kong / Apigee / AWS / Azure / MuleSoft)"
+        - "EMQX broker plugin"
+        - "New language or framework"
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would the API / config look like?
+      description: A rough call-site sketch helps. Optional.
+      render: shell
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Workarounds you've tried

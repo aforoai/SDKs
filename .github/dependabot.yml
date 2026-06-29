@@ -1,0 +1,51 @@
+version: 2
+updates:
+  # Node SDKs + the npm-based AWS Lambda plugin
+  - package-ecosystem: npm
+    directories:
+      - "/aforo-metering-sdks/node*"
+      - "/aforo-metering-sdks/mcp-proxy"
+      - "/aforo-gateway-plugins/aws-lambda"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+
+  # Python SDKs
+  - package-ecosystem: pip
+    directories:
+      - "/aforo-metering-sdks/python*"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+
+  # Java SDKs
+  - package-ecosystem: maven
+    directories:
+      - "/aforo-metering-sdks/java*"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+
+  # Go SDKs
+  - package-ecosystem: gomod
+    directories:
+      - "/aforo-metering-sdks/go*"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+
+  # GitHub Actions used by CI / release workflows
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"

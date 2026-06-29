@@ -1,0 +1,67 @@
+name: Bug report
+description: Something in an SDK or plugin doesn't work as documented.
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please check the artifact's `USER_GUIDE.md`
+        **Troubleshooting** table first — it answers the most common cases
+        (events not appearing, 401s, a metric that doesn't bill).
+        **Never paste an API key or tenant secret here.**
+  - type: dropdown
+    id: artifact
+    attributes:
+      label: Artifact
+      description: Which package or plugin?
+      options:
+        - "node (@aforo/metering)"
+        - "node-agent / node-mcp / mcp-proxy"
+        - "node-graphql / -grpc / -ws / -mqtt"
+        - "python (aforo-metering)"
+        - "python-mcp / -graphql / -grpc / -ws / -mqtt"
+        - "java (com.aforo:metering) + protocol variants"
+        - "go (metering-go) + protocol variants"
+        - "Kong plugin"
+        - "Apigee shared flow"
+        - "AWS Lambda"
+        - "Azure APIM"
+        - "MuleSoft"
+        - "EMQX broker plugin"
+        - "Other / not sure"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Artifact version
+      description: From the manifest (package.json / setup.py / pom.xml) or the VERSION file.
+      placeholder: "1.0.0"
+    validations:
+      required: true
+  - type: input
+    id: runtime
+    attributes:
+      label: Runtime / gateway version
+      placeholder: "Node 20.11 / Python 3.11 / JDK 17 / Go 1.22 / Kong 3.6"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected vs. what happened
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: Smallest code/config that shows the problem.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs (redact secrets)
+      render: shell

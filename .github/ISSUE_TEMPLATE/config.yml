@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://docs.aforo.ai
+    about: Install steps, quickstarts, and per-artifact user guides.
+  - name: Account, billing, or platform questions
+    url: mailto:support@aforo.ai
+    about: For anything about your Aforo account, rate plans, or the platform itself.
+  - name: Report a security vulnerability
+    url: https://github.com/aforoai/SDKs/security/advisories/new
+    about: Please report security issues privately — not as a public issue.
