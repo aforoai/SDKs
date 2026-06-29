@@ -1,0 +1,46 @@
+name: Publish — npm
+
+# Publishes one Node package to npm. Manual trigger (workflow_dispatch) so a
+# mistagged push can never auto-publish to a public registry.
+#
+# One-time setup required before this can run:
+#   - The `aforoai` (or relevant) npm org/scope exists and you own it.
+#   - Repository secret NPM_TOKEN = an npm automation token with publish rights,
+#     OR configure npm Trusted Publishing for this repo (then the token can be
+#     dropped). Provenance below needs id-token: write either way.
+#
+# Usage: Actions → "Publish — npm" → Run workflow → enter the package directory,
+#        e.g. aforo-metering-sdks/node
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_dir:
+        description: "npm package directory (e.g. aforo-metering-sdks/node)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write   # required for npm provenance (--provenance)
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Build
+        working-directory: ${{ inputs.package_dir }}
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+          npm test
+      - name: Publish (public, with provenance)
+        working-directory: ${{ inputs.package_dir }}
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -1,0 +1,53 @@
+name: Publish — Maven Central
+
+# Publishes one Java module to Maven Central. Manual trigger.
+#
+# One-time setup required before this can run (more than the other registries):
+#   1. Claim a namespace on the Central Portal (https://central.sonatype.com) —
+#      decide between `com.aforo` (current pom groupId) and `ai.aforo`.
+#   2. Generate a GPG key, publish the public key to a keyserver.
+#   3. Add repository secrets:
+#        MAVEN_CENTRAL_USERNAME, MAVEN_CENTRAL_PASSWORD  (Central Portal token)
+#        MAVEN_GPG_PRIVATE_KEY  (ASCII-armored private key)
+#        MAVEN_GPG_PASSPHRASE
+#   4. The module pom needs Central metadata to be accepted: <name>, <description>,
+#      <url>, <licenses>, <scm>, <developers>, plus the maven-source-plugin,
+#      maven-javadoc-plugin, maven-gpg-plugin, and the central-publishing-maven-plugin
+#      (or nexus-staging). See PUBLISHING.md for the exact pom block to add.
+#
+# Usage: Actions → "Publish — Maven Central" → Run workflow → enter the module dir,
+#        e.g. aforo-metering-sdks/java
+
+on:
+  workflow_dispatch:
+    inputs:
+      module_dir:
+        description: "Maven module directory (e.g. aforo-metering-sdks/java)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          server-id: central
+          server-username: MAVEN_CENTRAL_USERNAME
+          server-password: MAVEN_CENTRAL_PASSWORD
+          gpg-private-key: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+      - name: Deploy to Central
+        working-directory: ${{ inputs.module_dir }}
+        run: mvn -B -ntp -DskipTests deploy
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}

@@ -79,10 +79,13 @@ SDKs/
 ├── aforo-metering-sdks/    # language SDKs (Node / Python / Java / Go × base + protocols + MCP/agent)
 ├── aforo-gateway-plugins/  # API gateway plugins (Kong / Apigee / AWS / Azure / MuleSoft) + IaC + docs
 ├── aforo-emqx-plugin/      # MQTT broker (EMQX) metering plugin — experimental
+├── .github/                # CI + release/publish workflows, issue/PR templates, CODEOWNERS
 ├── VERSIONING.md           # per-artifact SemVer convention (version in code + docs)
+├── PUBLISHING.md           # release + registry-publish runbook (maintainers)
+├── CONTRIBUTING.md
+├── SECURITY.md · SUPPORT.md · CODE_OF_CONDUCT.md
 ├── README.md
-├── LICENSE
-└── CONTRIBUTING.md
+└── LICENSE
 ```
 
 ## License

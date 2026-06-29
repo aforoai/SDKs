@@ -1,0 +1,36 @@
+name: Release
+
+# Creates a GitHub Release whenever a version tag is pushed. Works for every
+# artifact and needs no secrets (uses the built-in GITHUB_TOKEN).
+#
+# Tag conventions (see VERSIONING.md):
+#   SDKs / plugins:  <artifact>-v<version>           e.g. node-v1.0.1, kong-v2.0.1
+#   Go modules:      aforo-metering-sdks/<pkg>/v<version>   (required by the Go proxy)
+#
+# After the release is cut, run the matching Publish workflow to push the
+# package to its registry (npm / PyPI / Maven). Go needs no publish step — the
+# tag itself is the release; `go get` fetches it via the module proxy.
+
+on:
+  push:
+    tags:
+      - '*-v*.*.*'
+      - 'aforo-metering-sdks/*/v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  github-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          # Mark a release as prerelease if the tag has a pre-release suffix.
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
