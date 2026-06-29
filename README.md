@@ -1,5 +1,7 @@
 # Aforo SDKs & Gateway Plugins
 
+[![CI](https://github.com/aforoai/SDKs/actions/workflows/ci.yml/badge.svg)](https://github.com/aforoai/SDKs/actions/workflows/ci.yml)
+
 Meter your product's usage and send it to Aforo for billing — in code with a language SDK, or with zero code at your API gateway. Everything in this repo is what you install to get usage events flowing into Aforo.
 
 > **Distribution status:** these packages are being prepared for public registries (npm · PyPI · Maven Central · Go modules) and the gateway plugins for tagged GitHub Releases. Until a package is published, install it from source — each package directory has its own README with the steps. The integration model below is stable.
