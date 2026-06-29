@@ -16,7 +16,7 @@ A gRPC server that emits one Aforo billing event per RPC — service, method, gR
 
 ## Step 1 — Add the module from source
 
-`go get github.com/aforo/grpc-metering-go` does not resolve yet (proxy not live). Clone and `replace`:
+`go get github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc` does not resolve yet (proxy not live). Clone and `replace`:
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
@@ -24,9 +24,9 @@ git clone https://github.com/aforoai/SDKs.git
 
 ```go
 // go.mod (your service)
-require github.com/aforo/grpc-metering-go v1.0.0
+require github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc v1.0.0
 
-replace github.com/aforo/grpc-metering-go => ../SDKs/aforo-metering-sdks/go-grpc
+replace github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc => ../SDKs/aforo-metering-sdks/go-grpc
 ```
 
 ```bash
@@ -43,7 +43,7 @@ import (
 	"log"
 	"os"
 
-	grpcmetering "github.com/aforo/grpc-metering-go"
+	grpcmetering "github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc"
 )
 
 billing, err := grpcmetering.New(grpcmetering.Config{

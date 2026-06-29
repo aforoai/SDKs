@@ -16,7 +16,7 @@ A GraphQL server that emits one Aforo billing event per operation — type, name
 
 ## Step 1 — Add the module from source
 
-`go get github.com/aforo/graphql-metering-go` does not resolve yet (proxy not live). Clone and `replace`:
+`go get github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql` does not resolve yet (proxy not live). Clone and `replace`:
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
@@ -24,9 +24,9 @@ git clone https://github.com/aforoai/SDKs.git
 
 ```go
 // go.mod (your service)
-require github.com/aforo/graphql-metering-go v1.0.0
+require github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql v1.0.0
 
-replace github.com/aforo/graphql-metering-go => ../SDKs/aforo-metering-sdks/go-graphql
+replace github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql => ../SDKs/aforo-metering-sdks/go-graphql
 ```
 
 ```bash
@@ -42,7 +42,7 @@ import (
 	"log"
 	"os"
 
-	graphqlmetering "github.com/aforo/graphql-metering-go"
+	graphqlmetering "github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql"
 )
 
 billing, err := graphqlmetering.New(graphqlmetering.Config{

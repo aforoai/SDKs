@@ -9,7 +9,7 @@ Every artifact in this repo carries its own version, recorded in **both code and
 | Node SDKs | `package.json` `"version"` | npm, on a git tag |
 | Python SDKs | `pyproject.toml` / `setup.py` `version` | PyPI, on a git tag |
 | Java SDKs | `pom.xml` `<version>` | Maven Central, on a git tag |
-| Go SDKs | a `VERSION` file (Go has no manifest version field) | `git tag <module>/vX.Y.Z` |
+| Go SDKs | a `VERSION` file (Go has no manifest version field) | tag `aforo-metering-sdks/<pkg>/vX.Y.Z` (the module's repo subpath); import path is `github.com/aforoai/SDKs/aforo-metering-sdks/<pkg>` |
 | Kong plugin | `*.rockspec` version | LuaRocks + GitHub Release |
 | Other gateway plugins (Apigee/AWS/Azure/MuleSoft) | `package.json` (AWS) or a `VERSION` file | GitHub Release |
 | EMQX plugin | `src/aforo_metering.app.src` `{vsn, ...}` | GitHub Release |

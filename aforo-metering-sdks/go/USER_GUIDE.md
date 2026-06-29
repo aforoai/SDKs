@@ -15,7 +15,7 @@ A Go service that ships one usage event per HTTP request (or per manual `Track` 
 
 ## Step 1 — Add the module from source
 
-`go get github.com/aforo/metering-go` does not resolve yet (the module proxy isn't live). Clone the distribution repo and point at it with a `replace`:
+`go get github.com/aforoai/SDKs/aforo-metering-sdks/go` does not resolve yet (the module proxy isn't live). Clone the distribution repo and point at it with a `replace`:
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
@@ -24,9 +24,9 @@ git clone https://github.com/aforoai/SDKs.git
 In your service's `go.mod`:
 
 ```go
-require github.com/aforo/metering-go v1.0.0
+require github.com/aforoai/SDKs/aforo-metering-sdks/go v1.0.0
 
-replace github.com/aforo/metering-go => ../SDKs/aforo-metering-sdks/go
+replace github.com/aforoai/SDKs/aforo-metering-sdks/go => ../SDKs/aforo-metering-sdks/go
 ```
 
 ```bash
@@ -41,7 +41,7 @@ go mod tidy
 import (
 	"os"
 
-	metering "github.com/aforo/metering-go"
+	metering "github.com/aforoai/SDKs/aforo-metering-sdks/go"
 )
 
 client := metering.NewClient(metering.Options{

@@ -11,10 +11,10 @@ Reach for this when your Go service already knows who the customer is and what t
 Intended public install once published:
 
 ```bash
-go get github.com/aforo/metering-go
+go get github.com/aforoai/SDKs/aforo-metering-sdks/go
 ```
 
-**Not yet on a public Go module proxy — `go get github.com/aforo/metering-go` will not resolve yet.** The module path in `go.mod` (`github.com/aforo/metering-go`) is mid-migration. Until the proxy is live, vendor it from source with a local `replace`:
+**Not yet published — `go get github.com/aforoai/SDKs/aforo-metering-sdks/go` resolves once this repo is public and the module is tagged** (`aforo-metering-sdks/go/v1.0.0`). Until then, vendor it from source with a local `replace`:
 
 ```bash
 # 1. Clone the SDK distribution repo next to your service
@@ -26,9 +26,9 @@ git clone https://github.com/aforoai/SDKs.git
 
 ```go
 // go.mod (your service)
-require github.com/aforo/metering-go v1.0.0
+require github.com/aforoai/SDKs/aforo-metering-sdks/go v1.0.0
 
-replace github.com/aforo/metering-go => ../SDKs/aforo-metering-sdks/go
+replace github.com/aforoai/SDKs/aforo-metering-sdks/go => ../SDKs/aforo-metering-sdks/go
 ```
 
 ```bash
@@ -47,7 +47,7 @@ package main
 import (
 	"os"
 
-	metering "github.com/aforo/metering-go"
+	metering "github.com/aforoai/SDKs/aforo-metering-sdks/go"
 )
 
 func main() {
@@ -76,7 +76,7 @@ import (
 	"net/http"
 	"os"
 
-	metering "github.com/aforo/metering-go"
+	metering "github.com/aforoai/SDKs/aforo-metering-sdks/go"
 )
 
 func main() {

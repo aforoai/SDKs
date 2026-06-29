@@ -1,4 +1,4 @@
-module github.com/aforo/grpc-metering-go
+module github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc
 
 go 1.21
 

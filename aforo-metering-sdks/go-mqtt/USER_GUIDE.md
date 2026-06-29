@@ -16,7 +16,7 @@ A Go MQTT client that emits one Aforo billing event per MQTT action — `CONNECT
 
 ## Step 1 — Add the module from source
 
-`go get github.com/aforo/mqtt-metering-go` does not resolve yet (proxy not live). Clone and `replace`:
+`go get github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt` does not resolve yet (proxy not live). Clone and `replace`:
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
@@ -24,9 +24,9 @@ git clone https://github.com/aforoai/SDKs.git
 
 ```go
 // go.mod (your service)
-require github.com/aforo/mqtt-metering-go v1.0.0
+require github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt v1.0.0
 
-replace github.com/aforo/mqtt-metering-go => ../SDKs/aforo-metering-sdks/go-mqtt
+replace github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt => ../SDKs/aforo-metering-sdks/go-mqtt
 ```
 
 ```bash
@@ -42,7 +42,7 @@ import (
 	"log"
 	"os"
 
-	mqttmetering "github.com/aforo/mqtt-metering-go"
+	mqttmetering "github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt"
 )
 
 billing, err := mqttmetering.New(mqttmetering.Config{

@@ -16,7 +16,7 @@ A WebSocket server that emits one Aforo `CONNECTION_OPENED` event when a connect
 
 ## Step 1 — Add the module from source
 
-`go get github.com/aforo/ws-metering-go` does not resolve yet (proxy not live). Clone and `replace`:
+`go get github.com/aforoai/SDKs/aforo-metering-sdks/go-ws` does not resolve yet (proxy not live). Clone and `replace`:
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
@@ -24,9 +24,9 @@ git clone https://github.com/aforoai/SDKs.git
 
 ```go
 // go.mod (your service)
-require github.com/aforo/ws-metering-go v1.0.0
+require github.com/aforoai/SDKs/aforo-metering-sdks/go-ws v1.0.0
 
-replace github.com/aforo/ws-metering-go => ../SDKs/aforo-metering-sdks/go-ws
+replace github.com/aforoai/SDKs/aforo-metering-sdks/go-ws => ../SDKs/aforo-metering-sdks/go-ws
 ```
 
 ```bash
@@ -42,7 +42,7 @@ import (
 	"log"
 	"os"
 
-	wsmetering "github.com/aforo/ws-metering-go"
+	wsmetering "github.com/aforoai/SDKs/aforo-metering-sdks/go-ws"
 )
 
 billing, err := wsmetering.New(wsmetering.Config{

@@ -11,10 +11,10 @@ Reach for this when you bill GraphQL by the operation (or by complexity tier) an
 Intended public install once published:
 
 ```bash
-go get github.com/aforo/graphql-metering-go
+go get github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql
 ```
 
-**Not yet on a public Go module proxy — `go get github.com/aforo/graphql-metering-go` will not resolve yet.** The module path in `go.mod` (`github.com/aforo/graphql-metering-go`) is mid-migration. Until the proxy is live, vendor from source with a local `replace`:
+**Not yet published — `go get github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql` resolves once this repo is public and the module is tagged** (`aforo-metering-sdks/go-graphql/v1.0.0`). Until then, vendor it from source with a local `replace`:
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
@@ -22,9 +22,9 @@ git clone https://github.com/aforoai/SDKs.git
 
 ```go
 // go.mod (your service)
-require github.com/aforo/graphql-metering-go v1.0.0
+require github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql v1.0.0
 
-replace github.com/aforo/graphql-metering-go => ../SDKs/aforo-metering-sdks/go-graphql
+replace github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql => ../SDKs/aforo-metering-sdks/go-graphql
 ```
 
 ```bash
@@ -45,7 +45,7 @@ import (
 	"net/http"
 	"os"
 
-	graphqlmetering "github.com/aforo/graphql-metering-go"
+	graphqlmetering "github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql"
 )
 
 func main() {
