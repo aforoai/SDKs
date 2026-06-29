@@ -22,10 +22,10 @@
     <outbound>
         <choose>
             <!-- MCP JSON-RPC tools/call detection -->
-            <when condition="@("{{aforo-mcp-enabled}}" == "true" &&
-                              context.Request.Method == "POST" &&
-                              context.Request.Body != null &&
-                              context.Request.Body.As<string>(preserveContent: true).Contains("tools/call"))">
+            <when condition="@(&quot;{{aforo-mcp-enabled}}&quot; == &quot;true&quot; &amp;&amp;
+                              context.Request.Method == &quot;POST&quot; &amp;&amp;
+                              context.Request.Body != null &amp;&amp;
+                              context.Request.Body.As&lt;string&gt;(preserveContent: true).Contains(&quot;tools/call&quot;))">
                 <send-one-way-request mode="new">
                     <set-url>{{aforo-endpoint}}</set-url>
                     <set-method>POST</set-method>
@@ -38,7 +38,7 @@
                     <set-header name="X-Tenant-Id" exists-action="override">
                         <value>{{aforo-tenant-id}}</value>
                     </set-header>
-                    <set-body>@{
+                    <set-body><![CDATA[@{
                         var reqBody = context.Request.Body.As<JObject>(preserveContent: true);
                         var toolName = "unknown";
                         var agentId = "";
@@ -96,7 +96,7 @@
                             ))
                         );
                         return evt.ToString();
-                    }</set-body>
+                    }]]></set-body>
                 </send-one-way-request>
             </when>
             <otherwise>
@@ -113,7 +113,7 @@
                     <set-header name="X-Tenant-Id" exists-action="override">
                         <value>{{aforo-tenant-id}}</value>
                     </set-header>
-                    <set-body>@{
+                    <set-body><![CDATA[@{
                         var path = context.Request.Url.Path;
                         var method = context.Request.Method;
                         var statusCode = context.Response.StatusCode;
@@ -150,7 +150,7 @@
                             ))
                         );
                         return evt.ToString();
-                    }</set-body>
+                    }]]></set-body>
                 </send-one-way-request>
             </otherwise>
         </choose>

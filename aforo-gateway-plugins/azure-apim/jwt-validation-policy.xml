@@ -71,9 +71,9 @@
         -->
         <set-variable name="aforo-jwt-payload" value="@{
             var token = (string)context.Variables.GetValueOrDefault(
-                            "aforo-jwt",
-                            context.Request.Headers.GetValueOrDefault("Authorization", "")
-                                .Replace("Bearer ", "").Replace("bearer ", ""));
+                            &quot;aforo-jwt&quot;,
+                            context.Request.Headers.GetValueOrDefault(&quot;Authorization&quot;, &quot;&quot;)
+                                .Replace(&quot;Bearer &quot;, &quot;&quot;).Replace(&quot;bearer &quot;, &quot;&quot;));
             var parts = token.Split('.');
             if (parts.Length != 3) return null;
             var padded = parts[1].PadRight(parts[1].Length + (4 - parts[1].Length % 4) % 4, '=')
@@ -85,31 +85,31 @@
         }"/>
 
         <set-header name="X-Customer-Id" exists-action="override">
-            <value>@{
+            <value><![CDATA[@{
                 var payload = (Newtonsoft.Json.Linq.JObject)context.Variables["aforo-jwt-payload"];
                 if (payload == null) return "";
                 return payload["customer_id"]?.ToString()
                     ?? payload["sub"]?.ToString()
                     ?? "";
-            }</value>
+            }]]></value>
         </set-header>
 
         <set-header name="X-Tenant-Id" exists-action="override">
-            <value>@{
+            <value><![CDATA[@{
                 var payload = (Newtonsoft.Json.Linq.JObject)context.Variables["aforo-jwt-payload"];
                 return payload?["tenant_id"]?.ToString() ?? "";
-            }</value>
+            }]]></value>
         </set-header>
 
         <set-header name="X-Key-Id" exists-action="override">
-            <value>@{
+            <value><![CDATA[@{
                 var payload = (Newtonsoft.Json.Linq.JObject)context.Variables["aforo-jwt-payload"];
                 return payload?["key_id"]?.ToString() ?? "";
-            }</value>
+            }]]></value>
         </set-header>
 
         <set-header name="X-Scopes" exists-action="override">
-            <value>@{
+            <value><![CDATA[@{
                 var payload = (Newtonsoft.Json.Linq.JObject)context.Variables["aforo-jwt-payload"];
                 if (payload == null) return "";
                 var scopes = payload["scopes"];
@@ -118,14 +118,14 @@
                     return string.Join(" ", scopes.ToObject<string[]>());
                 }
                 return scopes.ToString();
-            }</value>
+            }]]></value>
         </set-header>
 
         <set-header name="X-Environment" exists-action="override">
-            <value>@{
+            <value><![CDATA[@{
                 var payload = (Newtonsoft.Json.Linq.JObject)context.Variables["aforo-jwt-payload"];
                 return payload?["environment"]?.ToString() ?? "live";
-            }</value>
+            }]]></value>
         </set-header>
 
         <!--
@@ -143,7 +143,7 @@
             Response: { "revoked": true|false }
         -->
         <send-request mode="new" response-variable-name="aforo-jti-check" timeout="2" ignore-error="true">
-            <set-url>@{
+            <set-url><![CDATA[@{
                 var payload = (Newtonsoft.Json.Linq.JObject)context.Variables["aforo-jwt-payload"];
                 var jti   = payload?["jti"]?.ToString()    ?? "";
                 var keyId = payload?["key_id"]?.ToString() ?? "";
@@ -151,7 +151,7 @@
                     "http://org-service:8086/internal/v1/auth/token-check?jti={0}&keyId={1}",
                     Uri.EscapeDataString(jti),
                     Uri.EscapeDataString(keyId));
-            }</set-url>
+            }]]></set-url>
             <set-method>GET</set-method>
             <set-header name="X-Internal-Call" exists-action="override">
                 <value>apim</value>
@@ -161,13 +161,13 @@
         <choose>
             <when condition="@{
                 var response = (IResponse)context.Variables.GetValueOrDefault(
-                                   "aforo-jti-check", null);
+                                   &quot;aforo-jti-check&quot;, null);
                 if (response == null) return false;  // fail-open on timeout/error
                 if (response.StatusCode != 200) return false;
                 try {
                     var body = Newtonsoft.Json.Linq.JObject.Parse(
-                                   response.Body.As<string>());
-                    return body["revoked"]?.ToObject<bool>() == true;
+                                   response.Body.As&lt;string&gt;());
+                    return body[&quot;revoked&quot;]?.ToObject&lt;bool&gt;() == true;
                 } catch { return false; }
             }">
                 <return-response>

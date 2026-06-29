@@ -18,7 +18,7 @@
       - Named value: aforo-margin-guard-enabled ("true" to enable)
       - Named value: aforo-tenant-id (tenant identifier — admin-pinned fallback)
 
-    Usage: Include in <inbound> section, AFTER jwt-validation-policy.xml.
+    Usage: Include in inbound section, AFTER jwt-validation-policy.xml.
     <include-fragment fragment-id="aforo-margin-guard" />
 
     Security history:
@@ -30,7 +30,7 @@
 -->
 <fragment>
     <choose>
-        <when condition="@(context.Variables.GetValueOrDefault<string>("aforo-margin-guard-enabled", "false") == "true")">
+        <when condition="@(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-margin-guard-enabled&quot;, &quot;false&quot;) == &quot;true&quot;)">
             <!--
                 Resolve customer / tenant identity from authenticated sources only.
                 Primary: JWT claims (cryptographically verified by jwt-validation-policy).
@@ -39,36 +39,36 @@
                 NEVER read X-Customer-Id / X-Tenant-Id from the request headers.
             -->
             <set-variable name="mgCustomerId" value="@{
-                var payload = (Newtonsoft.Json.Linq.JObject)context.Variables.GetValueOrDefault<object>("aforo-jwt-payload", null);
+                var payload = (Newtonsoft.Json.Linq.JObject)context.Variables.GetValueOrDefault&lt;object&gt;(&quot;aforo-jwt-payload&quot;, null);
                 var fromJwt = payload == null ? null
-                    : (payload["customer_id"]?.ToString() ?? payload["sub"]?.ToString());
+                    : (payload[&quot;customer_id&quot;]?.ToString() ?? payload[&quot;sub&quot;]?.ToString());
                 if (!string.IsNullOrEmpty(fromJwt)) return fromJwt;
                 // Fallback: APIM-managed subscription id (set by subscription-key validation).
-                return context.Subscription != null ? context.Subscription.Id : "";
+                return context.Subscription != null ? context.Subscription.Id : &quot;&quot;;
             }" />
             <set-variable name="mgTenantId" value="@{
-                var payload = (Newtonsoft.Json.Linq.JObject)context.Variables.GetValueOrDefault<object>("aforo-jwt-payload", null);
-                var fromJwt = payload?["tenant_id"]?.ToString();
+                var payload = (Newtonsoft.Json.Linq.JObject)context.Variables.GetValueOrDefault&lt;object&gt;(&quot;aforo-jwt-payload&quot;, null);
+                var fromJwt = payload?[&quot;tenant_id&quot;]?.ToString();
                 if (!string.IsNullOrEmpty(fromJwt)) return fromJwt;
                 // Fallback: admin-pinned Named Value.
-                return context.Variables.GetValueOrDefault<string>("aforo-tenant-id", "");
+                return context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-tenant-id&quot;, &quot;&quot;);
             }" />
 
             <choose>
-                <when condition="@(context.Variables.GetValueOrDefault<string>("mgCustomerId", "") != "" &amp;&amp; context.Variables.GetValueOrDefault<string>("mgTenantId", "") != "")">
+                <when condition="@(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;mgCustomerId&quot;, &quot;&quot;) != &quot;&quot; &amp;&amp; context.Variables.GetValueOrDefault&lt;string&gt;(&quot;mgTenantId&quot;, &quot;&quot;) != &quot;&quot;)">
 
                     <!-- Check cache first (Azure APIM internal cache, 30s TTL) -->
-                    <cache-lookup-value key="@($"mg:{context.Variables["mgTenantId"]}:{context.Variables["mgCustomerId"]}")" variable-name="mgCachedResult" />
+                    <cache-lookup-value key="@($&quot;mg:{context.Variables[&quot;mgTenantId&quot;]}:{context.Variables[&quot;mgCustomerId&quot;]}&quot;)" variable-name="mgCachedResult" />
 
                     <choose>
-                        <when condition="@(context.Variables.ContainsKey("mgCachedResult"))">
+                        <when condition="@(context.Variables.ContainsKey(&quot;mgCachedResult&quot;))">
                             <!-- Use cached result -->
-                            <set-variable name="mgResult" value="@((string)context.Variables["mgCachedResult"])" />
+                            <set-variable name="mgResult" value="@((string)context.Variables[&quot;mgCachedResult&quot;])" />
                         </when>
                         <otherwise>
                             <!-- Call pricing-service quick-check -->
                             <send-request mode="new" response-variable-name="mgResponse" timeout="1" ignore-error="true">
-                                <set-url>@($"{context.Variables["aforo-margin-guard-url"]}/internal/v1/margin-guard/quick-check?tenantId={context.Variables["mgTenantId"]}&scopeType=CUSTOMER&scopeId={context.Variables["mgCustomerId"]}")</set-url>
+                                <set-url>@($"{context.Variables["aforo-margin-guard-url"]}/internal/v1/margin-guard/quick-check?tenantId={context.Variables["mgTenantId"]}&amp;scopeType=CUSTOMER&amp;scopeId={context.Variables["mgCustomerId"]}")</set-url>
                                 <set-method>GET</set-method>
                                 <set-header name="Content-Type" exists-action="override">
                                     <value>application/json</value>
@@ -79,10 +79,10 @@
                             </send-request>
 
                             <choose>
-                                <when condition="@(context.Variables.ContainsKey("mgResponse") && ((IResponse)context.Variables["mgResponse"]).StatusCode == 200)">
-                                    <set-variable name="mgResult" value="@(((IResponse)context.Variables["mgResponse"]).Body.As<string>())" />
+                                <when condition="@(context.Variables.ContainsKey(&quot;mgResponse&quot;) &amp;&amp; ((IResponse)context.Variables[&quot;mgResponse&quot;]).StatusCode == 200)">
+                                    <set-variable name="mgResult" value="@(((IResponse)context.Variables[&quot;mgResponse&quot;]).Body.As&lt;string&gt;())" />
                                     <!-- Cache for 30 seconds -->
-                                    <cache-store-value key="@($"mg:{context.Variables["mgTenantId"]}:{context.Variables["mgCustomerId"]}")" value="@((string)context.Variables["mgResult"])" duration="30" />
+                                    <cache-store-value key="@($&quot;mg:{context.Variables[&quot;mgTenantId&quot;]}:{context.Variables[&quot;mgCustomerId&quot;]}&quot;)" value="@((string)context.Variables[&quot;mgResult&quot;])" duration="30" />
                                 </when>
                                 <otherwise>
                                     <!-- Fail-open: pricing-service unreachable, allow request -->
@@ -96,8 +96,8 @@
                     <choose>
                         <!-- L3 BLOCK -->
                         <when condition="@{
-                            var json = JObject.Parse((string)context.Variables["mgResult"]);
-                            return json.Value<bool>("allowed") == false && json.Value<string>("level") == "L3_BLOCK";
+                            var json = JObject.Parse((string)context.Variables[&quot;mgResult&quot;]);
+                            return json.Value&lt;bool&gt;(&quot;allowed&quot;) == false &amp;&amp; json.Value&lt;string&gt;(&quot;level&quot;) == &quot;L3_BLOCK&quot;;
                         }">
                             <return-response>
                                 <set-status code="429" reason="Margin Guard - Blocked" />
@@ -111,12 +111,12 @@
                                     <value>L3</value>
                                 </set-header>
                                 <set-header name="Retry-After" exists-action="override">
-                                    <value>@{
+                                    <value><![CDATA[@{
                                         var json = JObject.Parse((string)context.Variables["mgResult"]);
                                         return json.Value<int?>("retryAfterSeconds")?.ToString() ?? "1800";
-                                    }</value>
+                                    }]]></value>
                                 </set-header>
-                                <set-body>@{
+                                <set-body><![CDATA[@{
                                     var json = JObject.Parse((string)context.Variables["mgResult"]);
                                     var retryAfter = json.Value<int?>("retryAfterSeconds") ?? 1800;
                                     return new JObject(
@@ -127,17 +127,17 @@
                                             new JProperty("supportUrl", "/portal/support")
                                         ))
                                     ).ToString();
-                                }</set-body>
+                                }]]></set-body>
                             </return-response>
                         </when>
 
                         <!-- L2 THROTTLE (probabilistic) -->
                         <when condition="@{
-                            var json = JObject.Parse((string)context.Variables["mgResult"]);
-                            if (json.Value<bool>("allowed") == false && json.Value<string>("level") == "L2_THROTTLE") {
-                                var throttleRate = json.Value<int?>("throttleRate") ?? 50;
+                            var json = JObject.Parse((string)context.Variables[&quot;mgResult&quot;]);
+                            if (json.Value&lt;bool&gt;(&quot;allowed&quot;) == false &amp;&amp; json.Value&lt;string&gt;(&quot;level&quot;) == &quot;L2_THROTTLE&quot;) {
+                                var throttleRate = json.Value&lt;int?&gt;(&quot;throttleRate&quot;) ?? 50;
                                 var roll = new Random().Next(100);
-                                return roll >= throttleRate;
+                                return roll &gt;= throttleRate;
                             }
                             return false;
                         }">
