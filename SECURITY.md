@@ -12,7 +12,7 @@ Report privately through either channel:
 
 - **GitHub** — open a private advisory: *Security → Report a vulnerability* on this
   repository ([GitHub private vulnerability reporting](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability)).
-- **Email** — security@aforo.ai. Encrypt with our PGP key if the report contains
+- **Email** — support@aforo.ai. Encrypt with our PGP key if the report contains
   sensitive detail.
 
 Please include: the affected artifact and version, a description, reproduction
@@ -36,7 +36,7 @@ In scope: any artifact in this repository — the language SDKs
 EMQX broker plugin (`aforo-emqx-plugin/`).
 
 Out of scope: the Aforo platform services themselves (report those to
-security@aforo.ai directly), and findings that require a misconfigured host you
+support@aforo.ai directly), and findings that require a misconfigured host you
 already control (e.g. a leaked API key you committed to your own repo).
 
 ## Handling credentials safely
