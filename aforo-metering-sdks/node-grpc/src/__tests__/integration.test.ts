@@ -102,6 +102,7 @@ async function setup(): Promise<Fixture> {
     tenantId: 'tenant-int-grpc',
     productId: 'prod-int-grpc',
     apiKey: 'sk_int_grpc',
+    onError: () => {}, // ignore teardown-race flush noise
     ingestorUrl: `http://127.0.0.1:${ingestorPort}`,
     serviceName: 'aforo.test.Greeter',
     flushCount: 1,
@@ -263,6 +264,7 @@ describe('Real-server integration (@grpc/grpc-js Server + Client)', () => {
         tenantId: 'tenant-headers',
         productId: 'prod-headers',
         apiKey: 'sk_header_check',
+        onError: () => {}, // ignore teardown-race flush noise
         ingestorUrl: `http://127.0.0.1:${port}`,
         serviceName: 'aforo.test.Greeter',
         flushCount: 1,

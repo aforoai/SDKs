@@ -71,6 +71,7 @@ async function setup(): Promise<Fixture> {
     tenantId: 'tenant-int-gql',
     productId: 'prod-int-gql',
     apiKey: 'sk_int_gql',
+    onError: () => {}, // ignore teardown-race flush noise
     ingestorUrl: `http://127.0.0.1:${ingestorPort}`,
     schemaVersion: 'v-test',
     flushCount: 1,

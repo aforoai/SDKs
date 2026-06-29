@@ -98,6 +98,7 @@ async function setup(): Promise<Fixture> {
     tenantId: 'tenant-integ-001',
     productId: 'prod-mqtt-integ',
     apiKey: 'sk_integ',
+    onError: () => {}, // ignore teardown-race flush noise
     ingestorUrl,
     flushCount: 1,             // flush after every event so the test is deterministic
     flushIntervalMs: 60_000,   // long timer; flushCount=1 dominates
@@ -236,6 +237,7 @@ describe('Real-broker integration (aedes + mqtt.js)', () => {
         tenantId: 'tenant-headers',
         productId: 'prod-headers',
         apiKey: 'sk_header_check',
+        onError: () => {}, // ignore teardown-race flush noise
         ingestorUrl: `http://127.0.0.1:${port}/ingest`,
         flushCount: 1,
       });
