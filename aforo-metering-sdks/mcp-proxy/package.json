@@ -28,7 +28,7 @@
   },
   "dependencies": {
     "commander": "^12.1.0",
-    "eventsource": "^3.0.2"
+    "eventsource": "^4.1.0"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
