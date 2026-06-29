@@ -294,7 +294,7 @@ export class AforoMcpBilling {
         if (response.ok) {
           // Check for kill signals from server
           try {
-            const result: BatchIngestResponse = await response.json();
+            const result = (await response.json()) as BatchIngestResponse;
             if (result.killedSessionIds && this.activeSessionId
                 && result.killedSessionIds.includes(this.activeSessionId)) {
               const killedId = this.activeSessionId;

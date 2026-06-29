@@ -89,22 +89,10 @@ func HTTPMiddleware(next http.Handler, opts MiddlewareOptions) http.Handler {
 	})
 }
 
-// GinMiddleware returns a Gin-compatible middleware function.
-// Usage: router.Use(metering.GinMiddleware(opts))
-//
-// Gin context is expected to have c.Writer.Status() and c.Request.
-func GinMiddleware(opts MiddlewareOptions) func(c interface{ Next(); Writer interface{ Status() int }; Request *http.Request }) {
-	// Since we don't import Gin, return a generic middleware via HTTP handler pattern.
-	// For actual Gin usage, wrap with HTTPMiddleware:
-	//   router.Use(func(c *gin.Context) { c.Next(); /* track here */ })
-	return nil // Gin users should use GinHandlerFunc below
-}
-
-// GinHandlerFunc returns a function compatible with gin.HandlerFunc.
-// Since we avoid importing Gin, this returns an http.HandlerFunc-compatible wrapper.
-// Usage with Gin: router.Use(gin.WrapH(metering.HTTPMiddleware(router, opts)))
-//
-// For native Gin integration, see the README example.
+// Gin users: there is no Gin-specific helper here because this package imports
+// no web framework (zero deps). Wrap HTTPMiddleware instead, e.g.
+//   router.Use(gin.WrapH(metering.HTTPMiddleware(next, opts)))
+// or call client.Track(...) directly from a gin.HandlerFunc.
 
 // ChiMiddleware returns a Chi-compatible middleware function.
 // Usage: r.Use(metering.ChiMiddleware(opts))
