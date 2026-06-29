@@ -223,6 +223,10 @@ export class AforoGraphQlBilling {
   private startTimer(): void {
     if (this.flushTimer) return;
     this.flushTimer = setInterval(() => { void this.flush(); }, this.flushIntervalMs);
+    // Unref so the background timer never blocks host-process exit (final flush still needs shutdown()).
+    if (this.flushTimer && typeof this.flushTimer === 'object' && 'unref' in this.flushTimer) {
+      this.flushTimer.unref();
+    }
     if (typeof (this.flushTimer as any).unref === 'function') (this.flushTimer as any).unref();
   }
 

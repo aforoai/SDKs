@@ -106,6 +106,10 @@ export class AforoMcpBilling {
 
     // Start periodic flush timer
     this.flushTimer = setInterval(() => this.flush(), this.flushIntervalMs);
+    // Unref so the background timer never blocks host-process exit (final flush still needs shutdown()).
+    if (this.flushTimer && typeof this.flushTimer === 'object' && 'unref' in this.flushTimer) {
+      this.flushTimer.unref();
+    }
   }
 
   // ─── Heartbeat lifecycle ─────────────────────────────────────────────
@@ -152,6 +156,10 @@ export class AforoMcpBilling {
     this.emitHeartbeat(); // First heartbeat immediately
 
     this.heartbeatTimer = setInterval(() => this.emitHeartbeat(), this.heartbeatIntervalMs);
+    // Unref so the background timer never blocks host-process exit (final flush still needs shutdown()).
+    if (this.heartbeatTimer && typeof this.heartbeatTimer === 'object' && 'unref' in this.heartbeatTimer) {
+      this.heartbeatTimer.unref();
+    }
   }
 
   private stopHeartbeat(): void {
