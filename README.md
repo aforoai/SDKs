@@ -52,11 +52,17 @@ Broker-level metering for [EMQX](https://www.emqx.io/) 5.x — an Erlang OTP plu
 
 ---
 
+## Docs & versioning
+
+Every artifact ships three docs in its own folder: a **README** (install + quickstart + config table), a **USER_GUIDE.md** (step-by-step walkthrough to a verified event in Aforo), and a **CHANGELOG.md**. Each carries its own version — in the manifest (`package.json` / `setup.py` / `pom.xml` / `.rockspec`) or a `VERSION` file (Go, Apigee, IaC) — recorded in both code and docs. See [VERSIONING.md](VERSIONING.md) for the per-artifact SemVer convention.
+
+---
+
 ## Common model
 
-Everything here funnels usage to one place. The SDKs batch events and `POST /v1/ingest/batch`; the gateway and broker plugins do the same from the log/response phase (non-blocking).
+Everything here funnels usage to one ingestion API. Base SDKs and the gateway/broker plugins batch events and `POST /v1/ingest/batch` (plugins do it from the log/response phase, non-blocking). The protocol SDKs (GraphQL/gRPC/WebSocket/MQTT) post to `/v1/ingest/events`, and the agent SDK posts to `/v1/ingest` — each package's README states the exact path it uses.
 
-- **Endpoint:** `https://ingest.aforo.ai/v1/ingest/batch` (override per environment)
+- **Endpoint base:** `https://ingest.aforo.ai` (override per environment); the path is `/v1/ingest/batch`, `/v1/ingest/events`, or `/v1/ingest` depending on the SDK — see the package README.
 - **Auth:** `Authorization: Bearer <AFORO_API_KEY>`
 - **Tenant scope:** your tenant id, supplied via SDK config or plugin config — never read from a client-settable request header
 
@@ -71,6 +77,7 @@ SDKs/
 ├── aforo-metering-sdks/    # language SDKs (Node / Python / Java / Go × base + protocols + MCP/agent)
 ├── aforo-gateway-plugins/  # API gateway plugins (Kong / Apigee / AWS / Azure / MuleSoft) + IaC + docs
 ├── aforo-emqx-plugin/      # MQTT broker (EMQX) metering plugin — experimental
+├── VERSIONING.md           # per-artifact SemVer convention (version in code + docs)
 ├── README.md
 ├── LICENSE
 └── CONTRIBUTING.md
