@@ -24,7 +24,7 @@
     "streaming"
   ],
   "author": "Aforo, Inc.",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "peerDependencies": {
     "ws": "^8.0.0"
   },

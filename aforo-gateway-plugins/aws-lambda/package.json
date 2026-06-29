@@ -7,6 +7,6 @@
     "test": "node tests/handler.test.js"
   },
   "author": "Aforo AI",
-  "license": "UNLICENSED",
+  "license": "Apache-2.0",
   "private": true
 }

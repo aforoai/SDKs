@@ -24,7 +24,7 @@
     "pub-sub"
   ],
   "author": "Aforo, Inc.",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "peerDependencies": {
     "mqtt": "^5.0.0"
   },

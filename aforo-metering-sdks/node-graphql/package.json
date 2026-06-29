@@ -24,7 +24,7 @@
     "usage-based"
   ],
   "author": "Aforo, Inc.",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "peerDependencies": {
     "graphql": "^15.0.0 || ^16.0.0"
   },

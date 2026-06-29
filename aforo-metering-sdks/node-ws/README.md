@@ -1,95 +1,96 @@
 # @aforo/ws-metering
 
-Aforo WebSocket Metering SDK for Node.js. Wraps WebSocket server connections to meter the handshake, frames, bytes, and total connection duration. Works with `ws`, `fastify-websocket`, `@fastify/websocket`, `Socket.io`, `uWebSockets.js`, Deno, and Bun.
+Meter WebSocket connections into Aforo — open, close, bytes, frame counts, and duration — by wrapping a `ws` server, or by tracking any connection that exposes the standard WebSocket event surface (Fastify-WebSocket, Socket.io, Deno, Bun).
+
+**Version:** 1.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
+Intended public install (once published):
+
 ```bash
-npm install @aforo/ws-metering ws
+npm i @aforo/ws-metering ws
 ```
 
-## Usage
+> **Not yet on the public npm registry — install from source for now.** `ws` (`^8`) is an **optional** peer dependency — needed only if you use `wrapServer`. `trackConnection` works with any compatible socket.
 
-### `ws` (standard Node.js)
+```bash
+# from the SDKs repo root
+cd aforo-metering-sdks/node-ws
+npm install
+npm run build          # tsc → dist/
+
+# then, from YOUR app
+npm install /absolute/path/to/aforo-metering-sdks/node-ws
+npm install ws         # only if you use wrapServer
+```
+
+## Quickstart
 
 ```ts
 import { WebSocketServer } from 'ws';
 import { AforoWsBilling } from '@aforo/ws-metering';
 
 const billing = new AforoWsBilling({
-  tenantId: process.env.AFORO_TENANT_ID!,
-  productId: 'prod_ws_market_feed',
+  tenantId: 'tenant_acme',
+  productId: 'prod_ws_001',
   apiKey: process.env.AFORO_API_KEY!,
-  ingestorUrl: 'https://ingestor.aforo.ai',
+  ingestorUrl: 'https://ingest.aforo.ai', // SDK appends /v1/ingest/events
 });
 
 const wss = new WebSocketServer({ port: 8080 });
-
 billing.wrapServer(wss, {
   extractCustomerId: (req) => req.headers['x-customer-id'] as string,
-  extractMetadata: (req) => ({ userAgent: req.headers['user-agent'] }),
 });
 
-wss.on('connection', (ws) => {
-  ws.on('message', (msg) => {
-    ws.send(`echo: ${msg}`);
-  });
-});
+process.on('SIGTERM', async () => { await billing.shutdown(); });
 ```
 
-### Fastify WebSocket / Socket.io / custom
-
-Use the lower-level `trackConnection` directly:
+For frameworks that don't expose a `ws`-style server, track each socket directly:
 
 ```ts
-import { AforoWsBilling } from '@aforo/ws-metering';
-const billing = new AforoWsBilling({ /* ... */ });
-
-fastify.get('/ws', { websocket: true }, (connection, req) => {
-  const customerId = resolveCustomerId(req);
-  if (!customerId) return;
-  billing.trackConnection(connection.socket, { customerId });
-});
+billing.trackConnection(socket, { customerId: 'cust_001', metadata: { feed: 'market' } });
 ```
 
-## Event strategy
+By default the SDK emits two events per connection — `CONNECTION_OPENED` on connect and `CONNECTION_CLOSED` on close (the billing anchor, carrying aggregated sent/recv counts + bytes + duration). The close event uses `metricName: "websocket_api.connection_closed"`; open and per-frame events use `websocket_api.message`. Events ship to `POST https://ingest.aforo.ai/v1/ingest/events` with `Authorization: Bearer <api_key>` and `X-Tenant-Id: <tenant_id>`.
 
-By default the SDK emits **one billing anchor per connection**:
+> **Per-frame metering is off by default.** Set `perFrameEvents: true` to emit one event per inbound and outbound frame — high volume, so size your batching accordingly. With it off, individual frames are still counted and rolled into the `CONNECTION_CLOSED` event.
 
-- `CONNECTION_OPENED` — on upgrade complete, with `messageCount=0, dataBytes=0`
-- `CONNECTION_CLOSED` — on close, with aggregated `messageCount` (sent + received), `dataBytes` (sent + received), `durationMs`, and `wsCloseReason` mapped from the standard close code
+## Configuration
 
-This is the recommended mode for most products — one billing event per connection is sufficient for per-connection-minute or per-message pricing, and avoids flooding the ingestor.
+`new AforoWsBilling(config)` — `tenantId`, `productId`, `apiKey`, and `ingestorUrl` are required.
 
-For per-frame analytics, set `perFrameEvents: true`:
+| Option | Type | Default | What it does |
+|---|---|---|---|
+| `tenantId` | `string` | — (required) | Aforo tenant. Sent as `X-Tenant-Id`. Never read from a client header. |
+| `productId` | `string` | — (required) | Aforo product id; into each event's `metadata.productId`. |
+| `apiKey` | `string` | — (required) | Sent as `Authorization: Bearer <apiKey>`. |
+| `ingestorUrl` | `string` | — (required) | Ingestion base URL. SDK appends `/v1/ingest/events`. Use `https://ingest.aforo.ai`. |
+| `perFrameEvents` | `boolean` | `false` | Emit one event per frame (each direction). Off → frames are aggregated into the close event only. |
+| `flushCount` | `number` | `100` | Buffered events that trigger an immediate flush. Higher default than the base SDK — WS is high-volume. |
+| `flushIntervalMs` | `number` | `3000` | Max ms before a partial batch is flushed. |
+| `onError` | `(error: Error) => void` | logs to `console.error` | Called when a flush fails terminally (after 3 retries). |
 
-```ts
-new AforoWsBilling({ /* ... */, perFrameEvents: true });
-```
+`wrapServer(wss, options)` / `trackConnection(ws, opts)` take the customer resolver:
 
-This emits one event per frame (inbound and outbound) in addition to the open/close anchors — ~10× the event volume but enables per-frame filtering and analytics.
+| Option | Where | Type | What it does |
+|---|---|---|---|
+| `extractCustomerId` | `wrapServer` | `(req) => string \| undefined` | Resolve the customer from the upgrade request. `undefined` → connection is not metered. |
+| `extractMetadata` | `wrapServer` | `(req) => Record<string, unknown> \| undefined` | Optional per-connection tags. |
+| `customerId` | `trackConnection` | `string` | Customer to attribute all traffic on this socket to. |
+| `metadata` | `trackConnection` | `Record<string, unknown>` | Optional per-connection tags. |
 
-## Close reason mapping
+Close codes map to labels via `WS_CLOSE_REASONS` — `1000 → NORMAL_CLOSURE`, `1006 → ABNORMAL_CLOSURE`, `1009 → MESSAGE_TOO_BIG`, `4000 → IDLE_TIMEOUT`, etc. A socket `error` emits a synthetic `CONNECTION_CLOSED` with `wsCloseReason: INTERNAL_ERROR` and `metadata.event: CONNECTION_ERROR`.
 
-Close codes → descriptor enum labels:
+Exported symbols: `AforoWsBilling` (with `wrapServer` / `trackConnection` / `shutdown`), the `WS_CLOSE_REASONS` map, and the `AforoWsConfig` / `WrapServerOptions` types.
 
-| Code | Label |
-|------|-------|
-| 1000 | NORMAL_CLOSURE |
-| 1001 | GOING_AWAY |
-| 1002 | PROTOCOL_ERROR |
-| 1006 | ABNORMAL_CLOSURE |
-| 1008 | POLICY_VIOLATION |
-| 1009 | MESSAGE_TOO_BIG |
-| 1011 | INTERNAL_ERROR |
-| 4000+ | IDLE_TIMEOUT (app-defined range) |
+## Walk me through it
 
-Connections that throw an error (socket error, not clean close) emit a synthetic `CONNECTION_CLOSED` with `wsCloseReason=INTERNAL_ERROR` and `event: CONNECTION_ERROR` in metadata.
+Step-by-step from install to a verified event in Aforo: [USER_GUIDE.md](USER_GUIDE.md).
 
-## Batching & retry
+## What this doesn't cover
 
-Buffers up to 100 events / 3 seconds by default (more aggressive than HTTP SDKs because WebSocket traffic is high-volume). 3× exponential retry, then `onError`.
-
-## License
-
-MIT
+- **`send()` is wrapped by reference.** `trackConnection` reassigns `ws.send` to count outbound frames. If another layer wraps `send` afterward, ordering matters.
+- **No persistent buffer.** Events are in memory until flushed; a hard crash before flush drops the buffered batch. `shutdown()` covers graceful exit only.
+- **Connection identity is per-process.** `wsConnectionId` is a fresh UUID per `trackConnection` call; it does not survive reconnects or correlate across processes.
+- **The SDK does not enforce or read pricing.** It emits usage; rating/billing happens in Aforo.

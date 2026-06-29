@@ -22,7 +22,7 @@
     "crewai",
     "autogen"
   ],
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/aforoai/aforo-metering-sdks.git",

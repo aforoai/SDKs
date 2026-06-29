@@ -1,97 +1,107 @@
-# grpcmetering — Aforo gRPC Metering SDK for Go
+# grpc-metering-go
 
-Server interceptors that meter every RPC call (unary + streaming) and ship billing events to Aforo's usage ingestor.
+Server interceptors that meter every gRPC call — unary and streaming — and ship one billing event per RPC to Aforo. Service, method, gRPC status code, call type, and duration are captured for you; streaming handlers can report exact message counts manually.
+
+**Version:** 1.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+
+Reach for this when you bill a gRPC service per call (or per status/method tier) and want the interceptors to do the counting, with a `Record()` escape hatch for streaming RPCs where you care about the exact number of messages sent.
 
 ## Install
+
+Intended public install once published:
 
 ```bash
 go get github.com/aforo/grpc-metering-go
 ```
 
-Peer dep: `google.golang.org/grpc ^1.60`.
+**Not yet on a public Go module proxy — `go get github.com/aforo/grpc-metering-go` will not resolve yet.** The module path in `go.mod` (`github.com/aforo/grpc-metering-go`) is mid-migration. Until the proxy is live, vendor from source with a local `replace`:
 
-## Usage
+```bash
+git clone https://github.com/aforoai/SDKs.git
+```
+
+```go
+// go.mod (your service)
+require github.com/aforo/grpc-metering-go v1.0.0
+
+replace github.com/aforo/grpc-metering-go => ../SDKs/aforo-metering-sdks/go-grpc
+```
+
+```bash
+go mod tidy
+```
+
+Requires `google.golang.org/grpc` (declared at `v1.60.0` in this module's `go.mod`); the SDK uses `grpc`, `grpc/metadata`, and `grpc/status` only.
+
+## Quickstart
 
 ```go
 package main
 
 import (
-    "context"
-    "log"
-    "net"
-    "os"
+	"context"
+	"log"
+	"net"
+	"os"
 
-    grpcmetering "github.com/aforo/grpc-metering-go"
-    "google.golang.org/grpc"
+	grpcmetering "github.com/aforo/grpc-metering-go"
+	"google.golang.org/grpc"
 )
 
 func main() {
-    billing, err := grpcmetering.New(grpcmetering.Config{
-        TenantID:    "tenant_acme",
-        ProductID:   "prod_grpc_user_svc",
-        APIKey:      os.Getenv("AFORO_API_KEY"),
-        IngestorURL: "https://ingestor.aforo.ai",
-        ServiceName: "acme.v1.UserService",
-    })
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer billing.Shutdown(context.Background())
+	billing, err := grpcmetering.New(grpcmetering.Config{
+		TenantID:    "tenant_acme",
+		ProductID:   "prod_grpc_user_svc",
+		APIKey:      os.Getenv("AFORO_API_KEY"),
+		IngestorURL: "https://ingest.aforo.ai",
+		ServiceName: "acme.v1.UserService",
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer billing.Shutdown(context.Background())
 
-    server := grpc.NewServer(
-        grpc.UnaryInterceptor(billing.UnaryInterceptor()),
-        grpc.StreamInterceptor(billing.StreamInterceptor()),
-    )
-    // pb.RegisterUserServiceServer(server, &userServer{})
+	server := grpc.NewServer(
+		grpc.UnaryInterceptor(billing.UnaryInterceptor()),
+		grpc.StreamInterceptor(billing.StreamInterceptor()),
+	)
+	// pb.RegisterUserServiceServer(server, &userServer{})
 
-    lis, _ := net.Listen("tcp", ":50051")
-    server.Serve(lis)
+	lis, _ := net.Listen("tcp", ":50051")
+	server.Serve(lis)
 }
 ```
 
-## Streaming RPCs — exact message counts
+Each call emits one event with `metricName` `"grpc_api.rpc_calls"`. The customer id comes from the `x-customer-id` gRPC metadata key by default; a call with no customer id is not metered.
 
-Both `UnaryInterceptor` and `StreamInterceptor` emit `messageCount = 1` per call by default — appropriate for unary, but undercounts streaming. For exact counts, call `billing.Record(...)` from inside your handler:
+> ⚠ `UnaryInterceptor` and `StreamInterceptor` both record `messageCount = 1` per call. That's correct for unary but undercounts streaming. If you bill per message, call `Record()` from inside the streaming handler with the real count (see the user guide).
 
-```go
-func (s *server) ListUsers(req *pb.ListReq, stream pb.UserService_ListUsersServer) error {
-    start := time.Now()
-    n := 0
-    for _, u := range users {
-        if err := stream.Send(u); err != nil {
-            return err
-        }
-        n++
-    }
-    billing.Record(stream.Context(), "ListUsers", "SERVER_STREAM", n, nil, time.Since(start).Milliseconds())
-    return nil
-}
-```
+## Configuration
 
-## Customer-ID resolution
+`Config`:
 
-Default extractor reads `x-customer-id` from the gRPC metadata. Override:
+| Option | Type | Default | What it does |
+|---|---|---|---|
+| `TenantID` | `string` | — (required) | Sent as the `X-Tenant-Id` header on every flush and embedded in idempotency keys. Set by you, never from a client header. |
+| `ProductID` | `string` | — (required) | Recorded in event metadata + idempotency keys. |
+| `APIKey` | `string` | — (required) | Sent as `Authorization: Bearer <APIKey>`. |
+| `IngestorURL` | `string` | — (required) | Ingestor base; the SDK appends `/v1/ingest/events`. Use `https://ingest.aforo.ai`. |
+| `ServiceName` | `string` | — (required) | Fully-qualified gRPC service (e.g. `acme.v1.UserService`); recorded as `grpcService`. |
+| `FlushCount` | `int` | `50` | Flush when the buffer reaches this many events. |
+| `FlushInterval` | `time.Duration` | `5s` | Background flush cadence. |
+| `HTTPClient` | `*http.Client` | `&http.Client{Timeout: 10s}` | Override the HTTP client used for flushing. |
+| `CustomerExtractor` | `func(context.Context) string` | reads `x-customer-id` metadata | How a call's customer id is resolved. |
+| `OnError` | `func(error)` | no-op | Called on a marshal failure or a flush that exhausts its 3 retries (events dropped). |
 
-```go
-billing, _ := grpcmetering.New(grpcmetering.Config{
-    // ...
-    CustomerExtractor: func(ctx context.Context) string {
-        md, _ := metadata.FromIncomingContext(ctx)
-        return decodeJWT(md.Get("authorization")[0])
-    },
-})
-```
+`New` returns an error if any of the five required fields is empty.
 
-Calls without a customer ID are not metered.
+## Walk me through it
 
-## Status code mapping
+Step-by-step from install to "I can see the RPC in Aforo" lives in [USER_GUIDE.md](USER_GUIDE.md).
 
-`status.Code()` → descriptor enum: `OK`, `CANCELLED`, `UNKNOWN`, `INVALID_ARGUMENT`, `DEADLINE_EXCEEDED`, `NOT_FOUND`, `ALREADY_EXISTS`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED`, `FAILED_PRECONDITION`, `ABORTED`, `OUT_OF_RANGE`, `UNIMPLEMENTED`, `INTERNAL`, `UNAVAILABLE`, `DATA_LOSS`, `UNAUTHENTICATED`.
+## What this doesn't cover
 
-## Batching & retry
-
-50 events / 5 s defaults. `OnError` callback for terminal flush failures. Call `Shutdown(ctx)` for graceful drain.
-
-## License
-
-MIT
+- **Streaming message counts aren't automatic.** Interceptors emit one event with `messageCount = 1` per stream; per-frame counts require a manual `Record()` from your handler.
+- **No client-side interceptors.** This meters the server. Client-side metering isn't provided.
+- **No delivery guarantee on crash.** Events live in memory until flushed; a hard crash before a flush loses the buffer. `Shutdown(ctx)` drains on graceful exit, bounded by the context.
+- **Customer id from metadata.** Default reads `x-customer-id` — trust it only behind your own auth. Override `CustomerExtractor` to decode a token.

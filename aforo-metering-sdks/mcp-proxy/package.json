@@ -2,7 +2,7 @@
   "name": "@aforo/mcp-proxy",
   "version": "1.0.0",
   "description": "Aforo MCP Transport Proxy — transparent sidecar for metering stdio/SSE/HTTP MCP servers",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "bin": {
     "aforo-mcp-proxy": "./dist/bin/aforo-mcp-proxy.js"
   },
