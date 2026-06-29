@@ -1,11 +1,12 @@
 # Contributing
 
-This repo is the public distribution home for Aforo's metering SDKs and gateway plugins. Each package is self-contained under `aforo-metering-sdks/` or `aforo-gateway-plugins/` and builds/tests independently.
+This repo is the public distribution home for Aforo's metering SDKs and gateway/broker plugins. Each package is self-contained under one of the top-level folders and builds/tests independently.
 
 ## Layout
 
 - `aforo-metering-sdks/<lang>[-<protocol>]/` — one package per language + protocol variant (Node, Python, Java, Go).
-- `aforo-gateway-plugins/<gateway>/` — one folder per gateway plugin, plus `aws-cloudformation/`, `azure-arm-templates/`, and `docs/`.
+- `aforo-gateway-plugins/<gateway>/` — one folder per API gateway plugin, plus `aws-cloudformation/`, `azure-arm-templates/`, and `docs/`.
+- `aforo-emqx-plugin/` — the EMQX MQTT broker metering plugin (Erlang/rebar3).
 
 ## Working on a package
 

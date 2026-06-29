@@ -12,6 +12,7 @@ Meter your product's usage and send it to Aforo for billing — in code with a l
 |---|---|---|
 | Meter from inside your service code | A language SDK + framework middleware | [`aforo-metering-sdks/`](aforo-metering-sdks/) |
 | Meter without touching app code | A gateway plugin (Tier 0) | [`aforo-gateway-plugins/`](aforo-gateway-plugins/) |
+| Meter an MQTT broker (EMQX) | The broker plugin | [`aforo-emqx-plugin/`](aforo-emqx-plugin/) |
 | Meter a GraphQL / gRPC / WebSocket / MQTT surface | A protocol-specific SDK | `aforo-metering-sdks/<lang>-<protocol>/` |
 | Meter AI agents or MCP tool calls | An MCP/agent SDK or the transport proxy | `aforo-metering-sdks/{node-mcp, python-mcp, mcp-proxy, node-agent}` |
 | Send events with no SDK at all | Direct REST `POST /v1/ingest/batch` | See "Common model" below |
@@ -33,7 +34,7 @@ Most teams start with a gateway plugin (no code) or the base SDK for their langu
 
 Base SDKs ship framework middleware (Express/Fastify/Koa, FastAPI/Django/Flask, Spring Boot servlet filter, net/http + Chi). The MCP SDKs wrap your tool handlers to auto-meter tool invocations; the transport proxy meters stdio/SSE MCP servers without code changes.
 
-### `aforo-gateway-plugins/` — API gateway & broker plugins (Tier 0, zero code)
+### `aforo-gateway-plugins/` — API gateway plugins (Tier 0, zero code)
 
 | Gateway | Folder | Artifact |
 |---|---|---|
@@ -42,21 +43,24 @@ Base SDKs ship framework middleware (Express/Fastify/Koa, FastAPI/Django/Flask, 
 | AWS API Gateway | [`aforo-gateway-plugins/aws-lambda`](aforo-gateway-plugins/aws-lambda) | Lambda + SAM template + JWT authorizer |
 | Azure APIM | [`aforo-gateway-plugins/azure-apim`](aforo-gateway-plugins/azure-apim) | Outbound XML/C# policy |
 | MuleSoft | [`aforo-gateway-plugins/mulesoft`](aforo-gateway-plugins/mulesoft) | DataWeave custom policy |
-| EMQX (MQTT broker) | [`aforo-gateway-plugins/emqx`](aforo-gateway-plugins/emqx) | Erlang OTP plugin *(experimental)* |
 
 Plus IaC templates in [`aforo-gateway-plugins/aws-cloudformation`](aforo-gateway-plugins/aws-cloudformation) and [`aforo-gateway-plugins/azure-arm-templates`](aforo-gateway-plugins/azure-arm-templates), and per-gateway deployment notes in [`aforo-gateway-plugins/docs`](aforo-gateway-plugins/docs). All five gateway plugins detect MCP `tools/call` JSON-RPC and meter the tool name + agent id alongside standard HTTP requests.
+
+### `aforo-emqx-plugin/` — MQTT broker plugin *(experimental)*
+
+Broker-level metering for [EMQX](https://www.emqx.io/) 5.x — an Erlang OTP plugin that meters MQTT client connections, publishes, and subscriptions at the broker instead of at an API gateway. See [`aforo-emqx-plugin/README.md`](aforo-emqx-plugin/README.md).
 
 ---
 
 ## Common model
 
-Everything here funnels usage to one place. The SDKs batch events and `POST /v1/ingest/batch`; the gateway plugins do the same from the log/response phase (non-blocking).
+Everything here funnels usage to one place. The SDKs batch events and `POST /v1/ingest/batch`; the gateway and broker plugins do the same from the log/response phase (non-blocking).
 
 - **Endpoint:** `https://ingest.aforo.ai/v1/ingest/batch` (override per environment)
 - **Auth:** `Authorization: Bearer <AFORO_API_KEY>`
 - **Tenant scope:** your tenant id, supplied via SDK config or plugin config — never read from a client-settable request header
 
-Gateway plugins take three values: `aforo_endpoint`, `api_key`, `tenant_id`. Each plugin README shows where to set them for that gateway.
+Gateway/broker plugins take three values: `aforo_endpoint`, `api_key`, `tenant_id`. Each plugin README shows where to set them.
 
 ---
 
@@ -65,7 +69,8 @@ Gateway plugins take three values: `aforo_endpoint`, `api_key`, `tenant_id`. Eac
 ```
 SDKs/
 ├── aforo-metering-sdks/    # language SDKs (Node / Python / Java / Go × base + protocols + MCP/agent)
-├── aforo-gateway-plugins/  # gateway plugins (Kong / Apigee / AWS / Azure / MuleSoft / EMQX) + IaC + docs
+├── aforo-gateway-plugins/  # API gateway plugins (Kong / Apigee / AWS / Azure / MuleSoft) + IaC + docs
+├── aforo-emqx-plugin/      # MQTT broker (EMQX) metering plugin — experimental
 ├── README.md
 ├── LICENSE
 └── CONTRIBUTING.md
