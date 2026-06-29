@@ -1,11 +1,11 @@
 # Contributing
 
-This repo is the public distribution home for Aforo's metering SDKs and gateway plugins. Each package is self-contained under `sdks/` or `plugins/` and builds/tests independently.
+This repo is the public distribution home for Aforo's metering SDKs and gateway plugins. Each package is self-contained under `aforo-metering-sdks/` or `aforo-gateway-plugins/` and builds/tests independently.
 
 ## Layout
 
-- `sdks/<lang>[-<protocol>]/` — one package per language + protocol variant (Node, Python, Java, Go).
-- `plugins/<gateway>/` — one folder per gateway plugin, plus `aws-cloudformation/`, `azure-arm-templates/`, and `docs/`.
+- `aforo-metering-sdks/<lang>[-<protocol>]/` — one package per language + protocol variant (Node, Python, Java, Go).
+- `aforo-gateway-plugins/<gateway>/` — one folder per gateway plugin, plus `aws-cloudformation/`, `azure-arm-templates/`, and `docs/`.
 
 ## Working on a package
 

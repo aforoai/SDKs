@@ -10,10 +10,10 @@ Meter your product's usage and send it to Aforo for billing — in code with a l
 
 | You want to… | Use | Where |
 |---|---|---|
-| Meter from inside your service code | A language SDK + framework middleware | [`sdks/`](sdks/) |
-| Meter without touching app code | A gateway plugin (Tier 0) | [`plugins/`](plugins/) |
-| Meter a GraphQL / gRPC / WebSocket / MQTT surface | A protocol-specific SDK | `sdks/<lang>-<protocol>/` |
-| Meter AI agents or MCP tool calls | An MCP/agent SDK or the transport proxy | `sdks/node-mcp`, `sdks/python-mcp`, `sdks/mcp-proxy`, `sdks/node-agent` |
+| Meter from inside your service code | A language SDK + framework middleware | [`aforo-metering-sdks/`](aforo-metering-sdks/) |
+| Meter without touching app code | A gateway plugin (Tier 0) | [`aforo-gateway-plugins/`](aforo-gateway-plugins/) |
+| Meter a GraphQL / gRPC / WebSocket / MQTT surface | A protocol-specific SDK | `aforo-metering-sdks/<lang>-<protocol>/` |
+| Meter AI agents or MCP tool calls | An MCP/agent SDK or the transport proxy | `aforo-metering-sdks/{node-mcp, python-mcp, mcp-proxy, node-agent}` |
 | Send events with no SDK at all | Direct REST `POST /v1/ingest/batch` | See "Common model" below |
 
 Most teams start with a gateway plugin (no code) or the base SDK for their language, then add protocol/MCP variants as needed.
@@ -22,7 +22,7 @@ Most teams start with a gateway plugin (no code) or the base SDK for their langu
 
 ## What's here
 
-### `sdks/` — language SDKs (24 packages)
+### `aforo-metering-sdks/` — language SDKs (24 packages)
 
 | Language | Base | GraphQL | gRPC | WebSocket | MQTT | MCP | Agent | Proxy (CLI) |
 |---|---|---|---|---|---|---|---|---|
@@ -33,18 +33,18 @@ Most teams start with a gateway plugin (no code) or the base SDK for their langu
 
 Base SDKs ship framework middleware (Express/Fastify/Koa, FastAPI/Django/Flask, Spring Boot servlet filter, net/http + Chi). The MCP SDKs wrap your tool handlers to auto-meter tool invocations; the transport proxy meters stdio/SSE MCP servers without code changes.
 
-### `plugins/` — API gateway & broker plugins (Tier 0, zero code)
+### `aforo-gateway-plugins/` — API gateway & broker plugins (Tier 0, zero code)
 
 | Gateway | Folder | Artifact |
 |---|---|---|
-| Kong | [`plugins/kong`](plugins/kong) | Lua plugin (`.rockspec`) |
-| Apigee | [`plugins/apigee`](plugins/apigee) | Shared-flow bundle (JS callout) |
-| AWS API Gateway | [`plugins/aws-lambda`](plugins/aws-lambda) | Lambda + SAM template + JWT authorizer |
-| Azure APIM | [`plugins/azure-apim`](plugins/azure-apim) | Outbound XML/C# policy |
-| MuleSoft | [`plugins/mulesoft`](plugins/mulesoft) | DataWeave custom policy |
-| EMQX (MQTT broker) | [`plugins/emqx`](plugins/emqx) | Erlang OTP plugin *(experimental)* |
+| Kong | [`aforo-gateway-plugins/kong`](aforo-gateway-plugins/kong) | Lua plugin (`.rockspec`) |
+| Apigee | [`aforo-gateway-plugins/apigee`](aforo-gateway-plugins/apigee) | Shared-flow bundle (JS callout) |
+| AWS API Gateway | [`aforo-gateway-plugins/aws-lambda`](aforo-gateway-plugins/aws-lambda) | Lambda + SAM template + JWT authorizer |
+| Azure APIM | [`aforo-gateway-plugins/azure-apim`](aforo-gateway-plugins/azure-apim) | Outbound XML/C# policy |
+| MuleSoft | [`aforo-gateway-plugins/mulesoft`](aforo-gateway-plugins/mulesoft) | DataWeave custom policy |
+| EMQX (MQTT broker) | [`aforo-gateway-plugins/emqx`](aforo-gateway-plugins/emqx) | Erlang OTP plugin *(experimental)* |
 
-Plus IaC templates in [`plugins/aws-cloudformation`](plugins/aws-cloudformation) and [`plugins/azure-arm-templates`](plugins/azure-arm-templates), and per-gateway deployment notes in [`plugins/docs`](plugins/docs). All five gateway plugins detect MCP `tools/call` JSON-RPC and meter the tool name + agent id alongside standard HTTP requests.
+Plus IaC templates in [`aforo-gateway-plugins/aws-cloudformation`](aforo-gateway-plugins/aws-cloudformation) and [`aforo-gateway-plugins/azure-arm-templates`](aforo-gateway-plugins/azure-arm-templates), and per-gateway deployment notes in [`aforo-gateway-plugins/docs`](aforo-gateway-plugins/docs). All five gateway plugins detect MCP `tools/call` JSON-RPC and meter the tool name + agent id alongside standard HTTP requests.
 
 ---
 
@@ -64,8 +64,8 @@ Gateway plugins take three values: `aforo_endpoint`, `api_key`, `tenant_id`. Eac
 
 ```
 SDKs/
-├── sdks/                  # language SDKs (Node / Python / Java / Go × base + protocols + MCP/agent)
-├── plugins/               # gateway plugins (Kong / Apigee / AWS / Azure / MuleSoft / EMQX) + IaC + docs
+├── aforo-metering-sdks/    # language SDKs (Node / Python / Java / Go × base + protocols + MCP/agent)
+├── aforo-gateway-plugins/  # gateway plugins (Kong / Apigee / AWS / Azure / MuleSoft / EMQX) + IaC + docs
 ├── README.md
 ├── LICENSE
 └── CONTRIBUTING.md
