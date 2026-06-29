@@ -75,6 +75,9 @@ async function setup(perFrameEvents = false): Promise<Fixture> {
     tenantId: 'tenant-int-ws',
     productId: 'prod-int-ws',
     apiKey: 'sk_int_ws',
+    // A final flush during teardown can race the just-closed ingestor server;
+    // that late failure is expected here and must not log after the test ends.
+    onError: () => {},
     ingestorUrl: `http://127.0.0.1:${ingestorPort}/ingest`,
     flushCount: 1,
     flushIntervalMs: 60_000,
@@ -243,6 +246,7 @@ describe('Real-broker integration (ws.WebSocketServer + ws client)', () => {
         tenantId: 'tenant-headers',
         productId: 'prod-headers',
         apiKey: 'sk_header_check',
+        onError: () => {}, // suppress the teardown-race flush failure (see setup())
         ingestorUrl: `http://127.0.0.1:${port}/ingest`,
         flushCount: 1,
       });

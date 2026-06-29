@@ -69,10 +69,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           # Test frameworks the protocol SDKs exercise (superset; harmless if unused).
-          pip install pytest fastapi flask django strawberry-graphql grpcio websockets paho-mqtt aiohttp httpx
+          pip install pytest pytest-asyncio fastapi flask django strawberry-graphql grpcio websockets paho-mqtt aiohttp httpx
           pip install -e .
           python -m compileall -q .
-          python -m pytest -q
+          python -m pytest -q -o asyncio_mode=auto
 
   java:
     name: Java SDKs

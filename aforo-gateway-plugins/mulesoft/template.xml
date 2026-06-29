@@ -57,14 +57,14 @@
                             authentication.clientId default ''
                     ]" />
 
-                <set-payload value='#[output application/json ---
+                <set-payload><![CDATA[#[output application/json ---
                     {
                         "events": [{
                             "customerId": vars.customerId,
                             "metricName": vars.metricName,
                             "quantity": vars.quantity,
                             "idempotencyKey": correlationId,
-                            "occurredAt": now() as String {format: "yyyy-MM-dd'\''T'\''HH:mm:ss.SSS'\''Z'\''"},
+                            "occurredAt": now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"},
                             ("metadata": {
                                 "gateway": "mulesoft",
                                 "method": attributes.method default "UNKNOWN",
@@ -72,12 +72,13 @@
                                 "status": attributes.statusCode default 0,
                                 "latency": 0,
                                 "clientId": authentication.clientId default "",
-                                "apiId": attributes.headers.'\''x-api-id'\'' default "",
+                                "apiId": attributes.headers.'x-api-id' default "",
                                 "version": attributes.version default ""
                             }) if (${include_metadata} default true)
                         }]
                     }
-                ]' />
+                ]
+            ]]></set-payload>
 
                 <!-- Send to Aforo ingestor -->
                 <http:request config-ref="aforo-metering-requester"
