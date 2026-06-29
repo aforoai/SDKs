@@ -27,7 +27,7 @@
     "clean": "rm -rf dist/"
   },
   "dependencies": {
-    "commander": "^12.1.0",
+    "commander": "^15.0.0",
     "eventsource": "^3.0.2"
   },
   "devDependencies": {
