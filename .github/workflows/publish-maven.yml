@@ -46,7 +46,7 @@ jobs:
           gpg-passphrase: MAVEN_GPG_PASSPHRASE
       - name: Deploy to Central
         working-directory: ${{ inputs.module_dir }}
-        run: mvn -B -ntp -DskipTests deploy
+        run: mvn -B -ntp -DskipTests -Prelease deploy
         env:
           MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
           MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}

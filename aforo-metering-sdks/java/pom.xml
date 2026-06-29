@@ -11,7 +11,7 @@
 
     <name>Aforo Metering SDK</name>
     <description>Aforo usage metering SDK for Java — track API usage events with batching, retry, and Spring Boot auto-configuration</description>
-    <url>https://github.com/aforoai/aforo-metering-java</url>
+    <url>https://github.com/aforoai/SDKs</url>
 
     <properties>
         <java.version>17</java.version>
@@ -20,6 +20,28 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
 
+    <licenses>
+        <license>
+            <name>Apache License 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+    <scm>
+        <connection>scm:git:https://github.com/aforoai/SDKs.git</connection>
+        <developerConnection>scm:git:git@github.com:aforoai/SDKs.git</developerConnection>
+        <url>https://github.com/aforoai/SDKs</url>
+        <tag>HEAD</tag>
+    </scm>
+    <developers>
+        <developer>
+            <id>aforo</id>
+            <name>Aforo</name>
+            <email>support@aforo.ai</email>
+            <organization>Aforo</organization>
+            <organizationUrl>https://aforo.ai</organizationUrl>
+        </developer>
+    </developers>
     <dependencies>
         <!-- Servlet API (provided — container supplies it) -->
         <dependency>
@@ -77,4 +99,42 @@
             </plugin>
         </plugins>
     </build>
+    <profiles>
+        <!-- Publishing only: mvn -Prelease deploy. Inactive for build/test. -->
+        <profile>
+            <id>release</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-source-plugin</artifactId>
+                        <version>3.3.1</version>
+                        <executions><execution><id>attach-sources</id><goals><goal>jar-no-fork</goal></goals></execution></executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-javadoc-plugin</artifactId>
+                        <version>3.6.3</version>
+                        <executions><execution><id>attach-javadocs</id><goals><goal>jar</goal></goals></execution></executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-gpg-plugin</artifactId>
+                        <version>3.2.4</version>
+                        <executions><execution><id>sign-artifacts</id><phase>verify</phase><goals><goal>sign</goal></goals></execution></executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.sonatype.central</groupId>
+                        <artifactId>central-publishing-maven-plugin</artifactId>
+                        <version>0.7.0</version>
+                        <extensions>true</extensions>
+                        <configuration>
+                            <publishingServerId>central</publishingServerId>
+                            <autoPublish>true</autoPublish>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>
