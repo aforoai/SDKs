@@ -1,0 +1,176 @@
+name: CI
+
+# Builds and tests every artifact in this repo on each push / PR, so a broken
+# build or malformed config never reaches a developer who clones a package.
+# Mirrors the local verification matrix: Go / Node / Python / Java SDKs build +
+# test; Kong (LuaJIT) and EMQX (Erlang) compile; every gateway config file is
+# validated as well-formed XML / YAML / JSON.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go SDKs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: build + vet + test
+        run: |
+          set -e
+          for d in go go-graphql go-grpc go-ws go-mqtt; do
+            echo "::group::$d"
+            (cd "aforo-metering-sdks/$d" && go build ./... && go vet ./... && go test ./...)
+            echo "::endgroup::"
+          done
+
+  node:
+    name: Node SDKs
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pkg: [node, node-agent, node-mcp, mcp-proxy, node-graphql, node-grpc, node-ws, node-mqtt]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: install + build + test
+        working-directory: aforo-metering-sdks/${{ matrix.pkg }}
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+          npm test
+
+  python:
+    name: Python SDKs
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pkg: [python, python-mcp, python-graphql, python-grpc, python-ws, python-mqtt]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: install + compile + test
+        working-directory: aforo-metering-sdks/${{ matrix.pkg }}
+        run: |
+          python -m pip install --upgrade pip
+          # Test frameworks the protocol SDKs exercise (superset; harmless if unused).
+          pip install pytest fastapi flask django strawberry-graphql grpcio websockets paho-mqtt aiohttp httpx
+          pip install -e .
+          python -m compileall -q .
+          python -m pytest -q
+
+  java:
+    name: Java SDKs
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [java, java-graphql, java-grpc, java-ws, java-mqtt]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: compile + test
+        working-directory: aforo-metering-sdks/${{ matrix.module }}
+        run: mvn -B -ntp clean test
+
+  kong-lua:
+    name: Kong plugin (LuaJIT parse)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install LuaJIT
+        run: sudo apt-get update && sudo apt-get install -y luajit
+      - name: parse-check every Lua file (Kong runs on LuaJIT)
+        working-directory: aforo-gateway-plugins/kong
+        run: |
+          set -e
+          shopt -s globstar nullglob
+          for f in **/*.lua; do
+            echo "luajit -b $f"
+            luajit -b "$f" /dev/null
+          done
+
+  emqx-erlang:
+    name: EMQX plugin (rebar3 compile)
+    runs-on: ubuntu-latest
+    # Informational: a standalone EMQX plugin build may need the EMQX umbrella to
+    # resolve the `emqx` dep. Keep it visible without blocking the gate.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '26'
+          rebar3-version: '3'
+      - name: rebar3 compile
+        working-directory: aforo-emqx-plugin
+        run: rebar3 compile
+
+  gateway-config:
+    name: Gateway config validation (XML / YAML / JSON)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install pyyaml
+      - name: validate every XML / YAML / JSON under gateway plugins + IaC
+        run: |
+          python - <<'PY'
+          import sys, glob, json, xml.dom.minidom, yaml
+          fail = 0
+
+          class Tolerant(yaml.SafeLoader):
+              pass
+          # CloudFormation / SAM intrinsic tags (!Ref, !GetAtt, ...) are valid YAML extensions.
+          Tolerant.add_multi_constructor('!', lambda loader, suffix, node: None)
+
+          roots = ['aforo-gateway-plugins/**', 'aforo-emqx-plugin/**']
+          for pat in roots:
+              for f in glob.glob(pat + '/*.xml', recursive=True) + glob.glob(pat, recursive=True):
+                  pass
+
+          def check(path, kind):
+              global fail
+              try:
+                  if kind == 'xml':
+                      xml.dom.minidom.parse(path)
+                  elif kind == 'json':
+                      json.load(open(path))
+                  elif kind == 'yaml':
+                      list(yaml.load_all(open(path), Loader=Tolerant))
+                  print(f"OK   {path}")
+              except Exception as e:
+                  print(f"FAIL {path}: {e}")
+                  fail += 1
+
+          for base in ('aforo-gateway-plugins', 'aforo-emqx-plugin'):
+              for path in glob.glob(f'{base}/**/*.xml', recursive=True):
+                  check(path, 'xml')
+              for path in glob.glob(f'{base}/**/*.json', recursive=True):
+                  check(path, 'json')
+              for path in glob.glob(f'{base}/**/*.yaml', recursive=True) + glob.glob(f'{base}/**/*.yml', recursive=True):
+                  check(path, 'yaml')
+
+          sys.exit(1 if fail else 0)
+          PY
