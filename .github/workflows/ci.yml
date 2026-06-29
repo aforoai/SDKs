@@ -174,3 +174,23 @@ jobs:
 
           sys.exit(1 if fail else 0)
           PY
+
+  ci-success:
+    name: CI success
+    # One stable check to require in branch protection — green only if every
+    # blocking job above passed. (emqx-erlang is informational, not required.)
+    if: always()
+    needs: [go, node, python, java, kong-lua, gateway-config]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required jobs succeeded
+        run: |
+          results="${{ join(needs.*.result, ' ') }}"
+          echo "Job results: $results"
+          for r in $results; do
+            if [ "$r" != "success" ]; then
+              echo "::error::A required CI job did not succeed ($r)."
+              exit 1
+            fi
+          done
+          echo "All required CI jobs passed."
