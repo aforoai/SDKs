@@ -136,6 +136,16 @@ git tag aforo-metering-sdks/go/v1.0.0 && git push origin aforo-metering-sdks/go/
 The `gh workflow run` calls are `workflow_dispatch`-only, so a publish happens
 **only** when explicitly triggered — a mistagged push never auto-publishes.
 
+### After a registry goes live — flip the docs flag
+
+docs.aforo.ai shows install-from-source until a registry is live. When you've
+published to one, flip its flag in the **docs** repo
+(`aforo-nextgen-main-documentation-app`,
+`components/docs-content/sdk-library.tsx` → the `PUBLISHED` map) from `false` to
+`true` and push — that single line swaps the page from "build from source" to the
+plain `npm i` / `pip install` / Maven / `go get` command. Flip `go` once the
+first Go module tag is pushed.
+
 ### Artifacts to loop through
 
 - **8 npm**: `node, node-agent, node-mcp, mcp-proxy, node-graphql, node-grpc, node-ws, node-mqtt`
@@ -162,3 +172,5 @@ pre-release (npm `--tag next`, a PyPI pre-release version, etc.).
 - [ ] Registry namespaces claimed + secrets/OIDC configured — Steps B/C/D
 - [ ] `@aforoai/sdk-maintainers` team has members — Step E
 - [ ] Customer docs on docs.aforo.ai published, then announce
+- [ ] After each registry goes live, flip its `PUBLISHED` flag in the docs repo
+      (`sdk-library.tsx`) so the page shows the package-manager command
