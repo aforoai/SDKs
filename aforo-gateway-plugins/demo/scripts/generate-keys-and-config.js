@@ -17,14 +17,45 @@ const path = require('path');
 
 const ROOT = path.join(__dirname, '..');
 
+/*
+ * docker compose reads .env automatically; this reads the same file so the two
+ * cannot drift. Getting that wrong is not cosmetic -- the page would point at
+ * whatever else is listening on :8000 and every call would fail with a CORS
+ * error that has nothing to do with CORS.
+ */
+function loadDotEnv() {
+  const file = path.join(ROOT, '.env');
+  if (!fs.existsSync(file)) return {};
+  return Object.fromEntries(
+    fs.readFileSync(file, 'utf8')
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith('#') && l.includes('='))
+      .map((l) => {
+        const i = l.indexOf('=');
+        return [l.slice(0, i).trim(), l.slice(i + 1).trim()];
+      })
+  );
+}
+
+const dotenv = loadDotEnv();
+const env = (name, fallback) => process.env[name] || dotenv[name] || fallback;
+
+const KONG_PORT = env('KONG_PROXY_PORT', '8000');
+const INGESTOR_PORT = env('INGESTOR_PORT', '8084');
+
 const CONFIG = {
   issuer: 'https://auth.aforo.ai',
-  tenantId: process.env.DEMO_TENANT_ID || 'test-tenant',
-  customerId: process.env.DEMO_CUSTOMER_ID || 'test-customer',
-  keyId: process.env.DEMO_KEY_ID || 'b0fd7c72-9a29-465c-904d-1528ccd97f25',
-  subscriptionId: process.env.DEMO_SUBSCRIPTION_ID || '444fa303-ca2d-4fdd-9576-a120e1c6be72',
-  aforoEndpoint: process.env.DEMO_AFORO_ENDPOINT || 'http://host.docker.internal:8084/v1/ingest/batch',
-  upstream: process.env.DEMO_UPSTREAM || 'http://suchith-backend:9000',
+  tenantId: env('DEMO_TENANT_ID', 'test-tenant'),
+  customerId: env('DEMO_CUSTOMER_ID', 'test-customer'),
+  teamId: env('DEMO_TEAM_ID', 'team-001'),
+  keyId: env('DEMO_KEY_ID', 'b0fd7c72-9a29-465c-904d-1528ccd97f25'),
+  subscriptionId: env('DEMO_SUBSCRIPTION_ID', '444fa303-ca2d-4fdd-9576-a120e1c6be72'),
+  aforoEndpoint: env('DEMO_AFORO_ENDPOINT', `http://host.docker.internal:${INGESTOR_PORT}/v1/ingest/batch`),
+  upstream: env('DEMO_UPSTREAM', 'http://suchith-backend:9000'),
+  // Browser-facing URLs. The page reads these instead of hardcoding a port.
+  kongUrl: env('DEMO_KONG_URL', `http://localhost:${KONG_PORT}`),
+  ingestorUrl: env('DEMO_INGESTOR_URL', `http://localhost:${INGESTOR_PORT}`),
 };
 
 const b64url = (buf) =>
@@ -85,6 +116,21 @@ services:
         paths: ["/api"]
         strip_path: false
     plugins:
+      # MUST come before aforo-metering. Kong's cors plugin runs at priority
+      # ~2000 while aforo-metering runs at 5, so cors handles the OPTIONS
+      # preflight and short-circuits first. Without it the demo breaks twice
+      # over in a browser: preflight requests carry no Authorization header, so
+      # JWT validation 401s them and POST /api/orders can never succeed; and
+      # Kong's own 401s carry no CORS headers, so a rejected token surfaces as
+      # an opaque network error instead of the clean 401 this demo exists to
+      # show.
+      - name: cors
+        config:
+          origins: ["*"]
+          methods: ["GET", "POST", "OPTIONS"]
+          headers: ["Authorization", "Content-Type"]
+          credentials: false
+          preflight_continue: false
       - name: aforo-metering
         config:
           tenant_id: ${CONFIG.tenantId}

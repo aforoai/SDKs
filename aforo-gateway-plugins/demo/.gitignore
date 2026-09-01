@@ -2,3 +2,4 @@ kong/kong.yml
 nirmala-frontend/tokens.json
 scripts/.tokens.json
 suchith-backend/node_modules/
+.env

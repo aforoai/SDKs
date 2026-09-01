@@ -110,9 +110,13 @@
 </main>
 
 <script>
-const KONG     = 'http://localhost:8000';
-const INGESTOR = 'http://localhost:8084';
+/* Filled in from tokens.json, which the generator writes from .env — so the
+   page always points at the Kong the compose stack actually published. The
+   previous hardcoded :8000 silently aimed at whatever else was listening there,
+   and every call failed with a CORS error that had nothing to do with CORS. */
+let KONG = null, INGESTOR = null;
 let TOKENS = null, TENANT = 'test-tenant', TEAM = 'team-001';
+let READY = false;
 
 const $ = (id) => document.getElementById(id);
 const now = () => new Date().toLocaleTimeString();
@@ -138,10 +142,22 @@ function authHeader() {
 /* Every call goes through Kong. Kong verifies the JWT, injects the verified
    identity downstream, and meters the request in its log phase. */
 async function callKong(path, options = {}) {
-  const res = await fetch(KONG + path, {
-    ...options,
-    headers: { 'Content-Type': 'application/json', ...authHeader(), ...(options.headers || {}) },
-  });
+  if (!READY) { log('config not loaded yet — is tokens.json present?', 't-bad'); return { status: 0, body: null }; }
+  let res;
+  try {
+    res = await fetch(KONG + path, {
+      ...options,
+      headers: { 'Content-Type': 'application/json', ...authHeader(), ...(options.headers || {}) },
+    });
+  } catch (e) {
+    // A thrown fetch is a transport/CORS failure, not an HTTP status. Say so
+    // plainly instead of letting it surface as an unhandled rejection.
+    banner(`<b>Could not reach Kong at <code>${KONG}</code>.</b> ${e.message}. ` +
+           `Check the stack is up and that KONG_PROXY_PORT in .env matches the published port.`, 'bad');
+    log(`${options.method || 'GET'} ${path} &rarr; network error`, 't-bad');
+    $('raw').textContent = `Network error calling ${KONG}${path}\n\n${e.message}`;
+    return { status: 0, body: null };
+  }
   const text = await res.text();
   let body; try { body = JSON.parse(text); } catch { body = text; }
   $('raw').textContent = `HTTP ${res.status}\n\n` + (typeof body === 'string' ? body : JSON.stringify(body, null, 2));
@@ -194,9 +210,19 @@ $('persona').onchange = () => { banner('', null); log(`token switched to "${$('p
    directly. Kong does NOT block on budget: metering happens in the log phase,
    after the response is already sent. See README. */
 async function loadBudget() {
+  if (!READY) return;
   try {
     const res = await fetch(`${INGESTOR}/v1/budget/status?teamId=${encodeURIComponent(TEAM)}`,
                             { headers: { 'X-Tenant-Id': TENANT } });
+    if (res.status === 403) {
+      // Almost always the origin, not auth: the ingestor allow-lists specific
+      // origins and :3000 is the one that ships in its defaults.
+      $('budgetBody').innerHTML =
+        `<span class="sub">Ingestor returned <b>403</b> for origin <code>${location.origin}</code>.<br><br>` +
+        `Serve this page on <code>:3000</code>, or add this origin to the ingestor's ` +
+        `<code>CORS_ALLOWED_ORIGINS</code> and restart it.</span>`;
+      return;
+    }
     if (!res.ok) { $('budgetBody').innerHTML = `<span class="sub">Ingestor returned HTTP ${res.status}</span>`; return; }
     const env = await res.json();
     const d = env.data || env;
@@ -219,16 +245,27 @@ async function loadBudget() {
              `Kong keeps serving traffic — see the README on why enforcement is not inline.`, 'bad');
     }
   } catch (e) {
-    $('budgetBody').innerHTML = `<span class="sub">Could not reach the ingestor on :8084 — ${e.message}</span>`;
+    $('budgetBody').innerHTML =
+      `<span class="sub">Could not reach the ingestor at <code>${INGESTOR}</code> — ${e.message}.<br><br>` +
+      `If the page is not on <code>:3000</code>, this is usually the ingestor's ` +
+      `<code>CORS_ALLOWED_ORIGINS</code> rejecting <code>${location.origin}</code>.</span>`;
   }
 }
 
 fetch('tokens.json').then((r) => r.json()).then((t) => {
   TOKENS = t;
   TENANT = t.config.tenantId;
-  log(`loaded demo tokens — customer <b>${t.config.customerId}</b>, key_id <b>${t.config.keyId.slice(0, 8)}…</b>`);
+  TEAM = t.config.teamId || TEAM;
+  KONG = t.config.kongUrl;
+  INGESTOR = t.config.ingestorUrl;
+  READY = true;
+  log(`config loaded — Kong <b>${KONG}</b>, ingestor <b>${INGESTOR}</b>`);
+  log(`customer <b>${t.config.customerId}</b>, team <b>${TEAM}</b>, key_id <b>${t.config.keyId.slice(0, 8)}…</b>`);
   loadBudget();
-}).catch(() => log('tokens.json missing — run scripts/generate-keys-and-config.js', 't-bad'));
+}).catch(() => {
+  banner('<b>tokens.json missing.</b> Run <code>node scripts/generate-keys-and-config.js</code>, then reload.', 'bad');
+  log('tokens.json missing — run scripts/generate-keys-and-config.js', 't-bad');
+});
 
 setInterval(loadBudget, 10000);
 </script>

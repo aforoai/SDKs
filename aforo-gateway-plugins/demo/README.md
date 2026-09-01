@@ -31,16 +31,29 @@ unattributed, and the budget panel stays empty.
 ## Run it
 
 ```bash
+cp .env.example .env                       # optional, but read the port notes in it
 node scripts/generate-keys-and-config.js   # fresh RSA keypair + tokens + kong.yml
 docker compose up --build
 open http://localhost:3000
 ```
 
-Ports 8000/8001/3000 already busy?
+### Changing ports
+
+`docker compose` and the generator both read `.env`, so set ports **there** rather than
+inline — otherwise the page and the gateway disagree about which port Kong is on, and every
+call fails with a CORS error that has nothing to do with CORS.
 
 ```bash
-KONG_PROXY_PORT=8010 KONG_ADMIN_PORT=8011 FRONTEND_PORT=3010 docker compose up --build
+printf 'KONG_PROXY_PORT=8010\nKONG_ADMIN_PORT=8011\nFRONTEND_PORT=3010\n' >> .env
+node scripts/generate-keys-and-config.js   # re-run so tokens.json picks up the new URL
+docker compose up --build
 ```
+
+One caveat on `FRONTEND_PORT`: the budget panel calls the ingestor directly, and the
+ingestor allow-lists origins (`:3000`, `:3001`, `:5174`, `:5175` by default). On any other
+port products still load — those go through Kong, which allows all origins — but the budget
+panel shows a 403 until you add the origin to the ingestor's `CORS_ALLOWED_ORIGINS`. The
+panel says so on screen rather than failing silently.
 
 Then walk the flow, or run it non-interactively:
 
@@ -97,12 +110,33 @@ demo/
 ├── docker-compose.yml            Kong + backend + frontend
 ├── suchith-backend/              Express API, no metering code
 ├── nirmala-frontend/             static page: products, orders, budget panel
-├── kong/kong.yml                 GENERATED — service, route, plugin config
+├── .env.example                  ports + demo identity; copy to .env
+├── kong/kong.yml                 GENERATED — cors + aforo-metering config
 └── scripts/
     ├── generate-keys-and-config.js   keypair + tokens + kong.yml
     ├── set-budget.sh                 set/clear the team budget
     └── test-flow.sh                  8-step end-to-end check
 ```
+
+## CORS
+
+Kong's bundled `cors` plugin is enabled ahead of `aforo-metering` in the generated config,
+and it is load-bearing for two reasons that are easy to miss:
+
+- **Preflight.** Browsers send `OPTIONS` with **no** `Authorization` header. With only
+  `aforo-metering` in the chain, JWT validation rejects the preflight with `401` and
+  `POST /api/orders` can never succeed from a browser — while `curl` works fine, because
+  curl sends no preflight.
+- **Errors need CORS headers too.** Kong's own `401` responses carry none by default, so a
+  rejected token surfaces in the browser as an opaque network failure instead of the clean
+  `401` this demo exists to show.
+
+Ordering matters: `cors` runs at priority ~2000, `aforo-metering` at 5, so `cors` handles
+the preflight and short-circuits first.
+
+Suchith's backend also sets permissive CORS headers, which covers requests that reach it.
+Both layers are needed: the backend cannot add headers to a response Kong generated on
+its own.
 
 ## Notes
 
