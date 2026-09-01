@@ -85,35 +85,50 @@ end
 -- Full RS256 signature verification requires the lua-resty-jwt library.
 --   Kong Enterprise: use the native JWT plugin with JWKS URI instead of
 --                    this plugin's built-in validation.
---   Kong OSS:        install lua-resty-jwt via LuaRocks and uncomment the
---                    resty_jwt.verify_jwt_obj() call below.
+--   Kong OSS:        install lua-resty-jwt via LuaRocks and set jwt_public_key.
 --
--- Current status: claims-based checks (exp, iss, jti blocklist, client revocation)
--- are always enforced.  Crypto signature verification is gated on lua-resty-jwt
--- availability so that teams on Kong OSS can opt-in when ready.
+-- FAIL-CLOSED (2026-09-01 security fix). This function previously returned true
+-- both when lua-resty-jwt was missing AND when no jwt_public_key was configured,
+-- so a default Kong OSS install could run jwt_validation_enabled=true while never
+-- verifying a single signature. exp / iss / jti / key_id are all read from the
+-- token payload, and that payload is only trustworthy once the signature is
+-- checked -- so an unverified token let any caller mint their own JWT naming an
+-- arbitrary customer_id + tenant_id and receive authorized, correctly-attributed
+-- access: free API usage, billed to somebody else.
+--
+-- Signature verification is now mandatory whenever jwt_validation_enabled=true.
+-- Operators who deliberately terminate JWT verification upstream (Kong Enterprise
+-- native JWT plugin, a service mesh, an external authorizer) opt out via
+-- jwt_allow_unverified_signature=true: explicit, defaulting to false, and logged
+-- at ERROR on every unverified path so the posture is never silent.
 local function verify_rs256_signature(token, conf)
+    local allow_unverified = conf.jwt_allow_unverified_signature == true
+
     local ok, resty_jwt = pcall(require, "resty.jwt")
     if not ok then
-        -- Library not available — log a startup-level warning once and skip.
-        kong.log.warn("[aforo-metering] lua-resty-jwt not found; RS256 signature NOT verified. ",
-            "Install via LuaRocks or use Kong Enterprise's native JWT plugin.")
-        return true  -- fail-open on missing library
+        kong.log.err("[aforo-metering] lua-resty-jwt not found -- RS256 signature CANNOT be verified. ",
+            "Install it via LuaRocks, or use Kong Enterprise's native JWT plugin. ",
+            "Set jwt_allow_unverified_signature=true only if signatures are verified upstream.")
+        return allow_unverified
     end
 
-    -- When lua-resty-jwt is installed, perform full RS256 verification via JWKS.
-    -- The public key must be pre-fetched and cached (below is a minimal inline
-    -- example; production deployments should use resty_jwt with a JWKS fetcher).
     local jwt_obj = resty_jwt:load_jwt(token)
     if not jwt_obj or not jwt_obj.valid then
         return false
     end
-    -- NOTE: Provide `conf.jwt_public_key` (PEM) for offline verification,
-    -- or integrate a JWKS fetcher that resolves `conf.jwt_jwks_uri` → kid → PEM.
-    if conf.jwt_public_key then
+
+    if conf.jwt_public_key and conf.jwt_public_key ~= "" then
         local verified = resty_jwt:verify_jwt_obj(conf.jwt_public_key, jwt_obj)
-        return verified.verified
+        return verified ~= nil and verified.verified == true
     end
-    return true  -- no public key configured — skip crypto check
+
+    -- jwt_jwks_uri is declared in schema.lua but no JWKS fetcher is implemented,
+    -- so a JWKS-only configuration verifies nothing. Treat that as unverified
+    -- rather than silently trusting the token.
+    kong.log.err("[aforo-metering] No jwt_public_key configured -- RS256 signature CANNOT be verified ",
+        "(jwt_jwks_uri is declared but not yet implemented). Set jwt_public_key to the issuer's PEM public key. ",
+        "Set jwt_allow_unverified_signature=true only if signatures are verified upstream.")
+    return allow_unverified
 end
 
 -- Main JWT validation entry point.
@@ -329,8 +344,49 @@ local function flush_buffer(premature, conf)
         end
     end
 
-    kong.log.err("[aforo-metering] All ", max_retries, " flush attempts failed. ",
-        #events, " events dropped.")
+    -- Re-buffer instead of dropping (2026-09-01 fix).
+    -- The buffer is cleared before the first attempt, so an ingestor outage
+    -- outlasting 3 retries used to destroy the only copy of these events:
+    -- unbilled usage, no dead-letter, nothing to reconstruct from. Push them
+    -- back so a later flush retries them.
+    --
+    -- Ordering: failed events are older than anything buffered during the
+    -- attempt, so they go in front. On overflow we keep the OLDEST and drop the
+    -- newest, because the oldest are the ones closest to falling outside the
+    -- ingestor's 90-day occurredAt acceptance window -- and losing recent events
+    -- is recoverable from upstream logs far more often than losing old ones.
+    local pending_json = dict:get(BUFFER_KEY)
+    if pending_json then
+        local pending = cjson.decode(pending_json)
+        if pending then
+            for i = 1, #pending do
+                events[#events + 1] = pending[i]
+            end
+        end
+    end
+
+    local dropped = 0
+    if #events > MAX_BUFFER_SIZE then
+        dropped = #events - MAX_BUFFER_SIZE
+        local trimmed = {}
+        for i = 1, MAX_BUFFER_SIZE do
+            trimmed[i] = events[i]
+        end
+        events = trimmed
+    end
+
+    dict:set(BUFFER_KEY, cjson.encode(events))
+    dict:set(BUFFER_COUNT_KEY, #events)
+
+    if dropped > 0 then
+        kong.log.err("[aforo-metering] All ", max_retries, " flush attempts failed. ",
+            #events, " events re-buffered for retry; ", dropped,
+            " dropped (buffer at MAX_BUFFER_SIZE=", MAX_BUFFER_SIZE,
+            "). Raise lua_shared_dict aforo_buffer if this recurs.")
+    else
+        kong.log.err("[aforo-metering] All ", max_retries, " flush attempts failed. ",
+            #events, " events re-buffered for retry on the next flush.")
+    end
 end
 
 -- ────────────────────────────────────────────────────────────
@@ -504,6 +560,29 @@ function AforoMeteringHandler:log(conf)
             route         = route_name,
             consumer      = consumer_name,
         }
+    end
+
+    -- Billing-hierarchy identity (2026-09-01 fix).
+    -- usage-ingestor's BillingHierarchyEnricher resolves team / member /
+    -- subscription for an event from an identity carried in metadata. Until now
+    -- this plugin emitted none, so every gateway-metered event reached the
+    -- ingestor unattributed: teamId stayed null, and because budget enforcement
+    -- is gated on a non-null teamId, team budgets were silently never enforced
+    -- for gateway traffic.
+    --
+    -- key_id is the JWT's Aforo API-key id (UUID). It is deliberately NOT the
+    -- same value as keyHash (SHA-256 hex of the raw key) which the enricher's
+    -- older :apikey: index is built on -- the gateway never sees the raw key, so
+    -- it cannot compute that hash. The ingestor therefore maintains a parallel
+    -- :keyid: index; see BillingHierarchySyncJob.
+    --
+    -- Set outside the include_metadata block on purpose: include_metadata=false
+    -- turns off *diagnostic* metadata, and must not silently disable billing
+    -- attribution.
+    local jwt_claims = kong.ctx.shared and kong.ctx.shared.aforo_jwt_claims
+    if jwt_claims and jwt_claims.key_id and jwt_claims.key_id ~= "" then
+        event.metadata = event.metadata or {}
+        event.metadata.keyId = jwt_claims.key_id
     end
 
     -- Buffer the event

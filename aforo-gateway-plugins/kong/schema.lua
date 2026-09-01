@@ -139,6 +139,13 @@ return {
                             description = "PEM-encoded RSA public key for offline RS256 verification. Alternative to jwt_jwks_uri for static key setups.",
                         },
                     },
+                    {
+                        jwt_allow_unverified_signature = {
+                            type = "boolean",
+                            default = false,
+                            description = "DANGEROUS. Accept JWTs whose RS256 signature could not be verified (lua-resty-jwt missing, or no jwt_public_key set). Defaults to false: unverifiable tokens are rejected. Enable ONLY when signatures are already verified upstream (Kong Enterprise native JWT plugin, service mesh, external authorizer). With this true and no verification upstream, any caller can mint a token naming any customer_id/tenant_id.",
+                        },
+                    },
                     -- Redis host/port are shared with rate-limit enforcement above.
                     -- jwt_validation uses rate_limit_redis_host / rate_limit_redis_port.
                     -- Add dedicated jwt_redis_host/jwt_redis_port below only if the
