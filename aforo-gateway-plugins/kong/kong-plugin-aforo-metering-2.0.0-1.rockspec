@@ -20,12 +20,24 @@ description = {
 dependencies = {
     "lua >= 5.1",
     "lua-resty-http >= 0.17",
+    -- Required for RS256 signature verification. The plugin rejects tokens it
+    -- cannot verify, so without this library any JWT-validating route fails
+    -- closed (see verify_rs256_signature in handler.lua).
+    "lua-resty-jwt >= 0.2.3",
 }
 
 build = {
     type = "builtin",
+    -- Every module handler.lua pulls in must be installed, not just the two
+    -- Kong looks up by name. Shipping only handler + schema left the siblings
+    -- absent from the rock entirely, so no require path could have resolved
+    -- them and the plugin failed to load.
     modules = {
-        ["kong.plugins.aforo-metering.handler"] = "handler.lua",
-        ["kong.plugins.aforo-metering.schema"]  = "schema.lua",
+        ["kong.plugins.aforo-metering.handler"]            = "handler.lua",
+        ["kong.plugins.aforo-metering.schema"]             = "schema.lua",
+        ["kong.plugins.aforo-metering.rate-limit-enforce"] = "rate-limit-enforce.lua",
+        ["kong.plugins.aforo-metering.margin-guard"]       = "margin-guard.lua",
+        ["kong.plugins.aforo-metering.preflight-quota"]    = "preflight-quota.lua",
+        ["kong.plugins.aforo-metering.compound-metering"]  = "compound-metering.lua",
     },
 }

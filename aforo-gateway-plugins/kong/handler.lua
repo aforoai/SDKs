@@ -11,8 +11,28 @@
 
 local http = require("resty.http")
 local cjson = require("cjson.safe")
-local rate_limit = require("rate-limit-enforce")
-local margin_guard = require("margin-guard")
+-- Sibling plugin modules.
+--
+-- These were previously required by bare filename, which resolves only when the
+-- process happens to have this directory on package.path. Under a real Kong
+-- install it does not, so the plugin died at load with
+-- "module 'rate-limit-enforce' not found" and never registered.
+--
+-- Installed via the rockspec, the siblings live at
+-- kong.plugins.aforo-metering.*; running busted from this source directory they
+-- resolve as bare filenames (the repo keeps the .lua files flat rather than in a
+-- kong/plugins/aforo-metering/ tree). Try the installed path first and fall back
+-- to the source-tree name so the one file works in both.
+local function require_sibling(name)
+    local ok, mod = pcall(require, "kong.plugins.aforo-metering." .. name)
+    if ok then
+        return mod
+    end
+    return require(name)
+end
+
+local rate_limit = require_sibling("rate-limit-enforce")
+local margin_guard = require_sibling("margin-guard")
 
 -- ────────────────────────────────────────────────────────────
 -- JWT Validation helpers
