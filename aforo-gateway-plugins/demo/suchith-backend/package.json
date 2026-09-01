@@ -1,0 +1,8 @@
+{
+  "name": "suchith-sms-backend",
+  "version": "1.0.0",
+  "description": "Demo upstream API sitting behind Kong + the Aforo metering plugin",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "dependencies": { "express": "^4.19.2" }
+}

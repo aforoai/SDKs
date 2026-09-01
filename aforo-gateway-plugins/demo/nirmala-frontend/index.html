@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Nirmala's App — Aforo Metering Demo</title>
+<style>
+  :root {
+    --bg:#f6f7f9; --card:#fff; --ink:#16191d; --muted:#5b6572;
+    --line:#e3e6ea; --accent:#2f6feb; --ok:#0f7b46; --warn:#9a6200; --bad:#b3261e;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  header { background:var(--card); border-bottom:1px solid var(--line); padding:14px 20px;
+           display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  h1 { font-size:16px; margin:0; font-weight:650; }
+  .sub { color:var(--muted); font-size:12px; }
+  main { max-width:1100px; margin:20px auto; padding:0 20px;
+         display:grid; grid-template-columns:1fr 320px; gap:20px; align-items:start; }
+  @media (max-width:820px){ main { grid-template-columns:1fr; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.04em;
+             color:var(--muted); margin:0 0 12px; font-weight:600; }
+  button { font:inherit; border:1px solid var(--line); background:var(--card); color:var(--ink);
+           padding:7px 12px; border-radius:7px; cursor:pointer; }
+  button:hover { border-color:#c8ccd2; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  select { font:inherit; padding:6px 8px; border-radius:7px; border:1px solid var(--line); background:var(--card); color:var(--ink); }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .product { display:flex; justify-content:space-between; align-items:center;
+             padding:10px 0; border-bottom:1px solid var(--line); }
+  .product:last-child { border-bottom:0; }
+  .price { font-variant-numeric:tabular-nums; color:var(--muted); }
+  .meter { height:8px; background:var(--line); border-radius:99px; overflow:hidden; margin:8px 0 4px; }
+  .meter > i { display:block; height:100%; background:var(--ok); transition:width .3s; }
+  .meter.warn > i { background:var(--warn); } .meter.bad > i { background:var(--bad); }
+  .kv { display:flex; justify-content:space-between; font-size:12px; color:var(--muted); padding:3px 0; }
+  .kv b { color:var(--ink); font-weight:600; font-variant-numeric:tabular-nums; }
+  pre { background:#0f1216; color:#d7dde5; padding:10px; border-radius:7px;
+        overflow:auto; max-height:230px; font-size:11.5px; margin:0; }
+  .log { font-size:11.5px; max-height:230px; overflow:auto; }
+  .log div { padding:4px 0; border-bottom:1px solid var(--line); }
+  .t-ok{color:var(--ok);} .t-bad{color:var(--bad);} .t-warn{color:var(--warn);} .t-muted{color:var(--muted);}
+  .banner { padding:10px 12px; border-radius:8px; margin-bottom:12px; display:none; font-size:13px; }
+  .banner.show { display:block; }
+  .banner.bad { background:#fdecea; color:var(--bad); border:1px solid #f5c6c2; }
+  .banner.warn{ background:#fff6e5; color:var(--warn); border:1px solid #f2dcb3; }
+  code { font-size:12px; background:var(--bg); padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Nirmala's App</h1>
+  <span class="sub">calls Suchith's API through Kong &rarr; metered by Aforo</span>
+  <span style="flex:1"></span>
+  <label class="sub" for="persona">Token</label>
+  <select id="persona">
+    <option value="valid">Valid (signed by issuer)</option>
+    <option value="forged">Forged (wrong signing key)</option>
+    <option value="expired">Expired</option>
+    <option value="none">No token</option>
+  </select>
+</header>
+
+<main>
+  <section>
+    <div id="banner" class="banner"></div>
+
+    <div class="card">
+      <h2>Products</h2>
+      <div class="row" style="margin-bottom:10px">
+        <button class="primary" id="loadProducts">GET /api/products</button>
+        <button id="loadOne">GET /api/products/p2</button>
+        <button id="spam">Send 10 requests</button>
+      </div>
+      <div id="products"><span class="sub">Load the catalogue to generate metered traffic.</span></div>
+    </div>
+
+    <div class="card">
+      <h2>Create an order</h2>
+      <div class="row">
+        <select id="orderProduct"></select>
+        <button class="primary" id="placeOrder">POST /api/orders</button>
+      </div>
+      <div id="orderResult" class="sub" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card">
+      <h2>Last response</h2>
+      <pre id="raw">(nothing yet)</pre>
+    </div>
+  </section>
+
+  <aside>
+    <div class="card">
+      <h2>Team budget</h2>
+      <div id="budgetBody"><span class="sub">Loading…</span></div>
+      <div class="row" style="margin-top:10px">
+        <button id="refreshBudget">Refresh</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Activity</h2>
+      <div class="log" id="log"></div>
+    </div>
+  </aside>
+</main>
+
+<script>
+const KONG     = 'http://localhost:8000';
+const INGESTOR = 'http://localhost:8084';
+let TOKENS = null, TENANT = 'test-tenant', TEAM = 'team-001';
+
+const $ = (id) => document.getElementById(id);
+const now = () => new Date().toLocaleTimeString();
+
+function log(msg, cls = 't-muted') {
+  const el = document.createElement('div');
+  el.innerHTML = `<span class="t-muted">${now()}</span> <span class="${cls}">${msg}</span>`;
+  $('log').prepend(el);
+}
+function banner(msg, kind) {
+  const b = $('banner');
+  if (!msg) { b.className = 'banner'; return; }
+  b.className = `banner show ${kind}`;
+  b.innerHTML = msg;
+}
+
+function authHeader() {
+  const which = $('persona').value;
+  if (which === 'none' || !TOKENS) return {};
+  return { Authorization: `Bearer ${TOKENS[which]}` };
+}
+
+/* Every call goes through Kong. Kong verifies the JWT, injects the verified
+   identity downstream, and meters the request in its log phase. */
+async function callKong(path, options = {}) {
+  const res = await fetch(KONG + path, {
+    ...options,
+    headers: { 'Content-Type': 'application/json', ...authHeader(), ...(options.headers || {}) },
+  });
+  const text = await res.text();
+  let body; try { body = JSON.parse(text); } catch { body = text; }
+  $('raw').textContent = `HTTP ${res.status}\n\n` + (typeof body === 'string' ? body : JSON.stringify(body, null, 2));
+
+  if (res.status === 401) {
+    const reason = (body && body.error_description) || 'unauthorized';
+    banner(`<b>401 — Kong rejected the token.</b> Reason: <code>${reason}</code>. The request never reached Suchith's backend.`, 'bad');
+    log(`${options.method || 'GET'} ${path} &rarr; 401 ${reason}`, 't-bad');
+  } else if (!res.ok) {
+    banner(`<b>HTTP ${res.status}</b> from the API.`, 'warn');
+    log(`${options.method || 'GET'} ${path} &rarr; ${res.status}`, 't-warn');
+  } else {
+    banner('', null);
+    log(`${options.method || 'GET'} ${path} &rarr; ${res.status}`, 't-ok');
+  }
+  return { status: res.status, body };
+}
+
+function renderProducts(list) {
+  $('products').innerHTML = list.map((p) => `
+    <div class="product">
+      <div><b>${p.name}</b><div class="sub">${p.description}</div></div>
+      <div class="price">$${p.priceUsd}/mo</div>
+    </div>`).join('');
+  $('orderProduct').innerHTML = list.map((p) => `<option value="${p.id}">${p.name}</option>`).join('');
+}
+
+$('loadProducts').onclick = async () => {
+  const { body, status } = await callKong('/api/products');
+  if (status === 200 && body.products) renderProducts(body.products);
+};
+$('loadOne').onclick = () => callKong('/api/products/p2');
+$('spam').onclick = async () => {
+  log('sending 10 requests to build usage…');
+  for (let i = 0; i < 10; i++) await callKong('/api/products');
+  setTimeout(loadBudget, 2500);  // let Kong's 2s flush land first
+};
+$('placeOrder').onclick = async () => {
+  const productId = $('orderProduct').value;
+  const { status, body } = await callKong('/api/orders', {
+    method: 'POST', body: JSON.stringify({ productId, quantity: 1 }),
+  });
+  $('orderResult').textContent =
+    status === 201 ? `Created ${body.order.id} — $${body.order.totalUsd}` : `Failed (HTTP ${status})`;
+};
+$('refreshBudget').onclick = () => loadBudget();
+$('persona').onchange = () => { banner('', null); log(`token switched to "${$('persona').value}"`); };
+
+/* Budget lives in Aforo, not in Suchith's API -- so this reads the ingestor
+   directly. Kong does NOT block on budget: metering happens in the log phase,
+   after the response is already sent. See README. */
+async function loadBudget() {
+  try {
+    const res = await fetch(`${INGESTOR}/v1/budget/status?teamId=${encodeURIComponent(TEAM)}`,
+                            { headers: { 'X-Tenant-Id': TENANT } });
+    if (!res.ok) { $('budgetBody').innerHTML = `<span class="sub">Ingestor returned HTTP ${res.status}</span>`; return; }
+    const env = await res.json();
+    const d = env.data || env;
+    if (!d.hasBudget) {
+      $('budgetBody').innerHTML =
+        `<span class="sub">No budget configured for <code>${TEAM}</code>.<br>Set one with <code>scripts/set-budget.sh 10</code>.</span>`;
+      return;
+    }
+    const spend = Number(d.currentSpend || 0), limit = Number(d.budgetLimit || 0);
+    const pct = limit > 0 ? Math.min(100, (spend / limit) * 100) : 0;
+    const cls = pct >= 100 ? 'bad' : pct >= 75 ? 'warn' : '';
+    $('budgetBody').innerHTML = `
+      <div class="meter ${cls}"><i style="width:${pct}%"></i></div>
+      <div class="kv"><span>Spent</span><b>${spend}</b></div>
+      <div class="kv"><span>Limit</span><b>${limit}</b></div>
+      <div class="kv"><span>Period</span><b>${d.periodKey || '—'}</b></div>
+      <div class="kv"><span>Status</span><b>${d.decision || '—'}</b></div>`;
+    if (pct >= 100) {
+      banner(`<b>Budget exceeded for ${TEAM}.</b> Aforo is now rejecting metering events with <code>402</code>. ` +
+             `Kong keeps serving traffic — see the README on why enforcement is not inline.`, 'bad');
+    }
+  } catch (e) {
+    $('budgetBody').innerHTML = `<span class="sub">Could not reach the ingestor on :8084 — ${e.message}</span>`;
+  }
+}
+
+fetch('tokens.json').then((r) => r.json()).then((t) => {
+  TOKENS = t;
+  TENANT = t.config.tenantId;
+  log(`loaded demo tokens — customer <b>${t.config.customerId}</b>, key_id <b>${t.config.keyId.slice(0, 8)}…</b>`);
+  loadBudget();
+}).catch(() => log('tokens.json missing — run scripts/generate-keys-and-config.js', 't-bad'));
+
+setInterval(loadBudget, 10000);
+</script>
+</body>
+</html>
