@@ -86,6 +86,29 @@ local function extract_bearer_token()
     return token
 end
 
+-- Format an epoch timestamp as ISO-8601 UTC with milliseconds.
+--
+-- 2026-09-01 fix. occurredAt was emitted as `ngx.now() * 1000`, i.e. a bare
+-- number of epoch MILLIseconds. The ingestor deserialises occurredAt into a
+-- java.time.Instant, and Jackson reads a bare number as epoch SECONDS -- so
+-- 1788268682221 was read as the year 58637 and every single event was rejected
+-- with "Event timestamp is too far in the future". Gateway-metered usage never
+-- persisted at all.
+--
+-- It failed quietly in the worst way: /v1/ingest/batch answers 202 with a
+-- per-event `failed` count rather than an HTTP error, so the plugin's own
+-- flush logged success and moved on. Emitting a string removes the ambiguity
+-- entirely -- there is no unit to misread.
+local function iso8601_utc(epoch_seconds)
+    local secs = math.floor(epoch_seconds)
+    local ms = math.floor((epoch_seconds - secs) * 1000 + 0.5)
+    if ms >= 1000 then
+        secs = secs + 1
+        ms = 0
+    end
+    return string.format("%s.%03dZ", os.date("!%Y-%m-%dT%H:%M:%S", secs), ms)
+end
+
 -- Decode base64url to bytes
 local function base64url_decode(str)
     str = str:gsub("-", "+"):gsub("_", "/")
@@ -630,7 +653,7 @@ function AforoMeteringHandler:log(conf)
         event.idempotencyKey = "mcp:" .. (conf.tenant_id or "") .. ":" ..
                                (request_id or uuid()) .. ":" ..
                                mcp_info.tool_name .. ":" .. tostring(ngx.now())
-        event.occurredAt     = ngx.now() * 1000
+        event.occurredAt     = iso8601_utc(ngx.now())
         event.productType    = "MCP_SERVER"
         event.toolName       = mcp_info.tool_name
         event.agentId        = mcp_info.agent_id or headers["x-agent-id"]
@@ -642,7 +665,7 @@ function AforoMeteringHandler:log(conf)
         event.metricName     = resolve_metric_name(conf, method, path, service_name, route_name, consumer_name)
         event.quantity       = resolve_quantity(conf, response_size)
         event.idempotencyKey = generate_idempotency_key(request_id)
-        event.occurredAt     = ngx.now() * 1000
+        event.occurredAt     = iso8601_utc(ngx.now())
     end
 
     -- Top-level HTTP fields (hoisted from metadata for fast ClickHouse queries)

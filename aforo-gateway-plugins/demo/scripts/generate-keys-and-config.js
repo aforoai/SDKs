@@ -56,6 +56,11 @@ const CONFIG = {
   // Browser-facing URLs. The page reads these instead of hardcoding a port.
   kongUrl: env('DEMO_KONG_URL', `http://localhost:${KONG_PORT}`),
   ingestorUrl: env('DEMO_INGESTOR_URL', `http://localhost:${INGESTOR_PORT}`),
+  // Redis, as seen from inside the Kong container. The plugin defaults to
+  // 127.0.0.1, which inside a container is the container itself -- hence
+  // "connection refused" on every jti/revocation check.
+  redisHost: env('DEMO_REDIS_HOST', 'host.docker.internal'),
+  redisPort: env('DEMO_REDIS_PORT', '6379'),
 };
 
 const b64url = (buf) =>
@@ -143,6 +148,14 @@ services:
           jwt_issuer: ${CONFIG.issuer}
           jwt_public_key: |
 ${indent(publicKey, 12)}
+
+          # JTI blocklist + client-revocation lookups. The plugin's default of
+          # 127.0.0.1 resolves to the Kong container itself, so every check
+          # failed with "connection refused". These checks are fail-open, so
+          # validation still worked -- but revocation was silently unenforced,
+          # which is exactly the kind of quiet gap not to ship.
+          jwt_redis_host: ${CONFIG.redisHost}
+          jwt_redis_port: ${CONFIG.redisPort}
 
           # Flush quickly so the demo does not sit waiting.
           flush_interval_ms: 2000
