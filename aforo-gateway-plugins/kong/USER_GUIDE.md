@@ -29,12 +29,7 @@ luarocks make kong-plugin-aforo-metering-2.0.0-1.rockspec
 Two things that will bite you if you skip them:
 
 - **Run `luarocks make` from inside this directory.** It resolves `build.modules` paths relative to the working directory, so `luarocks make kong/…rockspec` from a parent fails with `handler.lua: No such file or directory`.
-- **`lua-resty-jwt` cannot be installed from the LuaRocks mirrors for Lua 5.1** — the manifest itself fails to load (`main function has more than 65536 constants`), so resolution never reaches the package. Build it from source instead:
-
-  ```bash
-  git clone --depth 1 https://github.com/SkyLothar/lua-resty-jwt.git
-  cd lua-resty-jwt && luarocks make
-  ```
+- **Do not install `lua-resty-jwt`.** RS256 verification uses `resty.openssl`, which already ships with Kong. `lua-resty-jwt` depends on `lua-resty-hmac`, whose FFI binding cannot load against the OpenSSL 3 that Kong 3.x links — it fails with `size of C type is unknown or too large` because `HMAC_CTX` is opaque in OpenSSL 3. It installs cleanly and then fails at `require()`, which looks like a Lua-path problem and is not one.
 
 ### Running in Docker
 

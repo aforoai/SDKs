@@ -34,6 +34,46 @@ end
 local rate_limit = require_sibling("rate-limit-enforce")
 local margin_guard = require_sibling("margin-guard")
 
+-- UUID source (2026-09-01 fix).
+--
+-- The call sites below previously reached for the uuid helper through the PDK
+-- global. `kong.tools` is not part of the PDK in Kong 3.x, so that raised
+-- "attempt to index field 'tools' (a nil value)" and aborted the entire log
+-- phase -- meaning no event was buffered and the plugin metered nothing. The
+-- module also moved between releases: kong.tools.utils.uuid before Kong 3.9,
+-- kong.tools.uuid.uuid from 3.9 on. Resolve once at load with a fallback chain
+-- so the plugin spans both without a version check.
+local uuid
+do
+    local function try(mod_name, fn_name)
+        local ok, mod = pcall(require, mod_name)
+        if ok and type(mod) == "table" and type(mod[fn_name]) == "function" then
+            return mod[fn_name]
+        end
+        return nil
+    end
+
+    uuid = try("kong.tools.uuid", "uuid")        -- Kong >= 3.9
+        or try("kong.tools.utils", "uuid")       -- Kong <  3.9
+
+    if not uuid then
+        local ok, jit_uuid = pcall(require, "resty.jit-uuid")
+        if ok and type(jit_uuid) == "table" and type(jit_uuid.generate_v4) == "function" then
+            pcall(jit_uuid.seed)
+            uuid = jit_uuid.generate_v4
+        end
+    end
+
+    if not uuid then
+        -- Never leave this nil: both callers use it inside idempotency keys on
+        -- the metering hot path, and a nil here takes down the log phase again.
+        -- Not a real UUID, but unique enough to keep events distinct.
+        uuid = function()
+            return string.format("%d-%d-%d", ngx.worker.pid(), ngx.now() * 1000, math.random(1e9))
+        end
+    end
+end
+
 -- ────────────────────────────────────────────────────────────
 -- JWT Validation helpers
 -- ────────────────────────────────────────────────────────────
@@ -102,53 +142,83 @@ local function is_client_revoked(key_id, redis_host, redis_port)
     return val ~= nil and val ~= ngx.null
 end
 
--- Full RS256 signature verification requires the lua-resty-jwt library.
---   Kong Enterprise: use the native JWT plugin with JWKS URI instead of
---                    this plugin's built-in validation.
---   Kong OSS:        install lua-resty-jwt via LuaRocks and set jwt_public_key.
+-- RS256 signature verification, via Kong's bundled resty.openssl.
 --
--- FAIL-CLOSED (2026-09-01 security fix). This function previously returned true
--- both when lua-resty-jwt was missing AND when no jwt_public_key was configured,
--- so a default Kong OSS install could run jwt_validation_enabled=true while never
--- verifying a single signature. exp / iss / jti / key_id are all read from the
--- token payload, and that payload is only trustworthy once the signature is
--- checked -- so an unverified token let any caller mint their own JWT naming an
--- arbitrary customer_id + tenant_id and receive authorized, correctly-attributed
--- access: free API usage, billed to somebody else.
+-- FAIL-CLOSED (2026-09-01 security fix). This previously returned true both
+-- when the JWT library was missing AND when no jwt_public_key was configured,
+-- so a stock install could run jwt_validation_enabled=true while verifying no
+-- signature at all. exp / iss / jti / key_id are all read from the token
+-- payload, and that payload is only trustworthy once the signature is checked
+-- -- so an unverified token let any caller mint their own JWT naming an
+-- arbitrary customer_id and tenant_id and receive authorized,
+-- correctly-attributed access: free API usage, billed to somebody else.
 --
--- Signature verification is now mandatory whenever jwt_validation_enabled=true.
--- Operators who deliberately terminate JWT verification upstream (Kong Enterprise
--- native JWT plugin, a service mesh, an external authorizer) opt out via
--- jwt_allow_unverified_signature=true: explicit, defaulting to false, and logged
--- at ERROR on every unverified path so the posture is never silent.
+-- Uses resty.openssl rather than lua-resty-jwt. lua-resty-jwt pulls in
+-- lua-resty-hmac, whose FFI binding does not load against OpenSSL 3
+-- ("size of C type is unknown or too large" -- HMAC_CTX became opaque in
+-- OpenSSL 3). Kong 3.x links OpenSSL 3, so that dependency could never load
+-- here no matter how it was installed; the failure surfaced as a bare
+-- "signature cannot be verified" and looked like a packaging problem.
+-- resty.openssl ships with Kong, is OpenSSL 3 native, and needs no external
+-- rock -- so this also removes an install step that could not be satisfied
+-- from the LuaRocks mirrors anyway.
+--
+-- Operators who deliberately terminate JWT verification upstream (Kong
+-- Enterprise native JWT plugin, a service mesh, an external authorizer) opt out
+-- via jwt_allow_unverified_signature=true: explicit, defaulting to false, and
+-- logged at ERROR so the posture is never silent.
 local function verify_rs256_signature(token, conf)
     local allow_unverified = conf.jwt_allow_unverified_signature == true
 
-    local ok, resty_jwt = pcall(require, "resty.jwt")
-    if not ok then
-        kong.log.err("[aforo-metering] lua-resty-jwt not found -- RS256 signature CANNOT be verified. ",
-            "Install it via LuaRocks, or use Kong Enterprise's native JWT plugin. ",
-            "Set jwt_allow_unverified_signature=true only if signatures are verified upstream.")
+    if not conf.jwt_public_key or conf.jwt_public_key == "" then
+        -- jwt_jwks_uri is declared in schema.lua but no JWKS fetcher is
+        -- implemented, so a JWKS-only configuration verifies nothing.
+        kong.log.err("[aforo-metering] No jwt_public_key configured -- RS256 signature CANNOT ",
+            "be verified (jwt_jwks_uri is declared but not yet implemented). Set jwt_public_key ",
+            "to the issuer's PEM public key, or jwt_allow_unverified_signature=true only if ",
+            "signatures are verified upstream.")
         return allow_unverified
     end
 
-    local jwt_obj = resty_jwt:load_jwt(token)
-    if not jwt_obj or not jwt_obj.valid then
+    local ok, pkey = pcall(require, "resty.openssl.pkey")
+    if not ok then
+        -- Surface the underlying loader error. Reporting only "library not
+        -- found" here is what made the OpenSSL 3 breakage above look like a
+        -- missing package for so long.
+        kong.log.err("[aforo-metering] resty.openssl unavailable -- RS256 signature CANNOT be ",
+            "verified. Underlying error: ", tostring(pkey))
+        return allow_unverified
+    end
+
+    local dot1 = string.find(token, ".", 1, true)
+    local dot2 = dot1 and string.find(token, ".", dot1 + 1, true)
+    if not dot2 or string.find(token, ".", dot2 + 1, true) then
         return false
     end
 
-    if conf.jwt_public_key and conf.jwt_public_key ~= "" then
-        local verified = resty_jwt:verify_jwt_obj(conf.jwt_public_key, jwt_obj)
-        return verified ~= nil and verified.verified == true
+    local signing_input = string.sub(token, 1, dot2 - 1)
+    local signature = base64url_decode(string.sub(token, dot2 + 1))
+    if not signature or #signature == 0 then
+        return false
     end
 
-    -- jwt_jwks_uri is declared in schema.lua but no JWKS fetcher is implemented,
-    -- so a JWKS-only configuration verifies nothing. Treat that as unverified
-    -- rather than silently trusting the token.
-    kong.log.err("[aforo-metering] No jwt_public_key configured -- RS256 signature CANNOT be verified ",
-        "(jwt_jwks_uri is declared but not yet implemented). Set jwt_public_key to the issuer's PEM public key. ",
-        "Set jwt_allow_unverified_signature=true only if signatures are verified upstream.")
-    return allow_unverified
+    local pk, perr = pkey.new(conf.jwt_public_key)
+    if not pk then
+        -- A malformed configured key is an operator error, not an upstream
+        -- one. Never honour allow_unverified here: that would turn a typo in
+        -- the PEM into an open gate.
+        kong.log.err("[aforo-metering] jwt_public_key could not be parsed as a public key: ",
+            tostring(perr))
+        return false
+    end
+
+    local verified, verr = pk:verify(signature, signing_input, "sha256")
+    if verr then
+        kong.log.err("[aforo-metering] RS256 verification error: ", tostring(verr))
+        return false
+    end
+
+    return verified == true
 end
 
 -- Main JWT validation entry point.
@@ -173,7 +243,7 @@ local function validate_jwt(token, conf)
         return { valid = false, reason = "INVALID_ISSUER" }
     end
 
-    -- 4. RS256 signature verification (requires lua-resty-jwt; fail-open when absent)
+    -- 4. RS256 signature verification (resty.openssl; fail-closed -- see above)
     if not verify_rs256_signature(token, conf) then
         return { valid = false, reason = "INVALID_SIGNATURE" }
     end
@@ -293,7 +363,7 @@ local function resolve_customer_id(conf, consumer, headers)  -- luacheck: ignore
 end
 
 local function generate_idempotency_key(request_id)
-    return request_id or kong.tools.uuid()
+    return request_id or uuid()
 end
 
 -- ────────────────────────────────────────────────────────────
@@ -446,6 +516,24 @@ end
 function AforoMeteringHandler:access(conf)
     kong.ctx.shared.aforo_trace = extract_trace_context()
 
+    -- Stash the request body for the log phase (2026-09-01 fix).
+    -- kong.request.get_raw_body() is access/rewrite-phase only. Calling it from
+    -- log_by_lua raises "function cannot be called in log phase", which aborted
+    -- the ENTIRE log handler on every request -- so no event was ever buffered
+    -- and the plugin metered precisely nothing on Kong 3.x. The failure was
+    -- invisible from the plugin's own logs: Kong reports it as a generic
+    -- "failed to run log_by_lua*" and the handler never reaches its own
+    -- logging. Mirrors the aforo_trace stash directly above.
+    --
+    -- Only read when MCP detection needs it: touching the raw body forces Kong
+    -- to buffer the whole request, which is real overhead on large uploads and
+    -- pointless when nothing consumes it. pcall-guarded because the body is
+    -- legitimately unavailable for streamed or oversized requests.
+    if conf.mcp_enabled then
+        local ok, body = pcall(kong.request.get_raw_body)
+        kong.ctx.shared.aforo_raw_body = ok and body or nil
+    end
+
     -- ── JWT Validation (runs first — all subsequent checks depend on validated identity) ──
     if conf.jwt_validation_enabled then
         local token = extract_bearer_token()
@@ -507,8 +595,12 @@ function AforoMeteringHandler:log(conf)
     local service = kong.router.get_service()
     local route = kong.router.get_route()
     local latency = kong.response.get_header("X-Kong-Proxy-Latency")
-    local raw_body = kong.request.get_raw_body()
-    local request_size = raw_body and #raw_body or 0
+    -- Read the access-phase stash; never call get_raw_body() here (see above).
+    local raw_body = kong.ctx.shared.aforo_raw_body
+    -- Content-Length when the body was not captured, so request_size stays
+    -- populated for the common non-MCP path instead of reporting a flat 0.
+    local request_size = raw_body and #raw_body
+        or tonumber(kong.request.get_header("Content-Length")) or 0
     local response_size = tonumber(kong.response.get_header("Content-Length")) or 0
     local request_id = kong.request.get_header("X-Request-Id")
         or kong.request.get_header("X-Kong-Request-Id")
@@ -536,7 +628,7 @@ function AforoMeteringHandler:log(conf)
         event.metricName     = "mcp_server.tool_invocations"
         event.quantity       = 1
         event.idempotencyKey = "mcp:" .. (conf.tenant_id or "") .. ":" ..
-                               (request_id or kong.tools.uuid()) .. ":" ..
+                               (request_id or uuid()) .. ":" ..
                                mcp_info.tool_name .. ":" .. tostring(ngx.now())
         event.occurredAt     = ngx.now() * 1000
         event.productType    = "MCP_SERVER"

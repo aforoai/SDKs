@@ -20,10 +20,11 @@ description = {
 dependencies = {
     "lua >= 5.1",
     "lua-resty-http >= 0.17",
-    -- Required for RS256 signature verification. The plugin rejects tokens it
-    -- cannot verify, so without this library any JWT-validating route fails
-    -- closed (see verify_rs256_signature in handler.lua).
-    "lua-resty-jwt >= 0.2.3",
+    -- No JWT rock is required. RS256 verification uses resty.openssl, which
+    -- ships with Kong. lua-resty-jwt was tried and removed: it depends on
+    -- lua-resty-hmac, whose FFI binding cannot load against OpenSSL 3 (Kong 3.x)
+    -- -- "size of C type is unknown or too large", because HMAC_CTX became an
+    -- opaque struct. No install method fixes that.
 }
 
 build = {

@@ -23,16 +23,13 @@ FROM kong:3.4
 
 USER root
 
-# lua-resty-jwt cannot be installed from the LuaRocks mirrors for Lua 5.1 -- the
-# manifest itself fails to load ("main function has more than 65536 constants"),
-# so dependency resolution never gets as far as the package. Build from source.
-#
-# Tracking the default branch: pin this to a commit before using the image
-# anywhere that needs reproducible builds.
-RUN git clone --depth 1 https://github.com/SkyLothar/lua-resty-jwt.git /tmp/lua-resty-jwt \
-    && cd /tmp/lua-resty-jwt \
-    && luarocks make \
-    && rm -rf /tmp/lua-resty-jwt
+# No JWT library is installed. RS256 verification uses resty.openssl, which is
+# already part of Kong and is OpenSSL 3 native. lua-resty-jwt was tried and
+# deliberately dropped: it pulls in lua-resty-hmac, whose FFI binding cannot
+# load against the OpenSSL 3 that Kong 3.x links ("size of C type is unknown or
+# too large" -- HMAC_CTX is opaque in OpenSSL 3). Installing it appears to
+# succeed and then fails at require() time, which reads like a packaging or
+# Lua-path problem and is neither.
 
 # `luarocks make` resolves build.modules paths relative to the working directory,
 # so it must run from inside the plugin directory -- not from a parent with the
