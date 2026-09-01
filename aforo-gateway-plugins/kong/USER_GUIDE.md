@@ -24,7 +24,55 @@ luarocks install lua-resty-http
 luarocks make kong-plugin-aforo-metering-2.0.0-1.rockspec
 ```
 
-`luarocks make` reads `kong-plugin-aforo-metering-2.0.0-1.rockspec` and installs the `kong.plugins.aforo-metering.handler` and `.schema` modules.
+`luarocks make` reads `kong-plugin-aforo-metering-2.0.0-1.rockspec` and installs the `handler`, `schema`, `rate-limit-enforce`, `margin-guard`, `preflight-quota` and `compound-metering` modules under `kong.plugins.aforo-metering.*`.
+
+Two things that will bite you if you skip them:
+
+- **Run `luarocks make` from inside this directory.** It resolves `build.modules` paths relative to the working directory, so `luarocks make kong/…rockspec` from a parent fails with `handler.lua: No such file or directory`.
+- **`lua-resty-jwt` cannot be installed from the LuaRocks mirrors for Lua 5.1** — the manifest itself fails to load (`main function has more than 65536 constants`), so resolution never reaches the package. Build it from source instead:
+
+  ```bash
+  git clone --depth 1 https://github.com/SkyLothar/lua-resty-jwt.git
+  cd lua-resty-jwt && luarocks make
+  ```
+
+### Running in Docker
+
+Installing the plugin into a *running* Kong container does not survive, and the reason is not obvious. `KONG_PLUGINS` is an environment variable, so changing it forces `docker rm` + `docker run` — which discards whatever `luarocks make` put in the old container. The new container then dies during `init_by_lua` with `aforo-metering plugin is enabled but not installed`, and because it never reaches a running state you cannot `docker exec` in to install it. That is a deadlock, not a flaky install.
+
+Build an image with the plugin already present:
+
+```bash
+cd SDKs/aforo-gateway-plugins/kong
+docker build -t kong-aforo:3.4 .
+docker run -d --name kong --network=kong-net \
+  -e KONG_DATABASE=postgres -e KONG_PG_HOST=kong-database \
+  -e KONG_PG_USER=kong -e KONG_PG_PASSWORD=kong \
+  -e KONG_ADMIN_LISTEN=0.0.0.0:8001 \
+  -p 8000:8000 -p 8001:8001 kong-aforo:3.4
+```
+
+The `Dockerfile` sets `KONG_PLUGINS` and the `aforo_buffer` shared dict for you. Verify:
+
+```bash
+curl -s http://localhost:8001/ | grep -o aforo-metering
+```
+
+### Local development: mounting the plugin from source
+
+Rebuilding the image for every edit is slow. Mount the source over the installed copy instead — edit a `.lua` file, `docker restart kong`, done:
+
+```bash
+cd SDKs/aforo-gateway-plugins/kong
+docker run -d --name kong --network=kong-net \
+  -e KONG_DATABASE=postgres -e KONG_PG_HOST=kong-database \
+  -e KONG_PG_USER=kong -e KONG_PG_PASSWORD=kong \
+  -e KONG_ADMIN_LISTEN=0.0.0.0:8001 \
+  -v "$PWD:/usr/local/share/lua/5.1/kong/plugins/aforo-metering:ro" \
+  -p 8000:8000 -p 8001:8001 kong-aforo:3.4
+```
+
+Still based on `kong-aforo:3.4`, because the mount only replaces the plugin — `lua-resty-jwt` still has to come from the image.
 
 ## Step 2 — Register the plugin and the shared buffer
 
