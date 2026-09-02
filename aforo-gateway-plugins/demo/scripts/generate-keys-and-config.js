@@ -46,11 +46,14 @@ const INGESTOR_PORT = env('INGESTOR_PORT', '8084');
 
 const CONFIG = {
   issuer: 'https://auth.aforo.ai',
-  tenantId: env('DEMO_TENANT_ID', 'test-tenant'),
-  customerId: env('DEMO_CUSTOMER_ID', 'test-customer'),
-  teamId: env('DEMO_TEAM_ID', 'team-001'),
-  keyId: env('DEMO_KEY_ID', 'b0fd7c72-9a29-465c-904d-1528ccd97f25'),
-  subscriptionId: env('DEMO_SUBSCRIPTION_ID', '444fa303-ca2d-4fdd-9576-a120e1c6be72'),
+  // Deliberately placeholders, not working values. A default that happens to
+  // work is worse than none here: it produces a demo that runs, meters into
+  // somebody else's tenant, and looks fine while doing it.
+  tenantId: env('DEMO_TENANT_ID', 'YOUR_TENANT_ID'),
+  customerId: env('DEMO_CUSTOMER_ID', 'YOUR_CUSTOMER_ID'),
+  teamId: env('DEMO_TEAM_ID', 'YOUR_TEAM_ID'),
+  keyId: env('DEMO_KEY_ID', 'YOUR_API_KEY_ID'),
+  subscriptionId: env('DEMO_SUBSCRIPTION_ID', 'YOUR_SUBSCRIPTION_ID'),
   aforoEndpoint: env('DEMO_AFORO_ENDPOINT', `http://host.docker.internal:${INGESTOR_PORT}/v1/ingest/batch`),
   upstream: env('DEMO_UPSTREAM', 'http://suchith-backend:9000'),
   // Browser-facing URLs. The page reads these instead of hardcoding a port.
@@ -62,6 +65,36 @@ const CONFIG = {
   redisHost: env('DEMO_REDIS_HOST', 'host.docker.internal'),
   redisPort: env('DEMO_REDIS_PORT', '6379'),
 };
+
+/*
+ * Refuse to generate anything while a placeholder survives.
+ *
+ * Without this the demo starts happily, signs tokens claiming tenant
+ * "YOUR_TENANT_ID", and every event is silently dropped or misattributed --
+ * surfacing much later as an empty budget panel or a 403 that looks like an
+ * auth bug. Failing here, naming the exact variables, costs one run and saves
+ * that whole investigation.
+ */
+const REQUIRED = ['tenantId', 'customerId', 'teamId', 'keyId', 'subscriptionId'];
+const missing = REQUIRED.filter((k) => String(CONFIG[k] || '').startsWith('YOUR_'));
+if (missing.length) {
+  const varNames = { tenantId: 'DEMO_TENANT_ID', customerId: 'DEMO_CUSTOMER_ID',
+                     teamId: 'DEMO_TEAM_ID', keyId: 'DEMO_KEY_ID',
+                     subscriptionId: 'DEMO_SUBSCRIPTION_ID' };
+  console.error('\nRefusing to generate: these still hold placeholder values.\n');
+  for (const k of missing) console.error(`  ${varNames[k]}  (currently ${CONFIG[k]})`);
+  console.error(`
+Set them in .env, then re-run.
+
+  cp .env.example .env            # local Aforo stack
+  cp .env.production.example .env # Aforo production
+
+Where each value comes from is in README.md, "Where to find these values".
+DEMO_TEAM_ID is the one people skip: without it usage still bills correctly,
+but team budgets never apply and summary-by-team stays empty.
+`);
+  process.exit(1);
+}
 
 const b64url = (buf) =>
   Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');

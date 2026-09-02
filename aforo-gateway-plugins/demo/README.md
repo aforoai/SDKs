@@ -28,10 +28,39 @@ Aforo's own services are **not** in this compose file — run them first:
 Without that key row the traffic still flows and events still land — they just arrive
 unattributed, and the budget panel stays empty.
 
+## Where to find these values
+
+The demo ships **placeholders**, not working values — a default that happens to
+work would produce a demo that runs, meters into somebody else's tenant, and looks
+fine while doing it. The generator refuses to run until you replace them, naming
+the exact variables.
+
+| Variable | Where to get it |
+|---|---|
+| `DEMO_TENANT_ID` | Your workspace id — the `X-Tenant-Id` the console sends, visible in the URL of your Aforo workspace |
+| `DEMO_CUSTOMER_ID` | **Customers** → open the customer → its id (a UUID, not the display name) |
+| `DEMO_SUBSCRIPTION_ID` | **Subscriptions** → the subscription binding that customer to an offering |
+| `DEMO_KEY_ID` | **Developer Hub → Credentials** → create an API key → the `keyId` it returns. Not the `sk_live_…` secret — the plugin never sees that |
+| `DEMO_TEAM_ID` | **Customers → Teams**, if you use teams |
+
+Two of these decide whether the demo shows anything interesting:
+
+- **`DEMO_KEY_ID`** must be a key bound to `DEMO_SUBSCRIPTION_ID`. It becomes the
+  JWT's `key_id` claim, which the plugin forwards as `metadata.keyId`, which the
+  ingestor resolves to a team. Get it wrong and events still arrive, but
+  unattributed.
+- **`DEMO_TEAM_ID`** must be set on that API key. Without a team, usage still
+  bills correctly, but **team budgets never apply** and `summary-by-team` stays
+  empty — so the budget panel has nothing to show.
+
+Creating the key via `POST /api/v1/api-keys` returns the raw `sk_live_…` token
+**once and only once**; reading the key back never returns it again. Store it
+when you create it.
+
 ## Run it
 
 ```bash
-cp .env.example .env                       # optional, but read the port notes in it
+cp .env.example .env                       # local stack — or .env.production.example for production
 node scripts/generate-keys-and-config.js   # fresh RSA keypair + tokens + kong.yml
 docker compose up --build
 open http://localhost:3000
@@ -110,7 +139,8 @@ demo/
 ├── docker-compose.yml            Kong + backend + frontend
 ├── suchith-backend/              Express API, no metering code
 ├── nirmala-frontend/             static page: products, orders, budget panel
-├── .env.example                  ports + demo identity; copy to .env
+├── .env.example                  local stack — copy to .env, replace YOUR_* values
+├── .env.production.example       Aforo production — same, with production URLs
 ├── kong/kong.yml                 GENERATED — cors + aforo-metering config
 └── scripts/
     ├── generate-keys-and-config.js   keypair + tokens + kong.yml
