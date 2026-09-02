@@ -69,6 +69,70 @@ docker run -d --name kong --network=kong-net \
 
 Still based on `kong-aforo:3.4`, because the mount only replaces the plugin — `lua-resty-jwt` still has to come from the image.
 
+## Choosing what each endpoint bills as
+
+The plugin's legacy default, `metric_name_pattern = "{method} {path}"`, produces one
+metric per endpoint — `GET /api/products`, `POST /api/sms/v2/send`. Aforo rejects any
+metric not registered in the catalog, so out of the box every event fails.
+
+Registering one metric per endpoint is not the fix. It makes the catalog track URL
+structure instead of business meaning, puts a line item per endpoint on the invoice, and
+turns adding an endpoint into a billing change. Billing wants `sms_sent`, `otp_delivered`,
+`call_minutes` — and many endpoints map onto one of those.
+
+Aforo cannot do this mapping server-side. Metric filters narrow which events count toward
+a metric the event has **already named**, so the name has to be correct when it arrives.
+The gateway is the right place.
+
+### Map paths to metrics
+
+```yaml
+config:
+  metric_mappings:
+    - path_pattern: "^/api/otp"      # specific first — first match wins
+      metric_name: otp_delivered
+    - path_pattern: "^/api/sms"
+      metric_name: sms_sent
+    - path_pattern: "^/api/call"
+      method: POST                   # optional; any verb when omitted
+      metric_name: call_minutes
+  default_metric: api_calls          # unmapped endpoints still bill
+```
+
+`path_pattern` is a Lua pattern, not a glob — anchor with `^`. Rules are evaluated in
+order, so put specific before general. A malformed pattern is skipped with an error rather
+than taking metering down.
+
+`default_metric` matters more than it looks: it means a newly added endpoint bills as
+generic usage instead of being rejected. Adding a route is not a billing outage. It must
+exist in your catalog.
+
+### When only the backend knows
+
+Some values a gateway cannot observe — call duration, tokens consumed, which of several
+billable actions a multi-purpose endpoint performed. The backend can say so per request:
+
+```
+X-Aforo-Metric: call_minutes
+X-Aforo-Quantity: 7.5
+```
+
+These are **response** headers, set by your upstream, so a client cannot forge them. Both
+override the mapping for that request. A quantity that is not a positive number is ignored
+with a warning, because the ingestor requires `quantity > 0` and a malformed value would
+otherwise fail the whole batch.
+
+Configurable via `metric_header` / `quantity_header`; set either to empty to disable.
+
+### Resolution order
+
+1. `metric_header` from the upstream response
+2. first matching `metric_mappings` rule
+3. `metric_name_pattern`, only if explicitly set to something other than the default
+4. `default_metric`
+
+Existing deployments that set a custom `metric_name_pattern` keep working unchanged.
+
 ## Step 2 — Register the plugin and the shared buffer
 
 In `kong.conf`:

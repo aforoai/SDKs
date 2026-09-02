@@ -62,6 +62,9 @@ const CONFIG = {
   // Redis, as seen from inside the Kong container. The plugin defaults to
   // 127.0.0.1, which inside a container is the container itself -- hence
   // "connection refused" on every jti/revocation check.
+  // Metric names, which must exist in your Aforo catalog.
+  readMetric: env('DEMO_READ_METRIC', 'api_calls'),
+  orderMetric: env('DEMO_ORDER_METRIC', 'api_calls'),
   redisHost: env('DEMO_REDIS_HOST', 'host.docker.internal'),
   redisPort: env('DEMO_REDIS_PORT', '6379'),
 };
@@ -189,6 +192,17 @@ ${indent(publicKey, 12)}
           # which is exactly the kind of quiet gap not to ship.
           jwt_redis_host: ${CONFIG.redisHost}
           jwt_redis_port: ${CONFIG.redisPort}
+
+          # Endpoint -> metric. Without this the plugin falls back to
+          # "{method} {path}", producing a metric per endpoint that the catalog
+          # does not know, and every event is rejected as an unknown metric.
+          # These names must exist in YOUR catalog -- edit to match.
+          metric_mappings:
+            - path_pattern: "^/api/orders"
+              metric_name: ${CONFIG.orderMetric}
+            - path_pattern: "^/api/products"
+              metric_name: ${CONFIG.readMetric}
+          default_metric: ${CONFIG.readMetric}
 
           # Flush quickly so the demo does not sit waiting.
           flush_interval_ms: 2000

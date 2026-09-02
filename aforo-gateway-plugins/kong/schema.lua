@@ -42,7 +42,43 @@ return {
                         metric_name_pattern = {
                             type = "string",
                             default = "{method} {path}",
-                            description = "Template for metric name. Variables: {method}, {path}, {service}, {route}, {consumer}",
+                            description = "DEPRECATED. Template for metric name: {method}, {path}, {service}, {route}, {consumer}. Produces one metric per endpoint, which Aforo rejects unless every endpoint is registered in the catalog as its own metric. Prefer metric_mappings. Honoured only when set to something other than the default.",
+                        },
+                    },
+                    {
+                        metric_mappings = {
+                            type = "array",
+                            required = false,
+                            description = "Ordered endpoint-to-metric rules; first match wins, so put specific rules before general ones. path_pattern is a Lua pattern matched against the request path (anchor with ^). method is optional and matches any verb when omitted. Example: {path_pattern='^/api/sms', metric_name='sms_sent'}.",
+                            elements = {
+                                type = "record",
+                                fields = {
+                                    { path_pattern = { type = "string", required = true } },
+                                    { method = { type = "string", required = false } },
+                                    { metric_name = { type = "string", required = true } },
+                                },
+                            },
+                        },
+                    },
+                    {
+                        default_metric = {
+                            type = "string",
+                            default = "api_calls",
+                            description = "Metric used when no mapping matches. Must exist in the Aforo catalog. Keeps an unmapped endpoint billing as generic usage instead of being rejected, so adding an endpoint is not a billing outage.",
+                        },
+                    },
+                    {
+                        metric_header = {
+                            type = "string",
+                            default = "X-Aforo-Metric",
+                            description = "Upstream RESPONSE header that overrides the metric for a single request. For cases only the backend knows, e.g. one endpoint serving several billable actions. Read from the response, so clients cannot forge it. Set empty to disable.",
+                        },
+                    },
+                    {
+                        quantity_header = {
+                            type = "string",
+                            default = "X-Aforo-Quantity",
+                            description = "Upstream RESPONSE header supplying the quantity for a single request. Needed for metrics whose value only the backend knows -- call_minutes, tokens, bytes processed -- which a gateway cannot observe. Ignored unless it parses to a positive number. Set empty to disable.",
                         },
                     },
                     {

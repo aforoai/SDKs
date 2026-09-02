@@ -339,18 +339,96 @@ local function should_exclude_status(status, exclude_status_codes)
     return false
 end
 
-local function resolve_metric_name(conf, method, path, service_name, route_name, consumer_name)
-    local pattern = conf.metric_name_pattern or "{method} {path}"
-    local result = pattern
-    result = string.gsub(result, "{method}", method or "UNKNOWN")
-    result = string.gsub(result, "{path}", path or "/")
-    result = string.gsub(result, "{service}", service_name or "")
-    result = string.gsub(result, "{route}", route_name or "")
-    result = string.gsub(result, "{consumer}", consumer_name or "")
-    return result
+-- The legacy default. Kept as a sentinel so we can tell "operator left it
+-- alone" from "operator deliberately chose a template".
+local DEFAULT_METRIC_PATTERN = "{method} {path}"
+
+-- Resolve the metric this request should be billed against.
+--
+-- 2026-09-02. The old behaviour was `{method} {path}`, which produces a metric
+-- name per endpoint: "GET /api/products", "POST /api/sms/v2/send". Aforo rejects
+-- any metric that is not registered in the catalog, so out of the box every
+-- event failed. Registering one metric per endpoint is not a workaround -- it
+-- makes the catalog track URL structure instead of business meaning, puts a
+-- line item per endpoint on the invoice, and turns adding an endpoint into a
+-- billing change.
+--
+-- Billing wants business metrics -- sms_sent, otp_delivered, call_minutes --
+-- and many endpoints map onto one of those. Aforo cannot do that mapping
+-- server-side: metric filters narrow which events count toward a metric the
+-- event has ALREADY named, so the name has to be right when it arrives.
+--
+-- Resolution order, first match wins:
+--   1. upstream response header (conf.metric_header) -- per-request, for cases
+--      only the backend knows, e.g. which metric a multi-purpose endpoint served
+--   2. metric_mappings -- ordered path/method rules, the normal answer
+--   3. metric_name_pattern -- only when explicitly set, for backward compat
+--   4. default_metric -- a single registered fallback, so an unmapped endpoint
+--      still bills as generic usage rather than being rejected
+local function resolve_metric_name(conf, method, path, service_name, route_name,
+                                   consumer_name, header_metric)
+    -- 1. Upstream override. This reads the RESPONSE header, which the upstream
+    -- sets and the client cannot -- so it is not a spoofable input the way a
+    -- request header would be.
+    if header_metric and header_metric ~= "" then
+        return header_metric
+    end
+
+    -- 2. Ordered mappings. Lua patterns, not globs: "^/api/sms" anchors, and
+    -- ordering is the operator's tie-breaker, so put specific before general.
+    if conf.metric_mappings then
+        for _, rule in ipairs(conf.metric_mappings) do
+            local method_ok = (rule.method == nil or rule.method == ""
+                               or string.upper(rule.method) == string.upper(method or ""))
+            if method_ok and rule.path_pattern and rule.path_pattern ~= "" then
+                local ok, matched = pcall(string.find, path or "", rule.path_pattern)
+                if not ok then
+                    -- A malformed pattern must not take metering down for every
+                    -- request; skip the rule and say which one is broken.
+                    kong.log.err("[aforo-metering] Invalid path_pattern '", tostring(rule.path_pattern),
+                        "' in metric_mappings -- rule skipped.")
+                elseif matched then
+                    return rule.metric_name
+                end
+            end
+        end
+    end
+
+    -- 3. Legacy template, honoured only if the operator actually chose one.
+    local pattern = conf.metric_name_pattern
+    if pattern and pattern ~= "" and pattern ~= DEFAULT_METRIC_PATTERN then
+        local result = pattern
+        result = string.gsub(result, "{method}", method or "UNKNOWN")
+        result = string.gsub(result, "{path}", path or "/")
+        result = string.gsub(result, "{service}", service_name or "")
+        result = string.gsub(result, "{route}", route_name or "")
+        result = string.gsub(result, "{consumer}", consumer_name or "")
+        return result
+    end
+
+    -- 4. Fallback.
+    return conf.default_metric or "api_calls"
 end
 
-local function resolve_quantity(conf, response_size)
+-- Resolve the quantity to bill.
+--
+-- header_quantity comes from the upstream RESPONSE (conf.quantity_header) and
+-- wins when present. Without it, usage-based metrics whose value only the
+-- backend knows -- call_minutes, tokens consumed, bytes processed -- cannot be
+-- metered at the gateway at all: Kong can count that a call happened, not how
+-- long it lasted. Rejected unless it parses to a positive number, because the
+-- ingestor requires quantity > 0 and a malformed header would fail the whole
+-- batch rather than this one event.
+local function resolve_quantity(conf, response_size, header_quantity)
+    if header_quantity and header_quantity ~= "" then
+        local n = tonumber(header_quantity)
+        if n and n > 0 then
+            return n
+        end
+        kong.log.warn("[aforo-metering] Ignoring non-positive/unparseable ",
+            conf.quantity_header or "quantity", " header: '", tostring(header_quantity), "'")
+    end
+
     local source = conf.quantity_source or "1"
     if source == "1" then
         return 1
@@ -675,8 +753,16 @@ function AforoMeteringHandler:log(conf)
         event.executionDurationMs = tonumber(latency) or 0
     else
         event.customerId     = customer_id
-        event.metricName     = resolve_metric_name(conf, method, path, service_name, route_name, consumer_name)
-        event.quantity       = resolve_quantity(conf, response_size)
+        -- Upstream-supplied overrides, read from the response so a client
+        -- cannot forge them.
+        local header_metric = conf.metric_header and conf.metric_header ~= ""
+            and kong.response.get_header(conf.metric_header) or nil
+        local header_quantity = conf.quantity_header and conf.quantity_header ~= ""
+            and kong.response.get_header(conf.quantity_header) or nil
+
+        event.metricName     = resolve_metric_name(conf, method, path, service_name,
+                                                   route_name, consumer_name, header_metric)
+        event.quantity       = resolve_quantity(conf, response_size, header_quantity)
         event.idempotencyKey = generate_idempotency_key(request_id)
         event.occurredAt     = iso8601_utc(ngx.now())
     end
