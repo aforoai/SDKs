@@ -339,6 +339,129 @@ local function should_exclude_status(status, exclude_status_codes)
     return false
 end
 
+-- ────────────────────────────────────────────────────────────
+-- Central metric mappings, fetched from Aforo
+-- ────────────────────────────────────────────────────────────
+--
+-- Declaring endpoint->metric rules in gateway config works and does not scale:
+-- a customer with a hundred metrics maintains a hundred rules by hand, and every
+-- new metric couples an Aforo change to a gateway deploy. Catalog serves the
+-- same table, projected from the metric's own filter conditions, so the customer
+-- declares it once where the metric is defined.
+--
+-- Two rules govern this code:
+--   * It never blocks a request. Refresh runs in a timer; the request path only
+--     ever reads the cache.
+--   * A stale table beats no table. If catalog is unreachable we keep serving
+--     what we last saw, indefinitely, and log. The alternative is silently
+--     re-attributing live traffic to default_metric, which is a revenue bug that
+--     looks like nothing at all.
+--
+-- Cached in the existing aforo_buffer dict on purpose: requiring a second
+-- lua_shared_dict would add a deployment step operators forget, and a missing
+-- dict already costs this plugin all of its metering.
+local MAPPINGS_KEY = "aforo:gateway_mappings"
+local MAPPINGS_FETCHED_AT_KEY = "aforo:gateway_mappings_at"
+local MAPPINGS_INFLIGHT_KEY = "aforo:gateway_mappings_inflight"
+
+local function fetch_mappings(premature, conf)
+    if premature then return end
+
+    local dict = ngx.shared[BUFFER_DICT]
+    if not dict then return end
+
+    local httpc = http.new()
+    httpc:set_timeout(conf.mappings_timeout_ms or 3000)
+
+    local url = conf.mappings_url .. "?tenantId=" .. ngx.escape_uri(conf.tenant_id or "")
+    local res, err = httpc:request_uri(url, {
+        method = "GET",
+        headers = { ["Accept"] = "application/json" },
+    })
+
+    dict:delete(MAPPINGS_INFLIGHT_KEY)
+
+    if not res or res.status < 200 or res.status >= 300 then
+        -- Keep whatever is cached. Do not clear it.
+        kong.log.warn("[aforo-metering] Could not refresh metric mappings from ", url,
+            " (status=", res and res.status or "no response", ", err=", err or "none",
+            "). Continuing with the cached table.")
+        return
+    end
+
+    local ok, body = pcall(cjson.decode, res.body)
+    if not ok or type(body) ~= "table" or type(body.mappings) ~= "table" then
+        kong.log.err("[aforo-metering] Metric mappings response was not usable JSON; ",
+            "keeping the cached table.")
+        return
+    end
+
+    dict:set(MAPPINGS_KEY, cjson.encode(body.mappings))
+    dict:set(MAPPINGS_FETCHED_AT_KEY, ngx.now())
+    if body.cacheTtlSeconds and tonumber(body.cacheTtlSeconds) then
+        dict:set("aforo:gateway_mappings_ttl", tonumber(body.cacheTtlSeconds))
+    end
+    kong.log.info("[aforo-metering] Loaded ", #body.mappings, " metric mappings for tenant ",
+        conf.tenant_id or "?")
+end
+
+-- Spawn a refresh when the cache is older than its TTL. Called from the request
+-- path, but only ever schedules work -- it does not wait for it.
+local function maybe_refresh_mappings(conf)
+    if not conf.mappings_url or conf.mappings_url == "" then return end
+
+    local dict = ngx.shared[BUFFER_DICT]
+    if not dict then return end
+
+    local fetched_at = dict:get(MAPPINGS_FETCHED_AT_KEY)
+    local ttl = dict:get("aforo:gateway_mappings_ttl") or conf.mappings_refresh_seconds or 300
+    if fetched_at and (ngx.now() - fetched_at) < ttl then return end
+
+    -- One worker fetches; the rest carry on with the cache. add() is atomic, so
+    -- a burst of concurrent requests cannot stampede catalog.
+    local claimed = dict:add(MAPPINGS_INFLIGHT_KEY, 1, 30)
+    if not claimed then return end
+
+    local ok, err = ngx.timer.at(0, fetch_mappings, conf)
+    if not ok then
+        dict:delete(MAPPINGS_INFLIGHT_KEY)
+        kong.log.warn("[aforo-metering] Could not schedule mappings refresh: ", err)
+    end
+end
+
+-- Match a path against one cached rule. Plain string comparisons, never a
+-- pattern: catalog serves EXACT / PREFIX / CONTAINS precisely so the same rule
+-- means the same thing in every gateway, whatever its regex dialect.
+local function mapping_matches(path, rule)
+    local value = rule.value
+    if not value or value == "" or not path then return false end
+    local kind = rule.matchType or "EXACT"
+    if kind == "EXACT" then
+        return path == value
+    elseif kind == "PREFIX" then
+        return string.sub(path, 1, #value) == value
+    elseif kind == "CONTAINS" then
+        return string.find(path, value, 1, true) ~= nil
+    end
+    return false
+end
+
+local function metric_from_cached_mappings(path)
+    local dict = ngx.shared[BUFFER_DICT]
+    if not dict then return nil end
+    local raw = dict:get(MAPPINGS_KEY)
+    if not raw then return nil end
+    local ok, rules = pcall(cjson.decode, raw)
+    if not ok or type(rules) ~= "table" then return nil end
+    -- Catalog returns them already ordered; first match wins.
+    for _, rule in ipairs(rules) do
+        if mapping_matches(path, rule) then
+            return rule.metricName
+        end
+    end
+    return nil
+end
+
 -- The legacy default. Kept as a sentinel so we can tell "operator left it
 -- alone" from "operator deliberately chose a template".
 local DEFAULT_METRIC_PATTERN = "{method} {path}"
@@ -361,9 +484,12 @@ local DEFAULT_METRIC_PATTERN = "{method} {path}"
 -- Resolution order, first match wins:
 --   1. upstream response header (conf.metric_header) -- per-request, for cases
 --      only the backend knows, e.g. which metric a multi-purpose endpoint served
---   2. metric_mappings -- ordered path/method rules, the normal answer
---   3. metric_name_pattern -- only when explicitly set, for backward compat
---   4. default_metric -- a single registered fallback, so an unmapped endpoint
+--   2. central mappings fetched from Aforo (conf.mappings_url) -- the scalable
+--      answer: declared on the metric, no gateway deploy per metric
+--   3. metric_mappings -- local config rules; also the fallback when catalog is
+--      unreachable and nothing is cached yet
+--   4. metric_name_pattern -- only when explicitly set, for backward compat
+--   5. default_metric -- a single registered fallback, so an unmapped endpoint
 --      still bills as generic usage rather than being rejected
 local function resolve_metric_name(conf, method, path, service_name, route_name,
                                    consumer_name, header_metric)
@@ -374,8 +500,18 @@ local function resolve_metric_name(conf, method, path, service_name, route_name,
         return header_metric
     end
 
-    -- 2. Ordered mappings. Lua patterns, not globs: "^/api/sms" anchors, and
-    -- ordering is the operator's tie-breaker, so put specific before general.
+    -- 2. Central mappings from Aforo, when configured. Above local config so the
+    -- customer's own catalog wins; below the header so a backend can still speak
+    -- for a single request. Falls through when the cache is empty or has no rule
+    -- for this path, so an unreachable catalog degrades to local config rather
+    -- than to nothing.
+    local central = metric_from_cached_mappings(path)
+    if central and central ~= "" then
+        return central
+    end
+
+    -- 3. Local config mappings. Lua patterns, not globs: "^/api/sms" anchors,
+    -- and ordering is the operator's tie-breaker, so put specific before general.
     if conf.metric_mappings then
         for _, rule in ipairs(conf.metric_mappings) do
             local method_ok = (rule.method == nil or rule.method == ""
@@ -394,7 +530,7 @@ local function resolve_metric_name(conf, method, path, service_name, route_name,
         end
     end
 
-    -- 3. Legacy template, honoured only if the operator actually chose one.
+    -- 4. Legacy template, honoured only if the operator actually chose one.
     local pattern = conf.metric_name_pattern
     if pattern and pattern ~= "" and pattern ~= DEFAULT_METRIC_PATTERN then
         local result = pattern
@@ -406,7 +542,7 @@ local function resolve_metric_name(conf, method, path, service_name, route_name,
         return result
     end
 
-    -- 4. Fallback.
+    -- 5. Fallback.
     return conf.default_metric or "api_calls"
 end
 
@@ -629,6 +765,9 @@ end
 
 function AforoMeteringHandler:access(conf)
     kong.ctx.shared.aforo_trace = extract_trace_context()
+
+    -- Only ever schedules a background refresh; never waits on one.
+    maybe_refresh_mappings(conf)
 
     -- Stash the request body for the log phase (2026-09-01 fix).
     -- kong.request.get_raw_body() is access/rewrite-phase only. Calling it from

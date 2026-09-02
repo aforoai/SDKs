@@ -61,6 +61,26 @@ return {
                         },
                     },
                     {
+                        mappings_url = {
+                            type = "string",
+                            description = "Aforo catalog gateway-mappings endpoint, e.g. https://catalog.aforo.ai/internal/v1/metrics/gateway-mappings. When set, endpoint-to-metric rules are fetched from Aforo and refreshed in the background, so adding a metric needs no gateway change. Falls back to metric_mappings then default_metric when unset or unreachable. Leave empty to disable.",
+                        },
+                    },
+                    {
+                        mappings_refresh_seconds = {
+                            type = "number",
+                            default = 300,
+                            description = "How often to refresh central mappings. Only used until the first successful response; after that the TTL the API returns wins, so cadence is tuned centrally rather than per gateway.",
+                        },
+                    },
+                    {
+                        mappings_timeout_ms = {
+                            type = "number",
+                            default = 3000,
+                            description = "Timeout for the background mappings fetch. Never on the request path -- a slow catalog delays a refresh, it does not delay traffic.",
+                        },
+                    },
+                    {
                         default_metric = {
                             type = "string",
                             default = "api_calls",
