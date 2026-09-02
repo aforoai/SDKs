@@ -76,7 +76,10 @@ In `kong.conf`:
 ```
 plugins = bundled,aforo-metering
 nginx_http_lua_shared_dict = aforo_buffer 10m
+lua_ssl_verify_depth = 3
 ```
+
+> ⚠ `lua_ssl_verify_depth` is not optional when `aforo_endpoint` is `https://` — which it is in production. Kong defaults it to `1`, too shallow for an ordinary leaf → intermediate → root chain, and every flush then fails with `20: unable to get local issuer certificate`. That message reads like a missing CA bundle and is not one: Kong already trusts the system store via `lua_ssl_trusted_certificate`, so installing certificates changes nothing. Only the depth does. Events are re-buffered rather than lost, so the symptom is a stalled pipeline rather than an outage.
 
 > ⚠ The shared dict is not optional. The log phase buffers events into the `aforo_buffer` dict and a timer flushes them. Without the dict line, every request logs `Shared dict 'aforo_buffer' not available` and the event is dropped. In a raw nginx template the equivalent directive is `lua_shared_dict aforo_buffer 10m;`.
 

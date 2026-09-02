@@ -47,3 +47,14 @@ ENV KONG_PLUGINS=bundled,aforo-metering
 # plugin loads and proxies traffic but silently meters nothing -- every log-phase
 # call bails out with "Shared dict 'aforo_buffer' not found".
 ENV KONG_NGINX_HTTP_LUA_SHARED_DICT="aforo_buffer 10m"
+
+# Required for an https aforo_endpoint -- i.e. every production deployment.
+#
+# Kong defaults lua_ssl_verify_depth to 1, which is too shallow for an ordinary
+# certificate chain (leaf -> intermediate -> root needs at least 2). OpenSSL
+# reports the shortfall as "20: unable to get local issuer certificate", which
+# reads like a missing CA bundle and is not one: the image already ships a
+# complete trust store at /etc/ssl/certs/ca-certificates.crt, and Kong already
+# points lua_ssl_trusted_certificate at it. Installing more certificates does
+# nothing; only the depth does.
+ENV KONG_LUA_SSL_VERIFY_DEPTH=3

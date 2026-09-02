@@ -43,6 +43,12 @@ services:
       # handler.lua buffers events here. Without it the plugin loads, proxies
       # traffic, and silently meters nothing.
       KONG_NGINX_HTTP_LUA_SHARED_DICT: "aforo_buffer 10m"
+      # Needed whenever aforo_endpoint is https. Kong's default of 1 is too
+      # shallow for a normal certificate chain and every flush fails with
+      # "unable to get local issuer certificate" -- which is a depth problem,
+      # not a missing-CA problem. Also set in the plugin image; repeated here so
+      # the requirement is visible to anyone reading only this file.
+      KONG_LUA_SSL_VERIFY_DEPTH: "3"
     volumes:
       - ./kong/kong.yml:/kong/kong.yml:ro
     # Override when 8000/8001 are already taken:

@@ -452,6 +452,19 @@ local function flush_buffer(premature, conf)
         kong.log.warn("[aforo-metering] Flush attempt ", attempt, "/", max_retries,
             " failed (status=", status, ", err=", err or "none", ")")
 
+        -- Name the fix for the one failure that is reliably misdiagnosed.
+        -- OpenSSL error 20 against an https endpoint almost always means Kong's
+        -- lua_ssl_verify_depth (default 1) is too shallow for the chain, NOT a
+        -- missing CA bundle -- so operators go install certificates that are
+        -- already there. Only logged on the final attempt to avoid noise.
+        if attempt == max_retries and err and string.find(err, "unable to get local issuer certificate", 1, true) then
+            kong.log.err("[aforo-metering] TLS verification failed for ", conf.aforo_endpoint, ". ",
+                "This is usually lua_ssl_verify_depth, which Kong defaults to 1 -- too shallow for a ",
+                "leaf/intermediate/root chain. Set lua_ssl_verify_depth = 3 in kong.conf (or ",
+                "KONG_LUA_SSL_VERIFY_DEPTH=3). Adding CA certificates will not help: Kong already ",
+                "trusts the system bundle via lua_ssl_trusted_certificate.")
+        end
+
         if attempt < max_retries then
             ngx.sleep(math.pow(2, attempt - 1))
         end
