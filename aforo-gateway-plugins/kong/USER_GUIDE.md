@@ -24,7 +24,114 @@ luarocks install lua-resty-http
 luarocks make kong-plugin-aforo-metering-2.0.0-1.rockspec
 ```
 
-`luarocks make` reads `kong-plugin-aforo-metering-2.0.0-1.rockspec` and installs the `kong.plugins.aforo-metering.handler` and `.schema` modules.
+`luarocks make` reads `kong-plugin-aforo-metering-2.0.0-1.rockspec` and installs the `handler`, `schema`, `rate-limit-enforce`, `margin-guard`, `preflight-quota` and `compound-metering` modules under `kong.plugins.aforo-metering.*`.
+
+Two things that will bite you if you skip them:
+
+- **Run `luarocks make` from inside this directory.** It resolves `build.modules` paths relative to the working directory, so `luarocks make kong/…rockspec` from a parent fails with `handler.lua: No such file or directory`.
+- **Do not install `lua-resty-jwt`.** RS256 verification uses `resty.openssl`, which already ships with Kong. `lua-resty-jwt` depends on `lua-resty-hmac`, whose FFI binding cannot load against the OpenSSL 3 that Kong 3.x links — it fails with `size of C type is unknown or too large` because `HMAC_CTX` is opaque in OpenSSL 3. It installs cleanly and then fails at `require()`, which looks like a Lua-path problem and is not one.
+
+### Running in Docker
+
+Installing the plugin into a *running* Kong container does not survive, and the reason is not obvious. `KONG_PLUGINS` is an environment variable, so changing it forces `docker rm` + `docker run` — which discards whatever `luarocks make` put in the old container. The new container then dies during `init_by_lua` with `aforo-metering plugin is enabled but not installed`, and because it never reaches a running state you cannot `docker exec` in to install it. That is a deadlock, not a flaky install.
+
+Build an image with the plugin already present:
+
+```bash
+cd SDKs/aforo-gateway-plugins/kong
+docker build -t kong-aforo:3.4 .
+docker run -d --name kong --network=kong-net \
+  -e KONG_DATABASE=postgres -e KONG_PG_HOST=kong-database \
+  -e KONG_PG_USER=kong -e KONG_PG_PASSWORD=kong \
+  -e KONG_ADMIN_LISTEN=0.0.0.0:8001 \
+  -p 8000:8000 -p 8001:8001 kong-aforo:3.4
+```
+
+The `Dockerfile` sets `KONG_PLUGINS` and the `aforo_buffer` shared dict for you. Verify:
+
+```bash
+curl -s http://localhost:8001/ | grep -o aforo-metering
+```
+
+### Local development: mounting the plugin from source
+
+Rebuilding the image for every edit is slow. Mount the source over the installed copy instead — edit a `.lua` file, `docker restart kong`, done:
+
+```bash
+cd SDKs/aforo-gateway-plugins/kong
+docker run -d --name kong --network=kong-net \
+  -e KONG_DATABASE=postgres -e KONG_PG_HOST=kong-database \
+  -e KONG_PG_USER=kong -e KONG_PG_PASSWORD=kong \
+  -e KONG_ADMIN_LISTEN=0.0.0.0:8001 \
+  -v "$PWD:/usr/local/share/lua/5.1/kong/plugins/aforo-metering:ro" \
+  -p 8000:8000 -p 8001:8001 kong-aforo:3.4
+```
+
+Still based on `kong-aforo:3.4`, because the mount only replaces the plugin — `lua-resty-jwt` still has to come from the image.
+
+## Choosing what each endpoint bills as
+
+The plugin's legacy default, `metric_name_pattern = "{method} {path}"`, produces one
+metric per endpoint — `GET /api/products`, `POST /api/sms/v2/send`. Aforo rejects any
+metric not registered in the catalog, so out of the box every event fails.
+
+Registering one metric per endpoint is not the fix. It makes the catalog track URL
+structure instead of business meaning, puts a line item per endpoint on the invoice, and
+turns adding an endpoint into a billing change. Billing wants `sms_sent`, `otp_delivered`,
+`call_minutes` — and many endpoints map onto one of those.
+
+Aforo cannot do this mapping server-side. Metric filters narrow which events count toward
+a metric the event has **already named**, so the name has to be correct when it arrives.
+The gateway is the right place.
+
+### Map paths to metrics
+
+```yaml
+config:
+  metric_mappings:
+    - path_pattern: "^/api/otp"      # specific first — first match wins
+      metric_name: otp_delivered
+    - path_pattern: "^/api/sms"
+      metric_name: sms_sent
+    - path_pattern: "^/api/call"
+      method: POST                   # optional; any verb when omitted
+      metric_name: call_minutes
+  default_metric: api_calls          # unmapped endpoints still bill
+```
+
+`path_pattern` is a Lua pattern, not a glob — anchor with `^`. Rules are evaluated in
+order, so put specific before general. A malformed pattern is skipped with an error rather
+than taking metering down.
+
+`default_metric` matters more than it looks: it means a newly added endpoint bills as
+generic usage instead of being rejected. Adding a route is not a billing outage. It must
+exist in your catalog.
+
+### When only the backend knows
+
+Some values a gateway cannot observe — call duration, tokens consumed, which of several
+billable actions a multi-purpose endpoint performed. The backend can say so per request:
+
+```
+X-Aforo-Metric: call_minutes
+X-Aforo-Quantity: 7.5
+```
+
+These are **response** headers, set by your upstream, so a client cannot forge them. Both
+override the mapping for that request. A quantity that is not a positive number is ignored
+with a warning, because the ingestor requires `quantity > 0` and a malformed value would
+otherwise fail the whole batch.
+
+Configurable via `metric_header` / `quantity_header`; set either to empty to disable.
+
+### Resolution order
+
+1. `metric_header` from the upstream response
+2. first matching `metric_mappings` rule
+3. `metric_name_pattern`, only if explicitly set to something other than the default
+4. `default_metric`
+
+Existing deployments that set a custom `metric_name_pattern` keep working unchanged.
 
 ## Step 2 — Register the plugin and the shared buffer
 
@@ -33,7 +140,10 @@ In `kong.conf`:
 ```
 plugins = bundled,aforo-metering
 nginx_http_lua_shared_dict = aforo_buffer 10m
+lua_ssl_verify_depth = 3
 ```
+
+> ⚠ `lua_ssl_verify_depth` is not optional when `aforo_endpoint` is `https://` — which it is in production. Kong defaults it to `1`, too shallow for an ordinary leaf → intermediate → root chain, and every flush then fails with `20: unable to get local issuer certificate`. That message reads like a missing CA bundle and is not one: Kong already trusts the system store via `lua_ssl_trusted_certificate`, so installing certificates changes nothing. Only the depth does. Events are re-buffered rather than lost, so the symptom is a stalled pipeline rather than an outage.
 
 > ⚠ The shared dict is not optional. The log phase buffers events into the `aforo_buffer` dict and a timer flushes them. Without the dict line, every request logs `Shared dict 'aforo_buffer' not available` and the event is dropped. In a raw nginx template the equivalent directive is `lua_shared_dict aforo_buffer 10m;`.
 

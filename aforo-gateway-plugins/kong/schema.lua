@@ -42,7 +42,63 @@ return {
                         metric_name_pattern = {
                             type = "string",
                             default = "{method} {path}",
-                            description = "Template for metric name. Variables: {method}, {path}, {service}, {route}, {consumer}",
+                            description = "DEPRECATED. Template for metric name: {method}, {path}, {service}, {route}, {consumer}. Produces one metric per endpoint, which Aforo rejects unless every endpoint is registered in the catalog as its own metric. Prefer metric_mappings. Honoured only when set to something other than the default.",
+                        },
+                    },
+                    {
+                        metric_mappings = {
+                            type = "array",
+                            required = false,
+                            description = "Ordered endpoint-to-metric rules; first match wins, so put specific rules before general ones. path_pattern is a Lua pattern matched against the request path (anchor with ^). method is optional and matches any verb when omitted. Example: {path_pattern='^/api/sms', metric_name='sms_sent'}.",
+                            elements = {
+                                type = "record",
+                                fields = {
+                                    { path_pattern = { type = "string", required = true } },
+                                    { method = { type = "string", required = false } },
+                                    { metric_name = { type = "string", required = true } },
+                                },
+                            },
+                        },
+                    },
+                    {
+                        mappings_url = {
+                            type = "string",
+                            description = "Aforo catalog gateway-mappings endpoint, e.g. https://catalog.aforo.ai/internal/v1/metrics/gateway-mappings. When set, endpoint-to-metric rules are fetched from Aforo and refreshed in the background, so adding a metric needs no gateway change. Falls back to metric_mappings then default_metric when unset or unreachable. Leave empty to disable.",
+                        },
+                    },
+                    {
+                        mappings_refresh_seconds = {
+                            type = "number",
+                            default = 300,
+                            description = "How often to refresh central mappings. Only used until the first successful response; after that the TTL the API returns wins, so cadence is tuned centrally rather than per gateway.",
+                        },
+                    },
+                    {
+                        mappings_timeout_ms = {
+                            type = "number",
+                            default = 3000,
+                            description = "Timeout for the background mappings fetch. Never on the request path -- a slow catalog delays a refresh, it does not delay traffic.",
+                        },
+                    },
+                    {
+                        default_metric = {
+                            type = "string",
+                            default = "api_calls",
+                            description = "Metric used when no mapping matches. Must exist in the Aforo catalog. Keeps an unmapped endpoint billing as generic usage instead of being rejected, so adding an endpoint is not a billing outage.",
+                        },
+                    },
+                    {
+                        metric_header = {
+                            type = "string",
+                            default = "X-Aforo-Metric",
+                            description = "Upstream RESPONSE header that overrides the metric for a single request. For cases only the backend knows, e.g. one endpoint serving several billable actions. Read from the response, so clients cannot forge it. Set empty to disable.",
+                        },
+                    },
+                    {
+                        quantity_header = {
+                            type = "string",
+                            default = "X-Aforo-Quantity",
+                            description = "Upstream RESPONSE header supplying the quantity for a single request. Needed for metrics whose value only the backend knows -- call_minutes, tokens, bytes processed -- which a gateway cannot observe. Ignored unless it parses to a positive number. Set empty to disable.",
                         },
                     },
                     {
@@ -137,6 +193,13 @@ return {
                             type = "string",
                             encrypted = true,
                             description = "PEM-encoded RSA public key for offline RS256 verification. Alternative to jwt_jwks_uri for static key setups.",
+                        },
+                    },
+                    {
+                        jwt_allow_unverified_signature = {
+                            type = "boolean",
+                            default = false,
+                            description = "DANGEROUS. Accept JWTs whose RS256 signature could not be verified (lua-resty-jwt missing, or no jwt_public_key set). Defaults to false: unverifiable tokens are rejected. Enable ONLY when signatures are already verified upstream (Kong Enterprise native JWT plugin, service mesh, external authorizer). With this true and no verification upstream, any caller can mint a token naming any customer_id/tenant_id.",
                         },
                     },
                     -- Redis host/port are shared with rate-limit enforcement above.
