@@ -135,6 +135,35 @@ local function parse_jwt_claims(token)
     return claims, parts
 end
 
+-- Shared dict backing the event buffer and the warning throttle below.
+-- Declared here, above its first use: as a local defined further down it was
+-- invisible to warn_throttled, which then silently resolved a nil global and
+-- fell back to logging every time -- the throttle looked applied and did nothing.
+local BUFFER_DICT = "aforo_buffer"
+
+-- Rate-limit a repeating warning to once per interval (2026-09-03).
+--
+-- The revocation checks run on every request, so an unreachable Redis emitted
+-- two WARN lines per request -- 24 lines for a dozen page loads. That is not a
+-- cosmetic problem: it buried the CORS-preflight lines that explained why events
+-- were being rejected, and made a real fault invisible inside its own noise.
+--
+-- Throttled through the shared dict rather than a per-worker variable so the
+-- interval holds across all workers; add() is atomic and expires on its own, so
+-- the first caller in each window logs and the rest stay silent. Falls back to
+-- logging when the dict is unavailable: losing a warning entirely is worse than
+-- repeating it.
+local function warn_throttled(key, ttl, ...)
+    local dict = ngx.shared[BUFFER_DICT]
+    if not dict then
+        kong.log.warn(...)
+        return
+    end
+    if dict:add("aforo:warn:" .. key, 1, ttl or 60) then
+        kong.log.warn(...)
+    end
+end
+
 -- Check jti blocklist in Redis.  Fail-open: returns false on any Redis error.
 local function is_jti_blocked(jti, redis_host, redis_port)
     if not jti or jti == "" then return false end
@@ -142,7 +171,11 @@ local function is_jti_blocked(jti, redis_host, redis_port)
     red:set_timeout(500)
     local ok, err = red:connect(redis_host or "127.0.0.1", redis_port or 6379)
     if not ok then
-        kong.log.warn("[aforo-metering] Redis connect failed for jti check: ", err)
+        warn_throttled("redis_jti", 60,
+            "[aforo-metering] Redis unreachable for jti-blocklist check at ",
+            redis_host or "127.0.0.1", ":", redis_port or 6379, " (", err, "). ",
+            "Failing OPEN -- revoked tokens are NOT being rejected. ",
+            "Set jwt_redis_host/jwt_redis_port. Repeats suppressed for 60s.")
         return false  -- fail-open: do not block legitimate requests on Redis failure
     end
     local val = red:get("jti:blocked:" .. jti)
@@ -157,7 +190,11 @@ local function is_client_revoked(key_id, redis_host, redis_port)
     red:set_timeout(500)
     local ok, err = red:connect(redis_host or "127.0.0.1", redis_port or 6379)
     if not ok then
-        kong.log.warn("[aforo-metering] Redis connect failed for client revocation check: ", err)
+        warn_throttled("redis_revocation", 60,
+            "[aforo-metering] Redis unreachable for client-revocation check at ",
+            redis_host or "127.0.0.1", ":", redis_port or 6379, " (", err, "). ",
+            "Failing OPEN -- revoked API keys are NOT being rejected. ",
+            "Set jwt_redis_host/jwt_redis_port. Repeats suppressed for 60s.")
         return false
     end
     local val = red:get("jti:client:" .. key_id)
@@ -310,7 +347,6 @@ local AforoMeteringHandler = {
 }
 
 -- Shared memory buffer name (must be declared in kong.conf: lua_shared_dict aforo_buffer 10m)
-local BUFFER_DICT = "aforo_buffer"
 local BUFFER_KEY = "events"
 local BUFFER_COUNT_KEY = "event_count"
 local MAX_BUFFER_SIZE = 10000
