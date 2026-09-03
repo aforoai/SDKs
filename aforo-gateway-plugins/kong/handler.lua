@@ -650,9 +650,23 @@ local function flush_buffer(premature, conf)
         local res, err = httpc:request_uri(conf.aforo_endpoint, {
             method  = "POST",
             body    = body,
+            -- X-API-Key, not Authorization: Bearer (2026-09-03).
+            --
+            -- The ingestor authenticates keys through aforo-common's
+            -- ApiKeyAuthFilter, which reads X-API-Key and nothing else. A key sent
+            -- as a Bearer token is simply not seen: the request stays anonymous and
+            -- /v1/ingest/batch answers 403 "You don't have permission to
+            -- usage-events:ingest", which reads like a permissions problem on the
+            -- key rather than a header the server never looked at.
+            --
+            -- Sent ALONE. Adding Authorization: Bearer alongside as a fallback was
+            -- tried and is actively harmful: an API key in that header is parsed as
+            -- a JWT, fails, and the request is rejected 401 before the API-key
+            -- filter ever runs. Verified against production -- X-API-Key alone
+            -- returns 202, the two together return 401.
             headers = {
                 ["Content-Type"]  = "application/json",
-                ["Authorization"] = "Bearer " .. (conf.api_key or ""),
+                ["X-API-Key"]     = conf.api_key or "",
                 ["X-Tenant-Id"]   = conf.tenant_id or "",
             },
         })
