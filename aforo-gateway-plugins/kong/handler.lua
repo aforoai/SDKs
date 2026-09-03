@@ -886,6 +886,19 @@ function AforoMeteringHandler:log(conf)
     if should_exclude_path(path, conf.exclude_paths) then return end
     if should_exclude_status(status, conf.exclude_status_codes) then return end
 
+    -- Never meter a CORS preflight (2026-09-03).
+    --
+    -- A preflight is a browser protocol detail, not a billable API call, and it
+    -- carries no Authorization header by definition -- so it has no customer and
+    -- never can. Worse, Kong's cors plugin answers it in the access phase and
+    -- short-circuits the chain, so this plugin's access handler never runs and no
+    -- JWT claims are stashed; only the log phase fires. The result was an event
+    -- with an empty customerId, which the ingestor rejects, failing the whole
+    -- batch it travelled in and taking every valid event with it.
+    if method == "OPTIONS" and kong.request.get_header("Access-Control-Request-Method") then
+        return
+    end
+
     local consumer = kong.client.get_consumer()
     local headers = kong.request.get_headers()
     local service = kong.router.get_service()
@@ -999,6 +1012,22 @@ function AforoMeteringHandler:log(conf)
     if jwt_claims and jwt_claims.key_id and jwt_claims.key_id ~= "" then
         event.metadata = event.metadata or {}
         event.metadata.keyId = jwt_claims.key_id
+    end
+
+    -- Refuse to buffer an event that can never be accepted (2026-09-03).
+    --
+    -- customerId is what usage attributes to; the ingestor rejects a blank one.
+    -- Because it validates a batch as a whole, a single such event fails the
+    -- request and every well-formed event batched with it is rejected too. Since
+    -- nothing downstream can supply the missing value later, buffering it only
+    -- damages the events around it -- so it is dropped here, at the one point
+    -- where the loss is limited to the event actually at fault.
+    if not event.customerId or event.customerId == "" then
+        kong.log.warn("[aforo-metering] Skipping ", method, " ", path,
+            " -- no customer identity resolved. With jwt_validation_enabled the ",
+            "customer_id claim supplies this; otherwise set customer_id_source to a ",
+            "Kong consumer. Event not metered.")
+        return
     end
 
     -- Buffer the event
