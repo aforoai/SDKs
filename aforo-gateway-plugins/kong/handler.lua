@@ -646,6 +646,7 @@ local function flush_buffer(premature, conf)
     local body = cjson.encode({ events = events })
 
     local max_retries = 3
+    local last_status, last_body
     for attempt = 1, max_retries do
         local res, err = httpc:request_uri(conf.aforo_endpoint, {
             method  = "POST",
@@ -677,6 +678,8 @@ local function flush_buffer(premature, conf)
         end
 
         local status = res and res.status or "no response"
+        last_status = res and res.status or nil
+        last_body = res and res.body or nil
         kong.log.warn("[aforo-metering] Flush attempt ", attempt, "/", max_retries,
             " failed (status=", status, ", err=", err or "none", ")")
 
@@ -698,7 +701,33 @@ local function flush_buffer(premature, conf)
         end
     end
 
-    -- Re-buffer instead of dropping (2026-09-01 fix).
+    -- Drop on a permanent rejection; only retry what retrying can fix
+    -- (2026-09-03 fix).
+    --
+    -- Re-buffering EVERY failure, added 2026-09-01, created a poison pill. The
+    -- ingestor validates the batch as a whole: one event the server considers
+    -- malformed fails the request with 400, so the whole batch came back and was
+    -- re-buffered -- including every well-formed event in it. The bad event was
+    -- then retried forever, failing the batch every time and dragging good
+    -- events down with it. Metering stops permanently and the log only says
+    -- "flush attempts failed", which reads like the ingestor being unwell rather
+    -- than one unacceptable event stuck at the head of the queue.
+    --
+    -- 4xx means the server understood us and refused; retrying sends the same
+    -- bytes to the same judgement. 408 and 429 are the exceptions -- both
+    -- explicitly invite a retry. Anything else (5xx, timeout, connection
+    -- refused) is transient and worth keeping, which is what the original fix
+    -- was for.
+    local permanent = last_status and last_status >= 400 and last_status < 500
+        and last_status ~= 408 and last_status ~= 429
+    if permanent then
+        kong.log.err("[aforo-metering] Ingestor rejected the batch with ", last_status,
+            " -- dropping ", #events, " event(s) rather than retrying them forever. ",
+            "Response: ", string.sub(tostring(last_body or ""), 1, 500))
+        return
+    end
+
+    -- Re-buffer transient failures (2026-09-01 fix).
     -- The buffer is cleared before the first attempt, so an ingestor outage
     -- outlasting 3 retries used to destroy the only copy of these events:
     -- unbilled usage, no dead-letter, nothing to reconstruct from. Push them
