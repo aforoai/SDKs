@@ -7,6 +7,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 Brings the fragments in line with Azure's policy-fragment rules and the ingestor contract. **Breaking**: new required fragment `aforo-context` and new Named Values (`aforo-default-metric`, `aforo-metric-mappings`, `aforo-subscription-customer-map`, `aforo-org-service-url`); compound path Named Values change format. None of this has been run on a live APIM instance.
 
 ### Fixed
+- Docs: the example ingestor URL is now `https://usage-ingestor.aforo.ai/v1/ingest/batch`. `ingest.aforo.ai` is CloudFront in front of S3: a POST gets a 301 from AmazonS3 and never reaches the ingestor.
 - **Auth**: every fragment sent `Authorization: Bearer {{aforo-api-key}}`, which the ingestor never reads (and rejects 401). Now `X-API-Key` alone; `X-Tenant-Id` is no longer sent to the ingestor (tenant comes from the key).
 - **Customer identity**: metering sent `context.Subscription.Id` or the literal `"unknown"`; compound and preflight sent `context.Subscription.Key` — the subscription **secret** — as `customerId`. The new `aforo-context` fragment resolves the JWT `customer_id` claim, else an admin-maintained `aforo-subscription-customer-map`; requests with no customer (or > 64 chars) are not metered.
 - **Metric**: `{method} {path}` / `{method} {UrlTemplate}` is never a catalog metric, so every event was rejected. Replaced by `aforo-metric-mappings` (EXACT/PREFIX/CONTAINS) + `aforo-default-metric`.

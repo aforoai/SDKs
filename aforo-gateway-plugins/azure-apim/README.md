@@ -96,7 +96,7 @@ Create these as APIM **Named Values** (mark `aforo-api-key` Secret). The fragmen
 
 | Named Value | Used by | What it does |
 |---|---|---|
-| `aforo-endpoint` | metering | Aforo ingestor batch URL, e.g. `https://ingest.aforo.ai/v1/ingest/batch`. |
+| `aforo-endpoint` | metering | Aforo ingestor batch URL, e.g. `https://usage-ingestor.aforo.ai/v1/ingest/batch`. |
 | `aforo-api-key` | metering, compound, quota | Aforo API key, scope `usage:ingest`. Sent as `X-API-Key`. Mark Secret. |
 | `aforo-default-metric` | metering | Metric for requests no mapping matches, e.g. `api_calls`. **Must be registered in the Aforo catalog** — an unknown metric fails the batch with 400. |
 | `aforo-metric-mappings` | metering | Endpoint→metric rules, first match wins: `KIND\|value\|metricName` separated by `;`, `KIND` = `EXACT`, `PREFIX` or `CONTAINS`, matched against the client-facing path (`context.Request.OriginalUrl.Path`, which includes the API URL suffix). E.g. `PREFIX\|/sms/v1/send\|sms_sent;EXACT\|/otp/v1/verify\|otp_verified`. `none` = no mappings. Same semantics as catalog's `/internal/v1/metrics/gateway-mappings`, supplied as config because these fragments do not fetch it. |

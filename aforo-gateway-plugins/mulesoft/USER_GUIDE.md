@@ -52,7 +52,7 @@ Set the metering policy properties:
 
 | Property | Value |
 |---|---|
-| `aforo-endpoint` | `https://ingest.aforo.ai/v1/ingest/batch` |
+| `aforo-endpoint` | `https://usage-ingestor.aforo.ai/v1/ingest/batch` |
 | `aforo-api-key` | your Aforo API key (sensitive) |
 | `aforo-tenant-id` | `tenant_acme` (admin-pinned tenant fallback) |
 | `mcp-enabled` | `false` (set `true` only if fronting an MCP server) |

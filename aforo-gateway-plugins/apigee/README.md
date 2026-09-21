@@ -52,7 +52,7 @@ TOKEN="$(gcloud auth print-access-token)"
 apigeecli kvms create --name aforo-metering-config --org "$APIGEE_ORG" --token "$TOKEN"
 kv() { apigeecli kvms entries create --map aforo-metering-config --org "$APIGEE_ORG" --key "$1" --value "$2" --token "$TOKEN"; }
 
-kv aforo_endpoint  https://ingest.aforo.ai/v1/ingest/batch
+kv aforo_endpoint  https://usage-ingestor.aforo.ai/v1/ingest/batch
 kv api_key         "$AFORO_API_KEY"          # scope usage:ingest; sent as X-API-Key
 kv default_metric  api_calls                  # must exist in your Aforo catalog
 kv metric_mappings '[{"matchType":"PREFIX","value":"/sms/v1/send","metricName":"sms_sent"}]'
@@ -78,7 +78,7 @@ The bundle reads config from the organization-scoped KVM `aforo-metering-config`
 
 | KVM key | Flow variable | Default | What it does |
 |---------|---------------|---------|--------------|
-| `aforo_endpoint` | `aforo.endpoint` | — | Aforo ingestor batch URL, e.g. `https://ingest.aforo.ai/v1/ingest/batch`. |
+| `aforo_endpoint` | `aforo.endpoint` | — | Aforo ingestor batch URL, e.g. `https://usage-ingestor.aforo.ai/v1/ingest/batch`. |
 | `api_key` | `private.aforo.apiKey` | — | Aforo API key, scope `usage:ingest`. Sent as `X-API-Key` only — an `Authorization: Bearer` header makes the ingestor answer 401. The tenant comes from the key. |
 | `default_metric` | `aforo.defaultMetric` | `api_calls` | Metric for unmapped requests. **Must be registered in the Aforo catalog**; an unknown metric fails the batch with 400. |
 | `metric_mappings` | `aforo.metricMappings` | — | JSON array `[{"matchType":"EXACT\|PREFIX\|CONTAINS","value":"/path","metricName":"m"}]`, first match wins, matched against `proxy.basepath + proxy.pathsuffix`. Same semantics as catalog's `/internal/v1/metrics/gateway-mappings` (which Kong fetches; here it is config). |
