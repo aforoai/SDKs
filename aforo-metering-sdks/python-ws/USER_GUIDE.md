@@ -36,7 +36,7 @@ billing = AforoWsBilling(
 
 All four arguments are required — the constructor raises `ValueError` if any is empty.
 
-> ⚠ `ingestor_url` is the **host**; this package appends `/v1/ingest/events`. Pass `https://usage-ingestor.aforo.ai`.
+> ⚠ `ingestor_url` is the **host**; this package appends `/v1/ingest/batch`. Pass `https://usage-ingestor.aforo.ai`.
 
 ## Step 3 — Resolve the customer, then wrap the connection
 
@@ -77,7 +77,7 @@ async def ws_handler(ws: WebSocket):
 
 ## Step 4 — Drive some frames and let the connection close
 
-Send and receive normally inside the block. When the `async with` exits — clean close, client disconnect, or an exception — the tracker emits the close event with `messageCount` (sent + received), `dataBytes`, `durationMs`, and a `wsCloseReason` label.
+Send and receive normally inside the block. When the `async with` exits — clean close, client disconnect, or an exception — the tracker emits the close event with `messageCount` (sent + received), `dataBytes`, `executionDurationMs`, and a `wsCloseReason` label.
 
 ## Step 5 — Verify it landed in Aforo
 
@@ -106,7 +106,7 @@ billing.shutdown()   # flushes the final batch before process exit
 | `tenant_id` | `str` | required | Aforo tenant; sent as `X-Tenant-Id`. |
 | `product_id` | `str` | required | Product the connections bill against. |
 | `api_key` | `str` | required | Aforo API key, sent as `X-API-Key`. |
-| `ingestor_url` | `str` | required | Host; `/v1/ingest/events` appended. |
+| `ingestor_url` | `str` | required | Host; `/v1/ingest/batch` appended. |
 | `flush_interval_sec` | `float` | `3.0` | Background flush cadence. |
 | `flush_count` | `int` | `100` | Buffer size that forces a flush. |
 | `per_frame_events` | `bool` | `False` | One event per frame vs. open + close. |

@@ -51,9 +51,9 @@ server.start()
 server.wait_for_termination()
 ```
 
-Every unary RPC is now metered — one `grpc_api.rpc_calls` event with `grpcStatusCode`, `grpcCallType=UNARY`, and `executionDurationMs`, POSTed to `https://usage-ingestor.aforo.ai/v1/ingest/events` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
+Every unary RPC is now metered — one `grpc_api.rpc_calls` event with `grpcStatusCode`, `grpcCallType=UNARY`, and `executionDurationMs`, POSTed to `https://usage-ingestor.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
 
-> ⚠ This package targets the ingestor's **`/v1/ingest/events`** path (the base and MCP Aforo SDKs use `/v1/ingest/batch`). Set `ingestor_url` to the host only — the SDK appends the path.
+> ⚠ Events are sent to the ingestor's **`/v1/ingest/batch`** path as `{"events": [...]}`, at most 1000 events per request (larger buffers are split). Set `ingestor_url` to the host only — the SDK appends the path.
 
 > The interceptor auto-wraps **unary** RPCs only. For server-stream / client-stream / bidi, call `billing.record(...)` yourself at the end of the handler (see the [user guide](USER_GUIDE.md#step-5--meter-streaming-rpcs)). `tenant_id` is fixed from config; the default extractor reads `x-customer-id` from invocation metadata, and calls with no resolvable customer ID are **not** metered.
 
@@ -66,7 +66,7 @@ Constructor arguments for `AforoGrpcBilling(...)`:
 | `tenant_id` | `str` | — (required) | Aforo tenant; sent as `X-Tenant-Id`. |
 | `product_id` | `str` | — (required) | Product the RPCs bill against. |
 | `api_key` | `str` | — (required) | Aforo API key, sent to the ingestor as `X-API-Key`. |
-| `ingestor_url` | `str` | — (required) | Host; `/v1/ingest/events` is appended. |
+| `ingestor_url` | `str` | — (required) | Host; `/v1/ingest/batch` is appended. |
 | `service_name` | `str` | — (required) | Fully-qualified gRPC service; stamped as `grpcService`. |
 | `flush_interval_sec` | `float` | `5.0` | Background flush cadence (daemon thread from construction). |
 | `flush_count` | `int` | `50` | Buffer size that triggers an immediate flush. |

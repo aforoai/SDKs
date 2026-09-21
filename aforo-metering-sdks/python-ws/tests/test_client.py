@@ -119,7 +119,8 @@ def test_push_connection_closed_uses_close_metric(http, cfg):
     assert ev["wsCloseReason"] == "NORMAL_CLOSURE"
     assert ev["messageCount"] == 10
     assert ev["dataBytes"] == 500
-    assert ev["durationMs"] == 1800000
+    assert ev["executionDurationMs"] == 1800000
+    assert "durationMs" not in ev
     b.shutdown()
 
 

@@ -36,7 +36,7 @@ billing = AforoMqttBilling(
 
 All four arguments are required — the constructor raises `ValueError` if any is empty.
 
-> ⚠ `ingestor_url` is the **host**; this package appends `/v1/ingest/events`. Pass `https://usage-ingestor.aforo.ai`.
+> ⚠ `ingestor_url` is the **host**; this package appends `/v1/ingest/batch`. Pass `https://usage-ingestor.aforo.ai`.
 
 ## Step 3 — Wrap your MQTT client
 
@@ -110,7 +110,7 @@ billing.shutdown()   # flushes the final batch before process exit
 | `tenant_id` | `str` | required | Aforo tenant; sent as `X-Tenant-Id`. |
 | `product_id` | `str` | required | Product the events bill against. |
 | `api_key` | `str` | required | Aforo API key, sent as `X-API-Key`. |
-| `ingestor_url` | `str` | required | Host; `/v1/ingest/events` appended. |
+| `ingestor_url` | `str` | required | Host; `/v1/ingest/batch` appended. |
 | `flush_interval_sec` | `float` | `2.0` | Background flush cadence. |
 | `flush_count` | `int` | `200` | Buffer size that forces a flush. |
 | `emit_deliver_events` | `bool` | `False` | Bill inbound `on_message` deliveries. |

@@ -43,6 +43,29 @@ except ImportError:  # pragma: no cover
 __version__ = "1.0.0"
 logger = logging.getLogger("aforo_grpc_metering")
 
+# POST /v1/ingest/batch takes 1..1000 events per request.
+MAX_BATCH_EVENTS = 1000
+MAX_CUSTOMER_ID_LEN = 64
+MAX_IDEMPOTENCY_KEY_LEN = 255
+
+
+def _cap_idempotency_key(key: str) -> str:
+    """Keep keys within the ingestor's 255-char limit while staying unique."""
+    if len(key) <= MAX_IDEMPOTENCY_KEY_LEN:
+        return key
+    suffix = uuid.uuid4().hex
+    return key[:MAX_IDEMPOTENCY_KEY_LEN - len(suffix) - 1] + ":" + suffix
+
+
+def _valid_customer_id(customer_id: Any) -> bool:
+    """customerId must be non-blank and at most 64 chars or the ingestor rejects the event."""
+    if not isinstance(customer_id, str) or not customer_id.strip():
+        return False
+    if len(customer_id) > MAX_CUSTOMER_ID_LEN:
+        logger.warning("dropping usage event: customerId longer than %d chars", MAX_CUSTOMER_ID_LEN)
+        return False
+    return True
+
 
 GRPC_STATUS_LABELS: Dict[int, str] = {
     0: "OK", 1: "CANCELLED", 2: "UNKNOWN", 3: "INVALID_ARGUMENT",
@@ -51,6 +74,16 @@ GRPC_STATUS_LABELS: Dict[int, str] = {
     10: "ABORTED", 11: "OUT_OF_RANGE", 12: "UNIMPLEMENTED",
     13: "INTERNAL", 14: "UNAVAILABLE", 15: "DATA_LOSS", 16: "UNAUTHENTICATED",
 }
+
+GRPC_CALL_TYPES = ("UNARY", "CLIENT_STREAM", "SERVER_STREAM", "BIDI_STREAM")
+
+
+def _status_label(status: Any) -> str:
+    """Normalise a status (int code or label) to one of the ingestor's grpcStatusCode values."""
+    if isinstance(status, int):
+        return GRPC_STATUS_LABELS.get(status, "UNKNOWN")
+    label = str(status or "").upper()
+    return label if label in GRPC_STATUS_LABELS.values() else "UNKNOWN"
 
 
 @dataclass
@@ -136,19 +169,22 @@ class AforoGrpcBilling:
         duration_ms: int,
         data_bytes: int = 0,
     ) -> None:
-        if not customer_id:
+        if not _valid_customer_id(customer_id):
             return
+        call_type = str(call_type or "").upper()
+        if call_type not in GRPC_CALL_TYPES:
+            call_type = "UNARY"
         now = datetime.now(timezone.utc)
         event = GrpcUsageEvent(
             customerId=customer_id,
             metricName="grpc_api.rpc_calls",
             quantity=1,
             occurredAt=now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-            idempotencyKey=f"grpc:{self.tenant_id}:{self.service_name}:{method}:{int(now.timestamp() * 1000)}:{uuid.uuid4().hex[:8]}",
+            idempotencyKey=_cap_idempotency_key(f"grpc:{self.tenant_id}:{self.service_name}:{method}:{int(now.timestamp() * 1000)}:{uuid.uuid4().hex[:8]}"),
             productType="GRPC_API",
             grpcService=self.service_name,
             grpcMethod=method,
-            grpcStatusCode=status,
+            grpcStatusCode=_status_label(status),
             grpcCallType=call_type,
             messageCount=message_count,
             dataBytes=data_bytes,
@@ -170,16 +206,23 @@ class AforoGrpcBilling:
         with self._buffer_lock:
             if not self._buffer:
                 return
-            batch = self._buffer
+            pending = self._buffer
             self._buffer = []
 
+        # /v1/ingest/batch accepts at most MAX_BATCH_EVENTS per request.
+        for i in range(0, len(pending), MAX_BATCH_EVENTS):
+            self._send_batch(pending[i:i + MAX_BATCH_EVENTS])
+
+    def _send_batch(self, batch: List[Dict[str, Any]]) -> None:
+        # Events (and their idempotencyKeys) are built once in record/push,
+        # so every retry below re-sends identical keys.
         body = {"events": batch}
         headers = {
             "Content-Type": "application/json",
             "X-API-Key": self.api_key,
             "X-Tenant-Id": self.tenant_id,
         }
-        url = f"{self.ingestor_url}/v1/ingest/events"
+        url = f"{self.ingestor_url}/v1/ingest/batch"
 
         # 3x exponential retry
         for attempt in range(3):

@@ -37,7 +37,7 @@ billing = AforoGrpcBilling(
 
 All five arguments are required — the constructor raises `ValueError` if any (including `service_name`) is missing.
 
-> ⚠ `ingestor_url` is the **host**; this package appends `/v1/ingest/events`. Pass `https://usage-ingestor.aforo.ai`.
+> ⚠ `ingestor_url` is the **host**; this package appends `/v1/ingest/batch`. Pass `https://usage-ingestor.aforo.ai`.
 
 ## Step 3 — Add the interceptor
 
@@ -121,7 +121,7 @@ billing.shutdown()   # flushes the final batch before process exit
 | `tenant_id` | `str` | required | Aforo tenant; sent as `X-Tenant-Id`. |
 | `product_id` | `str` | required | Product the RPCs bill against. |
 | `api_key` | `str` | required | Aforo API key, sent as `X-API-Key`. |
-| `ingestor_url` | `str` | required | Host; `/v1/ingest/events` appended. |
+| `ingestor_url` | `str` | required | Host; `/v1/ingest/batch` appended. |
 | `service_name` | `str` | required | Stamped as `grpcService`. |
 | `flush_interval_sec` | `float` | `5.0` | Background flush cadence. |
 | `flush_count` | `int` | `50` | Buffer size that forces a flush. |

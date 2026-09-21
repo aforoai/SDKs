@@ -153,7 +153,7 @@ async def test_CONNECTION_OPENED_and_CLOSED_on_real_websocket_roundtrip():
         # 3 frames received, 7+8+5 bytes total (receive side)
         assert closed["metadata"]["recvCount"] == 3
         assert closed["metadata"]["recvBytes"] == 7 + 8 + 5
-        assert closed["durationMs"] >= 0
+        assert closed["executionDurationMs"] >= 0
 
         billing.shutdown()
     finally:

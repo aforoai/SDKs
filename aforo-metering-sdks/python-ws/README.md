@@ -82,9 +82,9 @@ async def ws_handler(ws: WebSocket):
             await ws.send_text(f"echo: {data}")
 ```
 
-Events POST to `https://usage-ingestor.aforo.ai/v1/ingest/events` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`. The tracker counts sent/received messages and bytes by wrapping the connection's `send`/`recv`, and emits a close event with `messageCount`, `dataBytes`, and `durationMs` when the `async with` block exits.
+Events POST to `https://usage-ingestor.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`. The tracker counts sent/received messages and bytes by wrapping the connection's `send`/`recv`, and emits a close event with `messageCount`, `dataBytes`, and `executionDurationMs` when the `async with` block exits.
 
-> ⚠ This package targets the ingestor's **`/v1/ingest/events`** path (the base and MCP Aforo SDKs use `/v1/ingest/batch`). Set `ingestor_url` to the host only — the SDK appends the path.
+> ⚠ Events are sent to the ingestor's **`/v1/ingest/batch`** path as `{"events": [...]}`, at most 1000 events per request (larger buffers are split). Set `ingestor_url` to the host only — the SDK appends the path.
 
 > `customer_id` is resolved by **your** handler (the examples read `x-customer-id`) and passed into the tracker — read it from a header your gateway sets, not a value the client can spoof. The tracker doesn't meter a connection you don't wrap.
 
@@ -97,7 +97,7 @@ Constructor arguments for `AforoWsBilling(...)`:
 | `tenant_id` | `str` | — (required) | Aforo tenant; sent as `X-Tenant-Id`. |
 | `product_id` | `str` | — (required) | Product the connections bill against. |
 | `api_key` | `str` | — (required) | Aforo API key, sent to the ingestor as `X-API-Key`. |
-| `ingestor_url` | `str` | — (required) | Host; `/v1/ingest/events` is appended. |
+| `ingestor_url` | `str` | — (required) | Host; `/v1/ingest/batch` is appended. |
 | `flush_interval_sec` | `float` | `3.0` | Background flush cadence (daemon thread from construction). |
 | `flush_count` | `int` | `100` | Buffer size that triggers an immediate flush. |
 | `per_frame_events` | `bool` | `False` | Emit one event per inbound/outbound frame instead of open+close. |

@@ -37,7 +37,7 @@ billing = AforoGraphQlBilling(
 
 `tenant_id`, `product_id`, `api_key`, and `ingestor_url` are required — the constructor raises `ValueError` if any is missing.
 
-> ⚠ `ingestor_url` is the **host**. This package appends `/v1/ingest/events`. Pass `https://usage-ingestor.aforo.ai`, not the full path.
+> ⚠ `ingestor_url` is the **host**. This package appends `/v1/ingest/batch`. Pass `https://usage-ingestor.aforo.ai`, not the full path.
 
 ## Step 3 — Wire it into your server
 
@@ -118,7 +118,7 @@ billing.shutdown()   # stops the flush thread and drains remaining events
 | `tenant_id` | `str` | required | Aforo tenant; sent as `X-Tenant-Id`. |
 | `product_id` | `str` | required | Product the operations bill against. |
 | `api_key` | `str` | required | Aforo API key, sent as `X-API-Key`. |
-| `ingestor_url` | `str` | required | Host; `/v1/ingest/events` appended. |
+| `ingestor_url` | `str` | required | Host; `/v1/ingest/batch` appended. |
 | `schema_version` | `str?` | `None` | Stamped on each event. |
 | `flush_interval_sec` | `float` | `5.0` | Background flush cadence. |
 | `flush_count` | `int` | `50` | Buffer size that forces a flush. |

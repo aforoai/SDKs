@@ -76,9 +76,9 @@ async def main():
             print(msg.topic, msg.payload)
 ```
 
-Each metered event POSTs to `https://usage-ingestor.aforo.ai/v1/ingest/events` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`, carrying `mqttEventType`, `mqttTopic`, `mqttQos`, `mqttRetained`, `mqttClientId`, and `dataBytes`.
+Each metered event POSTs to `https://usage-ingestor.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`, carrying `mqttEventType`, `mqttTopic`, `mqttQos`, `mqttRetained`, `mqttClientId`, and `dataBytes`.
 
-> ⚠ This package targets the ingestor's **`/v1/ingest/events`** path (the base and MCP Aforo SDKs use `/v1/ingest/batch`). Set `ingestor_url` to the host only — the SDK appends the path.
+> ⚠ Events are sent to the ingestor's **`/v1/ingest/batch`** path as `{"events": [...]}`, at most 1000 events per request (larger buffers are split). Set `ingestor_url` to the host only — the SDK appends the path.
 
 > `customer_id` is passed in when you wrap the client — supply it from your trusted device/account mapping, not from anything the broker peer controls. `tenant_id` is fixed from config and sent as a header.
 
@@ -91,7 +91,7 @@ Constructor arguments for `AforoMqttBilling(...)`:
 | `tenant_id` | `str` | — (required) | Aforo tenant; sent as `X-Tenant-Id`. |
 | `product_id` | `str` | — (required) | Product the events bill against. |
 | `api_key` | `str` | — (required) | Aforo API key, sent to the ingestor as `X-API-Key`. |
-| `ingestor_url` | `str` | — (required) | Host; `/v1/ingest/events` is appended. |
+| `ingestor_url` | `str` | — (required) | Host; `/v1/ingest/batch` is appended. |
 | `flush_interval_sec` | `float` | `2.0` | Background flush cadence — tightest of the SDKs, since MQTT is high-volume. |
 | `flush_count` | `int` | `200` | Buffer size that triggers an immediate flush. |
 | `emit_deliver_events` | `bool` | `False` | Emit a `DELIVER` event for each inbound `on_message` (off by default). |
