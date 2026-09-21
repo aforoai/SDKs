@@ -78,7 +78,7 @@ Every metered MQTT event is shipped as one element of an `events[]` batch:
 
 > The `metadata.sdkVersion` field is hard-coded in the source (`?SDK_VERSION = <<"1.0.0">>`) and is independent of the plugin's `vsn`. It identifies the event-shape contract, not the package release.
 
-The batch is POSTed with `Authorization: Bearer <api_key>` and `X-Tenant-Id: <tenant_id>`. Identity is resolved server-side by the plugin, never from a client-settable MQTT header.
+The batch is POSTed with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>` (never `Authorization: Bearer`, which the ingestor rejects with 401), in slices of at most 1000 events. Events with no resolved customer are never sent. A batch the ingestor rejects with a 4xx other than 408/429 is dropped and logged; anything else (5xx, 408, 429, timeout) is re-queued and counts toward the circuit breaker. Identity is resolved server-side by the plugin, never from a client-settable MQTT header.
 
 ## Hooks and events
 
@@ -101,7 +101,7 @@ All keys live under the `aforo_metering { ... }` HOCON block. Defaults are the s
 |---|---|---|---|
 | `tenant_id` | string | `"tenant_default"` | Sent as the `X-Tenant-Id` header. Your Aforo tenant. |
 | `product_id` | string | `"prod_mqtt_default"` | Stamped into `metadata.productId`. The Aforo product this broker reports as. |
-| `api_key` | string | `""` | Bearer token for the ingestor. Use `${AFORO_API_KEY}` and keep it out of the file. |
+| `api_key` | string | `""` | Ingestor API key (scope `usage:ingest`), sent as `X-API-Key`. Use `${AFORO_API_KEY}` and keep it out of the file. |
 | `ingestor_url` | string | `https://ingestor.aforo.ai/v1/ingest/events` | The ingestor endpoint. Set to `https://ingest.aforo.ai/v1/ingest/batch` for the standard batch ingestor, or your per-environment override. |
 | `flush_count` | integer | `500` | Flush when this many events are buffered (or `flush_interval_ms`, whichever first). |
 | `flush_interval_ms` | integer | `3000` | Max milliseconds between flushes of a partial batch. |
