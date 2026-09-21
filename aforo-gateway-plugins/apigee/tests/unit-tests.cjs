@@ -43,11 +43,17 @@ function createMockContext(variables) {
         'response.status.code': '200',
         'target.latency': '47',
         'messageid': 'msg-001',
-        'developer.app.name': 'cust_abc',
-        'developer.email': '',
+        'developer.app.name': 'my-developer-app',
+        'developer.email': 'dev@example.com',
+        'aforo.customer_id': 'cust_abc',
         'aforo.mcpEnabled': 'false',
         'aforo.mcpProductId': '',
-        'aforo.metricNamePattern': '{method} {path}',
+        'aforo.defaultMetric': 'api_calls',
+        'aforo.metricMappings': JSON.stringify([
+            { matchType: 'PREFIX', value: '/v1/sms', metricName: 'sms_sent' },
+            { matchType: 'EXACT', value: '/v1/otp/verify', metricName: 'otp_verified' },
+            { matchType: 'CONTAINS', value: '/calls/', metricName: 'call_minutes' },
+        ]),
         'request.header.traceparent': null,
         'request.header.tracestate': null,
         'request.header.x-trace-id': null,
@@ -66,6 +72,7 @@ function createMockContext(variables) {
             vars[name] = value;
         },
         getStoredPayload: function() { return storedPayload; },
+        vars: vars,
     };
 }
 
@@ -73,6 +80,7 @@ function runPolicy(ctx) {
     // Apigee JS scripts access a global `context` object. Eval the
     // policy source in a scope where `context` is our mock.
     const context = ctx;  // eslint-disable-line no-unused-vars
+    const print = function() {};  // Apigee's JS runtime provides print()
     eval(POLICY_SRC);
 }
 
@@ -170,6 +178,109 @@ console.log('\nTest 4: agent_id from JSON-RPC params._meta is trusted');
 
     assertEquals(event.agentId, 'agent_legit',
         'agentId comes from JSON-RPC payload, not the forged header');
+})();
+
+function eventOf(ctx) {
+    const raw = ctx.getStoredPayload();
+    return raw ? JSON.parse(raw).events[0] : null;
+}
+
+// Test 5: metric comes from mappings / default metric, never {method} {path}
+console.log('\nTest 5: Metric resolution (mappings, default; route-shaped only if configured)');
+(function() {
+    let ctx = createMockContext({});
+    runPolicy(ctx);
+    assertEquals(eventOf(ctx).metricName, 'api_calls', 'unmapped path → default_metric, not "GET /v1/accounts/123"');
+    ctx = createMockContext({ 'request.verb': 'POST', 'proxy.pathsuffix': '/v1/sms/send' });
+    runPolicy(ctx);
+    assertEquals(eventOf(ctx).metricName, 'sms_sent', 'PREFIX mapping');
+    ctx = createMockContext({ 'proxy.pathsuffix': '/v1/otp/verify' });
+    runPolicy(ctx);
+    assertEquals(eventOf(ctx).metricName, 'otp_verified', 'EXACT mapping');
+    ctx = createMockContext({ 'proxy.pathsuffix': '/v2/calls/9' });
+    runPolicy(ctx);
+    assertEquals(eventOf(ctx).metricName, 'call_minutes', 'CONTAINS mapping');
+    ctx = createMockContext({ 'proxy.basepath': '/svc', 'proxy.pathsuffix': '/v1/sms/x' });
+    runPolicy(ctx);
+    assertEquals(eventOf(ctx).metricName, 'api_calls', 'matching uses basepath + pathsuffix');
+    assertEquals(eventOf(ctx).endpointPath, '/svc/v1/sms/x', 'endpointPath includes basepath');
+    ctx = createMockContext({ 'aforo.metricMappings': 'not json' });
+    runPolicy(ctx);
+    assertEquals(eventOf(ctx).metricName, 'api_calls', 'invalid mappings JSON → default metric');
+    ctx = createMockContext({ 'aforo.metricMappings': null, 'aforo.metricNamePattern': '{method} {path}' });
+    runPolicy(ctx);
+    assertEquals(eventOf(ctx).metricName, 'GET /v1/accounts/123', 'pattern honoured only when explicitly set');
+})();
+
+// Test 6: customer identity
+console.log('\nTest 6: customerId from verified JWT only; never developer app name/email');
+(function() {
+    let ctx = createMockContext({});
+    runPolicy(ctx);
+    assertEquals(eventOf(ctx).customerId, 'cust_abc', 'customerId = aforo.customer_id (VerifyJWT claim)');
+
+    ctx = createMockContext({ 'aforo.customer_id': null });
+    runPolicy(ctx);
+    assertEquals(ctx.vars['aforo.sendEvent'], 'false', 'no verified customer → not sent');
+    assertEquals(ctx.vars['aforo.skipReason'], 'no customerId', 'skip reason recorded');
+    assertEquals(ctx.getStoredPayload(), '', 'developer.app.name / email not used as customer');
+
+    ctx = createMockContext({ 'aforo.customer_id': null,
+        'aforo.customerIdSource': 'flow_variable:verifyapikey.VerifyKey.app.aforo_customer_id',
+        'verifyapikey.VerifyKey.app.aforo_customer_id': 'cust_from_app' });
+    runPolicy(ctx);
+    assertEquals(eventOf(ctx).customerId, 'cust_from_app', 'customer_id_source flow_variable fallback');
+
+    ctx = createMockContext({ 'aforo.customer_id': null,
+        'aforo.customerIdSource': 'flow_variable:request.header.x-customer-id',
+        'request.header.x-customer-id': 'spoofed' });
+    runPolicy(ctx);
+    assertEquals(ctx.vars['aforo.sendEvent'], 'false', 'client-controlled request.* variable refused');
+
+    ctx = createMockContext({ 'aforo.customer_id': 'x'.repeat(65) });
+    runPolicy(ctx);
+    assertEquals(ctx.vars['aforo.sendEvent'], 'false', 'customerId > 64 chars not sent');
+})();
+
+// Test 7: skips
+console.log('\nTest 7: OPTIONS, exclude_paths, exclude_status_codes, zero quantity are not sent');
+(function() {
+    let ctx = createMockContext({ 'request.verb': 'OPTIONS' });
+    runPolicy(ctx);
+    assertEquals(ctx.vars['aforo.sendEvent'], 'false', 'OPTIONS not metered');
+    ctx = createMockContext({ 'aforo.excludePaths': '/health, /v1/accounts' });
+    runPolicy(ctx);
+    assertEquals(ctx.vars['aforo.skipReason'], 'excluded path', 'exclude_paths applied');
+    ctx = createMockContext({ 'aforo.excludeStatusCodes': '401,403,200' });
+    runPolicy(ctx);
+    assertEquals(ctx.vars['aforo.skipReason'], 'excluded status code', 'exclude_status_codes applied');
+    ctx = createMockContext({ 'aforo.quantitySource': 'response_size', 'response.header.Content-Length': '0' });
+    runPolicy(ctx);
+    assertEquals(ctx.vars['aforo.skipReason'], 'quantity <= 0', 'zero-byte response not metered');
+    ctx = createMockContext({ 'aforo.quantitySource': 'response_size', 'response.header.Content-Length': '512' });
+    runPolicy(ctx);
+    assertEquals(eventOf(ctx).quantity, 512, 'response_size quantity');
+    ctx = createMockContext({});
+    runPolicy(ctx);
+    assertEquals(ctx.vars['aforo.sendEvent'], 'true', 'normal request is sent');
+    assertEquals(eventOf(ctx).idempotencyKey, 'msg-001', 'idempotencyKey = messageid');
+    assert(!isNaN(Date.parse(eventOf(ctx).occurredAt)), 'occurredAt is ISO-8601');
+})();
+
+// Test 8: bundle XML contract checks (static)
+console.log('\nTest 8: bundle sends X-API-Key only; JWT steps are opt-in');
+(function() {
+    const bundle = path.resolve(__dirname, '../sharedflowbundle');
+    const send = fs.readFileSync(path.join(bundle, 'policies/AforoMeteringSendEvent.xml'), 'utf8');
+    assert(/<Header name="X-API-Key">/.test(send), 'ServiceCallout sets X-API-Key');
+    assert(!/<Header name="Authorization">/.test(send), 'no Authorization header');
+    assert(!/<Header name="X-Tenant-Id">/.test(send), 'no X-Tenant-Id header');
+    const flow = fs.readFileSync(path.join(bundle, 'sharedflows/default.xml'), 'utf8');
+    const jwtStep = flow.match(/<Name>AforoJwtValidation<\/Name>\s*<Condition>([^<]*)<\/Condition>/);
+    assert(jwtStep && /aforo\.jwtValidationEnabled = "true"/.test(jwtStep[1]), 'AforoJwtValidation gated on jwt_validation_enabled');
+    assert(/<Name>AforoMeteringSendEvent<\/Name>\s*<Condition>aforo\.sendEvent = "true"<\/Condition>/.test(flow), 'send gated on aforo.sendEvent');
+    const raise = fs.readFileSync(path.join(bundle, 'policies/AforoMarginGuardRaiseFault.xml'), 'utf8');
+    assert(!/\?/.test(raise.replace(/<\?xml[^>]*\?>/, '').replace(/<!--[\s\S]*?-->/g, '')), 'no ternary in RaiseFault templates');
 })();
 
 // Summary

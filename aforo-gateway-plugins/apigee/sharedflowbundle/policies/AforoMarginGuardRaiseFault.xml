@@ -2,6 +2,10 @@
 <!--
     RaiseFault policy that returns 429 when margin guard blocks or throttles a request.
     Triggered by flow variables set in AforoMarginGuardCheck JavaScript callout.
+    The condition lives on the Step in sharedflows/default.xml (RaiseFault has
+    no Condition element). Message templates cannot evaluate expressions, so
+    the old {a == "true" ? "x" : "y"} header was invalid; the JS now sets
+    aforo.marginGuard.header to "blocked" or "throttled".
 -->
 <RaiseFault continueOnError="false" enabled="true" name="AforoMarginGuardRaiseFault">
     <DisplayName>Aforo Margin Guard RaiseFault</DisplayName>
@@ -10,7 +14,7 @@
         <Set>
             <Headers>
                 <Header name="Content-Type">application/json</Header>
-                <Header name="X-Margin-Guard">{aforo.marginGuard.blocked == "true" ? "blocked" : "throttled"}</Header>
+                <Header name="X-Margin-Guard">{aforo.marginGuard.header}</Header>
                 <Header name="X-Margin-Guard-Level">{aforo.marginGuard.level}</Header>
                 <Header name="Retry-After">{aforo.marginGuard.retryAfterSeconds}</Header>
             </Headers>
@@ -19,5 +23,4 @@
             <ReasonPhrase>Margin Guard</ReasonPhrase>
         </Set>
     </FaultResponse>
-    <Condition>(aforo.marginGuard.blocked == "true") or (aforo.marginGuard.throttled == "true")</Condition>
 </RaiseFault>

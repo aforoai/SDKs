@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <!-- Sends the usage event payload to the Aforo ingestor service.
      Uses ServiceCallout with continueOnError=true so API response
-     is never impacted by metering failures. -->
+     is never impacted by metering failures. Runs only when
+     aforo-metering.js set aforo.sendEvent = "true" (see sharedflows/default.xml). -->
 <ServiceCallout name="AforoMeteringSendEvent" continueOnError="true">
     <DisplayName>Aforo Metering - Send Event to Ingestor</DisplayName>
     <Request variable="aforo.calloutRequest">
@@ -10,8 +11,10 @@
             <Payload contentType="application/json">{aforo.eventPayload}</Payload>
             <Headers>
                 <Header name="Content-Type">application/json</Header>
-                <Header name="Authorization">Bearer {aforo.apiKey}</Header>
-                <Header name="X-Tenant-Id">{aforo.tenantId}</Header>
+                <!-- X-API-Key ALONE: the ingestor's ApiKeyAuthFilter reads only this
+                     header; Authorization: Bearer is parsed as a JWT and rejected
+                     401. The tenant comes from the key, so no X-Tenant-Id. -->
+                <Header name="X-API-Key">{private.aforo.apiKey}</Header>
             </Headers>
         </Set>
     </Request>

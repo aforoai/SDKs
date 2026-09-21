@@ -6,6 +6,23 @@ This bundle ships on the Aforo gateway-plugins line; the whole repo is versioned
 
 ## [Unreleased]
 
+Brings the shared flow in line with the ingestor contract. **Breaking**: `default_metric` is required, customer identity no longer falls back to the developer app, and JWT validation is now opt-in. Not verified on a live Apigee org.
+
+### Fixed
+- **Auth**: the ServiceCallout sent `Authorization: Bearer {api_key}` + `X-Tenant-Id`; the ingestor reads only `X-API-Key` (and rejects Bearer with 401). Now `X-API-Key` alone, from a `private.` variable so it is masked in Debug.
+- **Customer**: `customerId` was `developer.app.name` / `developer.email` / `''` — Apigee names, not Aforo customer ids, and empty ones were sent anyway. Now the verified JWT `customer_id` (`aforo.customer_id`), else the newly implemented `customer_id_source = flow_variable:<name>` (client-controlled variables refused); nothing is sent without one or when it exceeds 64 chars.
+- **Metric**: `{method} {path}` default replaced by `metric_mappings` (EXACT/PREFIX/CONTAINS JSON) + `default_metric`; the pattern applies only if set.
+- **Skips**: `OPTIONS`, `exclude_paths` and `exclude_status_codes` (read but previously unused), and quantity ≤ 0. The send step is conditioned on `aforo.sendEvent`.
+- **quantity_source = response_size** is implemented (was read but ignored).
+- **JWT**: `AforoJwtValidation` had no condition, so every request without an Aforo JWT got 401. The three JWT steps now run only when `jwt_validation_enabled = true`.
+- **Margin guard**: read `aforo.marginGuardEnabled`, `aforo.marginGuardUrl` and `aforo.customerId`, none of which anything set — it could never run. The KVM now loads `margin_guard_enabled`/`margin_guard_url`, the JS uses the JWT customer/tenant, and the step is conditioned. The RaiseFault used a `? :` ternary in a message template (invalid) and a `<Condition>` element RaiseFault does not have; the header value is now set by the JS and the condition moved to the Step.
+- **MCP**: `mcp_enabled` / `mcp_product_id` are now loaded from the KVM; MCP idempotency key no longer includes `Date.now()`.
+- Bundle manifest lists all policies and JS resources the flow uses.
+- `aforo-compound-metering.js` / `aforo-preflight-quota.js`: removed the `apiproxy.consumerkey` (the caller's API key) customer fallback. Removed the unreferenced duplicate `aforo-mcp-metering.js`.
+
+### Docs
+- KVM is organization-scoped (the docs created entries with `--env`, which the policy never reads).
+
 ## [2.0.0] — 2026-06-29
 
 Initial public distribution packaging for the Apigee shared flow: README, user guide, and a top-level `VERSION` file, documented against the 2.0.0 security-hardened source.

@@ -68,8 +68,9 @@ if (enabled !== 'true') {
 
     var measurements = extractMeasurements(responseBody, extractionPaths, dimensionPaths);
     if (measurements) {
-        var customerId = context.getVariable('aforo.customer_id') ||
-                         context.getVariable('apiproxy.consumerkey') || '';
+        var customerId = context.getVariable('aforo.customer_id') || '';
+        // Not apiproxy.consumerkey: that is the caller's API key (a credential),
+        // not an Aforo customer id.
         var correlationId = context.getVariable('messageid') || java.util.UUID.randomUUID().toString();
 
         var compoundEvent = {
@@ -87,6 +88,7 @@ if (enabled !== 'true') {
 
         // Buffer in KVM for batch flush (ServiceCallout handles async POST)
         context.setVariable('aforo.compound_event', JSON.stringify(compoundEvent));
-        context.setVariable('aforo.compound_event_ready', 'true');
+        // No customer → the ingestor rejects the event; don't send it.
+        context.setVariable('aforo.compound_event_ready', customerId ? 'true' : 'false');
     }
 }
