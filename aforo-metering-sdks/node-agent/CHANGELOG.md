@@ -4,6 +4,9 @@ All notable changes to `@aforoai/agent-metering` are documented here. This proje
 
 ## [Unreleased]
 
+### Fixed
+- **Breaking (fix):** the tenant API key is sent as `X-API-Key` instead of `Authorization: Bearer`. The ingestor parses Bearer values as JWTs and rejected every request 401 (sending both headers is also 401), so no usage was being delivered.
+
 ## [1.0.0] — 2026-06-29
 
 Initial public distribution packaging — README, user guide, and versioning.

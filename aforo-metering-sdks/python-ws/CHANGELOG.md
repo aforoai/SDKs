@@ -4,6 +4,10 @@ All notable changes to `aforo-ws-metering` are documented here. This project fol
 
 ## [Unreleased]
 
+### Fixed
+- **Breaking (fix):** the tenant API key is sent as `X-API-Key` instead of `Authorization: Bearer`. The ingestor parses Bearer values as JWTs and rejected every request 401 (sending both headers is also 401), so no usage was being delivered.
+- Docs and examples use the real ingestor host `https://usage-ingestor.aforo.ai` (`ingest.aforo.ai` / `ingestor.aforo.ai` serve a static site, not the ingestor).
+
 ## [1.0.0] — 2026-06-29
 
 Initial public distribution packaging — README, user guide, and versioning.

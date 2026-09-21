@@ -4,6 +4,10 @@ All notable changes to `@aforo/mcp-proxy` are documented here. This project foll
 
 ## [Unreleased]
 
+### Fixed
+- **Breaking (fix):** the tenant API key is sent as `X-API-Key` instead of `Authorization: Bearer`. The ingestor parses Bearer values as JWTs and rejected every request 401 (sending both headers is also 401), so no usage was being delivered.
+- **Fix:** session heartbeats (`system.session.heartbeat`, quantity 0) are no longer sent in the usage batch; the ingestor rejects quantity 0 and failed the whole batch with 400. Session start/end methods are kept as no-ops/flush, heartbeat options are ignored.
+
 ## [1.0.0] — 2026-06-29
 
 Initial public distribution packaging — README, user guide, and versioning.
