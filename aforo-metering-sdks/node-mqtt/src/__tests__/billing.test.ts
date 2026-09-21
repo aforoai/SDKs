@@ -218,7 +218,7 @@ describe('wrapMqttClient', () => {
 // ── Event shape ─────────────────────────────────────────────────────────
 
 describe('event shape', () => {
-  test('idempotencyKey: mqtt:{tenant}:{clientId}:{eventType}:{topic}:{millis}:{8-hex}', async () => {
+  test('idempotencyKey: mqtt:{tenant}:{clientId}:{eventType}:{millis}:{8-hex}', async () => {
     const billing = new AforoMqttBilling({ ...config(), flushCount: 1 });
     const broker = new EventEmitter();
     billing.wrapAedesBroker(broker as any, { resolveCustomerId: () => 'cust_001' });
@@ -229,7 +229,7 @@ describe('event shape', () => {
     await new Promise((r) => setTimeout(r, 20));
 
     const key = drainedEvents()[0].idempotencyKey;
-    expect(key).toMatch(/^mqtt:tenant-001:c1:PUBLISH:a\/b:\d+:[a-z0-9]{8}$/);
+    expect(key).toMatch(/^mqtt:tenant-001:c1:PUBLISH:\d+:[a-z0-9]{8}$/);
     await billing.shutdown();
   });
 
@@ -254,5 +254,75 @@ describe('event shape', () => {
       'mqtt_broker.subscribe',
       'mqtt_broker.unsubscribe',
     ]);
+  });
+});
+
+function assertBatchContract(reqs: any[], apiKey: string, allowed: string[]) {
+  const allowedSet = new Set(allowed);
+  expect(reqs.length).toBeGreaterThan(0);
+  for (const r of reqs) {
+    expect(r.url).toBe('https://usage-ingestor.aforo.ai/v1/ingest/batch');
+    expect((r.init.headers as Record<string, string>)['X-API-Key']).toBe(apiKey);
+    expect(Object.keys(r.body)).toEqual(['events']);
+    expect(r.body.events.length).toBeGreaterThan(0);
+    expect(r.body.events.length).toBeLessThanOrEqual(1000);
+    for (const e of r.body.events) {
+      for (const k of Object.keys(e)) expect(allowedSet.has(k) ? k : `unexpected field ${k}`).toBe(k);
+      expect(JSON.stringify(e)).not.toContain(apiKey);
+      for (const k of ['customerId', 'metricName', 'occurredAt', 'idempotencyKey', 'mqttTopic']) {
+        expect(typeof e[k]).toBe('string');
+        expect(e[k].trim()).not.toBe('');
+      }
+      expect(e.quantity).toBeGreaterThan(0);
+      expect([0, 1, 2]).toContain(e.mqttQos);
+    }
+  }
+}
+
+describe('ingest batch contract', () => {
+  const FIELDS = ['customerId', 'metricName', 'quantity', 'occurredAt', 'idempotencyKey', 'productType', 'metadata', 'mqttTopic', 'mqttQos', 'mqttRetained',
+    'mqttEventType', 'mqttClientId', 'dataBytes'];
+
+  test('events carry only IngestUsageEventRequest fields; CONNECT/DISCONNECT get a $SYS topic', async () => {
+    const billing = new AforoMqttBilling({ ...config(), flushCount: 100 });
+    const broker = new EventEmitter();
+    billing.wrapAedesBroker(broker as any, { resolveCustomerId: () => 'cust_001' });
+    broker.emit('client', { id: 'c' });
+    broker.emit('publish', { topic: 't', qos: 7, retain: false, payload: Buffer.from('x') }, { id: 'c' });
+    broker.emit('unsubscribe', [''], { id: 'c' });
+    broker.emit('clientDisconnect', { id: 'c' });
+    await new Promise((r) => setTimeout(r, 20));
+    await billing.shutdown();
+    assertBatchContract(capturedRequests, 'sk_mqtt_abc', FIELDS);
+    const events = drainedEvents();
+    expect(events.map((e: any) => e.mqttEventType).sort()).toEqual(['CONNECT', 'DISCONNECT', 'PUBLISH']);
+    expect(events.find((e: any) => e.mqttEventType === 'CONNECT').mqttTopic).toBe('$SYS/clients/c/connected');
+    expect(events.find((e: any) => e.mqttEventType === 'DISCONNECT').mqttTopic).toBe('$SYS/clients/c/disconnected');
+    expect(events.find((e: any) => e.mqttEventType === 'PUBLISH').mqttQos).toBe(0);
+  });
+
+  test('>1000 buffered events are split into requests of <=1000', async () => {
+    const billing = new AforoMqttBilling({ ...config(), flushCount: 5000 });
+    const client: any = new EventEmitter();
+    client.publish = jest.fn();
+    client.options = { clientId: 'c1' };
+    billing.wrapMqttClient(client, { customerId: 'cust_001' });
+    for (let i = 0; i < 2500; i++) client.publish('t/' + i, 'x', { qos: 1 });
+    await billing.shutdown();
+    expect(capturedRequests.map((r) => r.body.events.length)).toEqual([1000, 1000, 500]);
+    assertBatchContract(capturedRequests, 'sk_mqtt_abc', FIELDS);
+  });
+
+  test('over-long topic and clientId are trimmed to ingestor limits', async () => {
+    const billing = new AforoMqttBilling({ ...config(), flushCount: 100 });
+    const client: any = new EventEmitter();
+    client.publish = jest.fn();
+    billing.wrapMqttClient(client, { customerId: 'cust_001', clientId: 'k'.repeat(300) });
+    client.publish('t'.repeat(900), 'x');
+    await billing.shutdown();
+    const ev = drainedEvents()[0];
+    expect(ev.mqttTopic.length).toBe(500);
+    expect(ev.mqttClientId.length).toBe(128);
+    expect(ev.idempotencyKey.length).toBeLessThanOrEqual(255);
   });
 });

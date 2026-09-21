@@ -44,12 +44,12 @@ const billing = new AforoGrpcBilling({
   tenantId: 'tenant_acme',
   productId: 'prod_grpc_001',
   apiKey: process.env.AFORO_API_KEY!,
-  ingestorUrl: 'https://usage-ingestor.aforo.ai', // SDK appends /v1/ingest/events
+  ingestorUrl: 'https://usage-ingestor.aforo.ai', // SDK appends /v1/ingest/batch
   serviceName: 'acme.v1.UserService',
 });
 ```
 
-> ⚠ `ingestorUrl` is the **base** URL — the SDK appends `/v1/ingest/events`. Don't include the path.
+> ⚠ `ingestorUrl` is the **base** URL — the SDK appends `/v1/ingest/batch`. Don't include the path.
 
 ## Step 3 — Wrap your handlers
 
@@ -117,7 +117,7 @@ process.on('SIGINT',  async () => { await billing.shutdown(); process.exit(0); }
 
 > ⚠ Without `shutdown()`, a process that exits inside the 5-second window drops the buffered batch.
 
-The batch is POSTed to `https://usage-ingestor.aforo.ai/v1/ingest/events` with `X-API-Key: <your api key>` and `X-Tenant-Id: tenant_acme`. Confirm in the Aforo console under the product's usage events (filter `productType = GRPC_API`). On 3 consecutive failures (1s/2s/4s backoff) the batch is dropped and `onError` fires — log it:
+The batch is POSTed to `https://usage-ingestor.aforo.ai/v1/ingest/batch` with `X-API-Key: <your api key>` and `X-Tenant-Id: tenant_acme`. Confirm in the Aforo console under the product's usage events (filter `productType = GRPC_API`). On 3 consecutive failures (1s/2s/4s backoff) the batch is dropped and `onError` fires — log it:
 
 ```ts
 const billing = new AforoGrpcBilling({
@@ -133,7 +133,7 @@ const billing = new AforoGrpcBilling({
 | `tenantId` | `string` | — (required) | Aforo tenant. Sent as `X-Tenant-Id`. |
 | `productId` | `string` | — (required) | Aforo product id; into `metadata.productId`. |
 | `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. |
-| `ingestorUrl` | `string` | — (required) | Base URL; SDK appends `/v1/ingest/events`. |
+| `ingestorUrl` | `string` | — (required) | Base URL; SDK appends `/v1/ingest/batch`. |
 | `serviceName` | `string` | — (required) | FQ service name; stamped as `grpcService`. |
 | `customerIdExtractor` | `(metadata) => string \| undefined` | reads `x-customer-id` | Resolve the customer per call; `undefined` → skip. |
 | `flushCount` | `number` | `50` | Buffered events that trigger an immediate flush. |
@@ -147,9 +147,9 @@ const billing = new AforoGrpcBilling({
 | No events at all | No customer id resolved | Send `x-customer-id` in metadata, or supply a `customerIdExtractor`. Calls without a customer are skipped by design. |
 | Stream emits zero events | Handler threw before resolving, or never resolved | The event records on resolve/reject — ensure the handler promise settles. |
 | Events stop after a deploy | Process exited before the 5s timer flushed | Call `await billing.shutdown()` on `SIGTERM`/`SIGINT`. |
-| `…/v1/ingest/events/v1/ingest/events` in logs | `ingestorUrl` already includes the path | Set `ingestorUrl` to the base host only. |
+| `…/v1/ingest/batch/v1/ingest/batch` in logs | `ingestorUrl` already includes the path | Set `ingestorUrl` to the base host only. |
 | `grpcStatusCode` always `UNKNOWN` on errors | Thrown error has no numeric `code` | Throw a gRPC error with a `code` (use the exported `GRPC_STATUS` map). |
-| `onError` firing repeatedly | Wrong `apiKey`/`tenantId`, or ingestor unreachable | Verify credentials and that the host accepts `POST /v1/ingest/events`. |
+| `onError` firing repeatedly | Wrong `apiKey`/`tenantId`, or ingestor unreachable | Verify credentials and that the host accepts `POST /v1/ingest/batch`. |
 
 ## What this guide does NOT cover
 

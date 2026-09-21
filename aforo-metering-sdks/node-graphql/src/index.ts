@@ -48,6 +48,11 @@ export interface AforoGraphQlConfig {
 }
 
 const SDK_VERSION = '1.0.0';
+/** The ingestor rejects batch requests with more than 1000 events. */
+const MAX_BATCH_EVENTS = 1000;
+/** usage-ingestor limits (IngestUsageEventRequest). */
+const MAX_CUSTOMER_ID = 64;
+const MAX_IDEMPOTENCY_KEY = 255;
 
 interface GraphQlUsageEvent {
   customerId: string;
@@ -107,7 +112,11 @@ export class AforoGraphQlBilling {
 
   /** Record a single GraphQL operation. Called by plugins/middleware or directly. */
   record(args: RecordArgs): void {
-    if (!args.customerId) return;
+    if (!args.customerId || !args.customerId.trim()) return;
+    if (args.customerId.length > MAX_CUSTOMER_ID) {
+      this.onError(new Error(`GraphQL metering: customerId longer than ${MAX_CUSTOMER_ID} chars; event dropped`));
+      return;
+    }
 
     const doc = typeof args.query === 'string' ? safeParse(args.query) : args.query;
     if (!doc) return;
@@ -118,20 +127,22 @@ export class AforoGraphQlBilling {
     const { complexity, fieldCount } = this.complexityScorer(doc, op.name?.value);
 
     const now = new Date();
+    const opName = (op.name?.value ?? 'anonymous').slice(0, 255);
     const event: GraphQlUsageEvent = {
       customerId: args.customerId,
       metricName: 'graphql_api.operations',
       quantity: 1,
       occurredAt: now.toISOString(),
-      idempotencyKey: `gql:${this.config.tenantId}:${this.config.productId}:${op.name?.value ?? 'anonymous'}:${now.getTime()}:${randomSuffix()}`,
+      // Tail-trimmed to the ingestor's limit, keeping the unique millis:random suffix.
+      idempotencyKey: `gql:${this.config.tenantId}:${this.config.productId}:${opName}:${now.getTime()}:${randomSuffix()}`.slice(-MAX_IDEMPOTENCY_KEY),
       productType: 'GRAPHQL_API',
       gqlOperationType: (op.operation.toUpperCase() as GraphQlUsageEvent['gqlOperationType']),
-      gqlOperationName: op.name?.value ?? 'anonymous',
+      gqlOperationName: opName,
       gqlComplexity: complexity,
       gqlFieldCount: fieldCount,
       gqlHasErrors: args.hasErrors,
       dataBytes: args.responseBytes,
-      executionDurationMs: args.durationMs,
+      executionDurationMs: Math.round(args.durationMs),
       metadata: {
         sdkVersion: SDK_VERSION,
         productId: this.config.productId,
@@ -192,14 +203,21 @@ export class AforoGraphQlBilling {
 
   private async flush(): Promise<void> {
     if (this.buffer.length === 0) return;
-    const batch = this.buffer.splice(0, this.buffer.length);
+    const pending = this.buffer.splice(0, this.buffer.length);
+    // The ingestor accepts at most MAX_BATCH_EVENTS events per request.
+    for (let i = 0; i < pending.length; i += MAX_BATCH_EVENTS) {
+      await this.send(pending.slice(i, i + MAX_BATCH_EVENTS));
+    }
+  }
 
+  private async send(batch: GraphQlUsageEvent[]): Promise<void> {
+    // Serialized once, so every retry re-sends the same idempotencyKeys.
     const body = JSON.stringify({ events: batch });
     const maxRetries = 3;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        const res = await fetch(this.config.ingestorUrl.replace(/\/$/, '') + '/v1/ingest/events', {
+        const res = await fetch(this.config.ingestorUrl.replace(/\/$/, '') + '/v1/ingest/batch', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',

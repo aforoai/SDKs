@@ -44,11 +44,11 @@ const billing = new AforoWsBilling({
   tenantId: 'tenant_acme',
   productId: 'prod_ws_001',
   apiKey: process.env.AFORO_API_KEY!,
-  ingestorUrl: 'https://usage-ingestor.aforo.ai', // SDK appends /v1/ingest/events
+  ingestorUrl: 'https://usage-ingestor.aforo.ai', // SDK appends /v1/ingest/batch
 });
 ```
 
-> ⚠ `ingestorUrl` is the **base** URL — the SDK appends `/v1/ingest/events`. Don't include the path.
+> ⚠ `ingestorUrl` is the **base** URL — the SDK appends `/v1/ingest/batch`. Don't include the path.
 
 ## Step 3 — Wrap your server (or track a socket)
 
@@ -83,7 +83,7 @@ fastify.get('/ws', { websocket: true }, (connection, req) => {
 
 ## Step 4 — Decide on per-frame metering
 
-By default you get two events per connection: `CONNECTION_OPENED` and `CONNECTION_CLOSED`. The close event is the billing anchor — it carries `messageCount` (sent + recv), `dataBytes` (sent + recv), `durationMs`, and `wsCloseReason`. Individual frames are still counted; they're rolled into that close event.
+By default you get two events per connection: `CONNECTION_OPENED` and `CONNECTION_CLOSED`. The close event is the billing anchor — it carries `messageCount` (sent + recv), `dataBytes` (sent + recv), `executionDurationMs`, and `wsCloseReason`. Individual frames are still counted; they're rolled into that close event.
 
 If you need an event per frame (for per-frame analytics or per-message pricing surfaced at frame granularity), turn it on — and raise your batch ceiling, because this is ~10× the volume:
 
@@ -115,7 +115,7 @@ process.on('SIGINT',  async () => { await billing.shutdown(); process.exit(0); }
 
 > ⚠ Without `shutdown()`, a process that exits inside the 3-second window drops the buffered batch.
 
-The batch is POSTed to `https://usage-ingestor.aforo.ai/v1/ingest/events` with `X-API-Key: <your api key>` and `X-Tenant-Id: tenant_acme`. Confirm in the Aforo console under the product's usage events (filter `productType = WEBSOCKET_API`). On 3 consecutive failures (1s/2s/4s backoff) the batch is dropped and `onError` fires — log it:
+The batch is POSTed to `https://usage-ingestor.aforo.ai/v1/ingest/batch` with `X-API-Key: <your api key>` and `X-Tenant-Id: tenant_acme`. Confirm in the Aforo console under the product's usage events (filter `productType = WEBSOCKET_API`). On 3 consecutive failures (1s/2s/4s backoff) the batch is dropped and `onError` fires — log it:
 
 ```ts
 new AforoWsBilling({ /* … */, onError: (err) => myLogger.error('aforo ws flush failed', err) });
@@ -128,7 +128,7 @@ new AforoWsBilling({ /* … */, onError: (err) => myLogger.error('aforo ws flush
 | `tenantId` | `string` | — (required) | Aforo tenant. Sent as `X-Tenant-Id`. |
 | `productId` | `string` | — (required) | Aforo product id; into `metadata.productId`. |
 | `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. |
-| `ingestorUrl` | `string` | — (required) | Base URL; SDK appends `/v1/ingest/events`. |
+| `ingestorUrl` | `string` | — (required) | Base URL; SDK appends `/v1/ingest/batch`. |
 | `perFrameEvents` | `boolean` | `false` | One event per frame vs. aggregate-on-close only. |
 | `flushCount` | `number` | `100` | Buffered events that trigger an immediate flush. |
 | `flushIntervalMs` | `number` | `3000` | Max ms before a partial batch is flushed. |
@@ -143,10 +143,10 @@ new AforoWsBilling({ /* … */, onError: (err) => myLogger.error('aforo ws flush
 | No events for a connection | `extractCustomerId` returned `undefined` | Send `x-customer-id` on the upgrade request, or resolve it inside `extractCustomerId` / `trackConnection`. |
 | Only seeing close events, never per-frame | `perFrameEvents` is off (default) | Set `perFrameEvents: true` and raise `flushCount`. |
 | Events stop after a deploy | Process exited before the 3s timer flushed | Call `await billing.shutdown()` on `SIGTERM`/`SIGINT`. |
-| `…/v1/ingest/events/v1/ingest/events` in logs | `ingestorUrl` already includes the path | Set `ingestorUrl` to the base host only. |
+| `…/v1/ingest/batch/v1/ingest/batch` in logs | `ingestorUrl` already includes the path | Set `ingestorUrl` to the base host only. |
 | `wsCloseReason` is `NORMAL_CLOSURE` for an abnormal drop | Close code `1005`/`1006` maps that way, or no code arrived | Inspect `metadata.closeCode`; abnormal drops show `1006 → ABNORMAL_CLOSURE`. |
 | Byte counts look low | `estimateBytes` only sizes strings/Buffers/typed arrays | Send standard frame payloads; exotic payload types size to 0. |
-| `onError` firing repeatedly | Wrong `apiKey`/`tenantId`, or ingestor unreachable | Verify credentials and that the host accepts `POST /v1/ingest/events`. |
+| `onError` firing repeatedly | Wrong `apiKey`/`tenantId`, or ingestor unreachable | Verify credentials and that the host accepts `POST /v1/ingest/batch`. |
 
 ## What this guide does NOT cover
 

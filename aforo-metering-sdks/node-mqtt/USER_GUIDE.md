@@ -45,11 +45,11 @@ const billing = new AforoMqttBilling({
   tenantId: 'tenant_acme',
   productId: 'prod_mqtt_001',
   apiKey: process.env.AFORO_API_KEY!,
-  ingestorUrl: 'https://usage-ingestor.aforo.ai', // SDK appends /v1/ingest/events
+  ingestorUrl: 'https://usage-ingestor.aforo.ai', // SDK appends /v1/ingest/batch
 });
 ```
 
-> ⚠ `ingestorUrl` is the **base** URL — the SDK appends `/v1/ingest/events`. Don't include the path.
+> ⚠ `ingestorUrl` is the **base** URL — the SDK appends `/v1/ingest/batch`. Don't include the path.
 
 ## Step 3 — Hook the broker (or wrap the client)
 
@@ -115,7 +115,7 @@ process.on('SIGINT',  async () => { await billing.shutdown(); process.exit(0); }
 
 > ⚠ Without `shutdown()`, a process that exits inside the 2-second window drops the buffered batch.
 
-The batch is POSTed to `https://usage-ingestor.aforo.ai/v1/ingest/events` with `X-API-Key: <your api key>` and `X-Tenant-Id: tenant_acme`. Confirm in the Aforo console under the product's usage events (filter `productType = MQTT_BROKER`). On 3 consecutive failures (1s/2s/4s backoff) the batch is dropped and `onError` fires — log it:
+The batch is POSTed to `https://usage-ingestor.aforo.ai/v1/ingest/batch` with `X-API-Key: <your api key>` and `X-Tenant-Id: tenant_acme`. Confirm in the Aforo console under the product's usage events (filter `productType = MQTT_BROKER`). On 3 consecutive failures (1s/2s/4s backoff) the batch is dropped and `onError` fires — log it:
 
 ```ts
 new AforoMqttBilling({ /* … */, onError: (err) => myLogger.error('aforo mqtt flush failed', err) });
@@ -128,7 +128,7 @@ new AforoMqttBilling({ /* … */, onError: (err) => myLogger.error('aforo mqtt f
 | `tenantId` | `string` | — (required) | Aforo tenant. Sent as `X-Tenant-Id`. |
 | `productId` | `string` | — (required) | Aforo product id; into `metadata.productId`. |
 | `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. |
-| `ingestorUrl` | `string` | — (required) | Base URL; SDK appends `/v1/ingest/events`. |
+| `ingestorUrl` | `string` | — (required) | Base URL; SDK appends `/v1/ingest/batch`. |
 | `emitDeliverEvents` | `boolean` | `false` | Emit `DELIVER` (fan-out) events. Off → dropped, both modes. |
 | `flushCount` | `number` | `200` | Buffered events that trigger an immediate flush. |
 | `flushIntervalMs` | `number` | `2000` | Max ms before a partial batch is flushed. |
@@ -146,9 +146,9 @@ new AforoMqttBilling({ /* … */, onError: (err) => myLogger.error('aforo mqtt f
 | Subscribe-only client meters nothing on receive | Inbound `message` maps to `DELIVER`, dropped by default | Set `emitDeliverEvents: true` if you bill on received messages. |
 | Publishes counted but fan-out missing | `DELIVER` events off | Set `emitDeliverEvents: true`. |
 | Events stop after a deploy | Process exited before the 2s timer flushed | Call `await billing.shutdown()` on `SIGTERM`/`SIGINT`. |
-| `…/v1/ingest/events/v1/ingest/events` in logs | `ingestorUrl` already includes the path | Set `ingestorUrl` to the base host only. |
+| `…/v1/ingest/batch/v1/ingest/batch` in logs | `ingestorUrl` already includes the path | Set `ingestorUrl` to the base host only. |
 | `mqttClientId` is `mqtt-client` for every client-mode event | No `clientId` configured and `client.options.clientId` unset | Pass `clientId` in the `wrapMqttClient` options, or set it on the mqtt.js connection. |
-| `onError` firing repeatedly | Wrong `apiKey`/`tenantId`, or ingestor unreachable | Verify credentials and that the host accepts `POST /v1/ingest/events`. |
+| `onError` firing repeatedly | Wrong `apiKey`/`tenantId`, or ingestor unreachable | Verify credentials and that the host accepts `POST /v1/ingest/batch`. |
 
 ## What this guide does NOT cover
 

@@ -190,7 +190,7 @@ describe('Real-broker integration (ws.WebSocketServer + ws client)', () => {
         expect(closed.messageCount).toBe(3);     // 3 frames received
         expect(closed.dataBytes).toBe(7 + 8 + 5); // sum of payload bytes
         expect(closed.wsCloseReason).toBe('NORMAL_CLOSURE');
-        expect(closed.durationMs).toBeGreaterThanOrEqual(0);
+        expect(closed.executionDurationMs).toBeGreaterThanOrEqual(0);
       } finally {
         await teardown(fix);
       }
