@@ -25,7 +25,7 @@
 
 -include_lib("emqx/include/logger.hrl").
 
--export([resolve/2, resolve/3, invalidate/2]).
+-export([resolve/2, resolve/3, invalidate/1]).
 
 -spec resolve(map(), map()) -> binary() | undefined.
 resolve(ClientInfo, ConnInfo) ->

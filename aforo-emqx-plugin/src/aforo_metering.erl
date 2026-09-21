@@ -18,6 +18,11 @@
     load/0,
     unload/0,
     health/0,
+    %% Called by timer:apply_interval/4 in start_flush_timer/0. It applies
+    %% ?MODULE:flush_now() from another process, which only reaches exported
+    %% functions: unexported, every interval tick crashed with undef and a
+    %% partial batch (fewer than flush_count events) was never flushed at all.
+    flush_now/0,
     %% Hook callbacks
     on_client_connected/3,
     on_client_disconnected/4,
@@ -28,6 +33,13 @@
 ]).
 
 -define(SDK_VERSION, <<"1.0.0">>).
+%% The ingestor rejects batches of more than 1000 events (IngestBatchRequest).
+-define(MAX_BATCH_SIZE, 1000).
+-define(MAX_ATTEMPTS, 3).
+
+-ifdef(TEST).
+-export([classify_response/1, chunk/2, has_customer/1]).
+-endif.
 
 %%--------------------------------------------------------------------
 %% Load/unload (called by aforo_metering_app on plugin start/stop)
@@ -226,7 +238,30 @@ resolve_customer_from_from(_) -> undefined.
 %% Buffering + flushing
 %%--------------------------------------------------------------------
 
+%% Refuse an event that can never be accepted (2026-09-21), mirroring the Kong
+%% plugin. The ingestor rejects a blank customerId and validates a batch as a
+%% whole, so one such event fails the request and takes every well-formed event
+%% batched with it down too. Nothing later can supply the missing value, so it is
+%% dropped here, where the loss is limited to the event actually at fault. The
+%% resolvers return `undefined' for "no customer", but a backend (the http one
+%% especially) can still hand back an empty string.
 buffer_event(CustomerId, Extra) ->
+    case has_customer(CustomerId) of
+        true  -> do_buffer_event(CustomerId, Extra);
+        false ->
+            aforo_metering_metrics:inc('aforo.metering.events.dropped', 1),
+            ok
+    end.
+
+has_customer(undefined) -> false;
+has_customer(null) -> false;
+has_customer(<<>>) -> false;
+has_customer("") -> false;
+has_customer(B) when is_binary(B) -> string:trim(B) =/= <<>>;
+has_customer(L) when is_list(L) -> string:trim(L) =/= "";
+has_customer(_) -> false.
+
+do_buffer_event(CustomerId, Extra) ->
     Now = erlang:system_time(millisecond),
     IdempKey = iolist_to_binary([
         "mqtt:", tenant_id(), ":",
@@ -312,22 +347,91 @@ ship_to_ingestor(Events) ->
             requeue_events(Events),
             ok;
         State ->
-            Body = jsone:encode(#{<<"events">> => Events}),
-            Url  = ingestor_url(),
-            Headers = [
-                {"Content-Type", "application/json"},
-                {"Authorization", "Bearer " ++ binary_to_list(api_key())},
-                {"X-Tenant-Id",   binary_to_list(tenant_id())}
-            ],
-            case ship_with_retry(Url, Headers, Body, 3) of
-                ok ->
-                    on_flush_success(State),
-                    aforo_metering_metrics:inc('aforo.metering.events.flushed', length(Events));
-                _ ->
-                    on_flush_failure(),
-                    requeue_events(Events)
-            end
+            %% Belt and braces for buffer_event's guard: anything already in the
+            %% buffer without a customer would fail its whole batch.
+            {Sendable, Blank} = lists:partition(
+                fun(E) -> has_customer(maps:get(<<"customerId">>, E, undefined)) end, Events),
+            case Blank of
+                [] -> ok;
+                _  -> aforo_metering_metrics:inc('aforo.metering.events.dropped', length(Blank))
+            end,
+            ship_batches(State, chunk(Sendable, ?MAX_BATCH_SIZE))
     end.
+
+%% The ingestor rejects a batch of more than 1000 events with 400. flush_count
+%% defaults to 500, but a flush drains the WHOLE buffer -- up to max_buffer_size
+%% (50000) after an outage -- so without slicing, the first flush after the
+%% ingestor recovered would be one oversized request, rejected outright.
+ship_batches(_State, []) ->
+    ok;
+ship_batches(State, [Batch | Rest]) ->
+    Body = jsone:encode(#{<<"events">> => Batch}),
+    case ship_with_retry(ingestor_url(), ingest_headers(), Body, ?MAX_ATTEMPTS) of
+        ok ->
+            on_flush_success(State),
+            aforo_metering_metrics:inc('aforo.metering.events.flushed', length(Batch)),
+            ship_batches(closed_if_probe(State), Rest);
+        {error, {rejected, Code, RespBody}} ->
+            %% Drop on a permanent rejection; only retry what retrying can fix.
+            %% A 4xx means the ingestor understood the batch and refused it, so
+            %% re-queueing sends identical bytes to an identical judgement --
+            %% forever, and dragging every good event queued behind it down
+            %% too. Logged at error with the response body so a dropped batch
+            %% says why. The ingestor answered, so this is not an availability
+            %% failure and does not count toward opening the circuit.
+            ?SLOG(error, #{
+                msg => "aforo_metering ingestor rejected batch, dropping it",
+                status => Code,
+                dropped => length(Batch),
+                response => truncate(RespBody, 500)
+            }),
+            aforo_metering_metrics:inc('aforo.metering.flush.error', 1),
+            aforo_metering_metrics:inc('aforo.metering.events.dropped', length(Batch)),
+            on_flush_success(State),
+            ship_batches(closed_if_probe(State), Rest);
+        {error, Reason} ->
+            %% Transient (5xx, 408, 429, timeout, connection refused): keep
+            %% this batch and everything after it, and stop -- the next slice
+            %% would only fail the same way. This is the failure the circuit
+            %% breaker counts; before 2026-09-21 ship_with_retry reported `ok'
+            %% here, so exhausted retries counted as sent, the events were
+            %% discarded, and the circuit could never open.
+            ?SLOG(error, #{
+                msg => "aforo_metering flush failed, events re-queued",
+                reason => Reason,
+                requeued => length(Batch) + lists:sum([length(B) || B <- Rest])
+            }),
+            aforo_metering_metrics:inc('aforo.metering.flush.error', 1),
+            on_flush_failure(),
+            requeue_events(lists:append([Batch | Rest]))
+    end.
+
+%% After a successful half-open probe the circuit is closed for later slices.
+closed_if_probe(half_open) -> closed;
+closed_if_probe(State) -> State.
+
+%% X-API-Key, not Authorization: Bearer (2026-09-21), matching the Kong fix.
+%% The ingestor authenticates keys through aforo-common's ApiKeyAuthFilter,
+%% which reads X-API-Key and nothing else. Sent ALONE: a key in an
+%% Authorization: Bearer header is parsed as a JWT, fails, and the request is
+%% rejected 401 before the API-key filter runs -- even when X-API-Key is also
+%% present.
+ingest_headers() ->
+    [
+        {"X-API-Key",   binary_to_list(api_key())},
+        {"X-Tenant-Id", binary_to_list(tenant_id())}
+    ].
+
+chunk([], _N) -> [];
+chunk(List, N) when length(List) =< N -> [List];
+chunk(List, N) ->
+    {Head, Tail} = lists:split(N, List),
+    [Head | chunk(Tail, N)].
+
+truncate(Bin, Max) when is_binary(Bin), byte_size(Bin) > Max -> binary:part(Bin, 0, Max);
+truncate(Bin, _Max) when is_binary(Bin) -> Bin;
+truncate(List, Max) when is_list(List) -> truncate(iolist_to_binary(List), Max);
+truncate(Other, _Max) -> Other.
 
 %% Put events back into the buffer (subject to retention cap).
 requeue_events(Events) ->
@@ -387,21 +491,45 @@ on_flush_failure() ->
         false -> ok
     end.
 
-ship_with_retry(_Url, _Headers, _Body, 0) ->
-    ?SLOG(error, #{msg => "aforo_metering flush exhausted retries"}),
-    aforo_metering_metrics:inc('aforo.metering.flush.error', 1),
-    ok;
-ship_with_retry(Url, Headers, Body, Attempts) ->
-    case httpc:request(post, {Url, Headers, "application/json", Body}, [{timeout, 10000}], []) of
-        {ok, {{_, Code, _}, _, _}} when Code >= 200, Code < 300 ->
+%% Returns ok, {error, {rejected, Code, Body}} for a permanent 4xx, or
+%% {error, Reason} once a transient failure has used up its attempts.
+ship_with_retry(Url, Headers, Body, AttemptsLeft) ->
+    Result = httpc:request(post, {Url, Headers, "application/json", Body},
+                           [{timeout, 10000}], [{body_format, binary}]),
+    case classify_response(Result) of
+        ok ->
             aforo_metering_metrics:inc('aforo.metering.flush.success', 1),
             ok;
-        Other ->
+        {rejected, _Code, _RespBody} = Rejected ->
+            %% Same bytes, same judgement: retrying a 4xx only delays the drop.
+            {error, Rejected};
+        {transient, Reason} when AttemptsLeft > 1 ->
             aforo_metering_metrics:inc('aforo.metering.flush.retry', 1),
-            ?SLOG(warning, #{msg => "aforo_metering flush retry", reason => Other, attempts_left => Attempts - 1}),
-            timer:sleep(trunc(math:pow(2, 4 - Attempts)) * 1000),
-            ship_with_retry(Url, Headers, Body, Attempts - 1)
+            ?SLOG(warning, #{msg => "aforo_metering flush retry", reason => Reason,
+                             attempts_left => AttemptsLeft - 1}),
+            %% 1s, 2s between the three attempts. The old schedule also slept
+            %% 8s after the final attempt, before giving up.
+            timer:sleep(trunc(math:pow(2, ?MAX_ATTEMPTS - AttemptsLeft)) * 1000),
+            ship_with_retry(Url, Headers, Body, AttemptsLeft - 1);
+        {transient, Reason} ->
+            ?SLOG(error, #{msg => "aforo_metering flush exhausted retries", reason => Reason}),
+            {error, Reason}
     end.
+
+%% 2xx is success. 4xx is a permanent rejection, except 408 and 429, which
+%% explicitly invite a retry. Everything else -- 5xx, timeouts, connection
+%% errors -- is transient. Same rule as the Kong plugin.
+classify_response({ok, {{_, Code, _}, _, _}}) when Code >= 200, Code < 300 ->
+    ok;
+classify_response({ok, {{_, Code, _}, _, RespBody}})
+  when Code >= 400, Code < 500, Code =/= 408, Code =/= 429 ->
+    {rejected, Code, RespBody};
+classify_response({ok, {{_, Code, _}, _, _}}) ->
+    {transient, {http_status, Code}};
+classify_response({error, Reason}) ->
+    {transient, Reason};
+classify_response(Other) ->
+    {transient, Other}.
 
 start_flush_timer() ->
     {ok, _} = timer:apply_interval(flush_interval_ms(), ?MODULE, flush_now, []),
@@ -444,7 +572,12 @@ iso8601(Millis) ->
 tenant_id()         -> get_cfg(tenant_id,         <<"tenant_default">>).
 product_id()        -> get_cfg(product_id,        <<"prod_mqtt_default">>).
 api_key()           -> get_cfg(api_key,           <<"">>).
-ingestor_url()      -> binary_to_list(get_cfg(ingestor_url, <<"https://ingestor.aforo.ai/v1/ingest/events">>)).
+%% /v1/ingest/batch, not /v1/ingest/events (2026-09-21). The plugin POSTs
+%% {"events": [...]}, which is the batch endpoint's contract; /v1/ingest/events
+%% is the single-event, Apigee-format endpoint. And usage-ingestor.aforo.ai,
+%% not ingestor.aforo.ai: the latter resolves to a static CloudFront/S3 site
+%% that answers a POST with a 301, so no event ever reached the ingestor.
+ingestor_url()      -> binary_to_list(get_cfg(ingestor_url, <<"https://usage-ingestor.aforo.ai/v1/ingest/batch">>)).
 flush_count()       -> get_cfg(flush_count,       500).
 flush_interval_ms() -> get_cfg(flush_interval_ms, 3000).
 emit_deliver_enabled() -> get_cfg(emit_deliver, false).
