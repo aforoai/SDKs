@@ -106,6 +106,16 @@ mock_kong = {
     response = {
         get_status = function() return 200 end,
         get_header = function(name) return nil end,
+        -- Records instead of exiting, as Kong's access phase does: exit only
+        -- stores the response and the handler keeps running unless it returns.
+        _exit = nil,
+        _set_headers = {},
+        exit = function(status, body, headers)
+            mock_kong.response._exit = { status = status, body = body, headers = headers }
+        end,
+        set_header = function(name, value)
+            mock_kong.response._set_headers[name] = value
+        end,
     },
     client = {
         get_consumer = function() return nil end,
@@ -406,6 +416,123 @@ describe("aforo-metering handler", function()
             assert.equals("old1", events[1].customerId)
             assert.equals("old10", events[10].customerId)
             assert.equals("new9990", events[10000].customerId)
+        end)
+    end)
+    -- ── Pre-flight quota check ──────────────────────────────────
+    describe("preflight quota", function()
+        local dict
+        local function conf(overrides)
+            local c = {
+                aforo_endpoint = "https://usage-ingestor.test/v1/ingest/batch",
+                api_key = "sk_ingest",
+                tenant_id = "tenant_1",
+                default_metric = "api_calls",
+                preflight_quota_enabled = true,
+                preflight_quota_timeout_ms = 100,
+                preflight_quota_cache_ttl_ms = 1000,
+                preflight_quota_fail_open = true,
+            }
+            for k, v in pairs(overrides or {}) do c[k] = v end
+            return c
+        end
+
+        local function with_customer(id)
+            mock_kong.ctx.shared = { aforo_jwt_claims = { customer_id = id } }
+        end
+
+        before_each(function()
+            dict = new_shared_dict()
+            ngx.shared.aforo_buffer = dict
+            http_mock.requests = {}
+            http_mock.responses = {}
+            http_mock.on_request = nil
+            mock_kong.response._exit = nil
+            mock_kong.response._set_headers = {}
+        end)
+
+        -- The access phase resets ctx.shared.aforo_trace but keeps the JWT
+        -- claims we stash, as Kong would after validation.
+        local function access(c)
+            handler:access(c)
+        end
+
+        it("makes no call and never blocks when disabled", function()
+            with_customer("cust_a")
+            http_mock.responses = { { status = 200, body = '{"decision":"DENY"}' } }
+            access(conf({ preflight_quota_enabled = false }))
+            assert.equals(0, #http_mock.requests)
+            assert.is_nil(mock_kong.response._exit)
+        end)
+
+        it("posts to /api/v1/quota/check with X-API-Key and the verified customer", function()
+            with_customer("cust_jwt")
+            mock_kong.request._headers = { ["x-customer-id"] = "cust_forged" }
+            http_mock.responses = { { status = 200, body = '{"decision":"ALLOW"}' } }
+            access(conf())
+
+            assert.equals(1, #http_mock.requests)
+            local req = http_mock.requests[1]
+            assert.equals("https://usage-ingestor.test/api/v1/quota/check", req.url)
+            assert.equals("POST", req.params.method)
+            assert.equals("sk_ingest", req.params.headers["X-API-Key"])
+            assert.is_nil(req.params.headers["Authorization"])
+            local body = cjson.decode(req.params.body)
+            assert.equals("cust_jwt", body.customerId)
+            assert.equals("api_calls", body.metricName)
+            assert.is_nil(mock_kong.response._exit)
+        end)
+
+        it("answers 429 on DENY with Retry-After", function()
+            with_customer("cust_a")
+            http_mock.responses = { { status = 200,
+                body = '{"decision":"DENY","reason":"Wallet empty","retryAfterMs":30000}' } }
+            access(conf())
+            assert.is_not_nil(mock_kong.response._exit)
+            assert.equals(429, mock_kong.response._exit.status)
+            assert.equals("30", mock_kong.response._exit.headers["Retry-After"])
+        end)
+
+        it("fails open on timeout and on non-200", function()
+            with_customer("cust_a")
+            http_mock.responses = { { err = "timeout" } }
+            access(conf())
+            assert.is_nil(mock_kong.response._exit)
+
+            http_mock.responses = { { status = 500 } }
+            access(conf())
+            assert.is_nil(mock_kong.response._exit)
+            assert.equals(2, #http_mock.requests)
+        end)
+
+        it("refuses with 503 on error only when fail-open is turned off", function()
+            with_customer("cust_a")
+            http_mock.responses = { { err = "timeout" } }
+            access(conf({ preflight_quota_fail_open = false }))
+            assert.equals(503, mock_kong.response._exit.status)
+        end)
+
+        it("caches ALLOW per tenant/customer/metric but never DENY", function()
+            with_customer("cust_a")
+            http_mock.responses = { { status = 200, body = '{"decision":"ALLOW"}' } }
+            access(conf())
+            access(conf())
+            assert.equals(1, #http_mock.requests)
+
+            with_customer("cust_b")
+            http_mock.responses = {
+                { status = 200, body = '{"decision":"DENY"}' },
+                { status = 200, body = '{"decision":"DENY"}' },
+            }
+            access(conf())
+            access(conf())
+            assert.equals(3, #http_mock.requests)
+        end)
+
+        it("skips the check when no verified customer is known", function()
+            mock_kong.ctx.shared = {}
+            mock_kong.request._headers = { ["x-customer-id"] = "cust_forged" }
+            access(conf())
+            assert.equals(0, #http_mock.requests)
         end)
     end)
 end)

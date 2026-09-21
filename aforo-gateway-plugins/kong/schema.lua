@@ -275,6 +275,50 @@ return {
                             description = "Cache TTL in seconds for margin guard decisions (default 30s)",
                         },
                     },
+                    -- Pre-flight quota check (calls the ingestor's /api/v1/quota/check)
+                    {
+                        preflight_quota_enabled = {
+                            type = "boolean",
+                            default = false,
+                            description = "Ask Aforo before proxying whether the customer is within quota (rate limit, prepaid wallet, cumulative quota) and answer 429 on DENY. Adds a synchronous call on every request that misses the local cache, so it is off by default.",
+                        },
+                    },
+                    {
+                        preflight_quota_url = {
+                            type = "string",
+                            description = "Quota-check endpoint. Defaults to aforo_endpoint's scheme and host plus /api/v1/quota/check, since the check lives on the same ingestor.",
+                        },
+                    },
+                    {
+                        preflight_quota_api_key = {
+                            type = "string",
+                            encrypted = true,
+                            description = "API key for the quota check, sent as X-API-Key. Defaults to api_key. Set it when api_key is an ingest-only key: with RBAC enforced the check needs quotas:read.",
+                        },
+                    },
+                    {
+                        preflight_quota_timeout_ms = {
+                            type = "integer",
+                            default = 100,
+                            gt = 0,
+                            description = "Timeout for the quota check. This is on the request path; on timeout the request proceeds (see preflight_quota_fail_open).",
+                        },
+                    },
+                    {
+                        preflight_quota_cache_ttl_ms = {
+                            type = "integer",
+                            default = 1000,
+                            between = { 0, 60000 },
+                            description = "How long an ALLOW is cached per tenant/customer/metric. DENY is never cached, so a top-up unblocks immediately. 0 disables the cache.",
+                        },
+                    },
+                    {
+                        preflight_quota_fail_open = {
+                            type = "boolean",
+                            default = true,
+                            description = "When the quota check errors, times out or answers non-200, let the request through (true) or refuse it with 503 (false).",
+                        },
+                    },
                     -- Exclusions
                     {
                         exclude_paths = {

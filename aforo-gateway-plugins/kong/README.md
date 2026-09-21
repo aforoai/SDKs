@@ -74,7 +74,7 @@ Every option lives under `config.*`. `aforo_endpoint`, `api_key`, and `tenant_id
 | Option | Type | Default | What it does |
 |--------|------|---------|--------------|
 | `aforo_endpoint` | string | — (required) | Aforo ingestor batch URL. Use `https://ingest.aforo.ai/v1/ingest/batch`. |
-| `api_key` | string | — (required) | Aforo API key. Sent as `Authorization: Bearer <api_key>` on the flush. Stored encrypted. |
+| `api_key` | string | — (required) | Aforo API key, scoped `usage:ingest`. Sent as `X-API-Key` on the flush — never as `Authorization: Bearer`, which the ingestor rejects with 401. Stored encrypted. |
 | `tenant_id` | string | — (required) | Aforo tenant identifier. Sent as the `X-Tenant-Id` header on the flush. |
 | `metric_name_pattern` | string | `{method} {path}` | Metric-name template. Variables: `{method}`, `{path}`, `{service}`, `{route}`, `{consumer}`. |
 | `quantity_source` | string | `1` | `1` = one unit per request, `response_size` = response bytes, or a literal number. |
@@ -98,6 +98,12 @@ Every option lives under `config.*`. `aforo_endpoint`, `api_key`, and `tenant_id
 | `margin_guard_enabled` | boolean | `false` | Run a pricing-service margin-guard quick-check in the access phase (429 on L2/L3). |
 | `margin_guard_url` | string | — | Pricing-service base URL for the margin-guard check. |
 | `margin_guard_cache_ttl` | integer | `30` | Cache TTL (seconds) for margin-guard decisions. |
+| `preflight_quota_enabled` | boolean | `false` | Ask the ingestor's `POST /api/v1/quota/check` before proxying (rate limit, prepaid wallet, cumulative quota); 429 on `DENY`. Off by default: it adds a synchronous call per cache miss. |
+| `preflight_quota_url` | string | origin of `aforo_endpoint` + `/api/v1/quota/check` | Quota-check endpoint. |
+| `preflight_quota_api_key` | string | `api_key` | Key sent as `X-API-Key` on the check. Set when `api_key` is ingest-only: with RBAC enforced the check needs `quotas:read`. Stored encrypted. |
+| `preflight_quota_timeout_ms` | integer | `100` | Timeout for the check (it is on the request path). |
+| `preflight_quota_cache_ttl_ms` | integer | `1000` | How long an `ALLOW` is cached per tenant/customer/metric. `DENY` is never cached. `0` disables. |
+| `preflight_quota_fail_open` | boolean | `true` | On error, timeout or non-200: let the request through (`true`) or answer 503 (`false`). |
 | `exclude_paths` | array | `["/health","/ready","/metrics"]` | Paths skipped from metering (prefix match). |
 | `exclude_status_codes` | array | `[401,403,429]` | Status codes skipped from metering. |
 
@@ -108,5 +114,5 @@ Step-by-step from install to a verified event in Aforo: see [USER_GUIDE.md](USER
 ## What this doesn't cover
 
 - **Crypto signature verification is opt-in.** With `jwt_validation_enabled=true`, the plugin always enforces `exp`, `iss`, the jti blocklist, and client revocation, but full RS256 signature verification requires `lua-resty-jwt` (Kong OSS) or Kong Enterprise's native JWT plugin with a JWKS URI. When `lua-resty-jwt` is absent the plugin logs a warning and skips the signature check (claims checks still run). On Kong Enterprise, prefer the native JWT plugin and leave `jwt_validation_enabled=false` here.
-- **No durable buffer.** Events live in the `aforo_buffer` shared dict until flush. A Kong worker restart, or three consecutive failed flush attempts, drops the buffered events — this is fire-and-forget metering, not a guaranteed-delivery queue.
-- **Rate-limit and margin-guard enforcement need Redis / pricing-service reachable.** Both fail open: a Redis timeout or unreachable pricing-service lets the request through rather than blocking it.
+- **No durable buffer.** Events live in the `aforo_buffer` shared dict until flush. A batch that fails transiently (5xx, timeout, 408, 429) is put back and retried on a later flush; a batch the ingestor rejects with any other 4xx is dropped with the reason logged. Past 10,000 buffered events the newest are dropped, and a Kong restart loses whatever is buffered — this is best-effort metering, not a guaranteed-delivery queue.
+- **Rate-limit, margin-guard and pre-flight quota enforcement need Redis / pricing-service / the ingestor reachable.** All fail open: a timeout or an unreachable dependency lets the request through rather than blocking it (the quota check can be made fail-closed with `preflight_quota_fail_open=false`).

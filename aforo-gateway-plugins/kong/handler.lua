@@ -33,6 +33,7 @@ end
 
 local rate_limit = require_sibling("rate-limit-enforce")
 local margin_guard = require_sibling("margin-guard")
+local preflight_quota = require_sibling("preflight-quota")
 
 -- UUID source (2026-09-01 fix).
 --
@@ -967,11 +968,32 @@ function AforoMeteringHandler:access(conf)
     -- Rate limit enforcement (reads policy from Redis, returns 429 on HARD breach)
     rate_limit.enforce(conf)
 
-    -- Margin guard pre-flight check (calls pricing-service quick-check, returns 429 on L2/L3).
     -- resolve_customer_id() prefers the JWT-validated claim stashed above;
     -- falls back to Kong consumer identity (credential-bound). Never reads
     -- request headers or query params — those sources were removed 2026-04-23.
-    local customer_id = resolve_customer_id(conf, kong.client.get_consumer())
+    local consumer = kong.client.get_consumer()
+    local customer_id = resolve_customer_id(conf, consumer)
+
+    -- Pre-flight quota check against the ingestor (2026-09-21). The module was
+    -- written and packaged in the rockspec but never called, so quotas and
+    -- prepaid wallets were enforced only after the fact, at ingest -- by which
+    -- point the upstream had already served the request. Off unless
+    -- preflight_quota_enabled; fail-open; see preflight-quota.lua.
+    --
+    -- The metric is resolved the same way the log phase will bill it, minus
+    -- the upstream response header, which does not exist yet.
+    if conf.preflight_quota_enabled then
+        local service = kong.router.get_service()
+        local route = kong.router.get_route()
+        local metric = resolve_metric_name(conf, kong.request.get_method(), kong.request.get_path(),
+            service and service.name or "", route and route.name or "",
+            consumer and (consumer.username or consumer.custom_id) or "", nil)
+        if preflight_quota.check(conf, customer_id, metric) then
+            return  -- answered 429/503; skip the remaining checks
+        end
+    end
+
+    -- Margin guard pre-flight check (calls pricing-service quick-check, returns 429 on L2/L3).
     margin_guard.check(conf, conf.tenant_id, customer_id)
 end
 
