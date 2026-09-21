@@ -145,7 +145,8 @@ def test_record_emits_event_with_correct_shape(http_collector, billing_config):
     assert req["url"] == "https://ingestor.aforo.ai/v1/ingest/events"  # trailing slash stripped
     assert req["method"] == "POST"
     assert req["headers"]["Content-type"] == "application/json"
-    assert req["headers"]["Authorization"] == "Bearer sk_test_abc"
+    assert req["headers"]["X-api-key"] == "sk_test_abc"
+    assert "Authorization" not in req["headers"]
     assert req["headers"]["X-tenant-id"] == "tenant-001"
 
     events = req["body"]["events"]

@@ -82,3 +82,33 @@ func TestClient_DoubleCloseSafe(t *testing.T) {
 	client.Close()
 	client.Close() // Should not panic
 }
+
+// The ingestor authenticates the tenant key from X-API-Key only. A key sent as
+// Authorization: Bearer is parsed as a JWT and rejected 401 -- even when
+// X-API-Key is also present -- so the SDK must send X-API-Key alone.
+func TestClient_SendsAPIKeyHeaderNotBearer(t *testing.T) {
+	var gotKey, gotAuth, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("X-API-Key")
+		gotAuth = r.Header.Get("Authorization")
+		gotPath = r.URL.Path
+		w.WriteHeader(202)
+	}))
+	defer srv.Close()
+
+	client := NewClient(Options{APIKey: "test-key", BaseURL: srv.URL, FlushCount: 100, FlushInterval: time.Minute})
+	defer client.Close()
+
+	_ = client.Track(TrackEvent{CustomerID: "cust_1", MetricName: "api_calls"})
+	client.Flush()
+
+	if gotPath != "/v1/ingest/batch" {
+		t.Errorf("path = %q, want /v1/ingest/batch", gotPath)
+	}
+	if gotKey != "test-key" {
+		t.Errorf("X-API-Key = %q, want test-key", gotKey)
+	}
+	if gotAuth != "" {
+		t.Errorf("Authorization must not be sent, got %q", gotAuth)
+	}
+}

@@ -268,7 +268,8 @@ describe('Real-broker integration (ws.WebSocketServer + ws client)', () => {
 
         expect(sniffed.length).toBeGreaterThan(0);
         const headers = sniffed[0];
-        expect(headers['authorization']).toBe('Bearer sk_header_check');
+        expect(headers['x-api-key']).toBe('sk_header_check');
+        expect(headers['authorization']).toBeUndefined();
         expect(headers['x-tenant-id']).toBe('tenant-headers');
 
         client.close();

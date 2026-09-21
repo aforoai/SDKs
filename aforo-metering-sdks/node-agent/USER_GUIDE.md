@@ -153,7 +153,7 @@ If you see that batch, the SDK is wired correctly. Then point `ingestorUrl` back
 |---|---|---|---|
 | `tenantId` | `string` | — (required) | Aforo tenant scope. Stamped on every event + sent as `X-Tenant-Id`. |
 | `productId` | `string` | — (required) | The AI_AGENT product the events bill against. |
-| `apiKey` | `string` | — (required) | Sent as `Authorization: Bearer <apiKey>`. |
+| `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. |
 | `ingestorUrl` | `string` | `https://usage-ingestor.aforo.ai/v1/ingest` | Full ingest URL; override per environment. |
 | `flushBatchSize` | `number` | `50` | Buffer size before a forced flush. |
 | `flushIntervalMs` | `number` | `5000` | Max buffer dwell time before a timed flush. |
@@ -165,7 +165,7 @@ If you see that batch, the SDK is wired correctly. Then point `ingestorUrl` back
 |---|---|---|
 | `AforoAgent: tenantId/productId/apiKey is required` thrown at construction | A required config value is empty or undefined | Provide all three. The constructor fails fast on purpose. |
 | `no fetch available — pass fetchImpl in config (Node <18)` | Running on Node < 18 with no global `fetch` | Pass `fetchImpl` (e.g. `node-fetch`), or upgrade to Node >= 18. |
-| `[aforo-agent] ingestor returned 401` in the console; batch dropped | Bad or missing API key | Check `AFORO_API_KEY`. The key goes out as a Bearer token. |
+| `[aforo-agent] ingestor returned 401` in the console; batch dropped | Bad or missing API key | Check `AFORO_API_KEY`. The key goes out as `X-API-Key`. |
 | `[aforo-agent] ingestor returned 4xx`; dashboard empty | Tenant/product mismatch or unknown metric on the product | Confirm `tenantId`/`productId` match the AI_AGENT product, and that `step_count`/`tokens_total`/`session_count`/`session_completed` exist on it. |
 | Process exits, no events arrive, no error logged | A timed flush never fired before exit | Call `await session.end(...)` (or `await agent.flush()`) before the process exits. |
 | Token charges look doubled | Counting both `agent_step` and `token_usage` for the same step | They're distinct metrics by design — bill against one. |

@@ -44,7 +44,10 @@ describe('Transport', () => {
     const [url, options] = mockFetch.mock.calls[0];
     expect(url).toBe('https://ingest.aforo.ai/v1/ingest/batch');
     expect(options.method).toBe('POST');
-    expect(options.headers['Authorization']).toBe('Bearer test-key');
+    expect(options.headers['X-API-Key']).toBe('test-key');
+    // The ingestor parses Authorization: Bearer as a JWT and rejects an API key
+    // there with 401 -- even alongside X-API-Key -- so it must never be sent.
+    expect(options.headers['Authorization']).toBeUndefined();
   });
 
   it('should return empty result for empty events', async () => {

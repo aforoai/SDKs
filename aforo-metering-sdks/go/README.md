@@ -110,7 +110,7 @@ r.Use(metering.ChiMiddleware(metering.MiddlewareOptions{
 
 | Option | Type | Default | What it does |
 |---|---|---|---|
-| `APIKey` | `string` | — (required) | Sent as `Authorization: Bearer <APIKey>`. |
+| `APIKey` | `string` | — (required) | Sent as `X-API-Key: <APIKey>`. |
 | `BaseURL` | `string` | `https://ingest.aforo.ai` | Ingestor base; the client appends `/v1/ingest/batch`. Override per environment. |
 | `FlushCount` | `int` | `50` | Flush when the buffer reaches this many events; also the per-batch drain size. |
 | `FlushInterval` | `time.Duration` | `5s` | Background flush cadence. |

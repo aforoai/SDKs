@@ -65,7 +65,7 @@ Pass these to `new AforoAgent({...})`:
 |---|---|---|---|
 | `tenantId` | `string` | — (required) | Aforo tenant scope. Stamped on every event and sent as `X-Tenant-Id`. Never read from a client header. |
 | `productId` | `string` | — (required) | The AI_AGENT product these events bill against. |
-| `apiKey` | `string` | — (required) | Sent as `Authorization: Bearer <apiKey>`. Use `process.env.AFORO_API_KEY`. |
+| `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. Use `process.env.AFORO_API_KEY`. |
 | `ingestorUrl` | `string` | `https://usage-ingestor.aforo.ai/v1/ingest` | Full ingest URL. Override for local dev or air-gapped deployments. |
 | `flushBatchSize` | `number` | `50` | Buffer this many events before forcing a flush. Lower it for low-volume agents to surface metrics sooner; raise it to amortize per-batch HTTP cost. |
 | `flushIntervalMs` | `number` | `5000` | Max time an event sits in the buffer before a timed flush. `session.end()` flushes regardless. |

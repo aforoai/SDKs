@@ -293,7 +293,7 @@ export class AforoGrpcBilling {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${this.config.apiKey}`,
+            'X-API-Key': this.config.apiKey,
             'X-Tenant-Id': this.config.tenantId,
           },
           body,

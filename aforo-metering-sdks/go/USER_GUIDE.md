@@ -126,7 +126,7 @@ The wire call the SDK makes:
 
 ```
 POST https://ingest.aforo.ai/v1/ingest/batch
-Authorization: Bearer <AFORO_API_KEY>
+X-API-Key: <AFORO_API_KEY>
 Content-Type: application/json
 
 {"events":[{"customerId":"cust_acme_001","metricName":"report_generated","quantity":1,"idempotencyKey":"…","occurredAt":"2026-06-29T…Z","metadata":{"format":"pdf"}}]}
@@ -140,7 +140,7 @@ Content-Type: application/json
 
 | Option | Type | Default | What it does |
 |---|---|---|---|
-| `APIKey` | `string` | — (required) | `Authorization: Bearer <APIKey>`. |
+| `APIKey` | `string` | — (required) | `X-API-Key: <APIKey>`. |
 | `BaseURL` | `string` | `https://ingest.aforo.ai` | Ingestor base; `/v1/ingest/batch` is appended. |
 | `FlushCount` | `int` | `50` | Flush threshold + per-batch drain size. |
 | `FlushInterval` | `time.Duration` | `5s` | Background flush cadence. |

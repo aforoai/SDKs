@@ -170,12 +170,13 @@ describe('AforoAgent — batching + flush', () => {
     expect((calls[0].body as any).events).toHaveLength(3);
   });
 
-  test('headers carry tenantId + Bearer apiKey', async () => {
+  test('headers carry tenantId + X-API-Key (and no Bearer)', async () => {
     const { calls, fetchImpl } = makeFetch();
     const agent = new AforoAgent(baseConfig({ fetchImpl }));
     await (await agent.startSession({ agentId: 'a' })).end({ taskCompleted: true });
     const headers = calls[0].headers;
-    expect(headers['Authorization']).toBe('Bearer sk_test_abcdef');
+    expect(headers['X-API-Key']).toBe('sk_test_abcdef');
+    expect(headers['Authorization']).toBeUndefined();
     expect(headers['X-Tenant-Id']).toBe('tenant_test');
   });
 

@@ -168,7 +168,7 @@ Precedence: **env var > CLI flag > config file > default.**
 | `--host` | `listen.host` | — | `127.0.0.1` | Listen host (sse / streamable-http). |
 | `--tenant` | `aforo.tenantId` | `AFORO_TENANT_ID` | — (required) | Tenant scope; sent as `X-Tenant-Id`. |
 | `--product` | `aforo.productId` | `AFORO_PRODUCT_ID` | — (required) | MCP_SERVER product. |
-| `--api-key` | `aforo.apiKey` | `AFORO_API_KEY` | — (required) | `Authorization: Bearer <apiKey>`. |
+| `--api-key` | `aforo.apiKey` | `AFORO_API_KEY` | — (required) | `X-API-Key: <apiKey>`. |
 | `--ingestor-url` | `aforo.ingestorUrl` | `AFORO_INGESTOR_URL` | — (required) | Base URL; proxy appends `/v1/ingest/batch` and `/api/v1/quota/check`. |
 | `--agent-id` | `aforo.agentId` | `AFORO_AGENT_ID` | — | Agent id override when traffic lacks `_meta.agent_id`. |
 | `--quota-enforcement` | `aforo.quotaEnforcement` | `AFORO_QUOTA_ENFORCEMENT` | `false` | Pre-flight quota gate (fail-open, 50ms budget). |

@@ -195,7 +195,9 @@ async def test_authorization_and_tenant_headers_reach_ingestor():
 
         assert captured, "ingestor was never called"
         headers = captured[0]["headers"]
-        assert headers.get("Authorization") == "Bearer sk_header_check"
+        lower = {k.lower(): v for k, v in headers.items()}
+        assert lower.get("x-api-key") == "sk_header_check"
+        assert "authorization" not in lower
         assert headers.get("X-Tenant-Id") == "tenant-headers"
 
         billing.shutdown()

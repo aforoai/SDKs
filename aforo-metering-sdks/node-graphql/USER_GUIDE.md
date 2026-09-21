@@ -126,7 +126,7 @@ process.on('SIGINT',  async () => { await billing.shutdown(); process.exit(0); }
 > ⚠ Without `shutdown()`, a process that exits inside the 5-second window drops the buffered batch. Wire it up before you trust the counts.
 
 The SDK POSTs the batch to `https://ingest.aforo.ai/v1/ingest/events` with:
-- `Authorization: Bearer <your api key>`
+- `X-API-Key: <your api key>`
 - `X-Tenant-Id: tenant_acme`
 
 Confirm it arrived in the Aforo console under the product's usage events (filter to `productType = GRAPHQL_API`). If a flush fails 3× (1s/2s/4s backoff), the `onError` callback fires and the batch is dropped — watch your logs:
@@ -144,7 +144,7 @@ const billing = new AforoGraphQlBilling({
 |---|---|---|---|
 | `tenantId` | `string` | — (required) | Aforo tenant. Sent as `X-Tenant-Id`. |
 | `productId` | `string` | — (required) | Aforo product id; into `metadata.productId`. |
-| `apiKey` | `string` | — (required) | Sent as `Authorization: Bearer <apiKey>`. |
+| `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. |
 | `ingestorUrl` | `string` | — (required) | Base URL; SDK appends `/v1/ingest/events`. |
 | `schemaVersion` | `string` | `undefined` | Copied into `metadata.schemaVersion`. |
 | `customerIdExtractor` | `(context) => string \| undefined` | reads `x-customer-id` | Resolve the customer per operation; `undefined` → skip. |

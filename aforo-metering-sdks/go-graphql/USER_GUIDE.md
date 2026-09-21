@@ -121,7 +121,7 @@ The wire call the SDK makes:
 
 ```
 POST https://ingest.aforo.ai/v1/ingest/events
-Authorization: Bearer <AFORO_API_KEY>
+X-API-Key: <AFORO_API_KEY>
 X-Tenant-Id: tenant_acme
 Content-Type: application/json
 
@@ -136,7 +136,7 @@ Content-Type: application/json
 |---|---|---|---|
 | `TenantID` | `string` | — (required) | `X-Tenant-Id` header + idempotency-key component. |
 | `ProductID` | `string` | — (required) | Event metadata + idempotency-key component. |
-| `APIKey` | `string` | — (required) | `Authorization: Bearer <APIKey>`. |
+| `APIKey` | `string` | — (required) | `X-API-Key: <APIKey>`. |
 | `IngestorURL` | `string` | — (required) | Base; `/v1/ingest/events` is appended. |
 | `SchemaVersion` | `string` | none | Added to metadata as `schemaVersion` when set. |
 | `FlushCount` | `int` | `50` | Buffer-size flush threshold. |

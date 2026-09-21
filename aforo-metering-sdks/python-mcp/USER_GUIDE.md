@@ -105,7 +105,7 @@ A hard crash skips this — buffered events that never flushed are lost.
 |---|---|---|---|
 | `tenant_id` | `str` | required | Aforo tenant; sent as `X-Tenant-Id`. |
 | `product_id` | `str` | required | MCP product id; stamped in metadata. |
-| `api_key` | `str` | required | Bearer token. |
+| `api_key` | `str` | required | Aforo API key, sent as `X-API-Key`. |
 | `ingestor_url` | `str` | required | Host; `/v1/ingest/batch` appended. |
 | `flush_interval_sec` | `float` | `5.0` | Periodic flush cadence (needs `start()`). |
 | `flush_count` | `int` | `50` | Buffer size that triggers an async flush. |

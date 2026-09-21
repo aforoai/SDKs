@@ -146,7 +146,7 @@ If you see that batch hit `/v1/ingest/batch`, the wrapper is wired correctly. Po
 |---|---|---|---|
 | `tenantId` | `string` | — (required) | Tenant scope; sent as `X-Tenant-Id`; heartbeat `customerId`. |
 | `productId` | `string` | — (required) | MCP_SERVER product; carried in event metadata. |
-| `apiKey` | `string` | — (required) | `Authorization: Bearer <apiKey>`. |
+| `apiKey` | `string` | — (required) | `X-API-Key: <apiKey>`. |
 | `ingestorUrl` | `string` | — (required) | Base URL; SDK appends `/v1/ingest/batch`. |
 | `entitlementMode` | `'SERVER_LEVEL' \| 'TOOL_LEVEL'` | unset | Reserved; accepted, not enforced client-side at this version. |
 | `sessionConfig.idleTimeoutSec` / `.maxDurationSec` | `number` | unset | Reserved; accepted, not enforced client-side at this version. |

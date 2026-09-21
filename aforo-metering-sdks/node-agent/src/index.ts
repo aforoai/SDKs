@@ -311,7 +311,7 @@ export class AforoAgent {
       const res = await this.fetchImpl(url, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${this.config.apiKey}`,
+          'X-API-Key': this.config.apiKey,
           'Content-Type': 'application/json',
           'X-Tenant-Id': this.config.tenantId,
         },

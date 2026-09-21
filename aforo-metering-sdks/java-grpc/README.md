@@ -50,7 +50,7 @@ Server server = ServerBuilder.forPort(50051)
 Runtime.getRuntime().addShutdownHook(new Thread(billing::close));
 ```
 
-The interceptor records one event when each call closes, so it never delays the RPC. Events POST to `<ingestorUrl>/v1/ingest/events` with `Authorization: Bearer <apiKey>` and `X-Tenant-Id: <tenantId>`; the buffer flushes every 5 seconds or once 50 events queue, with 3× exponential retry (1s / 2s / 4s).
+The interceptor records one event when each call closes, so it never delays the RPC. Events POST to `<ingestorUrl>/v1/ingest/events` with `X-API-Key: <apiKey>` and `X-Tenant-Id: <tenantId>`; the buffer flushes every 5 seconds or once 50 events queue, with 3× exponential retry (1s / 2s / 4s).
 
 > ⚠ Calls without a resolved customer id are not metered. The default extractor reads the `x-customer-id` gRPC metadata header. Override it with `.customerIdExtractor(...)` to decode a JWT from the `authorization` metadata instead — resolve from verified credentials, never from a request message field a client controls.
 
@@ -62,7 +62,7 @@ Builder options on `AforoGrpcBilling.newBuilder()`:
 |---|---|---|---|
 | `tenantId` | `String` | *(required)* | Sent as the `X-Tenant-Id` header. |
 | `productId` | `String` | *(required)* | Stamped into `metadata.productId` and the idempotency key. |
-| `apiKey` | `String` | *(required)* | Bearer token. |
+| `apiKey` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
 | `ingestorUrl` | `String` | *(required)* | Ingestion host. The SDK appends `/v1/ingest/events`. Use `https://ingest.aforo.ai`. |
 | `serviceName` | `String` | *(required)* | Logical service name stamped as `grpcService` and into the idempotency key. |
 | `flushCount` | `int` | `50` | Buffered events that trigger an immediate flush. |

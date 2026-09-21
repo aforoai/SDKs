@@ -232,7 +232,8 @@ describe('flush request shape', () => {
     expect(req.init.method).toBe('POST');
     const headers = req.init.headers as Record<string, string>;
     expect(headers['Content-Type']).toBe('application/json');
-    expect(headers['Authorization']).toBe('Bearer sk_test_abc');
+    expect(headers['X-API-Key']).toBe('sk_test_abc');
+    expect(headers['Authorization']).toBeUndefined();
     expect(headers['X-Tenant-Id']).toBe('tenant-001');
     await b.shutdown();
   });

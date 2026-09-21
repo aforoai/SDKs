@@ -103,7 +103,7 @@ Each `Record*` call buffers one event; an empty `customerID` records nothing (th
 |---|---|---|---|
 | `TenantID` | `string` | — (required) | Sent as the `X-Tenant-Id` header on every flush and embedded in idempotency keys. Set by you, never from a client header. |
 | `ProductID` | `string` | — (required) | Recorded in event metadata + idempotency keys. |
-| `APIKey` | `string` | — (required) | Sent as `Authorization: Bearer <APIKey>`. |
+| `APIKey` | `string` | — (required) | Sent as `X-API-Key: <APIKey>`. |
 | `IngestorURL` | `string` | — (required) | Ingestor base; the SDK appends `/v1/ingest/events`. Use `https://ingest.aforo.ai`. |
 | `EmitDeliverEvents` | `bool` | `false` | When true, `RecordDeliver` emits events. Off by default — inbound delivery is high-volume. |
 | `FlushCount` | `int` | `200` | Flush when the buffer reaches this many events (highest of the SDKs — MQTT telemetry is the highest-volume). |

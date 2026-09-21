@@ -127,7 +127,7 @@ AFORO_API_KEY = os.environ["AFORO_API_KEY"]
 
 | Option | Type | Default | What it does |
 |---|---|---|---|
-| `api_key` | `str` | required | Bearer token for the ingestor. |
+| `api_key` | `str` | required | Aforo API key, sent to the ingestor as `X-API-Key`. |
 | `base_url` | `str` | `https://ingest.aforo.ai` | Host only; `/v1/ingest/batch` is appended. |
 | `flush_count` | `int` | `50` | Buffer threshold + max batch size. |
 | `flush_interval` | `float` | `5.0` | Background flush cadence (seconds). |

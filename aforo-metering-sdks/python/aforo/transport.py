@@ -43,7 +43,7 @@ class Transport:
         body = {"events": [e.to_dict() for e in events]}
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self._api_key}",
+            "X-API-Key": self._api_key,
         }
 
         for attempt in range(self._max_retries + 1):

@@ -93,7 +93,7 @@ The proxy resolves each value with this precedence: **environment variable > CLI
 | `--host` | `listen.host` | — | `127.0.0.1` | Listen host (sse / streamable-http). |
 | `--tenant` | `aforo.tenantId` | `AFORO_TENANT_ID` | — (required) | Aforo tenant scope. Sent as `X-Tenant-Id`. |
 | `--product` | `aforo.productId` | `AFORO_PRODUCT_ID` | — (required) | MCP_SERVER product the events bill against. |
-| `--api-key` | `aforo.apiKey` | `AFORO_API_KEY` | — (required) | `Authorization: Bearer <apiKey>`. |
+| `--api-key` | `aforo.apiKey` | `AFORO_API_KEY` | — (required) | `X-API-Key: <apiKey>`. |
 | `--ingestor-url` | `aforo.ingestorUrl` | `AFORO_INGESTOR_URL` | — (required) | Base ingestor URL. The proxy appends `/v1/ingest/batch`. |
 | `--agent-id` | `aforo.agentId` | `AFORO_AGENT_ID` | — | Agent id override when the traffic doesn't carry `_meta.agent_id`. |
 | `--quota-enforcement` | `aforo.quotaEnforcement` | `AFORO_QUOTA_ENFORCEMENT` | `false` | Pre-flight quota gate before each `tools/call` (see below). |

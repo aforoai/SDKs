@@ -71,7 +71,7 @@ const client = mqtt.connect('mqtts://broker.example.com', { clientId: `device-${
 billing.wrapMqttClient(client, { customerId: 'cust_acme_001' });
 ```
 
-Each event uses `metricName: "mqtt_broker.<event>"` (`mqtt_broker.publish`, `mqtt_broker.subscribe`, …) with `quantity: 1`, and carries `mqttTopic`, `mqttQos`, `mqttRetained`, `mqttClientId`, and `dataBytes`. Events ship to `POST https://ingest.aforo.ai/v1/ingest/events` with `Authorization: Bearer <api_key>` and `X-Tenant-Id: <tenant_id>`.
+Each event uses `metricName: "mqtt_broker.<event>"` (`mqtt_broker.publish`, `mqtt_broker.subscribe`, …) with `quantity: 1`, and carries `mqttTopic`, `mqttQos`, `mqttRetained`, `mqttClientId`, and `dataBytes`. Events ship to `POST https://ingest.aforo.ai/v1/ingest/events` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
 
 > **`DELIVER` (fan-out) events are dropped unless `emitDeliverEvents: true`.** This gate applies in **both** modes — client-mode inbound `message` deliveries and any broker delivery path are skipped by default because fan-out is high-volume. `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, `CONNECT`, and `DISCONNECT` are always metered.
 
@@ -83,7 +83,7 @@ Each event uses `metricName: "mqtt_broker.<event>"` (`mqtt_broker.publish`, `mqt
 |---|---|---|---|
 | `tenantId` | `string` | — (required) | Aforo tenant. Sent as `X-Tenant-Id`. Never read from a client header. |
 | `productId` | `string` | — (required) | Aforo product id; into each event's `metadata.productId`. |
-| `apiKey` | `string` | — (required) | Sent as `Authorization: Bearer <apiKey>`. |
+| `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. |
 | `ingestorUrl` | `string` | — (required) | Ingestion base URL. SDK appends `/v1/ingest/events`. Use `https://ingest.aforo.ai`. |
 | `emitDeliverEvents` | `boolean` | `false` | Emit a `DELIVER` event per fan-out delivery. Off → `DELIVER` events are dropped (both modes). |
 | `flushCount` | `number` | `200` | Buffered events that trigger an immediate flush. Highest default of the SDKs — MQTT is very high-volume. |

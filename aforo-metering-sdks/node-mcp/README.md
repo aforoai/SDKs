@@ -60,7 +60,7 @@ Pass these to `new AforoMcpBilling({...})`:
 |---|---|---|---|
 | `tenantId` | `string` | — (required) | Aforo tenant scope. Sent as `X-Tenant-Id`; also the heartbeat's `customerId`. |
 | `productId` | `string` | — (required) | The MCP_SERVER product these events bill against. Carried in event metadata. |
-| `apiKey` | `string` | — (required) | Sent as `Authorization: Bearer <apiKey>`. |
+| `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. |
 | `ingestorUrl` | `string` | — (required) | Base ingestor URL. The SDK appends `/v1/ingest/batch`. |
 | `entitlementMode` | `'SERVER_LEVEL' \| 'TOOL_LEVEL'` | unset | Reserved for entitlement scoping. Accepted but not enforced client-side at this version. |
 | `sessionConfig.idleTimeoutSec` | `number` | unset | Reserved for session idle/duration policy. Accepted; not enforced client-side at this version. |

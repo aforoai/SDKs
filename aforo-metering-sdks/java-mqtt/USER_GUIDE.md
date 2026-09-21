@@ -106,7 +106,7 @@ Runtime.getRuntime().addShutdownHook(new Thread(billing::close));
 |---|---|---|---|
 | `tenantId` | `String` | *(required)* | `X-Tenant-Id` header. |
 | `productId` | `String` | *(required)* | `metadata.productId`. |
-| `apiKey` | `String` | *(required)* | Bearer token. |
+| `apiKey` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
 | `ingestorUrl` | `String` | *(required)* | Host; SDK appends `/v1/ingest/events`. |
 | `emitDeliverEvents` | `boolean` | `false` | `true` = emit `DELIVER` events for inbound messages. |
 | `flushCount` | `int` | `200` | Events per immediate flush. |

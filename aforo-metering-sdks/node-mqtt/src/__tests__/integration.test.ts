@@ -261,7 +261,8 @@ describe('Real-broker integration (aedes + mqtt.js)', () => {
       // The SDK's two ingestors will both fire — pick any sniffed
       // request and assert headers came through.
       const headers = sniffed[0];
-      expect(headers['authorization']).toBe('Bearer sk_header_check');
+      expect(headers['x-api-key']).toBe('sk_header_check');
+      expect(headers['authorization']).toBeUndefined();
       expect(headers['x-tenant-id']).toBe('tenant-headers');
 
       await new Promise<void>((r) => client.end(false, {}, () => r()));

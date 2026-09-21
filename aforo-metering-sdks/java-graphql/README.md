@@ -48,7 +48,7 @@ GraphQL gql = GraphQL.newGraphQL(schema)
 Runtime.getRuntime().addShutdownHook(new Thread(billing::close));
 ```
 
-Events POST to `<ingestorUrl>/v1/ingest/events` with `Authorization: Bearer <apiKey>` and `X-Tenant-Id: <tenantId>`. The buffer flushes every 5 seconds or once 50 events queue, with 3× exponential retry (1s / 2s / 4s).
+Events POST to `<ingestorUrl>/v1/ingest/events` with `X-API-Key: <apiKey>` and `X-Tenant-Id: <tenantId>`. The buffer flushes every 5 seconds or once 50 events queue, with 3× exponential retry (1s / 2s / 4s).
 
 > ⚠ Operations without a resolved customer id are not metered — safe for introspection and health queries. The default extractor reads `x-customer-id` (or `customerId`) from the GraphQL execution context `Map`. Override it with `.customerIdExtractor(...)` if your customer id lives elsewhere (e.g. a JWT claim).
 
@@ -60,7 +60,7 @@ Builder options on `AforoGraphQlBilling.newBuilder()`:
 |---|---|---|---|
 | `tenantId` | `String` | *(required)* | Sent as the `X-Tenant-Id` header. |
 | `productId` | `String` | *(required)* | Stamped into each event's `metadata.productId` and the idempotency key. |
-| `apiKey` | `String` | *(required)* | Bearer token. |
+| `apiKey` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
 | `ingestorUrl` | `String` | *(required)* | Ingestion host. The SDK appends `/v1/ingest/events`. Use `https://ingest.aforo.ai`. |
 | `schemaVersion` | `String` | *(none)* | Optional; added to `metadata.schemaVersion` when set. |
 | `flushCount` | `int` | `50` | Buffered events that trigger an immediate flush. |

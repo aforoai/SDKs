@@ -64,7 +64,7 @@ client.publish("devices/001/status", new MqttMessage("{\"online\": true}".getByt
 billing.recordPublish("cust_acme_001", "device-001", "devices/001/status", 0, false, 17);
 ```
 
-Events POST to `<ingestorUrl>/v1/ingest/events` with `Authorization: Bearer <apiKey>` and `X-Tenant-Id: <tenantId>`. The buffer flushes every 2 seconds or once 200 events queue — the most aggressive of the SDKs, because MQTT telemetry can run tens of thousands of events/sec — with 3× exponential retry.
+Events POST to `<ingestorUrl>/v1/ingest/events` with `X-API-Key: <apiKey>` and `X-Tenant-Id: <tenantId>`. The buffer flushes every 2 seconds or once 200 events queue — the most aggressive of the SDKs, because MQTT telemetry can run tens of thousands of events/sec — with 3× exponential retry.
 
 > ⚠ The SDK does not see your MQTT traffic — you report it. Call the matching `record*` method right next to each `publish` / `subscribe` / `connect` / `disconnect`. The customer id is your argument; resolve it from your device-to-customer mapping, never from the message payload.
 
@@ -89,7 +89,7 @@ Builder options on `AforoMqttBilling.newBuilder()`:
 |---|---|---|---|
 | `tenantId` | `String` | *(required)* | Sent as the `X-Tenant-Id` header. |
 | `productId` | `String` | *(required)* | Stamped into `metadata.productId`. |
-| `apiKey` | `String` | *(required)* | Bearer token. |
+| `apiKey` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
 | `ingestorUrl` | `String` | *(required)* | Ingestion host. The SDK appends `/v1/ingest/events`. Use `https://ingest.aforo.ai`. |
 | `emitDeliverEvents` | `boolean` | `false` | When `true`, `recordDeliver` emits `DELIVER` events. Off by default. |
 | `flushCount` | `int` | `200` | Buffered events that trigger an immediate flush. |

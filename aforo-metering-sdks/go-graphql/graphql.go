@@ -177,7 +177,7 @@ func (b *Billing) flush() {
 	for attempt := 1; attempt <= 3; attempt++ {
 		req, _ := http.NewRequest(http.MethodPost, b.url, bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+b.cfg.APIKey)
+		req.Header.Set("X-API-Key", b.cfg.APIKey)
 		req.Header.Set("X-Tenant-Id", b.cfg.TenantID)
 		resp, err := b.client.Do(req)
 		if err == nil {

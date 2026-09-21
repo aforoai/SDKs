@@ -51,7 +51,7 @@ server.start()
 server.wait_for_termination()
 ```
 
-Every unary RPC is now metered — one `grpc_api.rpc_calls` event with `grpcStatusCode`, `grpcCallType=UNARY`, and `executionDurationMs`, POSTed to `https://ingest.aforo.ai/v1/ingest/events` with `Authorization: Bearer <api_key>` and `X-Tenant-Id: <tenant_id>`.
+Every unary RPC is now metered — one `grpc_api.rpc_calls` event with `grpcStatusCode`, `grpcCallType=UNARY`, and `executionDurationMs`, POSTed to `https://ingest.aforo.ai/v1/ingest/events` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
 
 > ⚠ This package targets the ingestor's **`/v1/ingest/events`** path (the base and MCP Aforo SDKs use `/v1/ingest/batch`). Set `ingestor_url` to the host only — the SDK appends the path.
 
@@ -65,7 +65,7 @@ Constructor arguments for `AforoGrpcBilling(...)`:
 |---|---|---|---|
 | `tenant_id` | `str` | — (required) | Aforo tenant; sent as `X-Tenant-Id`. |
 | `product_id` | `str` | — (required) | Product the RPCs bill against. |
-| `api_key` | `str` | — (required) | Bearer token for the ingestor. |
+| `api_key` | `str` | — (required) | Aforo API key, sent to the ingestor as `X-API-Key`. |
 | `ingestor_url` | `str` | — (required) | Host; `/v1/ingest/events` is appended. |
 | `service_name` | `str` | — (required) | Fully-qualified gRPC service; stamped as `grpcService`. |
 | `flush_interval_sec` | `float` | `5.0` | Background flush cadence (daemon thread from construction). |

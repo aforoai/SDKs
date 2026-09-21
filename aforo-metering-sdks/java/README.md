@@ -74,7 +74,7 @@ The filter runs **after** the response is committed, so metering adds no latency
 
 | Option | Type | Default | What it does |
 |---|---|---|---|
-| `apiKey` | `String` | *(required)* | Bearer token sent as `Authorization: Bearer <apiKey>`. Blank throws `IllegalArgumentException`. |
+| `apiKey` | `String` | *(required)* | Sent as `X-API-Key: <apiKey>`. Blank throws `IllegalArgumentException`. |
 | `baseUrl(...)` | `String` | `https://ingest.aforo.ai` | Ingestion host. The SDK appends `/v1/ingest/batch`. Override per environment. |
 | `flushCount(...)` | `int` | `50` | Buffered events that trigger an immediate async flush. |
 | `flushIntervalMs(...)` | `long` | `5000` | Background flush cadence in ms. |
@@ -89,7 +89,7 @@ Spring Boot properties (prefix `aforo`) — a subset of the above:
 | Property | Default | What it does |
 |---|---|---|
 | `aforo.enabled` | *(unset → off)* | Auto-config activates only when set to `true`. |
-| `aforo.api-key` | *(required)* | Bearer token. |
+| `aforo.api-key` | *(required)* | Aforo API key, sent as `X-API-Key`. |
 | `aforo.base-url` | `https://ingest.aforo.ai` | Ingestion host. |
 | `aforo.flush-count` | `50` | Events per immediate flush. |
 | `aforo.flush-interval-ms` | `5000` | Background flush cadence. |

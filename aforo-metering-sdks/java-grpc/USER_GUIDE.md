@@ -112,7 +112,7 @@ billing.record("ListUsers", "SERVER_STREAM", customerId, "OK", durationMs);
 |---|---|---|---|
 | `tenantId` | `String` | *(required)* | `X-Tenant-Id` header. |
 | `productId` | `String` | *(required)* | `metadata.productId` + idempotency key. |
-| `apiKey` | `String` | *(required)* | Bearer token. |
+| `apiKey` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
 | `ingestorUrl` | `String` | *(required)* | Host; SDK appends `/v1/ingest/events`. |
 | `serviceName` | `String` | *(required)* | `grpcService` field + idempotency key. |
 | `flushCount` | `int` | `50` | Events per immediate flush. |

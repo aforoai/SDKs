@@ -66,7 +66,7 @@ public class FeedSocket {
 }
 ```
 
-Events POST to `<ingestorUrl>/v1/ingest/events` with `Authorization: Bearer <apiKey>` and `X-Tenant-Id: <tenantId>`. The buffer flushes every 3 seconds or once 100 events queue — more aggressive than the HTTP SDKs because WebSocket traffic is higher-volume — with 3× exponential retry.
+Events POST to `<ingestorUrl>/v1/ingest/events` with `X-API-Key: <apiKey>` and `X-Tenant-Id: <tenantId>`. The buffer flushes every 3 seconds or once 100 events queue — more aggressive than the HTTP SDKs because WebSocket traffic is higher-volume — with 3× exponential retry.
 
 > ⚠ `openConnection(customerId, ...)` returns `null` when `customerId` is blank, and every subsequent call short-circuits on a `null` connection id. Resolve the customer at open time from your auth, not from a frame payload. Keep the returned `connectionId` for the life of the socket — it's how `recordFrame` and `closeConnection` find the in-memory counters.
 
@@ -78,7 +78,7 @@ Builder options on `AforoWsBilling.newBuilder()`:
 |---|---|---|---|
 | `tenantId` | `String` | *(required)* | Sent as the `X-Tenant-Id` header. |
 | `productId` | `String` | *(required)* | Stamped into `metadata.productId`. |
-| `apiKey` | `String` | *(required)* | Bearer token. |
+| `apiKey` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
 | `ingestorUrl` | `String` | *(required)* | Ingestion host. The SDK appends `/v1/ingest/events`. Use `https://ingest.aforo.ai`. |
 | `perFrameEvents` | `boolean` | `false` | When `true`, each `recordFrame` emits its own event. When `false`, only OPEN and CLOSE events are emitted, with frame/byte totals aggregated on CLOSE. |
 | `flushCount` | `int` | `100` | Buffered events that trigger an immediate flush. |

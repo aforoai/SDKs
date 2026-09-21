@@ -52,7 +52,7 @@ server.addService(UserServiceService, {
 process.on('SIGTERM', async () => { await billing.shutdown(); });
 ```
 
-Each wrapped handler emits one event with `metricName: "grpc_api.rpc_calls"`, `quantity: 1`. Streams emit a single event on stream close carrying the aggregated `messageCount`. The gRPC status code is mapped to a label (`OK`, `NOT_FOUND`, `UNAVAILABLE`, …). Events ship to `POST https://ingest.aforo.ai/v1/ingest/events` with `Authorization: Bearer <api_key>` and `X-Tenant-Id: <tenant_id>`.
+Each wrapped handler emits one event with `metricName: "grpc_api.rpc_calls"`, `quantity: 1`. Streams emit a single event on stream close carrying the aggregated `messageCount`. The gRPC status code is mapped to a label (`OK`, `NOT_FOUND`, `UNAVAILABLE`, …). Events ship to `POST https://ingest.aforo.ai/v1/ingest/events` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
 
 ## Configuration
 
@@ -62,7 +62,7 @@ Each wrapped handler emits one event with `metricName: "grpc_api.rpc_calls"`, `q
 |---|---|---|---|
 | `tenantId` | `string` | — (required) | Aforo tenant. Sent as `X-Tenant-Id`. Never read from a client header. |
 | `productId` | `string` | — (required) | Aforo product id; into each event's `metadata.productId`. |
-| `apiKey` | `string` | — (required) | Sent as `Authorization: Bearer <apiKey>`. |
+| `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. |
 | `ingestorUrl` | `string` | — (required) | Ingestion base URL. SDK appends `/v1/ingest/events`. Use `https://ingest.aforo.ai`. |
 | `serviceName` | `string` | — (required) | Fully-qualified gRPC service name (e.g. `acme.v1.UserService`); stamped on every event as `grpcService`. |
 | `customerIdExtractor` | `(metadata: Record<string, unknown>) => string \| undefined` | reads `x-customer-id` from `call.metadata.getMap()` | Resolve the customer per call. `undefined` → call is not metered. |

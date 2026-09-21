@@ -49,6 +49,23 @@ class TestTransport:
         assert result.failed == 0
 
     @patch("aforo.transport.httpx.Client")
+    def test_sends_api_key_header_not_bearer(self, mock_client_cls):
+        """The ingestor authenticates X-API-Key only; Bearer is parsed as a JWT and 401s."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 202
+        mock_client = MagicMock()
+        mock_client.post.return_value = mock_resp
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_client
+
+        self._transport().send_sync(_events(1))
+
+        headers = mock_client.post.call_args.kwargs["headers"]
+        assert headers["X-API-Key"] == "test-key"
+        assert "Authorization" not in headers
+
+    @patch("aforo.transport.httpx.Client")
     def test_no_retry_on_400(self, mock_client_cls):
         mock_resp = MagicMock()
         mock_resp.status_code = 400

@@ -109,13 +109,13 @@ A `sent` count equal to what you tracked and `failed == 0` means the ingestor re
 
 - Open the Aforo console → **Ingestion → Recent Events** and filter by your `customerId` (`cust_acme_001`) and `metricName` (`api_calls`). Your event appears within a few seconds of the flush.
 
-To watch the wire during local debugging, point `base-url` / `baseUrl` at a request inspector and confirm the body is `{"events":[{"customerId":...,"metricName":...,"quantity":...,"idempotencyKey":...,"occurredAt":...}]}` with `Authorization: Bearer <key>`.
+To watch the wire during local debugging, point `base-url` / `baseUrl` at a request inspector and confirm the body is `{"events":[{"customerId":...,"metricName":...,"quantity":...,"idempotencyKey":...,"occurredAt":...}]}` with `X-API-Key: <key>`.
 
 ## Configuration reference
 
 | Option (manual) | Spring property | Type | Default | What it does |
 |---|---|---|---|---|
-| `apiKey` (ctor) | `aforo.api-key` | `String` | *(required)* | Bearer token. |
+| `apiKey` (ctor) | `aforo.api-key` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
 | `baseUrl(...)` | `aforo.base-url` | `String` | `https://ingest.aforo.ai` | Ingestion host; SDK appends `/v1/ingest/batch`. |
 | `flushCount(...)` | `aforo.flush-count` | `int` | `50` | Buffer size that triggers an immediate flush. |
 | `flushIntervalMs(...)` | `aforo.flush-interval-ms` | `long` | `5000` | Background flush cadence (ms). |

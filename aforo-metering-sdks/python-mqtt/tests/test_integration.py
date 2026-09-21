@@ -268,7 +268,9 @@ def test_authorization_and_tenant_headers_reach_ingestor(fixture):
         assert fixture["captured"], "ingestor was never called"
 
         headers = fixture["captured"][0]["headers"]
-        assert headers.get("Authorization") == "Bearer sk_int_mqtt"
+        lower = {k.lower(): v for k, v in headers.items()}
+        assert lower.get("x-api-key") == "sk_int_mqtt"
+        assert "authorization" not in lower
         assert headers.get("X-Tenant-Id") == "tenant-int-mqtt"
     finally:
         client.loop_stop()

@@ -169,7 +169,7 @@ public final class AforoGrpcBilling implements AutoCloseable {
         HttpRequest req = HttpRequest.newBuilder(ingestorUri)
                 .timeout(Duration.ofSeconds(10))
                 .header("Content-Type", "application/json")
-                .header("Authorization", "Bearer " + apiKey)
+                .header("X-API-Key", apiKey)
                 .header("X-Tenant-Id", tenantId)
                 .POST(HttpRequest.BodyPublishers.ofString(body))
                 .build();

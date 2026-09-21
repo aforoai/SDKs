@@ -70,7 +70,7 @@ export class QuotaGuard {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${this.apiKey}`,
+          'X-API-Key': this.apiKey,
           'X-Tenant-Id': this.tenantId,
         },
         body: JSON.stringify({

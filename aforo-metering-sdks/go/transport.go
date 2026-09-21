@@ -44,7 +44,7 @@ func (t *transport) send(events []resolvedEvent) FlushResult {
 			return FlushResult{Failed: len(events)}
 		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+t.apiKey)
+		req.Header.Set("X-API-Key", t.apiKey)
 
 		resp, err := t.client.Do(req)
 		if err != nil {

@@ -55,7 +55,7 @@ The middleware hooks `res.on('finish')`, so it runs after the response is sent �
 
 | Option | Type | Default | What it does |
 |---|---|---|---|
-| `apiKey` | `string` | — (required) | Aforo API key, sent as `Authorization: Bearer`. |
+| `apiKey` | `string` | — (required) | Aforo API key, sent as `X-API-Key`. |
 | `baseUrl` | `string` | `https://ingest.aforo.ai` | Ingestor base URL. Events POST to `<baseUrl>/v1/ingest/batch`. |
 | `flushCount` | `number` | `50` | Buffered events that trigger a flush. |
 | `flushInterval` | `number` (ms) | `5000` | Background flush cadence. |

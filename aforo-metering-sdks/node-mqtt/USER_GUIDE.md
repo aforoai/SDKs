@@ -115,7 +115,7 @@ process.on('SIGINT',  async () => { await billing.shutdown(); process.exit(0); }
 
 > ⚠ Without `shutdown()`, a process that exits inside the 2-second window drops the buffered batch.
 
-The batch is POSTed to `https://ingest.aforo.ai/v1/ingest/events` with `Authorization: Bearer <your api key>` and `X-Tenant-Id: tenant_acme`. Confirm in the Aforo console under the product's usage events (filter `productType = MQTT_BROKER`). On 3 consecutive failures (1s/2s/4s backoff) the batch is dropped and `onError` fires — log it:
+The batch is POSTed to `https://ingest.aforo.ai/v1/ingest/events` with `X-API-Key: <your api key>` and `X-Tenant-Id: tenant_acme`. Confirm in the Aforo console under the product's usage events (filter `productType = MQTT_BROKER`). On 3 consecutive failures (1s/2s/4s backoff) the batch is dropped and `onError` fires — log it:
 
 ```ts
 new AforoMqttBilling({ /* … */, onError: (err) => myLogger.error('aforo mqtt flush failed', err) });
@@ -127,7 +127,7 @@ new AforoMqttBilling({ /* … */, onError: (err) => myLogger.error('aforo mqtt f
 |---|---|---|---|
 | `tenantId` | `string` | — (required) | Aforo tenant. Sent as `X-Tenant-Id`. |
 | `productId` | `string` | — (required) | Aforo product id; into `metadata.productId`. |
-| `apiKey` | `string` | — (required) | Sent as `Authorization: Bearer <apiKey>`. |
+| `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. |
 | `ingestorUrl` | `string` | — (required) | Base URL; SDK appends `/v1/ingest/events`. |
 | `emitDeliverEvents` | `boolean` | `false` | Emit `DELIVER` (fan-out) events. Off → dropped, both modes. |
 | `flushCount` | `number` | `200` | Buffered events that trigger an immediate flush. |

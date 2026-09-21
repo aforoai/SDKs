@@ -249,5 +249,7 @@ def test_authorization_and_tenant_headers_reach_ingestor(fixture):
     assert fixture["captured"], "ingestor was never called"
     headers = fixture["captured"][0]["headers"]
     # http.server lowercases header keys; values stay verbatim
-    assert headers.get("Authorization") == "Bearer sk_int_grpc"
+    lower = {k.lower(): v for k, v in headers.items()}
+    assert lower.get("x-api-key") == "sk_int_grpc"
+    assert "authorization" not in lower
     assert headers.get("X-Tenant-Id") == "tenant-int-grpc"

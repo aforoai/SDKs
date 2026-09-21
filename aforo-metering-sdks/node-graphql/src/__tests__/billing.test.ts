@@ -210,7 +210,8 @@ describe('flush', () => {
     const req = capturedRequests[0];
     expect(req.url).toBe('https://ingestor.aforo.ai/v1/ingest/events');
     const headers = req.init.headers as Record<string, string>;
-    expect(headers['Authorization']).toBe('Bearer sk_gql_abc');
+    expect(headers['X-API-Key']).toBe('sk_gql_abc');
+    expect(headers['Authorization']).toBeUndefined();
     expect(headers['X-Tenant-Id']).toBe('tenant-001');
     await billing.shutdown();
   });

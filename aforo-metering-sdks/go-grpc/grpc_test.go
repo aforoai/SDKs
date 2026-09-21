@@ -141,8 +141,11 @@ func TestRecordEmitsEventWithCorrectShape(t *testing.T) {
 	if req.path != "/v1/ingest/events" {
 		t.Errorf("path = %s, want /v1/ingest/events (trailing slash stripped)", req.path)
 	}
-	if req.headers.Get("Authorization") != "Bearer sk_test_abc" {
-		t.Errorf("auth header = %q", req.headers.Get("Authorization"))
+	if req.headers.Get("X-API-Key") != "sk_test_abc" {
+		t.Errorf("X-API-Key header = %q", req.headers.Get("X-API-Key"))
+	}
+	if v := req.headers.Get("Authorization"); v != "" {
+		t.Errorf("Authorization header must not be sent, got %q", v)
 	}
 	if req.headers.Get("X-Tenant-Id") != "tenant-001" {
 		t.Errorf("tenant header = %q", req.headers.Get("X-Tenant-Id"))

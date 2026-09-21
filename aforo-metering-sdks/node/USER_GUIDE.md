@@ -84,7 +84,7 @@ See the full `AforoOptions` and `TrackEvent` tables in the [README](README.md#co
 | Symptom | Cause | Fix |
 |---|---|---|
 | Events never appear in Aforo | Process exited before a flush | Call `await aforo.shutdown()` on your shutdown path (Step 5). |
-| `401 Unauthorized` in logs | Bad/missing API key | Check `AFORO_API_KEY`; the key is sent as `Authorization: Bearer`. |
+| `401 Unauthorized` in logs | Bad/missing API key | Check `AFORO_API_KEY`; the key is sent as `X-API-Key`. |
 | Middleware meters nothing | `customerId` resolver returns `null` for every request | Return a real id; confirm `req.user` is populated before the middleware runs. |
 | Events accepted but don't bill | `metricName` isn't defined/mapped in Aforo | Define the metric (billable unit) in the console and map it to a rate plan. |
 | Some events silently dropped under load | Ring buffer overflowed (`maxQueueSize`) | Raise `maxQueueSize`, or lower `flushInterval`/`flushCount` to drain faster. |

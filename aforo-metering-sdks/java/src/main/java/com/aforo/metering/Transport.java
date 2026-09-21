@@ -16,7 +16,7 @@ import java.util.logging.Logger;
  * HTTP transport that sends batched usage events to the Aforo ingestor.
  *
  * <ul>
- *   <li>POST /v1/ingest/batch with Authorization header</li>
+ *   <li>POST /v1/ingest/batch with the tenant key in X-API-Key. Never Authorization: Bearer: the ingestor parses a Bearer value as a JWT and rejects the request 401, even when X-API-Key is also present</li>
  *   <li>Retry on 5xx, 408, 429 with exponential backoff</li>
  *   <li>No retry on other 4xx</li>
  * </ul>
@@ -62,7 +62,7 @@ class Transport {
                     HttpRequest request = HttpRequest.newBuilder()
                             .uri(URI.create(url))
                             .header("Content-Type", "application/json")
-                            .header("Authorization", "Bearer " + apiKey)
+                            .header("X-API-Key", apiKey)
                             .POST(HttpRequest.BodyPublishers.ofString(body))
                             .timeout(Duration.ofSeconds(10))
                             .build();

@@ -271,7 +271,7 @@ class AforoMcpBilling:
         url = f"{self.ingestor_url}/v1/ingest/batch"
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
+            "X-API-Key": self.api_key,
             "X-Tenant-Id": self.tenant_id,
         }
         body = json.dumps({"events": events})

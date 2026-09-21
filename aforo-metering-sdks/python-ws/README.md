@@ -82,7 +82,7 @@ async def ws_handler(ws: WebSocket):
             await ws.send_text(f"echo: {data}")
 ```
 
-Events POST to `https://ingest.aforo.ai/v1/ingest/events` with `Authorization: Bearer <api_key>` and `X-Tenant-Id: <tenant_id>`. The tracker counts sent/received messages and bytes by wrapping the connection's `send`/`recv`, and emits a close event with `messageCount`, `dataBytes`, and `durationMs` when the `async with` block exits.
+Events POST to `https://ingest.aforo.ai/v1/ingest/events` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`. The tracker counts sent/received messages and bytes by wrapping the connection's `send`/`recv`, and emits a close event with `messageCount`, `dataBytes`, and `durationMs` when the `async with` block exits.
 
 > ⚠ This package targets the ingestor's **`/v1/ingest/events`** path (the base and MCP Aforo SDKs use `/v1/ingest/batch`). Set `ingestor_url` to the host only — the SDK appends the path.
 
@@ -96,7 +96,7 @@ Constructor arguments for `AforoWsBilling(...)`:
 |---|---|---|---|
 | `tenant_id` | `str` | — (required) | Aforo tenant; sent as `X-Tenant-Id`. |
 | `product_id` | `str` | — (required) | Product the connections bill against. |
-| `api_key` | `str` | — (required) | Bearer token for the ingestor. |
+| `api_key` | `str` | — (required) | Aforo API key, sent to the ingestor as `X-API-Key`. |
 | `ingestor_url` | `str` | — (required) | Host; `/v1/ingest/events` is appended. |
 | `flush_interval_sec` | `float` | `3.0` | Background flush cadence (daemon thread from construction). |
 | `flush_count` | `int` | `100` | Buffer size that triggers an immediate flush. |

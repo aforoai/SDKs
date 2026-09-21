@@ -176,7 +176,7 @@ class AforoGrpcBilling:
         body = {"events": batch}
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
+            "X-API-Key": self.api_key,
             "X-Tenant-Id": self.tenant_id,
         }
         url = f"{self.ingestor_url}/v1/ingest/events"

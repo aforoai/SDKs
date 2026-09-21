@@ -109,7 +109,7 @@ billing.shutdown()   # flushes the final batch before process exit
 |---|---|---|---|
 | `tenant_id` | `str` | required | Aforo tenant; sent as `X-Tenant-Id`. |
 | `product_id` | `str` | required | Product the events bill against. |
-| `api_key` | `str` | required | Bearer token. |
+| `api_key` | `str` | required | Aforo API key, sent as `X-API-Key`. |
 | `ingestor_url` | `str` | required | Host; `/v1/ingest/events` appended. |
 | `flush_interval_sec` | `float` | `2.0` | Background flush cadence. |
 | `flush_count` | `int` | `200` | Buffer size that forces a flush. |
