@@ -10,7 +10,7 @@ A Kong service with the `aforo-metering` plugin enabled, capturing one usage eve
 
 - A running Kong Gateway (3.x) you can reload, with Admin API access (or declarative config you can edit).
 - LuaRocks on the Kong host (to build the plugin from source).
-- An Aforo API key and tenant id. The plugin sends events to `https://ingest.aforo.ai/v1/ingest/batch` by default — override `aforo_endpoint` per environment.
+- An Aforo API key and tenant id. Production events go to `https://usage-ingestor.aforo.ai/v1/ingest/batch` (`aforo_endpoint` is required; set it per environment).
 - For MCP metering: a route that proxies JSON-RPC `tools/call` POST bodies.
 
 ## Step 1 — Install the plugin from source
@@ -160,7 +160,7 @@ Use the Admin API with your three Aforo values:
 ```bash
 curl -X POST http://localhost:8001/services/my-service/plugins \
   --data "name=aforo-metering" \
-  --data "config.aforo_endpoint=https://ingest.aforo.ai/v1/ingest/batch" \
+  --data "config.aforo_endpoint=https://usage-ingestor.aforo.ai/v1/ingest/batch" \
   --data "config.api_key=$AFORO_API_KEY" \
   --data "config.tenant_id=$AFORO_TENANT_ID"
 ```
@@ -172,7 +172,7 @@ plugins:
   - name: aforo-metering
     service: my-service
     config:
-      aforo_endpoint: https://ingest.aforo.ai/v1/ingest/batch
+      aforo_endpoint: https://usage-ingestor.aforo.ai/v1/ingest/batch
       api_key: ${AFORO_API_KEY}
       tenant_id: ${AFORO_TENANT_ID}
 ```

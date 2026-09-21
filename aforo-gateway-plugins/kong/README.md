@@ -48,7 +48,7 @@ Enable the plugin on a service via the Admin API with the three values every Afo
 ```bash
 curl -X POST http://localhost:8001/services/my-service/plugins \
   --data "name=aforo-metering" \
-  --data "config.aforo_endpoint=https://ingest.aforo.ai/v1/ingest/batch" \
+  --data "config.aforo_endpoint=https://usage-ingestor.aforo.ai/v1/ingest/batch" \
   --data "config.api_key=$AFORO_API_KEY" \
   --data "config.tenant_id=$AFORO_TENANT_ID"
 ```
@@ -60,7 +60,7 @@ plugins:
   - name: aforo-metering
     service: my-service
     config:
-      aforo_endpoint: https://ingest.aforo.ai/v1/ingest/batch
+      aforo_endpoint: https://usage-ingestor.aforo.ai/v1/ingest/batch
       api_key: ${AFORO_API_KEY}
       tenant_id: ${AFORO_TENANT_ID}
 ```
@@ -73,7 +73,7 @@ Every option lives under `config.*`. `aforo_endpoint`, `api_key`, and `tenant_id
 
 | Option | Type | Default | What it does |
 |--------|------|---------|--------------|
-| `aforo_endpoint` | string | — (required) | Aforo ingestor batch URL. Use `https://ingest.aforo.ai/v1/ingest/batch`. |
+| `aforo_endpoint` | string | — (required) | Aforo ingestor batch URL. Use `https://usage-ingestor.aforo.ai/v1/ingest/batch`. |
 | `api_key` | string | — (required) | Aforo API key, scoped `usage:ingest`. Sent as `X-API-Key` on the flush — never as `Authorization: Bearer`, which the ingestor rejects with 401. Stored encrypted. |
 | `tenant_id` | string | — (required) | Aforo tenant identifier. Sent as the `X-Tenant-Id` header on the flush. |
 | `metric_name_pattern` | string | `{method} {path}` | Metric-name template. Variables: `{method}`, `{path}`, `{service}`, `{route}`, `{consumer}`. |
