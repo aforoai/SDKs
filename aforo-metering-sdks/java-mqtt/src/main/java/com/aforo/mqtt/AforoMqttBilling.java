@@ -37,6 +37,10 @@ public final class AforoMqttBilling implements AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(AforoMqttBilling.class.getName());
     private static final String SDK_VERSION = "1.0.0";
+    /** The ingestor rejects {@code /v1/ingest/batch} requests with more than 1000 events. */
+    static final int MAX_EVENTS_PER_REQUEST = 1000;
+    private static final int MAX_CUSTOMER_ID = 64;
+    private static final int MAX_IDEMPOTENCY_KEY = 255;
 
     private final String tenantId, productId, apiKey;
     private final URI ingestorUri;
@@ -58,7 +62,7 @@ public final class AforoMqttBilling implements AutoCloseable {
         this.tenantId = require(b.tenantId, "tenantId");
         this.productId = require(b.productId, "productId");
         this.apiKey = require(b.apiKey, "apiKey");
-        this.ingestorUri = URI.create(stripTrailingSlash(require(b.ingestorUrl, "ingestorUrl")) + "/v1/ingest/events");
+        this.ingestorUri = URI.create(stripTrailingSlash(require(b.ingestorUrl, "ingestorUrl")) + "/v1/ingest/batch");
         this.emitDeliverEvents = b.emitDeliverEvents;
         this.flushCount = b.flushCount;
         this.flushIntervalMs = b.flushIntervalMs;
@@ -85,31 +89,41 @@ public final class AforoMqttBilling implements AutoCloseable {
         push(eventOf(customerId, clientId, "UNSUBSCRIBE", topicFilter, 0, false, 0));
     }
 
-    /** CONNECT / DISCONNECT lifecycle markers. */
+    /**
+     * CONNECT / DISCONNECT lifecycle markers. The ingestor requires {@code mqttTopic} on every
+     * MQTT_BROKER event, so these carry the broker-style {@code $SYS/clients/<clientId>/connected}
+     * (or {@code /disconnected}) topic.
+     */
     public void recordConnect(String customerId, String clientId) {
-        push(eventOf(customerId, clientId, "CONNECT", "", 0, false, 0));
+        push(eventOf(customerId, clientId, "CONNECT", lifecycleTopic(clientId, "connected"), 0, false, 0));
     }
 
     public void recordDisconnect(String customerId, String clientId) {
-        push(eventOf(customerId, clientId, "DISCONNECT", "", 0, false, 0));
+        push(eventOf(customerId, clientId, "DISCONNECT", lifecycleTopic(clientId, "disconnected"), 0, false, 0));
+    }
+
+    private static String lifecycleTopic(String clientId, String state) {
+        return "$SYS/clients/" + (clientId == null || clientId.isBlank() ? "unknown" : clientId) + "/" + state;
     }
 
     private Map<String, Object> eventOf(String customerId, String clientId, String eventType, String topic,
                                         int qos, boolean retained, long bytes) {
+        // customerId and a non-blank topic are required by the ingestor; drop rather than
+        // send an event that would be rejected.
+        if (!validCustomerId(customerId) || topic == null || topic.isBlank()) return null;
         Instant now = Instant.now();
         Map<String, Object> e = new HashMap<>();
         e.put("customerId", customerId);
         e.put("metricName", "mqtt_broker." + eventType.toLowerCase());
         e.put("quantity", 1);
         e.put("occurredAt", now.toString());
-        e.put("idempotencyKey", "mqtt:" + tenantId + ":" + clientId + ":" + eventType + ":" + topic + ":"
-                + now.toEpochMilli() + ":" + UUID.randomUUID().toString().substring(0, 8));
+        e.put("idempotencyKey", idempotencyKey("mqtt:" + tenantId + ":" + clientId + ":" + eventType + ":" + topic, now));
         e.put("productType", "MQTT_BROKER");
-        e.put("mqttTopic", topic);
-        e.put("mqttQos", qos);
+        e.put("mqttTopic", truncate(topic, 500));
+        if (qos >= 0 && qos <= 2) e.put("mqttQos", qos);
         e.put("mqttRetained", retained);
         e.put("mqttEventType", eventType);
-        e.put("mqttClientId", clientId);
+        if (clientId != null && !clientId.isBlank()) e.put("mqttClientId", truncate(clientId, 128));
         e.put("dataBytes", bytes);
 
         Map<String, Object> meta = new HashMap<>();
@@ -138,7 +152,22 @@ public final class AforoMqttBilling implements AutoCloseable {
         while ((ev = buffer.poll()) != null) { batch.add(ev); bufferSize.decrementAndGet(); }
         if (batch.isEmpty()) return;
 
-        String body = mapper.writeValueAsString(Map.of("events", batch));
+        // Slice into requests of at most MAX_EVENTS_PER_REQUEST; a failed slice does
+        // not stop the remaining slices from being delivered.
+        Exception failure = null;
+        for (int from = 0; from < batch.size(); from += MAX_EVENTS_PER_REQUEST) {
+            try {
+                send(batch.subList(from, Math.min(batch.size(), from + MAX_EVENTS_PER_REQUEST)));
+            } catch (Exception e) {
+                failure = e;
+            }
+        }
+        if (failure != null) throw failure;
+    }
+
+    /** POSTs one slice. The body is serialized once, so every retry resends the same idempotency keys. */
+    private void send(java.util.List<Map<String, Object>> events) throws Exception {
+        String body = mapper.writeValueAsString(Map.of("events", events));
         HttpRequest req = HttpRequest.newBuilder(ingestorUri)
                 .timeout(Duration.ofSeconds(10))
                 .header("Content-Type", "application/json")
@@ -156,7 +185,7 @@ public final class AforoMqttBilling implements AutoCloseable {
             }
             Thread.sleep((long) Math.pow(2, attempt - 1) * 1000);
         }
-        LOG.warning("[aforo-mqtt] flush exhausted retries — dropped " + batch.size() + " events");
+        LOG.warning("[aforo-mqtt] flush exhausted retries — dropped " + events.size() + " events");
     }
 
     @Override
@@ -166,6 +195,22 @@ public final class AforoMqttBilling implements AutoCloseable {
             flushQuietly();
             if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) scheduler.shutdownNow();
         } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+
+    /** True when {@code customerId} satisfies the ingestor (non-blank, at most 64 chars). */
+    private static boolean validCustomerId(String customerId) {
+        return customerId != null && !customerId.isBlank() && customerId.length() <= MAX_CUSTOMER_ID;
+    }
+
+    /** Joins {@code natural:suffix}, trimming {@code natural} so the key stays within 255 chars. */
+    private static String idempotencyKey(String natural, Instant now) {
+        String suffix = now.toEpochMilli() + ":" + UUID.randomUUID().toString().substring(0, 8);
+        int room = MAX_IDEMPOTENCY_KEY - suffix.length() - 1;
+        return (natural.length() > room ? natural.substring(0, room) : natural) + ":" + suffix;
+    }
+
+    private static String truncate(String s, int max) {
+        return s == null || s.length() <= max ? s : s.substring(0, max);
     }
 
     private static String require(String s, String name) {

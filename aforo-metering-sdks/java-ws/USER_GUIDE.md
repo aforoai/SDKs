@@ -53,7 +53,7 @@ AforoWsBilling billing = AforoWsBilling.newBuilder()
         .build();
 ```
 
-> ⚠ `ingestorUrl` is the host only — the SDK appends `/v1/ingest/events`. Pass `https://usage-ingestor.aforo.ai`, not the full path.
+> ⚠ `ingestorUrl` is the host only — the SDK appends `/v1/ingest/batch`. Pass `https://usage-ingestor.aforo.ai`, not the full path.
 
 ## Step 4 — Open, record frames, and close
 
@@ -90,7 +90,7 @@ billing.close();   // flushes synchronously, then shuts down the daemon thread
 
 Then confirm on the Aforo side:
 
-- Aforo console → **Ingestion → Recent Events**, filter by your `customerId`. You'll see `websocket_api.message` (the OPEN marker) and `websocket_api.connection_closed` with the aggregated `messageCount`, `dataBytes`, `durationMs`, and `wsCloseReason`.
+- Aforo console → **Ingestion → Recent Events**, filter by your `customerId`. You'll see `websocket_api.message` (the OPEN marker) and `websocket_api.connection_closed` with the aggregated `messageCount`, `dataBytes`, `executionDurationMs`, and `wsCloseReason`.
 
 For a long-running server, register the flush on shutdown:
 
@@ -105,7 +105,7 @@ Runtime.getRuntime().addShutdownHook(new Thread(billing::close));
 | `tenantId` | `String` | *(required)* | `X-Tenant-Id` header. |
 | `productId` | `String` | *(required)* | `metadata.productId`. |
 | `apiKey` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
-| `ingestorUrl` | `String` | *(required)* | Host; SDK appends `/v1/ingest/events`. |
+| `ingestorUrl` | `String` | *(required)* | Host; SDK appends `/v1/ingest/batch`. |
 | `perFrameEvents` | `boolean` | `false` | `true` = one event per frame; `false` = OPEN + CLOSE only, aggregated. |
 | `flushCount` | `int` | `100` | Events per immediate flush. |
 | `flushIntervalMs` | `long` | `3000` | Background flush cadence (ms). |
@@ -117,7 +117,7 @@ Runtime.getRuntime().addShutdownHook(new Thread(billing::close));
 | `IllegalArgumentException: <field> is required` at build | A required builder field (`tenantId` / `productId` / `apiKey` / `ingestorUrl`) is blank | Set all four; they're validated in the constructor. |
 | No events for a connection | `openConnection` returned `null` (blank customer), or `connectionId` wasn't kept for later calls | Resolve a non-blank customer at open; store the returned id on the session. |
 | CLOSE event missing | `closeConnection` was never called (e.g. abnormal disconnect) or the process died first | Call `closeConnection` from `@OnClose` / your error path; flush before shutdown. |
-| Events POST to a 404 | `ingestorUrl` already includes the path | Pass the host only; the SDK appends `/v1/ingest/events`. |
+| Events POST to a 404 | `ingestorUrl` already includes the path | Pass the host only; the SDK appends `/v1/ingest/batch`. |
 | Far more events than connections | `perFrameEvents(true)` is set | That's per-frame mode. Leave it `false` for aggregated OPEN/CLOSE only. |
 | `flush exhausted retries — dropped N events` in logs | Ingestor returned non-2xx on all 3 attempts | Verify the key + `X-Tenant-Id`; ensure the `websocket_api.*` metrics exist in Aforo. |
 

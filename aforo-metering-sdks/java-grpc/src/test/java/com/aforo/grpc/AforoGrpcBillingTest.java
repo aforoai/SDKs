@@ -126,8 +126,8 @@ class AforoGrpcBillingTest {
 
         CapturedRequest req = requests.get(0);
         assertThat(req.method()).isEqualTo("POST");
-        // trailing slash on ingestorUrl must be stripped before appending /v1/ingest/events
-        assertThat(req.path()).isEqualTo("/v1/ingest/events");
+        // trailing slash on ingestorUrl must be stripped before appending /v1/ingest/batch
+        assertThat(req.path()).isEqualTo("/v1/ingest/batch");
         assertThat(req.apiKey()).isEqualTo("sk_test_abc");
         // Bearer is parsed as a JWT by the ingestor and rejected 401, even alongside X-API-Key
         assertThat(req.authorization()).isNull();
