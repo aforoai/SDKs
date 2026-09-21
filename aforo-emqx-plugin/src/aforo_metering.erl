@@ -18,6 +18,11 @@
     load/0,
     unload/0,
     health/0,
+    %% Called by timer:apply_interval/4 in start_flush_timer/0. It applies
+    %% ?MODULE:flush_now() from another process, which only reaches exported
+    %% functions: unexported, every interval tick crashed with undef and a
+    %% partial batch (fewer than flush_count events) was never flushed at all.
+    flush_now/0,
     %% Hook callbacks
     on_client_connected/3,
     on_client_disconnected/4,
