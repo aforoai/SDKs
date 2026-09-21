@@ -6,8 +6,8 @@ import time
 from typing import Any, Callable, Optional
 
 from ..client import AforoClient
-from ..path_normalizer import normalize_path
 from ..types import MiddlewareOptions
+from ._common import is_preflight, resolve_metric_name
 
 _DEFAULT_EXCLUDE = ["/health", "/ready", "/metrics", "/favicon.ico", "/openapi.json", "/docs"]
 
@@ -18,7 +18,18 @@ class AforoMeteringMiddleware:
     Usage::
 
         from aforo.middleware.fastapi import AforoMeteringMiddleware
-        app.add_middleware(AforoMeteringMiddleware, api_key=os.environ["AFORO_API_KEY"])
+        app.add_middleware(
+            AforoMeteringMiddleware,
+            api_key=os.environ["AFORO_API_KEY"],
+            metric_name="api_calls",   # or a callable(scope) -> str
+            customer_id=lambda scope: ...,  # callable(scope) -> str | None
+        )
+
+    ``metric_name`` defaults to ``"api_calls"`` and must name a metric in your
+    Aforo catalog: the ingestor rejects unknown metrics, and one rejected event
+    fails the whole batch. ``customer_id`` defaults to the ``X-Customer-Id``
+    header; the caller's ``X-Api-Key`` is never used (it is a secret, not an
+    id). Requests with no customer, and ``OPTIONS`` preflights, are not metered.
     """
 
     def __init__(self, app: Any, api_key: Optional[str] = None, **kwargs) -> None:
@@ -61,21 +72,15 @@ class AforoMeteringMiddleware:
             method = scope.get("method", "UNKNOWN")
             headers = dict(scope.get("headers", []))
 
+            if is_preflight(method):
+                return
             if any(path.startswith(p) for p in self._exclude_paths):
                 return
             if status_code in self._exclude_status_codes:
                 return
 
-            route_template = scope.get("path_params") and scope.get("route", {})
-            normalized = normalize_path(path, getattr(route_template, "path", None) if route_template else None)
-
-            # Resolve metric name
-            if callable(self._metric_name_fn):
-                metric_name = self._metric_name_fn(scope)
-            elif isinstance(self._metric_name_fn, str):
-                metric_name = self._metric_name_fn
-            else:
-                metric_name = f"{method} {normalized}"
+            # Resolve metric name (must be a metric in the tenant's catalog)
+            metric_name = resolve_metric_name(self._metric_name_fn, scope)
 
             # Resolve quantity
             if callable(self._quantity_fn):
@@ -111,12 +116,15 @@ class AforoMeteringMiddleware:
 
 
 def _extract_customer_id(headers: dict) -> Optional[str]:
-    """Extract customer ID from ASGI headers (bytes keys)."""
+    """Extract the customer ID from the ``X-Customer-Id`` ASGI header.
+
+    The caller's ``X-Api-Key`` header is deliberately NOT used: that is the end
+    user's secret, and using it as customerId wrote credentials into billing
+    data while never matching an Aforo customer.
+    """
     for key, value in headers.items():
         k = key.decode("utf-8") if isinstance(key, bytes) else key
         v = value.decode("utf-8") if isinstance(value, bytes) else value
-        if k.lower() == "x-customer-id":
-            return v
-        if k.lower() == "x-api-key":
-            return v
+        if k.lower() == "x-customer-id" and v.strip():
+            return v.strip()
     return None

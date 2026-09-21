@@ -89,7 +89,9 @@ client.shutdown()   # drains the buffer; safe to call once
 
 ## Step 7 (alternative) — Meter every request with middleware
 
-Skip per-call `track()` entirely. The middleware builds its own client and emits `"<METHOD> <normalized_path>"` per request.
+Skip per-call `track()` entirely. The middleware builds its own client and emits one event per request, against `metric_name` (default `"api_calls"`).
+
+> ⚠ The metric must exist in your Aforo catalog: the ingestor rejects unknown metrics, and one rejected event fails the whole batch. Earlier versions defaulted to `"<METHOD> <normalized_path>"`, which no catalog contains. Configure `metric_name` (FastAPI/Flask keyword, or `AFORO_METRIC_NAME` in Flask config / Django settings) as a fixed name or a callable.
 
 **FastAPI / Starlette:**
 
@@ -117,7 +119,7 @@ MIDDLEWARE = [..., "aforo.middleware.django.AforoMeteringMiddleware"]
 AFORO_API_KEY = os.environ["AFORO_API_KEY"]
 ```
 
-> ⚠ The middleware only meters requests it can attribute to a customer. It reads `X-Customer-Id`, then falls back to `X-Api-Key` (Django also tries `request.user.id` first). **No customer ID → the request is silently not metered.** Set that header at your gateway/auth layer; do not trust a value the end client can spoof for a customer it doesn't own.
+> ⚠ The middleware only meters requests it can attribute to a customer. Configure `customer_id` (keyword, or `AFORO_CUSTOMER_ID` in Flask config / Django settings); by default it reads `X-Customer-Id` (Django tries `request.user.id` first). The caller's `X-Api-Key` is never used — it is the end user's secret, not a customer id. **No customer ID → the request is silently not metered.** `OPTIONS` (CORS preflight) requests are never metered. Set that header at your gateway/auth layer; do not trust a value the end client can spoof for a customer it doesn't own.
 
 > ⚠ Default `exclude_paths` skip health/metrics/docs routes (`/health`, `/ready`, `/metrics`, `/favicon.ico`, plus `/openapi.json` and `/docs` on FastAPI, `/admin` and `/static` on Django, `/static` on Flask). Override `exclude_paths` to change this.
 
@@ -162,7 +164,7 @@ AFORO_API_KEY = os.environ["AFORO_API_KEY"]
 | `flush()` returns `sent=0, failed=0` | Buffer was empty — `track()` was never called, or another flush already drained it. | Confirm `client.buffered_count` before flushing; check you're calling the same client instance. |
 | `FlushResult.failed > 0`, logs show "Ingestor returned 401/403 — not retrying" | Bad or unscoped API key. 4xx is non-retryable, so the batch is dropped. | Fix `AFORO_API_KEY`; verify the key belongs to the tenant you're sending for. |
 | `sent` is positive but nothing in the console | Right delivery, wrong target or unmapped metric. | Confirm `base_url` host; confirm `metric_name` is attached to a rate plan / metric definition in Aforo. |
-| Middleware never emits events | No `X-Customer-Id` / `X-Api-Key` on requests, or the path is excluded. | Set the customer header upstream; check your route isn't in `exclude_paths`. |
+| Middleware never emits events | No `X-Customer-Id` on requests (and no `customer_id` resolver), or the path is excluded. | Set the customer header upstream; check your route isn't in `exclude_paths`. |
 | Events lost on process restart | `SIGKILL`/crash skips `atexit`; buffered events never flushed. | Call `client.shutdown()` in your shutdown hook; lower `flush_interval`/`flush_count` for tighter delivery. |
 | `RuntimeError: AforoClient is shut down` | `track()` called after `shutdown()`. | Build a fresh client, or don't shut down until you're done emitting. |
 | Sudden gaps under burst load | Ring buffer hit `max_queue_size`; oldest events dropped to make room. | Raise `max_queue_size`, or lower `flush_interval` so the buffer drains faster. |

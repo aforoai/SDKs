@@ -64,12 +64,14 @@ describe('expressMiddleware', () => {
     expect(mockFetch).toHaveBeenCalled();
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     expect(body.events[0].customerId).toBe('cust_123');
-    expect(body.events[0].metricName).toMatch(/^GET \/api\/v1\/data$/);
+    // Default metric is a catalog metric, not a route-shaped name the ingestor rejects
+    expect(body.events[0].metricName).toBe('api_calls');
   });
 
-  it('should use route template for path normalization', async () => {
+  it('should use a fixed metricName when configured', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
+      metricName: 'sms_sent',
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
     });
 
@@ -87,7 +89,28 @@ describe('expressMiddleware', () => {
     await new Promise((r) => setTimeout(r, 100));
 
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
-    expect(body.events[0].metricName).toBe('GET /users/:id');
+    expect(body.events[0].metricName).toBe('sms_sent');
+  });
+
+  it('should not meter CORS preflight (OPTIONS) requests', async () => {
+    const mw = expressMiddleware({
+      apiKey: 'test-key',
+      clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
+    });
+
+    const { req, res } = createMockReqRes({
+      method: 'OPTIONS',
+      url: '/api/data',
+      headers: { 'x-customer-id': 'cust_1', 'access-control-request-method': 'POST' },
+    });
+
+    const next = jest.fn();
+    mw(req, res, next);
+    expect(next).toHaveBeenCalled();
+    res.emit('finish');
+
+    await new Promise((r) => setTimeout(r, 50));
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it('should exclude health check paths', async () => {
@@ -130,7 +153,7 @@ describe('expressMiddleware', () => {
     expect(body.events[0].customerId).toBe('header-cust-456');
   });
 
-  it('should extract customer ID from x-api-key header as fallback', async () => {
+  it('should never use the caller\'s x-api-key header as the customer ID', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
@@ -145,10 +168,9 @@ describe('expressMiddleware', () => {
     mw(req, res, next);
     res.emit('finish');
 
-    await new Promise((r) => setTimeout(r, 100));
-
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
-    expect(body.events[0].customerId).toBe('apikey-789');
+    await new Promise((r) => setTimeout(r, 50));
+    // No customer resolvable -> not metered (and the secret never leaves the process)
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it('should skip when no customer ID can be resolved', async () => {

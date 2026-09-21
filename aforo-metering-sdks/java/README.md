@@ -62,9 +62,12 @@ aforo:
   enabled: true          # auto-config is off unless this is exactly "true"
   api-key: ${AFORO_API_KEY}
   base-url: https://ingest.aforo.ai
+  metric-name: api_calls   # must exist in your Aforo catalog
 ```
 
-The filter runs **after** the response is committed, so metering adds no latency to the API call. It resolves the customer from (in order) the Spring Security principal, then the `X-Customer-Id` header, then `X-Api-Key`; requests with none of those are skipped.
+The filter runs **after** the response is committed, so metering adds no latency to the API call. It records `aforo.metric-name` (default `api_calls`) or the result of an `AforoServletFilter.MetricNameResolver` bean. It resolves the customer from an `AforoServletFilter.CustomerIdResolver` bean if one exists, otherwise from the `X-Customer-Id` header (`aforo.customer-id-header`); the Spring Security principal is used only when `aforo.use-principal-as-customer-id: true`. The caller's `X-Api-Key` header is never used — it is a secret, not a customer id. Requests with no customer, and `OPTIONS` (CORS preflight) requests, are skipped.
+
+> ⚠ The metric must exist in your tenant's Aforo catalog: the ingestor rejects an unknown metric, and because it validates a batch as a whole, one rejected event fails every event in that batch. Earlier versions recorded `"<METHOD> <normalized-path>"`, which no catalog contains.
 
 > ⚠ The customer id comes from the authenticated principal or a server-trusted header — not from request body fields a client controls. Tenancy is determined by your `api-key`; there is no separate `tenant_id` config field in this SDK.
 
@@ -93,6 +96,9 @@ Spring Boot properties (prefix `aforo`) — a subset of the above:
 | `aforo.base-url` | `https://ingest.aforo.ai` | Ingestion host. |
 | `aforo.flush-count` | `50` | Events per immediate flush. |
 | `aforo.flush-interval-ms` | `5000` | Background flush cadence. |
+| `aforo.metric-name` | `api_calls` | Metric recorded per request by the filter. Must exist in your Aforo catalog. Declare an `AforoServletFilter.MetricNameResolver` bean for a per-request metric. |
+| `aforo.customer-id-header` | `X-Customer-Id` | Header carrying the Aforo customer id. Declare an `AforoServletFilter.CustomerIdResolver` bean for anything else. |
+| `aforo.use-principal-as-customer-id` | `false` | Opt in to using the authenticated principal's name as the customer id (ahead of the header). |
 
 ## Walk me through it
 

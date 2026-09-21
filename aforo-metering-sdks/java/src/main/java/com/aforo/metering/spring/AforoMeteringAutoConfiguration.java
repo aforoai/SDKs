@@ -2,6 +2,7 @@ package com.aforo.metering.spring;
 
 import com.aforo.metering.AforoClient;
 import com.aforo.metering.AforoOptions;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.web.servlet.FilterRegistrationBean;
@@ -20,7 +21,13 @@ import org.springframework.context.annotation.Configuration;
  *   enabled: true
  *   api-key: ${AFORO_API_KEY}
  *   base-url: https://ingest.aforo.ai
+ *   metric-name: api_calls            # must exist in your Aforo catalog
+ *   customer-id-header: X-Customer-Id
+ *   use-principal-as-customer-id: false
  * </pre>
+ *
+ * <p>Declare an {@link AforoServletFilter.MetricNameResolver} or
+ * {@link AforoServletFilter.CustomerIdResolver} bean to derive either per request.</p>
  */
 @Configuration
 @ConditionalOnProperty(name = "aforo.enabled", havingValue = "true")
@@ -42,9 +49,20 @@ public class AforoMeteringAutoConfiguration {
     }
 
     @Bean
-    public FilterRegistrationBean<AforoServletFilter> aforoMeteringFilter(AforoClient client) {
+    public FilterRegistrationBean<AforoServletFilter> aforoMeteringFilter(
+            AforoClient client,
+            AforoMeteringProperties props,
+            ObjectProvider<AforoServletFilter.MetricNameResolver> metricNameResolver,
+            ObjectProvider<AforoServletFilter.CustomerIdResolver> customerIdResolver) {
+        AforoServletFilter filter = new AforoServletFilter(client)
+                .metricName(props.getMetricName())
+                .customerIdHeader(props.getCustomerIdHeader())
+                .usePrincipalAsCustomerId(props.isUsePrincipalAsCustomerId());
+        metricNameResolver.ifAvailable(filter::metricNameResolver);
+        customerIdResolver.ifAvailable(filter::customerIdResolver);
+
         FilterRegistrationBean<AforoServletFilter> registration = new FilterRegistrationBean<>();
-        registration.setFilter(new AforoServletFilter(client));
+        registration.setFilter(filter);
         registration.addUrlPatterns("/*");
         registration.setOrder(Integer.MAX_VALUE); // Run last
         registration.setName("aforoMeteringFilter");

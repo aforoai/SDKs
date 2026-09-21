@@ -100,8 +100,10 @@ class MiddlewareOptions:
     api_key: str
     base_url: str = "https://ingest.aforo.ai"
     metric_name: Optional[Callable | str] = None
+    """Fixed metric or callable. Default ``"api_calls"``; must exist in your Aforo catalog."""
     quantity: Optional[Callable | float] = None
     customer_id: Optional[Callable | str] = None
+    """Fixed id or callable. Default: ``X-Customer-Id`` header (never ``X-Api-Key``)."""
     exclude_paths: list[str] = field(
         default_factory=lambda: ["/health", "/ready", "/metrics", "/favicon.ico"]
     )
