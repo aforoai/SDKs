@@ -1,19 +1,31 @@
 <!--
   Aforo JWT Validation Policy for Azure API Management
+  (fragment id: aforo-jwt-validation)
 
   Validates RS256 JWTs issued by Aforo's OAuth token endpoint.
-  Must be placed in the <inbound> section BEFORE the existing outbound metering fragment.
+  A policy fragment cannot contain section elements, so include this in the
+  <inbound> section, BEFORE aforo-context (which reads the verified
+  customer_id claim from aforo-jwt-payload).
 
   Prerequisites — create these Named Values in your APIM instance:
     aforo-jwks-uri      — Aforo JWKS endpoint URL
                           e.g. https://auth.smartai.com/.well-known/jwks.json
+                          NOTE: <openid-config> expects an OpenID Connect
+                          discovery document (…/.well-known/openid-configuration)
+                          whose jwks_uri points at the keys — not a bare JWKS
+                          URL. Point this at the discovery document (unverified
+                          whether Aforo serves one; see README).
     aforo-jwt-issuer    — Expected issuer
                           e.g. https://auth.aforo.ai
+    aforo-org-service-url — org-service base URL reachable from APIM, used for
+                          the jti revocation check (was hardcoded to
+                          http://org-service:8086, a docker-compose hostname).
 
   Usage in APIM policy (add to the inbound section of your API policy):
     <inbound>
         <base />
         <include-fragment fragment-id="aforo-jwt-validation" />
+        <include-fragment fragment-id="aforo-context" />
     </inbound>
     <outbound>
         <base />
@@ -30,7 +42,6 @@
   On validation failure: returns 401 Unauthorized with a JSON body.
 -->
 <fragment>
-    <inbound>
         <!--
           validate-jwt performs RS256 signature verification using the JWKS URI.
           APIM fetches and caches the JWKS automatically; the cache is refreshed
@@ -69,11 +80,14 @@
           The C# expressions decode the JWT payload inline using base64url decoding
           and Newtonsoft.Json (available in all APIM tiers).
         -->
+        <!--
+          The payload is decoded from the Authorization header that validate-jwt
+          just verified. (output-token-variable-name stores a Jwt object, not a
+          string, so the previous (string) cast of "aforo-jwt" threw.)
+        -->
         <set-variable name="aforo-jwt-payload" value="@{
-            var token = (string)context.Variables.GetValueOrDefault(
-                            &quot;aforo-jwt&quot;,
-                            context.Request.Headers.GetValueOrDefault(&quot;Authorization&quot;, &quot;&quot;)
-                                .Replace(&quot;Bearer &quot;, &quot;&quot;).Replace(&quot;bearer &quot;, &quot;&quot;));
+            var header = context.Request.Headers.GetValueOrDefault(&quot;Authorization&quot;, &quot;&quot;);
+            var token = header.StartsWith(&quot;Bearer &quot;, StringComparison.OrdinalIgnoreCase) ? header.Substring(7).Trim() : header.Trim();
             var parts = token.Split('.');
             if (parts.Length != 3) return null;
             var padded = parts[1].PadRight(parts[1].Length + (4 - parts[1].Length % 4) % 4, '=')
@@ -148,7 +162,7 @@
                 var jti   = payload?["jti"]?.ToString()    ?? "";
                 var keyId = payload?["key_id"]?.ToString() ?? "";
                 return string.Format(
-                    "http://org-service:8086/internal/v1/auth/token-check?jti={0}&keyId={1}",
+                    "{{aforo-org-service-url}}/internal/v1/auth/token-check?jti={0}&keyId={1}",
                     Uri.EscapeDataString(jti),
                     Uri.EscapeDataString(keyId));
             }]]></set-url>
@@ -182,5 +196,4 @@
                 </return-response>
             </when>
         </choose>
-    </inbound>
 </fragment>

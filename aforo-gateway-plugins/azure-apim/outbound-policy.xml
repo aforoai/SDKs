@@ -1,158 +1,200 @@
 <!--
-  Aforo Metering — Azure APIM Outbound Policy
+  Aforo Metering — Azure APIM Policy Fragment (fragment id: aforo-metering)
 
-  Sends usage events to the Aforo ingestor after every API response.
+  Sends one usage event to the Aforo ingestor after every API response.
   Captures W3C trace context (traceparent, tracestate, x-trace-id, x-request-id).
   Detects MCP JSON-RPC tools/call requests for MCP Server metering.
 
-  Prerequisites (Named Values):
-    - aforo-endpoint       — Aforo ingestor batch URL
-    - aforo-api-key        — Aforo API key
-    - aforo-tenant-id      — Tenant identifier
-    - aforo-mcp-product-id — MCP product ID (optional)
-    - aforo-mcp-enabled    — "true" to enable MCP detection (optional)
+  A policy fragment cannot contain section elements (<inbound>, <outbound>)
+  or <base />, so this file holds only the policies. Include it in the
+  <outbound> section, and include aforo-context in <inbound> (it resolves the
+  customer and captures the MCP body):
 
-  Usage:
+    <inbound>
+        <base />
+        <include-fragment fragment-id="aforo-jwt-validation" />   (optional)
+        <include-fragment fragment-id="aforo-context" />          (required)
+    </inbound>
     <outbound>
         <base />
         <include-fragment fragment-id="aforo-metering" />
     </outbound>
+
+  idempotencyKey is context.RequestId (plus the tool name for MCP) — stable for
+  the request, so a re-sent event deduplicates. Earlier versions appended
+  DateTime.UtcNow.Ticks, which made every send unique.
+
+  Not metered: OPTIONS (CORS preflights), and requests with no resolvable
+  Aforo customer (aforo-customer-id empty or longer than 64 characters) —
+  the ingestor rejects those, and there is nothing to bill them to.
+
+  Named Values (all must exist; "none" = empty):
+    aforo-endpoint         — Aforo ingestor batch URL (…/v1/ingest/batch)
+    aforo-api-key          — Aforo API key, scope usage:ingest (mark Secret).
+                             Sent as X-API-Key; the tenant comes from the key.
+    aforo-metric-mappings  — endpoint→metric rules, first match wins:
+                             "KIND|value|metricName" separated by ";",
+                             KIND = EXACT | PREFIX | CONTAINS, matched against
+                             the client-facing path (context.Request.OriginalUrl.Path),
+                             e.g. "PREFIX|/sms/v1/send|sms_sent;EXACT|/otp/v1/verify|otp_verified"
+    aforo-default-metric   — metric for unmapped requests (e.g. api_calls).
+                             MUST be a catalog metric: an unknown metric
+                             fails the batch with 400.
+    aforo-mcp-enabled      — "true" to enable MCP detection
+    aforo-mcp-product-id   — MCP product ID stamped in metadata ("none" if unused)
 -->
 <fragment>
-    <outbound>
-        <choose>
-            <!-- MCP JSON-RPC tools/call detection -->
-            <when condition="@(&quot;{{aforo-mcp-enabled}}&quot; == &quot;true&quot; &amp;&amp;
-                              context.Request.Method == &quot;POST&quot; &amp;&amp;
-                              context.Request.Body != null &amp;&amp;
-                              context.Request.Body.As&lt;string&gt;(preserveContent: true).Contains(&quot;tools/call&quot;))">
-                <send-one-way-request mode="new">
-                    <set-url>{{aforo-endpoint}}</set-url>
-                    <set-method>POST</set-method>
-                    <set-header name="Content-Type" exists-action="override">
-                        <value>application/json</value>
-                    </set-header>
-                    <set-header name="Authorization" exists-action="override">
-                        <value>Bearer {{aforo-api-key}}</value>
-                    </set-header>
-                    <set-header name="X-Tenant-Id" exists-action="override">
-                        <value>{{aforo-tenant-id}}</value>
-                    </set-header>
-                    <set-body><![CDATA[@{
-                        var reqBody = context.Request.Body.As<JObject>(preserveContent: true);
-                        var toolName = "unknown";
-                        var agentId = "";
+    <choose>
+        <when condition="@(context.Request.Method != &quot;OPTIONS&quot; &amp;&amp; !string.IsNullOrEmpty(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-customer-id&quot;, &quot;&quot;)) &amp;&amp; context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-customer-id&quot;, &quot;&quot;).Length &lt;= 64)">
+            <set-variable name="aforo-metric-name" value="@{
+                var path = context.Request.OriginalUrl.Path ?? &quot;&quot;;
+                var rules = &quot;{{aforo-metric-mappings}}&quot;;
+                foreach (var rule in rules.Split(new[] { &quot;;&quot;, &quot;\n&quot; }, StringSplitOptions.RemoveEmptyEntries)) {
+                    var p = rule.Split(new[] { &quot;|&quot; }, StringSplitOptions.None);
+                    if (p.Length != 3) { continue; }
+                    var kind = p[0].Trim().ToUpperInvariant();
+                    var value = p[1].Trim();
+                    var metric = p[2].Trim();
+                    if (value.Length == 0 || metric.Length == 0) { continue; }
+                    if ((kind == &quot;EXACT&quot; &amp;&amp; path == value)
+                        || (kind == &quot;PREFIX&quot; &amp;&amp; path.StartsWith(value))
+                        || (kind == &quot;CONTAINS&quot; &amp;&amp; path.Contains(value))) {
+                        return metric;
+                    }
+                }
+                return &quot;{{aforo-default-metric}}&quot;;
+            }" />
+            <choose>
+                <!-- MCP JSON-RPC tools/call detection (body captured in <inbound> by aforo-context) -->
+                <when condition="@(&quot;{{aforo-mcp-enabled}}&quot; == &quot;true&quot; &amp;&amp; context.Request.Method == &quot;POST&quot; &amp;&amp; context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-mcp-body&quot;, &quot;&quot;).Contains(&quot;tools/call&quot;))">
+                    <send-one-way-request mode="new">
+                        <set-url>{{aforo-endpoint}}</set-url>
+                        <set-method>POST</set-method>
+                        <set-header name="Content-Type" exists-action="override">
+                            <value>application/json</value>
+                        </set-header>
+                        <!-- X-API-Key ALONE: the ingestor reads only this header, and an
+                             Authorization: Bearer is parsed as a JWT and rejected 401. -->
+                        <set-header name="X-API-Key" exists-action="override">
+                            <value>{{aforo-api-key}}</value>
+                        </set-header>
+                        <set-body><![CDATA[@{
+                            JObject reqBody = null;
+                            try { reqBody = JObject.Parse(context.Variables.GetValueOrDefault<string>("aforo-mcp-body", "")); } catch { }
+                            var toolName = "unknown";
+                            var agentId = "";
 
-                        if (reqBody != null && reqBody["method"]?.ToString() == "tools/call") {
-                            var paramz = reqBody["params"] as JObject;
-                            if (paramz != null) {
-                                toolName = paramz["name"]?.ToString() ?? "unknown";
-                                var meta = paramz["_meta"] as JObject;
-                                if (meta != null) {
-                                    agentId = meta["agent_id"]?.ToString() ?? "";
+                            if (reqBody != null && reqBody["method"]?.ToString() == "tools/call") {
+                                var paramz = reqBody["params"] as JObject;
+                                if (paramz != null) {
+                                    toolName = paramz["name"]?.ToString() ?? "unknown";
+                                    var meta = paramz["_meta"] as JObject;
+                                    if (meta != null) {
+                                        agentId = meta["agent_id"]?.ToString() ?? "";
+                                    }
                                 }
                             }
-                        }
 
-                        var sessionId = context.Request.Headers.GetValueOrDefault("Mcp-Session-Id", "");
-                        var path = context.Request.Url.Path;
-                        var method = context.Request.Method;
-                        var statusCode = context.Response.StatusCode;
-                        var latencyMs = (int)context.Elapsed.TotalMilliseconds;
+                            var sessionId = context.Request.Headers.GetValueOrDefault("Mcp-Session-Id", "");
+                            var path = context.Request.OriginalUrl.Path;
+                            var method = context.Request.Method;
+                            var statusCode = context.Response.StatusCode;
+                            var latencyMs = (int)context.Elapsed.TotalMilliseconds;
+                            var productId = "{{aforo-mcp-product-id}}";
 
-                        var evt = new JObject(
-                            new JProperty("events", new JArray(
-                                new JObject(
-                                    new JProperty("customerId",
-                                        context.Subscription != null ? context.Subscription.Id : "unknown"),
-                                    new JProperty("metricName", "mcp_server.tool_invocations"),
-                                    new JProperty("quantity", 1),
-                                    new JProperty("idempotencyKey",
-                                        "mcp:" + context.RequestId + ":" + toolName + ":" +
-                                        DateTime.UtcNow.Ticks),
-                                    new JProperty("occurredAt", DateTime.UtcNow.ToString("o")),
-                                    new JProperty("productType", "MCP_SERVER"),
-                                    new JProperty("toolName", toolName),
-                                    new JProperty("agentId", agentId),
-                                    new JProperty("sessionId", sessionId),
-                                    new JProperty("executionStatus",
-                                        statusCode >= 200 && statusCode < 300 ? "SUCCESS" : "ERROR"),
-                                    new JProperty("executionDurationMs", latencyMs),
-                                    new JProperty("endpointPath", path),
-                                    new JProperty("httpMethod", method),
-                                    new JProperty("statusCode", statusCode),
-                                    new JProperty("responseTimeMs", latencyMs),
-                                    new JProperty("trace", new JObject(
-                                        new JProperty("traceparent", context.Request.Headers.GetValueOrDefault("traceparent", null)),
-                                        new JProperty("tracestate", context.Request.Headers.GetValueOrDefault("tracestate", null)),
-                                        new JProperty("xTraceId", context.Request.Headers.GetValueOrDefault("x-trace-id", null)),
-                                        new JProperty("xRequestId", context.Request.Headers.GetValueOrDefault("x-request-id", null))
-                                    )),
-                                    new JProperty("metadata", new JObject(
-                                        new JProperty("gateway", "azure-apim"),
-                                        new JProperty("productId", "{{aforo-mcp-product-id}}")
-                                    ))
-                                )
-                            ))
-                        );
-                        return evt.ToString();
-                    }]]></set-body>
-                </send-one-way-request>
-            </when>
-            <otherwise>
-                <!-- Standard API metering -->
-                <send-one-way-request mode="new">
-                    <set-url>{{aforo-endpoint}}</set-url>
-                    <set-method>POST</set-method>
-                    <set-header name="Content-Type" exists-action="override">
-                        <value>application/json</value>
-                    </set-header>
-                    <set-header name="Authorization" exists-action="override">
-                        <value>Bearer {{aforo-api-key}}</value>
-                    </set-header>
-                    <set-header name="X-Tenant-Id" exists-action="override">
-                        <value>{{aforo-tenant-id}}</value>
-                    </set-header>
-                    <set-body><![CDATA[@{
-                        var path = context.Request.Url.Path;
-                        var method = context.Request.Method;
-                        var statusCode = context.Response.StatusCode;
-                        var latencyMs = (int)context.Elapsed.TotalMilliseconds;
+                            var evt = new JObject(
+                                new JProperty("events", new JArray(
+                                    new JObject(
+                                        new JProperty("customerId", context.Variables.GetValueOrDefault<string>("aforo-customer-id", "")),
+                                        new JProperty("metricName", "mcp_server.tool_invocations"),
+                                        new JProperty("quantity", 1),
+                                        new JProperty("idempotencyKey", "mcp:" + context.RequestId.ToString() + ":" + toolName),
+                                        new JProperty("occurredAt", DateTime.UtcNow.ToString("o")),
+                                        new JProperty("productType", "MCP_SERVER"),
+                                        new JProperty("toolName", toolName),
+                                        new JProperty("agentId", agentId),
+                                        new JProperty("sessionId", sessionId),
+                                        new JProperty("executionStatus",
+                                            statusCode >= 200 && statusCode < 300 ? "SUCCESS" : "ERROR"),
+                                        new JProperty("executionDurationMs", latencyMs),
+                                        new JProperty("endpointPath", path),
+                                        new JProperty("httpMethod", method),
+                                        new JProperty("statusCode", statusCode),
+                                        new JProperty("responseTimeMs", latencyMs),
+                                        new JProperty("trace", new JObject(
+                                            new JProperty("traceparent", context.Request.Headers.GetValueOrDefault("traceparent", null)),
+                                            new JProperty("tracestate", context.Request.Headers.GetValueOrDefault("tracestate", null)),
+                                            new JProperty("xTraceId", context.Request.Headers.GetValueOrDefault("x-trace-id", null)),
+                                            new JProperty("xRequestId", context.Request.Headers.GetValueOrDefault("x-request-id", null))
+                                        )),
+                                        new JProperty("metadata", new JObject(
+                                            new JProperty("gateway", "azure-apim"),
+                                            new JProperty("productId", productId == "none" ? "" : productId)
+                                        ))
+                                    )
+                                ))
+                            );
+                            return evt.ToString();
+                        }]]></set-body>
+                    </send-one-way-request>
+                </when>
+                <otherwise>
+                    <!-- Standard API metering -->
+                    <send-one-way-request mode="new">
+                        <set-url>{{aforo-endpoint}}</set-url>
+                        <set-method>POST</set-method>
+                        <set-header name="Content-Type" exists-action="override">
+                            <value>application/json</value>
+                        </set-header>
+                        <set-header name="X-API-Key" exists-action="override">
+                            <value>{{aforo-api-key}}</value>
+                        </set-header>
+                        <set-body><![CDATA[@{
+                            var path = context.Request.OriginalUrl.Path;
+                            var method = context.Request.Method;
+                            var statusCode = context.Response.StatusCode;
+                            var latencyMs = (int)context.Elapsed.TotalMilliseconds;
 
-                        var evt = new JObject(
-                            new JProperty("events", new JArray(
-                                new JObject(
-                                    new JProperty("customerId",
-                                        context.Subscription != null ? context.Subscription.Id : "unknown"),
-                                    new JProperty("metricName", method + " " + path),
-                                    new JProperty("quantity", 1),
-                                    new JProperty("idempotencyKey",
-                                        context.RequestId + ":" + DateTime.UtcNow.Ticks),
-                                    new JProperty("occurredAt", DateTime.UtcNow.ToString("o")),
-                                    new JProperty("endpointPath", path),
-                                    new JProperty("httpMethod", method),
-                                    new JProperty("statusCode", statusCode),
-                                    new JProperty("responseTimeMs", latencyMs),
-                                    new JProperty("trace", new JObject(
-                                        new JProperty("traceparent", context.Request.Headers.GetValueOrDefault("traceparent", null)),
-                                        new JProperty("tracestate", context.Request.Headers.GetValueOrDefault("tracestate", null)),
-                                        new JProperty("xTraceId", context.Request.Headers.GetValueOrDefault("x-trace-id", null)),
-                                        new JProperty("xRequestId", context.Request.Headers.GetValueOrDefault("x-request-id", null))
-                                    )),
-                                    new JProperty("metadata", new JObject(
-                                        new JProperty("gateway", "azure-apim"),
-                                        new JProperty("method", method),
-                                        new JProperty("path", path),
-                                        new JProperty("status", statusCode),
-                                        new JProperty("latency", latencyMs)
-                                    ))
-                                )
-                            ))
-                        );
-                        return evt.ToString();
-                    }]]></set-body>
-                </send-one-way-request>
-            </otherwise>
-        </choose>
-    </outbound>
+                            var evt = new JObject(
+                                new JProperty("events", new JArray(
+                                    new JObject(
+                                        new JProperty("customerId", context.Variables.GetValueOrDefault<string>("aforo-customer-id", "")),
+                                        new JProperty("metricName", context.Variables.GetValueOrDefault<string>("aforo-metric-name", "")),
+                                        new JProperty("quantity", 1),
+                                        new JProperty("idempotencyKey", context.RequestId.ToString()),
+                                        new JProperty("occurredAt", DateTime.UtcNow.ToString("o")),
+                                        new JProperty("endpointPath", path),
+                                        new JProperty("httpMethod", method),
+                                        new JProperty("statusCode", statusCode),
+                                        new JProperty("responseTimeMs", latencyMs),
+                                        new JProperty("trace", new JObject(
+                                            new JProperty("traceparent", context.Request.Headers.GetValueOrDefault("traceparent", null)),
+                                            new JProperty("tracestate", context.Request.Headers.GetValueOrDefault("tracestate", null)),
+                                            new JProperty("xTraceId", context.Request.Headers.GetValueOrDefault("x-trace-id", null)),
+                                            new JProperty("xRequestId", context.Request.Headers.GetValueOrDefault("x-request-id", null))
+                                        )),
+                                        new JProperty("metadata", new JObject(
+                                            new JProperty("gateway", "azure-apim"),
+                                            new JProperty("method", method),
+                                            new JProperty("path", path),
+                                            new JProperty("status", statusCode),
+                                            new JProperty("latency", latencyMs),
+                                            new JProperty("subscription", context.Subscription != null ? context.Subscription.Id : ""),
+                                            new JProperty("operation", context.Operation != null ? context.Operation.Id : "")
+                                        ))
+                                    )
+                                ))
+                            );
+                            return evt.ToString();
+                        }]]></set-body>
+                    </send-one-way-request>
+                </otherwise>
+            </choose>
+        </when>
+        <otherwise>
+            <trace source="aforo-metering" severity="verbose">
+                <message>@(context.Request.Method == "OPTIONS" ? "Not metered: OPTIONS preflight" : "Not metered: no Aforo customer resolved (include aforo-context in inbound; check the JWT customer_id claim or aforo-subscription-customer-map)")</message>
+            </trace>
+        </otherwise>
+    </choose>
 </fragment>
