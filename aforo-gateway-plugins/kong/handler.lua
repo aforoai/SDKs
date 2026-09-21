@@ -347,9 +347,27 @@ local AforoMeteringHandler = {
 }
 
 -- Shared memory buffer name (must be declared in kong.conf: lua_shared_dict aforo_buffer 10m)
-local BUFFER_KEY = "events"
-local BUFFER_COUNT_KEY = "event_count"
+--
+-- The buffer is a shared-dict LIST, one JSON-encoded event per element
+-- (2026-09-21). It used to be a single JSON array under one key, appended by
+-- get -> decode -> insert -> set and drained by get -> delete. Neither sequence
+-- is atomic, and every nginx worker runs them concurrently: two workers
+-- appending at once each wrote back their own copy of the array and the other's
+-- event vanished, and an append landing between a flush's get and its delete
+-- was deleted unsent. Silent, proportional to traffic, and invisible in the
+-- logs -- the worst kind of metering loss. rpush / lpop are single atomic
+-- operations under the dict's own lock, so neither race exists any more.
+--
+-- A new key name on purpose: rpush against the old key, if it still held the
+-- legacy string after a hot reload, fails with "value not a list".
+local BUFFER_KEY = "aforo:events"
 local MAX_BUFFER_SIZE = 10000
+
+-- The ingestor rejects a batch of more than 1000 events with 400 -- which the
+-- drop-on-4xx rule in flush_buffer would turn into silently discarding the
+-- whole backlog. So a backlog (after an outage, say) is drained in slices no
+-- larger than this, rather than as one oversized request.
+local MAX_BATCH_SIZE = 1000
 
 -- ────────────────────────────────────────────────────────────
 -- Helpers
@@ -658,28 +676,69 @@ end
 -- Flush buffered events to Aforo ingestor
 -- ────────────────────────────────────────────────────────────
 
-local function flush_buffer(premature, conf)
-    if premature then return end
-
-    local dict = ngx.shared[BUFFER_DICT]
-    if not dict then
-        kong.log.err("[aforo-metering] Shared dict '", BUFFER_DICT, "' not found")
-        return
+-- Take up to `max` events off the head of the buffer. Each lpop is atomic, so
+-- concurrent flushes in different workers take disjoint events: nothing is sent
+-- twice and nothing is lost between a read and a delete.
+local function pop_batch(dict, max)
+    local batch = {}
+    for i = 1, max do
+        local item, err = dict:lpop(BUFFER_KEY)
+        if not item then
+            if err then
+                kong.log.err("[aforo-metering] Could not read buffer: ", err)
+            end
+            break
+        end
+        batch[i] = item
     end
+    return batch
+end
 
-    local events_json = dict:get(BUFFER_KEY)
-    if not events_json then return end
+-- Put a failed batch back at the head of the buffer, oldest first, and trim
+-- the tail back to MAX_BUFFER_SIZE. Returns how many events were dropped.
+--
+-- Ordering: failed events are older than anything buffered during the
+-- attempt, so they go in front. On overflow we keep the OLDEST and drop the
+-- newest, because the oldest are the ones closest to falling outside the
+-- ingestor's 90-day occurredAt acceptance window -- and losing recent events
+-- is recoverable from upstream logs far more often than losing old ones.
+local function rebuffer(dict, batch)
+    local dropped = 0
+    for i = #batch, 1, -1 do
+        local len, err = dict:lpush(BUFFER_KEY, batch[i])
+        if not len then
+            -- Only "no memory" in practice: the dict is full. The events
+            -- further down this loop are newer, so this is still "drop newest".
+            kong.log.err("[aforo-metering] Could not re-buffer event: ", err)
+            dropped = dropped + 1
+        end
+    end
+    local len = dict:llen(BUFFER_KEY) or 0
+    while len > MAX_BUFFER_SIZE do
+        if not dict:rpop(BUFFER_KEY) then break end
+        dropped = dropped + 1
+        len = len - 1
+    end
+    return dropped
+end
 
-    local events = cjson.decode(events_json)
-    if not events or #events == 0 then return end
+-- 4xx other than 408 / 429: the ingestor understood the batch and refused it.
+-- See the drop-on-rejection comment in send_batch for why these are not retried.
+local function is_permanent_rejection(status)
+    return status ~= nil and status >= 400 and status < 500
+        and status ~= 408 and status ~= 429
+end
 
-    dict:delete(BUFFER_KEY)
-    dict:set(BUFFER_COUNT_KEY, 0)
-
+-- POST one batch. Returns "sent", "rejected" (permanent -- dropped, do not
+-- retry) or "failed" (transient -- the caller keeps the events).
+local function send_batch(conf, batch)
     local httpc = http.new()
     httpc:set_timeout(10000)
 
-    local body = cjson.encode({ events = events })
+    -- Each element is already a JSON-encoded event, so the body is assembled
+    -- rather than decoded and re-encoded: cheaper, and the bytes sent are
+    -- exactly the bytes buffered.
+    local body = '{"events":[' .. table.concat(batch, ",") .. ']}'
 
     local max_retries = 3
     local last_status, last_body
@@ -709,8 +768,8 @@ local function flush_buffer(premature, conf)
         })
 
         if res and res.status >= 200 and res.status < 300 then
-            kong.log.info("[aforo-metering] Flushed ", #events, " events to Aforo (status=", res.status, ")")
-            return
+            kong.log.info("[aforo-metering] Flushed ", #batch, " events to Aforo (status=", res.status, ")")
+            return "sent"
         end
 
         local status = res and res.status or "no response"
@@ -730,6 +789,14 @@ local function flush_buffer(premature, conf)
                 "leaf/intermediate/root chain. Set lua_ssl_verify_depth = 3 in kong.conf (or ",
                 "KONG_LUA_SSL_VERIFY_DEPTH=3). Adding CA certificates will not help: Kong already ",
                 "trusts the system bundle via lua_ssl_trusted_certificate.")
+        end
+
+        -- A permanent rejection (see below) gets the same answer on every
+        -- attempt, so stop here rather than sleeping through two more of them
+        -- -- which, with a backlog drained in slices, would hold every slice
+        -- behind it for 3s per rejected batch.
+        if is_permanent_rejection(last_status) then
+            break
         end
 
         if attempt < max_retries then
@@ -754,57 +821,55 @@ local function flush_buffer(premature, conf)
     -- explicitly invite a retry. Anything else (5xx, timeout, connection
     -- refused) is transient and worth keeping, which is what the original fix
     -- was for.
-    local permanent = last_status and last_status >= 400 and last_status < 500
-        and last_status ~= 408 and last_status ~= 429
-    if permanent then
+    if is_permanent_rejection(last_status) then
         kong.log.err("[aforo-metering] Ingestor rejected the batch with ", last_status,
-            " -- dropping ", #events, " event(s) rather than retrying them forever. ",
+            " -- dropping ", #batch, " event(s) rather than retrying them forever. ",
             "Response: ", string.sub(tostring(last_body or ""), 1, 500))
+        return "rejected"
+    end
+
+    return "failed"
+end
+
+local function flush_buffer(premature, conf)
+    if premature then return end
+
+    local dict = ngx.shared[BUFFER_DICT]
+    if not dict then
+        kong.log.err("[aforo-metering] Shared dict '", BUFFER_DICT, "' not found")
         return
     end
 
-    -- Re-buffer transient failures (2026-09-01 fix).
-    -- The buffer is cleared before the first attempt, so an ingestor outage
-    -- outlasting 3 retries used to destroy the only copy of these events:
-    -- unbilled usage, no dead-letter, nothing to reconstruct from. Push them
-    -- back so a later flush retries them.
-    --
-    -- Ordering: failed events are older than anything buffered during the
-    -- attempt, so they go in front. On overflow we keep the OLDEST and drop the
-    -- newest, because the oldest are the ones closest to falling outside the
-    -- ingestor's 90-day occurredAt acceptance window -- and losing recent events
-    -- is recoverable from upstream logs far more often than losing old ones.
-    local pending_json = dict:get(BUFFER_KEY)
-    if pending_json then
-        local pending = cjson.decode(pending_json)
-        if pending then
-            for i = 1, #pending do
-                events[#events + 1] = pending[i]
+    -- Drain in slices of MAX_BATCH_SIZE. Bounded so one flush cannot chase a
+    -- buffer that live traffic refills as fast as it drains; whatever is left
+    -- is picked up by the flush the next buffered event schedules.
+    for _ = 1, math.ceil(MAX_BUFFER_SIZE / MAX_BATCH_SIZE) do
+        local batch = pop_batch(dict, MAX_BATCH_SIZE)
+        if #batch == 0 then return end
+
+        local outcome = send_batch(conf, batch)
+
+        if outcome == "failed" then
+            -- Re-buffer transient failures (2026-09-01 fix).
+            -- The events were taken off the buffer before the first attempt, so
+            -- an ingestor outage outlasting 3 retries used to destroy the only
+            -- copy of them: unbilled usage, no dead-letter, nothing to
+            -- reconstruct from. Push them back so a later flush retries them,
+            -- and stop draining -- the next slice would only fail the same way.
+            local dropped = rebuffer(dict, batch)
+            if dropped > 0 then
+                kong.log.err("[aforo-metering] All flush attempts failed. ",
+                    #batch, " events re-buffered for retry; ", dropped,
+                    " dropped (buffer at MAX_BUFFER_SIZE=", MAX_BUFFER_SIZE,
+                    "). Raise lua_shared_dict aforo_buffer if this recurs.")
+            else
+                kong.log.err("[aforo-metering] All flush attempts failed. ",
+                    #batch, " events re-buffered for retry on the next flush.")
             end
+            return
         end
-    end
 
-    local dropped = 0
-    if #events > MAX_BUFFER_SIZE then
-        dropped = #events - MAX_BUFFER_SIZE
-        local trimmed = {}
-        for i = 1, MAX_BUFFER_SIZE do
-            trimmed[i] = events[i]
-        end
-        events = trimmed
-    end
-
-    dict:set(BUFFER_KEY, cjson.encode(events))
-    dict:set(BUFFER_COUNT_KEY, #events)
-
-    if dropped > 0 then
-        kong.log.err("[aforo-metering] All ", max_retries, " flush attempts failed. ",
-            #events, " events re-buffered for retry; ", dropped,
-            " dropped (buffer at MAX_BUFFER_SIZE=", MAX_BUFFER_SIZE,
-            "). Raise lua_shared_dict aforo_buffer if this recurs.")
-    else
-        kong.log.err("[aforo-metering] All ", max_retries, " flush attempts failed. ",
-            #events, " events re-buffered for retry on the next flush.")
+        if #batch < MAX_BATCH_SIZE then return end
     end
 end
 
@@ -1074,19 +1139,43 @@ function AforoMeteringHandler:log(conf)
         return
     end
 
-    local count = dict:incr(BUFFER_COUNT_KEY, 1, 0)
-
-    if count > MAX_BUFFER_SIZE then
-        kong.log.warn("[aforo-metering] Buffer overflow (", count, "/", MAX_BUFFER_SIZE,
-            "). Dropping oldest event.")
-        dict:incr(BUFFER_COUNT_KEY, -1)
+    local encoded, enc_err = cjson.encode(event)
+    if not encoded then
+        kong.log.err("[aforo-metering] Could not encode event for ", method, " ", path,
+            ": ", enc_err, ". Event not metered.")
         return
     end
 
-    local events_json = dict:get(BUFFER_KEY)
-    local events = events_json and cjson.decode(events_json) or {}
-    table.insert(events, event)
-    dict:set(BUFFER_KEY, cjson.encode(events))
+    -- One atomic append; the returned length is this event's position, so it
+    -- doubles as the count that drives flush scheduling below without a
+    -- separate counter that could drift from the list.
+    local count, push_err = dict:rpush(BUFFER_KEY, encoded)
+    if not count then
+        kong.log.err("[aforo-metering] Could not buffer event (", push_err, "). ",
+            "Raise lua_shared_dict aforo_buffer if this recurs. Event not metered.")
+        return
+    end
+
+    if count > MAX_BUFFER_SIZE then
+        -- Over the cap: take one event back off the tail. That is this event or
+        -- one a concurrent worker appended a moment later -- either way the
+        -- newest, so the oldest (closest to the ingestor's acceptance window)
+        -- are the ones kept, matching the re-buffer rule in flush_buffer.
+        dict:rpop(BUFFER_KEY)
+        warn_throttled("buffer_overflow", 10,
+            "[aforo-metering] Buffer full (", MAX_BUFFER_SIZE, " events) -- dropping the ",
+            "newest event. The ingestor is failing or unreachable; see the flush errors. ",
+            "Repeats suppressed for 10s.")
+        -- Keep a flush coming. Previously an overflow returned without
+        -- scheduling one, so once the buffer was full and the last flush had
+        -- re-buffered, nothing ever flushed again even after the ingestor
+        -- recovered -- every new event was dropped at this line. add() limits
+        -- it to one attempt per second across workers rather than one per request.
+        if dict:add("aforo:overflow_flush", 1, 1) then
+            ngx.timer.at(0, flush_buffer, conf)
+        end
+        return
+    end
 
     if count >= (conf.flush_count or 50) then
         local ok, err = ngx.timer.at(0, flush_buffer, conf)
@@ -1105,5 +1194,6 @@ end
 -- Exported for unit testing — not used by the Kong runtime.
 -- Keep the top-level handler contract (access/log) unchanged.
 AforoMeteringHandler._resolve_customer_id = resolve_customer_id
+AforoMeteringHandler._flush_buffer = flush_buffer
 
 return AforoMeteringHandler
