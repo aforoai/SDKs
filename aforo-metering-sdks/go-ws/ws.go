@@ -24,15 +24,15 @@ import (
 const sdkVersion = "1.0.0"
 
 type Config struct {
-	TenantID         string
-	ProductID        string
-	APIKey           string
-	IngestorURL      string
-	PerFrameEvents   bool          // off by default — emit only OPEN + CLOSE
-	FlushCount       int           // default 100
-	FlushInterval    time.Duration // default 3s
-	HTTPClient       *http.Client
-	OnError          func(error)
+	TenantID       string
+	ProductID      string
+	APIKey         string
+	IngestorURL    string
+	PerFrameEvents bool          // off by default — emit only OPEN + CLOSE
+	FlushCount     int           // default 100
+	FlushInterval  time.Duration // default 3s
+	HTTPClient     *http.Client
+	OnError        func(error)
 }
 
 type Billing struct {
@@ -73,7 +73,7 @@ func New(cfg Config) (*Billing, error) {
 	}
 	b := &Billing{
 		cfg:    cfg,
-		url:    strings.TrimRight(cfg.IngestorURL, "/") + "/v1/ingest/events",
+		url:    strings.TrimRight(cfg.IngestorURL, "/") + "/v1/ingest/batch",
 		client: cfg.HTTPClient,
 		stop:   make(chan struct{}),
 	}
@@ -86,6 +86,10 @@ func New(cfg Config) (*Billing, error) {
 // you must hold and pass to RecordFrame and Close.
 func (b *Billing) Open(customerID string, metadata map[string]any) string {
 	if customerID == "" {
+		return ""
+	}
+	if len(customerID) > 64 {
+		b.cfg.OnError(fmt.Errorf("wsmetering: customerId longer than 64 chars, connection not metered"))
 		return ""
 	}
 	connID := fmt.Sprintf("ws_%d_%s", time.Now().UnixNano(), randomSuffix())
@@ -143,19 +147,27 @@ func (b *Billing) connEvent(customerID, connID, frameType, direction string, fra
 		metricName = "websocket_api.connection_closed"
 	}
 	e := map[string]any{
-		"customerId":     customerID,
-		"metricName":     metricName,
-		"quantity":       1,
-		"occurredAt":     now.Format(time.RFC3339Nano),
-		"idempotencyKey": fmt.Sprintf("ws:%s:%s:%s:%d:%s", b.cfg.TenantID, connID, frameType, now.UnixMilli(), randomSuffix()),
-		"productType":    "WEBSOCKET_API",
-		"wsConnectionId": connID,
-		"wsDirection":    direction,
-		"wsFrameType":    frameType,
-		"messageCount":   frames,
-		"dataBytes":      bytesAmt,
-		"durationMs":     durationMs,
-		"metadata":       merge(metadata, map[string]any{"sdkVersion": sdkVersion, "productId": b.cfg.ProductID}),
+		"customerId":          customerID,
+		"metricName":          metricName,
+		"quantity":            1,
+		"occurredAt":          now.Format(time.RFC3339Nano),
+		"idempotencyKey":      fmt.Sprintf("ws:%s:%s:%s:%d:%s", b.cfg.TenantID, connID, frameType, now.UnixMilli(), randomSuffix()),
+		"productType":         "WEBSOCKET_API",
+		"wsConnectionId":      connID,
+		"messageCount":        frames,
+		"dataBytes":           bytesAmt,
+		"executionDurationMs": durationMs,
+		"metadata":            merge(metadata, map[string]any{"sdkVersion": sdkVersion, "productId": b.cfg.ProductID}),
+	}
+	// wsDirection / wsFrameType are enums on the ingestor; a value outside the
+	// allowed set rejects the whole event, so omit rather than send it.
+	switch d := strings.ToUpper(direction); d {
+	case "CLIENT_TO_SERVER", "SERVER_TO_CLIENT":
+		e["wsDirection"] = d
+	}
+	switch ft := strings.ToUpper(frameType); ft {
+	case "TEXT", "BINARY", "PING", "PONG", "CLOSE":
+		e["wsFrameType"] = ft
 	}
 	if closeReason != "" {
 		e["wsCloseReason"] = closeReason
@@ -216,6 +228,9 @@ func (b *Billing) flushLoop() {
 	}
 }
 
+// maxBatchSize is the ingestor's per-request cap on POST /v1/ingest/batch.
+const maxBatchSize = 1000
+
 func (b *Billing) flush() {
 	b.mu.Lock()
 	if len(b.buffer) == 0 {
@@ -226,7 +241,19 @@ func (b *Billing) flush() {
 	b.buffer = nil
 	b.mu.Unlock()
 
-	body, err := json.Marshal(map[string]any{"events": batch})
+	for start := 0; start < len(batch); start += maxBatchSize {
+		end := start + maxBatchSize
+		if end > len(batch) {
+			end = len(batch)
+		}
+		b.send(batch[start:end])
+	}
+}
+
+// send POSTs one chunk of at most maxBatchSize events. The body is marshalled
+// once, so every retry carries the same idempotencyKeys.
+func (b *Billing) send(chunk []map[string]any) {
+	body, err := json.Marshal(map[string]any{"events": chunk})
 	if err != nil {
 		b.cfg.OnError(err)
 		return
@@ -234,7 +261,7 @@ func (b *Billing) flush() {
 	for attempt := 1; attempt <= 3; attempt++ {
 		req, _ := http.NewRequest(http.MethodPost, b.url, bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+b.cfg.APIKey)
+		req.Header.Set("X-API-Key", b.cfg.APIKey)
 		req.Header.Set("X-Tenant-Id", b.cfg.TenantID)
 		resp, err := b.client.Do(req)
 		if err == nil {
@@ -247,9 +274,11 @@ func (b *Billing) flush() {
 			b.cfg.OnError(err)
 			return
 		}
-		time.Sleep(time.Duration(1<<(attempt-1)) * time.Second)
+		if attempt < 3 {
+			time.Sleep(time.Duration(1<<(attempt-1)) * time.Second)
+		}
 	}
-	b.cfg.OnError(fmt.Errorf("wsmetering: flush exhausted retries (dropped %d events)", len(batch)))
+	b.cfg.OnError(fmt.Errorf("wsmetering: flush exhausted retries (dropped %d events)", len(chunk)))
 }
 
 func (b *Billing) Shutdown() error {

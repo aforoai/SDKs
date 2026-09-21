@@ -12,7 +12,7 @@ A GraphQL server that emits one Aforo billing event per operation — type, name
 - An Aforo API key (`AFORO_API_KEY`), a `tenant_id`, and a `product_id`. All three are SDK config — never read from a client header.
 - A GraphQL HTTP handler that accepts POST with a JSON `{ "query": "...", "operationName": "..." }` body.
 - A way to identify the customer per request — by default the `X-Customer-Id` header your gateway/auth sets.
-- Ingestor base URL — `https://ingest.aforo.ai`.
+- Ingestor base URL — `https://usage-ingestor.aforo.ai`.
 
 ## Step 1 — Add the module from source
 
@@ -49,7 +49,7 @@ billing, err := graphqlmetering.New(graphqlmetering.Config{
 	TenantID:    "tenant_acme",
 	ProductID:   "prod_graphql_unified_gateway",
 	APIKey:      os.Getenv("AFORO_API_KEY"),
-	IngestorURL: "https://ingest.aforo.ai",
+	IngestorURL: "https://usage-ingestor.aforo.ai",
 })
 if err != nil {
 	log.Fatal(err) // returned when any required field is empty
@@ -87,7 +87,7 @@ billing, _ := graphqlmetering.New(graphqlmetering.Config{
 	TenantID:    "tenant_acme",
 	ProductID:   "prod_graphql_unified_gateway",
 	APIKey:      os.Getenv("AFORO_API_KEY"),
-	IngestorURL: "https://ingest.aforo.ai",
+	IngestorURL: "https://usage-ingestor.aforo.ai",
 	CustomerExtractor: func(r *http.Request) string {
 		return decodeJWTSubject(r.Header.Get("Authorization"))
 	},
@@ -120,8 +120,8 @@ The buffer flushes every `FlushInterval` (5s) or when it reaches `FlushCount` (5
 The wire call the SDK makes:
 
 ```
-POST https://ingest.aforo.ai/v1/ingest/events
-Authorization: Bearer <AFORO_API_KEY>
+POST https://usage-ingestor.aforo.ai/v1/ingest/batch
+X-API-Key: <AFORO_API_KEY>
 X-Tenant-Id: tenant_acme
 Content-Type: application/json
 
@@ -136,8 +136,8 @@ Content-Type: application/json
 |---|---|---|---|
 | `TenantID` | `string` | — (required) | `X-Tenant-Id` header + idempotency-key component. |
 | `ProductID` | `string` | — (required) | Event metadata + idempotency-key component. |
-| `APIKey` | `string` | — (required) | `Authorization: Bearer <APIKey>`. |
-| `IngestorURL` | `string` | — (required) | Base; `/v1/ingest/events` is appended. |
+| `APIKey` | `string` | — (required) | `X-API-Key: <APIKey>`. |
+| `IngestorURL` | `string` | — (required) | Base; `/v1/ingest/batch` is appended. |
 | `SchemaVersion` | `string` | none | Added to metadata as `schemaVersion` when set. |
 | `FlushCount` | `int` | `50` | Buffer-size flush threshold. |
 | `FlushInterval` | `time.Duration` | `5s` | Background flush cadence. |

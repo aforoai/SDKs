@@ -153,7 +153,7 @@ async def test_CONNECTION_OPENED_and_CLOSED_on_real_websocket_roundtrip():
         # 3 frames received, 7+8+5 bytes total (receive side)
         assert closed["metadata"]["recvCount"] == 3
         assert closed["metadata"]["recvBytes"] == 7 + 8 + 5
-        assert closed["durationMs"] >= 0
+        assert closed["executionDurationMs"] >= 0
 
         billing.shutdown()
     finally:
@@ -195,7 +195,9 @@ async def test_authorization_and_tenant_headers_reach_ingestor():
 
         assert captured, "ingestor was never called"
         headers = captured[0]["headers"]
-        assert headers.get("Authorization") == "Bearer sk_header_check"
+        lower = {k.lower(): v for k, v in headers.items()}
+        assert lower.get("x-api-key") == "sk_header_check"
+        assert "authorization" not in lower
         assert headers.get("X-Tenant-Id") == "tenant-headers"
 
         billing.shutdown()

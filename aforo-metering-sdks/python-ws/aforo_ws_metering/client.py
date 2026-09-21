@@ -33,6 +33,29 @@ except ImportError:  # pragma: no cover
 __version__ = "1.0.0"
 logger = logging.getLogger("aforo_ws_metering")
 
+# POST /v1/ingest/batch takes 1..1000 events per request.
+MAX_BATCH_EVENTS = 1000
+MAX_CUSTOMER_ID_LEN = 64
+MAX_IDEMPOTENCY_KEY_LEN = 255
+
+
+def _cap_idempotency_key(key: str) -> str:
+    """Keep keys within the ingestor's 255-char limit while staying unique."""
+    if len(key) <= MAX_IDEMPOTENCY_KEY_LEN:
+        return key
+    suffix = uuid.uuid4().hex
+    return key[:MAX_IDEMPOTENCY_KEY_LEN - len(suffix) - 1] + ":" + suffix
+
+
+def _valid_customer_id(customer_id: Any) -> bool:
+    """customerId must be non-blank and at most 64 chars or the ingestor rejects the event."""
+    if not isinstance(customer_id, str) or not customer_id.strip():
+        return False
+    if len(customer_id) > MAX_CUSTOMER_ID_LEN:
+        logger.warning("dropping usage event: customerId longer than %d chars", MAX_CUSTOMER_ID_LEN)
+        return False
+    return True
+
 
 WS_CLOSE_REASONS: Dict[int, str] = {
     1000: "NORMAL_CLOSURE",
@@ -48,6 +71,9 @@ WS_CLOSE_REASONS: Dict[int, str] = {
     1012: "GOING_AWAY",
 }
 
+WS_DIRECTIONS = ("CLIENT_TO_SERVER", "SERVER_TO_CLIENT")
+WS_FRAME_TYPES = ("TEXT", "BINARY", "PING", "PONG", "CLOSE")
+
 
 @dataclass
 class WsUsageEvent:
@@ -62,7 +88,7 @@ class WsUsageEvent:
     wsFrameType: str
     messageCount: int = 0
     dataBytes: int = 0
-    durationMs: int = 0
+    executionDurationMs: int = 0
     wsCloseReason: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -113,22 +139,32 @@ class AforoWsBilling:
             pass
 
     def push(self, partial: Dict[str, Any]) -> None:
+        if not _valid_customer_id(partial.get("customerId")) or not partial.get("wsConnectionId"):
+            return
         now = datetime.now(timezone.utc)
-        frame_type = partial.get("wsFrameType", "TEXT")
+        frame_type = str(partial.get("wsFrameType") or "TEXT").upper()
+        if frame_type not in WS_FRAME_TYPES:
+            frame_type = "TEXT"
+        direction = str(partial.get("wsDirection") or "SERVER_TO_CLIENT").upper()
+        if direction not in WS_DIRECTIONS:
+            direction = "SERVER_TO_CLIENT"
+        # "durationMs" is accepted for backward compatibility; the ingestor field is executionDurationMs.
+        duration_ms = partial.get("executionDurationMs", partial.get("durationMs", 0))
+        close_reason = partial.get("wsCloseReason")
         ev = WsUsageEvent(
             customerId=partial["customerId"],
             metricName="websocket_api.connection_closed" if frame_type == "CLOSE" else "websocket_api.message",
             quantity=1,
             occurredAt=now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-            idempotencyKey=f"ws:{self.tenant_id}:{partial['wsConnectionId']}:{frame_type}:{int(now.timestamp() * 1000)}:{uuid.uuid4().hex[:8]}",
+            idempotencyKey=_cap_idempotency_key(f"ws:{self.tenant_id}:{partial['wsConnectionId']}:{frame_type}:{int(now.timestamp() * 1000)}:{uuid.uuid4().hex[:8]}"),
             productType="WEBSOCKET_API",
             wsConnectionId=partial["wsConnectionId"],
-            wsDirection=partial.get("wsDirection", "SERVER_TO_CLIENT"),
+            wsDirection=direction,
             wsFrameType=frame_type,
             messageCount=partial.get("messageCount", 1),
             dataBytes=partial.get("dataBytes", 0),
-            durationMs=partial.get("durationMs", 0),
-            wsCloseReason=partial.get("wsCloseReason"),
+            executionDurationMs=duration_ms,
+            wsCloseReason=close_reason[:32] if close_reason else None,
             metadata={
                 **(partial.get("metadata") or {}),
                 "sdkVersion": __version__,
@@ -148,16 +184,23 @@ class AforoWsBilling:
         with self._buffer_lock:
             if not self._buffer:
                 return
-            batch = self._buffer
+            pending = self._buffer
             self._buffer = []
 
+        # /v1/ingest/batch accepts at most MAX_BATCH_EVENTS per request.
+        for i in range(0, len(pending), MAX_BATCH_EVENTS):
+            self._send_batch(pending[i:i + MAX_BATCH_EVENTS])
+
+    def _send_batch(self, batch: List[Dict[str, Any]]) -> None:
+        # Events (and their idempotencyKeys) are built once in record/push,
+        # so every retry below re-sends identical keys.
         body = {"events": batch}
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
+            "X-API-Key": self.api_key,
             "X-Tenant-Id": self.tenant_id,
         }
-        url = f"{self.ingestor_url}/v1/ingest/events"
+        url = f"{self.ingestor_url}/v1/ingest/batch"
 
         for attempt in range(3):
             try:
@@ -232,7 +275,7 @@ async def track_websockets_connection(
                             "wsFrameType": "BINARY" if isinstance(data, (bytes, bytearray)) else "TEXT",
                             "messageCount": 1,
                             "dataBytes": _byte_len(data),
-                            "durationMs": int((time.monotonic() - self.start) * 1000),
+                            "executionDurationMs": int((time.monotonic() - self.start) * 1000),
                             "metadata": metadata,
                         })
                     return await self._orig_send(data)
@@ -251,7 +294,7 @@ async def track_websockets_connection(
                             "wsFrameType": "BINARY" if isinstance(data, (bytes, bytearray)) else "TEXT",
                             "messageCount": 1,
                             "dataBytes": _byte_len(data),
-                            "durationMs": int((time.monotonic() - self.start) * 1000),
+                            "executionDurationMs": int((time.monotonic() - self.start) * 1000),
                             "metadata": metadata,
                         })
                     return data
@@ -286,7 +329,7 @@ async def track_websockets_connection(
                 "wsCloseReason": close_reason,
                 "messageCount": self.sent + self.recv,
                 "dataBytes": self.sent_bytes + self.recv_bytes,
-                "durationMs": int((time.monotonic() - self.start) * 1000),
+                "executionDurationMs": int((time.monotonic() - self.start) * 1000),
                 "metadata": {
                     "event": "CONNECTION_CLOSED",
                     "sentCount": self.sent, "recvCount": self.recv,
@@ -345,7 +388,7 @@ async def track_starlette_websocket(
                     "wsFrameType": "BINARY" if _attr == "send_bytes" else "TEXT",
                     "messageCount": 1,
                     "dataBytes": _byte_len(data),
-                    "durationMs": int((time.monotonic() - start) * 1000),
+                    "executionDurationMs": int((time.monotonic() - start) * 1000),
                     "metadata": metadata,
                 })
             return await _orig(data)
@@ -372,7 +415,7 @@ async def track_starlette_websocket(
                     "wsFrameType": _frame,
                     "messageCount": 1,
                     "dataBytes": _byte_len(data),
-                    "durationMs": int((time.monotonic() - start) * 1000),
+                    "executionDurationMs": int((time.monotonic() - start) * 1000),
                     "metadata": metadata,
                 })
             return data
@@ -400,7 +443,7 @@ async def track_starlette_websocket(
                 "wsCloseReason": close_reason,
                 "messageCount": counters["sent"] + counters["recv"],
                 "dataBytes": counters["sent_bytes"] + counters["recv_bytes"],
-                "durationMs": int((time.monotonic() - start) * 1000),
+                "executionDurationMs": int((time.monotonic() - start) * 1000),
                 "metadata": {
                     "event": "CONNECTION_CLOSED",
                     "sentCount": counters["sent"], "recvCount": counters["recv"],

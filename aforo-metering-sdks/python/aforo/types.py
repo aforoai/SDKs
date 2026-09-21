@@ -13,7 +13,7 @@ class AforoOptions:
     api_key: str
     """Aforo API key for authentication."""
 
-    base_url: str = "https://ingest.aforo.ai"
+    base_url: str = "https://usage-ingestor.aforo.ai"
     """Base URL for the Aforo ingestor service."""
 
     flush_count: int = 50
@@ -98,10 +98,12 @@ class MiddlewareOptions:
     """Options for framework middleware."""
 
     api_key: str
-    base_url: str = "https://ingest.aforo.ai"
+    base_url: str = "https://usage-ingestor.aforo.ai"
     metric_name: Optional[Callable | str] = None
+    """Fixed metric or callable. Default ``"api_calls"``; must exist in your Aforo catalog."""
     quantity: Optional[Callable | float] = None
     customer_id: Optional[Callable | str] = None
+    """Fixed id or callable. Default: ``X-Customer-Id`` header (never ``X-Api-Key``)."""
     exclude_paths: list[str] = field(
         default_factory=lambda: ["/health", "/ready", "/metrics", "/favicon.ico"]
     )

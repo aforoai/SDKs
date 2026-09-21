@@ -168,14 +168,14 @@ Precedence: **env var > CLI flag > config file > default.**
 | `--host` | `listen.host` | — | `127.0.0.1` | Listen host (sse / streamable-http). |
 | `--tenant` | `aforo.tenantId` | `AFORO_TENANT_ID` | — (required) | Tenant scope; sent as `X-Tenant-Id`. |
 | `--product` | `aforo.productId` | `AFORO_PRODUCT_ID` | — (required) | MCP_SERVER product. |
-| `--api-key` | `aforo.apiKey` | `AFORO_API_KEY` | — (required) | `Authorization: Bearer <apiKey>`. |
+| `--api-key` | `aforo.apiKey` | `AFORO_API_KEY` | — (required) | `X-API-Key: <apiKey>`. |
 | `--ingestor-url` | `aforo.ingestorUrl` | `AFORO_INGESTOR_URL` | — (required) | Base URL; proxy appends `/v1/ingest/batch` and `/api/v1/quota/check`. |
 | `--agent-id` | `aforo.agentId` | `AFORO_AGENT_ID` | — | Agent id override when traffic lacks `_meta.agent_id`. |
 | `--quota-enforcement` | `aforo.quotaEnforcement` | `AFORO_QUOTA_ENFORCEMENT` | `false` | Pre-flight quota gate (fail-open, 50ms budget). |
 | `--debug` | `aforo.debug` | `AFORO_DEBUG` | `false` | Verbose logging. |
 | — | `aforo.flushIntervalMs` | `AFORO_FLUSH_INTERVAL_MS` | `5000` | Timed flush cadence. |
 | — | `aforo.flushCount` | `AFORO_FLUSH_COUNT` | `50` | Force flush at this buffer size. |
-| — | `aforo.heartbeatIntervalMs` | `AFORO_HEARTBEAT_INTERVAL_MS` | `30000` | Session heartbeat cadence. |
+| — | `aforo.heartbeatIntervalMs` | `AFORO_HEARTBEAT_INTERVAL_MS` | `30000` | Deprecated and ignored: session heartbeats are no longer sent (quantity-0 heartbeat events failed the ingestor's validation and took the whole usage batch down). |
 
 ## Troubleshooting
 

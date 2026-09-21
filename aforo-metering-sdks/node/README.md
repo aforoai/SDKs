@@ -44,10 +44,15 @@ import { expressMiddleware } from '@aforo/metering/middleware/express';
 app.use(expressMiddleware({
   apiKey: process.env.AFORO_API_KEY!,
   customerId: (req) => req.user?.id ?? null,   // return null to skip metering this request
+  metricName: 'api_calls',                      // or (req, res) => string; must exist in your Aforo catalog
 }));
 ```
 
-The middleware hooks `res.on('finish')`, so it runs after the response is sent — zero added latency. The default metric name is `"<METHOD> <normalized-path>"` (e.g. `GET /users/:id`).
+The middleware hooks `res.on('finish')`, so it runs after the response is sent — zero added latency.
+
+- **Metric:** `metricName` is a fixed name or a `(req, res) => string` resolver; the default is `"api_calls"` (exported as `DEFAULT_METRIC_NAME`). The metric must exist in your tenant's Aforo catalog: the ingestor rejects an unknown `metricName`, and because it validates a batch as a whole, one rejected event fails every event in that batch.
+- **Customer:** `customerId` is a fixed id or a `(req) => string | null` resolver; the default is `req.user.id` / `req.user.sub`, then the `X-Customer-Id` header. The caller's `X-Api-Key` header is never used — it is the end user's secret, not a customer id. Requests with no customer are not metered.
+- **CORS preflights** (`OPTIONS`) are never metered.
 
 ## Configuration
 
@@ -55,8 +60,8 @@ The middleware hooks `res.on('finish')`, so it runs after the response is sent �
 
 | Option | Type | Default | What it does |
 |---|---|---|---|
-| `apiKey` | `string` | — (required) | Aforo API key, sent as `Authorization: Bearer`. |
-| `baseUrl` | `string` | `https://ingest.aforo.ai` | Ingestor base URL. Events POST to `<baseUrl>/v1/ingest/batch`. |
+| `apiKey` | `string` | — (required) | Aforo API key, sent as `X-API-Key`. |
+| `baseUrl` | `string` | `https://usage-ingestor.aforo.ai` | Ingestor base URL. Events POST to `<baseUrl>/v1/ingest/batch`. |
 | `flushCount` | `number` | `50` | Buffered events that trigger a flush. |
 | `flushInterval` | `number` (ms) | `5000` | Background flush cadence. |
 | `maxQueueSize` | `number` | `10000` | Ring-buffer cap; oldest events drop on overflow. |
@@ -73,4 +78,4 @@ Step-by-step from install to a verified event in Aforo: see the **[User guide](U
 
 ## What this doesn't cover
 
-This SDK only *emits* usage. Pricing, rate plans, and which `metricName`s are billable are configured in the Aforo console — this package does not create or validate them. A `metricName` that isn't defined in your tenant is accepted by the ingestor but won't bill until you map it.
+This SDK only *emits* usage. Pricing, rate plans, and which `metricName`s are billable are configured in the Aforo console — this package does not create or validate them. A `metricName` that isn't defined in your tenant is **rejected** by the ingestor — and fails the whole batch it travels in — so define the metric before sending it.

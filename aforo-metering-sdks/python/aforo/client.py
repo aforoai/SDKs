@@ -5,7 +5,6 @@ from __future__ import annotations
 import atexit
 import logging
 import threading
-import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -59,13 +58,6 @@ class AforoClient:
         self._closed = False
         self._flush_lock = threading.Lock()
 
-        # Heartbeat state
-        self._heartbeat_stop = threading.Event()
-        self._heartbeat_thread: Optional[threading.Thread] = None
-        self._active_session_id: Optional[str] = None
-        self._session_started_at: Optional[float] = None
-        self._session_product_type: str = "AI_AGENT"
-
         # Background flush timer (daemon so it doesn't block exit)
         self._timer: Optional[threading.Timer] = None
         self._schedule_flush()
@@ -73,96 +65,23 @@ class AforoClient:
         # Register atexit handler for graceful shutdown
         atexit.register(self._atexit_flush)
 
-    # ─── Session lifecycle with heartbeat ──────────────────────────────
+    # ─── Session lifecycle (deprecated no-ops) ─────────────────────────
 
     def start_session(self, session_id: str, product_type: str = "AI_AGENT") -> None:
-        """Start a session and begin emitting periodic heartbeats (every 30s)."""
-        if self._closed:
-            return
-        self._active_session_id = session_id
-        self._session_started_at = time.monotonic()
-        self._session_product_type = product_type
+        """Deprecated: no longer emits anything; kept so existing callers work.
 
-        # Emit first heartbeat immediately
-        self._emit_session_heartbeat()
-
-        # Start heartbeat thread
-        self._heartbeat_stop.clear()
-        self._heartbeat_thread = threading.Thread(
-            target=self._heartbeat_loop, daemon=True
-        )
-        self._heartbeat_thread.start()
+        This used to push ``system.session.heartbeat`` events (customer
+        ``"system"``, quantity 0) into the usage batch every 30 s. The ingestor
+        validates every event in a batch -- quantity must be positive and the
+        metric must be in the tenant's catalog -- and fails the whole batch with
+        400 when one event is invalid, so each heartbeat took every real usage
+        event batched with it down. The ingestor has no dedicated heartbeat
+        endpoint, so heartbeats are not sent.
+        """
 
     def end_session(self) -> None:
-        """End the current session: emit SESSION_END, stop heartbeat, flush."""
-        # Stop heartbeat thread
-        self._heartbeat_stop.set()
-        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
-            self._heartbeat_thread.join(timeout=2.0)
-        self._heartbeat_thread = None
-
-        if self._active_session_id:
-            resolved = ResolvedEvent(
-                customer_id="system",
-                metric_name="system.session.heartbeat",
-                quantity=0,
-                idempotency_key=f"hb:end:{self._active_session_id}:{int(time.time() * 1000)}",
-                occurred_at=datetime.now(timezone.utc).isoformat(),
-                metadata={
-                    "sessionId": self._active_session_id,
-                    "sessionBoundary": "SESSION_END",
-                    "productType": self._session_product_type,
-                    "heartbeatType": "SESSION_END",
-                },
-            )
-            self._buffer.push(resolved)
-
-        self._active_session_id = None
-        self._session_started_at = None
+        """Deprecated: equivalent to :meth:`flush`; no SESSION_END event is sent."""
         self.flush()
-
-    def _heartbeat_loop(self) -> None:
-        """Background thread emitting periodic heartbeats every 30s."""
-        while not self._heartbeat_stop.wait(timeout=30.0):
-            self._emit_session_heartbeat()
-
-    def _emit_session_heartbeat(self) -> None:
-        """Push a heartbeat event into the buffer."""
-        if not self._active_session_id or self._closed:
-            return
-
-        process_memory_mb = None
-        try:
-            import resource
-            process_memory_mb = round(
-                resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-            )
-        except Exception:
-            pass
-
-        metadata: dict = {
-            "sessionId": self._active_session_id,
-            "sessionBoundary": "HEARTBEAT",
-            "productType": self._session_product_type,
-            "heartbeatType": "PERIODIC",
-            "uptimeMs": int(
-                (time.monotonic() - (self._session_started_at or time.monotonic()))
-                * 1000
-            ),
-            "sdkLanguage": "python",
-        }
-        if process_memory_mb is not None:
-            metadata["processMemoryMb"] = process_memory_mb
-
-        resolved = ResolvedEvent(
-            customer_id="system",
-            metric_name="system.session.heartbeat",
-            quantity=0,
-            idempotency_key=f"hb:{self._active_session_id}:{int(time.time() * 1000)}",
-            occurred_at=datetime.now(timezone.utc).isoformat(),
-            metadata=metadata,
-        )
-        self._buffer.push(resolved)
 
     # ─── Event tracking ──────────────────────────────────────────────
 
@@ -227,12 +146,6 @@ class AforoClient:
         if self._closed:
             return
         self._closed = True
-
-        # Stop heartbeat thread
-        self._heartbeat_stop.set()
-        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
-            self._heartbeat_thread.join(timeout=2.0)
-        self._heartbeat_thread = None
 
         if self._timer:
             self._timer.cancel()

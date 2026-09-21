@@ -38,7 +38,7 @@ class AforoGrpcBillingTest {
     private final AtomicInteger responseStatus = new AtomicInteger(204);
     private final ObjectMapper mapper = new ObjectMapper();
 
-    record CapturedRequest(String method, String path, String authorization,
+    record CapturedRequest(String method, String path, String authorization, String apiKey,
                            String tenantId, JsonNode body) {}
 
     @BeforeEach
@@ -53,6 +53,7 @@ class AforoGrpcBillingTest {
                     exchange.getRequestMethod(),
                     exchange.getRequestURI().getPath(),
                     exchange.getRequestHeaders().getFirst("Authorization"),
+                    exchange.getRequestHeaders().getFirst("X-API-Key"),
                     exchange.getRequestHeaders().getFirst("X-Tenant-Id"),
                     body
             ));
@@ -125,9 +126,11 @@ class AforoGrpcBillingTest {
 
         CapturedRequest req = requests.get(0);
         assertThat(req.method()).isEqualTo("POST");
-        // trailing slash on ingestorUrl must be stripped before appending /v1/ingest/events
-        assertThat(req.path()).isEqualTo("/v1/ingest/events");
-        assertThat(req.authorization()).isEqualTo("Bearer sk_test_abc");
+        // trailing slash on ingestorUrl must be stripped before appending /v1/ingest/batch
+        assertThat(req.path()).isEqualTo("/v1/ingest/batch");
+        assertThat(req.apiKey()).isEqualTo("sk_test_abc");
+        // Bearer is parsed as a JWT by the ingestor and rejected 401, even alongside X-API-Key
+        assertThat(req.authorization()).isNull();
         assertThat(req.tenantId()).isEqualTo("tenant-001");
 
         JsonNode events = req.body().get("events");

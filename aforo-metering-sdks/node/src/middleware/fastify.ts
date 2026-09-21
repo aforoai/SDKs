@@ -1,6 +1,6 @@
 import { AforoClient } from '../client';
 import { MiddlewareOptions } from '../types';
-import { normalizePath } from '../path-normalizer';
+import { isPreflight, resolveMetricName, firstNonEmpty } from './common';
 
 const DEFAULT_EXCLUDE_PATHS = ['/health', '/ready', '/metrics', '/favicon.ico'];
 
@@ -30,21 +30,11 @@ export async function fastifyPlugin(fastify: any, options: MiddlewareOptions) {
       const method: string = request.method || 'UNKNOWN';
       const statusCode: number = reply.statusCode || 0;
 
+      if (isPreflight(method)) return done();
       if (excludePaths.some((p: string) => path.startsWith(p))) return done();
       if (excludeStatusCodes.includes(statusCode)) return done();
 
-      const routeTemplate: string | undefined = request.routeOptions?.url
-        ?? request.routerPath;
-      const normalizedPath = normalizePath(path.split('?')[0], routeTemplate);
-
-      let metricName: string;
-      if (typeof options.metricName === 'function') {
-        metricName = options.metricName(request, reply);
-      } else if (options.metricName) {
-        metricName = options.metricName;
-      } else {
-        metricName = `${method} ${normalizedPath}`;
-      }
+      const metricName = resolveMetricName(options, request, reply);
 
       let quantity: number;
       if (typeof options.quantity === 'function') {
@@ -59,10 +49,8 @@ export async function fastifyPlugin(fastify: any, options: MiddlewareOptions) {
       } else if (options.customerId) {
         customerId = options.customerId;
       } else {
-        customerId = (request as any).user?.id
-          ?? request.headers?.['x-customer-id']
-          ?? request.headers?.['x-api-key']
-          ?? null;
+        // Never the caller's X-Api-Key: that is a secret, not a customer id.
+        customerId = firstNonEmpty((request as any).user?.id, request.headers?.['x-customer-id']);
       }
 
       if (!customerId) return done();

@@ -111,7 +111,8 @@ class AforoWsBillingTest {
         assertThat(ev.get("wsCloseReason").asText()).isEqualTo("NORMAL_CLOSURE");
         assertThat(ev.get("messageCount").asInt()).isEqualTo(3);
         assertThat(ev.get("dataBytes").asLong()).isEqualTo(12L);
-        assertThat(ev.get("durationMs").asLong()).isGreaterThanOrEqualTo(0L);
+        assertThat(ev.get("executionDurationMs").asLong()).isGreaterThanOrEqualTo(0L);
+        assertThat(ev.has("durationMs")).isFalse();
         assertThat(ev.get("metricName").asText()).isEqualTo("websocket_api.connection_closed");
     }
 

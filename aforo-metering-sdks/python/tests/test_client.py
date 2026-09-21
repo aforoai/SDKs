@@ -19,6 +19,23 @@ class TestAforoClient:
         mock_cls.return_value = mock_transport
         return patcher, mock_transport
 
+    def test_sessions_do_not_put_heartbeats_in_usage_batch(self):
+        """Heartbeats (quantity 0, customer "system") fail the ingestor's
+        @Positive check and take every real event in the same batch down."""
+        patcher, mock_transport = self._mock_transport()
+        try:
+            client = AforoClient(api_key="key", flush_interval=999)
+            client.start_session("sess_1")
+            client.track(customer_id="cust_1", metric_name="api_calls")
+            client.end_session()
+
+            sent = [e for call in mock_transport.send_sync.call_args_list for e in call.args[0]]
+            assert [e.metric_name for e in sent] == ["api_calls"]
+            assert all(e.quantity > 0 for e in sent)
+        finally:
+            client.shutdown()
+            patcher.stop()
+
     def test_requires_api_key(self):
         with pytest.raises(ValueError, match="api_key is required"):
             AforoClient(api_key="")

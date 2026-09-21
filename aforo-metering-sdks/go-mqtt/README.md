@@ -56,7 +56,7 @@ func main() {
 		TenantID:    "tenant_acme",
 		ProductID:   "prod_mqtt_iot_telemetry",
 		APIKey:      os.Getenv("AFORO_API_KEY"),
-		IngestorURL: "https://ingest.aforo.ai",
+		IngestorURL: "https://usage-ingestor.aforo.ai",
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -103,8 +103,8 @@ Each `Record*` call buffers one event; an empty `customerID` records nothing (th
 |---|---|---|---|
 | `TenantID` | `string` | — (required) | Sent as the `X-Tenant-Id` header on every flush and embedded in idempotency keys. Set by you, never from a client header. |
 | `ProductID` | `string` | — (required) | Recorded in event metadata + idempotency keys. |
-| `APIKey` | `string` | — (required) | Sent as `Authorization: Bearer <APIKey>`. |
-| `IngestorURL` | `string` | — (required) | Ingestor base; the SDK appends `/v1/ingest/events`. Use `https://ingest.aforo.ai`. |
+| `APIKey` | `string` | — (required) | Sent as `X-API-Key: <APIKey>`. |
+| `IngestorURL` | `string` | — (required) | Ingestor base; the SDK appends `/v1/ingest/batch`. Use `https://usage-ingestor.aforo.ai`. |
 | `EmitDeliverEvents` | `bool` | `false` | When true, `RecordDeliver` emits events. Off by default — inbound delivery is high-volume. |
 | `FlushCount` | `int` | `200` | Flush when the buffer reaches this many events (highest of the SDKs — MQTT telemetry is the highest-volume). |
 | `FlushInterval` | `time.Duration` | `2s` | Background flush cadence. |
@@ -117,12 +117,12 @@ Event methods:
 
 | Go call | Event type | Notes |
 |---|---|---|
-| `RecordPublish(customerID, clientID, topic, qos, retained, payloadBytes)` | `PUBLISH` | |
+| `RecordPublish(customerID, clientID, topic, qos, retained, payloadBytes)` | `PUBLISH` | Dropped (reported via `OnError`) if `topic` is empty. |
 | `RecordDeliver(customerID, clientID, topic, qos, retained, payloadBytes)` | `DELIVER` | No-op unless `EmitDeliverEvents: true`. |
 | `RecordSubscribe(customerID, clientID, topicFilter, qos)` | `SUBSCRIBE` | |
 | `RecordUnsubscribe(customerID, clientID, topicFilter)` | `UNSUBSCRIBE` | |
-| `RecordConnect(customerID, clientID)` | `CONNECT` | |
-| `RecordDisconnect(customerID, clientID)` | `DISCONNECT` | |
+| `RecordConnect(customerID, clientID)` | `CONNECT` | `mqttTopic` is set to `$SYS/clients/<clientID>/connected` (the ingestor requires a topic). |
+| `RecordDisconnect(customerID, clientID)` | `DISCONNECT` | `mqttTopic` is set to `$SYS/clients/<clientID>/disconnected`. |
 
 Every event carries `mqttQos` (0/1/2) and `mqttRetained`, so descriptor filter conditions can tier on them (e.g. charge only QoS ≥ 1, premium for retained).
 

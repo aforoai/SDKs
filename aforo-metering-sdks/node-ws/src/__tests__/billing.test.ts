@@ -28,7 +28,7 @@ const config = () => ({
   tenantId: 'tenant-001',
   productId: 'prod-ws-001',
   apiKey: 'sk_ws_abc',
-  ingestorUrl: 'https://ingestor.aforo.ai',
+  ingestorUrl: 'https://usage-ingestor.aforo.ai',
 });
 
 // A tiny WebSocket stub that matches the SDK's MinimalWs surface.
@@ -104,7 +104,8 @@ describe('trackConnection — default (OPEN + CLOSE only)', () => {
     expect(ev.wsCloseReason).toBe('NORMAL_CLOSURE');
     expect(ev.messageCount).toBe(4);             // 2 in + 2 out
     expect(ev.dataBytes).toBe(3 + 4 + 5 + 2);    // 14
-    expect(ev.durationMs).toBeGreaterThanOrEqual(0);
+    expect(ev.executionDurationMs).toBeGreaterThanOrEqual(0);
+    expect(ev.durationMs).toBeUndefined();
     expect(ev.metadata.sentCount).toBe(2);
     expect(ev.metadata.recvCount).toBe(2);
     expect(ev.metadata.sentBytes).toBe(7);
@@ -255,5 +256,59 @@ describe('event shape', () => {
     const msgEv = all.find((e: any) => e.wsFrameType === 'TEXT');
     expect(closeEv.metricName).toBe('websocket_api.connection_closed');
     expect(msgEv.metricName).toBe('websocket_api.message');
+  });
+});
+
+function assertBatchContract(reqs: Array<{ url: string; init: RequestInit; body: any }>, apiKey: string, allowed: string[]) {
+  const allowedSet = new Set(allowed);
+  expect(reqs.length).toBeGreaterThan(0);
+  for (const r of reqs) {
+    expect(r.url).toBe('https://usage-ingestor.aforo.ai/v1/ingest/batch');
+    expect((r.init.headers as Record<string, string>)['X-API-Key']).toBe(apiKey);
+    expect(Object.keys(r.body)).toEqual(['events']);
+    expect(r.body.events.length).toBeGreaterThan(0);
+    expect(r.body.events.length).toBeLessThanOrEqual(1000);
+    for (const e of r.body.events) {
+      for (const k of Object.keys(e)) expect(allowedSet.has(k) ? k : `unexpected field ${k}`).toBe(k);
+      expect(JSON.stringify(e)).not.toContain(apiKey);
+      for (const k of ['customerId', 'metricName', 'occurredAt', 'idempotencyKey']) {
+        expect(typeof e[k]).toBe('string');
+        expect(e[k].trim()).not.toBe('');
+      }
+      expect(e.quantity).toBeGreaterThan(0);
+    }
+  }
+}
+
+describe('ingest batch contract', () => {
+  const FIELDS = ['customerId', 'metricName', 'quantity', 'occurredAt', 'idempotencyKey', 'productType', 'metadata', 'wsConnectionId', 'wsDirection', 'wsFrameType',
+    'wsCloseReason', 'messageCount', 'dataBytes', 'executionDurationMs'];
+
+  test('events carry only IngestUsageEventRequest fields', async () => {
+    const billing = new AforoWsBilling({ ...config(), flushCount: 100, perFrameEvents: true });
+    const ws = new FakeWs();
+    billing.trackConnection(ws as any, { customerId: 'cust_001' });
+    ws.emit('message', 'hi', false);
+    ws.send(Buffer.from('yo'));
+    ws.emit('close', 1006);
+    await billing.shutdown();
+    assertBatchContract(capturedRequests, 'sk_ws_abc', FIELDS);
+  });
+
+  test('>1000 buffered events are split into requests of <=1000', async () => {
+    const billing = new AforoWsBilling({ ...config(), flushCount: 5000, perFrameEvents: true });
+    const ws = new FakeWs();
+    billing.trackConnection(ws as any, { customerId: 'cust_001' }); // 1 OPEN event
+    for (let i = 0; i < 2499; i++) ws.emit('message', 'm', false);
+    await billing.shutdown();
+    expect(capturedRequests.map((r) => r.body.events.length)).toEqual([1000, 1000, 500]);
+    assertBatchContract(capturedRequests, 'sk_ws_abc', FIELDS);
+  });
+
+  test('blank customerId is not metered', async () => {
+    const billing = new AforoWsBilling({ ...config(), flushCount: 1 });
+    billing.trackConnection(new FakeWs() as any, { customerId: ' ' });
+    await billing.shutdown();
+    expect(capturedRequests).toHaveLength(0);
   });
 });

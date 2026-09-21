@@ -58,7 +58,7 @@ const config = () => ({
   tenantId: 'tenant-001',
   productId: 'prod-001',
   apiKey: 'sk_test_abc',
-  ingestorUrl: 'https://ingestor.aforo.ai/',  // trailing slash on purpose — SDK should strip it
+  ingestorUrl: 'https://usage-ingestor.aforo.ai/',  // trailing slash on purpose — SDK should strip it
   serviceName: 'acme.v1.UserService',
 });
 
@@ -219,7 +219,7 @@ describe('buffering', () => {
 // ── HTTP request shape ───────────────────────────────────────────────────
 
 describe('flush request shape', () => {
-  test('POST to ingestorUrl + /v1/ingest/events with right headers', async () => {
+  test('POST to ingestorUrl + /v1/ingest/batch with right headers', async () => {
     const b = new AforoGrpcBilling({ ...config(), flushCount: 1 });
     const wrapped = b.wrapUnary('M', async () => ({}));
     const { cb } = makeCallback();
@@ -228,11 +228,12 @@ describe('flush request shape', () => {
 
     expect(capturedRequests).toHaveLength(1);
     const req = capturedRequests[0];
-    expect(req.url).toBe('https://ingestor.aforo.ai/v1/ingest/events'); // trailing slash stripped
+    expect(req.url).toBe('https://usage-ingestor.aforo.ai/v1/ingest/batch'); // trailing slash stripped
     expect(req.init.method).toBe('POST');
     const headers = req.init.headers as Record<string, string>;
     expect(headers['Content-Type']).toBe('application/json');
-    expect(headers['Authorization']).toBe('Bearer sk_test_abc');
+    expect(headers['X-API-Key']).toBe('sk_test_abc');
+    expect(headers['Authorization']).toBeUndefined();
     expect(headers['X-Tenant-Id']).toBe('tenant-001');
     await b.shutdown();
   });
@@ -276,6 +277,9 @@ describe('retry on flush failure', () => {
     }
 
     expect(capturedRequests.length).toBe(3);   // 3 attempts
+    // Every retry re-sends the exact same events, idempotencyKeys included.
+    const keysPerAttempt = capturedRequests.map((r) => JSON.stringify(r.body.events.map((e: any) => e.idempotencyKey)));
+    expect(new Set(keysPerAttempt).size).toBe(1);
     expect(onError).toHaveBeenCalledTimes(1);  // dropped
     expect(onError.mock.calls[0][0].message).toMatch(/3 attempts/);
     jest.useRealTimers();
@@ -315,5 +319,67 @@ describe('streaming wrappers — smoke', () => {
     const b = new AforoGrpcBilling(config());
     const wrapped = b.wrapBidiStream('Chat', async () => {});
     expect(typeof wrapped).toBe('function');
+  });
+});
+
+function assertBatchContract(reqs: Array<{ url: string; init: RequestInit; body: any }>, apiKey: string, allowed: string[]) {
+  const allowedSet = new Set(allowed);
+  expect(reqs.length).toBeGreaterThan(0);
+  for (const r of reqs) {
+    expect(r.url).toBe('https://usage-ingestor.aforo.ai/v1/ingest/batch');
+    expect((r.init.headers as Record<string, string>)['X-API-Key']).toBe(apiKey);
+    expect(Object.keys(r.body)).toEqual(['events']);
+    expect(r.body.events.length).toBeGreaterThan(0);
+    expect(r.body.events.length).toBeLessThanOrEqual(1000);
+    for (const e of r.body.events) {
+      for (const k of Object.keys(e)) expect(allowedSet.has(k) ? k : `unexpected field ${k}`).toBe(k);
+      expect(JSON.stringify(e)).not.toContain(apiKey);
+      for (const k of ['customerId', 'metricName', 'occurredAt', 'idempotencyKey']) {
+        expect(typeof e[k]).toBe('string');
+        expect(e[k].trim()).not.toBe('');
+      }
+      expect(e.quantity).toBeGreaterThan(0);
+    }
+  }
+}
+
+describe('ingest batch contract', () => {
+  const FIELDS = ['customerId', 'metricName', 'quantity', 'occurredAt', 'idempotencyKey', 'productType', 'metadata', 'grpcService', 'grpcMethod', 'grpcStatusCode',
+    'grpcCallType', 'messageCount', 'dataBytes', 'executionDurationMs'];
+
+  test('events carry only IngestUsageEventRequest fields', async () => {
+    const b = new AforoGrpcBilling({ ...config(), flushCount: 100 });
+    const { cb } = makeCallback();
+    b.wrapUnary('GetUser', async () => ({}))(makeCall(), cb);
+    b.wrapUnary('Fail', async () => { throw Object.assign(new Error('x'), { code: 5 }); })(makeCall(), cb);
+    await new Promise((r) => setTimeout(r, 20));
+    await b.shutdown();
+    assertBatchContract(capturedRequests, 'sk_test_abc', FIELDS);
+    const failed = capturedRequests[0].body.events.find((e: any) => e.grpcMethod === 'Fail');
+    expect(failed.grpcStatusCode).toBe('NOT_FOUND');
+  });
+
+  test('>1000 buffered events are split into requests of <=1000', async () => {
+    const b = new AforoGrpcBilling({ ...config(), flushCount: 5000 });
+    const wrapped = b.wrapUnary('M', async () => ({}));
+    const { cb } = makeCallback();
+    for (let i = 0; i < 2500; i++) wrapped(makeCall(), cb);
+    await new Promise((r) => setTimeout(r, 50));
+    await b.shutdown();
+    expect(capturedRequests.map((r) => r.body.events.length)).toEqual([1000, 1000, 500]);
+    assertBatchContract(capturedRequests, 'sk_test_abc', FIELDS);
+  });
+
+  test('blank or over-long customerId is not metered', async () => {
+    const onError = jest.fn();
+    const b = new AforoGrpcBilling({ ...config(), flushCount: 100, onError });
+    const wrapped = b.wrapUnary('M', async () => ({}));
+    const { cb } = makeCallback();
+    wrapped(makeCall({ 'x-customer-id': '   ' }), cb);
+    wrapped(makeCall({ 'x-customer-id': 'c'.repeat(65) }), cb);
+    await new Promise((r) => setTimeout(r, 20));
+    await b.shutdown();
+    expect(capturedRequests).toHaveLength(0);
+    expect(onError).toHaveBeenCalledTimes(1);
   });
 });

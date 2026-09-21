@@ -51,7 +51,7 @@ def cfg():
         tenant_id="tenant-001",
         product_id="prod-mqtt-001",
         api_key="sk_mqtt_abc",
-        ingestor_url="https://ingestor.aforo.ai",
+        ingestor_url="https://usage-ingestor.aforo.ai",
     )
 
 

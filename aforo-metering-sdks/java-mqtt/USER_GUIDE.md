@@ -46,12 +46,12 @@ AforoMqttBilling billing = AforoMqttBilling.newBuilder()
         .tenantId("tenant_acme")
         .productId("prod_mqtt_iot_telemetry")
         .apiKey(System.getenv("AFORO_API_KEY"))
-        .ingestorUrl("https://ingest.aforo.ai")
+        .ingestorUrl("https://usage-ingestor.aforo.ai")
         // .emitDeliverEvents(true)   // opt in to bill inbound DELIVER too
         .build();
 ```
 
-> ⚠ `ingestorUrl` is the host only — the SDK appends `/v1/ingest/events`. Pass `https://ingest.aforo.ai`, not the full path.
+> ⚠ `ingestorUrl` is the host only — the SDK appends `/v1/ingest/batch`. Pass `https://usage-ingestor.aforo.ai`, not the full path.
 
 ## Step 4 — Report each MQTT primitive
 
@@ -106,8 +106,8 @@ Runtime.getRuntime().addShutdownHook(new Thread(billing::close));
 |---|---|---|---|
 | `tenantId` | `String` | *(required)* | `X-Tenant-Id` header. |
 | `productId` | `String` | *(required)* | `metadata.productId`. |
-| `apiKey` | `String` | *(required)* | Bearer token. |
-| `ingestorUrl` | `String` | *(required)* | Host; SDK appends `/v1/ingest/events`. |
+| `apiKey` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
+| `ingestorUrl` | `String` | *(required)* | Host; SDK appends `/v1/ingest/batch`. |
 | `emitDeliverEvents` | `boolean` | `false` | `true` = emit `DELIVER` events for inbound messages. |
 | `flushCount` | `int` | `200` | Events per immediate flush. |
 | `flushIntervalMs` | `long` | `2000` | Background flush cadence (ms). |
@@ -119,7 +119,7 @@ Runtime.getRuntime().addShutdownHook(new Thread(billing::close));
 | `IllegalArgumentException: <field> is required` at build | A required builder field (`tenantId` / `productId` / `apiKey` / `ingestorUrl`) is blank | Set all four; they're validated in the constructor. |
 | Inbound messages not metered | `DELIVER` is off by default | Build with `.emitDeliverEvents(true)` if you bill on receipt. |
 | `metricName` is `mqtt_broker.<x>` not what you expected | The metric name is derived as `mqtt_broker.<eventType-lowercased>` | Define metrics in Aforo matching `mqtt_broker.publish`, `mqtt_broker.subscribe`, etc. |
-| Events POST to a 404 | `ingestorUrl` already includes the path | Pass the host only; the SDK appends `/v1/ingest/events`. |
+| Events POST to a 404 | `ingestorUrl` already includes the path | Pass the host only; the SDK appends `/v1/ingest/batch`. |
 | `flush exhausted retries — dropped N events` in logs | Ingestor returned non-2xx on all 3 attempts | Verify the key + `X-Tenant-Id`; ensure the `mqtt_broker.*` metrics exist in Aforo. |
 | Want to bill differently by QoS / retain | Filtering happens in the Aforo rate plan, not the SDK | Use descriptor `filterCondition` on `mqtt_qos` / `mqtt_retained` (every event carries both). |
 

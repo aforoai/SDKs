@@ -52,7 +52,7 @@ result = client.flush()        # FlushResult(sent=..., failed=...)
 client.shutdown()
 ```
 
-Events POST to `https://ingest.aforo.ai/v1/ingest/batch` with `Authorization: Bearer <api_key>`. The client appends `/v1/ingest/batch` to `base_url`, so set `base_url` to the host only.
+Events POST to `https://usage-ingestor.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>`. The client appends `/v1/ingest/batch` to `base_url`, so set `base_url` to the host only.
 
 > Tenant scope comes from the API key — there is no `tenant_id` argument on this SDK. `customer_id` is the entity you bill within that tenant. Never feed `customer_id` from a client-settable request header you don't trust.
 
@@ -62,8 +62,8 @@ Pass these as keyword args to `AforoClient(...)`, or build an `AforoOptions` and
 
 | Option | Type | Default | What it does |
 |---|---|---|---|
-| `api_key` | `str` | — (required) | Bearer token sent on every batch. |
-| `base_url` | `str` | `https://ingest.aforo.ai` | Ingestor host. `/v1/ingest/batch` is appended automatically. |
+| `api_key` | `str` | — (required) | Aforo API key, sent as `X-API-Key` on every batch. |
+| `base_url` | `str` | `https://usage-ingestor.aforo.ai` | Ingestor host. `/v1/ingest/batch` is appended automatically. |
 | `flush_count` | `int` | `50` | Buffered events that trigger a flush. Also the max batch size per request. |
 | `flush_interval` | `float` | `5.0` | Seconds between background timer flushes. |
 | `max_queue_size` | `int` | `10000` | Ring-buffer capacity. On overflow the **oldest** event is dropped. |
@@ -76,20 +76,27 @@ Retry rules, fixed in the transport and not configurable beyond the values above
 
 ### Framework middleware
 
-Each adapter constructs its own `AforoClient` and emits one event per request. Customer ID is read from `X-Customer-Id` (falling back to `X-Api-Key`); a request with no resolvable customer ID is **not** metered.
+Each adapter constructs its own `AforoClient` and emits one event per request.
+
+- **Metric:** `metric_name` — a fixed name or a callable; default `"api_calls"` (`aforo.DEFAULT_METRIC_NAME`). The metric must exist in your tenant's Aforo catalog: the ingestor rejects an unknown metric, and because it validates a batch as a whole, one rejected event fails every event in that batch.
+- **Customer:** `customer_id` — a fixed id or a callable; default is the `X-Customer-Id` header (Django tries `request.user.id` first). The caller's `X-Api-Key` is never used — it is a secret, not a customer id. A request with no resolvable customer ID is **not** metered.
+- **CORS preflights** (`OPTIONS`) are never metered.
 
 ```python
-# FastAPI / Starlette
+# FastAPI / Starlette -- callables receive the ASGI scope
 from aforo.middleware.fastapi import AforoMeteringMiddleware
-app.add_middleware(AforoMeteringMiddleware, api_key=os.environ["AFORO_API_KEY"])
+app.add_middleware(AforoMeteringMiddleware, api_key=os.environ["AFORO_API_KEY"],
+                   metric_name="api_calls")
 
-# Flask
+# Flask -- metric_name(request, response), customer_id(request); or AFORO_METRIC_NAME / AFORO_CUSTOMER_ID config
 from aforo.middleware.flask import AforoMetering
-AforoMetering(app, api_key=os.environ["AFORO_API_KEY"])
+AforoMetering(app, api_key=os.environ["AFORO_API_KEY"], metric_name="api_calls",
+              customer_id=lambda req: req.headers.get("X-Customer-Id"))
 
-# Django settings.py
+# Django settings.py -- AFORO_METRIC_NAME: str or callable(request, response); AFORO_CUSTOMER_ID: str or callable(request)
 MIDDLEWARE = [..., "aforo.middleware.django.AforoMeteringMiddleware"]
 AFORO_API_KEY = os.environ["AFORO_API_KEY"]
+AFORO_METRIC_NAME = "api_calls"
 ```
 
 `MiddlewareOptions` adds `metric_name`, `quantity`, `customer_id`, `metadata` (callables or constants), plus `exclude_paths` and `exclude_status_codes`. See the [user guide](USER_GUIDE.md#configuration-reference) for the full table.

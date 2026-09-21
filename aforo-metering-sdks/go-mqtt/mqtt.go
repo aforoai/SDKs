@@ -63,7 +63,7 @@ func New(cfg Config) (*Billing, error) {
 	}
 	b := &Billing{
 		cfg:    cfg,
-		url:    strings.TrimRight(cfg.IngestorURL, "/") + "/v1/ingest/events",
+		url:    strings.TrimRight(cfg.IngestorURL, "/") + "/v1/ingest/batch",
 		client: cfg.HTTPClient,
 		stop:   make(chan struct{}),
 	}
@@ -105,16 +105,30 @@ func (b *Billing) eventOf(customerID, clientID, eventType, topic string, qos int
 	if customerID == "" {
 		return nil
 	}
+	if len(customerID) > 64 {
+		b.cfg.OnError(fmt.Errorf("mqttmetering: customerId longer than 64 chars, event dropped"))
+		return nil
+	}
+	if topic == "" {
+		switch eventType {
+		case "CONNECT", "DISCONNECT":
+			// mqttTopic is required for MQTT_BROKER events; session events have
+			// no topic, so use the broker-style $SYS client topic.
+			topic = fmt.Sprintf("$SYS/clients/%s/%s", clientID, strings.ToLower(eventType)+"ed")
+		default:
+			b.cfg.OnError(fmt.Errorf("mqttmetering: empty topic on %s, event dropped", eventType))
+			return nil
+		}
+	}
 	now := time.Now().UTC()
-	return map[string]any{
+	e := map[string]any{
 		"customerId":     customerID,
 		"metricName":     "mqtt_broker." + strings.ToLower(eventType),
 		"quantity":       1,
 		"occurredAt":     now.Format(time.RFC3339Nano),
-		"idempotencyKey": fmt.Sprintf("mqtt:%s:%s:%s:%s:%d:%s", b.cfg.TenantID, clientID, eventType, topic, now.UnixMilli(), randomSuffix()),
+		"idempotencyKey": capKey(fmt.Sprintf("mqtt:%s:%s:%s:%s:%d:%s", b.cfg.TenantID, clientID, eventType, topic, now.UnixMilli(), randomSuffix())),
 		"productType":    "MQTT_BROKER",
 		"mqttTopic":      topic,
-		"mqttQos":        qos,
 		"mqttRetained":   retained,
 		"mqttEventType":  eventType,
 		"mqttClientId":   clientID,
@@ -124,6 +138,12 @@ func (b *Billing) eventOf(customerID, clientID, eventType, topic string, qos int
 			"productId":  b.cfg.ProductID,
 		},
 	}
+	// mqttQos must be 0, 1 or 2; omit anything else instead of having the
+	// ingestor reject the event.
+	if qos >= 0 && qos <= 2 {
+		e["mqttQos"] = qos
+	}
+	return e
 }
 
 func (b *Billing) push(event map[string]any) {
@@ -154,6 +174,9 @@ func (b *Billing) flushLoop() {
 	}
 }
 
+// maxBatchSize is the ingestor's per-request cap on POST /v1/ingest/batch.
+const maxBatchSize = 1000
+
 func (b *Billing) flush() {
 	b.mu.Lock()
 	if len(b.buffer) == 0 {
@@ -164,7 +187,19 @@ func (b *Billing) flush() {
 	b.buffer = nil
 	b.mu.Unlock()
 
-	body, err := json.Marshal(map[string]any{"events": batch})
+	for start := 0; start < len(batch); start += maxBatchSize {
+		end := start + maxBatchSize
+		if end > len(batch) {
+			end = len(batch)
+		}
+		b.send(batch[start:end])
+	}
+}
+
+// send POSTs one chunk of at most maxBatchSize events. The body is marshalled
+// once, so every retry carries the same idempotencyKeys.
+func (b *Billing) send(chunk []map[string]any) {
+	body, err := json.Marshal(map[string]any{"events": chunk})
 	if err != nil {
 		b.cfg.OnError(err)
 		return
@@ -172,7 +207,7 @@ func (b *Billing) flush() {
 	for attempt := 1; attempt <= 3; attempt++ {
 		req, _ := http.NewRequest(http.MethodPost, b.url, bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+b.cfg.APIKey)
+		req.Header.Set("X-API-Key", b.cfg.APIKey)
 		req.Header.Set("X-Tenant-Id", b.cfg.TenantID)
 		resp, err := b.client.Do(req)
 		if err == nil {
@@ -185,15 +220,26 @@ func (b *Billing) flush() {
 			b.cfg.OnError(err)
 			return
 		}
-		time.Sleep(time.Duration(1<<(attempt-1)) * time.Second)
+		if attempt < 3 {
+			time.Sleep(time.Duration(1<<(attempt-1)) * time.Second)
+		}
 	}
-	b.cfg.OnError(fmt.Errorf("mqttmetering: flush exhausted retries (dropped %d events)", len(batch)))
+	b.cfg.OnError(fmt.Errorf("mqttmetering: flush exhausted retries (dropped %d events)", len(chunk)))
 }
 
 func (b *Billing) Shutdown() error {
 	close(b.stop)
 	b.wg.Wait()
 	return nil
+}
+
+// capKey keeps idempotency keys within the ingestor's 255-char limit (topics
+// can be up to 500 chars). The unique tail (millis + random suffix) is kept.
+func capKey(k string) string {
+	if len(k) > 255 {
+		return k[len(k)-255:]
+	}
+	return k
 }
 
 var alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"

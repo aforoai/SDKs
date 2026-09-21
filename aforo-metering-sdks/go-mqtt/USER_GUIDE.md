@@ -12,7 +12,7 @@ A Go MQTT client that emits one Aforo billing event per MQTT action — `CONNECT
 - An MQTT client library (e.g. `github.com/eclipse/paho.mqtt.golang`).
 - An Aforo API key (`AFORO_API_KEY`), a `tenant_id`, and a `product_id`. All three are SDK config — never read from a client header.
 - A customer id and a client id per device/session — you pass both to the `Record*` methods.
-- Ingestor base URL — `https://ingest.aforo.ai`.
+- Ingestor base URL — `https://usage-ingestor.aforo.ai`.
 
 ## Step 1 — Add the module from source
 
@@ -49,7 +49,7 @@ billing, err := mqttmetering.New(mqttmetering.Config{
 	TenantID:    "tenant_acme",
 	ProductID:   "prod_mqtt_iot_telemetry",
 	APIKey:      os.Getenv("AFORO_API_KEY"),
-	IngestorURL: "https://ingest.aforo.ai",
+	IngestorURL: "https://usage-ingestor.aforo.ai",
 })
 if err != nil {
 	log.Fatal(err) // returned when any required field is empty
@@ -99,7 +99,7 @@ billing, _ := mqttmetering.New(mqttmetering.Config{
 	TenantID:          "tenant_acme",
 	ProductID:         "prod_mqtt_iot_telemetry",
 	APIKey:            os.Getenv("AFORO_API_KEY"),
-	IngestorURL:       "https://ingest.aforo.ai",
+	IngestorURL:       "https://usage-ingestor.aforo.ai",
 	EmitDeliverEvents: true, // now RecordDeliver emits
 })
 
@@ -119,8 +119,8 @@ The buffer flushes every `FlushInterval` (2s) or when it reaches `FlushCount` (2
 The metric name is `mqtt_broker.<lowercased event type>` (e.g. `mqtt_broker.publish`). The wire call the SDK makes:
 
 ```
-POST https://ingest.aforo.ai/v1/ingest/events
-Authorization: Bearer <AFORO_API_KEY>
+POST https://usage-ingestor.aforo.ai/v1/ingest/batch
+X-API-Key: <AFORO_API_KEY>
 X-Tenant-Id: tenant_acme
 Content-Type: application/json
 
@@ -135,8 +135,8 @@ Content-Type: application/json
 |---|---|---|---|
 | `TenantID` | `string` | — (required) | `X-Tenant-Id` header + idempotency-key component. |
 | `ProductID` | `string` | — (required) | Event metadata + idempotency-key component. |
-| `APIKey` | `string` | — (required) | `Authorization: Bearer <APIKey>`. |
-| `IngestorURL` | `string` | — (required) | Base; `/v1/ingest/events` is appended. |
+| `APIKey` | `string` | — (required) | `X-API-Key: <APIKey>`. |
+| `IngestorURL` | `string` | — (required) | Base; `/v1/ingest/batch` is appended. |
 | `EmitDeliverEvents` | `bool` | `false` | Whether `RecordDeliver` emits. |
 | `FlushCount` | `int` | `200` | Buffer-size flush threshold. |
 | `FlushInterval` | `time.Duration` | `2s` | Background flush cadence. |

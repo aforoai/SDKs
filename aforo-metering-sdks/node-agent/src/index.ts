@@ -15,6 +15,7 @@
  *     tenantId: 'tenant_xxx',
  *     productId: 'prod_xxx',
  *     apiKey: process.env.AFORO_API_KEY!,
+ *     customerId: 'cust_xxx', // or per session via startSession({ customerId })
  *   });
  *
  *   const session = await agent.startSession({
@@ -64,8 +65,16 @@ export interface AforoAgentConfig {
   productId: string;
   apiKey: string;
   /**
-   * Aforo usage-ingestor URL. Defaults to {@code https://usage-ingestor.aforo.ai/v1/ingest}
-   * — override for local dev or air-gapped deployments.
+   * Aforo customer the agent's usage is billed to. Can be overridden (or
+   * supplied only) per session via {@link StartSessionOptions.customerId};
+   * one of the two is required.
+   */
+  customerId?: string;
+  /**
+   * Aforo usage-ingestor batch URL. Defaults to
+   * {@code https://usage-ingestor.aforo.ai/v1/ingest/batch} — override for
+   * local dev or air-gapped deployments. A URL ending in {@code /v1/ingest}
+   * (the old default) is rewritten to {@code /v1/ingest/batch}.
    */
   ingestorUrl?: string;
   /**
@@ -85,8 +94,12 @@ export interface AforoAgentConfig {
 
 export interface StartSessionOptions {
   agentId: string;
+  /** Aforo customer to bill for this run. Defaults to the client's {@code customerId}. */
+  customerId?: string;
   /** Customer-side identifier for the run (defaults to a generated UUID). */
   sessionId?: string;
+  /** Distributed-trace id for the run. Defaults to the sessionId. */
+  traceId?: string;
   framework?: AgentFramework;
   modelProvider?: ModelProvider;
   modelName?: string;
@@ -101,6 +114,8 @@ export interface RecordStepOptions {
   outputTokens?: number;
   durationMs?: number;
   executionStatus?: ExecutionStatus;
+  /** Id of the step that spawned this one (sub-agent / nested tool call). */
+  parentStepId?: string;
   metadata?: Record<string, unknown>;
 }
 
@@ -110,20 +125,51 @@ export interface EndSessionOptions {
   metadata?: Record<string, unknown>;
 }
 
-interface UsageEvent {
-  tenantId: string;
-  productId: string;
-  apiKey: string;
+/**
+ * Input to {@link AforoAgent.emitEvent}. {@code properties} keys that have a
+ * first-class ingest field (capabilityName, executionStatus, durationMs,
+ * stepIndex, parentStepId) are promoted to it; everything else lands in the
+ * event's {@code metadata}.
+ */
+export interface AgentEventInput {
   eventType: string;
   metricKey: string;
   value: number;
   agentId: string;
   sessionId: string;
   properties: Record<string, unknown>;
-  timestamp: string;
+  /** Defaults to the client's {@code customerId}. */
+  customerId?: string;
+  /** Defaults to the sessionId. */
+  traceId?: string;
 }
 
-const DEFAULT_INGESTOR = 'https://usage-ingestor.aforo.ai/v1/ingest';
+/** One event in a {@code POST /v1/ingest/batch} body (usage-ingestor IngestUsageEventRequest). */
+interface IngestEvent {
+  customerId: string;
+  metricName: string;
+  quantity: number;
+  occurredAt: string;
+  idempotencyKey: string;
+  productType: 'AI_AGENT';
+  agentId: string;
+  sessionId: string;
+  traceId: string;
+  stepNumber?: number;
+  parentStepId?: string;
+  capabilityName?: string;
+  executionStatus?: 'SUCCESS' | 'ERROR' | 'TIMEOUT';
+  executionDurationMs?: number;
+  metadata: Record<string, unknown>;
+}
+
+const DEFAULT_INGESTOR = 'https://usage-ingestor.aforo.ai/v1/ingest/batch';
+/** The ingestor rejects batches over 1000 events. */
+const MAX_BATCH_EVENTS = 1000;
+/** executionStatus values the ingestor accepts; others ride in metadata.agentExecutionStatus. */
+const INGEST_EXECUTION_STATUSES = new Set(['SUCCESS', 'ERROR', 'TIMEOUT']);
+
+let eventSeq = 0;
 
 /**
  * Generate a UUID v4 without depending on Node's crypto module so the SDK
@@ -149,6 +195,8 @@ export class AgentSession {
       readonly agentId: string,
       readonly sessionId: string,
       private readonly meta: Record<string, unknown>,
+      readonly customerId?: string,
+      readonly traceId?: string,
   ) {}
 
   /**
@@ -163,6 +211,8 @@ export class AgentSession {
       value: 1,
       agentId: this.agentId,
       sessionId: this.sessionId,
+      customerId: this.customerId,
+      traceId: this.traceId,
       properties: {
         stepKind: options.stepKind,
         stepIndex: this.stepCount,
@@ -170,7 +220,8 @@ export class AgentSession {
         executionStatus: options.executionStatus || 'SUCCESS',
         inputTokens: options.inputTokens || 0,
         outputTokens: options.outputTokens || 0,
-        durationMs: options.durationMs || 0,
+        durationMs: options.durationMs,
+        parentStepId: options.parentStepId,
         ...this.meta,
         ...(options.metadata || {}),
       },
@@ -182,6 +233,8 @@ export class AgentSession {
         value: (options.inputTokens || 0) + (options.outputTokens || 0),
         agentId: this.agentId,
         sessionId: this.sessionId,
+        customerId: this.customerId,
+        traceId: this.traceId,
         properties: {
           inputTokens: options.inputTokens || 0,
           outputTokens: options.outputTokens || 0,
@@ -216,6 +269,8 @@ export class AgentSession {
       value: 1,
       agentId: this.agentId,
       sessionId: this.sessionId,
+      customerId: this.customerId,
+      traceId: this.traceId,
       properties: {
         stepCount: this.stepCount,
         taskCompleted: options.taskCompleted,
@@ -233,7 +288,7 @@ export class AgentSession {
  * One instance per process is enough — sessions share the same flush queue.
  */
 export class AforoAgent {
-  private readonly buffer: UsageEvent[] = [];
+  private readonly buffer: IngestEvent[] = [];
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly fetchImpl: typeof fetch;
 
@@ -251,6 +306,14 @@ export class AforoAgent {
   /** Open a new session. Returns a session handle for emitting per-step events. */
   async startSession(options: StartSessionOptions): Promise<AgentSession> {
     const sessionId = options.sessionId || genId();
+    const customerId = options.customerId || this.config.customerId;
+    if (!customerId || !customerId.trim()) {
+      throw new Error('AforoAgent: customerId is required (config.customerId or startSession({ customerId }))');
+    }
+    if (!options.agentId || !options.agentId.trim()) {
+      throw new Error('AforoAgent: agentId is required');
+    }
+    const traceId = options.traceId || sessionId;
     const meta: Record<string, unknown> = {
       framework: options.framework || 'CUSTOM',
       modelProvider: options.modelProvider,
@@ -263,9 +326,11 @@ export class AforoAgent {
       value: 1,
       agentId: options.agentId,
       sessionId,
+      customerId,
+      traceId,
       properties: { ...meta },
     });
-    return new AgentSession(this, options.agentId, sessionId, meta);
+    return new AgentSession(this, options.agentId, sessionId, meta, customerId, traceId);
   }
 
   /**
@@ -273,13 +338,41 @@ export class AforoAgent {
    * but stable enough to be used directly when an agent framework already
    * has its own lifecycle hooks and just wants to plug in a metering tap.
    */
-  async emitEvent(partial: Omit<UsageEvent, 'tenantId' | 'productId' | 'apiKey' | 'timestamp'>): Promise<void> {
-    const event: UsageEvent = {
-      tenantId: this.config.tenantId,
-      productId: this.config.productId,
-      apiKey: this.config.apiKey,
-      timestamp: new Date().toISOString(),
-      ...partial,
+  async emitEvent(partial: AgentEventInput): Promise<void> {
+    const customerId = partial.customerId || this.config.customerId;
+    if (!customerId || !customerId.trim()) {
+      throw new Error('AforoAgent: customerId is required (config.customerId or emitEvent({ customerId }))');
+    }
+    // Promote properties that have a first-class ingest field; the rest is metadata.
+    const {
+      capabilityName, executionStatus, durationMs, stepIndex, parentStepId, ...rest
+    } = partial.properties || {};
+    const status = typeof executionStatus === 'string' ? executionStatus.toUpperCase() : undefined;
+    const now = new Date();
+    const event: IngestEvent = {
+      customerId,
+      metricName: partial.metricKey,
+      quantity: partial.value,
+      occurredAt: now.toISOString(),
+      // Minted once here and never regenerated, so a replayed event dedupes.
+      idempotencyKey: `agent:${partial.sessionId}:${partial.eventType}:${now.getTime().toString(36)}:${(eventSeq++).toString(36)}:${Math.random().toString(36).substring(2, 10)}`.slice(-255),
+      productType: 'AI_AGENT',
+      agentId: partial.agentId,
+      sessionId: partial.sessionId,
+      traceId: partial.traceId || partial.sessionId,
+      stepNumber: typeof stepIndex === 'number' ? stepIndex : undefined,
+      parentStepId: typeof parentStepId === 'string' ? parentStepId.slice(0, 64) : undefined,
+      capabilityName: typeof capabilityName === 'string' ? capabilityName.slice(0, 64) : undefined,
+      executionStatus: status && INGEST_EXECUTION_STATUSES.has(status)
+        ? status as IngestEvent['executionStatus'] : undefined,
+      executionDurationMs: typeof durationMs === 'number' ? Math.round(durationMs) : undefined,
+      metadata: {
+        ...rest,
+        eventType: partial.eventType,
+        productId: this.config.productId,
+        // CANCELLED / HITL_REQUIRED have no ingest enum value — keep them visible here.
+        ...(status && !INGEST_EXECUTION_STATUSES.has(status) ? { agentExecutionStatus: status } : {}),
+      },
     };
     this.buffer.push(event);
     if (this.buffer.length >= (this.config.flushBatchSize || 50)) {
@@ -305,13 +398,19 @@ export class AforoAgent {
       this.flushTimer = null;
     }
     if (this.buffer.length === 0) return;
-    const batch = this.buffer.splice(0, this.buffer.length);
-    const url = this.config.ingestorUrl || DEFAULT_INGESTOR;
+    const pending = this.buffer.splice(0, this.buffer.length);
+    const url = (this.config.ingestorUrl || DEFAULT_INGESTOR).replace(/\/v1\/ingest\/?$/, '/v1/ingest/batch');
+    for (let i = 0; i < pending.length; i += MAX_BATCH_EVENTS) {
+      await this.send(url, pending.slice(i, i + MAX_BATCH_EVENTS));
+    }
+  }
+
+  private async send(url: string, batch: IngestEvent[]): Promise<void> {
     try {
       const res = await this.fetchImpl(url, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${this.config.apiKey}`,
+          'X-API-Key': this.config.apiKey,
           'Content-Type': 'application/json',
           'X-Tenant-Id': this.config.tenantId,
         },

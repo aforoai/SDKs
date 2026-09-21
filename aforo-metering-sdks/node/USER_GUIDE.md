@@ -54,12 +54,14 @@ import { expressMiddleware } from '@aforo/metering/middleware/express';
 app.use(expressMiddleware({
   apiKey: process.env.AFORO_API_KEY!,
   customerId: (req) => req.user?.id ?? null,   // null => this request is skipped
-  // metricName defaults to "<METHOD> <normalized-path>", e.g. "GET /users/:id"
+  metricName: 'api_calls',                      // default; or (req, res) => string. Must exist in your Aforo catalog
   excludePaths: ['/health', '/metrics'],        // these are the defaults
 }));
 ```
 
-> The middleware fires on `res.on('finish')` — after the response is flushed to the client — so it adds no latency. If `customerId` resolves to `null`/falsy, the request is silently not metered (no error thrown into your app).
+> The middleware fires on `res.on('finish')` — after the response is flushed to the client — so it adds no latency. If `customerId` resolves to `null`/falsy, the request is silently not metered (no error thrown into your app). The default resolver uses `req.user.id` / `req.user.sub`, then `X-Customer-Id` — never the caller's `X-Api-Key`, which is a secret. `OPTIONS` (CORS preflight) requests are never metered.
+>
+> ⚠ The ingestor rejects any `metricName` not in your catalog, and one rejected event fails the whole batch. Earlier versions defaulted to `"<METHOD> <normalized-path>"` (e.g. `GET /users/:id`), which no catalog contains; the default is now `api_calls`.
 
 Fastify (`fastifyPlugin`) and Koa (`koaMiddleware`) imports follow the same shape under `@aforo/metering/middleware/fastify` and `/middleware/koa`.
 
@@ -84,7 +86,7 @@ See the full `AforoOptions` and `TrackEvent` tables in the [README](README.md#co
 | Symptom | Cause | Fix |
 |---|---|---|
 | Events never appear in Aforo | Process exited before a flush | Call `await aforo.shutdown()` on your shutdown path (Step 5). |
-| `401 Unauthorized` in logs | Bad/missing API key | Check `AFORO_API_KEY`; the key is sent as `Authorization: Bearer`. |
+| `401 Unauthorized` in logs | Bad/missing API key | Check `AFORO_API_KEY`; the key is sent as `X-API-Key`. |
 | Middleware meters nothing | `customerId` resolver returns `null` for every request | Return a real id; confirm `req.user` is populated before the middleware runs. |
 | Events accepted but don't bill | `metricName` isn't defined/mapped in Aforo | Define the metric (billable unit) in the console and map it to a rate plan. |
 | Some events silently dropped under load | Ring buffer overflowed (`maxQueueSize`) | Raise `maxQueueSize`, or lower `flushInterval`/`flushCount` to drain faster. |

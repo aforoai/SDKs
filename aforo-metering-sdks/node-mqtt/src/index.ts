@@ -20,7 +20,7 @@
  *     tenantId: 'tenant_acme',
  *     productId: 'prod_mqtt_telemetry',
  *     apiKey: process.env.AFORO_API_KEY!,
- *     ingestorUrl: 'https://ingestor.aforo.ai',
+ *     ingestorUrl: 'https://usage-ingestor.aforo.ai',
  *   });
  *
  *   const broker = aedes();
@@ -59,6 +59,22 @@ export interface MqttClientOptions {
 }
 
 const SDK_VERSION = '1.0.0';
+/**
+ * mqttTopic is required on every MQTT_BROKER event, but CONNECT / DISCONNECT
+ * have no topic. These per-client `$SYS/clients/<id>/connected|disconnected`
+ * topics stand in for them (`$SYS/` is reserved for the broker by the MQTT
+ * spec, so they can never collide with a client topic). Same topics as the
+ * Python, Go and Java SDKs.
+ */
+export const mqttConnectTopic = (clientId: string): string =>
+  `$SYS/clients/${clientId || 'unknown'}/connected`;
+export const mqttDisconnectTopic = (clientId: string): string =>
+  `$SYS/clients/${clientId || 'unknown'}/disconnected`;
+/** The ingestor rejects batch requests with more than 1000 events. */
+const MAX_BATCH_EVENTS = 1000;
+/** usage-ingestor limits (IngestUsageEventRequest). */
+const MAX_CUSTOMER_ID = 64;
+const MAX_IDEMPOTENCY_KEY = 255;
 
 type MqttEventType = 'PUBLISH' | 'DELIVER' | 'SUBSCRIBE' | 'UNSUBSCRIBE' | 'CONNECT' | 'DISCONNECT';
 
@@ -194,7 +210,7 @@ export class AforoMqttBilling {
       if (!customerId) return;
       this.push({
         customerId,
-        mqttTopic: '', // no topic on CONNECT — kept empty for ClickHouse default
+        mqttTopic: mqttConnectTopic(clientId), // CONNECT has no topic; mqttTopic is required
         mqttQos: 0,
         mqttRetained: false,
         mqttEventType: 'CONNECT',
@@ -210,7 +226,7 @@ export class AforoMqttBilling {
       if (!customerId) return;
       this.push({
         customerId,
-        mqttTopic: '',
+        mqttTopic: mqttDisconnectTopic(clientId),
         mqttQos: 0,
         mqttRetained: false,
         mqttEventType: 'DISCONNECT',
@@ -229,7 +245,7 @@ export class AforoMqttBilling {
     client.on('connect', () => {
       this.push({
         customerId: options.customerId,
-        mqttTopic: '',
+        mqttTopic: mqttConnectTopic(clientId),
         mqttQos: 0,
         mqttRetained: false,
         mqttEventType: 'CONNECT',
@@ -241,7 +257,7 @@ export class AforoMqttBilling {
     client.on('close', () => {
       this.push({
         customerId: options.customerId,
-        mqttTopic: '',
+        mqttTopic: mqttDisconnectTopic(clientId),
         mqttQos: 0,
         mqttRetained: false,
         mqttEventType: 'DISCONNECT',
@@ -281,14 +297,26 @@ export class AforoMqttBilling {
 
   private push(partial: Omit<MqttUsageEvent, 'metricName' | 'quantity' | 'occurredAt' | 'idempotencyKey' | 'productType'>): void {
     if (!this.emitDeliverEvents && partial.mqttEventType === 'DELIVER') return;
+    if (!partial.customerId || !partial.customerId.trim()) return;
+    if (partial.customerId.length > MAX_CUSTOMER_ID) {
+      this.onError(new Error(`MQTT metering: customerId longer than ${MAX_CUSTOMER_ID} chars; event dropped`));
+      return;
+    }
+    const mqttTopic = partial.mqttTopic;
+    if (!mqttTopic) return; // mqttTopic is required on every MQTT_BROKER event
 
     const now = new Date();
+    const mqttClientId = partial.mqttClientId.slice(0, 128);
     const event: MqttUsageEvent = {
       ...partial,
+      mqttTopic: mqttTopic.slice(0, 500),
+      mqttQos: partial.mqttQos === 1 || partial.mqttQos === 2 ? partial.mqttQos : 0,
+      mqttClientId,
       metricName: `mqtt_broker.${partial.mqttEventType.toLowerCase()}`,
       quantity: 1,
       occurredAt: now.toISOString(),
-      idempotencyKey: `mqtt:${this.config.tenantId}:${partial.mqttClientId}:${partial.mqttEventType}:${partial.mqttTopic}:${now.getTime()}:${randomSuffix()}`,
+      // Topic left out (it can be 500 chars); tail-trimmed to keep the unique millis:random suffix.
+      idempotencyKey: `mqtt:${this.config.tenantId}:${mqttClientId}:${partial.mqttEventType}:${now.getTime()}:${randomSuffix()}`.slice(-MAX_IDEMPOTENCY_KEY),
       productType: 'MQTT_BROKER',
       metadata: {
         ...(partial.metadata ?? {}),
@@ -304,17 +332,25 @@ export class AforoMqttBilling {
 
   private async flush(): Promise<void> {
     if (this.buffer.length === 0) return;
-    const batch = this.buffer.splice(0, this.buffer.length);
+    const pending = this.buffer.splice(0, this.buffer.length);
+    // The ingestor accepts at most MAX_BATCH_EVENTS events per request.
+    for (let i = 0; i < pending.length; i += MAX_BATCH_EVENTS) {
+      await this.send(pending.slice(i, i + MAX_BATCH_EVENTS));
+    }
+  }
+
+  private async send(batch: MqttUsageEvent[]): Promise<void> {
+    // Serialized once, so every retry re-sends the same idempotencyKeys.
     const body = JSON.stringify({ events: batch });
     const maxRetries = 3;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        const res = await fetch(this.config.ingestorUrl.replace(/\/$/, '') + '/v1/ingest/events', {
+        const res = await fetch(this.config.ingestorUrl.replace(/\/$/, '') + '/v1/ingest/batch', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${this.config.apiKey}`,
+            'X-API-Key': this.config.apiKey,
             'X-Tenant-Id': this.config.tenantId,
           },
           body,

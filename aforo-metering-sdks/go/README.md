@@ -53,7 +53,7 @@ import (
 func main() {
 	client := metering.NewClient(metering.Options{
 		APIKey:  os.Getenv("AFORO_API_KEY"),
-		BaseURL: "https://ingest.aforo.ai", // default; override per environment
+		BaseURL: "https://usage-ingestor.aforo.ai", // default; override per environment
 	})
 	defer client.Close() // flushes the buffer before exit
 
@@ -84,14 +84,17 @@ func main() {
 	mux.HandleFunc("/v1/widgets", widgetsHandler)
 
 	wrapped := metering.HTTPMiddleware(mux, metering.MiddlewareOptions{
-		APIKey:  os.Getenv("AFORO_API_KEY"),
-		BaseURL: "https://ingest.aforo.ai",
+		APIKey:     os.Getenv("AFORO_API_KEY"),
+		BaseURL:    "https://usage-ingestor.aforo.ai",
+		MetricName: "api_calls", // must exist in your Aforo catalog
 	})
 	http.ListenAndServe(":8080", wrapped)
 }
 ```
 
-The middleware reads the customer id from `X-Customer-Id` (falling back to `X-Api-Key`), records `"<METHOD> <normalized-path>"` as the metric name — e.g. `GET /v1/widgets/:id` — and emits after the response is written. Requests with no resolvable customer id are not metered.
+The middleware reads the customer id from `X-Customer-Id` (or `CustomerIDHeader` / `CustomerIDFunc`), records `MetricName` (default `"api_calls"`, or `MetricNameFunc` per request), and emits after the response is written. Requests with no resolvable customer id, and `OPTIONS` (CORS preflight) requests, are not metered. The caller's `X-Api-Key` header is never used as the customer id — it is the end user's secret, not an id.
+
+> ⚠ The metric must exist in your tenant's Aforo catalog: the ingestor rejects an unknown metric, and because it validates a batch as a whole, one rejected event fails every event in that batch. Earlier versions recorded `"<METHOD> <normalized-path>"`, which no catalog contains; use `MetricNameFunc` (with `metering.NormalizePath` if useful) to map routes to catalog metrics.
 
 > ⚠ The customer id comes from a request header here. That's the convention for a service sitting behind your own auth/gateway that has already verified the caller. `tenant_id` is never read from a client header — set it through your Aforo API key's scope, not the request.
 
@@ -110,8 +113,8 @@ r.Use(metering.ChiMiddleware(metering.MiddlewareOptions{
 
 | Option | Type | Default | What it does |
 |---|---|---|---|
-| `APIKey` | `string` | — (required) | Sent as `Authorization: Bearer <APIKey>`. |
-| `BaseURL` | `string` | `https://ingest.aforo.ai` | Ingestor base; the client appends `/v1/ingest/batch`. Override per environment. |
+| `APIKey` | `string` | — (required) | Sent as `X-API-Key: <APIKey>`. |
+| `BaseURL` | `string` | `https://usage-ingestor.aforo.ai` | Ingestor base; the client appends `/v1/ingest/batch`. Override per environment. |
 | `FlushCount` | `int` | `50` | Flush when the buffer reaches this many events; also the per-batch drain size. |
 | `FlushInterval` | `time.Duration` | `5s` | Background flush cadence. |
 | `MaxQueueSize` | `int` | `10000` | Ring-buffer capacity. When full, the **oldest** event is dropped to make room. |
@@ -125,10 +128,13 @@ r.Use(metering.ChiMiddleware(metering.MiddlewareOptions{
 | Option | Type | Default | What it does |
 |---|---|---|---|
 | `APIKey` | `string` | — (required) | API key for the internally-created client. |
-| `BaseURL` | `string` | `https://ingest.aforo.ai` | Ingestor base for the internal client. |
+| `BaseURL` | `string` | `https://usage-ingestor.aforo.ai` | Ingestor base for the internal client. |
 | `ExcludePaths` | `[]string` | `["/health","/ready","/metrics","/favicon.ico"]` | Path **prefixes** to skip. Setting your own replaces the defaults. |
 | `ExcludeStatusCode` | `[]int` | none | Response status codes to skip (e.g. `404`). |
-| `CustomerIDHeader` | `string` | `X-Customer-Id` (then `X-Api-Key`) | Extra header checked for the customer id; if present and non-empty it wins. |
+| `MetricName` | `string` | `api_calls` (`DefaultMetricName`) | Fixed metric recorded per request. Must exist in your Aforo catalog. |
+| `MetricNameFunc` | `func(*http.Request) string` | nil | Per-request metric; wins over `MetricName`. An empty result falls back to `MetricName`. |
+| `CustomerIDHeader` | `string` | `X-Customer-Id` | Header carrying the Aforo customer id. The caller's `X-Api-Key` is never read. |
+| `CustomerIDFunc` | `func(*http.Request) string` | nil | Per-request customer id; wins over `CustomerIDHeader`. Empty result → request not metered. |
 | `ClientOptions` | `*Options` | nil | Full client tuning; `APIKey`/`BaseURL` from `MiddlewareOptions` override its fields. |
 
 Retry rule (in `transport`): `2xx` → sent; `4xx` except `408`/`429` → dropped, no retry; everything else (including `5xx`, `408`, `429`) is retried with backoff, honoring `Retry-After` on a `429`.
@@ -140,5 +146,5 @@ Step-by-step from install to "I can see the event in Aforo" lives in [USER_GUIDE
 ## What this doesn't cover
 
 - **No broker/queue metering.** This is an HTTP-request + manual-`Track` client. For GraphQL, gRPC, WebSocket, or MQTT use the sibling Go SDKs (`go-graphql`, `go-grpc`, `go-ws`, `go-mqtt`).
-- **No automatic customer-id discovery.** The middleware only knows the customer from a header (or your `CustomerIDHeader`); JWT/session decoding is yours to wire — read the header you control and pass the id to `Track` directly.
+- **No automatic customer-id discovery.** The middleware only knows the customer from a header (or your `CustomerIDHeader`) or your `CustomerIDFunc`; JWT/session decoding is yours to wire in that function.
 - **No delivery guarantee on crash.** Events live in memory until flushed. A hard crash before a flush loses the buffer, and an overflowing buffer drops the oldest events. Call `Close()` on graceful shutdown.

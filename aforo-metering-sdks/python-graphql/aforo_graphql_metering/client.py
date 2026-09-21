@@ -41,6 +41,29 @@ except ImportError:  # pragma: no cover
 __version__ = "1.0.0"
 logger = logging.getLogger("aforo_graphql_metering")
 
+# POST /v1/ingest/batch takes 1..1000 events per request.
+MAX_BATCH_EVENTS = 1000
+MAX_CUSTOMER_ID_LEN = 64
+MAX_IDEMPOTENCY_KEY_LEN = 255
+
+
+def _cap_idempotency_key(key: str) -> str:
+    """Keep keys within the ingestor's 255-char limit while staying unique."""
+    if len(key) <= MAX_IDEMPOTENCY_KEY_LEN:
+        return key
+    suffix = uuid.uuid4().hex
+    return key[:MAX_IDEMPOTENCY_KEY_LEN - len(suffix) - 1] + ":" + suffix
+
+
+def _valid_customer_id(customer_id: Any) -> bool:
+    """customerId must be non-blank and at most 64 chars or the ingestor rejects the event."""
+    if not isinstance(customer_id, str) or not customer_id.strip():
+        return False
+    if len(customer_id) > MAX_CUSTOMER_ID_LEN:
+        logger.warning("dropping usage event: customerId longer than %d chars", MAX_CUSTOMER_ID_LEN)
+        return False
+    return True
+
 
 @dataclass
 class GraphQlUsageEvent:
@@ -141,7 +164,7 @@ class AforoGraphQlBilling:
         has_errors: bool,
         response_bytes: int = 0,
     ) -> None:
-        if not customer_id or not HAS_GRAPHQL:
+        if not _valid_customer_id(customer_id) or not HAS_GRAPHQL:
             return
         try:
             doc = parse(query)
@@ -160,7 +183,7 @@ class AforoGraphQlBilling:
             metricName="graphql_api.operations",
             quantity=1,
             occurredAt=now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-            idempotencyKey=f"gql:{self.tenant_id}:{self.product_id}:{op.name.value if op.name else 'anonymous'}:{int(now.timestamp() * 1000)}:{uuid.uuid4().hex[:8]}",
+            idempotencyKey=_cap_idempotency_key(f"gql:{self.tenant_id}:{self.product_id}:{op.name.value if op.name else 'anonymous'}:{int(now.timestamp() * 1000)}:{uuid.uuid4().hex[:8]}"),
             productType="GRAPHQL_API",
             gqlOperationType=op.operation.value.upper() if hasattr(op.operation, "value") else str(op.operation).upper(),
             gqlOperationName=op.name.value if op.name else "anonymous",
@@ -188,16 +211,23 @@ class AforoGraphQlBilling:
         with self._buffer_lock:
             if not self._buffer:
                 return
-            batch = self._buffer
+            pending = self._buffer
             self._buffer = []
 
+        # /v1/ingest/batch accepts at most MAX_BATCH_EVENTS per request.
+        for i in range(0, len(pending), MAX_BATCH_EVENTS):
+            self._send_batch(pending[i:i + MAX_BATCH_EVENTS])
+
+    def _send_batch(self, batch: List[Dict[str, Any]]) -> None:
+        # Events (and their idempotencyKeys) are built once in record/push,
+        # so every retry below re-sends identical keys.
         body = {"events": batch}
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
+            "X-API-Key": self.api_key,
             "X-Tenant-Id": self.tenant_id,
         }
-        url = f"{self.ingestor_url}/v1/ingest/events"
+        url = f"{self.ingestor_url}/v1/ingest/batch"
 
         for attempt in range(3):
             try:

@@ -24,16 +24,16 @@ import (
 const sdkVersion = "1.0.0"
 
 type Config struct {
-	TenantID         string
-	ProductID        string
-	APIKey           string
-	IngestorURL      string
-	SchemaVersion    string // optional, attached to event metadata
-	FlushCount       int
-	FlushInterval    time.Duration
-	HTTPClient       *http.Client
+	TenantID          string
+	ProductID         string
+	APIKey            string
+	IngestorURL       string
+	SchemaVersion     string // optional, attached to event metadata
+	FlushCount        int
+	FlushInterval     time.Duration
+	HTTPClient        *http.Client
 	CustomerExtractor func(r *http.Request) string
-	OnError          func(error)
+	OnError           func(error)
 }
 
 type Billing struct {
@@ -68,7 +68,7 @@ func New(cfg Config) (*Billing, error) {
 	}
 	b := &Billing{
 		cfg:    cfg,
-		url:    strings.TrimRight(cfg.IngestorURL, "/") + "/v1/ingest/events",
+		url:    strings.TrimRight(cfg.IngestorURL, "/") + "/v1/ingest/batch",
 		client: cfg.HTTPClient,
 		stop:   make(chan struct{}),
 	}
@@ -113,7 +113,14 @@ func (b *Billing) Record(customerID, query, operationName string, durationMs int
 	if customerID == "" || query == "" {
 		return
 	}
+	if len(customerID) > 64 {
+		b.cfg.OnError(fmt.Errorf("graphqlmetering: customerId longer than 64 chars, event dropped"))
+		return
+	}
 	opType, opName := detectOperation(query, operationName)
+	if len(opName) > 255 {
+		opName = opName[:255]
+	}
 	complexity, fieldCount := scoreComplexity(query)
 
 	now := time.Now().UTC()
@@ -122,7 +129,7 @@ func (b *Billing) Record(customerID, query, operationName string, durationMs int
 		"metricName":          "graphql_api.operations",
 		"quantity":            1,
 		"occurredAt":          now.Format(time.RFC3339Nano),
-		"idempotencyKey":      fmt.Sprintf("gql:%s:%s:%s:%d:%s", b.cfg.TenantID, b.cfg.ProductID, opName, now.UnixMilli(), randomSuffix()),
+		"idempotencyKey":      capKey(fmt.Sprintf("gql:%s:%s:%s:%d:%s", b.cfg.TenantID, b.cfg.ProductID, opName, now.UnixMilli(), randomSuffix())),
 		"productType":         "GRAPHQL_API",
 		"gqlOperationType":    opType,
 		"gqlOperationName":    opName,
@@ -159,6 +166,9 @@ func (b *Billing) flushLoop() {
 	}
 }
 
+// maxBatchSize is the ingestor's per-request cap on POST /v1/ingest/batch.
+const maxBatchSize = 1000
+
 func (b *Billing) flush() {
 	b.mu.Lock()
 	if len(b.buffer) == 0 {
@@ -169,7 +179,19 @@ func (b *Billing) flush() {
 	b.buffer = nil
 	b.mu.Unlock()
 
-	body, err := json.Marshal(map[string]any{"events": batch})
+	for start := 0; start < len(batch); start += maxBatchSize {
+		end := start + maxBatchSize
+		if end > len(batch) {
+			end = len(batch)
+		}
+		b.send(batch[start:end])
+	}
+}
+
+// send POSTs one chunk of at most maxBatchSize events. The body is marshalled
+// once, so every retry carries the same idempotencyKeys.
+func (b *Billing) send(chunk []map[string]any) {
+	body, err := json.Marshal(map[string]any{"events": chunk})
 	if err != nil {
 		b.cfg.OnError(err)
 		return
@@ -177,7 +199,7 @@ func (b *Billing) flush() {
 	for attempt := 1; attempt <= 3; attempt++ {
 		req, _ := http.NewRequest(http.MethodPost, b.url, bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+b.cfg.APIKey)
+		req.Header.Set("X-API-Key", b.cfg.APIKey)
 		req.Header.Set("X-Tenant-Id", b.cfg.TenantID)
 		resp, err := b.client.Do(req)
 		if err == nil {
@@ -190,9 +212,11 @@ func (b *Billing) flush() {
 			b.cfg.OnError(err)
 			return
 		}
-		time.Sleep(time.Duration(1<<(attempt-1)) * time.Second)
+		if attempt < 3 {
+			time.Sleep(time.Duration(1<<(attempt-1)) * time.Second)
+		}
 	}
-	b.cfg.OnError(fmt.Errorf("graphqlmetering: flush exhausted retries (dropped %d events)", len(batch)))
+	b.cfg.OnError(fmt.Errorf("graphqlmetering: flush exhausted retries (dropped %d events)", len(chunk)))
 }
 
 func (b *Billing) Shutdown() error {
@@ -256,6 +280,15 @@ func withSchemaVersion(m map[string]any, sv string) map[string]any {
 		m["schemaVersion"] = sv
 	}
 	return m
+}
+
+// capKey keeps idempotency keys within the ingestor's 255-char limit. The
+// unique tail (millis + random suffix) is preserved.
+func capKey(k string) string {
+	if len(k) > 255 {
+		return k[len(k)-255:]
+	}
+	return k
 }
 
 var alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"

@@ -3,7 +3,7 @@ export interface AforoOptions {
   /** Aforo API key for authentication. */
   apiKey: string;
 
-  /** Base URL for the Aforo ingestor service. Defaults to https://ingest.aforo.ai */
+  /** Base URL for the Aforo ingestor service. Defaults to https://usage-ingestor.aforo.ai */
   baseUrl?: string;
 
   /** Maximum events to buffer before flushing. Default: 50 */
@@ -80,13 +80,24 @@ export interface MiddlewareOptions {
   /** Base URL for the ingestor. */
   baseUrl?: string;
 
-  /** Static metric name or function to derive from request. */
+  /**
+   * Metric to record for each request: a fixed name, or a function of the
+   * request/response. Default: `"api_calls"` (DEFAULT_METRIC_NAME).
+   *
+   * Must name a metric that exists in your Aforo catalog. The ingestor rejects
+   * unknown metrics, and one rejected event fails the whole batch it is in.
+   */
   metricName?: string | ((req: any, res: any) => string);
 
   /** Static quantity or function to derive from request/response. */
   quantity?: number | ((req: any, res: any) => number);
 
-  /** Static customer ID or function to derive from request. */
+  /**
+   * Aforo customer id: a fixed value, or a function of the request.
+   * Default: the authenticated user's id (`req.user.id` / `.sub`), then the
+   * `X-Customer-Id` header. Requests with no customer are not metered. The
+   * caller's `X-Api-Key` header is never used -- it is a secret, not an id.
+   */
   customerId?: string | ((req: any) => string | null);
 
   /** Paths to exclude from metering. Default: ["/health", "/ready", "/metrics", "/favicon.ico"] */

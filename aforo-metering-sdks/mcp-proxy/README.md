@@ -93,14 +93,14 @@ The proxy resolves each value with this precedence: **environment variable > CLI
 | `--host` | `listen.host` | — | `127.0.0.1` | Listen host (sse / streamable-http). |
 | `--tenant` | `aforo.tenantId` | `AFORO_TENANT_ID` | — (required) | Aforo tenant scope. Sent as `X-Tenant-Id`. |
 | `--product` | `aforo.productId` | `AFORO_PRODUCT_ID` | — (required) | MCP_SERVER product the events bill against. |
-| `--api-key` | `aforo.apiKey` | `AFORO_API_KEY` | — (required) | `Authorization: Bearer <apiKey>`. |
+| `--api-key` | `aforo.apiKey` | `AFORO_API_KEY` | — (required) | `X-API-Key: <apiKey>`. |
 | `--ingestor-url` | `aforo.ingestorUrl` | `AFORO_INGESTOR_URL` | — (required) | Base ingestor URL. The proxy appends `/v1/ingest/batch`. |
 | `--agent-id` | `aforo.agentId` | `AFORO_AGENT_ID` | — | Agent id override when the traffic doesn't carry `_meta.agent_id`. |
 | `--quota-enforcement` | `aforo.quotaEnforcement` | `AFORO_QUOTA_ENFORCEMENT` | `false` | Pre-flight quota gate before each `tools/call` (see below). |
 | `--debug` | `aforo.debug` | `AFORO_DEBUG` | `false` | Verbose logging. |
 | — | `aforo.flushIntervalMs` | `AFORO_FLUSH_INTERVAL_MS` | `5000` | Buffer dwell time before a timed flush. |
 | — | `aforo.flushCount` | `AFORO_FLUSH_COUNT` | `50` | Force a flush at this buffer size. |
-| — | `aforo.heartbeatIntervalMs` | `AFORO_HEARTBEAT_INTERVAL_MS` | `30000` | Session heartbeat cadence. |
+| — | `aforo.heartbeatIntervalMs` | `AFORO_HEARTBEAT_INTERVAL_MS` | `30000` | Deprecated and ignored: session heartbeats are no longer sent (quantity-0 heartbeat events failed the ingestor's validation and took the whole usage batch down). |
 
 > ⚠ The four `aforo.*` credentials (`tenantId`, `productId`, `apiKey`, `ingestorUrl`) are required and validated at startup — a missing one exits with a non-zero code and an error, it doesn't run unmetered. Pass `--ingestor-url` as the **base** URL (`https://usage-ingestor.aforo.ai`); the proxy appends `/v1/ingest/batch` for events and calls `/api/v1/quota/check` for quota.
 

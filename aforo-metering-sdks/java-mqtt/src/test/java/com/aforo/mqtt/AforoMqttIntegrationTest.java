@@ -227,10 +227,11 @@ class AforoMqttIntegrationTest {
             }
             assertThat(capturedHeaders).isNotEmpty();
             Map<String, List<String>> headers = capturedHeaders.get(0);
-            List<String> auth = headers.getOrDefault("Authorization", List.of());
+            List<String> auth = headers.getOrDefault("X-api-key", headers.getOrDefault("X-API-Key", List.of()));
             List<String> tenant = headers.getOrDefault("X-tenant-id",
                     headers.getOrDefault("X-Tenant-Id", List.of()));
-            assertThat(auth).contains("Bearer sk_int_mqtt");
+            assertThat(auth).contains("sk_int_mqtt");
+            assertThat(headers.containsKey("Authorization")).isFalse();
             assertThat(tenant).contains("tenant-int-mqtt");
         } finally {
             try { client.disconnect(); } catch (Exception ignored) {}

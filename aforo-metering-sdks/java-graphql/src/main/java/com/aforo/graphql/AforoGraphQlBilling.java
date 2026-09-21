@@ -48,7 +48,7 @@ import java.util.logging.Logger;
  *       .tenantId("tenant_acme")
  *       .productId("prod_graphql_unified_gateway")
  *       .apiKey(System.getenv("AFORO_API_KEY"))
- *       .ingestorUrl("https://ingestor.aforo.ai")
+ *       .ingestorUrl("https://usage-ingestor.aforo.ai")
  *       .schemaVersion("v2.1")
  *       .build();
  *
@@ -61,6 +61,10 @@ public final class AforoGraphQlBilling implements AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(AforoGraphQlBilling.class.getName());
     private static final String SDK_VERSION = "1.0.0";
+    /** The ingestor rejects {@code /v1/ingest/batch} requests with more than 1000 events. */
+    static final int MAX_EVENTS_PER_REQUEST = 1000;
+    private static final int MAX_CUSTOMER_ID = 64;
+    private static final int MAX_IDEMPOTENCY_KEY = 255;
 
     private final String tenantId, productId, apiKey, schemaVersion;
     private final URI ingestorUri;
@@ -83,7 +87,7 @@ public final class AforoGraphQlBilling implements AutoCloseable {
         this.productId = require(b.productId, "productId");
         this.apiKey = require(b.apiKey, "apiKey");
         this.schemaVersion = b.schemaVersion;
-        this.ingestorUri = URI.create(stripTrailingSlash(require(b.ingestorUrl, "ingestorUrl")) + "/v1/ingest/events");
+        this.ingestorUri = URI.create(stripTrailingSlash(require(b.ingestorUrl, "ingestorUrl")) + "/v1/ingest/batch");
         this.flushCount = b.flushCount;
         this.flushIntervalMs = b.flushIntervalMs;
         this.customerIdExtractor = b.customerIdExtractor != null ? b.customerIdExtractor : DEFAULT_CUSTOMER_EXTRACTOR;
@@ -106,7 +110,7 @@ public final class AforoGraphQlBilling implements AutoCloseable {
                     try {
                         if (result == null) return;
                         String customerId = customerIdExtractor.apply(parameters);
-                        if (customerId == null || customerId.isBlank()) return;
+                        if (!validCustomerId(customerId)) return;
 
                         long durationMs = System.currentTimeMillis() - ((TimingState) state).startMs;
                         boolean hasErrors = throwable != null
@@ -122,7 +126,7 @@ public final class AforoGraphQlBilling implements AutoCloseable {
 
     /** Record one operation manually. Public for non-graphql-java integrations. */
     public void record(String customerId, String query, String operationName, long durationMs, boolean hasErrors) {
-        if (customerId == null || customerId.isBlank() || query == null || query.isBlank()) return;
+        if (!validCustomerId(customerId) || query == null || query.isBlank()) return;
         try {
             Document doc = Parser.parse(query);
             OperationDefinition op = findOperation(doc, operationName);
@@ -149,7 +153,7 @@ public final class AforoGraphQlBilling implements AutoCloseable {
 
             int complexity = fc[0] + 5 * maxDepth[0];
             String opType = op.getOperation().name(); // QUERY, MUTATION, SUBSCRIPTION
-            String opName = op.getName() != null ? op.getName() : "anonymous";
+            String opName = truncate(op.getName() != null ? op.getName() : "anonymous", 255);
 
             Instant now = Instant.now();
             Map<String, Object> event = new HashMap<>();
@@ -157,15 +161,14 @@ public final class AforoGraphQlBilling implements AutoCloseable {
             event.put("metricName", "graphql_api.operations");
             event.put("quantity", 1);
             event.put("occurredAt", now.toString());
-            event.put("idempotencyKey", "gql:" + tenantId + ":" + productId + ":" + opName + ":"
-                    + now.toEpochMilli() + ":" + UUID.randomUUID().toString().substring(0, 8));
+            event.put("idempotencyKey", idempotencyKey("gql:" + tenantId + ":" + productId + ":" + opName, now));
             event.put("productType", "GRAPHQL_API");
             event.put("gqlOperationType", opType);
             event.put("gqlOperationName", opName);
             event.put("gqlComplexity", complexity);
             event.put("gqlFieldCount", fc[0]);
             event.put("gqlHasErrors", hasErrors);
-            event.put("executionDurationMs", durationMs);
+            event.put("executionDurationMs", (int) Math.max(0, Math.min(durationMs, Integer.MAX_VALUE)));
 
             Map<String, Object> meta = new HashMap<>();
             meta.put("sdkVersion", SDK_VERSION);
@@ -204,11 +207,26 @@ public final class AforoGraphQlBilling implements AutoCloseable {
         while ((ev = buffer.poll()) != null) { batch.add(ev); bufferSize.decrementAndGet(); }
         if (batch.isEmpty()) return;
 
-        String body = mapper.writeValueAsString(Map.of("events", batch));
+        // Slice into requests of at most MAX_EVENTS_PER_REQUEST; a failed slice does
+        // not stop the remaining slices from being delivered.
+        Exception failure = null;
+        for (int from = 0; from < batch.size(); from += MAX_EVENTS_PER_REQUEST) {
+            try {
+                send(batch.subList(from, Math.min(batch.size(), from + MAX_EVENTS_PER_REQUEST)));
+            } catch (Exception e) {
+                failure = e;
+            }
+        }
+        if (failure != null) throw failure;
+    }
+
+    /** POSTs one slice. The body is serialized once, so every retry resends the same idempotency keys. */
+    private void send(java.util.List<Map<String, Object>> events) throws Exception {
+        String body = mapper.writeValueAsString(Map.of("events", events));
         HttpRequest req = HttpRequest.newBuilder(ingestorUri)
                 .timeout(Duration.ofSeconds(10))
                 .header("Content-Type", "application/json")
-                .header("Authorization", "Bearer " + apiKey)
+                .header("X-API-Key", apiKey)
                 .header("X-Tenant-Id", tenantId)
                 .POST(HttpRequest.BodyPublishers.ofString(body))
                 .build();
@@ -222,7 +240,7 @@ public final class AforoGraphQlBilling implements AutoCloseable {
             }
             Thread.sleep((long) Math.pow(2, attempt - 1) * 1000);
         }
-        LOG.warning("[aforo-graphql] flush exhausted retries — dropped " + batch.size() + " events");
+        LOG.warning("[aforo-graphql] flush exhausted retries — dropped " + events.size() + " events");
     }
 
     @Override
@@ -248,6 +266,22 @@ public final class AforoGraphQlBilling implements AutoCloseable {
         }
         return null;
     };
+
+    /** True when {@code customerId} satisfies the ingestor (non-blank, at most 64 chars). */
+    private static boolean validCustomerId(String customerId) {
+        return customerId != null && !customerId.isBlank() && customerId.length() <= MAX_CUSTOMER_ID;
+    }
+
+    /** Joins {@code natural:suffix}, trimming {@code natural} so the key stays within 255 chars. */
+    private static String idempotencyKey(String natural, Instant now) {
+        String suffix = now.toEpochMilli() + ":" + UUID.randomUUID().toString().substring(0, 8);
+        int room = MAX_IDEMPOTENCY_KEY - suffix.length() - 1;
+        return (natural.length() > room ? natural.substring(0, room) : natural) + ":" + suffix;
+    }
+
+    private static String truncate(String s, int max) {
+        return s == null || s.length() <= max ? s : s.substring(0, max);
+    }
 
     private static String require(String s, String name) {
         if (s == null || s.isBlank()) throw new IllegalArgumentException(name + " is required");

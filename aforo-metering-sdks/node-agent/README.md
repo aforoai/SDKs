@@ -32,6 +32,7 @@ const agent = new AforoAgent({
   tenantId: 'tenant_smartai',
   productId: 'prod_agent_001',
   apiKey: process.env.AFORO_API_KEY!,
+  customerId: 'cust_acme_001', // the customer this agent's usage is billed to
 });
 
 const session = await agent.startSession({
@@ -65,17 +66,18 @@ Pass these to `new AforoAgent({...})`:
 |---|---|---|---|
 | `tenantId` | `string` | — (required) | Aforo tenant scope. Stamped on every event and sent as `X-Tenant-Id`. Never read from a client header. |
 | `productId` | `string` | — (required) | The AI_AGENT product these events bill against. |
-| `apiKey` | `string` | — (required) | Sent as `Authorization: Bearer <apiKey>`. Use `process.env.AFORO_API_KEY`. |
-| `ingestorUrl` | `string` | `https://usage-ingestor.aforo.ai/v1/ingest` | Full ingest URL. Override for local dev or air-gapped deployments. |
+| `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. Use `process.env.AFORO_API_KEY`. |
+| `customerId` | `string` | — | Aforo customer the usage is billed to. Required here or per session via `startSession({ customerId })`; `startSession` throws if neither is set. |
+| `ingestorUrl` | `string` | `https://usage-ingestor.aforo.ai/v1/ingest/batch` | Full batch-ingest URL. Override for local dev or air-gapped deployments. A URL ending in `/v1/ingest` is rewritten to `/v1/ingest/batch`. |
 | `flushBatchSize` | `number` | `50` | Buffer this many events before forcing a flush. Lower it for low-volume agents to surface metrics sooner; raise it to amortize per-batch HTTP cost. |
 | `flushIntervalMs` | `number` | `5000` | Max time an event sits in the buffer before a timed flush. `session.end()` flushes regardless. |
 | `fetchImpl` | `typeof fetch` | global `fetch` | Pluggable transport. Required on Node < 18 where there's no global `fetch`; also the seam used in tests. |
 
 ### Per-session and per-step options
 
-`startSession({...})` — `agentId` (required), optional `sessionId` (a UUID is generated if omitted), `framework` (`CLAUDE` \| `GPT` \| `LANGCHAIN` \| `CREWAI` \| `AUTOGEN` \| `CUSTOM`), `modelProvider` (`ANTHROPIC` \| `OPENAI` \| `GOOGLE` \| `COHERE` \| `CUSTOM`), `modelName`, and free-form `metadata`.
+`startSession({...})` — `agentId` (required), optional `customerId` (overrides the client's), `sessionId` (a UUID is generated if omitted), `traceId` (defaults to the sessionId), `framework` (`CLAUDE` \| `GPT` \| `LANGCHAIN` \| `CREWAI` \| `AUTOGEN` \| `CUSTOM`), `modelProvider` (`ANTHROPIC` \| `OPENAI` \| `GOOGLE` \| `COHERE` \| `CUSTOM`), `modelName`, and free-form `metadata`.
 
-`recordStep({...})` — `stepKind` (`TOOL_CALL` \| `THOUGHT` \| `OBSERVATION` \| `FINAL_ANSWER`, required), optional `capabilityName`, `inputTokens`, `outputTokens`, `durationMs`, `executionStatus` (`SUCCESS` \| `ERROR` \| `TIMEOUT` \| `CANCELLED` \| `HITL_REQUIRED`, defaults `SUCCESS`), and `metadata`. `session.recordToolCall(toolName, opts)` is the shortcut for the common `TOOL_CALL` case.
+`recordStep({...})` — `stepKind` (`TOOL_CALL` \| `THOUGHT` \| `OBSERVATION` \| `FINAL_ANSWER`, required), optional `capabilityName`, `inputTokens`, `outputTokens`, `durationMs`, `executionStatus` (`SUCCESS` \| `ERROR` \| `TIMEOUT` \| `CANCELLED` \| `HITL_REQUIRED`, defaults `SUCCESS`), `parentStepId`, and `metadata`. The ingestor only accepts `SUCCESS`/`ERROR`/`TIMEOUT` as `executionStatus`, so `CANCELLED` and `HITL_REQUIRED` are sent as `metadata.agentExecutionStatus` instead. `session.recordToolCall(toolName, opts)` is the shortcut for the common `TOOL_CALL` case.
 
 `end({...})` — `taskCompleted` (required), optional `errorMessage` and `metadata`.
 

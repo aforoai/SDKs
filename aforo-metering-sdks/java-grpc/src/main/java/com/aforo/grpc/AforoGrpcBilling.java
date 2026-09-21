@@ -40,7 +40,7 @@ import java.util.logging.Logger;
  *       .tenantId("tenant_acme")
  *       .productId("prod_grpc_user_svc")
  *       .apiKey(System.getenv("AFORO_API_KEY"))
- *       .ingestorUrl("https://ingestor.aforo.ai")
+ *       .ingestorUrl("https://usage-ingestor.aforo.ai")
  *       .serviceName("acme.v1.UserService")
  *       .build();
  *
@@ -54,6 +54,10 @@ public final class AforoGrpcBilling implements AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(AforoGrpcBilling.class.getName());
     private static final String SDK_VERSION = "1.0.0";
+    /** The ingestor rejects {@code /v1/ingest/batch} requests with more than 1000 events. */
+    static final int MAX_EVENTS_PER_REQUEST = 1000;
+    private static final int MAX_CUSTOMER_ID = 64;
+    private static final int MAX_IDEMPOTENCY_KEY = 255;
 
     private final String tenantId;
     private final String productId;
@@ -81,7 +85,7 @@ public final class AforoGrpcBilling implements AutoCloseable {
         this.productId = require(b.productId, "productId");
         this.apiKey = require(b.apiKey, "apiKey");
         this.serviceName = require(b.serviceName, "serviceName");
-        this.ingestorUri = URI.create(stripTrailingSlash(require(b.ingestorUrl, "ingestorUrl")) + "/v1/ingest/events");
+        this.ingestorUri = URI.create(stripTrailingSlash(require(b.ingestorUrl, "ingestorUrl")) + "/v1/ingest/batch");
         this.flushCount = b.flushCount;
         this.flushIntervalMs = b.flushIntervalMs;
         this.customerIdExtractor = b.customerIdExtractor != null ? b.customerIdExtractor : DEFAULT_CUSTOMER_EXTRACTOR;
@@ -104,7 +108,7 @@ public final class AforoGrpcBilling implements AutoCloseable {
                         new ForwardingServerCall.SimpleForwardingServerCall<>(call) {
                             @Override
                             public void close(Status status, Metadata trailers) {
-                                if (customerId != null && !customerId.isBlank()) {
+                                if (validCustomerId(customerId)) {
                                     record(method, callType, customerId, status.getCode().name(),
                                             System.currentTimeMillis() - start);
                                 }
@@ -118,7 +122,7 @@ public final class AforoGrpcBilling implements AutoCloseable {
 
     /** Record a single RPC. Public so streaming handlers can call it directly. */
     public void record(String method, String callType, String customerId, String status, long durationMs) {
-        if (customerId == null || customerId.isBlank()) return;
+        if (!validCustomerId(customerId) || method == null || method.isBlank()) return;
 
         Instant now = Instant.now();
         Map<String, Object> event = new HashMap<>();
@@ -126,17 +130,23 @@ public final class AforoGrpcBilling implements AutoCloseable {
         event.put("metricName", "grpc_api.rpc_calls");
         event.put("quantity", 1);
         event.put("occurredAt", now.toString());
-        event.put("idempotencyKey", "grpc:" + tenantId + ":" + serviceName + ":" + method + ":"
-                + now.toEpochMilli() + ":" + UUID.randomUUID().toString().substring(0, 8));
+        event.put("idempotencyKey", idempotencyKey("grpc:" + tenantId + ":" + serviceName + ":" + method, now));
         event.put("productType", "GRPC_API");
-        event.put("grpcService", serviceName);
-        event.put("grpcMethod", method);
-        event.put("grpcStatusCode", status);
-        event.put("grpcCallType", callType);
+        event.put("grpcService", truncate(serviceName, 255));
+        event.put("grpcMethod", truncate(method, 128));
+        event.put("grpcCallType", mapCallType(callType == null ? "" : callType.toUpperCase()));
         event.put("messageCount", 1);
-        event.put("executionDurationMs", durationMs);
+        event.put("executionDurationMs", (int) Math.max(0, Math.min(durationMs, Integer.MAX_VALUE)));
 
         Map<String, Object> meta = new HashMap<>();
+        // grpcStatusCode is enum-validated server-side; anything outside the gRPC code set
+        // would get the event rejected, so keep it in metadata instead.
+        String statusCode = status == null ? null : status.toUpperCase();
+        if (statusCode != null && GRPC_STATUS_CODES.contains(statusCode)) {
+            event.put("grpcStatusCode", statusCode);
+        } else if (status != null) {
+            meta.put("grpcStatus", status);
+        }
         meta.put("sdkVersion", SDK_VERSION);
         meta.put("productId", productId);
         event.put("metadata", meta);
@@ -165,11 +175,26 @@ public final class AforoGrpcBilling implements AutoCloseable {
         }
         if (batch.isEmpty()) return;
 
-        String body = mapper.writeValueAsString(Map.of("events", batch));
+        // Slice into requests of at most MAX_EVENTS_PER_REQUEST; a failed slice does
+        // not stop the remaining slices from being delivered.
+        Exception failure = null;
+        for (int from = 0; from < batch.size(); from += MAX_EVENTS_PER_REQUEST) {
+            try {
+                send(batch.subList(from, Math.min(batch.size(), from + MAX_EVENTS_PER_REQUEST)));
+            } catch (Exception e) {
+                failure = e;
+            }
+        }
+        if (failure != null) throw failure;
+    }
+
+    /** POSTs one slice. The body is serialized once, so every retry resends the same idempotency keys. */
+    private void send(java.util.List<Map<String, Object>> events) throws Exception {
+        String body = mapper.writeValueAsString(Map.of("events", events));
         HttpRequest req = HttpRequest.newBuilder(ingestorUri)
                 .timeout(Duration.ofSeconds(10))
                 .header("Content-Type", "application/json")
-                .header("Authorization", "Bearer " + apiKey)
+                .header("X-API-Key", apiKey)
                 .header("X-Tenant-Id", tenantId)
                 .POST(HttpRequest.BodyPublishers.ofString(body))
                 .build();
@@ -183,7 +208,7 @@ public final class AforoGrpcBilling implements AutoCloseable {
             }
             Thread.sleep((long) Math.pow(2, attempt - 1) * 1000);
         }
-        LOG.warning("[aforo-grpc] flush exhausted retries — dropped " + batch.size() + " events");
+        LOG.warning("[aforo-grpc] flush exhausted retries — dropped " + events.size() + " events");
     }
 
     @Override
@@ -204,14 +229,36 @@ public final class AforoGrpcBilling implements AutoCloseable {
         return headers.get(key);
     };
 
+    private static final java.util.Set<String> GRPC_STATUS_CODES = java.util.Set.of(
+            "OK", "CANCELLED", "UNKNOWN", "INVALID_ARGUMENT", "DEADLINE_EXCEEDED", "NOT_FOUND",
+            "ALREADY_EXISTS", "PERMISSION_DENIED", "RESOURCE_EXHAUSTED", "FAILED_PRECONDITION", "ABORTED",
+            "OUT_OF_RANGE", "UNIMPLEMENTED", "INTERNAL", "UNAVAILABLE", "DATA_LOSS", "UNAUTHENTICATED");
+
+    /** Maps grpc-java MethodType names (and the ingestor's own values) onto grpcCallType. */
     private static String mapCallType(String grpcMethodType) {
         return switch (grpcMethodType) {
             case "UNARY" -> "UNARY";
-            case "CLIENT_STREAMING" -> "CLIENT_STREAM";
-            case "SERVER_STREAMING" -> "SERVER_STREAM";
-            case "BIDI_STREAMING" -> "BIDI_STREAM";
+            case "CLIENT_STREAMING", "CLIENT_STREAM" -> "CLIENT_STREAM";
+            case "SERVER_STREAMING", "SERVER_STREAM" -> "SERVER_STREAM";
+            case "BIDI_STREAMING", "BIDI_STREAM" -> "BIDI_STREAM";
             default -> "UNARY";
         };
+    }
+
+    /** True when {@code customerId} satisfies the ingestor (non-blank, at most 64 chars). */
+    private static boolean validCustomerId(String customerId) {
+        return customerId != null && !customerId.isBlank() && customerId.length() <= MAX_CUSTOMER_ID;
+    }
+
+    /** Joins {@code natural:suffix}, trimming {@code natural} so the key stays within 255 chars. */
+    private static String idempotencyKey(String natural, Instant now) {
+        String suffix = now.toEpochMilli() + ":" + UUID.randomUUID().toString().substring(0, 8);
+        int room = MAX_IDEMPOTENCY_KEY - suffix.length() - 1;
+        return (natural.length() > room ? natural.substring(0, room) : natural) + ":" + suffix;
+    }
+
+    private static String truncate(String s, int max) {
+        return s == null || s.length() <= max ? s : s.substring(0, max);
     }
 
     private static String require(String s, String name) {

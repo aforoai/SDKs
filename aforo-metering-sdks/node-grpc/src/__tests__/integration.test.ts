@@ -298,7 +298,8 @@ describe('Real-server integration (@grpc/grpc-js Server + Client)', () => {
 
         expect(sniffed.length).toBeGreaterThan(0);
         const headers = sniffed[0];
-        expect(headers['authorization']).toBe('Bearer sk_header_check');
+        expect(headers['x-api-key']).toBe('sk_header_check');
+        expect(headers['authorization']).toBeUndefined();
         expect(headers['x-tenant-id']).toBe('tenant-headers');
       } finally {
         client2.close();

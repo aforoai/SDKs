@@ -1,6 +1,6 @@
 /**
  * @file HTTP client for sending batched usage events to Aforo ingestor.
- * POST /v1/ingest/batch with Bearer auth + X-Tenant-Id header.
+ * POST /v1/ingest/batch with X-API-Key auth + X-Tenant-Id header.
  * 3x retry with exponential backoff (1s, 2s, 4s). 10s timeout.
  * Pattern reused from aforo-metering-sdks/node/src/transport.ts
  */
@@ -43,7 +43,7 @@ export class IngestorClient {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${this.apiKey}`,
+            'X-API-Key': this.apiKey,
             'X-Tenant-Id': this.tenantId,
           },
           body,

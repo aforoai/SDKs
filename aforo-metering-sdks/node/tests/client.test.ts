@@ -29,6 +29,20 @@ describe('AforoClient', () => {
     await client.shutdown();
   });
 
+  it('should not put session heartbeats into the usage batch', async () => {
+    // Heartbeats (quantity 0, customerId "system") fail the ingestor's @Positive
+    // check and take every real event in the same batch down with them.
+    client.startSession('sess_1');
+    await client.track({ customerId: 'cust_1', metricName: 'api_calls', quantity: 1 });
+    await client.endSession();
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.events).toHaveLength(1);
+    expect(body.events[0].metricName).toBe('api_calls');
+    expect(body.events.every((e: any) => e.quantity > 0)).toBe(true);
+  });
+
   it('should require apiKey', () => {
     expect(() => new AforoClient({ apiKey: '' })).toThrow('apiKey is required');
   });

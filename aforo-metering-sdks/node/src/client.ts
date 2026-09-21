@@ -3,7 +3,7 @@ import { RingBuffer } from './buffer';
 import { Transport } from './transport';
 import { generateIdempotencyKey } from './idempotency';
 
-const DEFAULT_BASE_URL = 'https://ingest.aforo.ai';
+const DEFAULT_BASE_URL = 'https://usage-ingestor.aforo.ai';
 const DEFAULT_FLUSH_COUNT = 50;
 const DEFAULT_FLUSH_INTERVAL = 5_000;
 const DEFAULT_MAX_QUEUE_SIZE = 10_000;
@@ -37,12 +37,6 @@ export class AforoClient {
   private flushing = false;
   private closed = false;
   private pendingFlush: Promise<FlushResult> | null = null;
-
-  // Heartbeat state
-  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-  private activeSessionId: string | null = null;
-  private sessionStartedAt: number | null = null;
-  private sessionProductType: string = 'AI_AGENT';
 
   constructor(options: AforoOptions) {
     if (!options.apiKey) throw new Error('apiKey is required');
@@ -79,80 +73,28 @@ export class AforoClient {
     process.once('SIGINT', shutdownHandler);
   }
 
-  // ─── Session lifecycle with heartbeat ──────────────────────────────
+  // ─── Session lifecycle (deprecated no-ops) ──────────────────────────
 
   /**
-   * Start a session and begin emitting periodic heartbeats (every 30s).
-   * Heartbeats keep the session alive on the server and enable fast
-   * crash detection (90-180s instead of 1hr idle timeout).
+   * @deprecated No longer emits anything; kept so existing callers compile.
    *
-   * @param sessionId - Unique session identifier
-   * @param productType - Product type for the session (default AI_AGENT)
+   * This used to push `system.session.heartbeat` events (customerId "system",
+   * quantity 0) into the usage batch every 30s. The ingestor validates every
+   * event in a batch -- quantity must be positive and the metric must be in the
+   * tenant's catalog -- and fails the whole batch with 400 when one event is
+   * invalid, so each heartbeat took every real usage event batched with it down.
+   * The ingestor has no dedicated heartbeat endpoint, so heartbeats are not sent.
    */
-  startSession(sessionId: string, productType: string = 'AI_AGENT'): void {
-    if (this.closed) return;
-    this.activeSessionId = sessionId;
-    this.sessionStartedAt = Date.now();
-    this.sessionProductType = productType;
-
-    // Emit first heartbeat immediately
-    this.emitSessionHeartbeat();
-
-    this.heartbeatTimer = setInterval(() => this.emitSessionHeartbeat(), 30_000);
-    if (this.heartbeatTimer && typeof this.heartbeatTimer === 'object' && 'unref' in this.heartbeatTimer) {
-      this.heartbeatTimer.unref();
-    }
+  startSession(_sessionId: string, _productType: string = 'AI_AGENT'): void {
+    // Intentionally empty: see the deprecation note above.
   }
 
   /**
-   * End the current session: emit a final SESSION_END event, stop
-   * heartbeat, and flush remaining events.
+   * @deprecated Equivalent to `flush()`; no SESSION_END event is sent (see
+   * `startSession`).
    */
   async endSession(): Promise<void> {
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-    }
-    if (this.activeSessionId) {
-      const resolved: ResolvedEvent = {
-        customerId: 'system',
-        metricName: 'system.session.heartbeat',
-        quantity: 0,
-        idempotencyKey: `hb:end:${this.activeSessionId}:${Date.now()}`,
-        occurredAt: new Date().toISOString(),
-        metadata: {
-          sessionId: this.activeSessionId,
-          sessionBoundary: 'SESSION_END',
-          productType: this.sessionProductType,
-          heartbeatType: 'SESSION_END',
-        },
-      };
-      this.buffer.push(resolved);
-    }
-    this.activeSessionId = null;
-    this.sessionStartedAt = null;
     await this.flush();
-  }
-
-  private emitSessionHeartbeat(): void {
-    if (!this.activeSessionId || this.closed) return;
-
-    const resolved: ResolvedEvent = {
-      customerId: 'system',
-      metricName: 'system.session.heartbeat',
-      quantity: 0,
-      idempotencyKey: `hb:${this.activeSessionId}:${Date.now()}`,
-      occurredAt: new Date().toISOString(),
-      metadata: {
-        sessionId: this.activeSessionId,
-        sessionBoundary: 'HEARTBEAT',
-        productType: this.sessionProductType,
-        heartbeatType: 'PERIODIC',
-        uptimeMs: Date.now() - (this.sessionStartedAt ?? Date.now()),
-        sdkLanguage: 'node',
-      },
-    };
-    this.buffer.push(resolved);
   }
 
   // ─── Event tracking ──────────────────────────────────────────────
@@ -231,12 +173,6 @@ export class AforoClient {
   async shutdown(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-
-    // Stop heartbeat timer
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-    }
 
     // Clear periodic flush timer
     if (this.flushTimer) {

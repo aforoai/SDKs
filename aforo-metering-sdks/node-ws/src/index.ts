@@ -18,7 +18,7 @@
  *     tenantId: 'tenant_acme',
  *     productId: 'prod_ws_market_feed',
  *     apiKey: process.env.AFORO_API_KEY!,
- *     ingestorUrl: 'https://ingestor.aforo.ai',
+ *     ingestorUrl: 'https://usage-ingestor.aforo.ai',
  *   });
  *
  *   const wss = new WebSocketServer({ port: 8080 });
@@ -66,6 +66,11 @@ interface MinimalWss {
 }
 
 const SDK_VERSION = '1.0.0';
+/** The ingestor rejects batch requests with more than 1000 events. */
+const MAX_BATCH_EVENTS = 1000;
+/** usage-ingestor limits (IngestUsageEventRequest). */
+const MAX_CUSTOMER_ID = 64;
+const MAX_IDEMPOTENCY_KEY = 255;
 
 // Close reason code → descriptor enum label
 const CLOSE_REASONS: Record<number, string> = {
@@ -96,7 +101,7 @@ interface WsUsageEvent {
   wsCloseReason?: string;
   messageCount: number;
   dataBytes: number;
-  durationMs: number;
+  executionDurationMs: number;
   metadata?: Record<string, unknown>;
 }
 
@@ -130,7 +135,7 @@ export class AforoWsBilling {
   wrapServer(wss: MinimalWss, options: WrapServerOptions): void {
     wss.on('connection', (ws, req) => {
       const customerId = options.extractCustomerId(req);
-      if (!customerId) return; // no customer resolved → skip metering
+      if (!customerId || !customerId.trim()) return; // no customer resolved → skip metering
       const metadata = options.extractMetadata?.(req);
       this.trackConnection(ws, { customerId, metadata });
     });
@@ -141,6 +146,11 @@ export class AforoWsBilling {
     ws: MinimalWs,
     opts: { customerId: string; metadata?: Record<string, unknown> }
   ): () => void {
+    if (!opts.customerId || !opts.customerId.trim()) return () => {};
+    if (opts.customerId.length > MAX_CUSTOMER_ID) {
+      this.onError(new Error(`WebSocket metering: customerId longer than ${MAX_CUSTOMER_ID} chars; connection not metered`));
+      return () => {};
+    }
     const connectionId = randomUUID();
     const start = Date.now();
     let sentCount = 0;
@@ -156,7 +166,7 @@ export class AforoWsBilling {
       wsFrameType: 'PING', // "handshake complete" marker; not an actual frame
       messageCount: 0,
       dataBytes: 0,
-      durationMs: 0,
+      executionDurationMs: 0,
       metadata: { ...(opts.metadata ?? {}), event: 'CONNECTION_OPENED' },
     });
 
@@ -172,7 +182,7 @@ export class AforoWsBilling {
           wsFrameType: isBinary ? 'BINARY' : 'TEXT',
           messageCount: 1,
           dataBytes: bytes,
-          durationMs: Date.now() - start,
+          executionDurationMs: Date.now() - start,
           metadata: opts.metadata,
         });
       }
@@ -192,7 +202,7 @@ export class AforoWsBilling {
           wsFrameType: typeof data === 'string' ? 'TEXT' : 'BINARY',
           messageCount: 1,
           dataBytes: bytes,
-          durationMs: Date.now() - start,
+          executionDurationMs: Date.now() - start,
           metadata: opts.metadata,
         });
       }
@@ -209,7 +219,7 @@ export class AforoWsBilling {
         wsCloseReason: CLOSE_REASONS[code] ?? 'NORMAL_CLOSURE',
         messageCount: sentCount + recvCount,
         dataBytes: sentBytes + recvBytes,
-        durationMs: Date.now() - start,
+        executionDurationMs: Date.now() - start,
         metadata: {
           ...(opts.metadata ?? {}),
           event: 'CONNECTION_CLOSED',
@@ -231,7 +241,7 @@ export class AforoWsBilling {
         wsCloseReason: 'INTERNAL_ERROR',
         messageCount: sentCount + recvCount,
         dataBytes: sentBytes + recvBytes,
-        durationMs: Date.now() - start,
+        executionDurationMs: Date.now() - start,
         metadata: { ...(opts.metadata ?? {}), event: 'CONNECTION_ERROR', error: err.message },
       });
     });
@@ -266,17 +276,25 @@ export class AforoWsBilling {
 
   private async flush(): Promise<void> {
     if (this.buffer.length === 0) return;
-    const batch = this.buffer.splice(0, this.buffer.length);
+    const pending = this.buffer.splice(0, this.buffer.length);
+    // The ingestor accepts at most MAX_BATCH_EVENTS events per request.
+    for (let i = 0; i < pending.length; i += MAX_BATCH_EVENTS) {
+      await this.send(pending.slice(i, i + MAX_BATCH_EVENTS));
+    }
+  }
+
+  private async send(batch: WsUsageEvent[]): Promise<void> {
+    // Serialized once, so every retry re-sends the same idempotencyKeys.
     const body = JSON.stringify({ events: batch });
     const maxRetries = 3;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        const res = await fetch(this.config.ingestorUrl.replace(/\/$/, '') + '/v1/ingest/events', {
+        const res = await fetch(this.config.ingestorUrl.replace(/\/$/, '') + '/v1/ingest/batch', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${this.config.apiKey}`,
+            'X-API-Key': this.config.apiKey,
             'X-Tenant-Id': this.config.tenantId,
           },
           body,

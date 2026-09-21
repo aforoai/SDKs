@@ -11,7 +11,7 @@ export interface TransportOptions {
 /**
  * HTTP transport that sends batched usage events to the Aforo ingestor.
  *
- * - POST /v1/ingest/batch with Authorization: Bearer {apiKey}
+ * - POST /v1/ingest/batch with X-API-Key: {apiKey} (never Authorization: Bearer -- the ingestor parses Bearer as a JWT and rejects the request 401)
  * - Retry on 5xx, 408, 429 with exponential backoff
  * - Respects Retry-After header on 429
  * - No retry on 4xx (bad input)
@@ -49,7 +49,7 @@ export class Transport {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${this.apiKey}`,
+            'X-API-Key': this.apiKey,
           },
           body: bodyStr,
           signal: controller.signal,

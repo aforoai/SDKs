@@ -33,6 +33,32 @@ except ImportError:  # pragma: no cover
 __version__ = "1.0.0"
 logger = logging.getLogger("aforo_mqtt_metering")
 
+# POST /v1/ingest/batch takes 1..1000 events per request.
+MAX_BATCH_EVENTS = 1000
+MAX_CUSTOMER_ID_LEN = 64
+MAX_IDEMPOTENCY_KEY_LEN = 255
+
+
+def _cap_idempotency_key(key: str) -> str:
+    """Keep keys within the ingestor's 255-char limit while staying unique."""
+    if len(key) <= MAX_IDEMPOTENCY_KEY_LEN:
+        return key
+    suffix = uuid.uuid4().hex
+    return key[:MAX_IDEMPOTENCY_KEY_LEN - len(suffix) - 1] + ":" + suffix
+
+
+def _valid_customer_id(customer_id: Any) -> bool:
+    """customerId must be non-blank and at most 64 chars or the ingestor rejects the event."""
+    if not isinstance(customer_id, str) or not customer_id.strip():
+        return False
+    if len(customer_id) > MAX_CUSTOMER_ID_LEN:
+        logger.warning("dropping usage event: customerId longer than %d chars", MAX_CUSTOMER_ID_LEN)
+        return False
+    return True
+
+
+MQTT_EVENT_TYPES = ("PUBLISH", "DELIVER", "SUBSCRIBE", "UNSUBSCRIBE", "CONNECT", "DISCONNECT")
+
 
 @dataclass
 class MqttUsageEvent:
@@ -108,19 +134,36 @@ class AforoMqttBilling:
         data_bytes: int = 0,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
+        event_type = str(event_type or "").upper()
+        if event_type not in MQTT_EVENT_TYPES:
+            logger.warning("dropping MQTT usage event: unsupported event_type %r", event_type)
+            return
         if event_type == "DELIVER" and not self.emit_deliver_events:
             return
+        if not _valid_customer_id(customer_id):
+            return
+        client_id = (client_id or "unknown-client")[:128]
+        if not topic:
+            # mqttTopic is required on every MQTT_BROKER event. CONNECT /
+            # DISCONNECT have no topic, so they carry a broker-style $SYS marker
+            # (same as the Go and Java SDKs); any other topic-less event is invalid.
+            if event_type not in ("CONNECT", "DISCONNECT"):
+                logger.warning("dropping MQTT usage event: %s without a topic", event_type)
+                return
+            topic = f"$SYS/clients/{client_id}/{event_type.lower()}ed"
+        topic = topic[:500]
+        qos = qos if qos in (0, 1, 2) else 0
         now = datetime.now(timezone.utc)
         ev = MqttUsageEvent(
             customerId=customer_id,
             metricName=f"mqtt_broker.{event_type.lower()}",
             quantity=1,
             occurredAt=now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-            idempotencyKey=f"mqtt:{self.tenant_id}:{client_id}:{event_type}:{topic}:{int(now.timestamp() * 1000)}:{uuid.uuid4().hex[:8]}",
+            idempotencyKey=_cap_idempotency_key(f"mqtt:{self.tenant_id}:{client_id}:{event_type}:{topic}:{int(now.timestamp() * 1000)}:{uuid.uuid4().hex[:8]}"),
             productType="MQTT_BROKER",
             mqttTopic=topic,
             mqttQos=qos,
-            mqttRetained=retained,
+            mqttRetained=bool(retained),
             mqttEventType=event_type,
             mqttClientId=client_id,
             dataBytes=data_bytes,
@@ -143,16 +186,23 @@ class AforoMqttBilling:
         with self._buffer_lock:
             if not self._buffer:
                 return
-            batch = self._buffer
+            pending = self._buffer
             self._buffer = []
 
+        # /v1/ingest/batch accepts at most MAX_BATCH_EVENTS per request.
+        for i in range(0, len(pending), MAX_BATCH_EVENTS):
+            self._send_batch(pending[i:i + MAX_BATCH_EVENTS])
+
+    def _send_batch(self, batch: List[Dict[str, Any]]) -> None:
+        # Events (and their idempotencyKeys) are built once in record/push,
+        # so every retry below re-sends identical keys.
         body = {"events": batch}
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
+            "X-API-Key": self.api_key,
             "X-Tenant-Id": self.tenant_id,
         }
-        url = f"{self.ingestor_url}/v1/ingest/events"
+        url = f"{self.ingestor_url}/v1/ingest/batch"
 
         for attempt in range(3):
             try:

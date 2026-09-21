@@ -39,7 +39,7 @@ AforoWsBilling billing = AforoWsBilling.newBuilder()
         .tenantId("tenant_acme")
         .productId("prod_ws_market_feed")
         .apiKey(System.getenv("AFORO_API_KEY"))
-        .ingestorUrl("https://ingest.aforo.ai")
+        .ingestorUrl("https://usage-ingestor.aforo.ai")
         .build();
 
 @ServerEndpoint("/ws")
@@ -66,7 +66,7 @@ public class FeedSocket {
 }
 ```
 
-Events POST to `<ingestorUrl>/v1/ingest/events` with `Authorization: Bearer <apiKey>` and `X-Tenant-Id: <tenantId>`. The buffer flushes every 3 seconds or once 100 events queue — more aggressive than the HTTP SDKs because WebSocket traffic is higher-volume — with 3× exponential retry.
+Events POST to `<ingestorUrl>/v1/ingest/batch` as `{"events": [...]}` (at most 1000 events per request; larger flushes are split) with `X-API-Key: <apiKey>` and `X-Tenant-Id: <tenantId>`. The buffer flushes every 3 seconds or once 100 events queue — more aggressive than the HTTP SDKs because WebSocket traffic is higher-volume — with 3× exponential retry.
 
 > ⚠ `openConnection(customerId, ...)` returns `null` when `customerId` is blank, and every subsequent call short-circuits on a `null` connection id. Resolve the customer at open time from your auth, not from a frame payload. Keep the returned `connectionId` for the life of the socket — it's how `recordFrame` and `closeConnection` find the in-memory counters.
 
@@ -78,8 +78,8 @@ Builder options on `AforoWsBilling.newBuilder()`:
 |---|---|---|---|
 | `tenantId` | `String` | *(required)* | Sent as the `X-Tenant-Id` header. |
 | `productId` | `String` | *(required)* | Stamped into `metadata.productId`. |
-| `apiKey` | `String` | *(required)* | Bearer token. |
-| `ingestorUrl` | `String` | *(required)* | Ingestion host. The SDK appends `/v1/ingest/events`. Use `https://ingest.aforo.ai`. |
+| `apiKey` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
+| `ingestorUrl` | `String` | *(required)* | Ingestion host. The SDK appends `/v1/ingest/batch`. Use `https://usage-ingestor.aforo.ai`. |
 | `perFrameEvents` | `boolean` | `false` | When `true`, each `recordFrame` emits its own event. When `false`, only OPEN and CLOSE events are emitted, with frame/byte totals aggregated on CLOSE. |
 | `flushCount` | `int` | `100` | Buffered events that trigger an immediate flush. |
 | `flushIntervalMs` | `long` | `3000` | Background flush cadence (ms). |
@@ -88,7 +88,7 @@ Every required field is validated at build time — a blank value throws `Illega
 
 ## Billing model
 
-Default mode emits **one** `CONNECTION_OPENED` event on `openConnection` and **one** `CONNECTION_CLOSED` event on `closeConnection`. The CLOSE event carries the aggregated `messageCount` (frames in + out), `dataBytes`, `durationMs`, `closeCode`, and a mapped `wsCloseReason`. Set `perFrameEvents(true)` to also emit one event per frame.
+Default mode emits **one** `CONNECTION_OPENED` event on `openConnection` and **one** `CONNECTION_CLOSED` event on `closeConnection`. The CLOSE event carries the aggregated `messageCount` (frames in + out), `dataBytes`, `executionDurationMs`, `closeCode`, and a mapped `wsCloseReason`. Set `perFrameEvents(true)` to also emit one event per frame.
 
 Close codes map to descriptor reasons: `1000 → NORMAL_CLOSURE`, `1001 → GOING_AWAY`, `1002/1007 → PROTOCOL_ERROR`, `1003 → UNSUPPORTED_DATA`, `1006 → ABNORMAL_CLOSURE`, `1008 → POLICY_VIOLATION`, `1009 → MESSAGE_TOO_BIG`, `1011 → INTERNAL_ERROR`, codes ≥ 4000 → `IDLE_TIMEOUT`.
 

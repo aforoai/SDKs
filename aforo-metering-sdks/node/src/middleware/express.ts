@@ -1,6 +1,6 @@
 import { AforoClient } from '../client';
 import { MiddlewareOptions } from '../types';
-import { normalizePath } from '../path-normalizer';
+import { isPreflight, resolveMetricName, firstNonEmpty } from './common';
 
 const DEFAULT_EXCLUDE_PATHS = ['/health', '/ready', '/metrics', '/favicon.ico'];
 
@@ -36,20 +36,12 @@ export function expressMiddleware(options: MiddlewareOptions) {
         const statusCode: number = res.statusCode || 0;
 
         // Check exclusions
+        if (isPreflight(method)) return;
         if (excludePaths.some((p: string) => path.startsWith(p))) return;
         if (excludeStatusCodes.includes(statusCode)) return;
 
-        // Resolve metric name
-        const routeTemplate: string | undefined = req.route?.path;
-        const normalizedPath = normalizePath(path.split('?')[0], routeTemplate);
-        let metricName: string;
-        if (typeof options.metricName === 'function') {
-          metricName = options.metricName(req, res);
-        } else if (options.metricName) {
-          metricName = options.metricName;
-        } else {
-          metricName = `${method} ${normalizedPath}`;
-        }
+        // Resolve metric name (must be a metric in the tenant's catalog)
+        const metricName = resolveMetricName(options, req, res);
 
         // Resolve quantity
         let quantity: number;
@@ -93,22 +85,16 @@ export function expressMiddleware(options: MiddlewareOptions) {
   };
 }
 
-/** Extract customer ID using the standard fallback chain. */
+/**
+ * Default customer resolution: authenticated user id, then X-Customer-Id.
+ *
+ * The caller's X-Api-Key header is deliberately NOT used: that is the end
+ * user's secret, and using it as customerId wrote credentials into billing data
+ * while never matching an Aforo customer. Configure `customerId` to map your
+ * callers to Aforo customer ids.
+ */
 function extractCustomerId(req: any): string | null {
-  // 1. JWT/session user ID
-  if (req.user?.id) return String(req.user.id);
-  if (req.user?.sub) return String(req.user.sub);
-
-  // 2. Explicit customer header
-  const customerHeader = req.headers?.['x-customer-id'];
-  if (customerHeader) return String(customerHeader);
-
-  // 3. API key header
-  const apiKeyHeader = req.headers?.['x-api-key'];
-  if (apiKeyHeader) return String(apiKeyHeader);
-
-  // 4. Authorization bearer token (use as identifier, not as customer ID)
-  return null;
+  return firstNonEmpty(req.user?.id, req.user?.sub, req.headers?.['x-customer-id']);
 }
 
 // Also export as `middleware` for convenience

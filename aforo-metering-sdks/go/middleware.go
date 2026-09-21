@@ -15,14 +15,43 @@ var (
 	defaultExcludePaths = []string{"/health", "/ready", "/metrics", "/favicon.ico"}
 )
 
+// DefaultMetricName is the metric recorded per request when neither
+// MetricName nor MetricNameFunc is set.
+//
+// It must exist in the tenant's Aforo metric catalog: the ingestor rejects an
+// unknown metric, and because it validates a batch as a whole, one such event
+// fails the entire batch with 400. The previous default, "METHOD /path", is a
+// name no catalog contains, so every event failed out of the box.
+const DefaultMetricName = "api_calls"
+
+// DefaultCustomerIDHeader is the request header read for the customer id when
+// CustomerIDFunc is not set.
+const DefaultCustomerIDHeader = "X-Customer-Id"
+
 // MiddlewareOptions configures the HTTP middleware.
 type MiddlewareOptions struct {
 	APIKey            string
 	BaseURL           string
 	ExcludePaths      []string
 	ExcludeStatusCode []int
-	CustomerIDHeader  string // Default: "X-Customer-Id", fallback "X-Api-Key"
-	ClientOptions     *Options
+
+	// MetricName is the fixed metric recorded per request. Default
+	// DefaultMetricName ("api_calls"). Must exist in your Aforo catalog.
+	MetricName string
+	// MetricNameFunc derives the metric from the request; it takes precedence
+	// over MetricName. An empty result falls back to MetricName / the default.
+	MetricNameFunc func(r *http.Request) string
+
+	// CustomerIDHeader is the header carrying the Aforo customer id.
+	// Default DefaultCustomerIDHeader ("X-Customer-Id"). The caller's
+	// X-Api-Key is never used: it is a secret, not a customer id.
+	CustomerIDHeader string
+	// CustomerIDFunc derives the customer id from the request; it takes
+	// precedence over CustomerIDHeader. Requests with no customer id are not
+	// metered.
+	CustomerIDFunc func(r *http.Request) string
+
+	ClientOptions *Options
 }
 
 // HTTPMiddleware returns an http.Handler wrapper that captures usage events.
@@ -47,6 +76,15 @@ func HTTPMiddleware(next http.Handler, opts MiddlewareOptions) http.Handler {
 		excludePaths = defaultExcludePaths
 	}
 
+	customerHeader := opts.CustomerIDHeader
+	if customerHeader == "" {
+		customerHeader = DefaultCustomerIDHeader
+	}
+	metricName := opts.MetricName
+	if metricName == "" {
+		metricName = DefaultMetricName
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Wrap response writer to capture status code
 		sw := &statusWriter{ResponseWriter: w, statusCode: 200}
@@ -54,7 +92,12 @@ func HTTPMiddleware(next http.Handler, opts MiddlewareOptions) http.Handler {
 
 		// After response — capture event
 		path := r.URL.Path
-		method := r.Method
+
+		// CORS preflights are browser protocol, not billable calls, and carry
+		// no credentials -- so they never have a customer. Never meter them.
+		if r.Method == http.MethodOptions {
+			return
+		}
 
 		for _, ep := range excludePaths {
 			if strings.HasPrefix(path, ep) {
@@ -67,23 +110,27 @@ func HTTPMiddleware(next http.Handler, opts MiddlewareOptions) http.Handler {
 			}
 		}
 
-		customerID := r.Header.Get("X-Customer-Id")
-		if customerID == "" {
-			customerID = r.Header.Get("X-Api-Key")
+		var customerID string
+		if opts.CustomerIDFunc != nil {
+			customerID = opts.CustomerIDFunc(r)
+		} else {
+			customerID = r.Header.Get(customerHeader)
 		}
-		if opts.CustomerIDHeader != "" {
-			if v := r.Header.Get(opts.CustomerIDHeader); v != "" {
-				customerID = v
-			}
-		}
+		customerID = strings.TrimSpace(customerID)
 		if customerID == "" {
 			return
 		}
 
-		normalized := normalizePath(path)
+		metric := metricName
+		if opts.MetricNameFunc != nil {
+			if m := opts.MetricNameFunc(r); m != "" {
+				metric = m
+			}
+		}
+
 		_ = client.Track(TrackEvent{
 			CustomerID: customerID,
-			MetricName: method + " " + normalized,
+			MetricName: metric,
 			Quantity:   1,
 		})
 	})
@@ -101,6 +148,11 @@ func ChiMiddleware(opts MiddlewareOptions) func(http.Handler) http.Handler {
 		return HTTPMiddleware(next, opts)
 	}
 }
+
+// NormalizePath replaces dynamic path segments (numeric ids, UUIDs, Mongo ids)
+// with ":id". Useful inside a MetricNameFunc or for metadata; the middleware no
+// longer uses route-shaped metric names by default.
+func NormalizePath(path string) string { return normalizePath(path) }
 
 // normalizePath replaces dynamic segments with :id.
 func normalizePath(path string) string {

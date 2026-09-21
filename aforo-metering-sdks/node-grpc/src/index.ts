@@ -12,7 +12,7 @@
  *     tenantId: 'tenant_acme',
  *     productId: 'prod_grpc_001',
  *     apiKey: process.env.AFORO_API_KEY!,
- *     ingestorUrl: 'https://ingestor.aforo.ai',
+ *     ingestorUrl: 'https://usage-ingestor.aforo.ai',
  *     serviceName: 'acme.v1.UserService',
  *   });
  *
@@ -59,6 +59,11 @@ export interface AforoGrpcConfig {
 }
 
 const SDK_VERSION = '1.0.0';
+/** The ingestor rejects batch requests with more than 1000 events. */
+const MAX_BATCH_EVENTS = 1000;
+/** usage-ingestor limits (IngestUsageEventRequest). */
+const MAX_CUSTOMER_ID = 64;
+const MAX_IDEMPOTENCY_KEY = 255;
 
 // Mapping from gRPC status codes (numeric) to descriptor enum labels
 const GRPC_STATUS_LABELS: Record<number, string> = {
@@ -248,20 +253,27 @@ export class AforoGrpcBilling {
     durationMs: number,
     dataBytes?: number
   ): void {
-    if (!customerId) {
+    if (!customerId || !customerId.trim()) {
       // No customer resolved — skip metering (non-billable call, e.g. health check)
       return;
     }
+    if (customerId.length > MAX_CUSTOMER_ID) {
+      this.onError(new Error(`gRPC metering: customerId longer than ${MAX_CUSTOMER_ID} chars; event dropped`));
+      return;
+    }
+    const service = this.config.serviceName.slice(0, 255);
+    const grpcMethod = method.slice(0, 128);
     const now = new Date();
     const event: GrpcUsageEvent = {
       customerId,
       metricName: 'grpc_api.rpc_calls',
       quantity: 1,
       occurredAt: now.toISOString(),
-      idempotencyKey: `grpc:${this.config.tenantId}:${this.config.serviceName}:${method}:${now.getTime()}:${randomSuffix()}`,
+      // Tail-trimmed to the ingestor's limit, keeping the unique millis:random suffix.
+      idempotencyKey: `grpc:${this.config.tenantId}:${service}:${grpcMethod}:${now.getTime()}:${randomSuffix()}`.slice(-MAX_IDEMPOTENCY_KEY),
       productType: 'GRPC_API',
-      grpcService: this.config.serviceName,
-      grpcMethod: method,
+      grpcService: service,
+      grpcMethod,
       grpcStatusCode: status,
       grpcCallType: callType,
       messageCount,
@@ -282,18 +294,25 @@ export class AforoGrpcBilling {
 
   private async flush(): Promise<void> {
     if (this.buffer.length === 0) return;
-    const batch = this.buffer.splice(0, this.buffer.length);
+    const pending = this.buffer.splice(0, this.buffer.length);
+    // The ingestor accepts at most MAX_BATCH_EVENTS events per request.
+    for (let i = 0; i < pending.length; i += MAX_BATCH_EVENTS) {
+      await this.send(pending.slice(i, i + MAX_BATCH_EVENTS));
+    }
+  }
 
+  private async send(batch: GrpcUsageEvent[]): Promise<void> {
+    // Serialized once, so every retry re-sends the same idempotencyKeys.
     const body = JSON.stringify({ events: batch });
     const maxRetries = 3;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        const res = await fetch(this.config.ingestorUrl.replace(/\/$/, '') + '/v1/ingest/events', {
+        const res = await fetch(this.config.ingestorUrl.replace(/\/$/, '') + '/v1/ingest/batch', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${this.config.apiKey}`,
+            'X-API-Key': this.config.apiKey,
             'X-Tenant-Id': this.config.tenantId,
           },
           body,

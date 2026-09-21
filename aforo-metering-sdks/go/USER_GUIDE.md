@@ -11,7 +11,7 @@ A Go service that ships one usage event per HTTP request (or per manual `Track` 
 - Go 1.21+ (the module declares `go 1.21`).
 - An Aforo API key (`AFORO_API_KEY`) whose scope already carries your `tenant_id`. The SDK does **not** take a tenant id — it rides on the key.
 - A customer identifier per request. For the middleware path that's an inbound `X-Customer-Id` header your gateway/auth layer has already set; for the direct path it's whatever id you pass to `Track`.
-- The ingestor base URL — `https://ingest.aforo.ai` in production.
+- The ingestor base URL — `https://usage-ingestor.aforo.ai` in production.
 
 ## Step 1 — Add the module from source
 
@@ -46,7 +46,7 @@ import (
 
 client := metering.NewClient(metering.Options{
 	APIKey:  os.Getenv("AFORO_API_KEY"),
-	BaseURL: "https://ingest.aforo.ai",
+	BaseURL: "https://usage-ingestor.aforo.ai",
 })
 defer client.Close()
 ```
@@ -65,17 +65,20 @@ mux.HandleFunc("/v1/widgets", widgetsHandler)
 
 wrapped := metering.HTTPMiddleware(mux, metering.MiddlewareOptions{
 	APIKey:  os.Getenv("AFORO_API_KEY"),
-	BaseURL: "https://ingest.aforo.ai",
+	BaseURL: "https://usage-ingestor.aforo.ai",
 })
 http.ListenAndServe(":8080", wrapped)
 ```
 
 What the middleware does, after the response is written:
 
-- Resolves the customer id from `X-Customer-Id`, then `X-Api-Key`, then your `CustomerIDHeader` if set (a non-empty `CustomerIDHeader` value wins).
+- Skips `OPTIONS` (CORS preflight) requests.
+- Resolves the customer id from `CustomerIDFunc` if set, otherwise from the `CustomerIDHeader` header (default `X-Customer-Id`). The caller's `X-Api-Key` is never used — it is a secret, not a customer id.
 - Skips the request if the path matches an `ExcludePaths` prefix (defaults: `/health`, `/ready`, `/metrics`, `/favicon.ico`) or the status matches `ExcludeStatusCode`.
 - Skips the request if no customer id resolved.
-- Records `MetricName` as `"<METHOD> <normalized-path>"`, where numeric / UUID / 24-hex Mongo-id segments collapse to `:id` (e.g. `GET /v1/widgets/8f3c… ` → `GET /v1/widgets/:id`). A `vN` version segment is left intact.
+- Records the metric from `MetricNameFunc` if set and non-empty, otherwise `MetricName` (default `"api_calls"`).
+
+> ⚠ The metric must exist in your tenant's Aforo catalog: the ingestor rejects an unknown metric, and because it validates a batch as a whole, one rejected event fails every event in that batch. Earlier versions recorded `"<METHOD> <normalized-path>"`, which no catalog contains.
 
 > ⚠ The customer id is read straight from a request header. Only trust that header behind your own auth/gateway. `HTTPMiddleware` creates and owns its own client internally — you don't pass it one; tune it via `ClientOptions`.
 
@@ -125,8 +128,8 @@ A clean run prints `failed=0`. Then confirm server-side:
 The wire call the SDK makes:
 
 ```
-POST https://ingest.aforo.ai/v1/ingest/batch
-Authorization: Bearer <AFORO_API_KEY>
+POST https://usage-ingestor.aforo.ai/v1/ingest/batch
+X-API-Key: <AFORO_API_KEY>
 Content-Type: application/json
 
 {"events":[{"customerId":"cust_acme_001","metricName":"report_generated","quantity":1,"idempotencyKey":"…","occurredAt":"2026-06-29T…Z","metadata":{"format":"pdf"}}]}
@@ -140,8 +143,8 @@ Content-Type: application/json
 
 | Option | Type | Default | What it does |
 |---|---|---|---|
-| `APIKey` | `string` | — (required) | `Authorization: Bearer <APIKey>`. |
-| `BaseURL` | `string` | `https://ingest.aforo.ai` | Ingestor base; `/v1/ingest/batch` is appended. |
+| `APIKey` | `string` | — (required) | `X-API-Key: <APIKey>`. |
+| `BaseURL` | `string` | `https://usage-ingestor.aforo.ai` | Ingestor base; `/v1/ingest/batch` is appended. |
 | `FlushCount` | `int` | `50` | Flush threshold + per-batch drain size. |
 | `FlushInterval` | `time.Duration` | `5s` | Background flush cadence. |
 | `MaxQueueSize` | `int` | `10000` | Ring-buffer capacity; oldest event dropped when full. |
@@ -155,10 +158,13 @@ Content-Type: application/json
 | Option | Type | Default | What it does |
 |---|---|---|---|
 | `APIKey` | `string` | — (required) | API key for the internal client. |
-| `BaseURL` | `string` | `https://ingest.aforo.ai` | Ingestor base for the internal client. |
+| `BaseURL` | `string` | `https://usage-ingestor.aforo.ai` | Ingestor base for the internal client. |
 | `ExcludePaths` | `[]string` | `["/health","/ready","/metrics","/favicon.ico"]` | Path prefixes to skip; your value replaces the defaults. |
 | `ExcludeStatusCode` | `[]int` | none | Status codes to skip. |
-| `CustomerIDHeader` | `string` | `X-Customer-Id` then `X-Api-Key` | Extra header for the customer id; non-empty value wins. |
+| `MetricName` | `string` | `api_calls` (`DefaultMetricName`) | Fixed metric recorded per request. Must exist in your Aforo catalog. |
+| `MetricNameFunc` | `func(*http.Request) string` | nil | Per-request metric; wins over `MetricName`. An empty result falls back to `MetricName`. |
+| `CustomerIDHeader` | `string` | `X-Customer-Id` | Header carrying the Aforo customer id. The caller's `X-Api-Key` is never read. |
+| `CustomerIDFunc` | `func(*http.Request) string` | nil | Per-request customer id; wins over `CustomerIDHeader`. Empty result → request not metered. |
 | `ClientOptions` | `*Options` | nil | Full client tuning; `APIKey`/`BaseURL` above override it. |
 
 ## Troubleshooting
@@ -168,7 +174,7 @@ Content-Type: application/json
 | `Track` returns `ErrClientClosed` | `Close()` already ran on this client | Don't reuse a closed client; create a new one, or move `Close()` to actual shutdown. |
 | Events never arrive, no error | Process exited before a flush and `Close()` wasn't called | Add `defer client.Close()` / call it in your signal handler. The buffer is in-memory only. |
 | `Flush()` returns `Failed > 0` repeatedly | Bad API key, wrong `BaseURL`, or `4xx` from the ingestor | Verify `AFORO_API_KEY`, confirm `BaseURL`, and check the metric exists for the key's tenant. Non-`408`/`429` `4xx` is not retried. |
-| Middleware records nothing for some requests | No resolvable customer id, excluded path prefix, or excluded status | Confirm `X-Customer-Id` (or your `CustomerIDHeader`) is set upstream and the path/status isn't in the exclude lists. |
+| Middleware records nothing for some requests | No resolvable customer id, excluded path prefix, or excluded status | Confirm `X-Customer-Id` (or your `CustomerIDHeader` / `CustomerIDFunc`) is set upstream and the path/status isn't in the exclude lists. |
 | Two identical calls show as one event | Auto idempotency key collided (same customer/metric/quantity/`OccurredAt`) | Vary `OccurredAt` or pass a distinct `IdempotencyKey`. |
 | Older events seem missing under load | Buffer hit `MaxQueueSize` and dropped oldest entries | Raise `MaxQueueSize`, lower `FlushInterval`, or lower `FlushCount` so flushes drain sooner. |
 

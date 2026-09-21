@@ -7,6 +7,9 @@ import type { ProxyUsageEvent } from '../types.js';
 import type { IngestorClient } from './IngestorClient.js';
 import { logger } from '../util/logger.js';
 
+/** The ingestor's per-request cap on POST /v1/ingest/batch (IngestBatchRequest). */
+export const MAX_BATCH_EVENTS = 1000;
+
 export interface EventBufferConfig {
   flushCount: number;
   flushIntervalMs: number;
@@ -37,8 +40,22 @@ export class EventBuffer {
     if (this.buffer.length === 0 || this.flushing) return;
 
     this.flushing = true;
-    const events = this.buffer.splice(0);
+    const pending = this.buffer.splice(0);
 
+    // POST /v1/ingest/batch rejects more than MAX_BATCH_EVENTS events with 400
+    // (IngestBatchRequest @Size(max = 1000)), losing every event in the batch.
+    // Events pushed while a flush is in flight accumulate past flushCount, so
+    // the next flush can hold more than that -- send it in slices.
+    try {
+      for (let i = 0; i < pending.length; i += MAX_BATCH_EVENTS) {
+        await this.sendSlice(pending.slice(i, i + MAX_BATCH_EVENTS));
+      }
+    } finally {
+      this.flushing = false;
+    }
+  }
+
+  private async sendSlice(events: ProxyUsageEvent[]): Promise<void> {
     try {
       const result = await this.client.sendBatch(events);
       if (result) {
@@ -52,8 +69,6 @@ export class EventBuffer {
       }
     } catch (err) {
       logger.error('Flush error', { error: (err as Error).message, count: events.length });
-    } finally {
-      this.flushing = false;
     }
   }
 

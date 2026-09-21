@@ -48,7 +48,7 @@ AforoGrpcBilling billing = AforoGrpcBilling.newBuilder()
         .tenantId("tenant_acme")
         .productId("prod_grpc_user_svc")
         .apiKey(System.getenv("AFORO_API_KEY"))
-        .ingestorUrl("https://ingest.aforo.ai")
+        .ingestorUrl("https://usage-ingestor.aforo.ai")
         .serviceName("acme.v1.UserService")
         .build();
 
@@ -59,7 +59,7 @@ Server server = ServerBuilder.forPort(50051)
         .start();
 ```
 
-> ⚠ `ingestorUrl` is the host only — the SDK appends `/v1/ingest/events`. Pass `https://ingest.aforo.ai`, not the full path.
+> ⚠ `ingestorUrl` is the host only — the SDK appends `/v1/ingest/batch`. Pass `https://usage-ingestor.aforo.ai`, not the full path.
 
 ## Step 4 — Make the customer id reachable from metadata
 
@@ -112,8 +112,8 @@ billing.record("ListUsers", "SERVER_STREAM", customerId, "OK", durationMs);
 |---|---|---|---|
 | `tenantId` | `String` | *(required)* | `X-Tenant-Id` header. |
 | `productId` | `String` | *(required)* | `metadata.productId` + idempotency key. |
-| `apiKey` | `String` | *(required)* | Bearer token. |
-| `ingestorUrl` | `String` | *(required)* | Host; SDK appends `/v1/ingest/events`. |
+| `apiKey` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
+| `ingestorUrl` | `String` | *(required)* | Host; SDK appends `/v1/ingest/batch`. |
 | `serviceName` | `String` | *(required)* | `grpcService` field + idempotency key. |
 | `flushCount` | `int` | `50` | Events per immediate flush. |
 | `flushIntervalMs` | `long` | `5000` | Background flush cadence (ms). |
@@ -125,7 +125,7 @@ billing.record("ListUsers", "SERVER_STREAM", customerId, "OK", durationMs);
 |---|---|---|
 | `IllegalArgumentException: <field> is required` at build | A required builder field (`tenantId` / `productId` / `apiKey` / `ingestorUrl` / `serviceName`) is blank | Set all five; they're validated in the constructor. |
 | No events appear, no errors logged | Customer id not on metadata, so every call is skipped | Have the client send `x-customer-id`, or supply a `customerIdExtractor`. |
-| Events POST to a 404 | `ingestorUrl` already includes the path | Pass the host only; the SDK appends `/v1/ingest/events`. |
+| Events POST to a 404 | `ingestorUrl` already includes the path | Pass the host only; the SDK appends `/v1/ingest/batch`. |
 | `flush exhausted retries — dropped N events` in logs | Ingestor returned non-2xx on all 3 attempts (bad key, unknown metric, network) | Verify the key + `X-Tenant-Id`; ensure the `grpc_api.rpc_calls` metric exists in Aforo. |
 | Streaming calls all show `messageCount = 1` | The interceptor counts one event per call, not per message | Call `billing.record(...)` inside the streaming handler for exact counts. |
 | `grpcStatusCode` is `UNKNOWN` for errors you expected to classify | Your handler threw a raw exception rather than setting a `Status` | Map errors to gRPC `Status` codes in your service; the SDK reports whatever code the call closes with. |

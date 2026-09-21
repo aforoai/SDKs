@@ -4,7 +4,7 @@
 
 ## What you'll build
 
-A Java service that emits one Aforo usage event per billable action and ships those events in batches to `https://ingest.aforo.ai/v1/ingest/batch`. By the end you'll have a metered event confirmed as landed in Aforo.
+A Java service that emits one Aforo usage event per billable action and ships those events in batches to `https://usage-ingestor.aforo.ai/v1/ingest/batch`. By the end you'll have a metered event confirmed as landed in Aforo.
 
 ## Prerequisites
 
@@ -77,7 +77,7 @@ Add the same dependency, then set the properties:
 aforo:
   enabled: true                 # MUST be exactly "true" — auto-config is off otherwise
   api-key: ${AFORO_API_KEY}
-  base-url: https://ingest.aforo.ai
+  base-url: https://usage-ingestor.aforo.ai
 ```
 
 That's the whole wiring. `AforoMeteringAutoConfiguration` registers:
@@ -87,11 +87,11 @@ That's the whole wiring. `AforoMeteringAutoConfiguration` registers:
 
 The filter records one event per request **after** `filterChain.doFilter(...)` returns:
 
-- `metricName` = `"<METHOD> <normalized-path>"`, e.g. `GET /users/:id`. Path normalization replaces UUIDs, numeric ids, Mongo ObjectIds, and mixed alphanumeric ids with `:id`. When Spring MVC's matched route pattern is on the request, the SDK uses that instead of the heuristic.
+- `metricName` = `aforo.metric-name` (default `api_calls`), or whatever an `AforoServletFilter.MetricNameResolver` bean returns for the request. The metric must exist in your tenant's Aforo catalog: the ingestor rejects an unknown metric, and because it validates a batch as a whole, one rejected event fails every event in that batch. (Earlier versions sent `"<METHOD> <normalized-path>"`, which no catalog contains.)
 - `quantity` = `1`, `metadata` = `{"gateway":"java-servlet","status":<httpStatus>}`.
-- These paths are skipped by default: `/health`, `/ready`, `/metrics`, `/favicon.ico`, `/actuator`.
+- These paths are skipped by default: `/health`, `/ready`, `/metrics`, `/favicon.ico`, `/actuator`. `OPTIONS` (CORS preflight) requests are never metered.
 
-> ⚠ The filter resolves the customer in this order: Spring Security principal → `X-Customer-Id` header → `X-Api-Key` header. If none resolves, the request is **not** metered (so health checks and unauthenticated probes stay silent). Make sure your auth populates the principal, or your gateway sets `X-Customer-Id`.
+> ⚠ The filter resolves the customer in this order: an `AforoServletFilter.CustomerIdResolver` bean if you declared one; otherwise the Spring Security principal (only when `aforo.use-principal-as-customer-id: true`) → the `aforo.customer-id-header` header (default `X-Customer-Id`). The caller's `X-Api-Key` is never used — it is a secret, not a customer id. If none resolves, the request is **not** metered (so health checks and unauthenticated probes stay silent).
 
 ## Step 5 — Force a flush and verify it landed
 
@@ -109,14 +109,14 @@ A `sent` count equal to what you tracked and `failed == 0` means the ingestor re
 
 - Open the Aforo console → **Ingestion → Recent Events** and filter by your `customerId` (`cust_acme_001`) and `metricName` (`api_calls`). Your event appears within a few seconds of the flush.
 
-To watch the wire during local debugging, point `base-url` / `baseUrl` at a request inspector and confirm the body is `{"events":[{"customerId":...,"metricName":...,"quantity":...,"idempotencyKey":...,"occurredAt":...}]}` with `Authorization: Bearer <key>`.
+To watch the wire during local debugging, point `base-url` / `baseUrl` at a request inspector and confirm the body is `{"events":[{"customerId":...,"metricName":...,"quantity":...,"idempotencyKey":...,"occurredAt":...}]}` with `X-API-Key: <key>`.
 
 ## Configuration reference
 
 | Option (manual) | Spring property | Type | Default | What it does |
 |---|---|---|---|---|
-| `apiKey` (ctor) | `aforo.api-key` | `String` | *(required)* | Bearer token. |
-| `baseUrl(...)` | `aforo.base-url` | `String` | `https://ingest.aforo.ai` | Ingestion host; SDK appends `/v1/ingest/batch`. |
+| `apiKey` (ctor) | `aforo.api-key` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
+| `baseUrl(...)` | `aforo.base-url` | `String` | `https://usage-ingestor.aforo.ai` | Ingestion host; SDK appends `/v1/ingest/batch`. |
 | `flushCount(...)` | `aforo.flush-count` | `int` | `50` | Buffer size that triggers an immediate flush. |
 | `flushIntervalMs(...)` | `aforo.flush-interval-ms` | `long` | `5000` | Background flush cadence (ms). |
 | `maxQueueSize(...)` | — | `int` | `10000` | Ring-buffer capacity; oldest events overwritten when full. |
@@ -124,6 +124,9 @@ To watch the wire during local debugging, point `base-url` / `baseUrl` at a requ
 | `retryBaseMs(...)` | — | `long` | `1000` | Base backoff (ms), doubles per attempt; `429` honors `Retry-After`. |
 | `timeoutMs(...)` | — | `long` | `10000` | HTTP connect timeout (ms). |
 | `aforo.enabled` | `aforo.enabled` | — | *(unset → off)* | Spring auto-config activates only when `true`. |
+| `metricName(...)` / `metricNameResolver(...)` on `AforoServletFilter` | `aforo.metric-name` | `String` | `api_calls` | Metric per request; must exist in your Aforo catalog. |
+| `customerIdHeader(...)` / `customerIdResolver(...)` | `aforo.customer-id-header` | `String` | `X-Customer-Id` | Where the customer id comes from. |
+| `usePrincipalAsCustomerId(...)` | `aforo.use-principal-as-customer-id` | `boolean` | `false` | Use the principal's name as the customer id. |
 
 ## Troubleshooting
 
@@ -132,7 +135,7 @@ To watch the wire during local debugging, point `base-url` / `baseUrl` at a requ
 | Spring auto-config does nothing | `aforo.enabled` is unset or not the literal `true` | Set `aforo.enabled: true`. It's gated by `@ConditionalOnProperty(havingValue = "true")`. |
 | `IllegalArgumentException: apiKey is required` at startup | `AFORO_API_KEY` is empty / not exported | Export the env var and confirm it reaches `aforo.api-key` / `AforoOptions`. |
 | `flush()` returns `failed > 0` | Ingestor returned a non-2xx. 4xx (except 408/429) is **not** retried — usually a bad/expired key or an unknown `metricName` | Check the key; create the metric in Aforo so its name matches `metricName`; check service logs at `FINE` for the status code. |
-| Events tracked but never appear in Aforo | Process exited before a flush, or the customer resolved to `null` in the filter | Use try-with-resources / `close()`; ensure the principal or `X-Customer-Id` is present so the filter doesn't skip the request. |
+| Events tracked but never appear in Aforo | Process exited before a flush, or the customer resolved to `null` in the filter | Use try-with-resources / `close()`; ensure `X-Customer-Id` (or your resolver / opted-in principal) is present so the filter doesn't skip the request. |
 | `IllegalStateException: AforoClient is closed` | `track(...)` called after `close()` | Don't reuse a closed client; build a new `AforoClient` (or keep the Spring-managed bean for the app lifetime). |
 | Health checks show up as metered traffic | A custom filter path or non-default excludes | The default excludes are `/health /ready /metrics /favicon.ico /actuator`. Construct `AforoServletFilter(client, yourExcludeList)` directly if you need different ones. |
 

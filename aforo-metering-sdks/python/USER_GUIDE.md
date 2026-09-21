@@ -34,7 +34,7 @@ The API key is the only required value. Keep it out of source:
 export AFORO_API_KEY="sk_live_…"
 ```
 
-`base_url` defaults to `https://ingest.aforo.ai`. Only override it to point at a non-production ingestor.
+`base_url` defaults to `https://usage-ingestor.aforo.ai`. Only override it to point at a non-production ingestor.
 
 ## Step 3 — Create a client and emit one event
 
@@ -89,7 +89,9 @@ client.shutdown()   # drains the buffer; safe to call once
 
 ## Step 7 (alternative) — Meter every request with middleware
 
-Skip per-call `track()` entirely. The middleware builds its own client and emits `"<METHOD> <normalized_path>"` per request.
+Skip per-call `track()` entirely. The middleware builds its own client and emits one event per request, against `metric_name` (default `"api_calls"`).
+
+> ⚠ The metric must exist in your Aforo catalog: the ingestor rejects unknown metrics, and one rejected event fails the whole batch. Earlier versions defaulted to `"<METHOD> <normalized_path>"`, which no catalog contains. Configure `metric_name` (FastAPI/Flask keyword, or `AFORO_METRIC_NAME` in Flask config / Django settings) as a fixed name or a callable.
 
 **FastAPI / Starlette:**
 
@@ -117,7 +119,7 @@ MIDDLEWARE = [..., "aforo.middleware.django.AforoMeteringMiddleware"]
 AFORO_API_KEY = os.environ["AFORO_API_KEY"]
 ```
 
-> ⚠ The middleware only meters requests it can attribute to a customer. It reads `X-Customer-Id`, then falls back to `X-Api-Key` (Django also tries `request.user.id` first). **No customer ID → the request is silently not metered.** Set that header at your gateway/auth layer; do not trust a value the end client can spoof for a customer it doesn't own.
+> ⚠ The middleware only meters requests it can attribute to a customer. Configure `customer_id` (keyword, or `AFORO_CUSTOMER_ID` in Flask config / Django settings); by default it reads `X-Customer-Id` (Django tries `request.user.id` first). The caller's `X-Api-Key` is never used — it is the end user's secret, not a customer id. **No customer ID → the request is silently not metered.** `OPTIONS` (CORS preflight) requests are never metered. Set that header at your gateway/auth layer; do not trust a value the end client can spoof for a customer it doesn't own.
 
 > ⚠ Default `exclude_paths` skip health/metrics/docs routes (`/health`, `/ready`, `/metrics`, `/favicon.ico`, plus `/openapi.json` and `/docs` on FastAPI, `/admin` and `/static` on Django, `/static` on Flask). Override `exclude_paths` to change this.
 
@@ -127,8 +129,8 @@ AFORO_API_KEY = os.environ["AFORO_API_KEY"]
 
 | Option | Type | Default | What it does |
 |---|---|---|---|
-| `api_key` | `str` | required | Bearer token for the ingestor. |
-| `base_url` | `str` | `https://ingest.aforo.ai` | Host only; `/v1/ingest/batch` is appended. |
+| `api_key` | `str` | required | Aforo API key, sent to the ingestor as `X-API-Key`. |
+| `base_url` | `str` | `https://usage-ingestor.aforo.ai` | Host only; `/v1/ingest/batch` is appended. |
 | `flush_count` | `int` | `50` | Buffer threshold + max batch size. |
 | `flush_interval` | `float` | `5.0` | Background flush cadence (seconds). |
 | `max_queue_size` | `int` | `10000` | Ring-buffer cap; oldest dropped on overflow. |
@@ -151,9 +153,9 @@ AFORO_API_KEY = os.environ["AFORO_API_KEY"]
 
 `MiddlewareOptions` (extra knobs for the framework adapters): `metric_name`, `quantity`, `customer_id`, `metadata` (each a constant or a callable over the request/scope), `exclude_paths` (`list[str]`), `exclude_status_codes` (`list[int]`), plus `flush_count` / `flush_interval` / `max_queue_size` forwarded to the client.
 
-### Session heartbeats (advanced)
+### Session heartbeats (removed)
 
-`start_session(session_id, product_type="AI_AGENT")` / `end_session()` emit `system.session.heartbeat` events every 30 s for long-running sessions (e.g. agent runs), then a `SESSION_END` event on close. Use these only if your Aforo product is configured for session/heartbeat billing — otherwise stick to `track()`.
+`start_session(session_id, product_type="AI_AGENT")` is now a deprecated no-op and `end_session()` only flushes. They used to emit heartbeats, but they were `system.session.heartbeat` events with `quantity: 0` sent in the usage batch, and the ingestor rejects quantity 0 and fails the whole batch with 400, taking every real event batched with it down. The ingestor has no dedicated heartbeat endpoint. Use `track()` for billable usage.
 
 ## Troubleshooting
 
@@ -162,7 +164,7 @@ AFORO_API_KEY = os.environ["AFORO_API_KEY"]
 | `flush()` returns `sent=0, failed=0` | Buffer was empty — `track()` was never called, or another flush already drained it. | Confirm `client.buffered_count` before flushing; check you're calling the same client instance. |
 | `FlushResult.failed > 0`, logs show "Ingestor returned 401/403 — not retrying" | Bad or unscoped API key. 4xx is non-retryable, so the batch is dropped. | Fix `AFORO_API_KEY`; verify the key belongs to the tenant you're sending for. |
 | `sent` is positive but nothing in the console | Right delivery, wrong target or unmapped metric. | Confirm `base_url` host; confirm `metric_name` is attached to a rate plan / metric definition in Aforo. |
-| Middleware never emits events | No `X-Customer-Id` / `X-Api-Key` on requests, or the path is excluded. | Set the customer header upstream; check your route isn't in `exclude_paths`. |
+| Middleware never emits events | No `X-Customer-Id` on requests (and no `customer_id` resolver), or the path is excluded. | Set the customer header upstream; check your route isn't in `exclude_paths`. |
 | Events lost on process restart | `SIGKILL`/crash skips `atexit`; buffered events never flushed. | Call `client.shutdown()` in your shutdown hook; lower `flush_interval`/`flush_count` for tighter delivery. |
 | `RuntimeError: AforoClient is shut down` | `track()` called after `shutdown()`. | Build a fresh client, or don't shut down until you're done emitting. |
 | Sudden gaps under burst load | Ring buffer hit `max_queue_size`; oldest events dropped to make room. | Raise `max_queue_size`, or lower `flush_interval` so the buffer drains faster. |

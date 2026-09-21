@@ -35,6 +35,10 @@ public final class AforoWsBilling implements AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(AforoWsBilling.class.getName());
     private static final String SDK_VERSION = "1.0.0";
+    /** The ingestor rejects {@code /v1/ingest/batch} requests with more than 1000 events. */
+    static final int MAX_EVENTS_PER_REQUEST = 1000;
+    private static final int MAX_CUSTOMER_ID = 64;
+    private static final int MAX_IDEMPOTENCY_KEY = 255;
 
     private final String tenantId, productId, apiKey;
     private final URI ingestorUri;
@@ -57,7 +61,7 @@ public final class AforoWsBilling implements AutoCloseable {
         this.tenantId = require(b.tenantId, "tenantId");
         this.productId = require(b.productId, "productId");
         this.apiKey = require(b.apiKey, "apiKey");
-        this.ingestorUri = URI.create(stripTrailingSlash(require(b.ingestorUrl, "ingestorUrl")) + "/v1/ingest/events");
+        this.ingestorUri = URI.create(stripTrailingSlash(require(b.ingestorUrl, "ingestorUrl")) + "/v1/ingest/batch");
         this.perFrameEvents = b.perFrameEvents;
         this.flushCount = b.flushCount;
         this.flushIntervalMs = b.flushIntervalMs;
@@ -66,7 +70,7 @@ public final class AforoWsBilling implements AutoCloseable {
 
     /** Open a billing-tracked connection. Returns the synthetic connection ID. */
     public String openConnection(String customerId, Map<String, Object> metadata) {
-        if (customerId == null || customerId.isBlank()) return null;
+        if (!validCustomerId(customerId)) return null;
         String connectionId = UUID.randomUUID().toString();
         active.put(connectionId, new ConnectionState(customerId, System.currentTimeMillis(), metadata));
         // Merge caller metadata into the OPEN marker so per-connection tags (region,
@@ -123,23 +127,35 @@ public final class AforoWsBilling implements AutoCloseable {
                 ? "websocket_api.connection_closed" : "websocket_api.message");
         e.put("quantity", 1);
         e.put("occurredAt", now.toString());
-        e.put("idempotencyKey", "ws:" + tenantId + ":" + connectionId + ":" + frameType + ":"
-                + now.toEpochMilli() + ":" + UUID.randomUUID().toString().substring(0, 8));
+        e.put("idempotencyKey", idempotencyKey("ws:" + tenantId + ":" + connectionId + ":" + frameType, now));
         e.put("productType", "WEBSOCKET_API");
         e.put("wsConnectionId", connectionId);
-        e.put("wsDirection", direction);
-        e.put("wsFrameType", frameType);
         e.put("messageCount", frames);
         e.put("dataBytes", bytes);
-        e.put("durationMs", durationMs);
+        e.put("executionDurationMs", (int) Math.max(0, Math.min(durationMs, Integer.MAX_VALUE)));
         if (closeReason != null) e.put("wsCloseReason", closeReason);
 
         Map<String, Object> meta = new HashMap<>();
         if (metadata != null) meta.putAll(metadata);
+        // wsDirection / wsFrameType are enum-validated server-side; an out-of-set value would
+        // get the event rejected, so unrecognised values are kept in metadata instead.
+        putEnumOrMetadata(e, meta, "wsDirection", direction, WS_DIRECTIONS);
+        putEnumOrMetadata(e, meta, "wsFrameType", frameType, WS_FRAME_TYPES);
         meta.put("sdkVersion", SDK_VERSION);
         meta.put("productId", productId);
         e.put("metadata", meta);
         return e;
+    }
+
+    private static final java.util.Set<String> WS_DIRECTIONS = java.util.Set.of("CLIENT_TO_SERVER", "SERVER_TO_CLIENT");
+    private static final java.util.Set<String> WS_FRAME_TYPES = java.util.Set.of("TEXT", "BINARY", "PING", "PONG", "CLOSE");
+
+    private static void putEnumOrMetadata(Map<String, Object> event, Map<String, Object> meta,
+                                          String field, String value, java.util.Set<String> allowed) {
+        if (value == null) return;
+        String upper = value.toUpperCase();
+        if (allowed.contains(upper)) event.put(field, upper);
+        else meta.put(field, value);
     }
 
     private static String mapCloseReason(int code) {
@@ -167,11 +183,26 @@ public final class AforoWsBilling implements AutoCloseable {
         while ((ev = buffer.poll()) != null) { batch.add(ev); bufferSize.decrementAndGet(); }
         if (batch.isEmpty()) return;
 
-        String body = mapper.writeValueAsString(Map.of("events", batch));
+        // Slice into requests of at most MAX_EVENTS_PER_REQUEST; a failed slice does
+        // not stop the remaining slices from being delivered.
+        Exception failure = null;
+        for (int from = 0; from < batch.size(); from += MAX_EVENTS_PER_REQUEST) {
+            try {
+                send(batch.subList(from, Math.min(batch.size(), from + MAX_EVENTS_PER_REQUEST)));
+            } catch (Exception e) {
+                failure = e;
+            }
+        }
+        if (failure != null) throw failure;
+    }
+
+    /** POSTs one slice. The body is serialized once, so every retry resends the same idempotency keys. */
+    private void send(java.util.List<Map<String, Object>> events) throws Exception {
+        String body = mapper.writeValueAsString(Map.of("events", events));
         HttpRequest req = HttpRequest.newBuilder(ingestorUri)
                 .timeout(Duration.ofSeconds(10))
                 .header("Content-Type", "application/json")
-                .header("Authorization", "Bearer " + apiKey)
+                .header("X-API-Key", apiKey)
                 .header("X-Tenant-Id", tenantId)
                 .POST(HttpRequest.BodyPublishers.ofString(body))
                 .build();
@@ -185,7 +216,7 @@ public final class AforoWsBilling implements AutoCloseable {
             }
             Thread.sleep((long) Math.pow(2, attempt - 1) * 1000);
         }
-        LOG.warning("[aforo-ws] flush exhausted retries — dropped " + batch.size() + " events");
+        LOG.warning("[aforo-ws] flush exhausted retries — dropped " + events.size() + " events");
     }
 
     @Override
@@ -209,6 +240,22 @@ public final class AforoWsBilling implements AutoCloseable {
             this.startMs = startMs;
             this.metadata = metadata;
         }
+    }
+
+    /** True when {@code customerId} satisfies the ingestor (non-blank, at most 64 chars). */
+    private static boolean validCustomerId(String customerId) {
+        return customerId != null && !customerId.isBlank() && customerId.length() <= MAX_CUSTOMER_ID;
+    }
+
+    /** Joins {@code natural:suffix}, trimming {@code natural} so the key stays within 255 chars. */
+    private static String idempotencyKey(String natural, Instant now) {
+        String suffix = now.toEpochMilli() + ":" + UUID.randomUUID().toString().substring(0, 8);
+        int room = MAX_IDEMPOTENCY_KEY - suffix.length() - 1;
+        return (natural.length() > room ? natural.substring(0, room) : natural) + ":" + suffix;
+    }
+
+    private static String truncate(String s, int max) {
+        return s == null || s.length() <= max ? s : s.substring(0, max);
     }
 
     private static String require(String s, String name) {

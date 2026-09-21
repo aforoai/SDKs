@@ -50,7 +50,7 @@ def cfg():
         tenant_id="tenant-001",
         product_id="prod-ws-001",
         api_key="sk_ws_abc",
-        ingestor_url="https://ingestor.aforo.ai",
+        ingestor_url="https://usage-ingestor.aforo.ai",
     )
 
 
@@ -119,7 +119,8 @@ def test_push_connection_closed_uses_close_metric(http, cfg):
     assert ev["wsCloseReason"] == "NORMAL_CLOSURE"
     assert ev["messageCount"] == 10
     assert ev["dataBytes"] == 500
-    assert ev["durationMs"] == 1800000
+    assert ev["executionDurationMs"] == 1800000
+    assert "durationMs" not in ev
     b.shutdown()
 
 

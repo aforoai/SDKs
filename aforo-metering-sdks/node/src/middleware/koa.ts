@@ -1,6 +1,6 @@
 import { AforoClient } from '../client';
 import { MiddlewareOptions } from '../types';
-import { normalizePath } from '../path-normalizer';
+import { isPreflight, resolveMetricName, firstNonEmpty } from './common';
 
 const DEFAULT_EXCLUDE_PATHS = ['/health', '/ready', '/metrics', '/favicon.ico'];
 
@@ -32,20 +32,11 @@ export function koaMiddleware(options: MiddlewareOptions) {
       const method: string = ctx.method || 'UNKNOWN';
       const statusCode: number = ctx.status || 0;
 
+      if (isPreflight(method)) return;
       if (excludePaths.some((p: string) => path.startsWith(p))) return;
       if (excludeStatusCodes.includes(statusCode)) return;
 
-      const routeTemplate: string | undefined = ctx._matchedRoute ?? ctx.routerPath;
-      const normalizedPath = normalizePath(path.split('?')[0], routeTemplate);
-
-      let metricName: string;
-      if (typeof options.metricName === 'function') {
-        metricName = options.metricName(ctx.request, ctx.response);
-      } else if (options.metricName) {
-        metricName = options.metricName;
-      } else {
-        metricName = `${method} ${normalizedPath}`;
-      }
+      const metricName = resolveMetricName(options, ctx.request, ctx.response);
 
       let quantity: number;
       if (typeof options.quantity === 'function') {
@@ -60,10 +51,8 @@ export function koaMiddleware(options: MiddlewareOptions) {
       } else if (options.customerId) {
         customerId = options.customerId;
       } else {
-        customerId = ctx.state?.user?.id
-          ?? ctx.get('x-customer-id')
-          ?? ctx.get('x-api-key')
-          ?? null;
+        // Never the caller's X-Api-Key: that is a secret, not a customer id.
+        customerId = firstNonEmpty(ctx.state?.user?.id, ctx.get('x-customer-id'));
       }
 
       if (!customerId) return;

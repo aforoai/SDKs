@@ -33,7 +33,7 @@ const config = () => ({
   tenantId: 'tenant-001',
   productId: 'prod-gql-001',
   apiKey: 'sk_gql_abc',
-  ingestorUrl: 'https://ingestor.aforo.ai',
+  ingestorUrl: 'https://usage-ingestor.aforo.ai',
   schemaVersion: 'v2.1',
 });
 
@@ -197,7 +197,7 @@ describe('record() operation detection', () => {
 // ── Buffer + flush shape ────────────────────────────────────────────────
 
 describe('flush', () => {
-  test('POST to ingestor /v1/ingest/events with correct headers', async () => {
+  test('POST to ingestor /v1/ingest/batch with correct headers', async () => {
     const billing = new AforoGraphQlBilling({ ...config(), flushCount: 1 });
     billing.record({
       customerId: 'cust_001',
@@ -208,9 +208,10 @@ describe('flush', () => {
     });
     await new Promise((r) => setTimeout(r, 20));
     const req = capturedRequests[0];
-    expect(req.url).toBe('https://ingestor.aforo.ai/v1/ingest/events');
+    expect(req.url).toBe('https://usage-ingestor.aforo.ai/v1/ingest/batch');
     const headers = req.init.headers as Record<string, string>;
-    expect(headers['Authorization']).toBe('Bearer sk_gql_abc');
+    expect(headers['X-API-Key']).toBe('sk_gql_abc');
+    expect(headers['Authorization']).toBeUndefined();
     expect(headers['X-Tenant-Id']).toBe('tenant-001');
     await billing.shutdown();
   });
@@ -244,5 +245,62 @@ describe('flush', () => {
     await billing.shutdown();
     expect(capturedRequests).toHaveLength(1);
     expect(capturedRequests[0].body.events).toHaveLength(3);
+  });
+});
+
+function assertBatchContract(reqs: Array<{ url: string; init: RequestInit; body: any }>, apiKey: string, allowed: string[]) {
+  const allowedSet = new Set(allowed);
+  expect(reqs.length).toBeGreaterThan(0);
+  for (const r of reqs) {
+    expect(r.url).toBe('https://usage-ingestor.aforo.ai/v1/ingest/batch');
+    expect((r.init.headers as Record<string, string>)['X-API-Key']).toBe(apiKey);
+    expect(Object.keys(r.body)).toEqual(['events']);
+    expect(r.body.events.length).toBeGreaterThan(0);
+    expect(r.body.events.length).toBeLessThanOrEqual(1000);
+    for (const e of r.body.events) {
+      for (const k of Object.keys(e)) expect(allowedSet.has(k) ? k : `unexpected field ${k}`).toBe(k);
+      expect(JSON.stringify(e)).not.toContain(apiKey);
+      for (const k of ['customerId', 'metricName', 'occurredAt', 'idempotencyKey']) {
+        expect(typeof e[k]).toBe('string');
+        expect(e[k].trim()).not.toBe('');
+      }
+      expect(e.quantity).toBeGreaterThan(0);
+    }
+  }
+}
+
+describe('ingest batch contract', () => {
+  const record = (b: AforoGraphQlBilling, i = 0) => b.record({
+    customerId: 'cust_001', query: `query Op${i} { a { b } }`, operationName: `Op${i}`,
+    durationMs: 5.6, hasErrors: false, responseBytes: 10,
+  });
+  const FIELDS = ['customerId', 'metricName', 'quantity', 'occurredAt', 'idempotencyKey', 'productType', 'metadata', 'gqlOperationType', 'gqlOperationName',
+    'gqlComplexity', 'gqlFieldCount', 'gqlHasErrors', 'dataBytes', 'executionDurationMs'];
+
+  test('events carry only IngestUsageEventRequest fields', async () => {
+    const billing = new AforoGraphQlBilling({ ...config(), flushCount: 100 });
+    record(billing);
+    await billing.shutdown();
+    assertBatchContract(capturedRequests, 'sk_gql_abc', FIELDS);
+    expect(capturedRequests[0].body.events[0].executionDurationMs).toBe(6);
+  });
+
+  test('>1000 buffered events are split into requests of <=1000', async () => {
+    const billing = new AforoGraphQlBilling({ ...config(), flushCount: 5000 });
+    for (let i = 0; i < 2500; i++) record(billing, i);
+    await billing.shutdown();
+    expect(capturedRequests.map((r) => r.body.events.length)).toEqual([1000, 1000, 500]);
+    assertBatchContract(capturedRequests, 'sk_gql_abc', FIELDS);
+  });
+
+  test('long operation name is trimmed to 255 and idempotencyKey to 255', async () => {
+    const billing = new AforoGraphQlBilling({ ...config(), flushCount: 100 });
+    const name = 'Op' + 'x'.repeat(400);
+    billing.record({ customerId: 'cust_001', query: `query ${name} { a }`, operationName: name, durationMs: 1, hasErrors: false });
+    await billing.shutdown();
+    const ev = capturedRequests[0].body.events[0];
+    expect(ev.gqlOperationName.length).toBe(255);
+    expect(ev.idempotencyKey.length).toBeLessThanOrEqual(255);
+    expect(ev.idempotencyKey).toMatch(/:\d+:[a-z0-9]{8}$/);
   });
 });

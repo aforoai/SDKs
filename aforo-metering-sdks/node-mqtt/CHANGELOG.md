@@ -4,6 +4,14 @@ All notable changes to `@aforo/mqtt-metering` are documented here. Format follow
 
 ## [Unreleased]
 
+### Fixed
+- **Breaking (fix):** the tenant API key is sent as `X-API-Key` instead of `Authorization: Bearer`. The ingestor parses Bearer values as JWTs and rejected every request 401 (sending both headers is also 401), so no usage was being delivered.
+- Docs and examples use the real ingestor host `https://usage-ingestor.aforo.ai` (`ingest.aforo.ai` / `ingestor.aforo.ai` serve a static site, not the ingestor).
+- Batches are POSTed to `<ingestorUrl>/v1/ingest/batch`. `/v1/ingest/events` is the ingestor's Apigee single-event endpoint and never accepted an `{events:[...]}` batch, so no usage was being delivered. Flushes are split into requests of at most 1000 events (the ingestor's batch limit), and each event's `idempotencyKey` is minted once and re-sent unchanged on retries.
+- CONNECT / DISCONNECT events carry a `$SYS/clients/<clientId>/connected|disconnected` topic instead of an empty `mqttTopic`, which the ingestor requires. Events with no topic, such as an empty UNSUBSCRIBE, are skipped.
+- `mqttQos` values other than 0, 1 or 2 are sent as 0. `mqttTopic` is trimmed to 500 characters and `mqttClientId` to 128. The topic is no longer part of `idempotencyKey`, which stays within 255 characters.
+- Events with a blank `customerId` are skipped, and ones longer than 64 characters are dropped with `onError`.
+
 ## [1.0.0] — 2026-06-29
 
 Initial public distribution packaging — README, user guide, and versioning.

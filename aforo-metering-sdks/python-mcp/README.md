@@ -40,7 +40,7 @@ billing = AforoMcpBilling(
     tenant_id="tenant_smartai",
     product_id="prod_mcp_001",
     api_key=os.environ["AFORO_API_KEY"],
-    ingestor_url="https://ingest.aforo.ai",
+    ingestor_url="https://usage-ingestor.aforo.ai",
 )
 
 @server.call_tool()
@@ -55,7 +55,7 @@ await billing.start()
 await billing.shutdown()
 ```
 
-The decorator times the call, sets `executionStatus` to `SUCCESS` or `ERROR` (re-raising any exception), and records one `mcp_server.tool_invocations` event per call. Events POST to `https://ingest.aforo.ai/v1/ingest/batch` with `Authorization: Bearer <api_key>` and an `X-Tenant-Id: <tenant_id>` header.
+The decorator times the call, sets `executionStatus` to `SUCCESS` or `ERROR` (re-raising any exception), and records one `mcp_server.tool_invocations` event per call. Events POST to `https://usage-ingestor.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and an `X-Tenant-Id: <tenant_id>` header.
 
 > `tenant_id` is set in code from your trusted config — it is never read from a request the tool caller controls. `wrap_tool_handler` reads `agent_id` and `session_id` from the handler's `**kwargs`; pass them through from your MCP server, or `agent_id` defaults to `"unknown"`.
 
@@ -67,13 +67,13 @@ Constructor arguments for `AforoMcpBilling(...)`:
 |---|---|---|---|
 | `tenant_id` | `str` | — (required) | Your Aforo tenant; sent as `X-Tenant-Id`. |
 | `product_id` | `str` | — (required) | MCP product the calls bill against; stamped in event metadata. |
-| `api_key` | `str` | — (required) | Bearer token for the ingestor. |
-| `ingestor_url` | `str` | — (required) | Ingestor host; `/v1/ingest/batch` is appended. Use `https://ingest.aforo.ai`. |
+| `api_key` | `str` | — (required) | Aforo API key, sent to the ingestor as `X-API-Key`. |
+| `ingestor_url` | `str` | — (required) | Ingestor host; `/v1/ingest/batch` is appended. Use `https://usage-ingestor.aforo.ai`. |
 | `flush_interval_sec` | `float` | `5.0` | Background flush cadence (seconds). Requires `await start()`. |
 | `flush_count` | `int` | `50` | Buffer size that triggers an immediate async flush. |
 | `on_error` | `Callable[[Exception], None]?` | logs the error | Invoked when a batch fails permanently. |
-| `heartbeat_interval_sec` | `float` | `30.0` | Cadence of session heartbeats. |
-| `heartbeat_enabled` | `bool` | `True` | Turn periodic heartbeats off entirely. |
+| `heartbeat_interval_sec` | `float` | `30.0` | Deprecated, ignored — heartbeats are no longer sent. |
+| `heartbeat_enabled` | `bool` | `True` | Deprecated, ignored — heartbeats are no longer sent. |
 | `on_session_killed` | `Callable[[str, str], None]?` | `None` | Called when the ingestor returns this session in `killedSessionIds`. |
 
 Retry is fixed at **3 attempts** with `1s / 2s / 4s` backoff; any 4xx is non-retryable and the batch is dropped via `on_error`.
@@ -84,4 +84,4 @@ Install → wrap a handler → fire a real tool call → confirm the event in Af
 
 ## What this doesn't cover
 
-This SDK **emits** invocation, heartbeat, and session events — it does not price them. It does not enforce entitlements at call time: the only server-driven control is the `killedSessionIds` signal returned on a flush, which stops the heartbeat for that session and fires `on_session_killed` (it does not abort an in-flight tool call). Streaming/partial tool results are recorded as a single invocation. Rate plans and metric mapping live in the Aforo console.
+This SDK **emits** invocation events (session heartbeats are no longer sent: they were `system.session.heartbeat` events with `quantity: 0` sent in the usage batch, and the ingestor rejects quantity 0 and fails the whole batch with 400, taking every real event batched with it down. The ingestor has no dedicated heartbeat endpoint.) — it does not price them. It does not enforce entitlements at call time: the only server-driven control is the `killedSessionIds` signal returned on a flush, which clears that session and fires `on_session_killed` (The ingestor only computes `killedSessionIds` while processing heartbeats, so with heartbeats removed this signal is not expected to fire until a dedicated heartbeat API exists.) (it does not abort an in-flight tool call). Streaming/partial tool results are recorded as a single invocation. Rate plans and metric mapping live in the Aforo console.

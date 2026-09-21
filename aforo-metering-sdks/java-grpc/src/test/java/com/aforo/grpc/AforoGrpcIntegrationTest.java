@@ -312,9 +312,10 @@ class AforoGrpcIntegrationTest {
         assertThat(capturedHeaders).isNotEmpty();
         Map<String, List<String>> headers = capturedHeaders.get(0);
         // HttpExchange capitalizes keys; use case-insensitive lookup
-        List<String> auth = headers.getOrDefault("Authorization", List.of());
+        List<String> auth = headers.getOrDefault("X-api-key", headers.getOrDefault("X-API-Key", List.of()));
         List<String> tenant = headers.getOrDefault("X-tenant-id", headers.getOrDefault("X-Tenant-Id", List.of()));
-        assertThat(auth).contains("Bearer sk_int_grpc");
+        assertThat(auth).contains("sk_int_grpc");
+        assertThat(headers.containsKey("Authorization")).isFalse();
         assertThat(tenant).contains("tenant-int-grpc");
     }
 }
