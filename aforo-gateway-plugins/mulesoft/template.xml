@@ -2,9 +2,25 @@
 <!--
   Aforo Usage Metering — MuleSoft Policy Template
 
-  Runs in the outbound phase (after the API response). Uses an async scope
-  to fire a non-blocking HTTP POST to the Aforo ingestor service.
-  Zero latency impact on the API call.
+  NOT PRODUCTION-READY. This file is NOT a deployable Mule 4 custom policy:
+  <before-call>/<after-call> are not Mule 4 policy elements, and property
+  placeholders use ${...} where a Mule 4 policy template uses {{{...}}}
+  inside <http-policy:proxy>/<http-policy:source> with
+  <http-policy:execute-next/>. It is kept as a reference for the event
+  contract only. See README.md for what a real implementation needs.
+
+  Contract fixes applied here (2026-09-21) so the reference is at least
+  correct about what it sends:
+    - X-API-Key header only (the ingestor ignores Authorization: Bearer and
+      rejects it 401); no X-Tenant-Id — the tenant comes from the key.
+    - customerId only from vars.aforo.customerId, set by aforo-jwt-validation
+      from a verified JWT. The x-customer-id request-header path (spoofable)
+      and the authentication.clientId fallback (an Anypoint client app id,
+      not an Aforo customer id) are removed.
+    - No event for OPTIONS or when customerId is empty / > 64 chars.
+    - The endpoint is a full URL (aforo_endpoint), used via the request's
+      url attribute; it was previously put in host="" with port 443.
+    - metricName = default_metric (a catalog metric), not "{method} {path}".
 -->
 <mule xmlns="http://www.mulesoft.org/schema/mule/core"
       xmlns:http="http://www.mulesoft.org/schema/mule/http"
@@ -13,15 +29,13 @@
         http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
         http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
 
-    <!-- HTTP requester for calling Aforo ingestor -->
+    <!-- HTTP requester for calling the Aforo ingestor. The full URL is given
+         per request (url attribute), so no host/port is configured here. -->
     <http:request-config name="aforo-metering-requester">
-        <http:request-connection host="${aforo_endpoint}" port="443" protocol="HTTPS">
-            <http:default-headers>
-                <http:default-header key="Content-Type" value="application/json" />
-                <http:default-header key="Authorization" value="Bearer ${api_key}" />
-                <http:default-header key="X-Tenant-Id" value="${tenant_id}" />
-            </http:default-headers>
-        </http:request-connection>
+        <http:default-headers>
+            <http:default-header key="Content-Type" value="application/json" />
+            <http:default-header key="X-API-Key" value="${api_key}" />
+        </http:default-headers>
     </http:request-config>
 
     <!-- Policy source: runs after the API response is generated -->
@@ -33,61 +47,56 @@
         <!-- Async scope: non-blocking, doesn't affect API response time -->
         <async>
             <try>
-                <!-- Build the usage event payload -->
-                <set-variable variableName="metricName"
-                    value="#[
-                        ('${metric_name_pattern}' default '{method} {path}')
-                            replace '{method}' with (attributes.method default 'UNKNOWN')
-                            replace '{path}' with (attributes.requestPath default '/')
-                    ]" />
-
-                <set-variable variableName="quantity"
-                    value="#[
-                        if ('${quantity_source}' == 'response_size')
-                            sizeOf(payload default '') default 1
-                        else
-                            1
-                    ]" />
-
                 <set-variable variableName="customerId"
-                    value="#[
-                        if ('${customer_id_source}' == 'header')
-                            attributes.headers.'x-customer-id' default ''
-                        else
-                            authentication.clientId default ''
-                    ]" />
+                    value="#[(vars.aforo.customerId default '') as String]" />
 
-                <set-payload><![CDATA[#[output application/json ---
-                    {
-                        "events": [{
-                            "customerId": vars.customerId,
-                            "metricName": vars.metricName,
-                            "quantity": vars.quantity,
-                            "idempotencyKey": correlationId,
-                            "occurredAt": now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"},
-                            ("metadata": {
-                                "gateway": "mulesoft",
-                                "method": attributes.method default "UNKNOWN",
-                                "path": attributes.requestPath default "/",
-                                "status": attributes.statusCode default 0,
-                                "latency": 0,
-                                "clientId": authentication.clientId default "",
-                                "apiId": attributes.headers.'x-api-id' default "",
-                                "version": attributes.version default ""
-                            }) if (${include_metadata} default true)
-                        }]
-                    }
-                ]
-            ]]></set-payload>
+                <choice>
+                    <when expression="#[(attributes.method default '') != 'OPTIONS' and sizeOf(vars.customerId) > 0 and sizeOf(vars.customerId) &lt;= 64]">
+                        <set-variable variableName="quantity"
+                            value="#[
+                                if ('${quantity_source}' == 'response_size')
+                                    sizeOf(payload default '')
+                                else
+                                    1
+                            ]" />
 
-                <!-- Send to Aforo ingestor -->
-                <http:request config-ref="aforo-metering-requester"
-                              method="POST"
-                              path="/v1/ingest/batch">
-                    <http:response-validator>
-                        <http:success-status-code-validator values="200..299,400..499" />
-                    </http:response-validator>
-                </http:request>
+                        <choice>
+                            <when expression="#[vars.quantity > 0]">
+                                <set-payload><![CDATA[#[output application/json ---
+                                    {
+                                        "events": [{
+                                            "customerId": vars.customerId,
+                                            "metricName": ('${default_metric}' default 'api_calls'),
+                                            "quantity": vars.quantity,
+                                            "idempotencyKey": correlationId,
+                                            "occurredAt": now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"},
+                                            ("metadata": {
+                                                "gateway": "mulesoft",
+                                                "method": attributes.method default "UNKNOWN",
+                                                "path": attributes.requestPath default "/",
+                                                "status": attributes.statusCode default 0,
+                                                "version": attributes.version default ""
+                                            }) if (${include_metadata} default true)
+                                        }]
+                                    }
+                                ]]]></set-payload>
+
+                                <!-- Send to Aforo ingestor (aforo_endpoint = full …/v1/ingest/batch URL) -->
+                                <http:request config-ref="aforo-metering-requester"
+                                              method="POST"
+                                              url="${aforo_endpoint}">
+                                    <http:response-validator>
+                                        <http:success-status-code-validator values="200..299" />
+                                    </http:response-validator>
+                                </http:request>
+                            </when>
+                        </choice>
+                    </when>
+                    <otherwise>
+                        <logger level="DEBUG"
+                                message="[aforo-metering] Not metered: OPTIONS or no verified Aforo customer (apply aforo-jwt-validation first)" />
+                    </otherwise>
+                </choice>
 
                 <error-handler>
                     <on-error-continue type="ANY">
