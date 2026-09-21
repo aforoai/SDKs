@@ -27,7 +27,7 @@ const config = () => ({
   tenantId: 'tenant-001',
   productId: 'prod-mqtt-001',
   apiKey: 'sk_mqtt_abc',
-  ingestorUrl: 'https://ingestor.aforo.ai',
+  ingestorUrl: 'https://usage-ingestor.aforo.ai',
 });
 
 const drainedEvents = () => capturedRequests.flatMap(r => r.body?.events ?? []);

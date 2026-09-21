@@ -37,7 +37,7 @@ billing = AforoGrpcBilling(
     tenant_id="tenant_acme",
     product_id="prod_grpc_user_svc",
     api_key=os.environ["AFORO_API_KEY"],
-    ingestor_url="https://ingest.aforo.ai",
+    ingestor_url="https://usage-ingestor.aforo.ai",
     service_name="acme.v1.UserService",
 )
 
@@ -51,7 +51,7 @@ server.start()
 server.wait_for_termination()
 ```
 
-Every unary RPC is now metered — one `grpc_api.rpc_calls` event with `grpcStatusCode`, `grpcCallType=UNARY`, and `executionDurationMs`, POSTed to `https://ingest.aforo.ai/v1/ingest/events` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
+Every unary RPC is now metered — one `grpc_api.rpc_calls` event with `grpcStatusCode`, `grpcCallType=UNARY`, and `executionDurationMs`, POSTed to `https://usage-ingestor.aforo.ai/v1/ingest/events` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
 
 > ⚠ This package targets the ingestor's **`/v1/ingest/events`** path (the base and MCP Aforo SDKs use `/v1/ingest/batch`). Set `ingestor_url` to the host only — the SDK appends the path.
 

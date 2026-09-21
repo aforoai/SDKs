@@ -3,7 +3,7 @@ export interface AforoOptions {
   /** Aforo API key for authentication. */
   apiKey: string;
 
-  /** Base URL for the Aforo ingestor service. Defaults to https://ingest.aforo.ai */
+  /** Base URL for the Aforo ingestor service. Defaults to https://usage-ingestor.aforo.ai */
   baseUrl?: string;
 
   /** Maximum events to buffer before flushing. Default: 50 */

@@ -52,7 +52,7 @@ try (AforoClient client = new AforoClient(new AforoOptions(System.getenv("AFORO_
 }
 ```
 
-`track(...)` returns immediately — it pushes onto an in-memory ring buffer that a daemon thread flushes to `https://ingest.aforo.ai/v1/ingest/batch` every 5 seconds, or sooner once 50 events are queued. The constructor also registers a JVM shutdown hook, so events aren't lost if the process exits without an explicit `close()`.
+`track(...)` returns immediately — it pushes onto an in-memory ring buffer that a daemon thread flushes to `https://usage-ingestor.aforo.ai/v1/ingest/batch` every 5 seconds, or sooner once 50 events are queued. The constructor also registers a JVM shutdown hook, so events aren't lost if the process exits without an explicit `close()`.
 
 Spring Boot — add the dependency and set two properties; the auto-configuration wires an `AforoClient` bean and a request-end servlet filter:
 
@@ -61,7 +61,7 @@ Spring Boot — add the dependency and set two properties; the auto-configuratio
 aforo:
   enabled: true          # auto-config is off unless this is exactly "true"
   api-key: ${AFORO_API_KEY}
-  base-url: https://ingest.aforo.ai
+  base-url: https://usage-ingestor.aforo.ai
   metric-name: api_calls   # must exist in your Aforo catalog
 ```
 
@@ -78,7 +78,7 @@ The filter runs **after** the response is committed, so metering adds no latency
 | Option | Type | Default | What it does |
 |---|---|---|---|
 | `apiKey` | `String` | *(required)* | Sent as `X-API-Key: <apiKey>`. Blank throws `IllegalArgumentException`. |
-| `baseUrl(...)` | `String` | `https://ingest.aforo.ai` | Ingestion host. The SDK appends `/v1/ingest/batch`. Override per environment. |
+| `baseUrl(...)` | `String` | `https://usage-ingestor.aforo.ai` | Ingestion host. The SDK appends `/v1/ingest/batch`. Override per environment. |
 | `flushCount(...)` | `int` | `50` | Buffered events that trigger an immediate async flush. |
 | `flushIntervalMs(...)` | `long` | `5000` | Background flush cadence in ms. |
 | `maxQueueSize(...)` | `int` | `10000` | Ring-buffer capacity. Oldest events are overwritten when full. |
@@ -93,7 +93,7 @@ Spring Boot properties (prefix `aforo`) — a subset of the above:
 |---|---|---|
 | `aforo.enabled` | *(unset → off)* | Auto-config activates only when set to `true`. |
 | `aforo.api-key` | *(required)* | Aforo API key, sent as `X-API-Key`. |
-| `aforo.base-url` | `https://ingest.aforo.ai` | Ingestion host. |
+| `aforo.base-url` | `https://usage-ingestor.aforo.ai` | Ingestion host. |
 | `aforo.flush-count` | `50` | Events per immediate flush. |
 | `aforo.flush-interval-ms` | `5000` | Background flush cadence. |
 | `aforo.metric-name` | `api_calls` | Metric recorded per request by the filter. Must exist in your Aforo catalog. Declare an `AforoServletFilter.MetricNameResolver` bean for a per-request metric. |

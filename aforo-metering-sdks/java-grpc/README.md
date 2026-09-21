@@ -37,7 +37,7 @@ AforoGrpcBilling billing = AforoGrpcBilling.newBuilder()
         .tenantId("tenant_acme")
         .productId("prod_grpc_user_svc")
         .apiKey(System.getenv("AFORO_API_KEY"))
-        .ingestorUrl("https://ingest.aforo.ai")
+        .ingestorUrl("https://usage-ingestor.aforo.ai")
         .serviceName("acme.v1.UserService")
         .build();
 
@@ -63,7 +63,7 @@ Builder options on `AforoGrpcBilling.newBuilder()`:
 | `tenantId` | `String` | *(required)* | Sent as the `X-Tenant-Id` header. |
 | `productId` | `String` | *(required)* | Stamped into `metadata.productId` and the idempotency key. |
 | `apiKey` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
-| `ingestorUrl` | `String` | *(required)* | Ingestion host. The SDK appends `/v1/ingest/events`. Use `https://ingest.aforo.ai`. |
+| `ingestorUrl` | `String` | *(required)* | Ingestion host. The SDK appends `/v1/ingest/events`. Use `https://usage-ingestor.aforo.ai`. |
 | `serviceName` | `String` | *(required)* | Logical service name stamped as `grpcService` and into the idempotency key. |
 | `flushCount` | `int` | `50` | Buffered events that trigger an immediate flush. |
 | `flushIntervalMs` | `long` | `5000` | Background flush cadence (ms). |

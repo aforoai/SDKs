@@ -40,7 +40,7 @@ import java.util.logging.Logger;
  *       .tenantId("tenant_acme")
  *       .productId("prod_grpc_user_svc")
  *       .apiKey(System.getenv("AFORO_API_KEY"))
- *       .ingestorUrl("https://ingestor.aforo.ai")
+ *       .ingestorUrl("https://usage-ingestor.aforo.ai")
  *       .serviceName("acme.v1.UserService")
  *       .build();
  *

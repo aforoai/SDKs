@@ -5,7 +5,7 @@ import "time"
 // Options configures the AforoClient.
 type Options struct {
 	APIKey          string
-	BaseURL         string        // Default: "https://ingest.aforo.ai"
+	BaseURL         string        // Default: "https://usage-ingestor.aforo.ai"
 	FlushCount      int           // Default: 50
 	FlushInterval   time.Duration // Default: 5s
 	MaxQueueSize    int           // Default: 10000
@@ -17,7 +17,7 @@ type Options struct {
 
 func (o *Options) defaults() {
 	if o.BaseURL == "" {
-		o.BaseURL = "https://ingest.aforo.ai"
+		o.BaseURL = "https://usage-ingestor.aforo.ai"
 	}
 	if o.FlushCount <= 0 {
 		o.FlushCount = 50

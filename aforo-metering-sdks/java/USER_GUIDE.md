@@ -4,7 +4,7 @@
 
 ## What you'll build
 
-A Java service that emits one Aforo usage event per billable action and ships those events in batches to `https://ingest.aforo.ai/v1/ingest/batch`. By the end you'll have a metered event confirmed as landed in Aforo.
+A Java service that emits one Aforo usage event per billable action and ships those events in batches to `https://usage-ingestor.aforo.ai/v1/ingest/batch`. By the end you'll have a metered event confirmed as landed in Aforo.
 
 ## Prerequisites
 
@@ -77,7 +77,7 @@ Add the same dependency, then set the properties:
 aforo:
   enabled: true                 # MUST be exactly "true" — auto-config is off otherwise
   api-key: ${AFORO_API_KEY}
-  base-url: https://ingest.aforo.ai
+  base-url: https://usage-ingestor.aforo.ai
 ```
 
 That's the whole wiring. `AforoMeteringAutoConfiguration` registers:
@@ -116,7 +116,7 @@ To watch the wire during local debugging, point `base-url` / `baseUrl` at a requ
 | Option (manual) | Spring property | Type | Default | What it does |
 |---|---|---|---|---|
 | `apiKey` (ctor) | `aforo.api-key` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
-| `baseUrl(...)` | `aforo.base-url` | `String` | `https://ingest.aforo.ai` | Ingestion host; SDK appends `/v1/ingest/batch`. |
+| `baseUrl(...)` | `aforo.base-url` | `String` | `https://usage-ingestor.aforo.ai` | Ingestion host; SDK appends `/v1/ingest/batch`. |
 | `flushCount(...)` | `aforo.flush-count` | `int` | `50` | Buffer size that triggers an immediate flush. |
 | `flushIntervalMs(...)` | `aforo.flush-interval-ms` | `long` | `5000` | Background flush cadence (ms). |
 | `maxQueueSize(...)` | — | `int` | `10000` | Ring-buffer capacity; oldest events overwritten when full. |

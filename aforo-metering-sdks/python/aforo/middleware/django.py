@@ -54,7 +54,7 @@ class AforoMeteringMiddleware:
 
         from django.conf import settings
         api_key = getattr(settings, "AFORO_API_KEY", os.environ.get("AFORO_API_KEY", ""))
-        base_url = getattr(settings, "AFORO_BASE_URL", "https://ingest.aforo.ai")
+        base_url = getattr(settings, "AFORO_BASE_URL", "https://usage-ingestor.aforo.ai")
 
         self._client = AforoClient(api_key=api_key, base_url=base_url)
         self._exclude_paths = getattr(settings, "AFORO_EXCLUDE_PATHS", _DEFAULT_EXCLUDE)

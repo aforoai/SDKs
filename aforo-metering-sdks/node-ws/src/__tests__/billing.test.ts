@@ -28,7 +28,7 @@ const config = () => ({
   tenantId: 'tenant-001',
   productId: 'prod-ws-001',
   apiKey: 'sk_ws_abc',
-  ingestorUrl: 'https://ingestor.aforo.ai',
+  ingestorUrl: 'https://usage-ingestor.aforo.ai',
 });
 
 // A tiny WebSocket stub that matches the SDK's MinimalWs surface.

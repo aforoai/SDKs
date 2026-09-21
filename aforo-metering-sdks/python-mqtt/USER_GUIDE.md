@@ -30,13 +30,13 @@ billing = AforoMqttBilling(
     tenant_id="tenant_acme",
     product_id="prod_mqtt_iot_telemetry",
     api_key=os.environ["AFORO_API_KEY"],
-    ingestor_url="https://ingest.aforo.ai",
+    ingestor_url="https://usage-ingestor.aforo.ai",
 )
 ```
 
 All four arguments are required — the constructor raises `ValueError` if any is empty.
 
-> ⚠ `ingestor_url` is the **host**; this package appends `/v1/ingest/events`. Pass `https://ingest.aforo.ai`.
+> ⚠ `ingestor_url` is the **host**; this package appends `/v1/ingest/events`. Pass `https://usage-ingestor.aforo.ai`.
 
 ## Step 3 — Wrap your MQTT client
 
@@ -125,7 +125,7 @@ Exports: `AforoMqttBilling`, `wrap_paho_client(billing, client, customer_id=...)
 | No events at all | The client was wrapped after connecting/publishing, or never wrapped. | Call `wrap_paho_client` / `wrap_aiomqtt_client` before you publish/subscribe. |
 | Inbound messages not billed | `emit_deliver_events` defaults to `False`. | Set `emit_deliver_events=True` if you price received messages. |
 | `on_error` fires with "Aforo returned 401/403" | Bad/unscoped API key — 4xx is dropped, not retried. | Fix `api_key`; confirm it matches `tenant_id`. |
-| Events sent, none in console | Wrong `ingestor_url` host, or `mqtt_broker.*` isn't mapped to a rate plan. | Use `https://ingest.aforo.ai`; map the metric in Aforo. |
+| Events sent, none in console | Wrong `ingestor_url` host, or `mqtt_broker.*` isn't mapped to a rate plan. | Use `https://usage-ingestor.aforo.ai`; map the metric in Aforo. |
 | QoS tier never applies | Filter condition not set on the rate plan. | Add `mqtt_qos IN ("1","2")` (or similar) to the rate plan in the console. |
 | Event volume far higher than expected | `emit_deliver_events=True` on a wildcard subscription. | Turn it off, or narrow the subscription topics. |
 | Final batch lost on shutdown | `shutdown()` not called before exit. | Call `billing.shutdown()` in your cleanup path. |

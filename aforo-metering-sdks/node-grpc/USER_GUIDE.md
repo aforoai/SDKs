@@ -44,7 +44,7 @@ const billing = new AforoGrpcBilling({
   tenantId: 'tenant_acme',
   productId: 'prod_grpc_001',
   apiKey: process.env.AFORO_API_KEY!,
-  ingestorUrl: 'https://ingest.aforo.ai', // SDK appends /v1/ingest/events
+  ingestorUrl: 'https://usage-ingestor.aforo.ai', // SDK appends /v1/ingest/events
   serviceName: 'acme.v1.UserService',
 });
 ```
@@ -117,7 +117,7 @@ process.on('SIGINT',  async () => { await billing.shutdown(); process.exit(0); }
 
 > ⚠ Without `shutdown()`, a process that exits inside the 5-second window drops the buffered batch.
 
-The batch is POSTed to `https://ingest.aforo.ai/v1/ingest/events` with `X-API-Key: <your api key>` and `X-Tenant-Id: tenant_acme`. Confirm in the Aforo console under the product's usage events (filter `productType = GRPC_API`). On 3 consecutive failures (1s/2s/4s backoff) the batch is dropped and `onError` fires — log it:
+The batch is POSTed to `https://usage-ingestor.aforo.ai/v1/ingest/events` with `X-API-Key: <your api key>` and `X-Tenant-Id: tenant_acme`. Confirm in the Aforo console under the product's usage events (filter `productType = GRPC_API`). On 3 consecutive failures (1s/2s/4s backoff) the batch is dropped and `onError` fires — log it:
 
 ```ts
 const billing = new AforoGrpcBilling({

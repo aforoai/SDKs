@@ -39,7 +39,7 @@ AforoWsBilling billing = AforoWsBilling.newBuilder()
         .tenantId("tenant_acme")
         .productId("prod_ws_market_feed")
         .apiKey(System.getenv("AFORO_API_KEY"))
-        .ingestorUrl("https://ingest.aforo.ai")
+        .ingestorUrl("https://usage-ingestor.aforo.ai")
         .build();
 
 @ServerEndpoint("/ws")
@@ -79,7 +79,7 @@ Builder options on `AforoWsBilling.newBuilder()`:
 | `tenantId` | `String` | *(required)* | Sent as the `X-Tenant-Id` header. |
 | `productId` | `String` | *(required)* | Stamped into `metadata.productId`. |
 | `apiKey` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
-| `ingestorUrl` | `String` | *(required)* | Ingestion host. The SDK appends `/v1/ingest/events`. Use `https://ingest.aforo.ai`. |
+| `ingestorUrl` | `String` | *(required)* | Ingestion host. The SDK appends `/v1/ingest/events`. Use `https://usage-ingestor.aforo.ai`. |
 | `perFrameEvents` | `boolean` | `false` | When `true`, each `recordFrame` emits its own event. When `false`, only OPEN and CLOSE events are emitted, with frame/byte totals aggregated on CLOSE. |
 | `flushCount` | `int` | `100` | Buffered events that trigger an immediate flush. |
 | `flushIntervalMs` | `long` | `3000` | Background flush cadence (ms). |

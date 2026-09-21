@@ -11,7 +11,7 @@
  *     tenantId: 'tenant_smartai',
  *     productId: 'prod_mcp_001',
  *     apiKey: process.env.AFORO_API_KEY,
- *     ingestorUrl: 'https://ingestor.aforo.ai',
+ *     ingestorUrl: 'https://usage-ingestor.aforo.ai',
  *   });
  *
  *   server.setRequestHandler(

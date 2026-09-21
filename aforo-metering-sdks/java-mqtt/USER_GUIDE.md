@@ -46,12 +46,12 @@ AforoMqttBilling billing = AforoMqttBilling.newBuilder()
         .tenantId("tenant_acme")
         .productId("prod_mqtt_iot_telemetry")
         .apiKey(System.getenv("AFORO_API_KEY"))
-        .ingestorUrl("https://ingest.aforo.ai")
+        .ingestorUrl("https://usage-ingestor.aforo.ai")
         // .emitDeliverEvents(true)   // opt in to bill inbound DELIVER too
         .build();
 ```
 
-> ⚠ `ingestorUrl` is the host only — the SDK appends `/v1/ingest/events`. Pass `https://ingest.aforo.ai`, not the full path.
+> ⚠ `ingestorUrl` is the host only — the SDK appends `/v1/ingest/events`. Pass `https://usage-ingestor.aforo.ai`, not the full path.
 
 ## Step 4 — Report each MQTT primitive
 

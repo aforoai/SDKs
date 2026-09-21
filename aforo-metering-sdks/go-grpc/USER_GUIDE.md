@@ -12,7 +12,7 @@ A gRPC server that emits one Aforo billing event per RPC — service, method, gR
 - `google.golang.org/grpc` v1.60.0 (the version this module pins).
 - An Aforo API key (`AFORO_API_KEY`), a `tenant_id`, a `product_id`, and the fully-qualified `service_name`. All four are SDK config — never read from a client header.
 - A customer id reachable from the call context — by default the `x-customer-id` gRPC metadata key.
-- Ingestor base URL — `https://ingest.aforo.ai`.
+- Ingestor base URL — `https://usage-ingestor.aforo.ai`.
 
 ## Step 1 — Add the module from source
 
@@ -50,7 +50,7 @@ billing, err := grpcmetering.New(grpcmetering.Config{
 	TenantID:    "tenant_acme",
 	ProductID:   "prod_grpc_user_svc",
 	APIKey:      os.Getenv("AFORO_API_KEY"),
-	IngestorURL: "https://ingest.aforo.ai",
+	IngestorURL: "https://usage-ingestor.aforo.ai",
 	ServiceName: "acme.v1.UserService",
 })
 if err != nil {
@@ -85,7 +85,7 @@ billing, _ := grpcmetering.New(grpcmetering.Config{
 	TenantID:    "tenant_acme",
 	ProductID:   "prod_grpc_user_svc",
 	APIKey:      os.Getenv("AFORO_API_KEY"),
-	IngestorURL: "https://ingest.aforo.ai",
+	IngestorURL: "https://usage-ingestor.aforo.ai",
 	ServiceName: "acme.v1.UserService",
 	CustomerExtractor: func(ctx context.Context) string {
 		md, ok := metadata.FromIncomingContext(ctx)
@@ -132,7 +132,7 @@ The buffer flushes every `FlushInterval` (5s) or when it reaches `FlushCount` (5
 The wire call the SDK makes:
 
 ```
-POST https://ingest.aforo.ai/v1/ingest/events
+POST https://usage-ingestor.aforo.ai/v1/ingest/events
 X-API-Key: <AFORO_API_KEY>
 X-Tenant-Id: tenant_acme
 Content-Type: application/json

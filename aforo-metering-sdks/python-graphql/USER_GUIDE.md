@@ -30,14 +30,14 @@ billing = AforoGraphQlBilling(
     tenant_id="tenant_acme",
     product_id="prod_graphql_gateway",
     api_key=os.environ["AFORO_API_KEY"],
-    ingestor_url="https://ingest.aforo.ai",
+    ingestor_url="https://usage-ingestor.aforo.ai",
     schema_version="v2.1",
 )
 ```
 
 `tenant_id`, `product_id`, `api_key`, and `ingestor_url` are required — the constructor raises `ValueError` if any is missing.
 
-> ⚠ `ingestor_url` is the **host**. This package appends `/v1/ingest/events`. Pass `https://ingest.aforo.ai`, not the full path.
+> ⚠ `ingestor_url` is the **host**. This package appends `/v1/ingest/events`. Pass `https://usage-ingestor.aforo.ai`, not the full path.
 
 ## Step 3 — Wire it into your server
 
@@ -135,7 +135,7 @@ Methods: `record(customer_id, query, operation_name, duration_ms, has_errors, re
 | No events for any operation | `graphql-core` not installed, so `record()` no-ops; or the document failed to parse. | Install `graphql-core>=3.2`; confirm the query is valid GraphQL. |
 | Some operations never metered | Customer ID didn't resolve (no `x-customer-id`), or the ASGI `path` doesn't match. | Set the header upstream / fix the extractor; point `asgi_middleware(path=...)` at the real route. |
 | `on_error` fires with "Aforo returned 401/403" | Bad/unscoped API key — 4xx is dropped, not retried. | Fix `api_key`; confirm it matches `tenant_id`. |
-| Events sent, none in console | Wrong `ingestor_url` host, or `graphql_api.operations` isn't mapped to a rate plan. | Use `https://ingest.aforo.ai`; map the metric in Aforo. |
+| Events sent, none in console | Wrong `ingestor_url` host, or `graphql_api.operations` isn't mapped to a rate plan. | Use `https://usage-ingestor.aforo.ai`; map the metric in Aforo. |
 | Complexity is always the default formula | No `complexity_scorer` supplied. | Pass `complexity_scorer=...` to match your pricing model. |
 | Subscriptions aren't billed | This SDK meters query/mutation operations, not long-lived subscription streams. | Use `aforo-ws-metering` for subscription/socket traffic. |
 

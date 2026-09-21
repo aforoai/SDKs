@@ -33,7 +33,7 @@ const config = () => ({
   tenantId: 'tenant-001',
   productId: 'prod-gql-001',
   apiKey: 'sk_gql_abc',
-  ingestorUrl: 'https://ingestor.aforo.ai',
+  ingestorUrl: 'https://usage-ingestor.aforo.ai',
   schemaVersion: 'v2.1',
 });
 
@@ -208,7 +208,7 @@ describe('flush', () => {
     });
     await new Promise((r) => setTimeout(r, 20));
     const req = capturedRequests[0];
-    expect(req.url).toBe('https://ingestor.aforo.ai/v1/ingest/events');
+    expect(req.url).toBe('https://usage-ingestor.aforo.ai/v1/ingest/events');
     const headers = req.init.headers as Record<string, string>;
     expect(headers['X-API-Key']).toBe('sk_gql_abc');
     expect(headers['Authorization']).toBeUndefined();

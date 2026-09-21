@@ -52,7 +52,7 @@ result = client.flush()        # FlushResult(sent=..., failed=...)
 client.shutdown()
 ```
 
-Events POST to `https://ingest.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>`. The client appends `/v1/ingest/batch` to `base_url`, so set `base_url` to the host only.
+Events POST to `https://usage-ingestor.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>`. The client appends `/v1/ingest/batch` to `base_url`, so set `base_url` to the host only.
 
 > Tenant scope comes from the API key — there is no `tenant_id` argument on this SDK. `customer_id` is the entity you bill within that tenant. Never feed `customer_id` from a client-settable request header you don't trust.
 
@@ -63,7 +63,7 @@ Pass these as keyword args to `AforoClient(...)`, or build an `AforoOptions` and
 | Option | Type | Default | What it does |
 |---|---|---|---|
 | `api_key` | `str` | — (required) | Aforo API key, sent as `X-API-Key` on every batch. |
-| `base_url` | `str` | `https://ingest.aforo.ai` | Ingestor host. `/v1/ingest/batch` is appended automatically. |
+| `base_url` | `str` | `https://usage-ingestor.aforo.ai` | Ingestor host. `/v1/ingest/batch` is appended automatically. |
 | `flush_count` | `int` | `50` | Buffered events that trigger a flush. Also the max batch size per request. |
 | `flush_interval` | `float` | `5.0` | Seconds between background timer flushes. |
 | `max_queue_size` | `int` | `10000` | Ring-buffer capacity. On overflow the **oldest** event is dropped. |

@@ -61,7 +61,7 @@ The middleware hooks `res.on('finish')`, so it runs after the response is sent â
 | Option | Type | Default | What it does |
 |---|---|---|---|
 | `apiKey` | `string` | â€” (required) | Aforo API key, sent as `X-API-Key`. |
-| `baseUrl` | `string` | `https://ingest.aforo.ai` | Ingestor base URL. Events POST to `<baseUrl>/v1/ingest/batch`. |
+| `baseUrl` | `string` | `https://usage-ingestor.aforo.ai` | Ingestor base URL. Events POST to `<baseUrl>/v1/ingest/batch`. |
 | `flushCount` | `number` | `50` | Buffered events that trigger a flush. |
 | `flushInterval` | `number` (ms) | `5000` | Background flush cadence. |
 | `maxQueueSize` | `number` | `10000` | Ring-buffer cap; oldest events drop on overflow. |

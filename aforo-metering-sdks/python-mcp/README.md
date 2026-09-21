@@ -40,7 +40,7 @@ billing = AforoMcpBilling(
     tenant_id="tenant_smartai",
     product_id="prod_mcp_001",
     api_key=os.environ["AFORO_API_KEY"],
-    ingestor_url="https://ingest.aforo.ai",
+    ingestor_url="https://usage-ingestor.aforo.ai",
 )
 
 @server.call_tool()
@@ -55,7 +55,7 @@ await billing.start()
 await billing.shutdown()
 ```
 
-The decorator times the call, sets `executionStatus` to `SUCCESS` or `ERROR` (re-raising any exception), and records one `mcp_server.tool_invocations` event per call. Events POST to `https://ingest.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and an `X-Tenant-Id: <tenant_id>` header.
+The decorator times the call, sets `executionStatus` to `SUCCESS` or `ERROR` (re-raising any exception), and records one `mcp_server.tool_invocations` event per call. Events POST to `https://usage-ingestor.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and an `X-Tenant-Id: <tenant_id>` header.
 
 > `tenant_id` is set in code from your trusted config — it is never read from a request the tool caller controls. `wrap_tool_handler` reads `agent_id` and `session_id` from the handler's `**kwargs`; pass them through from your MCP server, or `agent_id` defaults to `"unknown"`.
 
@@ -68,7 +68,7 @@ Constructor arguments for `AforoMcpBilling(...)`:
 | `tenant_id` | `str` | — (required) | Your Aforo tenant; sent as `X-Tenant-Id`. |
 | `product_id` | `str` | — (required) | MCP product the calls bill against; stamped in event metadata. |
 | `api_key` | `str` | — (required) | Aforo API key, sent to the ingestor as `X-API-Key`. |
-| `ingestor_url` | `str` | — (required) | Ingestor host; `/v1/ingest/batch` is appended. Use `https://ingest.aforo.ai`. |
+| `ingestor_url` | `str` | — (required) | Ingestor host; `/v1/ingest/batch` is appended. Use `https://usage-ingestor.aforo.ai`. |
 | `flush_interval_sec` | `float` | `5.0` | Background flush cadence (seconds). Requires `await start()`. |
 | `flush_count` | `int` | `50` | Buffer size that triggers an immediate async flush. |
 | `on_error` | `Callable[[Exception], None]?` | logs the error | Invoked when a batch fails permanently. |

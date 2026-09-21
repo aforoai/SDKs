@@ -20,7 +20,7 @@ import org.springframework.context.annotation.Configuration;
  * aforo:
  *   enabled: true
  *   api-key: ${AFORO_API_KEY}
- *   base-url: https://ingest.aforo.ai
+ *   base-url: https://usage-ingestor.aforo.ai
  *   metric-name: api_calls            # must exist in your Aforo catalog
  *   customer-id-header: X-Customer-Id
  *   use-principal-as-customer-id: false

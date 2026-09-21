@@ -58,7 +58,7 @@ const config = () => ({
   tenantId: 'tenant-001',
   productId: 'prod-001',
   apiKey: 'sk_test_abc',
-  ingestorUrl: 'https://ingestor.aforo.ai/',  // trailing slash on purpose — SDK should strip it
+  ingestorUrl: 'https://usage-ingestor.aforo.ai/',  // trailing slash on purpose — SDK should strip it
   serviceName: 'acme.v1.UserService',
 });
 
@@ -228,7 +228,7 @@ describe('flush request shape', () => {
 
     expect(capturedRequests).toHaveLength(1);
     const req = capturedRequests[0];
-    expect(req.url).toBe('https://ingestor.aforo.ai/v1/ingest/events'); // trailing slash stripped
+    expect(req.url).toBe('https://usage-ingestor.aforo.ai/v1/ingest/events'); // trailing slash stripped
     expect(req.init.method).toBe('POST');
     const headers = req.init.headers as Record<string, string>;
     expect(headers['Content-Type']).toBe('application/json');

@@ -37,7 +37,7 @@ AforoMqttBilling billing = AforoMqttBilling.newBuilder()
         .tenantId("tenant_acme")
         .productId("prod_mqtt_iot_telemetry")
         .apiKey(System.getenv("AFORO_API_KEY"))
-        .ingestorUrl("https://ingest.aforo.ai")
+        .ingestorUrl("https://usage-ingestor.aforo.ai")
         .build();
 
 MqttClient client = new MqttClient("ssl://broker.example.com:8883", "device-001");
@@ -90,7 +90,7 @@ Builder options on `AforoMqttBilling.newBuilder()`:
 | `tenantId` | `String` | *(required)* | Sent as the `X-Tenant-Id` header. |
 | `productId` | `String` | *(required)* | Stamped into `metadata.productId`. |
 | `apiKey` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
-| `ingestorUrl` | `String` | *(required)* | Ingestion host. The SDK appends `/v1/ingest/events`. Use `https://ingest.aforo.ai`. |
+| `ingestorUrl` | `String` | *(required)* | Ingestion host. The SDK appends `/v1/ingest/events`. Use `https://usage-ingestor.aforo.ai`. |
 | `emitDeliverEvents` | `boolean` | `false` | When `true`, `recordDeliver` emits `DELIVER` events. Off by default. |
 | `flushCount` | `int` | `200` | Buffered events that trigger an immediate flush. |
 | `flushIntervalMs` | `long` | `2000` | Background flush cadence (ms). |

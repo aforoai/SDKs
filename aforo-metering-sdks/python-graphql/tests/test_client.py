@@ -63,7 +63,7 @@ def cfg():
         tenant_id="tenant-001",
         product_id="prod-gql-001",
         api_key="sk_gql_abc",
-        ingestor_url="https://ingestor.aforo.ai",
+        ingestor_url="https://usage-ingestor.aforo.ai",
         schema_version="v2.1",
     )
 

@@ -53,7 +53,7 @@ import (
 func main() {
 	client := metering.NewClient(metering.Options{
 		APIKey:  os.Getenv("AFORO_API_KEY"),
-		BaseURL: "https://ingest.aforo.ai", // default; override per environment
+		BaseURL: "https://usage-ingestor.aforo.ai", // default; override per environment
 	})
 	defer client.Close() // flushes the buffer before exit
 
@@ -85,7 +85,7 @@ func main() {
 
 	wrapped := metering.HTTPMiddleware(mux, metering.MiddlewareOptions{
 		APIKey:     os.Getenv("AFORO_API_KEY"),
-		BaseURL:    "https://ingest.aforo.ai",
+		BaseURL:    "https://usage-ingestor.aforo.ai",
 		MetricName: "api_calls", // must exist in your Aforo catalog
 	})
 	http.ListenAndServe(":8080", wrapped)
@@ -114,7 +114,7 @@ r.Use(metering.ChiMiddleware(metering.MiddlewareOptions{
 | Option | Type | Default | What it does |
 |---|---|---|---|
 | `APIKey` | `string` | — (required) | Sent as `X-API-Key: <APIKey>`. |
-| `BaseURL` | `string` | `https://ingest.aforo.ai` | Ingestor base; the client appends `/v1/ingest/batch`. Override per environment. |
+| `BaseURL` | `string` | `https://usage-ingestor.aforo.ai` | Ingestor base; the client appends `/v1/ingest/batch`. Override per environment. |
 | `FlushCount` | `int` | `50` | Flush when the buffer reaches this many events; also the per-batch drain size. |
 | `FlushInterval` | `time.Duration` | `5s` | Background flush cadence. |
 | `MaxQueueSize` | `int` | `10000` | Ring-buffer capacity. When full, the **oldest** event is dropped to make room. |
@@ -128,7 +128,7 @@ r.Use(metering.ChiMiddleware(metering.MiddlewareOptions{
 | Option | Type | Default | What it does |
 |---|---|---|---|
 | `APIKey` | `string` | — (required) | API key for the internally-created client. |
-| `BaseURL` | `string` | `https://ingest.aforo.ai` | Ingestor base for the internal client. |
+| `BaseURL` | `string` | `https://usage-ingestor.aforo.ai` | Ingestor base for the internal client. |
 | `ExcludePaths` | `[]string` | `["/health","/ready","/metrics","/favicon.ico"]` | Path **prefixes** to skip. Setting your own replaces the defaults. |
 | `ExcludeStatusCode` | `[]int` | none | Response status codes to skip (e.g. `404`). |
 | `MetricName` | `string` | `api_calls` (`DefaultMetricName`) | Fixed metric recorded per request. Must exist in your Aforo catalog. |

@@ -41,7 +41,7 @@ billing = AforoMqttBilling(
     tenant_id="tenant_acme",
     product_id="prod_mqtt_iot_telemetry",
     api_key=os.environ["AFORO_API_KEY"],
-    ingestor_url="https://ingest.aforo.ai",
+    ingestor_url="https://usage-ingestor.aforo.ai",
 )
 
 client = mqtt.Client(client_id="device-001")
@@ -64,7 +64,7 @@ billing = AforoMqttBilling(
     tenant_id="tenant_acme",
     product_id="prod_mqtt_iot_telemetry",
     api_key=os.environ["AFORO_API_KEY"],
-    ingestor_url="https://ingest.aforo.ai",
+    ingestor_url="https://usage-ingestor.aforo.ai",
 )
 
 async def main():
@@ -76,7 +76,7 @@ async def main():
             print(msg.topic, msg.payload)
 ```
 
-Each metered event POSTs to `https://ingest.aforo.ai/v1/ingest/events` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`, carrying `mqttEventType`, `mqttTopic`, `mqttQos`, `mqttRetained`, `mqttClientId`, and `dataBytes`.
+Each metered event POSTs to `https://usage-ingestor.aforo.ai/v1/ingest/events` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`, carrying `mqttEventType`, `mqttTopic`, `mqttQos`, `mqttRetained`, `mqttClientId`, and `dataBytes`.
 
 > ⚠ This package targets the ingestor's **`/v1/ingest/events`** path (the base and MCP Aforo SDKs use `/v1/ingest/batch`). Set `ingestor_url` to the host only — the SDK appends the path.
 

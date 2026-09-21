@@ -30,13 +30,13 @@ billing = AforoWsBilling(
     tenant_id="tenant_acme",
     product_id="prod_ws_market_feed",
     api_key=os.environ["AFORO_API_KEY"],
-    ingestor_url="https://ingest.aforo.ai",
+    ingestor_url="https://usage-ingestor.aforo.ai",
 )
 ```
 
 All four arguments are required — the constructor raises `ValueError` if any is empty.
 
-> ⚠ `ingestor_url` is the **host**; this package appends `/v1/ingest/events`. Pass `https://ingest.aforo.ai`.
+> ⚠ `ingestor_url` is the **host**; this package appends `/v1/ingest/events`. Pass `https://usage-ingestor.aforo.ai`.
 
 ## Step 3 — Resolve the customer, then wrap the connection
 
@@ -121,7 +121,7 @@ Exports: `AforoWsBilling`, `track_websockets_connection(billing, ws, customer_id
 | A route emits no events | The connection wasn't wrapped in `track_*`, or `customer_id` was falsy. | Wrap the connection in the `async with` block and resolve `customer_id` first. |
 | Close event missing / counts are zero | The `async with` block never exited cleanly, or the handler returned before entering it. | Ensure the block wraps the whole message loop; counts finalize on exit. |
 | `on_error` fires with "Aforo returned 401/403" | Bad/unscoped API key — 4xx is dropped, not retried. | Fix `api_key`; confirm it matches `tenant_id`. |
-| Events sent, none in console | Wrong `ingestor_url` host, or the metric isn't mapped to a rate plan. | Use `https://ingest.aforo.ai`; map `websocket_api.connection_closed` (and `.message`) in Aforo. |
+| Events sent, none in console | Wrong `ingestor_url` host, or the metric isn't mapped to a rate plan. | Use `https://usage-ingestor.aforo.ai`; map `websocket_api.connection_closed` (and `.message`) in Aforo. |
 | Event volume far higher than expected | `per_frame_events=True` emits one event per frame. | Switch back to default open+close unless you price per frame. |
 | `wsCloseReason` is `INTERNAL_ERROR` | An exception was raised inside the handler before a clean close. | Expected — fix the handler error; the close is still recorded. |
 
