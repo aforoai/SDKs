@@ -103,7 +103,7 @@ func main() {
 | `TenantID` | `string` | — (required) | Sent as the `X-Tenant-Id` header on every flush and embedded in idempotency keys. Set by you, never from a client header. |
 | `ProductID` | `string` | — (required) | Recorded in event metadata + idempotency keys. |
 | `APIKey` | `string` | — (required) | Sent as `X-API-Key: <APIKey>`. |
-| `IngestorURL` | `string` | — (required) | Ingestor base; the SDK appends `/v1/ingest/events`. Use `https://usage-ingestor.aforo.ai`. |
+| `IngestorURL` | `string` | — (required) | Ingestor base; the SDK appends `/v1/ingest/batch`. Use `https://usage-ingestor.aforo.ai`. |
 | `PerFrameEvents` | `bool` | `false` | When true, each `RecordFrame` emits an immediate event **in addition** to the open/close pair. Off by default — open + close only. |
 | `FlushCount` | `int` | `100` | Flush when the buffer reaches this many events. |
 | `FlushInterval` | `time.Duration` | `3s` | Background flush cadence. |

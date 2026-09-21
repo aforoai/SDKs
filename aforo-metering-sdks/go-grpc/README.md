@@ -85,7 +85,7 @@ Each call emits one event with `metricName` `"grpc_api.rpc_calls"`. The customer
 | `TenantID` | `string` | — (required) | Sent as the `X-Tenant-Id` header on every flush and embedded in idempotency keys. Set by you, never from a client header. |
 | `ProductID` | `string` | — (required) | Recorded in event metadata + idempotency keys. |
 | `APIKey` | `string` | — (required) | Sent as `X-API-Key: <APIKey>`. |
-| `IngestorURL` | `string` | — (required) | Ingestor base; the SDK appends `/v1/ingest/events`. Use `https://usage-ingestor.aforo.ai`. |
+| `IngestorURL` | `string` | — (required) | Ingestor base; the SDK appends `/v1/ingest/batch`. Use `https://usage-ingestor.aforo.ai`. |
 | `ServiceName` | `string` | — (required) | Fully-qualified gRPC service (e.g. `acme.v1.UserService`); recorded as `grpcService`. |
 | `FlushCount` | `int` | `50` | Flush when the buffer reaches this many events. |
 | `FlushInterval` | `time.Duration` | `5s` | Background flush cadence. |

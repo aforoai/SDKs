@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
@@ -40,16 +41,16 @@ const sdkVersion = "1.0.0"
 
 // Config captures all SDK options.
 type Config struct {
-	TenantID         string
-	ProductID        string
-	APIKey           string
-	IngestorURL      string
-	ServiceName      string // fully-qualified gRPC service, e.g. "acme.v1.UserService"
-	FlushCount       int   // default 50
-	FlushInterval    time.Duration // default 5s
-	HTTPClient       *http.Client  // optional override
+	TenantID          string
+	ProductID         string
+	APIKey            string
+	IngestorURL       string
+	ServiceName       string                           // fully-qualified gRPC service, e.g. "acme.v1.UserService"
+	FlushCount        int                              // default 50
+	FlushInterval     time.Duration                    // default 5s
+	HTTPClient        *http.Client                     // optional override
 	CustomerExtractor func(ctx context.Context) string // default reads "x-customer-id" md
-	OnError          func(error)
+	OnError           func(error)
 }
 
 type Billing struct {
@@ -86,7 +87,7 @@ func New(cfg Config) (*Billing, error) {
 
 	b := &Billing{
 		cfg:    cfg,
-		url:    strings.TrimRight(cfg.IngestorURL, "/") + "/v1/ingest/events",
+		url:    strings.TrimRight(cfg.IngestorURL, "/") + "/v1/ingest/batch",
 		client: cfg.HTTPClient,
 		stop:   make(chan struct{}),
 	}
@@ -129,13 +130,17 @@ func (b *Billing) StreamInterceptor() grpc.StreamServerInterceptor {
 // message counts. The grpcStatusCode is auto-derived from err.
 func (b *Billing) Record(ctx context.Context, method, callType string, messageCount int, err error, durationMs int64) {
 	customerID := b.cfg.CustomerExtractor(ctx)
-	if customerID == "" {
+	if customerID == "" || method == "" {
+		return
+	}
+	if len(customerID) > 64 {
+		b.cfg.OnError(fmt.Errorf("grpcmetering: customerId longer than 64 chars, event dropped"))
 		return
 	}
 	statusLabel := "OK"
 	if err != nil {
 		st, _ := status.FromError(err)
-		statusLabel = st.Code().String()
+		statusLabel = statusCodeName(st.Code())
 	}
 	now := time.Now().UTC()
 	event := map[string]any{
@@ -143,18 +148,23 @@ func (b *Billing) Record(ctx context.Context, method, callType string, messageCo
 		"metricName":          "grpc_api.rpc_calls",
 		"quantity":            1,
 		"occurredAt":          now.Format(time.RFC3339Nano),
-		"idempotencyKey":      fmt.Sprintf("grpc:%s:%s:%s:%d:%s", b.cfg.TenantID, b.cfg.ServiceName, method, now.UnixMilli(), randomSuffix()),
+		"idempotencyKey":      capKey(fmt.Sprintf("grpc:%s:%s:%s:%d:%s", b.cfg.TenantID, b.cfg.ServiceName, method, now.UnixMilli(), randomSuffix())),
 		"productType":         "GRPC_API",
 		"grpcService":         b.cfg.ServiceName,
 		"grpcMethod":          method,
 		"grpcStatusCode":      statusLabel,
-		"grpcCallType":        callType,
 		"messageCount":        messageCount,
 		"executionDurationMs": durationMs,
 		"metadata": map[string]any{
 			"sdkVersion": sdkVersion,
 			"productId":  b.cfg.ProductID,
 		},
+	}
+	// grpcCallType is an enum on the ingestor; an unknown value rejects the
+	// whole event, so omit it rather than send something outside the set.
+	switch ct := strings.ToUpper(callType); ct {
+	case "UNARY", "CLIENT_STREAM", "SERVER_STREAM", "BIDI_STREAM":
+		event["grpcCallType"] = ct
 	}
 	b.mu.Lock()
 	b.buffer = append(b.buffer, event)
@@ -188,6 +198,9 @@ func (b *Billing) flushLoop() {
 	}
 }
 
+// maxBatchSize is the ingestor's per-request cap on POST /v1/ingest/batch.
+const maxBatchSize = 1000
+
 func (b *Billing) flush() {
 	b.mu.Lock()
 	if len(b.buffer) == 0 {
@@ -198,12 +211,23 @@ func (b *Billing) flush() {
 	b.buffer = nil
 	b.mu.Unlock()
 
-	body, err := json.Marshal(map[string]any{"events": batch})
+	for start := 0; start < len(batch); start += maxBatchSize {
+		end := start + maxBatchSize
+		if end > len(batch) {
+			end = len(batch)
+		}
+		b.send(batch[start:end])
+	}
+}
+
+// send POSTs one chunk of at most maxBatchSize events. The body is marshalled
+// once, so every retry carries the same idempotencyKeys.
+func (b *Billing) send(chunk []map[string]any) {
+	body, err := json.Marshal(map[string]any{"events": chunk})
 	if err != nil {
 		b.cfg.OnError(err)
 		return
 	}
-
 	for attempt := 1; attempt <= 3; attempt++ {
 		req, _ := http.NewRequest(http.MethodPost, b.url, bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
@@ -220,9 +244,11 @@ func (b *Billing) flush() {
 			b.cfg.OnError(err)
 			return
 		}
-		time.Sleep(time.Duration(1<<(attempt-1)) * time.Second)
+		if attempt < 3 {
+			time.Sleep(time.Duration(1<<(attempt-1)) * time.Second)
+		}
 	}
-	b.cfg.OnError(fmt.Errorf("grpcmetering: flush exhausted retries (dropped %d events)", len(batch)))
+	b.cfg.OnError(fmt.Errorf("grpcmetering: flush exhausted retries (dropped %d events)", len(chunk)))
 }
 
 // Shutdown flushes pending events and stops the background goroutine.
@@ -247,6 +273,57 @@ func defaultCustomerExtractor(ctx context.Context) string {
 		return v[0]
 	}
 	return ""
+}
+
+// statusCodeName maps a gRPC code to the ingestor's grpcStatusCode enum
+// (canonical UPPER_SNAKE names). codes.Code.String() returns CamelCase
+// ("InvalidArgument", "Canceled"), which the ingestor rejects.
+func statusCodeName(c codes.Code) string {
+	switch c {
+	case codes.OK:
+		return "OK"
+	case codes.Canceled:
+		return "CANCELLED"
+	case codes.InvalidArgument:
+		return "INVALID_ARGUMENT"
+	case codes.DeadlineExceeded:
+		return "DEADLINE_EXCEEDED"
+	case codes.NotFound:
+		return "NOT_FOUND"
+	case codes.AlreadyExists:
+		return "ALREADY_EXISTS"
+	case codes.PermissionDenied:
+		return "PERMISSION_DENIED"
+	case codes.ResourceExhausted:
+		return "RESOURCE_EXHAUSTED"
+	case codes.FailedPrecondition:
+		return "FAILED_PRECONDITION"
+	case codes.Aborted:
+		return "ABORTED"
+	case codes.OutOfRange:
+		return "OUT_OF_RANGE"
+	case codes.Unimplemented:
+		return "UNIMPLEMENTED"
+	case codes.Internal:
+		return "INTERNAL"
+	case codes.Unavailable:
+		return "UNAVAILABLE"
+	case codes.DataLoss:
+		return "DATA_LOSS"
+	case codes.Unauthenticated:
+		return "UNAUTHENTICATED"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// capKey keeps idempotency keys within the ingestor's 255-char limit. The
+// unique tail (millis + random suffix) is preserved.
+func capKey(k string) string {
+	if len(k) > 255 {
+		return k[len(k)-255:]
+	}
+	return k
 }
 
 var alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"

@@ -18,6 +18,8 @@ import (
 type rec struct {
 	mu       sync.Mutex
 	requests []map[string]any
+	paths    []string
+	headers  []http.Header
 }
 
 func (r *rec) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -27,6 +29,8 @@ func (r *rec) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	_ = json.Unmarshal(raw, &body)
 	r.mu.Lock()
 	r.requests = append(r.requests, body)
+	r.paths = append(r.paths, req.URL.Path)
+	r.headers = append(r.headers, req.Header.Clone())
 	r.mu.Unlock()
 	w.WriteHeader(204)
 }
@@ -263,5 +267,94 @@ func TestOpenRejectsEmptyCustomer(t *testing.T) {
 	_ = b.Shutdown()
 	if n := len(r.events()); n != 0 {
 		t.Errorf("got %d events, want 0", n)
+	}
+}
+
+// ── Wire contract: POST /v1/ingest/batch ─────────────────────────────
+
+func TestBatchWireContract(t *testing.T) {
+	r := &rec{}
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+	b := newBilling(t, srv, func(c *Config) { c.PerFrameEvents = true })
+
+	id := b.Open("cust_001", nil)
+	b.RecordFrame(id, "client_to_server", "text", 128)
+	b.RecordFrame(id, "sideways", "blob", 1)
+	b.Close(id, 1000)
+	_ = b.Shutdown()
+
+	r.mu.Lock()
+	path, hdr, body := r.paths[0], r.headers[0], r.requests[0]
+	r.mu.Unlock()
+	if path != "/v1/ingest/batch" {
+		t.Errorf("path = %s, want /v1/ingest/batch", path)
+	}
+	if hdr.Get("X-API-Key") != "sk_ws_abc" {
+		t.Errorf("X-API-Key = %q", hdr.Get("X-API-Key"))
+	}
+	if _, ok := body["apiKey"]; ok {
+		t.Error("apiKey must not be in the body")
+	}
+	evs := r.events()
+	if len(evs) != 4 {
+		t.Fatalf("events = %d, want 4", len(evs))
+	}
+	for _, ev := range evs {
+		if _, ok := ev["apiKey"]; ok {
+			t.Error("apiKey must not be in an event")
+		}
+		if _, ok := ev["durationMs"]; ok {
+			t.Error("durationMs is not a DTO field; use executionDurationMs")
+		}
+		for _, k := range []string{"customerId", "metricName", "quantity", "occurredAt", "idempotencyKey", "productType", "wsConnectionId", "executionDurationMs", "dataBytes", "messageCount"} {
+			if _, ok := ev[k]; !ok {
+				t.Errorf("event missing %q: %v", k, ev)
+			}
+		}
+		if _, err := time.Parse(time.RFC3339Nano, ev["occurredAt"].(string)); err != nil {
+			t.Errorf("occurredAt not RFC3339: %v", err)
+		}
+	}
+	// Lower-case enums are normalised; values outside the enum are omitted.
+	if evs[1]["wsDirection"] != "CLIENT_TO_SERVER" || evs[1]["wsFrameType"] != "TEXT" {
+		t.Errorf("frame enums = %v / %v", evs[1]["wsDirection"], evs[1]["wsFrameType"])
+	}
+	if _, ok := evs[2]["wsDirection"]; ok {
+		t.Errorf("invalid wsDirection should be omitted: %v", evs[2]["wsDirection"])
+	}
+	if _, ok := evs[2]["wsFrameType"]; ok {
+		t.Errorf("invalid wsFrameType should be omitted: %v", evs[2]["wsFrameType"])
+	}
+}
+
+func TestLargeBufferSplitsIntoBatchesOf1000(t *testing.T) {
+	r := &rec{}
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+	b := newBilling(t, srv, func(c *Config) { c.FlushCount = 100000; c.PerFrameEvents = true })
+
+	id := b.Open("cust_001", nil) // 1 event
+	for i := 0; i < 2498; i++ {
+		b.RecordFrame(id, "SERVER_TO_CLIENT", "TEXT", 10)
+	}
+	b.Close(id, 1000) // 1 event → 2500 total
+	_ = b.Shutdown()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.requests) != 3 {
+		t.Fatalf("requests = %d, want 3", len(r.requests))
+	}
+	total := 0
+	for _, body := range r.requests {
+		n := len(body["events"].([]any))
+		if n == 0 || n > 1000 {
+			t.Errorf("batch size = %d, want 1..1000", n)
+		}
+		total += n
+	}
+	if total != 2500 {
+		t.Errorf("total = %d, want 2500", total)
 	}
 }

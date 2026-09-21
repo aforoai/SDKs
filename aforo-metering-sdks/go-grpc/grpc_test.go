@@ -19,9 +19,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
-	"google.golang.org/grpc/codes"
 )
 
 // ── Helper: collect HTTP requests against a test server ─────────────────
@@ -71,9 +71,9 @@ func newBilling(t *testing.T, server *httptest.Server, opts ...func(*Config)) *B
 		TenantID:      "tenant-001",
 		ProductID:     "prod-001",
 		APIKey:        "sk_test_abc",
-		IngestorURL:   server.URL + "/",   // trailing slash stripped by SDK
+		IngestorURL:   server.URL + "/", // trailing slash stripped by SDK
 		ServiceName:   "acme.v1.UserService",
-		FlushCount:    1,                  // flush on first event
+		FlushCount:    1, // flush on first event
 		FlushInterval: 100 * time.Millisecond,
 	}
 	for _, o := range opts {
@@ -138,8 +138,8 @@ func TestRecordEmitsEventWithCorrectShape(t *testing.T) {
 	if req.method != http.MethodPost {
 		t.Errorf("method = %s, want POST", req.method)
 	}
-	if req.path != "/v1/ingest/events" {
-		t.Errorf("path = %s, want /v1/ingest/events (trailing slash stripped)", req.path)
+	if req.path != "/v1/ingest/batch" {
+		t.Errorf("path = %s, want /v1/ingest/batch (trailing slash stripped)", req.path)
 	}
 	if req.headers.Get("X-API-Key") != "sk_test_abc" {
 		t.Errorf("X-API-Key header = %q", req.headers.Get("X-API-Key"))
@@ -170,6 +170,20 @@ func TestRecordEmitsEventWithCorrectShape(t *testing.T) {
 			t.Errorf("event[%q] = %v, want %v", k, ev[k], v)
 		}
 	}
+	if _, ok := req.body["apiKey"]; ok {
+		t.Errorf("apiKey must not be sent in the body")
+	}
+	if _, ok := ev["apiKey"]; ok {
+		t.Errorf("apiKey must not be sent in an event")
+	}
+	for _, k := range []string{"quantity", "occurredAt", "messageCount"} {
+		if _, ok := ev[k]; !ok {
+			t.Errorf("event missing %q", k)
+		}
+	}
+	if _, err := time.Parse(time.RFC3339Nano, ev["occurredAt"].(string)); err != nil {
+		t.Errorf("occurredAt not RFC3339: %v", err)
+	}
 	if ev["executionDurationMs"].(float64) != 42 {
 		t.Errorf("executionDurationMs = %v, want 42", ev["executionDurationMs"])
 	}
@@ -192,8 +206,94 @@ func TestRecordMapsGrpcErrorToStatusLabel(t *testing.T) {
 	waitFor(t, func() bool { return len(rec.got()) == 1 }, 2*time.Second)
 	events, _ := rec.got()[0].body["events"].([]any)
 	ev := events[0].(map[string]any)
-	if ev["grpcStatusCode"] != "NotFound" {
-		t.Errorf("status label = %v, want NotFound (from status.Code().String())", ev["grpcStatusCode"])
+	if ev["grpcStatusCode"] != "NOT_FOUND" {
+		t.Errorf("status label = %v, want NOT_FOUND", ev["grpcStatusCode"])
+	}
+}
+
+func TestStatusCodeNamesMatchIngestorEnum(t *testing.T) {
+	cases := map[codes.Code]string{
+		codes.OK:                "OK",
+		codes.Canceled:          "CANCELLED",
+		codes.InvalidArgument:   "INVALID_ARGUMENT",
+		codes.DeadlineExceeded:  "DEADLINE_EXCEEDED",
+		codes.ResourceExhausted: "RESOURCE_EXHAUSTED",
+		codes.Unauthenticated:   "UNAUTHENTICATED",
+		codes.Code(99):          "UNKNOWN",
+	}
+	for c, want := range cases {
+		if got := statusCodeName(c); got != want {
+			t.Errorf("statusCodeName(%v) = %s, want %s", c, got, want)
+		}
+	}
+}
+
+func TestUnknownCallTypeIsOmitted(t *testing.T) {
+	rec := &recorder{status: 204}
+	srv := httptest.NewServer(rec)
+	defer srv.Close()
+	b := newBilling(t, srv)
+
+	ctx := ctxWith(metadata.Pairs("x-customer-id", "cust_001"))
+	b.Record(ctx, "Watch", "streaming", 3, nil, 10)
+	b.Record(ctx, "List", "server_stream", 3, nil, 10)
+
+	byMethod := map[string]map[string]any{}
+	waitFor(t, func() bool {
+		for _, r := range rec.got() {
+			for _, e := range r.body["events"].([]any) {
+				ev := e.(map[string]any)
+				byMethod[ev["grpcMethod"].(string)] = ev
+			}
+		}
+		return len(byMethod) == 2
+	}, 2*time.Second)
+	if _, ok := byMethod["Watch"]["grpcCallType"]; ok {
+		t.Errorf("invalid grpcCallType should be omitted, got %v", byMethod["Watch"]["grpcCallType"])
+	}
+	if got := byMethod["List"]["grpcCallType"]; got != "SERVER_STREAM" {
+		t.Errorf("grpcCallType = %v, want SERVER_STREAM", got)
+	}
+}
+
+func TestLargeBufferSplitsIntoBatchesOf1000(t *testing.T) {
+	rec := &recorder{status: 204}
+	srv := httptest.NewServer(rec)
+	defer srv.Close()
+
+	b, err := New(Config{
+		TenantID: "tenant-001", ProductID: "prod-001", APIKey: "k",
+		IngestorURL: srv.URL, ServiceName: "svc",
+		FlushCount:    100000,
+		FlushInterval: 60 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := ctxWith(metadata.Pairs("x-customer-id", "cust_001"))
+	for i := 0; i < 2500; i++ {
+		b.Record(ctx, "M", "UNARY", 1, nil, 1)
+	}
+	if err := b.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := rec.got()
+	if len(got) != 3 {
+		t.Fatalf("requests = %d, want 3", len(got))
+	}
+	total := 0
+	for _, r := range got {
+		if r.path != "/v1/ingest/batch" {
+			t.Errorf("path = %s", r.path)
+		}
+		n := len(r.body["events"].([]any))
+		if n == 0 || n > 1000 {
+			t.Errorf("batch size = %d, want 1..1000", n)
+		}
+		total += n
+	}
+	if total != 2500 {
+		t.Errorf("total events = %d, want 2500", total)
 	}
 }
 
@@ -327,8 +427,18 @@ func TestRetryUntilOnErrorFires(t *testing.T) {
 		return len(errs) >= 1
 	}, 10*time.Second)
 
-	if got := len(rec.got()); got != 3 {
-		t.Errorf("attempts = %d, want 3", got)
+	got := rec.got()
+	if len(got) != 3 {
+		t.Errorf("attempts = %d, want 3", len(got))
+	}
+	// Retries must resend the same idempotencyKey.
+	keyOf := func(c captured) string {
+		return c.body["events"].([]any)[0].(map[string]any)["idempotencyKey"].(string)
+	}
+	for _, c := range got[1:] {
+		if keyOf(c) != keyOf(got[0]) {
+			t.Errorf("idempotencyKey changed across retries: %s vs %s", keyOf(c), keyOf(got[0]))
+		}
 	}
 	errMu.Lock()
 	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "exhausted") {

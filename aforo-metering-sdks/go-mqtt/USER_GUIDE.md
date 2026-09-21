@@ -119,7 +119,7 @@ The buffer flushes every `FlushInterval` (2s) or when it reaches `FlushCount` (2
 The metric name is `mqtt_broker.<lowercased event type>` (e.g. `mqtt_broker.publish`). The wire call the SDK makes:
 
 ```
-POST https://usage-ingestor.aforo.ai/v1/ingest/events
+POST https://usage-ingestor.aforo.ai/v1/ingest/batch
 X-API-Key: <AFORO_API_KEY>
 X-Tenant-Id: tenant_acme
 Content-Type: application/json
@@ -136,7 +136,7 @@ Content-Type: application/json
 | `TenantID` | `string` | — (required) | `X-Tenant-Id` header + idempotency-key component. |
 | `ProductID` | `string` | — (required) | Event metadata + idempotency-key component. |
 | `APIKey` | `string` | — (required) | `X-API-Key: <APIKey>`. |
-| `IngestorURL` | `string` | — (required) | Base; `/v1/ingest/events` is appended. |
+| `IngestorURL` | `string` | — (required) | Base; `/v1/ingest/batch` is appended. |
 | `EmitDeliverEvents` | `bool` | `false` | Whether `RecordDeliver` emits. |
 | `FlushCount` | `int` | `200` | Buffer-size flush threshold. |
 | `FlushInterval` | `time.Duration` | `2s` | Background flush cadence. |

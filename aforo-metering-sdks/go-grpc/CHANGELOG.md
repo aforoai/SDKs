@@ -7,6 +7,10 @@ All notable changes to `grpc-metering-go` are documented here. This project foll
 ### Fixed
 - **Breaking (fix):** the tenant API key is sent as `X-API-Key` instead of `Authorization: Bearer`. The ingestor parses Bearer values as JWTs and rejected every request 401 (sending both headers is also 401), so no usage was being delivered.
 - Docs and examples use the real ingestor host `https://usage-ingestor.aforo.ai` (`ingest.aforo.ai` / `ingestor.aforo.ai` serve a static site, not the ingestor).
+- **Breaking (fix):** batches are POSTed to `/v1/ingest/batch` instead of `/v1/ingest/events`. `/v1/ingest/events` is a single-event Apigee-format endpoint and does not accept `{"events":[...]}`, so batches were not being ingested.
+- Each flush is split into requests of at most 1000 events (the ingestor's batch limit). Retries resend the same body, so `idempotencyKey`s are stable across attempts.
+- Events whose `customerId` exceeds 64 characters are dropped and reported via `OnError` instead of being rejected by the ingestor.
+- `grpcStatusCode` now uses the ingestor's enum names (`CANCELLED`, `INVALID_ARGUMENT`, `NOT_FOUND`, …) instead of Go's `codes.Code.String()` (`Canceled`, `InvalidArgument`, `NotFound`), which the ingestor rejected. `grpcCallType` passed to `Record` is upper-cased and omitted if it is not `UNARY`/`CLIENT_STREAM`/`SERVER_STREAM`/`BIDI_STREAM`. `Record` with an empty method is ignored (`grpcMethod` is required).
 
 ## [1.0.0] — 2026-06-29
 

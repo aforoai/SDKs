@@ -106,12 +106,12 @@ The buffer flushes every `FlushInterval` (3s) or when it reaches `FlushCount` (1
 The wire call the SDK makes:
 
 ```
-POST https://usage-ingestor.aforo.ai/v1/ingest/events
+POST https://usage-ingestor.aforo.ai/v1/ingest/batch
 X-API-Key: <AFORO_API_KEY>
 X-Tenant-Id: tenant_acme
 Content-Type: application/json
 
-{"events":[{"customerId":"…","metricName":"websocket_api.connection_closed","quantity":1,"occurredAt":"…","idempotencyKey":"ws:…","productType":"WEBSOCKET_API","wsConnectionId":"ws_…","wsDirection":"SERVER_TO_CLIENT","wsFrameType":"CLOSE","messageCount":42,"dataBytes":8192,"durationMs":15300,"wsCloseReason":"NORMAL_CLOSURE","metadata":{"path":"/ws","event":"CONNECTION_CLOSED","frames":42,"bytes":8192,"closeCode":1000,"sdkVersion":"1.0.0","productId":"prod_ws_market_feed"}}]}
+{"events":[{"customerId":"…","metricName":"websocket_api.connection_closed","quantity":1,"occurredAt":"…","idempotencyKey":"ws:…","productType":"WEBSOCKET_API","wsConnectionId":"ws_…","wsDirection":"SERVER_TO_CLIENT","wsFrameType":"CLOSE","messageCount":42,"dataBytes":8192,"executionDurationMs":15300,"wsCloseReason":"NORMAL_CLOSURE","metadata":{"path":"/ws","event":"CONNECTION_CLOSED","frames":42,"bytes":8192,"closeCode":1000,"sdkVersion":"1.0.0","productId":"prod_ws_market_feed"}}]}
 ```
 
 > ⚠ Flush failures are silent unless you set `OnError`. If nothing lands, set `OnError: func(err error){ log.Println("aforo:", err) }` to surface marshal failures and retry-exhausted drops.
@@ -123,7 +123,7 @@ Content-Type: application/json
 | `TenantID` | `string` | — (required) | `X-Tenant-Id` header + idempotency-key component. |
 | `ProductID` | `string` | — (required) | Event metadata + idempotency-key component. |
 | `APIKey` | `string` | — (required) | `X-API-Key: <APIKey>`. |
-| `IngestorURL` | `string` | — (required) | Base; `/v1/ingest/events` is appended. |
+| `IngestorURL` | `string` | — (required) | Base; `/v1/ingest/batch` is appended. |
 | `PerFrameEvents` | `bool` | `false` | Per-frame event emission in addition to open/close. |
 | `FlushCount` | `int` | `100` | Buffer-size flush threshold. |
 | `FlushInterval` | `time.Duration` | `3s` | Background flush cadence. |
