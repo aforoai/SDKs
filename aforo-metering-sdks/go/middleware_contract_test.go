@@ -105,11 +105,16 @@ func TestHTTPMiddleware_MetricAndCustomerOptions(t *testing.T) {
 	if len(events) != 2 {
 		t.Fatalf("expected 2 events, got %+v", events)
 	}
-	if events[0].MetricName != "otp_delivered" || events[1].MetricName != "fallback_metric" {
-		t.Fatalf("unexpected metric names %+v", events)
+	// Each event flushes on its own goroutine, so arrival order is not fixed.
+	metrics := map[string]bool{}
+	for _, e := range events {
+		metrics[e.MetricName] = true
+		if e.CustomerID != "cust_fn" {
+			t.Fatalf("unexpected customer %+v", e)
+		}
 	}
-	if events[0].CustomerID != "cust_fn" {
-		t.Fatalf("unexpected customer %+v", events[0])
+	if !metrics["otp_delivered"] || !metrics["fallback_metric"] {
+		t.Fatalf("unexpected metric names %+v", events)
 	}
 }
 
