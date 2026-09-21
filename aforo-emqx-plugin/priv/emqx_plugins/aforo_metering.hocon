@@ -11,11 +11,14 @@ aforo_metering {
   ## Required: Aforo product ID this broker instance is registered as
   product_id = "prod_mqtt_default"
 
-  ## Required: Aforo API key (Bearer token for the ingestor)
+  ## Required: Aforo API key, scoped usage:ingest. Sent as the X-API-Key
+  ## header -- never as Authorization: Bearer, which the ingestor rejects 401.
   api_key = "${AFORO_API_KEY}"
 
-  ## Aforo usage-ingestor batch endpoint
-  ingestor_url = "https://ingestor.aforo.ai/v1/ingest/events"
+  ## Aforo usage-ingestor batch endpoint. The plugin POSTs {"events": [...]},
+  ## which is /v1/ingest/batch's contract (/v1/ingest/events is the
+  ## single-event Apigee-format endpoint).
+  ingestor_url = "https://usage-ingestor.aforo.ai/v1/ingest/batch"
 
   ## Flush when this many events are buffered (or at flush_interval_ms, whichever comes first)
   flush_count = 500

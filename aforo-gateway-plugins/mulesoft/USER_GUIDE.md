@@ -2,6 +2,8 @@
 
 **Version:** 2.0.0 · **Updated:** 2026-06-29 · **Audience:** engineers who own a MuleSoft Anypoint API and need gateway-level metering for Aforo billing.
 
+> ⛔ **NOT PRODUCTION-READY.** The artifacts this guide walks through are not a deployable Anypoint policy format and have not been run on a gateway. Follow the rebuild guidance at the top of [README.md](README.md) before using this guide.
+
 ## What you'll build
 
 A MuleSoft API in Anypoint API Manager with JWT validation + Aforo metering applied, emitting a usage event after every response with customer/tenant identity taken from the verified JWT. By the end you'll have called the API and confirmed the event landed in Aforo — plus a forged-header check proving a spoofed `X-Client-Id` is ignored.
@@ -50,7 +52,7 @@ Set the metering policy properties:
 
 | Property | Value |
 |---|---|
-| `aforo-endpoint` | `https://ingest.aforo.ai/v1/ingest/batch` |
+| `aforo-endpoint` | `https://usage-ingestor.aforo.ai/v1/ingest/batch` |
 | `aforo-api-key` | your Aforo API key (sensitive) |
 | `aforo-tenant-id` | `tenant_acme` (admin-pinned tenant fallback) |
 | `mcp-enabled` | `false` (set `true` only if fronting an MCP server) |

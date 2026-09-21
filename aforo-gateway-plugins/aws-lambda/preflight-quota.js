@@ -11,7 +11,8 @@ const https = require('https');
 /**
  * Check pre-flight quota for a customer.
  *
- * @param {Object} config - { preflightUrl, tenantId, apiKey, timeoutMs, fallback }
+ * @param {Object} config - { preflightUrl, apiKey, timeoutMs, fallback }
+ *   apiKey is sent as X-API-Key (the tenant is derived from the key).
  * @param {string} customerId - Customer identifier
  * @param {string} [metricName] - Optional metric name
  * @returns {Promise<{decision: string, reason?: string, headers?: Object}>}
@@ -31,8 +32,8 @@ async function checkPreFlightQuota(config, customerId, metricName) {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
-            'X-Tenant-Id': config.tenantId,
-            'Authorization': `Bearer ${config.apiKey}`,
+            // X-API-Key alone: Bearer is parsed as a JWT and rejected 401.
+            'X-API-Key': config.apiKey,
             'Content-Length': Buffer.byteLength(payload),
         },
         timeout: config.timeoutMs || 50,

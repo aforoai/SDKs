@@ -6,6 +6,23 @@ This function ships on the Aforo gateway-plugins line; the whole repo is version
 
 ## [Unreleased]
 
+Brings the function in line with the ingestor contract. **Breaking** for deployments: SAM parameters `AforoTenantId` and `CustomerIdSource` were removed, and the stage's access-log format must now include `customerId` from the authorizer context.
+
+### Fixed
+- `index.handler` was `undefined` at runtime: `exports.handler` was set and then `module.exports` was replaced wholesale for tests. The handler is now exported.
+- Authenticates with `X-API-Key` alone (was `Authorization: Bearer`, which the ingestor never reads — and rejects 401 if present). Same fix in `preflight-quota.js` and `compound-metering.js`. `X-Tenant-Id` is no longer sent; the tenant comes from the key.
+- Customer identity came from `$context.identity.apiKey` — the raw API key, a secret, sent to Aforo as `customerId` — or the CLF client IP. It now comes only from `$context.authorizer.customerId` (set by `authorizer.js` from the verified JWT). Entries without one, or with one longer than 64 chars, are skipped instead of being sent with `customerId: null` (which failed the whole batch).
+- `OPTIONS` (CORS preflight) and quantity ≤ 0 (e.g. an empty 204 with `QUANTITY_SOURCE=response_size`) are no longer metered.
+- The default metric was `{method} {path}` — never a catalog metric, so every batch failed 400. Added `METRIC_MAPPINGS` (EXACT/PREFIX/CONTAINS, first match wins) and `DEFAULT_METRIC` (`api_calls`); `METRIC_NAME_PATTERN` applies only when explicitly set.
+- Retries: 408 and 429 are now retried; other 4xx are dropped with the response body logged. Batches are sent concurrently under one deadline taken from `context.getRemainingTimeInMillis()`, so retries cannot run past the Lambda timeout or starve later batches. A batch that still fails transiently makes the handler throw so Lambda's async retry re-delivers it (idempotency keys dedupe).
+- `compound-metering.js` required `uuid`, which is not a dependency — now `crypto.randomUUID()`. Its default compound URL is built from the endpoint's origin instead of appended to the batch URL.
+- Default `AforoEndpoint` is now `https://usage-ingestor.aforo.ai/v1/ingest/batch`. `ingest.aforo.ai` is CloudFront in front of S3: a POST gets a 301 from AmazonS3 and never reaches the ingestor.
+- `FLUSH_COUNT` is capped at 1000, because the ingestor rejects a larger batch with 400.
+- MCP idempotency key no longer embeds the tenant id or timestamp (`mcp:{requestId}:{tool}`).
+
+### Tests
+- Handler-level tests against a local capture server: `X-API-Key` only, no `Authorization`/`X-Tenant-Id`, OPTIONS/no-customer/oversize-customer skipped, API key never in payload, 400 dropped without retry, 429 retried, 5xx throws, deadline respected, zero quantity skipped, metric mapping resolution.
+
 ## [2.0.0] — 2026-06-29
 
 Initial public distribution packaging for the AWS Lambda metering function: README, user guide, and versioning, documented against the 2.0.0 source.

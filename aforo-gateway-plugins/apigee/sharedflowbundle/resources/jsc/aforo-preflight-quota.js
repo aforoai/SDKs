@@ -17,8 +17,9 @@ if (enabled !== 'true') {
     // Pre-flight disabled — skip
     context.setVariable('aforo.preflight_decision', 'ALLOW');
 } else {
-    var customerId = context.getVariable('aforo.customer_id') ||
-                     context.getVariable('apiproxy.consumerkey') || '';
+    var customerId = context.getVariable('aforo.customer_id') || '';
+    // Not apiproxy.consumerkey: that is the caller's API key (a credential),
+    // not an Aforo customer id.
 
     if (!customerId) {
         context.setVariable('aforo.preflight_decision', 'ALLOW');

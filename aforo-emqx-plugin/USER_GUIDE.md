@@ -35,7 +35,7 @@ aforo_metering {
   tenant_id    = "tenant_acme"
   product_id   = "prod_mqtt_iot_telemetry"
   api_key      = "${AFORO_API_KEY}"
-  ingestor_url = "https://ingest.aforo.ai/v1/ingest/batch"
+  ingestor_url = "https://usage-ingestor.aforo.ai/v1/ingest/batch"
 
   flush_count       = 500
   flush_interval_ms = 3000
@@ -113,8 +113,8 @@ If `buffer_depth` keeps climbing and `flush.success` stays at 0, the ingestor is
 |---|---|---|---|
 | `tenant_id` | string | `"tenant_default"` | `X-Tenant-Id` header value. |
 | `product_id` | string | `"prod_mqtt_default"` | Stamped into `metadata.productId`. |
-| `api_key` | string | `""` | Ingestor Bearer token. Use `${AFORO_API_KEY}`. |
-| `ingestor_url` | string | `https://ingestor.aforo.ai/v1/ingest/events` | Ingestor endpoint. Standard batch ingestor: `https://ingest.aforo.ai/v1/ingest/batch`. |
+| `api_key` | string | `""` | Ingestor API key (scope `usage:ingest`), sent as `X-API-Key`. Use `${AFORO_API_KEY}`. |
+| `ingestor_url` | string | `https://usage-ingestor.aforo.ai/v1/ingest/batch` | Ingestor batch endpoint. Override per environment, keeping the `/v1/ingest/batch` path. |
 | `flush_count` | integer | `500` | Buffered-event count that triggers a flush. |
 | `flush_interval_ms` | integer | `3000` | Max ms between partial-batch flushes. |
 | `emit_deliver` | boolean | `false` | One event per fan-out delivery. High volume. |

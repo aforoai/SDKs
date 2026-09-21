@@ -8,11 +8,17 @@
     <LastModifiedAt>1711036800000</LastModifiedAt>
     <Policies>
         <Policy>AforoMeteringReadConfig</Policy>
+        <Policy>AforoJwtReadConfig</Policy>
+        <Policy>AforoJwtValidation</Policy>
+        <Policy>AforoJwtAssignHeaders</Policy>
+        <Policy>AforoMarginGuardCheck</Policy>
+        <Policy>AforoMarginGuardRaiseFault</Policy>
         <Policy>AforoMeteringBuildEvent</Policy>
         <Policy>AforoMeteringSendEvent</Policy>
     </Policies>
     <Resources>
         <Resource>jsc://aforo-metering.js</Resource>
+        <Resource>jsc://aforo-margin-guard.js</Resource>
     </Resources>
     <SharedFlows>
         <SharedFlow>default</SharedFlow>

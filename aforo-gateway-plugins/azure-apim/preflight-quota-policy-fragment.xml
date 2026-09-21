@@ -1,38 +1,47 @@
 <!--
     Aforo Pre-Flight Quota Check Policy Fragment for Azure APIM
+    (fragment id: aforo-preflight)
 
-    Runs in the inbound policy (before proxying to backend).
-    Calls usage-ingestor /api/v1/quota/check synchronously.
-    Fail-open: returns ALLOW if check times out or fails.
+    Calls usage-ingestor /api/v1/quota/check synchronously before proxying.
+    Fail-open: returns ALLOW if the check times out or fails.
 
-    Named values required:
+    A policy fragment cannot contain section elements. Include this in
+    <inbound> AFTER aforo-context (which resolves aforo-customer-id):
+
+      <inbound>
+          <base />
+          <include-fragment fragment-id="aforo-jwt-validation" />   (optional)
+          <include-fragment fragment-id="aforo-context" />
+          <include-fragment fragment-id="aforo-preflight" />
+      </inbound>
+
+    Skipped for OPTIONS and when no Aforo customer was resolved. The customer
+    sent is the resolved Aforo customer id — never the APIM subscription key,
+    which is a credential.
+
+    Named Values (double-brace syntax):
       aforo-preflight-enabled:    "true" | "false"
-      aforo-preflight-url:        Usage ingestor quota check URL
-      aforo-preflight-timeout-ms: Max wait (default: 50)
-      aforo-preflight-fallback:   "ALLOW" (default) or "DENY"
-      aforo-api-key:              Aforo API key
-      aforo-tenant-id:            Tenant identifier
+      aforo-preflight-url:        Usage ingestor quota check URL (…/api/v1/quota/check)
+      aforo-preflight-fallback:   "ALLOW" or "DENY" when the check errors
+      aforo-api-key:              Aforo API key (Secret), sent as X-API-Key.
+                                  The key needs quotas:read (unverified for a
+                                  usage:ingest-only key).
 -->
 <fragment>
-    <inbound>
         <choose>
-            <when condition="@(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-preflight-enabled&quot;, &quot;false&quot;) == &quot;true&quot;)">
+            <when condition="@(&quot;{{aforo-preflight-enabled}}&quot; == &quot;true&quot; &amp;&amp; context.Request.Method != &quot;OPTIONS&quot; &amp;&amp; !string.IsNullOrEmpty(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-customer-id&quot;, &quot;&quot;)))">
                 <send-request mode="new" response-variable-name="preflightResponse" timeout="1" ignore-error="true">
-                    <set-url>@(context.Variables.GetValueOrDefault&lt;string&gt;("aforo-preflight-url"))</set-url>
+                    <set-url>{{aforo-preflight-url}}</set-url>
                     <set-method>POST</set-method>
                     <set-header name="Content-Type" exists-action="override">
                         <value>application/json</value>
                     </set-header>
-                    <set-header name="X-Tenant-Id" exists-action="override">
-                        <value>@(context.Variables.GetValueOrDefault&lt;string&gt;("aforo-tenant-id"))</value>
-                    </set-header>
-                    <set-header name="Authorization" exists-action="override">
-                        <value>@($"Bearer {context.Variables.GetValueOrDefault&lt;string&gt;("aforo-api-key")}")</value>
+                    <set-header name="X-API-Key" exists-action="override">
+                        <value>{{aforo-api-key}}</value>
                     </set-header>
                     <set-body><![CDATA[@{
-                        var customerId = context.Subscription?.Key ?? context.User?.Id ?? "";
                         var body = new JObject();
-                        body["customerId"] = customerId;
+                        body["customerId"] = context.Variables.GetValueOrDefault<string>("aforo-customer-id", "");
                         return body.ToString(Newtonsoft.Json.Formatting.None);
                     }]]></set-body>
                 </send-request>
@@ -43,12 +52,12 @@
                         <set-variable name="preflightDecision" value="@{
                             try {
                                 var response = ((IResponse)context.Variables[&quot;preflightResponse&quot;]);
-                                if (response.StatusCode != 200) return &quot;ALLOW&quot;;
+                                if (response == null || response.StatusCode != 200) { return &quot;{{aforo-preflight-fallback}}&quot;; }
                                 var body = response.Body.As&lt;JObject&gt;();
                                 var data = body[&quot;data&quot;] ?? body;
                                 return data[&quot;decision&quot;]?.ToString() ?? &quot;ALLOW&quot;;
                             } catch {
-                                return context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-preflight-fallback&quot;, &quot;ALLOW&quot;);
+                                return &quot;{{aforo-preflight-fallback}}&quot;;
                             }
                         }" />
 
@@ -75,5 +84,4 @@
                 </choose>
             </when>
         </choose>
-    </inbound>
 </fragment>

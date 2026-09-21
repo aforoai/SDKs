@@ -7,7 +7,7 @@
  * Runs asynchronously after response is returned to client (zero latency impact).
  */
 
-const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
 const https = require('https');
 
 // ── JSONPath-lite: dotted path resolution ──────────────────
@@ -73,8 +73,11 @@ function extractMeasurements(responseBody, extractionPaths, dimensionPaths) {
 
 function buildCompoundEvent(customerId, measurements, metadata) {
     if (!measurements || measurements.length === 0) return null;
+    // Same rule as index.js: an event without an Aforo customer id can never
+    // be accepted, so it is not built. Pass the authorizer's customerId.
+    if (!customerId || String(customerId).length > 64) return null;
     return {
-        correlationId: uuidv4(),
+        correlationId: crypto.randomUUID(),
         customerId,
         occurredAt: new Date().toISOString(),
         metadata,
@@ -88,8 +91,10 @@ async function flushCompoundEvents(events, config) {
     if (!events || events.length === 0) return;
 
     const payload = JSON.stringify({ events });
+    // aforoEndpoint is normally the full batch URL (…/v1/ingest/batch), so the
+    // compound path is built from its origin, not appended to it.
     const url = new URL(config.compoundBatchEndpoint ||
-        `${config.aforoEndpoint}/api/v1/ingest/compound/batch`);
+        `${new URL(config.aforoEndpoint).origin}/api/v1/ingest/compound/batch`);
 
     const options = {
         hostname: url.hostname,
@@ -98,8 +103,8 @@ async function flushCompoundEvents(events, config) {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
-            'X-Tenant-Id': config.tenantId,
-            'Authorization': `Bearer ${config.apiKey}`,
+            // X-API-Key alone: Bearer is parsed as a JWT and rejected 401.
+            'X-API-Key': config.apiKey,
             'Content-Length': Buffer.byteLength(payload),
         },
         timeout: 5000,
