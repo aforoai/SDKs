@@ -123,4 +123,15 @@ describe('EventBuffer', () => {
     assert.equal(client.batches.length, 1);
     assert.equal(client.batches[0].length, 2);
   });
+
+  it('sends more than 1000 buffered events as slices of at most 1000', async () => {
+    client = new StubClient();
+    buffer = new EventBuffer({ flushCount: 5000, flushIntervalMs: 60_000, client: client as any });
+
+    for (let i = 0; i < 2500; i++) buffer.push(makeEvent(`t${i}`));
+    await buffer.flush();
+
+    assert.deepEqual(client.batches.map(b => b.length), [1000, 1000, 500]);
+    assert.equal(buffer.size, 0);
+  });
 });

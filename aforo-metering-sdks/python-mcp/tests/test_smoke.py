@@ -65,3 +65,37 @@ def test_sessions_never_put_heartbeats_in_usage_batch():
         assert all(e["quantity"] > 0 for e in posted)
 
     asyncio.run(scenario())
+
+
+def test_flush_posts_batch_contract_in_slices_of_1000():
+    async def scenario():
+        billing = AforoMcpBilling(**dict(CFG, flush_count=5000))
+        posts = []
+
+        async def fake_post(url, headers, body):
+            posts.append((url, headers, json.loads(body)))
+            return 202, ""
+
+        billing._do_post_with_body = fake_post
+        for _ in range(2500):
+            billing.record_tool_invocation("search", "agent_1", "sess_1", "SUCCESS", 12)
+        await billing.flush()
+
+        assert [u for u, _, _ in posts] == ["https://ingestor.example/v1/ingest/batch"] * 3
+        assert [len(b["events"]) for _, _, b in posts] == [1000, 1000, 500]
+        assert posts[0][1]["X-API-Key"] == "k"
+        assert "Authorization" not in posts[0][1]
+        events = [e for _, _, b in posts for e in b["events"]]
+        assert all("apiKey" not in e for e in events)
+        e = events[0]
+        assert e["customerId"] == "agent_1"
+        assert e["metricName"] == "mcp_server.tool_invocations"
+        assert e["quantity"] == 1
+        assert e["productType"] == "MCP_SERVER"
+        assert e["toolName"] == "search"
+        assert e["executionDurationMs"] == 12
+        # Same tool, same millisecond: keys must still differ or the ingestor
+        # dedupes real invocations.
+        assert len({ev["idempotencyKey"] for ev in events}) == 2500
+
+    asyncio.run(scenario())

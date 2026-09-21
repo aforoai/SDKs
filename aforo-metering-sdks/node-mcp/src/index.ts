@@ -23,6 +23,9 @@
  *   );
  */
 
+/** The ingestor's per-request cap on POST /v1/ingest/batch (IngestBatchRequest). */
+export const MAX_BATCH_EVENTS = 1000;
+
 export interface AforoMcpConfig {
   tenantId: string;
   productId: string;
@@ -188,7 +191,9 @@ export class AforoMcpBilling {
       metricName: 'mcp_server.tool_invocations',
       quantity: 1,
       occurredAt: new Date().toISOString(),
-      idempotencyKey: `mcp:sdk:${agentId}:${sessionId ?? 'no-session'}:${toolName}:${Date.now()}`,
+      // Unique per event: Date.now() alone collides for two calls of the same
+      // tool in the same ms, and the ingestor dedupes the second as a replay.
+      idempotencyKey: `mcp:sdk:${agentId}:${sessionId ?? 'no-session'}:${toolName}:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`,
       productType: 'MCP_SERVER',
       toolName,
       agentId,
@@ -218,6 +223,16 @@ export class AforoMcpBilling {
     const events = [...this.buffer];
     this.buffer = [];
 
+    // POST /v1/ingest/batch rejects more than MAX_BATCH_EVENTS events with 400
+    // (IngestBatchRequest @Size(max = 1000)), so an oversized flush would lose
+    // every event in it. flushCount above 1000, or a burst between timer
+    // ticks, can leave more than that buffered -- send it in slices.
+    for (let i = 0; i < events.length; i += MAX_BATCH_EVENTS) {
+      await this.sendBatch(events.slice(i, i + MAX_BATCH_EVENTS));
+    }
+  }
+
+  private async sendBatch(events: UsageEvent[]): Promise<void> {
     const url = `${this.config.ingestorUrl}/v1/ingest/batch`;
     const body = JSON.stringify({ events });
 

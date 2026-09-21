@@ -59,3 +59,45 @@ describe('AforoMcpBilling session heartbeats', () => {
     expect(events.every((e: any) => e.quantity > 0)).toBe(true);
   });
 });
+
+describe('AforoMcpBilling batch flush', () => {
+  it('posts {events:[...]} to /v1/ingest/batch with X-API-Key, in slices of at most 1000', async () => {
+    const fetchMock = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ accepted: 1, duplicates: 0, failed: 0 }),
+    });
+    (global as { fetch?: unknown }).fetch = fetchMock;
+
+    const billing = new AforoMcpBilling({ ...cfg, flushCount: 5000 });
+    for (let i = 0; i < 2500; i++) {
+      billing.recordToolInvocation('search', 'agent_1', 'sess_1', 'SUCCESS', 12);
+    }
+    await billing.flush();
+
+    const calls = fetchMock.mock.calls;
+    expect(calls.map((c: any[]) => c[0])).toEqual([
+      'https://ingestor.example/v1/ingest/batch',
+      'https://ingestor.example/v1/ingest/batch',
+      'https://ingestor.example/v1/ingest/batch',
+    ]);
+    const bodies = calls.map((c: any[]) => JSON.parse(c[1].body));
+    expect(bodies.map((b: any) => b.events.length)).toEqual([1000, 1000, 500]);
+    expect(calls[0][1].headers['X-API-Key']).toBe('k');
+    expect(calls[0][1].headers.Authorization).toBeUndefined();
+
+    const e = bodies[0].events[0];
+    expect(e).toMatchObject({
+      customerId: 'agent_1', metricName: 'mcp_server.tool_invocations', quantity: 1,
+      productType: 'MCP_SERVER', toolName: 'search', agentId: 'agent_1',
+      sessionId: 'sess_1', executionStatus: 'SUCCESS', executionDurationMs: 12,
+    });
+    expect(typeof e.idempotencyKey).toBe('string');
+    // Same tool, same millisecond: keys must still differ or the ingestor dedupes real calls.
+    const keys = new Set(bodies.flatMap((b: any) => b.events.map((ev: any) => ev.idempotencyKey)));
+    expect(keys.size).toBe(2500);
+    expect(new Date(e.occurredAt).toISOString()).toBe(e.occurredAt);
+    expect(bodies.every((b: any) => b.events.every((ev: any) => !('apiKey' in ev)))).toBe(true);
+
+    await billing.shutdown();
+  });
+});

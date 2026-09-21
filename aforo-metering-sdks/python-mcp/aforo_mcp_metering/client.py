@@ -31,6 +31,9 @@ except ImportError:
 logger = logging.getLogger("aforo_mcp_metering")
 
 
+# The ingestor's per-request cap on POST /v1/ingest/batch (IngestBatchRequest).
+MAX_BATCH_EVENTS = 1000
+
 @dataclass
 class UsageEvent:
     customer_id: str
@@ -172,7 +175,9 @@ class AforoMcpBilling:
             "metricName": "mcp_server.tool_invocations",
             "quantity": 1,
             "occurredAt": datetime.now(timezone.utc).isoformat(),
-            "idempotencyKey": f"mcp:sdk:{agent_id}:{session_id or 'no-session'}:{tool_name}:{int(time.time() * 1000)}",
+            # Unique per event: a millisecond timestamp alone collides for two calls
+            # of the same tool in the same ms, and the ingestor dedupes the second.
+            "idempotencyKey": f"mcp:sdk:{agent_id}:{session_id or 'no-session'}:{tool_name}:{int(time.time() * 1000)}:{uuid.uuid4().hex[:8]}",
             "productType": "MCP_SERVER",
             "toolName": tool_name,
             "agentId": agent_id,
@@ -199,6 +204,14 @@ class AforoMcpBilling:
         events = self._buffer[:]
         self._buffer.clear()
 
+        # POST /v1/ingest/batch rejects more than MAX_BATCH_EVENTS events with 400
+        # (IngestBatchRequest @Size(max = 1000)), losing every event in the batch.
+        # record_tool_invocation schedules flush() rather than awaiting it, so a
+        # burst can buffer more than flush_count -- send in slices.
+        for i in range(0, len(events), MAX_BATCH_EVENTS):
+            await self._send_batch(events[i:i + MAX_BATCH_EVENTS])
+
+    async def _send_batch(self, events: List[Dict[str, Any]]) -> None:
         url = f"{self.ingestor_url}/v1/ingest/batch"
         headers = {
             "Content-Type": "application/json",
