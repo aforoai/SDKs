@@ -216,6 +216,12 @@ async function handlerTests() {
     assertEquals(captured.length, 1, 'no retry that could not finish in time');
     nextStatuses = [];
 
+    console.log('\nTest 13a: FLUSH_COUNT is capped at the ingestor limit of 1000');
+    delete require.cache[require.resolve('../index')];
+    process.env.FLUSH_COUNT = '5000';
+    assertEquals(require('../index').FLUSH_COUNT, 1000, 'FLUSH_COUNT=5000 → 1000');
+    delete process.env.FLUSH_COUNT;
+
     console.log('\nTest 13: response_size quantity 0 is skipped');
     // Re-load with QUANTITY_SOURCE=response_size.
     delete require.cache[require.resolve('../index')];

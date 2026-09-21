@@ -29,7 +29,7 @@ cd SDKs/aforo-gateway-plugins/aws-lambda
 sam build
 sam deploy --guided \
   --parameter-overrides \
-    AforoEndpoint=https://ingest.aforo.ai/v1/ingest/batch \
+    AforoEndpoint=https://usage-ingestor.aforo.ai/v1/ingest/batch \
     AforoApiKey="$AFORO_API_KEY" \
     DefaultMetric=api_calls \
     ApiGatewayLogGroupName=/aws/apigateway/aforo-access-logs
@@ -60,7 +60,7 @@ The values every deployment needs map to SAM parameters / Lambda env vars — `A
 ```bash
 sam deploy \
   --parameter-overrides \
-    AforoEndpoint=https://ingest.aforo.ai/v1/ingest/batch \
+    AforoEndpoint=https://usage-ingestor.aforo.ai/v1/ingest/batch \
     AforoApiKey="$AFORO_API_KEY" \
     DefaultMetric=api_calls \
     MetricMappings='[{"matchType":"PREFIX","value":"/v1/sms","metricName":"sms_sent"}]' \
@@ -75,13 +75,13 @@ The function reads everything from environment variables (set by the SAM templat
 
 | Env var | SAM parameter | Default | What it does |
 |---------|---------------|---------|--------------|
-| `AFORO_ENDPOINT` | `AforoEndpoint` | `https://ingest.aforo.ai/v1/ingest/batch` | Aforo ingestor batch URL. |
+| `AFORO_ENDPOINT` | `AforoEndpoint` | `https://usage-ingestor.aforo.ai/v1/ingest/batch` | Aforo ingestor batch URL. |
 | `AFORO_API_KEY` | `AforoApiKey` | — | Aforo API key, scope `usage:ingest`. Sent as `X-API-Key` (alone — an `Authorization: Bearer` header makes the ingestor answer 401). The tenant is derived from the key. |
 | `METRIC_MAPPINGS` | `MetricMappings` | `[]` | JSON array of `{matchType, value, metricName}` rules, first match wins. `matchType` is `EXACT`, `PREFIX` or `CONTAINS` (plain string comparison — same semantics as catalog's `/internal/v1/metrics/gateway-mappings`, which Kong fetches; this Lambda takes the table as config). Invalid JSON is logged and ignored. |
 | `DEFAULT_METRIC` | `DefaultMetric` | `api_calls` | Metric for requests no mapping matches. **Must be registered in the Aforo catalog** — an unknown metric fails the whole batch with 400. |
 | `METRIC_NAME_PATTERN` | `MetricNamePattern` | *(empty)* | Legacy route-shaped template (`{method}`, `{path}`, `{service}`=stage, `{route}`=resource). Used only when set; every resulting name must be a catalog metric, which route-shaped names almost never are. |
 | `QUANTITY_SOURCE` | `QuantitySource` | `1` | `1` = count, `response_size` = response bytes. Entries whose quantity is 0 (e.g. an empty 204) are skipped — the ingestor requires quantity > 0. |
-| `FLUSH_COUNT` | — (set to `50` in template) | `50` | Max events per POST batch. |
+| `FLUSH_COUNT` | — (set to `50` in template) | `50` | Max events per POST batch. Capped at 1000: the ingestor rejects a larger batch with 400. |
 | `INCLUDE_METADATA` | — (set to `true` in template) | `true` | Include request metadata in the event. Set to `"false"` to omit. |
 | `MCP_ENABLED` | — | `false` | Detect MCP JSON-RPC `tools/call` in the logged request body and emit `mcp_server.tool_invocations`. |
 

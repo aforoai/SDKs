@@ -23,7 +23,8 @@
  *                          {service} {route}). Used ONLY when explicitly set;
  *                          every resulting name must be a catalog metric.
  *   QUANTITY_SOURCE      — "1" (count) or "response_size"
- *   FLUSH_COUNT          — Max events per batch (default 50)
+ *   FLUSH_COUNT          — Max events per batch (default 50, capped at 1000 —
+ *                          the ingestor rejects larger batches with 400)
  *   INCLUDE_METADATA     — "false" to omit request metadata
  *   MCP_ENABLED          — "true" to enable MCP JSON-RPC detection
  *   MCP_PRODUCT_ID       — Aforo product ID for MCP metering
@@ -51,7 +52,11 @@ const DEFAULT_METRIC = process.env.DEFAULT_METRIC || 'api_calls';
 // '{method} {path}' default failed every batch. Only honoured when set.
 const METRIC_NAME_PATTERN = process.env.METRIC_NAME_PATTERN || '';
 const QUANTITY_SOURCE = process.env.QUANTITY_SOURCE || '1';
-const FLUSH_COUNT = Math.max(1, parseInt(process.env.FLUSH_COUNT || '50', 10) || 50);
+// The ingestor rejects a batch of more than 1000 events with 400 (the whole
+// batch), so FLUSH_COUNT is clamped to that however it is configured.
+const MAX_BATCH_EVENTS = 1000;
+const FLUSH_COUNT = Math.min(MAX_BATCH_EVENTS,
+    Math.max(1, parseInt(process.env.FLUSH_COUNT || '50', 10) || 50));
 const INCLUDE_METADATA = process.env.INCLUDE_METADATA !== 'false';
 const MCP_ENABLED = process.env.MCP_ENABLED === 'true';
 
@@ -448,4 +453,5 @@ module.exports = {
     resolveMetricName,
     parseMetricMappings,
     isPermanentRejection,
+    FLUSH_COUNT,
 };

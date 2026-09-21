@@ -16,6 +16,8 @@ Brings the function in line with the ingestor contract. **Breaking** for deploym
 - The default metric was `{method} {path}` — never a catalog metric, so every batch failed 400. Added `METRIC_MAPPINGS` (EXACT/PREFIX/CONTAINS, first match wins) and `DEFAULT_METRIC` (`api_calls`); `METRIC_NAME_PATTERN` applies only when explicitly set.
 - Retries: 408 and 429 are now retried; other 4xx are dropped with the response body logged. Batches are sent concurrently under one deadline taken from `context.getRemainingTimeInMillis()`, so retries cannot run past the Lambda timeout or starve later batches. A batch that still fails transiently makes the handler throw so Lambda's async retry re-delivers it (idempotency keys dedupe).
 - `compound-metering.js` required `uuid`, which is not a dependency — now `crypto.randomUUID()`. Its default compound URL is built from the endpoint's origin instead of appended to the batch URL.
+- Default `AforoEndpoint` is now `https://usage-ingestor.aforo.ai/v1/ingest/batch`. `ingest.aforo.ai` is CloudFront in front of S3: a POST gets a 301 from AmazonS3 and never reaches the ingestor.
+- `FLUSH_COUNT` is capped at 1000, because the ingestor rejects a larger batch with 400.
 - MCP idempotency key no longer embeds the tenant id or timestamp (`mcp:{requestId}:{tool}`).
 
 ### Tests
