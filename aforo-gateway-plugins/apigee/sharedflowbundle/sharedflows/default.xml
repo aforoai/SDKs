@@ -1,39 +1,48 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <SharedFlow name="default">
-    <!-- Step 1: Read all Aforo config from KVM (metering + JWT config) -->
+    <!-- Step 1: Read all Aforo config from KVM (metering, JWT flag, margin guard) -->
     <Step>
         <Name>AforoMeteringReadConfig</Name>
     </Step>
 
     <!--
-      Steps 2-4: JWT Validation (runs BEFORE metering and margin guard)
-      Skip by setting flow variable aforo.jwt_validation_enabled = "false" in KVM.
+      Steps 2-4: JWT Validation — OPT-IN. Runs only when the KVM key
+      jwt_validation_enabled is "true". Previously unconditional, which made
+      VerifyJWT fault (401) every request that did not carry an Aforo JWT —
+      i.e. all ordinary API traffic on every proxy the flow hook covers.
     -->
     <Step>
         <Name>AforoJwtReadConfig</Name>
+        <Condition>aforo.jwtValidationEnabled = "true"</Condition>
     </Step>
     <Step>
         <!-- RS256 signature verification + exp + iss check via Apigee built-in -->
         <Name>AforoJwtValidation</Name>
+        <Condition>aforo.jwtValidationEnabled = "true"</Condition>
     </Step>
     <Step>
         <!-- Set X-Customer-Id, X-Tenant-Id, X-Key-Id, X-Scopes from verified claims -->
         <Name>AforoJwtAssignHeaders</Name>
+        <Condition>aforo.jwtValidationEnabled = "true"</Condition>
     </Step>
 
-    <!-- Step 5: Margin guard pre-flight check (access phase, before metering) -->
+    <!-- Step 5: Margin guard pre-flight check — only when margin_guard_enabled is "true" -->
     <Step>
         <Name>AforoMarginGuardCheck</Name>
+        <Condition>aforo.marginGuardEnabled = "true"</Condition>
     </Step>
     <Step>
         <Name>AforoMarginGuardRaiseFault</Name>
+        <Condition>(aforo.marginGuard.blocked = "true") or (aforo.marginGuard.throttled = "true")</Condition>
     </Step>
 
-    <!-- Steps 6-7: Metering (post-response) -->
+    <!-- Steps 6-7: Metering. The send runs only for events the ingestor can accept
+         (not OPTIONS, not excluded, has a customer, quantity > 0). -->
     <Step>
         <Name>AforoMeteringBuildEvent</Name>
     </Step>
     <Step>
         <Name>AforoMeteringSendEvent</Name>
+        <Condition>aforo.sendEvent = "true"</Condition>
     </Step>
 </SharedFlow>

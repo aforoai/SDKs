@@ -45,56 +45,63 @@ The bundle expects an organization-scoped KVM named `aforo-metering-config` (see
 
 ## Quickstart
 
-1. Create the KVM with the three values every Aforo artifact needs — `aforo_endpoint`, `api_key`, `tenant_id`:
+1. Create the **organization-scoped** KVM the bundle reads (`AforoMeteringReadConfig` uses `<Scope>organization</Scope>`, so do not pass `--env`) with the required keys:
 
 ```bash
-apigeecli kvms entries create \
-  --map aforo-metering-config \
-  --org "$APIGEE_ORG" --env "$APIGEE_ENV" \
-  --key aforo_endpoint --value https://ingest.aforo.ai/v1/ingest/batch \
-  --token "$(gcloud auth print-access-token)"
+TOKEN="$(gcloud auth print-access-token)"
+apigeecli kvms create --name aforo-metering-config --org "$APIGEE_ORG" --token "$TOKEN"
+kv() { apigeecli kvms entries create --map aforo-metering-config --org "$APIGEE_ORG" --key "$1" --value "$2" --token "$TOKEN"; }
 
-apigeecli kvms entries create --map aforo-metering-config \
-  --org "$APIGEE_ORG" --env "$APIGEE_ENV" \
-  --key api_key --value "$AFORO_API_KEY" \
-  --token "$(gcloud auth print-access-token)"
-
-apigeecli kvms entries create --map aforo-metering-config \
-  --org "$APIGEE_ORG" --env "$APIGEE_ENV" \
-  --key tenant_id --value "$AFORO_TENANT_ID" \
-  --token "$(gcloud auth print-access-token)"
+kv aforo_endpoint  https://usage-ingestor.aforo.ai/v1/ingest/batch
+kv api_key         "$AFORO_API_KEY"          # scope usage:ingest; sent as X-API-Key
+kv default_metric  api_calls                  # must exist in your Aforo catalog
+kv metric_mappings '[{"matchType":"PREFIX","value":"/sms/v1/send","metricName":"sms_sent"}]'
+kv jwt_validation_enabled true               # or set customer_id_source (see below)
+kv aforo_jwks_uri  https://auth.aforo.ai/.well-known/jwks.json
+kv aforo_jwt_issuer https://auth.aforo.ai
 ```
 
-2. Attach `aforo-metering` to your proxies with a Flow Hook on `PostProxyFlowHook` (or add a `FlowCallout` step that references the shared flow).
+2. Attach `aforo-metering` to your proxies with a Flow Hook (or a `FlowCallout` step).
 
-3. Call any attached API, then confirm the event under the matching customer + metric in Aforo.
+3. Call an attached API with an Aforo JWT, then confirm the event under the matching customer + metric in Aforo.
 
 ## Configuration
 
-The bundle reads config from the organization-scoped KVM `aforo-metering-config` via the `AforoMeteringReadConfig` policy (cached 300 s). The customer identity is `developer.app.name` (falling back to `developer.email`) — both gateway-managed, not client-settable.
+The bundle reads config from the organization-scoped KVM `aforo-metering-config` via `AforoMeteringReadConfig` (cached 300 s).
 
-| KVM key | Used as | Default (if unset) | What it does |
-|---------|---------|--------------------|--------------|
-| `aforo_endpoint` | `aforo.endpoint` → ServiceCallout URL | — | Aforo ingestor batch URL. Use `https://ingest.aforo.ai/v1/ingest/batch`. |
-| `api_key` | `aforo.apiKey` → `Authorization: Bearer` | — | Aforo API key sent on the callout. |
-| `tenant_id` | `aforo.tenantId` → `X-Tenant-Id` header | — | Aforo tenant identifier sent on the callout. |
-| `metric_name_pattern` | `aforo.metricNamePattern` | `{method} {path}` | Metric-name template. Variables: `{method}`, `{path}`. |
-| `quantity_source` | `aforo.quantitySource` | `1` (in code) | Quantity source. The JS emits `quantity: 1` per event. |
-| `customer_id_source` | `aforo.customerIdSource` | `consumer` | Identity source. The JS uses `developer.app.name`/`developer.email`; request headers are never read. |
-| `exclude_paths` | `aforo.excludePaths` | — | Paths to exclude from metering. |
-| `exclude_status_codes` | `aforo.excludeStatusCodes` | — | Status codes to exclude from metering. |
-| `include_metadata` | `aforo.includeMetadata` | `true` | Include request metadata in the event payload. |
+**Customer identity** comes only from verified sources, in this order:
 
-JWT validation (optional) reads additional KVM keys via `AforoJwtReadConfig`:
+1. `aforo.customer_id` — the `customer_id` claim of an Aforo JWT verified by `AforoJwtValidation` (requires `jwt_validation_enabled = true`).
+2. `customer_id_source = flow_variable:<name>` — a flow variable you know is populated by a verified policy, e.g. `verifyapikey.VerifyKey.app.aforo_customer_id` (a developer-app custom attribute holding the Aforo customer id, available after your `VerifyAPIKey` policy — check the exact variable name in a Debug session). `request.*`, `message.*` and `response.*` variables are refused: they are client-controlled.
+
+`developer.app.name` / `developer.email` are **no longer used**: they are Apigee names, not Aforo customer ids, and the ingestor rejects unknown customers. A call with no resolvable customer is **not sent** (`aforo.skipReason = "no customerId"` in Debug).
+
+| KVM key | Flow variable | Default | What it does |
+|---------|---------------|---------|--------------|
+| `aforo_endpoint` | `aforo.endpoint` | — | Aforo ingestor batch URL, e.g. `https://usage-ingestor.aforo.ai/v1/ingest/batch`. |
+| `api_key` | `private.aforo.apiKey` | — | Aforo API key, scope `usage:ingest`. Sent as `X-API-Key` only — an `Authorization: Bearer` header makes the ingestor answer 401. The tenant comes from the key. |
+| `default_metric` | `aforo.defaultMetric` | `api_calls` | Metric for unmapped requests. **Must be registered in the Aforo catalog**; an unknown metric fails the batch with 400. |
+| `metric_mappings` | `aforo.metricMappings` | — | JSON array `[{"matchType":"EXACT\|PREFIX\|CONTAINS","value":"/path","metricName":"m"}]`, first match wins, matched against `proxy.basepath + proxy.pathsuffix`. Same semantics as catalog's `/internal/v1/metrics/gateway-mappings` (which Kong fetches; here it is config). |
+| `metric_name_pattern` | `aforo.metricNamePattern` | *(unset)* | Legacy `{method} {path}` template, used only when set — route-shaped names are almost never catalog metrics. |
+| `customer_id_source` | `aforo.customerIdSource` | *(unset)* | Optional `flow_variable:<name>` fallback, see above. |
+| `jwt_validation_enabled` | `aforo.jwtValidationEnabled` | *(off)* | `true` runs the JWT steps. Off by default: they used to run unconditionally and 401 every request without an Aforo JWT. |
+| `exclude_paths` | `aforo.excludePaths` | — | Comma-separated path prefixes not to meter (e.g. `/health,/ready`). |
+| `exclude_status_codes` | `aforo.excludeStatusCodes` | — | Comma-separated status codes not to meter (e.g. `401,403,429`). |
+| `quantity_source` | `aforo.quantitySource` | `1` | `1` per call, or `response_size` (response `Content-Length`). Quantity ≤ 0 is not sent. |
+| `include_metadata` | `aforo.includeMetadata` | `true` | `false` omits metadata. |
+| `mcp_enabled` / `mcp_product_id` | `aforo.mcpEnabled` / `aforo.mcpProductId` | off | MCP `tools/call` detection (these were read by the JS but never loaded from the KVM). |
+| `margin_guard_enabled` / `margin_guard_url` | `aforo.marginGuardEnabled` / `aforo.marginGuardUrl` | off | Margin-guard pre-flight (these were read by the JS but never loaded, so it could not run). Uses the JWT `customer_id`/`tenant_id`. |
+| `tenant_id` | `aforo.tenantId` | — | Margin guard only, when the JWT has no `tenant_id`. **Not sent to the ingestor.** |
+
+Never metered: `OPTIONS` (CORS preflights), requests with no customer or a customer id longer than 64 characters, excluded paths/status codes, quantity ≤ 0.
+
+JWT validation reads additional KVM keys via `AforoJwtReadConfig` (only when `jwt_validation_enabled = true`):
 
 | KVM key | What it does |
 |---------|--------------|
-| `aforo_jwks_uri` | JWKS endpoint for RS256 verification (e.g. `https://auth.smartai.com/.well-known/jwks.json`). |
+| `aforo_jwks_uri` | JWKS endpoint for RS256 verification. |
 | `aforo_jwt_issuer` | Expected `iss` claim (e.g. `https://auth.aforo.ai`). |
-| `aforo_redis_host` | Redis host for the jti blocklist (optional). |
-| `aforo_redis_port` | Redis port for the jti blocklist (optional, default 6379). |
-
-> Set the flow variable `aforo.jwt_validation_enabled = "false"` in KVM to skip the JWT steps. When enabled, `AforoJwtValidation` runs RS256 + `exp` + `iss` checks via the Apigee built-in before metering, and `AforoJwtAssignHeaders` sets `X-Customer-Id`/`X-Tenant-Id`/`X-Key-Id`/`X-Scopes` from the verified claims.
+| `aforo_redis_host` / `aforo_redis_port` | Redis for the jti blocklist (optional; the jti-check JS is not wired into the flow — see below). |
 
 ## Walk me through it
 
@@ -102,6 +109,7 @@ Step-by-step from KVM setup to a verified event in Aforo: see [USER_GUIDE.md](US
 
 ## What this doesn't cover
 
-- **Quantity is fixed at 1 per call in the JS.** `quantity_source` exists in KVM and is read into `aforo.quantitySource`, but `aforo-metering.js` emits `quantity: 1` for standard requests. To bill by response size, post-process in Aforo or extend the JS — the source code is the contract.
-- **Best-effort send.** `AforoMeteringSendEvent` uses `continueOnError="true"`, so a failed callout to the ingestor never affects the API response — and is not retried within the shared flow. This is fire-and-forget metering.
-- **Apigee's built-in JWT policy resolves the issuer + JWKS**, but the jti-blocklist and client-revocation logic in `aforo-jwt-jti-check.js` requires the optional Redis KVM keys; without them only `exp`/`iss`/signature run.
+- **Not verified on a live Apigee org.** The JS is unit-tested with a mock context and the XML is well-formed, but the bundle has not been deployed. Unverified: the `private.` KVM assignment, step conditions, and whether your verified-credential variable names match `customer_id_source`.
+- **Phase mixing.** One shared flow runs request-phase steps (JWT validation, margin guard) and response-phase steps (metering). Attached to a post-proxy flow hook, JWT validation and margin guard run after the backend has already served the request; attached pre-proxy, metering has no response. A correct deployment needs two shared flows (pre-proxy: JWT + margin guard; post-client: metering). Not restructured here.
+- **Best-effort send.** `AforoMeteringSendEvent` uses `continueOnError="true"` and is not retried; a rejected or failed callout is visible only in Debug.
+- **Orphaned JS.** `aforo-compound-metering.js`, `aforo-preflight-quota.js` and `aforo-jwt-jti-check.js` are not referenced by any policy in the flow. Their `apiproxy.consumerkey` (API key) customer fallback was removed, but they remain unwired. `aforo-mcp-metering.js`, an unreferenced duplicate of the MCP branch in `aforo-metering.js`, was removed.

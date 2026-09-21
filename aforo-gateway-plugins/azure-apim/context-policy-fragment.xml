@@ -1,0 +1,64 @@
+<!--
+  Aforo Request Context — Azure APIM Policy Fragment (fragment id: aforo-context)
+
+  REQUIRED by every other Aforo fragment. Include it in the <inbound> section,
+  AFTER aforo-jwt-validation (if you use it) and BEFORE aforo-preflight /
+  aforo-margin-guard:
+
+    <inbound>
+        <base />
+        <include-fragment fragment-id="aforo-jwt-validation" />   (optional)
+        <include-fragment fragment-id="aforo-context" />
+        ...
+    </inbound>
+
+  It sets these context variables, which the metering / compound / preflight
+  fragments read (fragments cannot include other fragments, so the resolution
+  lives here once):
+
+    aforo-customer-id  — the Aforo customer id this request is billed to, or ""
+                         when none can be resolved (the request is then NOT
+                         metered). Resolution order:
+                           1. customer_id claim of the verified Aforo JWT
+                              (aforo-jwt-payload, set by aforo-jwt-validation)
+                           2. the Named Value aforo-subscription-customer-map lookup of the
+                              APIM subscription id (context.Subscription.Id)
+                         Never the subscription KEY (a secret), never a request
+                         header, never a placeholder like "unknown".
+    aforo-mcp-body     — the request body, captured only when
+                         the Named Value aforo-mcp-enabled is "true" and the method is POST.
+                         The request body is not readable in <outbound> unless
+                         it was read with preserveContent in <inbound>.
+
+  Named Values (all must EXIST — APIM rejects a policy that references an
+  undefined Named Value; use the value "none" to leave one empty):
+    aforo-subscription-customer-map — "subscriptionId=customerId" pairs
+        separated by ";", e.g. "acme-prod=cust_123;globex=cust_456".
+        Named Values are limited to 4096 characters. Use "none" if every
+        caller presents an Aforo JWT.
+    aforo-mcp-enabled — "true" to capture the body for MCP detection.
+
+  Values must not contain double quotes or backslashes: they are substituted
+  into C# string literals.
+-->
+<fragment>
+    <set-variable name="aforo-customer-id" value="@{
+        var payload = context.Variables.GetValueOrDefault&lt;object&gt;(&quot;aforo-jwt-payload&quot;, null) as JObject;
+        var fromJwt = payload == null ? null : payload[&quot;customer_id&quot;]?.ToString();
+        if (!string.IsNullOrWhiteSpace(fromJwt)) { return fromJwt.Trim(); }
+        if (context.Subscription == null || string.IsNullOrEmpty(context.Subscription.Id)) { return &quot;&quot;; }
+        var subId = context.Subscription.Id;
+        var map = &quot;{{aforo-subscription-customer-map}}&quot;;
+        foreach (var entry in map.Split(new[] { &quot;;&quot;, &quot;\n&quot; }, StringSplitOptions.RemoveEmptyEntries)) {
+            var idx = entry.IndexOf(&quot;=&quot;);
+            if (idx &lt;= 0) { continue; }
+            if (entry.Substring(0, idx).Trim() == subId) { return entry.Substring(idx + 1).Trim(); }
+        }
+        return &quot;&quot;;
+    }" />
+    <choose>
+        <when condition="@(&quot;{{aforo-mcp-enabled}}&quot; == &quot;true&quot; &amp;&amp; context.Request.Method == &quot;POST&quot; &amp;&amp; context.Request.Body != null)">
+            <set-variable name="aforo-mcp-body" value="@(context.Request.Body.As&lt;string&gt;(preserveContent: true))" />
+        </when>
+    </choose>
+</fragment>

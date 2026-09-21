@@ -4,7 +4,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [Unreleased]
 
-- _Nothing yet._
+### Status
+- Marked **NOT PRODUCTION-READY** in the README and user guide: the YAML files are not a deployable Anypoint policy format and `template.xml` uses elements that do not exist in Mule 4 policies. A rebuild as a Mule 4 custom policy (mule-policy Maven project) or Flex Gateway PDK policy is required; the README lists what it needs. No full rewrite was attempted.
+
+### Fixed (`template.xml` only, as a correct reference for the event contract)
+- Docs: the example ingestor URL is now `https://usage-ingestor.aforo.ai/v1/ingest/batch`. `ingest.aforo.ai` is CloudFront in front of S3: a POST gets a 301 from AmazonS3 and never reaches the ingestor.
+- Authenticates with `X-API-Key` (was `Authorization: Bearer`, which the ingestor rejects 401); `X-Tenant-Id` removed — the tenant comes from the key.
+- Removed the spoofable `customer_id_source = header` path (`x-customer-id` request header) and the `authentication.clientId` fallback (an Anypoint client-app id, not an Aforo customer id). `customerId` comes only from `vars.aforo.customerId` (JWT-verified).
+- No event for `OPTIONS`, an empty / > 64-char customer, or quantity ≤ 0.
+- `aforo_endpoint` (a full URL) was used as `host=` with port 443; it is now the request `url`.
+- `metricName` is `default_metric` (default `api_calls`) instead of `{method} {path}`; `occurredAt` uses a real offset instead of a literal `'Z'` on local time; only 2xx counts as success (4xx was treated as success and silently swallowed).
+
+### Not fixed
+- The YAML descriptors still send `Authorization: Bearer` + `X-Tenant-Id` and route-shaped metric names; they are superseded by the required rebuild.
 
 ## [2.0.0] — 2026-06-29
 

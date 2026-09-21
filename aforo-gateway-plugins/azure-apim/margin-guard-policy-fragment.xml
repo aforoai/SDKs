@@ -11,14 +11,19 @@
     client-settable request header.
 
     Prerequisites:
-      - aforo-jwt-validation policy fragment MUST be applied before this
-        fragment. It sets context.Variables["aforo-jwt-payload"] (a JObject
-        containing the verified JWT claims).
-      - Named value: aforo-margin-guard-url (pricing-service base URL)
-      - Named value: aforo-margin-guard-enabled ("true" to enable)
-      - Named value: aforo-tenant-id (tenant identifier — admin-pinned fallback)
+      - aforo-context MUST be included before this fragment (it resolves
+        aforo-customer-id from the verified JWT or the subscription map).
+        aforo-jwt-validation, if used, goes before aforo-context.
+      - Named values (read with double-brace syntax; Named Values are not context
+        variables, so the previous context.Variables lookups never resolved and
+        the ["aforo-margin-guard-url"] indexer threw):
+          aforo-margin-guard-url     (pricing-service base URL)
+          aforo-margin-guard-enabled ("true" to enable)
+          aforo-tenant-id            (tenant id — margin-guard only; used when
+                                      the JWT carries no tenant_id. The ingestor
+                                      fragments do not use it.)
 
-    Usage: Include in inbound section, AFTER jwt-validation-policy.xml.
+    Usage: Include in the inbound section, AFTER aforo-context.
     <include-fragment fragment-id="aforo-margin-guard" />
 
     Security history:
@@ -30,28 +35,20 @@
 -->
 <fragment>
     <choose>
-        <when condition="@(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-margin-guard-enabled&quot;, &quot;false&quot;) == &quot;true&quot;)">
+        <when condition="@(&quot;{{aforo-margin-guard-enabled}}&quot; == &quot;true&quot; &amp;&amp; context.Request.Method != &quot;OPTIONS&quot;)">
             <!--
                 Resolve customer / tenant identity from authenticated sources only.
-                Primary: JWT claims (cryptographically verified by jwt-validation-policy).
-                Fallback for customer: APIM subscription id (bound to the verified subscription key).
-                Fallback for tenant: admin-pinned Named Value (not client-settable).
+                Customer: aforo-customer-id from aforo-context (JWT customer_id,
+                else the admin-configured subscription→customer map).
+                Tenant: JWT tenant_id claim, else the admin-pinned Named Value.
                 NEVER read X-Customer-Id / X-Tenant-Id from the request headers.
             -->
-            <set-variable name="mgCustomerId" value="@{
-                var payload = (Newtonsoft.Json.Linq.JObject)context.Variables.GetValueOrDefault&lt;object&gt;(&quot;aforo-jwt-payload&quot;, null);
-                var fromJwt = payload == null ? null
-                    : (payload[&quot;customer_id&quot;]?.ToString() ?? payload[&quot;sub&quot;]?.ToString());
-                if (!string.IsNullOrEmpty(fromJwt)) return fromJwt;
-                // Fallback: APIM-managed subscription id (set by subscription-key validation).
-                return context.Subscription != null ? context.Subscription.Id : &quot;&quot;;
-            }" />
+            <set-variable name="mgCustomerId" value="@(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-customer-id&quot;, &quot;&quot;))" />
             <set-variable name="mgTenantId" value="@{
                 var payload = (Newtonsoft.Json.Linq.JObject)context.Variables.GetValueOrDefault&lt;object&gt;(&quot;aforo-jwt-payload&quot;, null);
                 var fromJwt = payload?[&quot;tenant_id&quot;]?.ToString();
                 if (!string.IsNullOrEmpty(fromJwt)) return fromJwt;
-                // Fallback: admin-pinned Named Value.
-                return context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-tenant-id&quot;, &quot;&quot;);
+                return &quot;{{aforo-tenant-id}}&quot;;
             }" />
 
             <choose>
@@ -68,7 +65,7 @@
                         <otherwise>
                             <!-- Call pricing-service quick-check -->
                             <send-request mode="new" response-variable-name="mgResponse" timeout="1" ignore-error="true">
-                                <set-url>@($"{context.Variables["aforo-margin-guard-url"]}/internal/v1/margin-guard/quick-check?tenantId={context.Variables["mgTenantId"]}&amp;scopeType=CUSTOMER&amp;scopeId={context.Variables["mgCustomerId"]}")</set-url>
+                                <set-url>@($"{{aforo-margin-guard-url}}/internal/v1/margin-guard/quick-check?tenantId={context.Variables["mgTenantId"]}&amp;scopeType=CUSTOMER&amp;scopeId={context.Variables["mgCustomerId"]}")</set-url>
                                 <set-method>GET</set-method>
                                 <set-header name="Content-Type" exists-action="override">
                                     <value>application/json</value>

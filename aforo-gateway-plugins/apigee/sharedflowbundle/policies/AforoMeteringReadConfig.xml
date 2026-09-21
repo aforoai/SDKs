@@ -1,7 +1,13 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<!-- Reads Aforo metering configuration from the organization-scoped KVM
+<!-- Reads Aforo configuration from the organization-scoped KVM
      'aforo-metering-config'. Values are stored as flow variables for use
-     by the JavaScript policy. -->
+     by the JavaScript policies and step conditions.
+
+     Required keys: aforo_endpoint, api_key, default_metric.
+     api_key is assigned to a private.* variable so it is masked in Debug
+     sessions. tenant_id is used ONLY by margin guard (when the JWT carries
+     no tenant_id); it is never sent to the ingestor, which takes the
+     tenant from the API key. -->
 <KeyValueMapOperations name="AforoMeteringReadConfig" mapIdentifier="aforo-metering-config">
     <DisplayName>Aforo Metering - Read Config from KVM</DisplayName>
     <ExpiryTimeInSecs>300</ExpiryTimeInSecs>
@@ -9,11 +15,17 @@
     <Get assignTo="aforo.endpoint">
         <Key><Parameter>aforo_endpoint</Parameter></Key>
     </Get>
-    <Get assignTo="aforo.apiKey">
+    <Get assignTo="private.aforo.apiKey">
         <Key><Parameter>api_key</Parameter></Key>
     </Get>
     <Get assignTo="aforo.tenantId">
         <Key><Parameter>tenant_id</Parameter></Key>
+    </Get>
+    <Get assignTo="aforo.metricMappings">
+        <Key><Parameter>metric_mappings</Parameter></Key>
+    </Get>
+    <Get assignTo="aforo.defaultMetric">
+        <Key><Parameter>default_metric</Parameter></Key>
     </Get>
     <Get assignTo="aforo.metricNamePattern">
         <Key><Parameter>metric_name_pattern</Parameter></Key>
@@ -32,5 +44,20 @@
     </Get>
     <Get assignTo="aforo.includeMetadata">
         <Key><Parameter>include_metadata</Parameter></Key>
+    </Get>
+    <Get assignTo="aforo.mcpEnabled">
+        <Key><Parameter>mcp_enabled</Parameter></Key>
+    </Get>
+    <Get assignTo="aforo.mcpProductId">
+        <Key><Parameter>mcp_product_id</Parameter></Key>
+    </Get>
+    <Get assignTo="aforo.jwtValidationEnabled">
+        <Key><Parameter>jwt_validation_enabled</Parameter></Key>
+    </Get>
+    <Get assignTo="aforo.marginGuardEnabled">
+        <Key><Parameter>margin_guard_enabled</Parameter></Key>
+    </Get>
+    <Get assignTo="aforo.marginGuardUrl">
+        <Key><Parameter>margin_guard_url</Parameter></Key>
     </Get>
 </KeyValueMapOperations>

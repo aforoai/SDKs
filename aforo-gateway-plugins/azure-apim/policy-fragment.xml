@@ -1,76 +1,84 @@
 <!--
-  Aforo Usage Metering — Azure APIM Outbound Policy Fragment
+  Aforo Usage Metering — Azure APIM Policy Fragment, minimal variant
+  (fragment id: aforo-metering)
 
-  Apply this fragment in the <outbound> section of your APIM policy.
-  It fires a non-blocking POST to the Aforo ingestor after every response,
-  capturing usage data for billing and analytics.
+  Minimal alternative to outbound-policy.xml: no MCP detection, no trace
+  context. Import ONE of the two under the id aforo-metering, not both.
 
-  Prerequisites:
-    Create these Named Values in your APIM instance:
-    - aforo-endpoint       (Aforo ingestor batch URL)
-    - aforo-api-key        (Aforo API key, mark as Secret)
-    - aforo-tenant-id      (Your Aforo tenant ID)
+  A policy fragment cannot contain section elements (<inbound>, <outbound>)
+  or <base />. Include it in <outbound>, with aforo-context in <inbound>:
 
-  Usage in APIM policy:
+    <inbound>
+        <base />
+        <include-fragment fragment-id="aforo-jwt-validation" />   (optional)
+        <include-fragment fragment-id="aforo-context" />          (required)
+    </inbound>
     <outbound>
         <base />
         <include-fragment fragment-id="aforo-metering" />
     </outbound>
 
-  Or inline (copy the <send-one-way-request> block directly):
+  send-one-way-request is fire-and-forget: it does not delay the response,
+  and if the Aforo endpoint is unreachable the event is lost.
+
+  Named Values (all must exist): aforo-endpoint, aforo-api-key (Secret; sent
+  as X-API-Key — the tenant comes from the key), aforo-metric-mappings
+  ("KIND|value|metricName;..." or "none"), aforo-default-metric (a catalog
+  metric). See outbound-policy.xml for the mapping format.
 -->
 <fragment>
-    <outbound>
-        <!--
-            send-one-way-request is ASYNC — it does NOT block the API response.
-            The response is already sent to the client before this executes.
-            If the Aforo endpoint is unreachable, the request is silently dropped.
-        -->
-        <send-one-way-request mode="new">
-            <set-url>{{aforo-endpoint}}</set-url>
-            <set-method>POST</set-method>
-            <set-header name="Content-Type" exists-action="override">
-                <value>application/json</value>
-            </set-header>
-            <set-header name="Authorization" exists-action="override">
-                <value>Bearer {{aforo-api-key}}</value>
-            </set-header>
-            <set-header name="X-Tenant-Id" exists-action="override">
-                <value>{{aforo-tenant-id}}</value>
-            </set-header>
-            <set-body>@{
-                var evt = new JObject(
-                    new JProperty("events", new JArray(
-                        new JObject(
-                            new JProperty("customerId",
-                                context.Subscription != null ? context.Subscription.Id : "unknown"),
-                            new JProperty("metricName",
-                                context.Request.Method + " " +
-                                (context.Operation != null ? context.Operation.UrlTemplate : context.Request.Url.Path)),
-                            new JProperty("quantity", 1),
-                            new JProperty("idempotencyKey", context.RequestId),
-                            new JProperty("occurredAt", DateTime.UtcNow.ToString("o")),
-                            new JProperty("metadata", new JObject(
-                                new JProperty("gateway", "azure-apim"),
-                                new JProperty("method", context.Request.Method),
-                                new JProperty("path",
-                                    context.Operation != null ? context.Operation.UrlTemplate : context.Request.Url.Path),
-                                new JProperty("status", context.Response.StatusCode),
-                                new JProperty("latency", context.Elapsed.TotalMilliseconds),
-                                new JProperty("product",
-                                    context.Product != null ? context.Product.Id : ""),
-                                new JProperty("subscription",
-                                    context.Subscription != null ? context.Subscription.Id : ""),
-                                new JProperty("operation",
-                                    context.Operation != null ? context.Operation.Id : ""),
-                                new JProperty("user",
-                                    context.User != null ? context.User.Id : "")
-                            ))
-                        )
-                    ))
-                );
-                return evt.ToString();
-            }</set-body>
-        </send-one-way-request>
-    </outbound>
+    <choose>
+        <when condition="@(context.Request.Method != &quot;OPTIONS&quot; &amp;&amp; !string.IsNullOrEmpty(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-customer-id&quot;, &quot;&quot;)) &amp;&amp; context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-customer-id&quot;, &quot;&quot;).Length &lt;= 64)">
+            <send-one-way-request mode="new">
+                <set-url>{{aforo-endpoint}}</set-url>
+                <set-method>POST</set-method>
+                <set-header name="Content-Type" exists-action="override">
+                    <value>application/json</value>
+                </set-header>
+                <set-header name="X-API-Key" exists-action="override">
+                    <value>{{aforo-api-key}}</value>
+                </set-header>
+                <set-body><![CDATA[@{
+                    var path = context.Request.OriginalUrl.Path ?? "";
+                    var metricName = "{{aforo-default-metric}}";
+                    foreach (var rule in "{{aforo-metric-mappings}}".Split(new[] { ";", "\n" }, StringSplitOptions.RemoveEmptyEntries)) {
+                        var p = rule.Split(new[] { "|" }, StringSplitOptions.None);
+                        if (p.Length != 3) { continue; }
+                        var kind = p[0].Trim().ToUpperInvariant();
+                        var value = p[1].Trim();
+                        var metric = p[2].Trim();
+                        if (value.Length == 0 || metric.Length == 0) { continue; }
+                        if ((kind == "EXACT" && path == value)
+                            || (kind == "PREFIX" && path.StartsWith(value))
+                            || (kind == "CONTAINS" && path.Contains(value))) {
+                            metricName = metric;
+                            break;
+                        }
+                    }
+                    var evt = new JObject(
+                        new JProperty("events", new JArray(
+                            new JObject(
+                                new JProperty("customerId", context.Variables.GetValueOrDefault<string>("aforo-customer-id", "")),
+                                new JProperty("metricName", metricName),
+                                new JProperty("quantity", 1),
+                                new JProperty("idempotencyKey", context.RequestId.ToString()),
+                                new JProperty("occurredAt", DateTime.UtcNow.ToString("o")),
+                                new JProperty("endpointPath", path),
+                                new JProperty("httpMethod", context.Request.Method),
+                                new JProperty("statusCode", context.Response.StatusCode),
+                                new JProperty("responseTimeMs", (int)context.Elapsed.TotalMilliseconds),
+                                new JProperty("metadata", new JObject(
+                                    new JProperty("gateway", "azure-apim"),
+                                    new JProperty("product", context.Product != null ? context.Product.Id : ""),
+                                    new JProperty("subscription", context.Subscription != null ? context.Subscription.Id : ""),
+                                    new JProperty("operation", context.Operation != null ? context.Operation.Id : "")
+                                ))
+                            )
+                        ))
+                    );
+                    return evt.ToString();
+                }]]></set-body>
+            </send-one-way-request>
+        </when>
+    </choose>
 </fragment>

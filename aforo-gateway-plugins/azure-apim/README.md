@@ -10,102 +10,112 @@ Reach for the APIM policy when Azure API Management already fronts your API and 
 
 This is a deployment artifact: you install policy fragments into your APIM instance and set Named Values. There is nothing to `npm install`.
 
-> ⚠ **Identity comes from authenticated sources only.** As of v2.0.0 (the 2026-04-23 security release), none of these policies read `X-Customer-Id` / `X-Tenant-Id` from a request. Customer identity is the JWT `customer_id`/`sub` claim (when `jwt-validation-policy.xml` runs in `<inbound>`) or the APIM subscription ID; tenant is the JWT `tenant_id` claim or the admin-pinned `aforo-tenant-id` Named Value. Forged headers are ignored.
+> ⚠ **Identity comes from authenticated sources only.** `customerId` is the verified Aforo JWT's `customer_id` claim, or — for callers without an Aforo JWT — an admin-maintained map from APIM subscription id to Aforo customer id (`aforo-subscription-customer-map`). It is never the subscription **key** (a credential), never a request header, and never a placeholder: a request with no resolvable customer is **not metered**.
+
+> ⚠ **Not verified on a live APIM instance.** The fragments are well-formed XML and follow Microsoft's documented fragment rules, but the C# policy expressions have not been compiled or executed by an APIM gateway here. Import them into a non-production instance and use request tracing before relying on them.
 
 ## Install
 
-These are XML policy fragments, not a package — there is no registry coordinate. The repo is **not yet published** publicly; install from source.
+These are XML policy fragments, not a package. Install from source:
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
 cd SDKs/aforo-gateway-plugins/azure-apim
-# Files to import as APIM policy fragments:
-#   outbound-policy.xml                   → fragment id: aforo-metering
-#   jwt-validation-policy.xml             → fragment id: aforo-jwt-validation
-#   margin-guard-policy-fragment.xml      → fragment id: aforo-margin-guard
-#   preflight-quota-policy-fragment.xml   → fragment id: aforo-preflight
-#   compound-metering-policy-fragment.xml → fragment id: aforo-compound-metering
 ```
 
-Create the fragment via Azure CLI (repeat per file, matching the fragment id):
+| File | Fragment id | Include in | Required? |
+|---|---|---|---|
+| `jwt-validation-policy.xml` | `aforo-jwt-validation` | `<inbound>`, first | Optional (needed for JWT identity) |
+| `context-policy-fragment.xml` | `aforo-context` | `<inbound>`, after jwt-validation | **Required** by every other fragment |
+| `preflight-quota-policy-fragment.xml` | `aforo-preflight` | `<inbound>`, after aforo-context | Optional |
+| `margin-guard-policy-fragment.xml` | `aforo-margin-guard` | `<inbound>`, after aforo-context | Optional |
+| `outbound-policy.xml` | `aforo-metering` | `<outbound>` | **Required** (full: MCP + trace) |
+| `policy-fragment.xml` | `aforo-metering` | `<outbound>` | Alternative minimal variant — import one of the two, not both |
+| `compound-metering-policy-fragment.xml` | `aforo-compound-metering` | `<outbound>` | Optional |
+
+Per [Microsoft's policy-fragment rules](https://learn.microsoft.com/azure/api-management/policy-fragments), a fragment **cannot contain section elements** (`<inbound>`, `<outbound>`, …) or `<base />`, and **cannot include another fragment**. Five of these files previously wrapped their policies in `<inbound>`/`<outbound>`, and `mcp-policy-fragment.xml` included another fragment; the former are fixed and the latter is removed (MCP detection lives in `outbound-policy.xml`). The section each fragment belongs in is now decided by where you include it, per the table above.
 
 ```bash
 az apim policy-fragment create \
-  --resource-group "<rg>" \
-  --service-name "<apim-instance>" \
+  --resource-group "<rg>" --service-name "<apim-instance>" \
   --policy-fragment-id "aforo-metering" \
-  --value @outbound-policy.xml \
-  --format xml
+  --value @outbound-policy.xml --format xml
 ```
-
-Or import each file under **APIM → Policy fragments → + Add** in the portal.
 
 ## Quickstart
 
-1. Create the required Named Values (see Configuration).
-2. Import `outbound-policy.xml` as fragment `aforo-metering`.
-3. Reference it in the API's policy:
+1. Create the Named Values (see Configuration). **Every Named Value a fragment references must exist** — APIM rejects a policy that references an undefined one. Use the value `none` for ones you want empty.
+2. Import `context-policy-fragment.xml` as `aforo-context` and `outbound-policy.xml` as `aforo-metering` (plus `aforo-jwt-validation` if callers present Aforo JWTs).
+3. Reference them in the API's policy:
 
 ```xml
 <policies>
     <inbound>
         <base />
-        <!-- optional, but required for JWT-based identity + margin-guard/quota -->
-        <include-fragment fragment-id="aforo-jwt-validation" />
+        <include-fragment fragment-id="aforo-jwt-validation" />  <!-- optional -->
+        <include-fragment fragment-id="aforo-context" />
     </inbound>
+    <backend><base /></backend>
     <outbound>
         <base />
         <include-fragment fragment-id="aforo-metering" />
     </outbound>
+    <on-error><base /></on-error>
 </policies>
 ```
 
-Each metered call POSTs an `events[]` batch to `{{aforo-endpoint}}` with `Authorization: Bearer {{aforo-api-key}}` and `X-Tenant-Id: {{aforo-tenant-id}}`:
+Each metered call POSTs to `{{aforo-endpoint}}` with the header `X-API-Key: {{aforo-api-key}}` only (no `Authorization`, no `X-Tenant-Id` — the ingestor derives the tenant from the key, and answers 401 if an `Authorization: Bearer` header is present):
 
 ```json
 {
   "events": [
     {
-      "customerId": "<apim-subscription-id-or-jwt-customer_id>",
-      "metricName": "GET /v1/accounts/123",
+      "customerId": "cust_123",
+      "metricName": "api_calls",
       "quantity": 1,
-      "idempotencyKey": "<context.RequestId>:<ticks>",
-      "occurredAt": "2026-06-29T10:15:42.318Z",
-      "endpointPath": "/v1/accounts/123",
+      "idempotencyKey": "<context.RequestId>",
+      "occurredAt": "2026-06-29T10:15:42.3180000Z",
+      "endpointPath": "/accounts/v1/accounts/123",
       "httpMethod": "GET",
       "statusCode": 200,
       "responseTimeMs": 42,
       "trace": { "traceparent": "00-...", "tracestate": "...", "xTraceId": null, "xRequestId": null },
-      "metadata": { "gateway": "azure-apim", "method": "GET", "path": "/v1/accounts/123", "status": 200, "latency": 42 }
+      "metadata": { "gateway": "azure-apim", "method": "GET", "path": "/accounts/v1/accounts/123", "status": 200, "latency": 42, "subscription": "acme-prod", "operation": "get-account" }
     }
   ]
 }
 ```
 
-When `aforo-mcp-enabled = "true"` and the request body contains a JSON-RPC `tools/call`, the event instead carries `metricName: "mcp_server.tool_invocations"`, `productType: "MCP_SERVER"`, `toolName`, `agentId` (from `params._meta.agent_id`), and `sessionId` (from the `Mcp-Session-Id` header).
+Not metered: `OPTIONS` (CORS preflights) and requests with no resolvable customer (or one longer than 64 characters).
+
+When `aforo-mcp-enabled` is `true` and the POST body (captured in `<inbound>` by `aforo-context`) is a JSON-RPC `tools/call`, the event instead carries `metricName: "mcp_server.tool_invocations"`, `productType: "MCP_SERVER"`, `toolName`, `agentId` (from `params._meta.agent_id`), and `sessionId` (from `Mcp-Session-Id`).
 
 ## Configuration
 
-Create these as APIM **Named Values** (mark `aforo-api-key` as Secret). The policies read them as `{{name}}`.
+Create these as APIM **Named Values** (mark `aforo-api-key` Secret). The fragments reference them with double-brace syntax (`{{name}}`); Named Values are not `context.Variables`, so the previous `context.Variables.GetValueOrDefault("aforo-…")` lookups never resolved. Values are substituted into C# string literals, so they must not contain `"` or `\`.
 
 | Named Value | Used by | What it does |
 |---|---|---|
-| `aforo-endpoint` | metering | Aforo ingestor batch URL, e.g. `https://ingest.aforo.ai/v1/ingest/batch`. |
-| `aforo-api-key` | metering, quota | Bearer token for the ingestor. Mark Secret. |
-| `aforo-tenant-id` | metering, margin-guard, quota | Your Aforo tenant. Sent as `X-Tenant-Id`; admin-pinned tenant fallback for margin-guard. |
-| `aforo-mcp-enabled` | metering | `"true"` to detect JSON-RPC `tools/call` and emit MCP events. Optional. |
-| `aforo-mcp-product-id` | metering | Aforo product ID stamped into MCP event metadata. Optional. |
-| `aforo-jwks-uri` | jwt-validation | Aforo JWKS endpoint, e.g. `https://auth.aforo.ai/.well-known/jwks.json`. |
+| `aforo-endpoint` | metering | Aforo ingestor batch URL, e.g. `https://usage-ingestor.aforo.ai/v1/ingest/batch`. |
+| `aforo-api-key` | metering, compound, quota | Aforo API key, scope `usage:ingest`. Sent as `X-API-Key`. Mark Secret. |
+| `aforo-default-metric` | metering | Metric for requests no mapping matches, e.g. `api_calls`. **Must be registered in the Aforo catalog** — an unknown metric fails the batch with 400. |
+| `aforo-metric-mappings` | metering | Endpoint→metric rules, first match wins: `KIND\|value\|metricName` separated by `;`, `KIND` = `EXACT`, `PREFIX` or `CONTAINS`, matched against the client-facing path (`context.Request.OriginalUrl.Path`, which includes the API URL suffix). E.g. `PREFIX\|/sms/v1/send\|sms_sent;EXACT\|/otp/v1/verify\|otp_verified`. `none` = no mappings. Same semantics as catalog's `/internal/v1/metrics/gateway-mappings`, supplied as config because these fragments do not fetch it. |
+| `aforo-subscription-customer-map` | context | `subscriptionId=customerId` pairs separated by `;` — the Aforo customer for callers without an Aforo JWT. `none` if every caller presents one. Max 4096 characters (a Named Value limit). |
+| `aforo-mcp-enabled` | context, metering | `true` to detect JSON-RPC `tools/call` and emit MCP events; otherwise `false`. |
+| `aforo-mcp-product-id` | metering | Aforo product ID stamped into MCP event metadata; `none` if unused. |
+| `aforo-jwks-uri` | jwt-validation | URL given to `<openid-config>`. That element expects an **OpenID discovery document** (`…/.well-known/openid-configuration`), not a bare JWKS URL — see "What this doesn't cover". |
 | `aforo-jwt-issuer` | jwt-validation | Expected `iss` claim, e.g. `https://auth.aforo.ai`. |
-| `aforo-margin-guard-enabled` | margin-guard | `"true"` to enable the pre-flight margin check. |
+| `aforo-org-service-url` | jwt-validation | org-service base URL reachable from APIM, for the jti revocation check (was hardcoded to `http://org-service:8086`). |
+| `aforo-margin-guard-enabled` | margin-guard | `true` to enable the pre-flight margin check. |
 | `aforo-margin-guard-url` | margin-guard | pricing-service base URL for `/internal/v1/margin-guard/quick-check`. |
-| `aforo-preflight-enabled` | quota | `"true"` to enable the pre-flight quota check. |
-| `aforo-preflight-url` | quota | usage-ingestor quota-check URL. |
-| `aforo-preflight-fallback` | quota | `"ALLOW"` (default) or `"DENY"` when the check times out/errors. |
-| `aforo-ingestor-url` | compound | Ingestor base URL for `/api/v1/ingest/compound`. |
-| `aforo-compound-enabled` | compound | `"true"` to extract multiple metrics from the response body. |
-| `aforo-compound-extraction-paths` | compound | JSON map of JSONPath → metric name. |
-| `aforo-compound-dimension-paths` | compound | JSON map of JSONPath → dimension key. |
+| `aforo-tenant-id` | margin-guard only | Tenant for the margin-guard query when the JWT has no `tenant_id`. Not sent to the ingestor. |
+| `aforo-preflight-enabled` | quota | `true` to enable the pre-flight quota check. |
+| `aforo-preflight-url` | quota | usage-ingestor quota-check URL (`…/api/v1/quota/check`). |
+| `aforo-preflight-fallback` | quota | `ALLOW` or `DENY` when the check times out/errors. |
+| `aforo-ingestor-url` | compound | Ingestor origin; the fragment appends `/api/v1/ingest/compound`. |
+| `aforo-compound-enabled` | compound | `true` to extract multiple metrics from the response body. |
+| `aforo-compound-extraction-paths` | compound | `jsonPath=metricName` pairs separated by `;` (was JSON, which cannot be embedded in a C# string literal). |
+| `aforo-compound-dimension-paths` | compound | `jsonPath=dimensionKey` pairs, or `none`. |
 
 ## Walk me through it
 
@@ -113,6 +123,8 @@ Named Values → import fragments → wire them into an API → forge-header smo
 
 ## What this doesn't cover
 
-- **Guaranteed delivery.** `send-one-way-request` is fire-and-forget; if `{{aforo-endpoint}}` is down, the event is lost. There is no on-gateway retry/buffer (unlike the client SDKs).
-- **Identity without JWT validation.** Without `jwt-validation-policy.xml` in `<inbound>`, `customerId` falls back to the APIM subscription ID. Margin-guard and quota then scope to that subscription, not a JWT customer.
-- **jti revocation in real time** unless you keep the synchronous `send-request` blocklist check in `jwt-validation-policy.xml` (it adds ~5–10ms; the commented Option B accepts the validate-jwt cache TTL window instead).
+- **Guaranteed delivery.** `send-one-way-request` is fire-and-forget; if `{{aforo-endpoint}}` is down, or the ingestor rejects the event (unknown metric, unknown customer), the event is lost and APIM does not log the response. There is no on-gateway retry/buffer.
+- **Live verification.** None of these fragments has been imported into or executed on a real APIM instance. In particular unverified: C# expression compilation (allowed types such as `StringSplitOptions`), `context.Request.OriginalUrl.Path` matching your mapping values, and request-body capture for MCP.
+- **JWKS discovery.** `<openid-config>` needs an OpenID Connect discovery document. If Aforo only serves a bare JWKS, `validate-jwt` will not load keys; you would need `<issuer-signing-keys>` with the keys inlined, or a discovery document. Confirm before enabling JWT validation.
+- **Central metric mappings.** Kong fetches mappings from catalog; these fragments use the `aforo-metric-mappings` Named Value. Keep it in sync with your catalog by hand (or by automation that updates the Named Value).
+- **jti revocation in real time** requires `aforo-org-service-url` to be reachable from APIM; the check is fail-open.

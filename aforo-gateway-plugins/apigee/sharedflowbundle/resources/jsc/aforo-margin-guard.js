@@ -7,14 +7,18 @@
  * Fail-open: if the check fails or times out, the request proceeds.
  *
  * Flow variables consumed:
- *   aforo.marginGuardEnabled — "true" to enable
- *   aforo.marginGuardUrl — pricing-service base URL
- *   aforo.tenantId — tenant identifier
- *   aforo.customerId — customer identifier (from consumer or header)
+ *   aforo.marginGuardEnabled — "true" to enable (KVM margin_guard_enabled)
+ *   aforo.marginGuardUrl — pricing-service base URL (KVM margin_guard_url)
+ *   aforo.tenant_id — tenant from the verified JWT, else aforo.tenantId (KVM tenant_id)
+ *   aforo.customer_id — customer from the verified JWT (VerifyJWT output claim)
+ *
+ * Previously read aforo.customerId (set by nothing) and aforo.marginGuard*
+ * (never read from the KVM), so the check could never run.
  *
  * Flow variables produced:
  *   aforo.marginGuard.blocked — "true" if L3 block
  *   aforo.marginGuard.throttled — "true" if L2 throttle (probabilistic, this request rejected)
+ *   aforo.marginGuard.header — "blocked" | "throttled" (X-Margin-Guard header value)
  *   aforo.marginGuard.level — enforcement level (NONE, L1_ALERT, L2_THROTTLE, L3_BLOCK)
  *   aforo.marginGuard.retryAfterSeconds — seconds until retry
  *   aforo.marginGuard.message — human-readable message
@@ -26,13 +30,14 @@
 
 var marginGuardEnabled = context.getVariable('aforo.marginGuardEnabled');
 var marginGuardUrl = context.getVariable('aforo.marginGuardUrl');
-var tenantId = context.getVariable('aforo.tenantId');
-var customerId = context.getVariable('aforo.customerId');
+var tenantId = context.getVariable('aforo.tenant_id') || context.getVariable('aforo.tenantId');
+var customerId = context.getVariable('aforo.customer_id');
 
 // Initialize output variables to safe defaults
 context.setVariable('aforo.marginGuard.blocked', 'false');
 context.setVariable('aforo.marginGuard.throttled', 'false');
 context.setVariable('aforo.marginGuard.level', 'NONE');
+context.setVariable('aforo.marginGuard.header', '');
 
 if (marginGuardEnabled !== 'true' || !customerId || !tenantId || !marginGuardUrl) {
     // Not enabled or missing required context — skip
@@ -63,6 +68,7 @@ if (marginGuardEnabled !== 'true' || !customerId || !tenantId || !marginGuardUrl
                     if (result.level === 'L3_BLOCK') {
                         var retryAfter = result.retryAfterSeconds || 1800;
                         context.setVariable('aforo.marginGuard.blocked', 'true');
+                        context.setVariable('aforo.marginGuard.header', 'blocked');
                         context.setVariable('aforo.marginGuard.retryAfterSeconds', String(retryAfter));
                         context.setVariable('aforo.marginGuard.message',
                             result.message || 'Service restricted due to margin constraints.');
@@ -80,6 +86,7 @@ if (marginGuardEnabled !== 'true' || !customerId || !tenantId || !marginGuardUrl
                         if (roll >= throttleRate) {
                             // This request is throttled
                             context.setVariable('aforo.marginGuard.throttled', 'true');
+                            context.setVariable('aforo.marginGuard.header', 'throttled');
                             context.setVariable('aforo.marginGuard.retryAfterSeconds', '60');
                             context.setVariable('aforo.marginGuard.message',
                                 result.message || 'Rate limited due to margin constraints.');
