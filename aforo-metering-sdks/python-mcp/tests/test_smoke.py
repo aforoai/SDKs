@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 
@@ -31,5 +32,36 @@ def test_wrap_passes_result_through():
 
         # Best-effort flush against an unresolvable host (fast NXDOMAIN, swallowed).
         await billing.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_sessions_never_put_heartbeats_in_usage_batch():
+    """Heartbeats (quantity 0) fail the ingestor's @Positive check and take every
+    real event in the same batch down with them, so none may be sent."""
+
+    async def scenario():
+        billing = AforoMcpBilling(**CFG)
+        posted = []
+
+        async def fake_post(url, headers, body):
+            posted.extend(json.loads(body)["events"])
+            return 202, ""
+
+        billing._do_post_with_body = fake_post
+
+        @billing.wrap_tool_handler
+        async def handler(name, arguments, **kwargs):
+            return "ok"
+
+        await billing.start_session("sess_1")
+        await asyncio.sleep(0)
+        await handler("search", {}, session_id="sess_1")
+        await billing.end_session()
+        await billing.shutdown()
+
+        assert posted, "expected the tool invocation to be flushed"
+        assert all(e["metricName"] != "system.session.heartbeat" for e in posted)
+        assert all(e["quantity"] > 0 for e in posted)
 
     asyncio.run(scenario())

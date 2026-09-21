@@ -36,9 +36,17 @@ export interface AforoMcpConfig {
   flushIntervalMs?: number;
   flushCount?: number;
   onError?: (error: Error) => void;
-  /** Interval between heartbeat emissions in ms (default 30000 = 30s) */
+  /**
+   * @deprecated Ignored. Heartbeats are no longer sent: they were
+   * `system.session.heartbeat` events with quantity 0 in the usage batch, which
+   * fail the ingestor's validation and take the whole batch down with them.
+   */
   heartbeatIntervalMs?: number;
-  /** Whether to emit periodic heartbeats while a session is active (default true) */
+  /**
+   * @deprecated Ignored. Heartbeats are no longer sent: they were
+   * `system.session.heartbeat` events with quantity 0 in the usage batch, which
+   * fail the ingestor's validation and take the whole batch down with them.
+   */
   heartbeatEnabled?: boolean;
   /** Called when the server signals that a session has been killed */
   onSessionKilled?: (sessionId: string, reason: string) => void;
@@ -77,12 +85,8 @@ export class AforoMcpBilling {
   private flushCount: number;
   private onError: (error: Error) => void;
 
-  // Heartbeat state
-  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-  private heartbeatIntervalMs: number;
-  private heartbeatEnabled: boolean;
+  // Session state
   private activeSessionId: string | null = null;
-  private sessionStartedAt: number | null = null;
   private onSessionKilled: ((sessionId: string, reason: string) => void) | null;
 
   constructor(config: AforoMcpConfig) {
@@ -100,8 +104,6 @@ export class AforoMcpBilling {
     this.flushIntervalMs = config.flushIntervalMs ?? 5000;
     this.flushCount = config.flushCount ?? 50;
     this.onError = config.onError ?? ((err) => console.error('[aforo-mcp] Error:', err.message));
-    this.heartbeatIntervalMs = config.heartbeatIntervalMs ?? 30_000;
-    this.heartbeatEnabled = config.heartbeatEnabled ?? true;
     this.onSessionKilled = config.onSessionKilled ?? null;
 
     // Start periodic flush timer
@@ -112,95 +114,28 @@ export class AforoMcpBilling {
     }
   }
 
-  // ─── Heartbeat lifecycle ─────────────────────────────────────────────
+  // ─── Session lifecycle ───────────────────────────────────────────────
+  //
+  // Session heartbeats are NOT sent. They used to be pushed into the usage batch
+  // as `system.session.heartbeat` events with quantity 0; the ingestor validates
+  // every event in a batch (quantity must be positive) and rejects the whole
+  // batch with 400 when one is invalid, so each heartbeat took every real tool
+  // invocation batched with it down. The ingestor has no dedicated heartbeat
+  // endpoint, so there is nowhere correct to send them.
 
-  /**
-   * Explicitly start a session and begin emitting heartbeats.
-   * If not called, heartbeat starts automatically on the first tool call.
-   */
+  /** Record the active session (used to match server kill signals). */
   startSession(sessionId: string): void {
     this.activeSessionId = sessionId;
-    this.startHeartbeat(sessionId);
   }
 
-  /**
-   * End the current session: emit a final SESSION_END heartbeat, stop the
-   * heartbeat timer, and flush any remaining events.
-   */
+  /** End the current session and flush any remaining events. */
   async endSession(): Promise<void> {
-    if (this.activeSessionId) {
-      this.buffer.push({
-        customerId: this.config.tenantId,
-        metricName: 'system.session.heartbeat',
-        quantity: 0,
-        occurredAt: new Date().toISOString(),
-        idempotencyKey: `hb:end:${this.activeSessionId}:${Date.now()}`,
-        productType: 'MCP_SERVER',
-        agentId: '',
-        sessionId: this.activeSessionId,
-        sessionBoundary: 'SESSION_END',
-        executionStatus: 'SUCCESS',
-        metadata: { heartbeatType: 'SESSION_END', sdkVersion: SDK_VERSION, sdkLanguage: 'node' },
-      });
-    }
-    this.stopHeartbeat();
+    this.stopSession();
     await this.flush();
   }
 
-  private startHeartbeat(sessionId: string): void {
-    if (!this.heartbeatEnabled) return;
-    if (this.heartbeatTimer) return; // Already running
-
-    this.activeSessionId = sessionId;
-    this.sessionStartedAt = Date.now();
-    this.emitHeartbeat(); // First heartbeat immediately
-
-    this.heartbeatTimer = setInterval(() => this.emitHeartbeat(), this.heartbeatIntervalMs);
-    // Unref so the background timer never blocks host-process exit (final flush still needs shutdown()).
-    if (this.heartbeatTimer && typeof this.heartbeatTimer === 'object' && 'unref' in this.heartbeatTimer) {
-      this.heartbeatTimer.unref();
-    }
-  }
-
-  private stopHeartbeat(): void {
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-    }
+  private stopSession(): void {
     this.activeSessionId = null;
-    this.sessionStartedAt = null;
-  }
-
-  private emitHeartbeat(): void {
-    if (!this.activeSessionId) return;
-
-    const now = Date.now();
-    let processMemoryMb: number | undefined;
-    try {
-      processMemoryMb = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
-    } catch {
-      // Not available in all runtimes
-    }
-
-    this.buffer.push({
-      customerId: this.config.tenantId,
-      metricName: 'system.session.heartbeat',
-      quantity: 0,
-      occurredAt: new Date().toISOString(),
-      idempotencyKey: `hb:${this.activeSessionId}:${now}`,
-      productType: 'MCP_SERVER',
-      agentId: '',
-      sessionId: this.activeSessionId,
-      sessionBoundary: 'HEARTBEAT',
-      executionStatus: 'SUCCESS',
-      metadata: {
-        heartbeatType: 'PERIODIC',
-        uptimeMs: now - (this.sessionStartedAt ?? now),
-        sdkVersion: SDK_VERSION,
-        sdkLanguage: 'node',
-        ...(processMemoryMb != null ? { processMemoryMb } : {}),
-      },
-    });
   }
 
   // ─── Tool handler wrapper ──────────────────────────────────────────
@@ -208,7 +143,7 @@ export class AforoMcpBilling {
   /**
    * Wrap an MCP tool handler to automatically meter invocations.
    * The wrapper extracts tool name, tracks timing, and fires usage events.
-   * Starts heartbeat on the first tool call if a sessionId is present.
+   * Records the session from the first tool call that carries a sessionId.
    */
   wrapToolHandler<TReq extends { params: { name: string; arguments?: unknown; _meta?: Record<string, unknown> } }, TRes>(
     handler: (request: TReq) => Promise<TRes>
@@ -219,9 +154,9 @@ export class AforoMcpBilling {
       const sessionId = (request.params._meta?.session_id as string) ?? undefined;
       const startTime = Date.now();
 
-      // Auto-start heartbeat on first tool call if session exists
-      if (sessionId && !this.heartbeatTimer) {
-        this.startHeartbeat(sessionId);
+      // Track the session on the first tool call that carries one
+      if (sessionId && !this.activeSessionId) {
+        this.startSession(sessionId);
       }
 
       let status = 'SUCCESS';
@@ -306,7 +241,7 @@ export class AforoMcpBilling {
             if (result.killedSessionIds && this.activeSessionId
                 && result.killedSessionIds.includes(this.activeSessionId)) {
               const killedId = this.activeSessionId;
-              this.stopHeartbeat();
+              this.stopSession();
               this.onSessionKilled?.(killedId, 'SERVER_KILL');
             }
           } catch {
@@ -332,10 +267,10 @@ export class AforoMcpBilling {
   }
 
   /**
-   * Stop heartbeat and flush timers, flush remaining events.
+   * Stop the flush timer and flush remaining events.
    */
   async shutdown(): Promise<void> {
-    this.stopHeartbeat();
+    this.stopSession();
     if (this.flushTimer) {
       clearInterval(this.flushTimer);
       this.flushTimer = null;

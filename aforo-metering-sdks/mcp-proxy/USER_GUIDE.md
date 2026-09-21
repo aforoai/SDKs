@@ -175,7 +175,7 @@ Precedence: **env var > CLI flag > config file > default.**
 | `--debug` | `aforo.debug` | `AFORO_DEBUG` | `false` | Verbose logging. |
 | — | `aforo.flushIntervalMs` | `AFORO_FLUSH_INTERVAL_MS` | `5000` | Timed flush cadence. |
 | — | `aforo.flushCount` | `AFORO_FLUSH_COUNT` | `50` | Force flush at this buffer size. |
-| — | `aforo.heartbeatIntervalMs` | `AFORO_HEARTBEAT_INTERVAL_MS` | `30000` | Session heartbeat cadence. |
+| — | `aforo.heartbeatIntervalMs` | `AFORO_HEARTBEAT_INTERVAL_MS` | `30000` | Deprecated and ignored: session heartbeats are no longer sent (quantity-0 heartbeat events failed the ingestor's validation and took the whole usage batch down). |
 
 ## Troubleshooting
 

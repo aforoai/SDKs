@@ -4,7 +4,7 @@
 
 ## What you'll build
 
-An MCP server whose tool handlers are wrapped so each invocation fires an Aforo usage event with the tool name, agent id, status, and duration — plus periodic session heartbeats. By the end you'll have confirmed a metered tool call reached the ingestor, not just that the tool returned.
+An MCP server whose tool handlers are wrapped so each invocation fires an Aforo usage event with the tool name, agent id, status, and duration . By the end you'll have confirmed a metered tool call reached the ingestor, not just that the tool returned.
 
 ## Prerequisites
 
@@ -73,19 +73,19 @@ server.setRequestHandler(
 
 ## Step 4 — Manage the session (optional but recommended)
 
-If a `session_id` rides in on `_meta`, the first wrapped call auto-starts a heartbeat for it. To bound the session explicitly — and to emit a clean `SESSION_END` heartbeat — call the lifecycle methods yourself:
+If a `session_id` rides in on `_meta`, the first wrapped call records it as the active session. To bound the session explicitly, call the lifecycle methods yourself:
 
 ```ts
-billing.startSession('sess_abc');     // begins HEARTBEAT emissions every 30s
+billing.startSession('sess_abc');     // records the active session
 // ... tool calls happen ...
-await billing.endSession();           // emits SESSION_END heartbeat + flushes
+await billing.endSession();           // clears the session + flushes
 ```
 
-Heartbeats are `system.session.heartbeat` events with `quantity: 0` — they're presence/uptime signals, not billable units. Set `heartbeatEnabled: false` in the config to turn them off.
+Session heartbeats are no longer sent: they were `system.session.heartbeat` events with `quantity: 0` sent in the usage batch, and the ingestor rejects quantity 0 and fails the whole batch with 400, taking every real event batched with it down. The ingestor has no dedicated heartbeat endpoint. `heartbeatEnabled` / `heartbeatIntervalMs` are accepted and ignored.
 
 ## Step 5 — React to a server kill signal
 
-The batch response can carry `killedSessionIds`. When the active session appears in that list, the SDK stops its heartbeat and calls your `onSessionKilled` callback:
+The batch response can carry `killedSessionIds`. When the active session appears in that list, the SDK clears the session and calls your `onSessionKilled` callback (The ingestor only computes `killedSessionIds` while processing heartbeats, so with heartbeats removed this signal is not expected to fire until a dedicated heartbeat API exists.):
 
 ```ts
 const billing = new AforoMcpBilling({
@@ -108,7 +108,7 @@ The periodic timer flushes on its own, but a process can exit mid-interval. Flus
 
 ```ts
 process.on('SIGTERM', async () => {
-  await billing.shutdown(); // stops heartbeat + flush timers, flushes remaining events
+  await billing.shutdown(); // stops the flush timer, flushes remaining events
 });
 ```
 
@@ -144,7 +144,7 @@ If you see that batch hit `/v1/ingest/batch`, the wrapper is wired correctly. Po
 
 | Option | Type | Default | What it does |
 |---|---|---|---|
-| `tenantId` | `string` | — (required) | Tenant scope; sent as `X-Tenant-Id`; heartbeat `customerId`. |
+| `tenantId` | `string` | — (required) | Tenant scope; sent as `X-Tenant-Id`. |
 | `productId` | `string` | — (required) | MCP_SERVER product; carried in event metadata. |
 | `apiKey` | `string` | — (required) | `X-API-Key: <apiKey>`. |
 | `ingestorUrl` | `string` | — (required) | Base URL; SDK appends `/v1/ingest/batch`. |
@@ -152,8 +152,8 @@ If you see that batch hit `/v1/ingest/batch`, the wrapper is wired correctly. Po
 | `sessionConfig.idleTimeoutSec` / `.maxDurationSec` | `number` | unset | Reserved; accepted, not enforced client-side at this version. |
 | `flushIntervalMs` | `number` | `5000` | Periodic flush cadence. |
 | `flushCount` | `number` | `50` | Force flush at this buffer size. |
-| `heartbeatIntervalMs` | `number` | `30000` | Heartbeat cadence while a session is active. |
-| `heartbeatEnabled` | `boolean` | `true` | Disable heartbeats with `false`. |
+| `heartbeatIntervalMs` | `number` | `30000` | Deprecated, ignored — heartbeats are no longer sent. |
+| `heartbeatEnabled` | `boolean` | `true` | Deprecated, ignored — heartbeats are no longer sent. |
 | `onError` | `(err) => void` | `console.error` | Called on non-retryable 4xx or after retries exhausted. |
 | `onSessionKilled` | `(sessionId, reason) => void` | unset | Fired when a flush response lists the active session as killed. |
 

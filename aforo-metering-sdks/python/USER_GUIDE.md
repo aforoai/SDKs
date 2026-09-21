@@ -153,9 +153,9 @@ AFORO_API_KEY = os.environ["AFORO_API_KEY"]
 
 `MiddlewareOptions` (extra knobs for the framework adapters): `metric_name`, `quantity`, `customer_id`, `metadata` (each a constant or a callable over the request/scope), `exclude_paths` (`list[str]`), `exclude_status_codes` (`list[int]`), plus `flush_count` / `flush_interval` / `max_queue_size` forwarded to the client.
 
-### Session heartbeats (advanced)
+### Session heartbeats (removed)
 
-`start_session(session_id, product_type="AI_AGENT")` / `end_session()` emit `system.session.heartbeat` events every 30 s for long-running sessions (e.g. agent runs), then a `SESSION_END` event on close. Use these only if your Aforo product is configured for session/heartbeat billing — otherwise stick to `track()`.
+`start_session(session_id, product_type="AI_AGENT")` is now a deprecated no-op and `end_session()` only flushes. They used to emit heartbeats, but they were `system.session.heartbeat` events with `quantity: 0` sent in the usage batch, and the ingestor rejects quantity 0 and fails the whole batch with 400, taking every real event batched with it down. The ingestor has no dedicated heartbeat endpoint. Use `track()` for billable usage.
 
 ## Troubleshooting
 

@@ -1,7 +1,7 @@
 """
 Aforo MCP Billing Client — meters tool invocations and manages sessions.
 
-Includes automatic heartbeat emission for long-running sessions.
+Session heartbeats are not sent: see ``AforoMcpBilling.start_session``.
 """
 
 import asyncio
@@ -91,107 +91,38 @@ class AforoMcpBilling:
         self._flush_task: Optional[asyncio.Task] = None
         self._running = False
 
-        # Heartbeat state
-        self._heartbeat_interval = heartbeat_interval_sec
-        self._heartbeat_enabled = heartbeat_enabled
-        self._heartbeat_task: Optional[asyncio.Task] = None
+        # Session state. heartbeat_interval_sec / heartbeat_enabled are accepted
+        # for backwards compatibility and ignored: heartbeats are not sent.
         self._active_session_id: Optional[str] = None
-        self._session_started_at: Optional[float] = None
         self._on_session_killed = on_session_killed
 
-    # ─── Heartbeat lifecycle ─────────────────────────────────────────────
+    # ─── Session lifecycle ───────────────────────────────────────────────
+    #
+    # Session heartbeats are NOT sent. They used to be appended to the usage
+    # batch as ``system.session.heartbeat`` events with quantity 0; the ingestor
+    # validates every event in a batch (quantity must be positive) and rejects
+    # the whole batch with 400 when one is invalid, so each heartbeat took every
+    # real tool invocation batched with it down. The ingestor has no dedicated
+    # heartbeat endpoint, so there is nowhere correct to send them.
 
     async def start_session(self, session_id: str) -> None:
-        """Explicitly start a session and begin emitting heartbeats."""
+        """Record the active session (used to match server kill signals)."""
         self._active_session_id = session_id
-        self._start_heartbeat(session_id)
 
     async def end_session(self) -> None:
-        """End the session: emit final SESSION_END heartbeat and flush."""
-        if self._active_session_id:
-            self._buffer.append({
-                "customerId": self.tenant_id,
-                "metricName": "system.session.heartbeat",
-                "quantity": 0,
-                "occurredAt": datetime.now(timezone.utc).isoformat(),
-                "idempotencyKey": f"hb:end:{self._active_session_id}:{int(time.time() * 1000)}",
-                "productType": "MCP_SERVER",
-                "agentId": "",
-                "sessionId": self._active_session_id,
-                "sessionBoundary": "SESSION_END",
-                "executionStatus": "SUCCESS",
-                "metadata": {"heartbeatType": "SESSION_END", "sdkVersion": __version__, "sdkLanguage": "python"},
-            })
-        self._stop_heartbeat()
+        """End the session and flush remaining events."""
+        self._stop_session()
         await self.flush()
 
-    def _start_heartbeat(self, session_id: str) -> None:
-        if not self._heartbeat_enabled:
-            return
-        if self._heartbeat_task and not self._heartbeat_task.done():
-            return  # Already running
-
-        self._active_session_id = session_id
-        self._session_started_at = time.monotonic()
-        self._heartbeat_task = asyncio.ensure_future(self._heartbeat_loop())
-
-    async def _heartbeat_loop(self) -> None:
-        """Background coroutine emitting periodic heartbeats."""
-        try:
-            self._emit_heartbeat()  # First heartbeat immediately
-            while True:
-                await asyncio.sleep(self._heartbeat_interval)
-                self._emit_heartbeat()
-        except asyncio.CancelledError:
-            pass  # Normal shutdown
-
-    def _emit_heartbeat(self) -> None:
-        if not self._active_session_id:
-            return
-
-        process_memory_mb = None
-        try:
-            import resource
-            process_memory_mb = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
-        except Exception:
-            pass
-
-        metadata: Dict[str, Any] = {
-            "heartbeatType": "PERIODIC",
-            "uptimeMs": int((time.monotonic() - (self._session_started_at or 0)) * 1000),
-            "sdkVersion": __version__,
-            "sdkLanguage": "python",
-        }
-        if process_memory_mb is not None:
-            metadata["processMemoryMb"] = process_memory_mb
-
-        self._buffer.append({
-            "customerId": self.tenant_id,
-            "metricName": "system.session.heartbeat",
-            "quantity": 0,
-            "occurredAt": datetime.now(timezone.utc).isoformat(),
-            "idempotencyKey": f"hb:{self._active_session_id}:{int(time.time() * 1000)}",
-            "productType": "MCP_SERVER",
-            "agentId": "",
-            "sessionId": self._active_session_id,
-            "sessionBoundary": "HEARTBEAT",
-            "executionStatus": "SUCCESS",
-            "metadata": metadata,
-        })
-
-    def _stop_heartbeat(self) -> None:
-        if self._heartbeat_task and not self._heartbeat_task.done():
-            self._heartbeat_task.cancel()
-        self._heartbeat_task = None
+    def _stop_session(self) -> None:
         self._active_session_id = None
-        self._session_started_at = None
 
     # ─── Tool handler wrapper ──────────────────────────────────────────
 
     def wrap_tool_handler(self, handler: Callable) -> Callable:
         """
         Decorator that wraps an MCP tool handler with automatic metering.
-        Starts heartbeat on the first tool call if a session_id is present.
+        Records the session from the first tool call that carries a session_id.
 
         Usage:
             @billing.wrap_tool_handler
@@ -205,9 +136,9 @@ class AforoMcpBilling:
             start_time = time.monotonic()
             status = "SUCCESS"
 
-            # Auto-start heartbeat on first tool call
-            if session_id and not self._heartbeat_task:
-                self._start_heartbeat(session_id)
+            # Track the session on the first tool call that carries one
+            if session_id and not self._active_session_id:
+                self._active_session_id = session_id
 
             try:
                 result = await handler(name, arguments, **kwargs)
@@ -288,7 +219,7 @@ class AforoMcpBilling:
                             killed_ids = result.get("killedSessionIds") or []
                             if self._active_session_id in killed_ids:
                                 killed_id = self._active_session_id
-                                self._stop_heartbeat()
+                                self._stop_session()
                                 if self._on_session_killed:
                                     self._on_session_killed(killed_id, "SERVER_KILL")
                         except (json.JSONDecodeError, TypeError):
@@ -338,8 +269,8 @@ class AforoMcpBilling:
                 self.on_error(e)
 
     async def shutdown(self) -> None:
-        """Stop heartbeat and flush timer, flush remaining events."""
-        self._stop_heartbeat()
+        """Stop the flush timer and flush remaining events."""
+        self._stop_session()
         self._running = False
         if self._flush_task:
             self._flush_task.cancel()

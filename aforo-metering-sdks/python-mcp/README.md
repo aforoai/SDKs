@@ -72,8 +72,8 @@ Constructor arguments for `AforoMcpBilling(...)`:
 | `flush_interval_sec` | `float` | `5.0` | Background flush cadence (seconds). Requires `await start()`. |
 | `flush_count` | `int` | `50` | Buffer size that triggers an immediate async flush. |
 | `on_error` | `Callable[[Exception], None]?` | logs the error | Invoked when a batch fails permanently. |
-| `heartbeat_interval_sec` | `float` | `30.0` | Cadence of session heartbeats. |
-| `heartbeat_enabled` | `bool` | `True` | Turn periodic heartbeats off entirely. |
+| `heartbeat_interval_sec` | `float` | `30.0` | Deprecated, ignored — heartbeats are no longer sent. |
+| `heartbeat_enabled` | `bool` | `True` | Deprecated, ignored — heartbeats are no longer sent. |
 | `on_session_killed` | `Callable[[str, str], None]?` | `None` | Called when the ingestor returns this session in `killedSessionIds`. |
 
 Retry is fixed at **3 attempts** with `1s / 2s / 4s` backoff; any 4xx is non-retryable and the batch is dropped via `on_error`.
@@ -84,4 +84,4 @@ Install → wrap a handler → fire a real tool call → confirm the event in Af
 
 ## What this doesn't cover
 
-This SDK **emits** invocation, heartbeat, and session events — it does not price them. It does not enforce entitlements at call time: the only server-driven control is the `killedSessionIds` signal returned on a flush, which stops the heartbeat for that session and fires `on_session_killed` (it does not abort an in-flight tool call). Streaming/partial tool results are recorded as a single invocation. Rate plans and metric mapping live in the Aforo console.
+This SDK **emits** invocation events (session heartbeats are no longer sent: they were `system.session.heartbeat` events with `quantity: 0` sent in the usage batch, and the ingestor rejects quantity 0 and fails the whole batch with 400, taking every real event batched with it down. The ingestor has no dedicated heartbeat endpoint.) — it does not price them. It does not enforce entitlements at call time: the only server-driven control is the `killedSessionIds` signal returned on a flush, which clears that session and fires `on_session_killed` (The ingestor only computes `killedSessionIds` while processing heartbeats, so with heartbeats removed this signal is not expected to fire until a dedicated heartbeat API exists.) (it does not abort an in-flight tool call). Streaming/partial tool results are recorded as a single invocation. Rate plans and metric mapping live in the Aforo console.
