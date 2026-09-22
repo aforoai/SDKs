@@ -41,7 +41,7 @@ already control (e.g. a leaked API key you committed to your own repo).
 
 ## Handling credentials safely
 
-- Pass `api_key` / `tenant_id` through environment variables or your secret
+- Pass `api_key` (and `tenant_id`, if you still set one) through environment variables or your secret
   manager — never commit them, and never read tenant scope from a client-settable
   request header. Each SDK's user guide shows the safe call site.
 - Rotate an Aforo API key immediately in the Aforo console if you suspect it
