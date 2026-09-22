@@ -94,6 +94,14 @@ func main() {
 
 > ⚠ Pair every `Open` with a `Close` — `defer billing.Close(connID, code)` right after `Open`. The `CONNECTION_CLOSED` event (carrying duration, frame count, and byte totals) is only emitted by `Close`; if the goroutine returns without it, that connection's totals never ship and the entry leaks in the in-memory map.
 
+Product type: every event carries a top-level `productType` — `Config.ProductType` (default `"WEBSOCKET_API"`). `Open` accepts an optional trailing `wsmetering.EventOptions` to override it for that connection; the override applies to every event of the connection (open, frames, close). Example:
+
+```go
+connID := billing.Open(customerID, meta, wsmetering.EventOptions{ProductType: "AGENTIC_API"})
+```
+
+Delivery: `POST /v1/ingest/batch` with `{"events":[...]}`, at most 1000 events per request, `X-API-Key` header. Transport errors, `408`, `429` (honouring `Retry-After`) and `5xx` are retried with the same body; any other `4xx` is reported via `OnError` and not retried.
+
 ## Configuration
 
 `Config`:
@@ -105,10 +113,11 @@ func main() {
 | `APIKey` | `string` | — (required) | Sent as `X-API-Key: <APIKey>`. |
 | `IngestorURL` | `string` | — (required) | Ingestor base; the SDK appends `/v1/ingest/batch`. Use `https://api.aforo.ai`. |
 | `PerFrameEvents` | `bool` | `false` | When true, each `RecordFrame` emits an immediate event **in addition** to the open/close pair. Off by default — open + close only. |
+| `ProductType` | `string` | `WEBSOCKET_API` | Top-level `productType` on every event (required by the ingestor). Trimmed + upper-cased; unknown values pass through. Overridable per event via `EventOptions`. |
 | `FlushCount` | `int` | `100` | Flush when the buffer reaches this many events. |
 | `FlushInterval` | `time.Duration` | `3s` | Background flush cadence. |
 | `HTTPClient` | `*http.Client` | `&http.Client{Timeout: 10s}` | Override the HTTP client used for flushing. |
-| `OnError` | `func(error)` | no-op | Called on a marshal failure or a flush that exhausts its 3 retries (events dropped). |
+| `OnError` | `func(error)` | no-op | Called on a marshal failure, a flush that exhausts its 3 retries, a non-retryable `4xx` (dropped without retry), or a `2xx` whose body reports `failed > 0` — messages include the ingestor's `errors[].message`. |
 
 `New` returns an error if `TenantID`, `ProductID`, `APIKey`, or `IngestorURL` is empty.
 

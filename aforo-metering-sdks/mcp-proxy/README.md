@@ -71,6 +71,7 @@ Put the proxy in front of the server in the host's `mcpServers` block, with the 
     "apiKey": "sk_live_xxx",
     "ingestorUrl": "https://api.aforo.ai",
     "agentId": "agent_claude_desktop",
+    "productType": "MCP_SERVER",
     "quotaEnforcement": false,
     "debug": false
   }
@@ -96,11 +97,13 @@ The proxy resolves each value with this precedence: **environment variable > CLI
 | `--api-key` | `aforo.apiKey` | `AFORO_API_KEY` | — (required) | `X-API-Key: <apiKey>`. |
 | `--ingestor-url` | `aforo.ingestorUrl` | `AFORO_INGESTOR_URL` | — (required) | Base ingestor URL. The proxy appends `/v1/ingest/batch`. |
 | `--agent-id` | `aforo.agentId` | `AFORO_AGENT_ID` | — | Agent id override when the traffic doesn't carry `_meta.agent_id`. |
+| — | `aforo.customerId` | `AFORO_CUSTOMER_ID` | — | Customer billed when a `tools/call` carries no `_meta.customer_id` (otherwise the agent id is billed). Also the customer on session heartbeats (else the first call's customer, else `system`). |
+| — | `aforo.productType` | `AFORO_PRODUCT_TYPE` | `MCP_SERVER` | Top-level `productType` on every event (required by the ingestor). Trimmed and uppercased. |
 | `--quota-enforcement` | `aforo.quotaEnforcement` | `AFORO_QUOTA_ENFORCEMENT` | `false` | Pre-flight quota gate before each `tools/call` (see below). |
 | `--debug` | `aforo.debug` | `AFORO_DEBUG` | `false` | Verbose logging. |
 | — | `aforo.flushIntervalMs` | `AFORO_FLUSH_INTERVAL_MS` | `5000` | Buffer dwell time before a timed flush. |
 | — | `aforo.flushCount` | `AFORO_FLUSH_COUNT` | `50` | Force a flush at this buffer size. |
-| — | `aforo.heartbeatIntervalMs` | `AFORO_HEARTBEAT_INTERVAL_MS` | `30000` | Deprecated and ignored: session heartbeats are no longer sent (quantity-0 heartbeat events failed the ingestor's validation and took the whole usage batch down). |
+| — | `aforo.heartbeatIntervalMs` | `AFORO_HEARTBEAT_INTERVAL_MS` | `30000` | Interval between session heartbeats (`system.session.heartbeat`, quantity 1). The first tool call starts the session and sends one immediately; a `SESSION_END` is sent on shutdown. Each heartbeat goes in its own `/v1/ingest/batch` request, never inside a usage batch, so the ingestor intercepts it before billing. Best-effort: no retries, failures ignored. |
 
 > ⚠ The four `aforo.*` credentials (`tenantId`, `productId`, `apiKey`, `ingestorUrl`) are required and validated at startup — a missing one exits with a non-zero code and an error, it doesn't run unmetered. Pass `--ingestor-url` as the **base** URL (`https://api.aforo.ai`); the proxy appends `/v1/ingest/batch` for events and calls `/api/v1/quota/check` for quota.
 

@@ -6,7 +6,16 @@ export interface AforoOptions {
   /** Base URL for the Aforo ingestor service. Defaults to https://api.aforo.ai */
   baseUrl?: string;
 
-  /** Maximum events to buffer before flushing. Default: 50 */
+  /**
+   * Default product type stamped on every event (top-level `productType`).
+   * Required by the Aforo ingestor in production. One of API, AGENTIC_API,
+   * AI_AGENT, MCP_SERVER, GRPC_API, GRAPHQL_API, WEBSOCKET_API, MQTT_BROKER.
+   * Values are trimmed, uppercased and passed through. Default: "API".
+   * A per-event `productType` on `track()` overrides this.
+   */
+  productType?: string;
+
+  /** Maximum events to buffer before flushing (capped at 1000, the ingestor's batch limit). Default: 50 */
   flushCount?: number;
 
   /** Flush interval in milliseconds. Default: 5000 (5 seconds) */
@@ -36,8 +45,14 @@ export interface TrackEvent {
   /** Metric name (e.g., "api_calls", "ai_tokens", "GET /users"). */
   metricName: string;
 
-  /** Quantity of usage. Default: 1 */
+  /** Quantity of usage. Must be > 0 (the ingestor rejects 0). Default: 1 */
   quantity?: number;
+
+  /**
+   * Product type for this event. Overrides the client-level `productType`
+   * default. Trimmed, uppercased and sent as top-level `productType`.
+   */
+  productType?: string;
 
   /** Optional override for idempotency key. Auto-generated if omitted. */
   idempotencyKey?: string;
@@ -47,16 +62,29 @@ export interface TrackEvent {
 
   /** Arbitrary key-value metadata attached to the event. */
   metadata?: Record<string, string | number | boolean>;
+
+  /** Optional HTTP context, sent as top-level fields. */
+  endpointPath?: string;
+  httpMethod?: string;
+  statusCode?: number;
+  responseTimeMs?: number;
 }
 
-/** Internal event with all fields resolved. */
+/** Internal event with all fields resolved (the exact wire shape). */
 export interface ResolvedEvent {
   customerId: string;
   metricName: string;
   quantity: number;
   idempotencyKey: string;
   occurredAt: string;
+  productType: string;
   metadata?: Record<string, string | number | boolean>;
+  endpointPath?: string;
+  httpMethod?: string;
+  statusCode?: number;
+  responseTimeMs?: number;
+  sessionId?: string;
+  sessionBoundary?: 'HEARTBEAT' | 'SESSION_END';
 }
 
 /** Batch request body sent to POST /v1/ingest/batch. */
@@ -69,7 +97,8 @@ export interface BatchResponse {
   accepted: number;
   duplicates: number;
   failed: number;
-  errors: Array<{ index: number; error: string }>;
+  errors: Array<{ index: number; message: string }>;
+  killedSessionIds?: string[];
 }
 
 /** Options for Express/Koa/Fastify middleware. */
@@ -81,6 +110,12 @@ export interface MiddlewareOptions {
   baseUrl?: string;
 
   /**
+   * Product type stamped on every metered request (top-level `productType`).
+   * Default: the client default ("API", or `clientOptions.productType`).
+   */
+  productType?: string;
+
+  /**
    * Metric to record for each request: a fixed name, or a function of the
    * request/response. Default: `"api_calls"` (DEFAULT_METRIC_NAME).
    *
@@ -89,7 +124,7 @@ export interface MiddlewareOptions {
    */
   metricName?: string | ((req: any, res: any) => string);
 
-  /** Static quantity or function to derive from request/response. */
+  /** Static quantity or function to derive from request/response. Requests with quantity <= 0 are not metered. */
   quantity?: number | ((req: any, res: any) => number);
 
   /**

@@ -326,3 +326,95 @@ describe('ingest batch contract', () => {
     expect(ev.idempotencyKey.length).toBeLessThanOrEqual(255);
   });
 });
+
+describe('productType', () => {
+  test('defaults to MQTT_BROKER; client option is trimmed + uppercased; per-integration value wins', async () => {
+    const def = new AforoMqttBilling({ ...config(), flushCount: 100 });
+    const c0: any = new EventEmitter();
+    c0.publish = jest.fn();
+    def.wrapMqttClient(c0, { customerId: 'cust_001' });
+    c0.publish('t/1', 'x');
+    await def.shutdown();
+    expect(drainedEvents()[0].productType).toBe('MQTT_BROKER');
+
+    capturedRequests = [];
+    const b = new AforoMqttBilling({ ...config(), flushCount: 100, productType: ' agentic_api ' });
+    const mk = () => { const c: any = new EventEmitter(); c.publish = jest.fn(); return c; };
+    const cDefault = mk(), cCustom = mk(), cBlank = mk();
+    b.wrapMqttClient(cDefault, { customerId: 'c_default' });
+    b.wrapMqttClient(cCustom, { customerId: 'c_custom', productType: ' custom_type ' });
+    b.wrapMqttClient(cBlank, { customerId: 'c_blank', productType: '  ' });
+    cDefault.publish('t/1', 'x');
+    cCustom.publish('t/1', 'x');
+    cBlank.publish('t/1', 'x');
+    const broker: any = new EventEmitter();
+    b.wrapAedesBroker(broker, { resolveCustomerId: () => 'c_broker', productType: 'api' });
+    broker.emit('publish', { topic: 't/2', payload: 'y' }, { id: 'dev-1' });
+    await new Promise((r) => setTimeout(r, 20));
+    await b.shutdown();
+    expect(drainedEvents().map((e: any) => `${e.customerId}=${e.productType}`)).toEqual([
+      'c_default=AGENTIC_API', 'c_custom=CUSTOM_TYPE', 'c_blank=AGENTIC_API', 'c_broker=API',
+    ]);
+  });
+
+  test('blank / whitespace mqttTopic is dropped client-side', async () => {
+    const b = new AforoMqttBilling({ ...config(), flushCount: 100 });
+    const c: any = new EventEmitter();
+    c.publish = jest.fn();
+    b.wrapMqttClient(c, { customerId: 'cust_001' });
+    c.publish('', 'x');
+    c.publish('   ', 'x');
+    await b.shutdown();
+    expect(capturedRequests).toHaveLength(0);
+  });
+});
+
+describe('batch response handling', () => {
+  const resp = (status: number, body: any = {}, headers: Record<string, string> = {}) => ({
+    ok: status >= 200 && status < 300, status, statusText: String(status),
+    headers: { get: (k: string) => headers[k.toLowerCase()] ?? null },
+    json: async () => body,
+  } as unknown as Response);
+  const respondWith = (next: () => Response) => {
+    global.fetch = jest.fn(async (input: any, init: any = {}) => {
+      capturedRequests.push({ url: String(input), init, body: JSON.parse(init.body) });
+      return next();
+    }) as any;
+  };
+
+  test('4xx (not 408/429) is not retried and reports errors[].message', async () => {
+    const onError = jest.fn();
+    respondWith(() => resp(400, { errors: [{ index: 0, message: 'field is required' }] }));
+    await meterOnce(onError);
+    expect(capturedRequests).toHaveLength(1);
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError.mock.calls[0][0].message).toMatch(/HTTP 400.*field is required.*not retried/);
+  });
+
+  test('429 honours Retry-After and 408 is retried; same idempotencyKeys re-sent', async () => {
+    const onError = jest.fn();
+    const seq = [resp(429, {}, { 'retry-after': '0' }), resp(408, {}, { 'retry-after': '0' }), resp(202, { accepted: 1, failed: 0 })];
+    respondWith(() => seq.shift()!);
+    await meterOnce(onError);
+    expect(capturedRequests).toHaveLength(3);
+    expect(new Set(capturedRequests.map((r: any) => r.body.events[0].idempotencyKey)).size).toBe(1);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  test('202 with failed > 0 reports per-event errors[].message via onError', async () => {
+    const onError = jest.fn();
+    respondWith(() => resp(202, { accepted: 0, duplicates: 0, failed: 1, errors: [{ index: 0, message: 'bad event' }] }));
+    await meterOnce(onError);
+    expect(capturedRequests).toHaveLength(1);
+    expect(onError.mock.calls[0][0].message).toMatch(/rejected 1 event\(s\).*#0: bad event/);
+  });
+});
+
+async function meterOnce(onError: (e: Error) => void) {
+  const b = new AforoMqttBilling({ ...config(), flushCount: 100, onError });
+  const c: any = new EventEmitter();
+  c.publish = jest.fn();
+  b.wrapMqttClient(c, { customerId: 'cust_001' });
+  c.publish('t/1', 'x');
+  await b.shutdown();
+}

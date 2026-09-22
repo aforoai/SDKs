@@ -6,7 +6,14 @@ All notable changes to `@aforo/mcp-proxy` are documented here. This project foll
 
 ### Fixed
 - **Breaking (fix):** the tenant API key is sent as `X-API-Key` instead of `Authorization: Bearer`. The ingestor parses Bearer values as JWTs and rejected every request 401 (sending both headers is also 401), so no usage was being delivered.
-- **Fix:** session heartbeats (`system.session.heartbeat`, quantity 0) are no longer sent in the usage batch; the ingestor rejects quantity 0 and failed the whole batch with 400. Session start/end methods are kept as no-ops/flush, heartbeat options are ignored.
+- **Fix:** session heartbeats (`system.session.heartbeat`) are no longer sent in the usage batch; with quantity 0 the ingestor rejected them and failed the whole batch with 400.
+- **Fix:** session heartbeats are sent again, in a shape the ingestor accepts: quantity 1, a non-blank customerId (`aforo.customerId`, else the first tool call's customer, else `"system"`), top-level `sessionId`, `productType` and `sessionBoundary` (`HEARTBEAT` when the session starts and every `heartbeatIntervalMs`, `SESSION_END` on shutdown), unique idempotency key. Each heartbeat is POSTed in its own `{"events":[heartbeat]}` request so it always takes the ingestor's synchronous path, where it is intercepted before billing; it is never pushed into the usage buffer. Best-effort: sent once, failures logged and ignored, usage delivery unaffected; the timer is unref'd.
+- **Fix:** tool calls whose toolName (> 64 chars), agentId (> 36) or customerId (> 64) the ingestor would reject are not metered (logged) instead of failing their whole batch.
+- **Fix:** batch responses' per-event rejections are logged from `errors[].message` (the type said `error`).
+
+### Added
+- `aforo.productType` / `AFORO_PRODUCT_TYPE` (default `MCP_SERVER`, previously hard-coded), stamped as top-level `productType` on every event.
+- `aforo.customerId` / `AFORO_CUSTOMER_ID` and `_meta.customer_id` on `tools/call` to bill a real customer; the agent id remains the fallback.
 - **Fix:** a flush holding more than 1000 events is sent as several `/v1/ingest/batch` requests of at most 1000. The ingestor rejects larger batches with 400, which lost every event in them.
 
 ## [1.0.0] — 2026-06-29

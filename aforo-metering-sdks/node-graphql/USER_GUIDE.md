@@ -129,7 +129,7 @@ The SDK POSTs the batch to `https://api.aforo.ai/v1/ingest/batch` with:
 - `X-API-Key: <your api key>`
 - `X-Tenant-Id: tenant_acme`
 
-Confirm it arrived in the Aforo console under the product's usage events (filter to `productType = GRAPHQL_API`). If a flush fails 3× (1s/2s/4s backoff), the `onError` callback fires and the batch is dropped — watch your logs:
+Confirm it arrived in the Aforo console under the product's usage events (filter to `productType = GRAPHQL_API`). Network errors, 408, 429 (honouring `Retry-After`) and 5xx are retried 3× (1s/2s/4s backoff); any other 4xx is not retried. When a batch is dropped, or a 202 reports per-event failures (`errors[].message`), the `onError` callback fires — watch your logs:
 
 ```ts
 const billing = new AforoGraphQlBilling({
@@ -146,6 +146,7 @@ const billing = new AforoGraphQlBilling({
 | `productId` | `string` | — (required) | Aforo product id; into `metadata.productId`. |
 | `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. |
 | `ingestorUrl` | `string` | — (required) | Base URL; SDK appends `/v1/ingest/batch`. |
+| `productType` | `string` | `'GRAPHQL_API'` | Top-level `productType` on every event (trimmed + uppercased; unknown values pass through). Override via `record({ productType })`, `billing.middleware({ productType })` or `aforoApolloPlugin(billing, { productType })`. |
 | `schemaVersion` | `string` | `undefined` | Copied into `metadata.schemaVersion`. |
 | `customerIdExtractor` | `(context) => string \| undefined` | reads `x-customer-id` | Resolve the customer per operation; `undefined` → skip. |
 | `complexityScorer` | `(doc, operationName?) => { complexity, fieldCount }` | `fieldCount + 5 × maxDepth` | Replace the complexity formula. |

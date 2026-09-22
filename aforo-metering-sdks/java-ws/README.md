@@ -81,6 +81,7 @@ Builder options on `AforoWsBilling.newBuilder()`:
 | `apiKey` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
 | `ingestorUrl` | `String` | *(required)* | Ingestion host. The SDK appends `/v1/ingest/batch`. Use `https://api.aforo.ai`. |
 | `perFrameEvents` | `boolean` | `false` | When `true`, each `recordFrame` emits its own event. When `false`, only OPEN and CLOSE events are emitted, with frame/byte totals aggregated on CLOSE. |
+| `productType` | `String` | `WEBSOCKET_API` | Top-level `productType` on every event (required by the ingestor). Trimmed and uppercased; unknown values are passed through. |
 | `flushCount` | `int` | `100` | Buffered events that trigger an immediate flush. |
 | `flushIntervalMs` | `long` | `3000` | Background flush cadence (ms). |
 

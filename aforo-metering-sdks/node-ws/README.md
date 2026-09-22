@@ -66,10 +66,11 @@ By default the SDK emits two events per connection — `CONNECTION_OPENED` on co
 | `productId` | `string` | — (required) | Aforo product id; into each event's `metadata.productId`. |
 | `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. |
 | `ingestorUrl` | `string` | — (required) | Ingestion base URL. SDK appends `/v1/ingest/batch`. Use `https://api.aforo.ai`. |
+| `productType` | `string` | `'WEBSOCKET_API'` | Aforo product type sent as top-level `productType` on every event (trimmed + uppercased; unknown values pass through). Override via `wrapServer(wss, { productType })` or `trackConnection(ws, { customerId, productType })`. |
 | `perFrameEvents` | `boolean` | `false` | Emit one event per frame (each direction). Off → frames are aggregated into the close event only. |
 | `flushCount` | `number` | `100` | Buffered events that trigger an immediate flush. Higher default than the base SDK — WS is high-volume. |
 | `flushIntervalMs` | `number` | `3000` | Max ms before a partial batch is flushed. |
-| `onError` | `(error: Error) => void` | logs to `console.error` | Called when a flush fails terminally (after 3 retries). |
+| `onError` | `(error: Error) => void` | logs to `console.error` | Called when a batch is dropped: after 3 attempts on network errors / 408 / 429 (honouring `Retry-After`) / 5xx, immediately on any other 4xx (not retried), and when a 202 reports per-event failures (`errors[].message`). |
 
 `wrapServer(wss, options)` / `trackConnection(ws, opts)` take the customer resolver:
 
@@ -79,6 +80,7 @@ By default the SDK emits two events per connection — `CONNECTION_OPENED` on co
 | `extractMetadata` | `wrapServer` | `(req) => Record<string, unknown> \| undefined` | Optional per-connection tags. |
 | `customerId` | `trackConnection` | `string` | Customer to attribute all traffic on this socket to. |
 | `metadata` | `trackConnection` | `Record<string, unknown>` | Optional per-connection tags. |
+| `productType` | both | `string` | Product type for this server's / socket's events. Default: the client-level `productType`. |
 
 Close codes map to labels via `WS_CLOSE_REASONS` — `1000 → NORMAL_CLOSURE`, `1006 → ABNORMAL_CLOSURE`, `1009 → MESSAGE_TOO_BIG`, `4000 → IDLE_TIMEOUT`, etc. A socket `error` emits a synthetic `CONNECTION_CLOSED` with `wsCloseReason: INTERNAL_ERROR` and `metadata.event: CONNECTION_ERROR`.
 

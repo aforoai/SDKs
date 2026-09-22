@@ -86,14 +86,15 @@ Every recorded operation emits one event with `metricName: "graphql_api.operatio
 | `productId` | `string` | — (required) | Aforo product id; attached to each event's `metadata.productId`. |
 | `apiKey` | `string` | — (required) | Aforo API key. Sent as `X-API-Key: <apiKey>`. |
 | `ingestorUrl` | `string` | — (required) | Ingestion base URL. The SDK appends `/v1/ingest/batch` (trailing slash trimmed). Use `https://api.aforo.ai`. |
+| `productType` | `string` | `'GRAPHQL_API'` | Aforo product type sent as top-level `productType` on every event (trimmed + uppercased; unknown values pass through). Override via `record({ productType })`, `billing.middleware({ productType })` or `aforoApolloPlugin(billing, { productType })`. |
 | `schemaVersion` | `string` | `undefined` | Optional schema version string; copied into each event's `metadata.schemaVersion`. |
 | `customerIdExtractor` | `(context) => string \| undefined` | reads `x-customer-id` from the request/context headers | Resolve the Aforo customer id per operation. Return `undefined` and the operation is not metered. |
 | `complexityScorer` | `(doc, operationName?) => { complexity, fieldCount }` | `fieldCount + 5 × maxDepth` | Override the complexity formula. Receives the parsed `DocumentNode`. |
 | `flushCount` | `number` | `50` | Buffered events that trigger an immediate flush. |
 | `flushIntervalMs` | `number` | `5000` | Max ms before a partial batch is flushed by the background timer. |
-| `onError` | `(error: Error) => void` | logs to `console.error` | Called when a flush fails terminally (after 3 retries). |
+| `onError` | `(error: Error) => void` | logs to `console.error` | Called when a batch is dropped: after 3 attempts on network errors / 408 / 429 (honouring `Retry-After`) / 5xx, immediately on any other 4xx (not retried), and when a 202 reports per-event failures (`errors[].message`). |
 
-Exported symbols: `AforoGraphQlBilling`, `aforoApolloPlugin(billing)`, `defaultComplexityScorer(doc, operationName?)`, and the `AforoGraphQlConfig` type.
+Exported symbols: `AforoGraphQlBilling`, `aforoApolloPlugin(billing, options?)`, `defaultComplexityScorer(doc, operationName?)`, and the `AforoGraphQlConfig` type.
 
 ## Walk me through it
 

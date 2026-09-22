@@ -109,6 +109,7 @@ Runtime.getRuntime().addShutdownHook(new Thread(billing::close));
 | `apiKey` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
 | `ingestorUrl` | `String` | *(required)* | Host; SDK appends `/v1/ingest/batch`. |
 | `emitDeliverEvents` | `boolean` | `false` | `true` = emit `DELIVER` events for inbound messages. |
+| `productType` | `String` | `MQTT_BROKER` | Top-level `productType` on every event; trimmed + uppercased. |
 | `flushCount` | `int` | `200` | Events per immediate flush. |
 | `flushIntervalMs` | `long` | `2000` | Background flush cadence (ms). |
 

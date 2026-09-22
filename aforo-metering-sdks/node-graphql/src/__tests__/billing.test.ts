@@ -304,3 +304,78 @@ describe('ingest batch contract', () => {
     expect(ev.idempotencyKey).toMatch(/:\d+:[a-z0-9]{8}$/);
   });
 });
+
+describe('productType', () => {
+  const rec = (b: AforoGraphQlBilling, productType?: string) => b.record({
+    customerId: 'cust_001', query: `{ a }`, operationName: undefined, durationMs: 1, hasErrors: false, productType,
+  });
+
+  test('defaults to GRAPHQL_API; client option is trimmed + uppercased; per-call value wins', async () => {
+    const def = new AforoGraphQlBilling({ ...config(), flushCount: 100 });
+    rec(def);
+    await def.shutdown();
+    expect(capturedRequests[0].body.events[0].productType).toBe('GRAPHQL_API');
+
+    capturedRequests = [];
+    const b = new AforoGraphQlBilling({ ...config(), flushCount: 100, productType: ' agentic_api ' });
+    rec(b);
+    rec(b, ' custom_type ');   // unknown values pass through
+    rec(b, '   ');             // blank override falls back to the client-level type
+    await b.shutdown();
+    expect(capturedRequests[0].body.events.map((e: any) => e.productType)).toEqual(['AGENTIC_API', 'CUSTOM_TYPE', 'AGENTIC_API']);
+  });
+
+  test('middleware({ productType }) is passed through to recorded events', async () => {
+    const b = new AforoGraphQlBilling({ ...config(), flushCount: 100 });
+    const mw = b.middleware({ productType: 'api' });
+    const res: any = { statusCode: 200, end: () => undefined };
+    mw({ body: { query: '{ a }' }, headers: { 'x-customer-id': 'cust_001' } }, res, () => undefined);
+    res.end('{}');
+    await b.shutdown();
+    expect(capturedRequests[0].body.events[0].productType).toBe('API');
+  });
+});
+
+describe('batch response handling', () => {
+  const rec = (b: AforoGraphQlBilling) => b.record({
+    customerId: 'cust_001', query: `{ a }`, operationName: undefined, durationMs: 1, hasErrors: false,
+  });
+  const resp = (status: number, body: any = {}, headers: Record<string, string> = {}) => ({
+    ok: status >= 200 && status < 300, status, statusText: String(status),
+    headers: { get: (k: string) => headers[k.toLowerCase()] ?? null },
+    json: async () => body,
+  } as unknown as Response);
+
+  test('4xx (not 408/429) is not retried and reports errors[].message', async () => {
+    const onError = jest.fn();
+    const b = new AforoGraphQlBilling({ ...config(), flushCount: 100, onError });
+    nextFetchResponse = () => resp(400, { errors: [{ index: 0, message: 'productType is required' }] });
+    rec(b);
+    await b.shutdown();
+    expect(capturedRequests).toHaveLength(1);
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError.mock.calls[0][0].message).toMatch(/HTTP 400.*productType is required.*not retried/);
+  });
+
+  test('429 honours Retry-After and 408 is retried; same idempotencyKeys re-sent', async () => {
+    const onError = jest.fn();
+    const b = new AforoGraphQlBilling({ ...config(), flushCount: 100, onError });
+    const seq = [resp(429, {}, { 'retry-after': '0' }), resp(408, {}, { 'retry-after': '0' }), resp(202, { accepted: 1, failed: 0 })];
+    nextFetchResponse = () => seq.shift()!;
+    rec(b);
+    await b.shutdown();
+    expect(capturedRequests).toHaveLength(3);
+    expect(new Set(capturedRequests.map((r) => r.body.events[0].idempotencyKey)).size).toBe(1);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  test('202 with failed > 0 reports per-event errors[].message via onError', async () => {
+    const onError = jest.fn();
+    const b = new AforoGraphQlBilling({ ...config(), flushCount: 100, onError });
+    nextFetchResponse = () => resp(202, { accepted: 0, duplicates: 0, failed: 1, errors: [{ index: 0, message: 'bad event' }] });
+    rec(b);
+    await b.shutdown();
+    expect(capturedRequests).toHaveLength(1);
+    expect(onError.mock.calls[0][0].message).toMatch(/rejected 1 event\(s\).*#0: bad event/);
+  });
+});

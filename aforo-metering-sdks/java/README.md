@@ -63,9 +63,10 @@ aforo:
   api-key: ${AFORO_API_KEY}
   base-url: https://api.aforo.ai
   metric-name: api_calls   # must exist in your Aforo catalog
+  product-type: API        # default; top-level productType on every event
 ```
 
-The filter runs **after** the response is committed, so metering adds no latency to the API call. It records `aforo.metric-name` (default `api_calls`) or the result of an `AforoServletFilter.MetricNameResolver` bean. It resolves the customer from an `AforoServletFilter.CustomerIdResolver` bean if one exists, otherwise from the `X-Customer-Id` header (`aforo.customer-id-header`); the Spring Security principal is used only when `aforo.use-principal-as-customer-id: true`. The caller's `X-Api-Key` header is never used — it is a secret, not a customer id. Requests with no customer, and `OPTIONS` (CORS preflight) requests, are skipped.
+The filter runs **after** the response is committed, so metering adds no latency to the API call. It records `aforo.metric-name` (default `api_calls`) or the result of an `AforoServletFilter.MetricNameResolver` bean. It resolves the customer from an `AforoServletFilter.CustomerIdResolver` bean if one exists, otherwise from the `X-Customer-Id` header (`aforo.customer-id-header`); the Spring Security principal is used only when `aforo.use-principal-as-customer-id: true`. The caller's `X-Api-Key` header is never used — it is a secret, not a customer id. Requests with no customer, and `OPTIONS` (CORS preflight) requests, are skipped. Each event also carries top-level `endpointPath` (the matched route pattern, else the normalized path, without query string, at most 512 chars), `httpMethod`, `statusCode`, `responseTimeMs`, and `productType` (`AforoServletFilter.productType(...)`, else the client default).
 
 > ⚠ The metric must exist in your tenant's Aforo catalog: the ingestor rejects an unknown metric, and because it validates a batch as a whole, one rejected event fails every event in that batch. Earlier versions recorded `"<METHOD> <normalized-path>"`, which no catalog contains.
 
@@ -79,7 +80,8 @@ The filter runs **after** the response is committed, so metering adds no latency
 |---|---|---|---|
 | `apiKey` | `String` | *(required)* | Sent as `X-API-Key: <apiKey>`. Blank throws `IllegalArgumentException`. |
 | `baseUrl(...)` | `String` | `https://api.aforo.ai` | Ingestion host. The SDK appends `/v1/ingest/batch`. Override per environment. |
-| `flushCount(...)` | `int` | `50` | Buffered events that trigger an immediate async flush. |
+| `productType(...)` | `String` | `API` | Sent as top-level `productType` on every event (required by the ingestor): `API`, `AGENTIC_API`, `AI_AGENT`, `MCP_SERVER`, `GRPC_API`, `GRAPHQL_API`, `WEBSOCKET_API`, `MQTT_BROKER`. Trimmed and uppercased; unknown values are passed through. Override per event with `TrackEvent.builder(...).productType(...)`. |
+| `flushCount(...)` | `int` | `50` | Buffered events that trigger an immediate async flush; also the batch size. Clamped to 1–1000 (the ingestor's batch limit). |
 | `flushIntervalMs(...)` | `long` | `5000` | Background flush cadence in ms. |
 | `maxQueueSize(...)` | `int` | `10000` | Ring-buffer capacity. Oldest events are overwritten when full. |
 | `maxRetries(...)` | `int` | `3` | Retry attempts per batch on 5xx / 408 / 429. |
@@ -94,6 +96,7 @@ Spring Boot properties (prefix `aforo`) — a subset of the above:
 | `aforo.enabled` | *(unset → off)* | Auto-config activates only when set to `true`. |
 | `aforo.api-key` | *(required)* | Aforo API key, sent as `X-API-Key`. |
 | `aforo.base-url` | `https://api.aforo.ai` | Ingestion host. |
+| `aforo.product-type` | `API` | Top-level `productType` on every event. |
 | `aforo.flush-count` | `50` | Events per immediate flush. |
 | `aforo.flush-interval-ms` | `5000` | Background flush cadence. |
 | `aforo.metric-name` | `api_calls` | Metric recorded per request by the filter. Must exist in your Aforo catalog. Declare an `AforoServletFilter.MetricNameResolver` bean for a per-request metric. |

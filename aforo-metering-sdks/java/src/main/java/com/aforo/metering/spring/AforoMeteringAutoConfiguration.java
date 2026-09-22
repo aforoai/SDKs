@@ -21,6 +21,7 @@ import org.springframework.context.annotation.Configuration;
  *   enabled: true
  *   api-key: ${AFORO_API_KEY}
  *   base-url: https://api.aforo.ai
+ *   product-type: API                 # default; e.g. AGENTIC_API
  *   metric-name: api_calls            # must exist in your Aforo catalog
  *   customer-id-header: X-Customer-Id
  *   use-principal-as-customer-id: false
@@ -43,6 +44,7 @@ public class AforoMeteringAutoConfiguration {
     public AforoClient aforoClient(AforoMeteringProperties props) {
         AforoOptions options = new AforoOptions(props.getApiKey());
         if (props.getBaseUrl() != null) options.baseUrl(props.getBaseUrl());
+        if (props.getProductType() != null) options.productType(props.getProductType());
         if (props.getFlushCount() > 0) options.flushCount(props.getFlushCount());
         if (props.getFlushIntervalMs() > 0) options.flushIntervalMs(props.getFlushIntervalMs());
         return new AforoClient(options);

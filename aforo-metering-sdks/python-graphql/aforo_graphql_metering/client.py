@@ -65,6 +65,74 @@ def _valid_customer_id(customer_id: Any) -> bool:
     return True
 
 
+DEFAULT_PRODUCT_TYPE = "GRAPHQL_API"
+MAX_RETRY_AFTER_SEC = 60.0
+
+
+def _normalize_product_type(product_type: Any, default: str) -> str:
+    """Trim + uppercase. Unknown values pass through; the ingestor is the authority."""
+    value = str(product_type).strip().upper() if product_type is not None else ""
+    return value or default
+
+
+def _post_json(url: str, body: Dict[str, Any], headers: Dict[str, str]) -> Tuple[int, Optional[str], bytes]:
+    """POST JSON; returns (status, Retry-After header, response body). Raises on network errors."""
+    if HAS_HTTPX:
+        with httpx.Client(timeout=10.0) as c:
+            r = c.post(url, json=body, headers=headers)
+            return r.status_code, r.headers.get("Retry-After"), r.content
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"),
+        headers=headers, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            return resp.status, _header(resp, "Retry-After"), _read(resp)
+    except urllib.error.HTTPError as e:
+        return e.code, _header(e, "Retry-After"), _read(e)
+
+
+def _header(resp: Any, name: str) -> Optional[str]:
+    try:
+        value = resp.headers.get(name)
+        return value if isinstance(value, str) else None
+    except Exception:
+        return None
+
+
+def _read(resp: Any) -> bytes:
+    try:
+        data = resp.read()
+        return data if isinstance(data, (bytes, bytearray)) else b""
+    except Exception:
+        return b""
+
+
+def _retry_after_seconds(value: str, default: float) -> float:
+    try:
+        return min(max(0.0, float(value)), MAX_RETRY_AFTER_SEC)
+    except (TypeError, ValueError):
+        return default
+
+
+def _error_messages(raw: bytes) -> List[str]:
+    """Pull errors[].message out of a batch response ({accepted, failed, errors:[{index, message}]})."""
+    try:
+        data = json.loads(raw.decode("utf-8")) if raw else None
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    out: List[str] = []
+    for err in data.get("errors") or []:
+        if isinstance(err, dict) and err.get("message"):
+            prefix = f"[{err['index']}] " if err.get("index") is not None else ""
+            out.append(prefix + str(err["message"]))
+    return out
+
+
 @dataclass
 class GraphQlUsageEvent:
     customerId: str
@@ -119,6 +187,7 @@ class AforoGraphQlBilling:
         on_error: Optional[Callable[[Exception], None]] = None,
         customer_id_extractor: Optional[Callable[[Any], Optional[str]]] = None,
         complexity_scorer: Optional[Callable[["DocumentNode", Optional[str]], Tuple[int, int]]] = None,
+        product_type: str = DEFAULT_PRODUCT_TYPE,
     ):
         if not all([tenant_id, product_id, api_key, ingestor_url]):
             raise ValueError("tenant_id, product_id, api_key and ingestor_url are required")
@@ -127,6 +196,8 @@ class AforoGraphQlBilling:
         self.product_id = product_id
         self.api_key = api_key
         self.ingestor_url = ingestor_url.rstrip("/")
+        # Top-level productType on every event; record(product_type=...) overrides per call.
+        self.product_type = _normalize_product_type(product_type, DEFAULT_PRODUCT_TYPE)
         self.schema_version = schema_version
         self.flush_interval_sec = flush_interval_sec
         self.flush_count = flush_count
@@ -163,6 +234,7 @@ class AforoGraphQlBilling:
         duration_ms: int,
         has_errors: bool,
         response_bytes: int = 0,
+        product_type: Optional[str] = None,
     ) -> None:
         if not _valid_customer_id(customer_id) or not HAS_GRAPHQL:
             return
@@ -184,7 +256,7 @@ class AforoGraphQlBilling:
             quantity=1,
             occurredAt=now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
             idempotencyKey=_cap_idempotency_key(f"gql:{self.tenant_id}:{self.product_id}:{op.name.value if op.name else 'anonymous'}:{int(now.timestamp() * 1000)}:{uuid.uuid4().hex[:8]}"),
-            productType="GRAPHQL_API",
+            productType=_normalize_product_type(product_type, self.product_type),
             gqlOperationType=op.operation.value.upper() if hasattr(op.operation, "value") else str(op.operation).upper(),
             gqlOperationName=op.name.value if op.name else "anonymous",
             gqlComplexity=complexity,
@@ -230,26 +302,35 @@ class AforoGraphQlBilling:
         url = f"{self.ingestor_url}/v1/ingest/batch"
 
         for attempt in range(3):
+            delay = float(2 ** attempt)
             try:
-                if HAS_HTTPX:
-                    with httpx.Client(timeout=10.0) as c:
-                        r = c.post(url, json=body, headers=headers)
-                        if 200 <= r.status_code < 300:
-                            return
-                else:
-                    import urllib.request
-                    req = urllib.request.Request(
-                        url, data=json.dumps(body).encode("utf-8"),
-                        headers=headers, method="POST",
-                    )
-                    with urllib.request.urlopen(req, timeout=10.0) as resp:
-                        if 200 <= resp.status < 300:
-                            return
+                status, retry_after, raw = _post_json(url, body, headers)
             except Exception as e:
                 if attempt == 2:
                     self.on_error(e)
                     return
-            time.sleep(2 ** attempt)
+                time.sleep(delay)
+                continue
+            if 200 <= status < 300:
+                # 202 can still carry per-event failures ({failed, errors:[{index, message}]}).
+                messages = _error_messages(raw)
+                if messages:
+                    self.on_error(RuntimeError(
+                        "GraphQL metering: ingestor rejected events: " + "; ".join(messages[:5])
+                    ))
+                return
+            if 400 <= status < 500 and status not in (408, 429):
+                # 400 invalid batch / 401 bad key / 422 unknown metric: retrying cannot help.
+                messages = _error_messages(raw)
+                self.on_error(RuntimeError(
+                    f"GraphQL metering flush rejected with HTTP {status}, not retrying "
+                    f"(dropped {len(batch)} events)" + (": " + "; ".join(messages[:5]) if messages else "")
+                ))
+                return
+            if status == 429 and retry_after:
+                delay = _retry_after_seconds(retry_after, delay)
+            if attempt < 2:
+                time.sleep(delay)
         self.on_error(RuntimeError(f"GraphQL metering flush failed after 3 attempts (dropped {len(batch)} events)"))
 
     def shutdown(self) -> None:

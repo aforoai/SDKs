@@ -114,7 +114,8 @@ billing.shutdown()   # flushes the final batch before process exit
 | `flush_interval_sec` | `float` | `2.0` | Background flush cadence. |
 | `flush_count` | `int` | `200` | Buffer size that forces a flush. |
 | `emit_deliver_events` | `bool` | `False` | Bill inbound `on_message` deliveries. |
-| `on_error` | `Callable?` | logs | Called on permanent batch failure. |
+| `on_error` | `Callable?` | logs | Called on permanent batch failure, and with the ingestor's `errors[].message` when it rejects events. |
+| `product_type` | `str` | `"MQTT_BROKER"` | Top-level `productType` sent on every event (trimmed and upper-cased; values the SDK does not know are passed through). Override per event with `push(..., product_type=...)` or `product_type=` on `wrap_paho_client` / `wrap_aiomqtt_client`. |
 
 Exports: `AforoMqttBilling`, `wrap_paho_client(billing, client, customer_id=...)`, `wrap_aiomqtt_client(billing, client, customer_id=..., client_id=...)`. Metric names: `mqtt_broker.<event_type>` (publish / subscribe / unsubscribe / connect / disconnect / deliver).
 

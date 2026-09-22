@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
+	"unicode/utf8"
 )
 
 var (
@@ -28,6 +30,9 @@ const DefaultMetricName = "api_calls"
 // CustomerIDFunc is not set.
 const DefaultCustomerIDHeader = "X-Customer-Id"
 
+// maxEndpointPathLen is the ingestor's limit for the top-level endpointPath field.
+const maxEndpointPathLen = 512
+
 // MiddlewareOptions configures the HTTP middleware.
 type MiddlewareOptions struct {
 	APIKey            string
@@ -51,6 +56,10 @@ type MiddlewareOptions struct {
 	// metered.
 	CustomerIDFunc func(r *http.Request) string
 
+	// ProductType is sent as the top-level productType on every event.
+	// Default: ClientOptions.ProductType, else DefaultProductType ("API").
+	ProductType string
+
 	ClientOptions *Options
 }
 
@@ -68,6 +77,9 @@ func HTTPMiddleware(next http.Handler, opts MiddlewareOptions) http.Handler {
 		if opts.BaseURL != "" {
 			clientOpts.BaseURL = opts.BaseURL
 		}
+	}
+	if opts.ProductType != "" {
+		clientOpts.ProductType = opts.ProductType
 	}
 	client := NewClient(clientOpts)
 
@@ -88,7 +100,9 @@ func HTTPMiddleware(next http.Handler, opts MiddlewareOptions) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Wrap response writer to capture status code
 		sw := &statusWriter{ResponseWriter: w, statusCode: 200}
+		start := time.Now()
 		next.ServeHTTP(sw, r)
+		elapsed := time.Since(start)
 
 		// After response — capture event
 		path := r.URL.Path
@@ -128,10 +142,15 @@ func HTTPMiddleware(next http.Handler, opts MiddlewareOptions) http.Handler {
 			}
 		}
 
+		// r.URL.Path never carries the query string.
 		_ = client.Track(TrackEvent{
-			CustomerID: customerID,
-			MetricName: metric,
-			Quantity:   1,
+			CustomerID:     customerID,
+			MetricName:     metric,
+			Quantity:       1,
+			EndpointPath:   truncateUTF8(normalizePath(path), maxEndpointPathLen),
+			HTTPMethod:     r.Method,
+			StatusCode:     sw.statusCode,
+			ResponseTimeMs: elapsed.Milliseconds(),
 		})
 	})
 }
@@ -169,6 +188,17 @@ func normalizePath(path string) string {
 		}
 	}
 	return strings.Join(segments, "/")
+}
+
+// truncateUTF8 cuts s to at most max bytes without splitting a rune.
+func truncateUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
 }
 
 // statusWriter wraps http.ResponseWriter to capture the status code.

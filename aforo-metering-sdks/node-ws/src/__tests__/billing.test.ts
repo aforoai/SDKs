@@ -312,3 +312,84 @@ describe('ingest batch contract', () => {
     expect(capturedRequests).toHaveLength(0);
   });
 });
+
+describe('productType', () => {
+  test('defaults to WEBSOCKET_API; client option is trimmed + uppercased; per-connection value wins', async () => {
+    const def = new AforoWsBilling({ ...config(), flushCount: 100 });
+    def.trackConnection(new FakeWs() as any, { customerId: 'cust_001' });
+    await def.shutdown();
+    expect(capturedRequests[0].body.events[0].productType).toBe('WEBSOCKET_API');
+
+    capturedRequests = [];
+    const b = new AforoWsBilling({ ...config(), flushCount: 100, productType: ' agentic_api ' });
+    b.trackConnection(new FakeWs() as any, { customerId: 'c_default' });
+    b.trackConnection(new FakeWs() as any, { customerId: 'c_custom', productType: ' custom_type ' });
+    b.trackConnection(new FakeWs() as any, { customerId: 'c_blank', productType: '  ' });
+    const wss = new EventEmitter();
+    b.wrapServer(wss as any, { extractCustomerId: () => 'c_server', productType: 'api' });
+    const ws = new FakeWs();
+    wss.emit('connection', ws, {});
+    ws.emit('close', 1000);
+    await b.shutdown();
+    const types = capturedRequests[0].body.events.map((e: any) => `${e.customerId}=${e.productType}`);
+    expect(types).toEqual([
+      'c_default=AGENTIC_API', 'c_custom=CUSTOM_TYPE', 'c_blank=AGENTIC_API', 'c_server=API', 'c_server=API',
+    ]);
+  });
+
+  test('idempotencyKey is capped at 255 chars', async () => {
+    const b = new AforoWsBilling({ ...config(), tenantId: 't'.repeat(400), flushCount: 100 });
+    b.trackConnection(new FakeWs() as any, { customerId: 'cust_001' });
+    await b.shutdown();
+    const key = capturedRequests[0].body.events[0].idempotencyKey;
+    expect(key.length).toBeLessThanOrEqual(255);
+    expect(key).toMatch(/:\d+:[a-z0-9]{8}$/);
+  });
+});
+
+describe('batch response handling', () => {
+  const resp = (status: number, body: any = {}, headers: Record<string, string> = {}) => ({
+    ok: status >= 200 && status < 300, status, statusText: String(status),
+    headers: { get: (k: string) => headers[k.toLowerCase()] ?? null },
+    json: async () => body,
+  } as unknown as Response);
+  const respondWith = (next: () => Response) => {
+    global.fetch = jest.fn(async (input: any, init: any = {}) => {
+      capturedRequests.push({ url: String(input), init, body: JSON.parse(init.body) });
+      return next();
+    }) as any;
+  };
+
+  test('4xx (not 408/429) is not retried and reports errors[].message', async () => {
+    const onError = jest.fn();
+    respondWith(() => resp(400, { errors: [{ index: 0, message: 'field is required' }] }));
+    await meterOnce(onError);
+    expect(capturedRequests).toHaveLength(1);
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError.mock.calls[0][0].message).toMatch(/HTTP 400.*field is required.*not retried/);
+  });
+
+  test('429 honours Retry-After and 408 is retried; same idempotencyKeys re-sent', async () => {
+    const onError = jest.fn();
+    const seq = [resp(429, {}, { 'retry-after': '0' }), resp(408, {}, { 'retry-after': '0' }), resp(202, { accepted: 1, failed: 0 })];
+    respondWith(() => seq.shift()!);
+    await meterOnce(onError);
+    expect(capturedRequests).toHaveLength(3);
+    expect(new Set(capturedRequests.map((r: any) => r.body.events[0].idempotencyKey)).size).toBe(1);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  test('202 with failed > 0 reports per-event errors[].message via onError', async () => {
+    const onError = jest.fn();
+    respondWith(() => resp(202, { accepted: 0, duplicates: 0, failed: 1, errors: [{ index: 0, message: 'bad event' }] }));
+    await meterOnce(onError);
+    expect(capturedRequests).toHaveLength(1);
+    expect(onError.mock.calls[0][0].message).toMatch(/rejected 1 event\(s\).*#0: bad event/);
+  });
+});
+
+async function meterOnce(onError: (e: Error) => void) {
+  const b = new AforoWsBilling({ ...config(), flushCount: 100, onError });
+  b.trackConnection(new FakeWs() as any, { customerId: 'cust_001' });
+  await b.shutdown();
+}

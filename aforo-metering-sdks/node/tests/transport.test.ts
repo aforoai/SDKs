@@ -25,6 +25,7 @@ describe('Transport', () => {
       quantity: 1,
       idempotencyKey: 'key_1',
       occurredAt: '2026-03-21T00:00:00Z',
+      productType: 'API',
     },
   ];
 
@@ -137,5 +138,27 @@ describe('Transport', () => {
     t.send(events);
 
     expect(mockFetch.mock.calls[0][0]).toBe('https://example.com/v1/ingest/batch');
+  });
+
+  describe('sendSingleBestEffort', () => {
+    it('posts exactly one event, once, with X-API-Key', async () => {
+      mockFetch.mockResolvedValueOnce({ ok: true, status: 202, headers: new Map() });
+      const ok = await transport.sendSingleBestEffort(events[0]);
+      expect(ok).toBe(true);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const [url, options] = mockFetch.mock.calls[0];
+      expect(url).toBe('https://api.aforo.ai/v1/ingest/batch');
+      expect(options.headers['X-API-Key']).toBe('test-key');
+      expect(options.headers['Authorization']).toBeUndefined();
+      expect(JSON.parse(options.body).events).toHaveLength(1);
+    });
+
+    it('does not retry and swallows failures', async () => {
+      mockFetch.mockResolvedValueOnce({ ok: false, status: 503, headers: new Map() });
+      expect(await transport.sendSingleBestEffort(events[0])).toBe(false);
+      mockFetch.mockRejectedValueOnce(new Error('network down'));
+      expect(await transport.sendSingleBestEffort(events[0])).toBe(false);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
   });
 });

@@ -110,7 +110,8 @@ billing.shutdown()   # flushes the final batch before process exit
 | `flush_interval_sec` | `float` | `3.0` | Background flush cadence. |
 | `flush_count` | `int` | `100` | Buffer size that forces a flush. |
 | `per_frame_events` | `bool` | `False` | One event per frame vs. open + close. |
-| `on_error` | `Callable?` | logs | Called on permanent batch failure. |
+| `on_error` | `Callable?` | logs | Called on permanent batch failure, and with the ingestor's `errors[].message` when it rejects events. |
+| `product_type` | `str` | `"WEBSOCKET_API"` | Top-level `productType` sent on every event (trimmed and upper-cased; values the SDK does not know are passed through). Override per event with a `productType` key in `push({...})` or `product_type=` on `track_websockets_connection` / `track_starlette_websocket`. |
 
 Exports: `AforoWsBilling`, `track_websockets_connection(billing, ws, customer_id)`, `track_starlette_websocket(billing, ws, customer_id)`, `WS_CLOSE_REASONS`. Each tracker helper returns an async context manager.
 

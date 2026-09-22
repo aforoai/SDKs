@@ -107,6 +107,7 @@ Runtime.getRuntime().addShutdownHook(new Thread(billing::close));
 | `apiKey` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
 | `ingestorUrl` | `String` | *(required)* | Host; SDK appends `/v1/ingest/batch`. |
 | `perFrameEvents` | `boolean` | `false` | `true` = one event per frame; `false` = OPEN + CLOSE only, aggregated. |
+| `productType` | `String` | `WEBSOCKET_API` | Top-level `productType` on every event; trimmed + uppercased. |
 | `flushCount` | `int` | `100` | Events per immediate flush. |
 | `flushIntervalMs` | `long` | `3000` | Background flush cadence (ms). |
 

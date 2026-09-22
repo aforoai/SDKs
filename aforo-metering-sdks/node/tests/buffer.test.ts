@@ -7,6 +7,7 @@ describe('RingBuffer', () => {
     quantity: 1,
     idempotencyKey: `key_${id}`,
     occurredAt: new Date().toISOString(),
+    productType: 'API',
   });
 
   it('should push and drain events', () => {

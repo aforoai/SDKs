@@ -50,10 +50,12 @@ export abstract class BaseProxy {
 
     this.heartbeat = new HeartbeatEmitter({
       intervalMs: config.aforo.heartbeatIntervalMs ?? 30_000,
-      buffer: this.buffer,
+      client,
       tenantId: config.aforo.tenantId,
       productId: config.aforo.productId,
       transport: config.transport,
+      customerId: config.aforo.customerId,
+      productType: config.aforo.productType,
     });
 
     this.sessionManager = new SessionManager(config.transport);
@@ -65,6 +67,8 @@ export abstract class BaseProxy {
       productId: config.aforo.productId,
       transport: config.transport,
       agentIdOverride: config.aforo.agentId,
+      customerId: config.aforo.customerId,
+      productType: config.aforo.productType,
     });
 
     this.quota = new QuotaGuard({
@@ -147,13 +151,14 @@ export abstract class BaseProxy {
     logger.info('Shutting down', { signal });
 
     try {
-      await this.heartbeat.stopSession();
+      // Stops heartbeats; the final SESSION_END is sent best-effort alongside the flush.
+      const sessionEnd = this.heartbeat.stopSession();
       this.tracker.shutdown();
       await this.cleanup();
 
-      // Final flush with timeout
+      // Final flush (and SESSION_END) with timeout
       await Promise.race([
-        this.buffer.shutdown(),
+        Promise.all([this.buffer.shutdown(), sessionEnd]),
         new Promise(resolve => setTimeout(resolve, SHUTDOWN_TIMEOUT_MS)),
       ]);
 

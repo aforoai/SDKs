@@ -12,6 +12,16 @@ export interface AforoConfig {
   apiKey: string;
   ingestorUrl: string;
   agentId?: string;
+  /**
+   * Customer billed for tool calls that carry no `_meta.customer_id` (else the
+   * call's agentId is billed). Also the customer of session heartbeats.
+   */
+  customerId?: string;
+  /**
+   * Top-level `productType` on every event (required by the ingestor).
+   * Default `MCP_SERVER`; trimmed and uppercased, unknown values pass through.
+   */
+  productType?: string;
   quotaEnforcement?: boolean;
   flushIntervalMs?: number;
   flushCount?: number;
@@ -71,11 +81,11 @@ export interface ProxyUsageEvent {
   quantity: number;
   occurredAt: string;
   idempotencyKey: string;
-  productType: 'MCP_SERVER';
+  productType: string;
   toolName?: string;
-  agentId: string;
+  agentId?: string;
   sessionId?: string;
-  sessionBoundary?: 'HEARTBEAT' | 'SESSION_START' | 'SESSION_END';
+  sessionBoundary?: 'HEARTBEAT' | 'SESSION_END';
   executionStatus: 'SUCCESS' | 'ERROR';
   executionDurationMs?: number;
   metadata?: Record<string, unknown>;
@@ -85,7 +95,7 @@ export interface BatchIngestResponse {
   accepted: number;
   duplicates: number;
   failed: number;
-  errors?: Array<{ index: number; error: string }>;
+  errors?: Array<{ index: number; message: string }>;
   killedSessionIds?: string[];
 }
 
@@ -107,6 +117,7 @@ export interface QuotaCheckResponse {
 export interface InFlightCall {
   toolName: string;
   agentId: string;
+  customerId: string;
   startTime: number;
   requestId: string | number;
 }

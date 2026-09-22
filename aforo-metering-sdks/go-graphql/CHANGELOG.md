@@ -11,6 +11,8 @@ All notable changes to `graphql-metering-go` are documented here. This project f
 - Each flush is split into requests of at most 1000 events (the ingestor's batch limit). Retries resend the same body, so `idempotencyKey`s are stable across attempts.
 - Events whose `customerId` exceeds 64 characters are dropped and reported via `OnError` instead of being rejected by the ingestor.
 - `gqlOperationName` is truncated to 255 characters and `idempotencyKey` is capped at 255 characters (ingestor limits).
+- `productType` is now configurable: new `Config.ProductType` (default `"GRAPHQL_API"`, previously hard-coded) and a per-event `EventOptions{ProductType}` override (`Record`). Values are trimmed and upper-cased; unknown values are passed through.
+- Delivery follows the ingestor contract: a non-retryable `4xx` (anything but `408`/`429`) is reported via `OnError` and no longer retried; `429` honours `Retry-After` (capped at 60s); the ingestor's `errors[].message` is included in `OnError` messages, and a `2xx` with `failed > 0` is reported too. Blank (whitespace-only) customer ids are skipped like empty ones.
 
 ## [1.0.0] — 2026-06-29
 

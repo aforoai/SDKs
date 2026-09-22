@@ -65,9 +65,12 @@ public final class AforoGraphQlBilling implements AutoCloseable {
     static final int MAX_EVENTS_PER_REQUEST = 1000;
     private static final int MAX_CUSTOMER_ID = 64;
     private static final int MAX_IDEMPOTENCY_KEY = 255;
+    /** Default top-level {@code productType}; override with {@link Builder#productType(String)}. */
+    public static final String DEFAULT_PRODUCT_TYPE = "GRAPHQL_API";
 
     private final String tenantId, productId, apiKey, schemaVersion;
     private final URI ingestorUri;
+    private final String productType;
     private final int flushCount;
     private final long flushIntervalMs;
     private final Function<InstrumentationExecutionParameters, String> customerIdExtractor;
@@ -88,6 +91,7 @@ public final class AforoGraphQlBilling implements AutoCloseable {
         this.apiKey = require(b.apiKey, "apiKey");
         this.schemaVersion = b.schemaVersion;
         this.ingestorUri = URI.create(stripTrailingSlash(require(b.ingestorUrl, "ingestorUrl")) + "/v1/ingest/batch");
+        this.productType = normalizeProductType(b.productType, DEFAULT_PRODUCT_TYPE);
         this.flushCount = b.flushCount;
         this.flushIntervalMs = b.flushIntervalMs;
         this.customerIdExtractor = b.customerIdExtractor != null ? b.customerIdExtractor : DEFAULT_CUSTOMER_EXTRACTOR;
@@ -126,6 +130,15 @@ public final class AforoGraphQlBilling implements AutoCloseable {
 
     /** Record one operation manually. Public for non-graphql-java integrations. */
     public void record(String customerId, String query, String operationName, long durationMs, boolean hasErrors) {
+        record(customerId, query, operationName, durationMs, hasErrors, null);
+    }
+
+    /**
+     * Record one operation with a per-call {@code productType} override
+     * ({@code null}/blank → the client-level {@link Builder#productType(String)}).
+     */
+    public void record(String customerId, String query, String operationName, long durationMs, boolean hasErrors,
+                       String productTypeOverride) {
         if (!validCustomerId(customerId) || query == null || query.isBlank()) return;
         try {
             Document doc = Parser.parse(query);
@@ -162,7 +175,7 @@ public final class AforoGraphQlBilling implements AutoCloseable {
             event.put("quantity", 1);
             event.put("occurredAt", now.toString());
             event.put("idempotencyKey", idempotencyKey("gql:" + tenantId + ":" + productId + ":" + opName, now));
-            event.put("productType", "GRAPHQL_API");
+            event.put("productType", normalizeProductType(productTypeOverride, productType));
             event.put("gqlOperationType", opType);
             event.put("gqlOperationName", opName);
             event.put("gqlComplexity", complexity);
@@ -232,15 +245,57 @@ public final class AforoGraphQlBilling implements AutoCloseable {
                 .build();
 
         for (int attempt = 1; attempt <= 3; attempt++) {
+            long delayMs = (long) Math.pow(2, attempt - 1) * 1000;
             try {
                 HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-                if (resp.statusCode() >= 200 && resp.statusCode() < 300) return;
+                int status = resp.statusCode();
+                if (status >= 200 && status < 300) {
+                    String rejected = errorMessages(resp.body());
+                    if (!rejected.isEmpty()) LOG.warning("[aforo-graphql] ingestor rejected events:" + rejected);
+                    return;
+                }
+                // 4xx other than 408/429 (bad key, invalid event, unknown metric) cannot succeed on retry.
+                if (status >= 400 && status < 500 && status != 408 && status != 429) {
+                    LOG.warning("[aforo-graphql] ingestor returned " + status + " — not retrying, dropped "
+                            + events.size() + " events" + errorMessages(resp.body()));
+                    return;
+                }
+                if (status == 429) delayMs = retryAfterMs(resp, delayMs);
             } catch (Exception e) {
                 if (attempt == 3) throw e;
             }
-            Thread.sleep((long) Math.pow(2, attempt - 1) * 1000);
+            if (attempt < 3) Thread.sleep(delayMs);
         }
         LOG.warning("[aforo-graphql] flush exhausted retries — dropped " + events.size() + " events");
+    }
+
+    /** {@code errors[].message} from an ingestor batch response, formatted for a log line; "" if none. */
+    private String errorMessages(String body) {
+        if (body == null || body.isBlank()) return "";
+        try {
+            com.fasterxml.jackson.databind.JsonNode errors = mapper.readTree(body).path("errors");
+            if (!errors.isArray() || errors.isEmpty()) return "";
+            StringBuilder sb = new StringBuilder();
+            for (com.fasterxml.jackson.databind.JsonNode err : errors) {
+                sb.append(" [");
+                if (err.has("index")) sb.append(err.get("index").asText()).append(": ");
+                sb.append(err.path("message").asText("")).append(']');
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /** Honours a delta-seconds {@code Retry-After} header on 429; otherwise keeps {@code fallbackMs}. */
+    private static long retryAfterMs(HttpResponse<String> resp, long fallbackMs) {
+        String retryAfter = resp.headers().firstValue("Retry-After").orElse(null);
+        if (retryAfter == null) return fallbackMs;
+        try {
+            return Math.max(0, Long.parseLong(retryAfter.trim())) * 1000;
+        } catch (NumberFormatException e) {
+            return fallbackMs;
+        }
     }
 
     @Override
@@ -283,6 +338,11 @@ public final class AforoGraphQlBilling implements AutoCloseable {
         return s == null || s.length() <= max ? s : s.substring(0, max);
     }
 
+    /** Trim + uppercase; {@code fallback} for null/blank. Unknown values pass through. */
+    private static String normalizeProductType(String s, String fallback) {
+        return s == null || s.isBlank() ? fallback : s.trim().toUpperCase(java.util.Locale.ROOT);
+    }
+
     private static String require(String s, String name) {
         if (s == null || s.isBlank()) throw new IllegalArgumentException(name + " is required");
         return s;
@@ -292,9 +352,13 @@ public final class AforoGraphQlBilling implements AutoCloseable {
         return s.endsWith("/") ? s.substring(0, s.length() - 1) : s;
     }
 
+    /** The client-level {@code productType} stamped on events without a per-call override. */
+    public String getProductType() { return productType; }
+
     public static Builder newBuilder() { return new Builder(); }
 
     public static final class Builder {
+        private String productType;
         private String tenantId, productId, apiKey, ingestorUrl, schemaVersion;
         private int flushCount = 50;
         private long flushIntervalMs = 5_000L;
@@ -303,6 +367,11 @@ public final class AforoGraphQlBilling implements AutoCloseable {
         public Builder tenantId(String s) { this.tenantId = s; return this; }
         public Builder productId(String s) { this.productId = s; return this; }
         public Builder apiKey(String s) { this.apiKey = s; return this; }
+        /**
+         * Top-level {@code productType} on every event (default {@code GRAPHQL_API}).
+         * Trimmed and uppercased; unknown values are passed through.
+         */
+        public Builder productType(String s) { this.productType = s; return this; }
         public Builder ingestorUrl(String s) { this.ingestorUrl = s; return this; }
         public Builder schemaVersion(String s) { this.schemaVersion = s; return this; }
         public Builder flushCount(int n) { this.flushCount = n; return this; }

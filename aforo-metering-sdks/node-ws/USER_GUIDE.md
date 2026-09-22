@@ -115,7 +115,7 @@ process.on('SIGINT',  async () => { await billing.shutdown(); process.exit(0); }
 
 > ⚠ Without `shutdown()`, a process that exits inside the 3-second window drops the buffered batch.
 
-The batch is POSTed to `https://api.aforo.ai/v1/ingest/batch` with `X-API-Key: <your api key>` and `X-Tenant-Id: tenant_acme`. Confirm in the Aforo console under the product's usage events (filter `productType = WEBSOCKET_API`). On 3 consecutive failures (1s/2s/4s backoff) the batch is dropped and `onError` fires — log it:
+The batch is POSTed to `https://api.aforo.ai/v1/ingest/batch` with `X-API-Key: <your api key>` and `X-Tenant-Id: tenant_acme`. Confirm in the Aforo console under the product's usage events (filter `productType = WEBSOCKET_API`). Network errors, 408, 429 (honouring `Retry-After`) and 5xx are retried 3× (1s/2s/4s backoff); any other 4xx is not retried. When a batch is dropped, or a 202 reports per-event failures (`errors[].message`), `onError` fires — log it:
 
 ```ts
 new AforoWsBilling({ /* … */, onError: (err) => myLogger.error('aforo ws flush failed', err) });
@@ -129,6 +129,7 @@ new AforoWsBilling({ /* … */, onError: (err) => myLogger.error('aforo ws flush
 | `productId` | `string` | — (required) | Aforo product id; into `metadata.productId`. |
 | `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. |
 | `ingestorUrl` | `string` | — (required) | Base URL; SDK appends `/v1/ingest/batch`. |
+| `productType` | `string` | `'WEBSOCKET_API'` | Top-level `productType` on every event (trimmed + uppercased; unknown values pass through). Override via `wrapServer(wss, { productType })` or `trackConnection(ws, { customerId, productType })`. |
 | `perFrameEvents` | `boolean` | `false` | One event per frame vs. aggregate-on-close only. |
 | `flushCount` | `number` | `100` | Buffered events that trigger an immediate flush. |
 | `flushIntervalMs` | `number` | `3000` | Max ms before a partial batch is flushed. |

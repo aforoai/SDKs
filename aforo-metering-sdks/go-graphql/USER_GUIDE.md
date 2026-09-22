@@ -128,7 +128,7 @@ Content-Type: application/json
 {"events":[{"customerId":"…","metricName":"graphql_api.operations","quantity":1,"occurredAt":"…","idempotencyKey":"gql:…","productType":"GRAPHQL_API","gqlOperationType":"QUERY","gqlOperationName":"…","gqlComplexity":12,"gqlFieldCount":7,"gqlHasErrors":false,"executionDurationMs":3,"metadata":{"sdkVersion":"1.0.0","productId":"prod_graphql_unified_gateway"}}]}
 ```
 
-> ⚠ Flush failures are silent unless you set `OnError`. If nothing lands, set `OnError: func(err error){ log.Println("aforo:", err) }` to surface marshal failures and retry-exhausted drops.
+> ⚠ Flush failures are silent unless you set `OnError`. If nothing lands, set `OnError: func(err error){ log.Println("aforo:", err) }` to surface marshal failures, retry-exhausted drops and ingestor rejections (including `errors[].message`).
 
 ## Configuration reference
 
@@ -139,11 +139,12 @@ Content-Type: application/json
 | `APIKey` | `string` | — (required) | `X-API-Key: <APIKey>`. |
 | `IngestorURL` | `string` | — (required) | Base; `/v1/ingest/batch` is appended. |
 | `SchemaVersion` | `string` | none | Added to metadata as `schemaVersion` when set. |
+| `ProductType` | `string` | `GRAPHQL_API` | Top-level `productType` on every event; per-event override via `EventOptions`. |
 | `FlushCount` | `int` | `50` | Buffer-size flush threshold. |
 | `FlushInterval` | `time.Duration` | `5s` | Background flush cadence. |
 | `HTTPClient` | `*http.Client` | `&http.Client{Timeout: 10s}` | HTTP client override. |
 | `CustomerExtractor` | `func(*http.Request) string` | reads `X-Customer-Id` | Per-request customer-id resolver. |
-| `OnError` | `func(error)` | no-op | Marshal failures + retry-exhausted drops. |
+| `OnError` | `func(error)` | no-op | Marshal failures, retry-exhausted drops, non-retryable `4xx` rejections, and partial failures (with the ingestor's `errors[].message`). |
 
 ## Troubleshooting
 

@@ -77,6 +77,7 @@ What the middleware does, after the response is written:
 - Skips the request if the path matches an `ExcludePaths` prefix (defaults: `/health`, `/ready`, `/metrics`, `/favicon.ico`) or the status matches `ExcludeStatusCode`.
 - Skips the request if no customer id resolved.
 - Records the metric from `MetricNameFunc` if set and non-empty, otherwise `MetricName` (default `"api_calls"`).
+- Also sends top-level `productType` (`MiddlewareOptions.ProductType`, default `API`), `endpointPath` (the normalized path without query string, capped at 512 chars), `httpMethod`, `statusCode` and `responseTimeMs`.
 
 > ⚠ The metric must exist in your tenant's Aforo catalog: the ingestor rejects an unknown metric, and because it validates a batch as a whole, one rejected event fails every event in that batch. Earlier versions recorded `"<METHOD> <normalized-path>"`, which no catalog contains.
 
@@ -94,9 +95,10 @@ When metering isn't one-per-request — a background job, a batch operation, a n
 
 ```go
 client.Track(metering.TrackEvent{
-	CustomerID: "cust_acme_001",
-	MetricName: "report_generated",
-	Quantity:   1,
+	CustomerID:  "cust_acme_001",
+	MetricName:  "report_generated",
+	Quantity:    1,
+	ProductType: "API", // optional per-event override of Options.ProductType
 	Metadata: map[string]any{
 		"format": "pdf",
 	},
@@ -106,6 +108,10 @@ client.Track(metering.TrackEvent{
 Field defaults applied inside `Track`:
 
 - `Quantity` of `0` becomes `1`.
+- `ProductType` (top-level `productType`) is the event's value if set, else `Options.ProductType`, else `API`; trimmed and upper-cased, unknown values passed through.
+- `OccurredAt`, when set, must be RFC 3339 and is normalized to UTC.
+
+`Track` returns an error wrapping `metering.ErrInvalidEvent` (and buffers nothing) for a blank `CustomerID` / `MetricName`, a negative / NaN / Inf `Quantity`, or an unparseable `OccurredAt` — the ingestor would otherwise reject the whole batch the event lands in.
 - `OccurredAt` is set to now (`RFC3339Nano`, UTC) if empty.
 - `IdempotencyKey` is auto-derived (SHA-256 of `customerID:metricName:quantity:occurredAt`, first 32 hex chars) if empty.
 
@@ -145,7 +151,8 @@ Content-Type: application/json
 |---|---|---|---|
 | `APIKey` | `string` | — (required) | `X-API-Key: <APIKey>`. |
 | `BaseURL` | `string` | `https://api.aforo.ai` | Ingestor base; `/v1/ingest/batch` is appended. |
-| `FlushCount` | `int` | `50` | Flush threshold + per-batch drain size. |
+| `ProductType` | `string` | `API` | Top-level `productType` on every event; `TrackEvent.ProductType` overrides per event. |
+| `FlushCount` | `int` | `50` | Flush threshold + per-batch drain size (clamped to 1000). |
 | `FlushInterval` | `time.Duration` | `5s` | Background flush cadence. |
 | `MaxQueueSize` | `int` | `10000` | Ring-buffer capacity; oldest event dropped when full. |
 | `MaxRetries` | `int` | `3` | Retry attempts per batch. |
@@ -165,6 +172,7 @@ Content-Type: application/json
 | `MetricNameFunc` | `func(*http.Request) string` | nil | Per-request metric; wins over `MetricName`. An empty result falls back to `MetricName`. |
 | `CustomerIDHeader` | `string` | `X-Customer-Id` | Header carrying the Aforo customer id. The caller's `X-Api-Key` is never read. |
 | `CustomerIDFunc` | `func(*http.Request) string` | nil | Per-request customer id; wins over `CustomerIDHeader`. Empty result → request not metered. |
+| `ProductType` | `string` | `ClientOptions.ProductType`, else `API` | Top-level `productType` on every metered request. |
 | `ClientOptions` | `*Options` | nil | Full client tuning; `APIKey`/`BaseURL` above override it. |
 
 ## Troubleshooting

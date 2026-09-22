@@ -122,7 +122,8 @@ billing.shutdown()   # stops the flush thread and drains remaining events
 | `schema_version` | `str?` | `None` | Stamped on each event. |
 | `flush_interval_sec` | `float` | `5.0` | Background flush cadence. |
 | `flush_count` | `int` | `50` | Buffer size that forces a flush. |
-| `on_error` | `Callable?` | logs | Called on permanent batch failure. |
+| `on_error` | `Callable?` | logs | Called on permanent batch failure, and with the ingestor's `errors[].message` when it rejects events. |
+| `product_type` | `str` | `"GRAPHQL_API"` | Top-level `productType` sent on every event (trimmed and upper-cased; values the SDK does not know are passed through). Override per event with `record(..., product_type=...)`. |
 | `customer_id_extractor` | `Callable?` | reads `x-customer-id` | Resolve the billed customer. |
 | `complexity_scorer` | `Callable?` | `field_count + 5 × max_depth` | Returns `(complexity, field_count)`. |
 

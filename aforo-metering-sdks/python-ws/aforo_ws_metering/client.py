@@ -22,7 +22,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     import httpx  # type: ignore
@@ -55,6 +55,74 @@ def _valid_customer_id(customer_id: Any) -> bool:
         logger.warning("dropping usage event: customerId longer than %d chars", MAX_CUSTOMER_ID_LEN)
         return False
     return True
+
+
+DEFAULT_PRODUCT_TYPE = "WEBSOCKET_API"
+MAX_RETRY_AFTER_SEC = 60.0
+
+
+def _normalize_product_type(product_type: Any, default: str) -> str:
+    """Trim + uppercase. Unknown values pass through; the ingestor is the authority."""
+    value = str(product_type).strip().upper() if product_type is not None else ""
+    return value or default
+
+
+def _post_json(url: str, body: Dict[str, Any], headers: Dict[str, str]) -> Tuple[int, Optional[str], bytes]:
+    """POST JSON; returns (status, Retry-After header, response body). Raises on network errors."""
+    if HAS_HTTPX:
+        with httpx.Client(timeout=10.0) as c:
+            r = c.post(url, json=body, headers=headers)
+            return r.status_code, r.headers.get("Retry-After"), r.content
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"),
+        headers=headers, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            return resp.status, _header(resp, "Retry-After"), _read(resp)
+    except urllib.error.HTTPError as e:
+        return e.code, _header(e, "Retry-After"), _read(e)
+
+
+def _header(resp: Any, name: str) -> Optional[str]:
+    try:
+        value = resp.headers.get(name)
+        return value if isinstance(value, str) else None
+    except Exception:
+        return None
+
+
+def _read(resp: Any) -> bytes:
+    try:
+        data = resp.read()
+        return data if isinstance(data, (bytes, bytearray)) else b""
+    except Exception:
+        return b""
+
+
+def _retry_after_seconds(value: str, default: float) -> float:
+    try:
+        return min(max(0.0, float(value)), MAX_RETRY_AFTER_SEC)
+    except (TypeError, ValueError):
+        return default
+
+
+def _error_messages(raw: bytes) -> List[str]:
+    """Pull errors[].message out of a batch response ({accepted, failed, errors:[{index, message}]})."""
+    try:
+        data = json.loads(raw.decode("utf-8")) if raw else None
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    out: List[str] = []
+    for err in data.get("errors") or []:
+        if isinstance(err, dict) and err.get("message"):
+            prefix = f"[{err['index']}] " if err.get("index") is not None else ""
+            out.append(prefix + str(err["message"]))
+    return out
 
 
 WS_CLOSE_REASONS: Dict[int, str] = {
@@ -104,6 +172,7 @@ class AforoWsBilling:
         flush_count: int = 100,
         per_frame_events: bool = False,
         on_error: Optional[Callable[[Exception], None]] = None,
+        product_type: str = DEFAULT_PRODUCT_TYPE,
     ):
         if not all([tenant_id, product_id, api_key, ingestor_url]):
             raise ValueError("tenant_id, product_id, api_key and ingestor_url are required")
@@ -115,6 +184,8 @@ class AforoWsBilling:
         self.flush_interval_sec = flush_interval_sec
         self.flush_count = flush_count
         self.per_frame_events = per_frame_events
+        # Top-level productType on every event; a "productType" key in push() overrides it.
+        self.product_type = _normalize_product_type(product_type, DEFAULT_PRODUCT_TYPE)
         self.on_error = on_error or (lambda e: logger.error(f"[aforo-ws] {e}"))
 
         self._buffer: List[Dict[str, Any]] = []
@@ -139,6 +210,9 @@ class AforoWsBilling:
             pass
 
     def push(self, partial: Dict[str, Any]) -> None:
+        """Buffer one event. ``partial`` uses wire (camelCase) keys; ``customerId`` and
+        ``wsConnectionId`` are required and ``productType`` optionally overrides the
+        client default."""
         if not _valid_customer_id(partial.get("customerId")) or not partial.get("wsConnectionId"):
             return
         now = datetime.now(timezone.utc)
@@ -157,7 +231,7 @@ class AforoWsBilling:
             quantity=1,
             occurredAt=now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
             idempotencyKey=_cap_idempotency_key(f"ws:{self.tenant_id}:{partial['wsConnectionId']}:{frame_type}:{int(now.timestamp() * 1000)}:{uuid.uuid4().hex[:8]}"),
-            productType="WEBSOCKET_API",
+            productType=_normalize_product_type(partial.get("productType"), self.product_type),
             wsConnectionId=partial["wsConnectionId"],
             wsDirection=direction,
             wsFrameType=frame_type,
@@ -203,26 +277,35 @@ class AforoWsBilling:
         url = f"{self.ingestor_url}/v1/ingest/batch"
 
         for attempt in range(3):
+            delay = float(2 ** attempt)
             try:
-                if HAS_HTTPX:
-                    with httpx.Client(timeout=10.0) as c:
-                        r = c.post(url, json=body, headers=headers)
-                        if 200 <= r.status_code < 300:
-                            return
-                else:
-                    import urllib.request
-                    req = urllib.request.Request(
-                        url, data=json.dumps(body).encode("utf-8"),
-                        headers=headers, method="POST",
-                    )
-                    with urllib.request.urlopen(req, timeout=10.0) as resp:
-                        if 200 <= resp.status < 300:
-                            return
+                status, retry_after, raw = _post_json(url, body, headers)
             except Exception as e:
                 if attempt == 2:
                     self.on_error(e)
                     return
-            time.sleep(2 ** attempt)
+                time.sleep(delay)
+                continue
+            if 200 <= status < 300:
+                # 202 can still carry per-event failures ({failed, errors:[{index, message}]}).
+                messages = _error_messages(raw)
+                if messages:
+                    self.on_error(RuntimeError(
+                        "WebSocket metering: ingestor rejected events: " + "; ".join(messages[:5])
+                    ))
+                return
+            if 400 <= status < 500 and status not in (408, 429):
+                # 400 invalid batch / 401 bad key / 422 unknown metric: retrying cannot help.
+                messages = _error_messages(raw)
+                self.on_error(RuntimeError(
+                    f"WebSocket metering flush rejected with HTTP {status}, not retrying "
+                    f"(dropped {len(batch)} events)" + (": " + "; ".join(messages[:5]) if messages else "")
+                ))
+                return
+            if status == 429 and retry_after:
+                delay = _retry_after_seconds(retry_after, delay)
+            if attempt < 2:
+                time.sleep(delay)
         self.on_error(RuntimeError(f"WebSocket metering flush failed after 3 attempts (dropped {len(batch)} events)"))
 
     def shutdown(self) -> None:
@@ -240,6 +323,7 @@ async def track_websockets_connection(
     customer_id: str,
     *,
     metadata: Optional[Dict[str, Any]] = None,
+    product_type: Optional[str] = None,
 ) -> Any:
     """
     Async context helper for the `websockets` library (and similar).
@@ -270,6 +354,7 @@ async def track_websockets_connection(
                     if billing.per_frame_events:
                         billing.push({
                             "customerId": customer_id,
+                            "productType": product_type,
                             "wsConnectionId": self.connection_id,
                             "wsDirection": "SERVER_TO_CLIENT",
                             "wsFrameType": "BINARY" if isinstance(data, (bytes, bytearray)) else "TEXT",
@@ -289,6 +374,7 @@ async def track_websockets_connection(
                     if billing.per_frame_events:
                         billing.push({
                             "customerId": customer_id,
+                            "productType": product_type,
                             "wsConnectionId": self.connection_id,
                             "wsDirection": "CLIENT_TO_SERVER",
                             "wsFrameType": "BINARY" if isinstance(data, (bytes, bytearray)) else "TEXT",
@@ -303,6 +389,7 @@ async def track_websockets_connection(
         async def __aenter__(self):
             billing.push({
                 "customerId": customer_id,
+                "productType": product_type,
                 "wsConnectionId": self.connection_id,
                 "wsDirection": "SERVER_TO_CLIENT",
                 "wsFrameType": "PING",
@@ -323,6 +410,7 @@ async def track_websockets_connection(
 
             billing.push({
                 "customerId": customer_id,
+                "productType": product_type,
                 "wsConnectionId": self.connection_id,
                 "wsDirection": "SERVER_TO_CLIENT",
                 "wsFrameType": "CLOSE",
@@ -349,6 +437,7 @@ async def track_starlette_websocket(
     customer_id: str,
     *,
     metadata: Optional[Dict[str, Any]] = None,
+    product_type: Optional[str] = None,
 ):
     """
     Async context helper for FastAPI / Starlette WebSocket routes.
@@ -383,6 +472,7 @@ async def track_starlette_websocket(
             if billing.per_frame_events:
                 billing.push({
                     "customerId": customer_id,
+                    "productType": product_type,
                     "wsConnectionId": connection_id,
                     "wsDirection": _direction,
                     "wsFrameType": "BINARY" if _attr == "send_bytes" else "TEXT",
@@ -410,6 +500,7 @@ async def track_starlette_websocket(
             if billing.per_frame_events:
                 billing.push({
                     "customerId": customer_id,
+                    "productType": product_type,
                     "wsConnectionId": connection_id,
                     "wsDirection": _direction,
                     "wsFrameType": _frame,
@@ -426,6 +517,7 @@ async def track_starlette_websocket(
         async def __aenter__(self):
             billing.push({
                 "customerId": customer_id,
+                "productType": product_type,
                 "wsConnectionId": connection_id,
                 "wsDirection": "SERVER_TO_CLIENT",
                 "wsFrameType": "PING",
@@ -437,6 +529,7 @@ async def track_starlette_websocket(
             close_reason = "NORMAL_CLOSURE" if exc is None else "INTERNAL_ERROR"
             billing.push({
                 "customerId": customer_id,
+                "productType": product_type,
                 "wsConnectionId": connection_id,
                 "wsDirection": "SERVER_TO_CLIENT",
                 "wsFrameType": "CLOSE",

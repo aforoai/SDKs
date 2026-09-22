@@ -257,4 +257,48 @@ describe('expressMiddleware', () => {
     await new Promise((r) => setTimeout(r, 50));
     expect(mockFetch).not.toHaveBeenCalled();
   });
+
+  it('sends productType and top-level HTTP fields', async () => {
+    const mw = expressMiddleware({
+      apiKey: 'test-key',
+      productType: 'agentic_api',
+      clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
+    });
+    const { req, res } = createMockReqRes({ method: 'POST', url: '/api/items?page=2', statusCode: 201, user: { id: 'cust_1' } });
+    mw(req, res, jest.fn());
+    res.emit('finish');
+    await new Promise((r) => setTimeout(r, 100));
+
+    const ev = JSON.parse(mockFetch.mock.calls[0][1].body).events[0];
+    expect(ev).toMatchObject({ productType: 'AGENTIC_API', endpointPath: '/api/items', httpMethod: 'POST', statusCode: 201 });
+    expect(typeof ev.responseTimeMs).toBe('number');
+  });
+
+  it('defaults productType to API and caps endpointPath at 512 chars', async () => {
+    const mw = expressMiddleware({
+      apiKey: 'test-key',
+      clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
+    });
+    const { req, res } = createMockReqRes({ url: '/' + 'a'.repeat(600), user: { id: 'cust_1' } });
+    mw(req, res, jest.fn());
+    res.emit('finish');
+    await new Promise((r) => setTimeout(r, 100));
+
+    const ev = JSON.parse(mockFetch.mock.calls[0][1].body).events[0];
+    expect(ev.productType).toBe('API');
+    expect(ev.endpointPath).toHaveLength(512);
+  });
+
+  it('skips requests whose quantity is <= 0', async () => {
+    const mw = expressMiddleware({
+      apiKey: 'test-key',
+      quantity: 0,
+      clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
+    });
+    const { req, res } = createMockReqRes({ user: { id: 'cust_1' } });
+    mw(req, res, jest.fn());
+    res.emit('finish');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
 });

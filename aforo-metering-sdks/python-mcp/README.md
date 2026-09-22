@@ -41,6 +41,7 @@ billing = AforoMcpBilling(
     product_id="prod_mcp_001",
     api_key=os.environ["AFORO_API_KEY"],
     ingestor_url="https://api.aforo.ai",
+    product_type="MCP_SERVER",  # default; sent as productType on every event
 )
 
 @server.call_tool()
@@ -72,11 +73,14 @@ Constructor arguments for `AforoMcpBilling(...)`:
 | `flush_interval_sec` | `float` | `5.0` | Background flush cadence (seconds). Requires `await start()`. |
 | `flush_count` | `int` | `50` | Buffer size that triggers an immediate async flush. |
 | `on_error` | `Callable[[Exception], None]?` | logs the error | Invoked when a batch fails permanently. |
-| `heartbeat_interval_sec` | `float` | `30.0` | Deprecated, ignored — heartbeats are no longer sent. |
-| `heartbeat_enabled` | `bool` | `True` | Deprecated, ignored — heartbeats are no longer sent. |
+| `heartbeat_interval_sec` | `float` | `30.0` | Seconds between session heartbeats. |
+| `heartbeat_enabled` | `bool` | `True` | Turn periodic session heartbeats off. |
 | `on_session_killed` | `Callable[[str, str], None]?` | `None` | Called when the ingestor returns this session in `killedSessionIds`. |
+| `product_type` | `str` | `"MCP_SERVER"` | Top-level `productType` on every event (trimmed + upper-cased; unknown values passed through). Override per call with a `product_type` handler kwarg or `record_tool_invocation(..., product_type=...)`. |
 
-Retry is fixed at **3 attempts** with `1s / 2s / 4s` backoff; any 4xx is non-retryable and the batch is dropped via `on_error`.
+Retry is fixed at **3 attempts** with `1s / 2s / 4s` backoff; 429 honours `Retry-After`; any other 4xx except 408 is non-retryable and the batch is dropped via `on_error` (with the ingestor's `errors[].message`). An invocation the ingestor would reject (blank tool name, `customerId` over 64 chars) is dropped via `on_error` instead of failing its batch; `toolName` is capped at 64 chars and `agentId` at 36.
+
+Session heartbeats (`start_session`, or automatically on the first tool call carrying `session_id`) are `system.session.heartbeat` events with `quantity: 1` and top-level `sessionId`, `productType`, `sessionBoundary` (`HEARTBEAT` / `SESSION_END`). Each is POSTed **alone** (`{"events": [heartbeat]}`), never inside a usage batch, so the ingestor always intercepts it before billing. They are best-effort: one attempt, failures logged, never affecting usage delivery.
 
 ## Walk me through it
 
@@ -84,4 +88,4 @@ Install → wrap a handler → fire a real tool call → confirm the event in Af
 
 ## What this doesn't cover
 
-This SDK **emits** invocation events (session heartbeats are no longer sent: they were `system.session.heartbeat` events with `quantity: 0` sent in the usage batch, and the ingestor rejects quantity 0 and fails the whole batch with 400, taking every real event batched with it down. The ingestor has no dedicated heartbeat endpoint.) — it does not price them. It does not enforce entitlements at call time: the only server-driven control is the `killedSessionIds` signal returned on a flush, which clears that session and fires `on_session_killed` (The ingestor only computes `killedSessionIds` while processing heartbeats, so with heartbeats removed this signal is not expected to fire until a dedicated heartbeat API exists.) (it does not abort an in-flight tool call). Streaming/partial tool results are recorded as a single invocation. Rate plans and metric mapping live in the Aforo console.
+This SDK **emits** invocation, heartbeat and session-end events — it does not price them. It does not enforce entitlements at call time: the only server-driven control is the `killedSessionIds` signal returned on a flush (on a heartbeat or a flush), which stops that session's heartbeats and fires `on_session_killed` (it does not abort an in-flight tool call). Streaming/partial tool results are recorded as a single invocation. Rate plans and metric mapping live in the Aforo console.

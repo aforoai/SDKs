@@ -4,7 +4,11 @@ All notable changes to `aforo-mqtt-metering` are documented here. This project f
 
 ## [Unreleased]
 
+### Added
+- `product_type` constructor option (default `"MQTT_BROKER"`) for the top-level `productType` the ingestor requires on every event, with a per-event override via `push(product_type=...)` or `product_type=` on `wrap_paho_client` / `wrap_aiomqtt_client`. Values are trimmed and upper-cased; unknown values are passed through rather than rejected.
+
 ### Fixed
+- Batch delivery no longer retries 4xx responses other than 408 and 429 (a bad key or invalid batch cannot succeed on retry), honours `Retry-After` on 429 (capped at 60 s), no longer sleeps after the final attempt, and passes the ingestor's `errors[].message` to `on_error`, including per-event failures reported in a 202 response.
 - **Breaking (fix):** the tenant API key is sent as `X-API-Key` instead of `Authorization: Bearer`. The ingestor parses Bearer values as JWTs and rejected every request 401 (sending both headers is also 401), so no usage was being delivered.
 - Docs and examples use `https://api.aforo.ai`, Aforo's public API gateway in front of the ingestor (`ingest.aforo.ai` / `ingestor.aforo.ai` serve a static site, not the ingestor).
 - **Breaking (fix):** batches are POSTed to `/v1/ingest/batch` instead of `/v1/ingest/events`. `/v1/ingest/events` is the Apigee-format single-event endpoint and does not accept `{"events": [...]}`, so no usage was being recorded. Each flush is split into requests of at most 1000 events (the ingestor's batch limit).

@@ -32,6 +32,7 @@ class IngestBatchContractTest {
     private final ObjectMapper mapper = new ObjectMapper();
     private final List<Captured> captured = new CopyOnWriteArrayList<>();
     private final AtomicInteger failuresBeforeSuccess = new AtomicInteger();
+    private final AtomicInteger failureStatus = new AtomicInteger(500);
     private HttpServer server;
     private int port;
 
@@ -43,7 +44,16 @@ class IngestBatchContractTest {
             String raw = new String(exchange.getRequestBody().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
             captured.add(new Captured(exchange.getRequestURI().getPath(),
                     exchange.getRequestHeaders().getFirst("X-API-Key"), raw, mapper.readTree(raw)));
-            int status = failuresBeforeSuccess.getAndDecrement() > 0 ? 500 : 202;
+            int status = failuresBeforeSuccess.getAndDecrement() > 0 ? failureStatus.get() : 202;
+            if (status == 429) exchange.getResponseHeaders().add("Retry-After", "0");
+            if (status == 400) {
+                byte[] err = "{\"accepted\":0,\"failed\":1,\"errors\":[{\"index\":0,\"message\":\"bad event\"}]}"
+                        .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(status, err.length);
+                exchange.getResponseBody().write(err);
+                exchange.close();
+                return;
+            }
             exchange.sendResponseHeaders(status, -1);
             exchange.close();
         });
@@ -140,6 +150,62 @@ class IngestBatchContractTest {
             Thread.sleep(100);
         }
         assertThat(captured).isEmpty();
+    }
+
+    @Test
+    @DisplayName("productType defaults to GRPC_API; client option is trimmed and uppercased")
+    void clientProductType() throws Exception {
+        try (AforoGrpcBilling b = builder().build()) {
+            assertThat(b.getProductType()).isEqualTo("GRPC_API");
+        }
+        try (AforoGrpcBilling b = builder().productType(" api ").flushCount(1).build()) {
+            assertThat(b.getProductType()).isEqualTo("API");
+            b.record("GetUser", "UNARY", "cust_001", "OK", 1L);
+            waitFor(() -> !captured.isEmpty(), 3000);
+        }
+        assertThat(captured.get(0).body().get("events").get(0).get("productType").asText()).isEqualTo("API");
+    }
+
+    @Test
+    @DisplayName("per-call productType override wins over the client default")
+    void perCallProductTypeOverride() throws Exception {
+        try (AforoGrpcBilling b = builder().flushCount(2).build()) {
+            b.record("GetUser", "UNARY", "cust_001", "OK", 1L);
+            b.record("GetUser", "UNARY", "cust_001", "OK", 1L, " agentic_api ");
+            waitFor(() -> !captured.isEmpty(), 3000);
+        }
+        JsonNode events = captured.get(0).body().get("events");
+        assertThat(events.get(0).get("productType").asText()).isEqualTo("GRPC_API");
+        assertThat(events.get(1).get("productType").asText()).isEqualTo("AGENTIC_API");
+    }
+
+    @Test
+    @DisplayName("a 400 is not retried")
+    void badRequestNotRetried() throws Exception {
+        failuresBeforeSuccess.set(5);
+        failureStatus.set(400);
+        try (AforoGrpcBilling b = builder().flushCount(1).build()) {
+            b.record("GetUser", "UNARY", "cust_001", "OK", 1L);
+            waitFor(() -> !captured.isEmpty(), 3000);
+            Thread.sleep(1_500); // longer than the first backoff
+        }
+        assertThat(captured).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("a 429 is retried after Retry-After, with the same idempotency key")
+    void tooManyRequestsHonoursRetryAfter() throws Exception {
+        failuresBeforeSuccess.set(1);
+        failureStatus.set(429);
+        long start = System.currentTimeMillis();
+        try (AforoGrpcBilling b = builder().flushCount(1).build()) {
+            b.record("GetUser", "UNARY", "cust_001", "OK", 1L);
+            waitFor(() -> captured.size() == 2, 3000);
+        }
+        // Retry-After: 0 replaces the 1s exponential backoff.
+        assertThat(System.currentTimeMillis() - start).isLessThan(900);
+        assertThat(captured.get(1).body().get("events").get(0).get("idempotencyKey").asText())
+                .isEqualTo(captured.get(0).body().get("events").get(0).get("idempotencyKey").asText());
     }
 
     /** Every top-level JSON name IngestUsageEventRequest binds; anything else is dropped server-side. */

@@ -198,10 +198,11 @@ describe('AforoAgent — batching + flush', () => {
       return new Response('{}', { status: 503 }) as unknown as Response;
     }) as unknown as typeof fetch;
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => { /* swallow */ });
-    const agent = new AforoAgent(baseConfig({ fetchImpl: failingFetch }));
+    const agent = new AforoAgent(baseConfig({ fetchImpl: failingFetch, retryBaseDelayMs: 1 }));
     await (await agent.startSession({ agentId: 'a' })).end({ taskCompleted: true });
     expect(warn).toHaveBeenCalled();
     expect(warn.mock.calls[0][0]).toContain('503');
+    expect(calls).toHaveLength(3); // 5xx is retried (3 attempts by default), then dropped
     warn.mockRestore();
   });
 });
@@ -292,6 +293,91 @@ describe('AforoAgent — ingest batch contract', () => {
     for (const c of calls) expect(c.url).toMatch(/\/v1\/ingest\/batch$/);
     const keys = calls.flatMap((c) => (c.body as any).events.map((e: any) => e.idempotencyKey));
     expect(new Set(keys).size).toBe(2500);
+  });
+});
+
+describe('AforoAgent — productType, validation and retries', () => {
+  test('productType: default AI_AGENT, client option, per session, per event (trimmed, uppercased)', async () => {
+    const { calls, fetchImpl } = makeFetch();
+    const agent = new AforoAgent(baseConfig({ fetchImpl, productType: ' agentic_api ' }));
+    const s1 = await agent.startSession({ agentId: 'a' });
+    await s1.recordStep({ stepKind: 'THOUGHT' });
+    const s2 = await agent.startSession({ agentId: 'b', productType: 'ai_agent' });
+    await s2.recordStep({ stepKind: 'THOUGHT' });
+    await agent.emitEvent({
+      eventType: 'x', metricKey: 'm', value: 1, agentId: 'a', sessionId: 's',
+      properties: {}, productType: 'Future_Type',
+    });
+    await agent.flush();
+    const types = (calls[0].body as any).events.map((e: any) => [e.agentId, e.productType]);
+    expect(types).toEqual([
+      ['a', 'AGENTIC_API'], ['a', 'AGENTIC_API'],
+      ['b', 'AI_AGENT'], ['b', 'AI_AGENT'],
+      ['a', 'FUTURE_TYPE'],
+    ]);
+
+    const { calls: c2, fetchImpl: f2 } = makeFetch();
+    const def = new AforoAgent(baseConfig({ fetchImpl: f2 }));
+    await (await def.startSession({ agentId: 'a' })).end({ taskCompleted: true });
+    for (const e of (c2[0].body as any).events) expect(e.productType).toBe('AI_AGENT');
+  });
+
+  test('startSession rejects agentId over 36 chars', async () => {
+    const { fetchImpl } = makeFetch();
+    const agent = new AforoAgent(baseConfig({ fetchImpl }));
+    await expect(agent.startSession({ agentId: 'x'.repeat(37) })).rejects.toThrow('at most 36');
+  });
+
+  test('emitEvent drops events missing agentId/sessionId/metric or with value <= 0', async () => {
+    const { calls, fetchImpl } = makeFetch();
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => { /* swallow */ });
+    const agent = new AforoAgent(baseConfig({ fetchImpl }));
+    const base = { eventType: 'e', metricKey: 'm', value: 1, agentId: 'a', sessionId: 's', properties: {} };
+    await agent.emitEvent({ ...base, agentId: ' ' });
+    await agent.emitEvent({ ...base, agentId: 'x'.repeat(37) });
+    await agent.emitEvent({ ...base, sessionId: '' });
+    await agent.emitEvent({ ...base, metricKey: '' });
+    await agent.emitEvent({ ...base, value: 0 });
+    await agent.emitEvent({ ...base, value: -2 });
+    await agent.flush();
+    expect(calls).toHaveLength(0);
+    expect(warn).toHaveBeenCalledTimes(6);
+    warn.mockRestore();
+  });
+
+  test('4xx other than 408/429 is not retried', async () => {
+    let n = 0;
+    const fetchImpl = (async () => { n++; return new Response('{}', { status: 400 }); }) as unknown as typeof fetch;
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => { /* swallow */ });
+    const agent = new AforoAgent(baseConfig({ fetchImpl, retryBaseDelayMs: 1 }));
+    await (await agent.startSession({ agentId: 'a' })).end({ taskCompleted: true });
+    expect(n).toBe(1);
+    warn.mockRestore();
+  });
+
+  test('429 is retried honouring Retry-After, re-sending the same keys', async () => {
+    const bodies: string[] = [];
+    const responses = [
+      new Response('{}', { status: 429, headers: { 'Retry-After': '0' } }),
+      new Response('{"accepted":1,"duplicates":0,"failed":0,"errors":[]}', { status: 202 }),
+    ];
+    const fetchImpl = (async (_u: any, init: any) => { bodies.push(init.body); return responses.shift()!; }) as unknown as typeof fetch;
+    const agent = new AforoAgent(baseConfig({ fetchImpl, retryBaseDelayMs: 60_000 }));
+    await agent.emitEvent({ eventType: 'e', metricKey: 'm', value: 1, agentId: 'a', sessionId: 's', properties: {} });
+    await agent.flush(); // would hang ~60s if Retry-After: 0 were ignored
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]).toBe(bodies[1]);
+  });
+
+  test('per-event rejections are reported from errors[].message', async () => {
+    const fetchImpl = (async () => new Response(
+      JSON.stringify({ accepted: 0, duplicates: 0, failed: 1, errors: [{ index: 0, message: 'unknown metric' }] }),
+      { status: 202 })) as unknown as typeof fetch;
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => { /* swallow */ });
+    const agent = new AforoAgent(baseConfig({ fetchImpl }));
+    await (await agent.startSession({ agentId: 'a' })).end({ taskCompleted: true });
+    expect(warn.mock.calls[0][0]).toContain('#0: unknown metric');
+    warn.mockRestore();
   });
 });
 

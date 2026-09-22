@@ -9,6 +9,11 @@ All notable changes to `@aforo/grpc-metering` are documented here. Format follow
 - Docs and examples use `https://api.aforo.ai`, Aforo's public API gateway in front of the ingestor (`ingest.aforo.ai` / `ingestor.aforo.ai` serve a static site, not the ingestor).
 - Batches are POSTed to `<ingestorUrl>/v1/ingest/batch`. `/v1/ingest/events` is the ingestor's Apigee single-event endpoint and never accepted an `{events:[...]}` batch, so no usage was being delivered. Flushes are split into requests of at most 1000 events (the ingestor's batch limit), and each event's `idempotencyKey` is minted once and re-sent unchanged on retries.
 - Events with a blank `customerId` are skipped, and ones longer than 64 characters are dropped with `onError`, since the ingestor rejects both. `grpcService` is trimmed to 255 characters, `grpcMethod` to 128 and `idempotencyKey` to 255.
+- Events with a blank `grpcService` (`serviceName`) or `grpcMethod` are dropped with `onError` instead of failing the whole batch.
+- Only network errors, 408, 429 (honouring `Retry-After`, capped at 30 s) and 5xx are retried. Any other 4xx (400/401/403/422...) is dropped immediately with `onError`, including the ingestor's `errors[].message` details, instead of being retried. A 202 whose summary has `failed > 0` reports the per-event `errors[].message` through `onError`.
+
+### Added
+- `productType` option (default `GRPC_API`), sent as top-level `productType` on every event (trimmed + uppercased; unknown values pass through). Override it via the wrappers' last argument, e.g. `wrapUnary('GetUser', handler, { productType })`.
 
 ## [1.0.0] — 2026-06-29
 

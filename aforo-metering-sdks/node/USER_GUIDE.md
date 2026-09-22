@@ -33,7 +33,10 @@ Create one `AforoClient` for the process lifetime — it owns the buffer and the
 ```ts
 import { AforoClient } from '@aforo/metering';
 
-export const aforo = new AforoClient({ apiKey: process.env.AFORO_API_KEY! });
+export const aforo = new AforoClient({
+  apiKey: process.env.AFORO_API_KEY!,
+  productType: 'API',   // default; sent as top-level productType on every event
+});
 ```
 
 ## Step 3 — Track your first event
@@ -56,10 +59,11 @@ app.use(expressMiddleware({
   customerId: (req) => req.user?.id ?? null,   // null => this request is skipped
   metricName: 'api_calls',                      // default; or (req, res) => string. Must exist in your Aforo catalog
   excludePaths: ['/health', '/metrics'],        // these are the defaults
+  productType: 'API',                           // default: the client default
 }));
 ```
 
-> The middleware fires on `res.on('finish')` — after the response is flushed to the client — so it adds no latency. If `customerId` resolves to `null`/falsy, the request is silently not metered (no error thrown into your app). The default resolver uses `req.user.id` / `req.user.sub`, then `X-Customer-Id` — never the caller's `X-Api-Key`, which is a secret. `OPTIONS` (CORS preflight) requests are never metered.
+> The middleware fires on `res.on('finish')` — after the response is flushed to the client — so it adds no latency. If `customerId` resolves to `null`/falsy, the request is silently not metered (no error thrown into your app). The default resolver uses `req.user.id` / `req.user.sub`, then `X-Customer-Id` — never the caller's `X-Api-Key`, which is a secret. `OPTIONS` (CORS preflight) requests are never metered, nor are requests whose quantity is `<= 0`. Each event carries top-level `endpointPath` (no query string, max 512 chars), `httpMethod`, `statusCode`, `responseTimeMs` and `productType`.
 >
 > ⚠ The ingestor rejects any `metricName` not in your catalog, and one rejected event fails the whole batch. Earlier versions defaulted to `"<METHOD> <normalized-path>"` (e.g. `GET /users/:id`), which no catalog contains; the default is now `api_calls`.
 
@@ -79,7 +83,7 @@ In the Aforo console, open **Ingestion → Recent Events** and filter by your `c
 
 ## Configuration reference
 
-See the full `AforoOptions` and `TrackEvent` tables in the [README](README.md#configuration). The fields that most affect behavior: `flushCount` (50), `flushInterval` (5000 ms), `maxQueueSize` (10000, oldest-dropped on overflow), `maxRetries` (3), `timeout` (10000 ms).
+See the full `AforoOptions` and `TrackEvent` tables in the [README](README.md#configuration). The fields that most affect behavior: `productType` ("API"; override per event with `track({ productType })`), `flushCount` (50, capped at 1000), `flushInterval` (5000 ms), `maxQueueSize` (10000, oldest-dropped on overflow), `maxRetries` (3), `timeout` (10000 ms).
 
 ## Troubleshooting
 

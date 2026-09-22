@@ -101,9 +101,10 @@ Constructor arguments for `AforoWsBilling(...)`:
 | `flush_interval_sec` | `float` | `3.0` | Background flush cadence (daemon thread from construction). |
 | `flush_count` | `int` | `100` | Buffer size that triggers an immediate flush. |
 | `per_frame_events` | `bool` | `False` | Emit one event per inbound/outbound frame instead of open+close. |
-| `on_error` | `Callable[[Exception], None]?` | logs | Called on permanent batch failure. |
+| `on_error` | `Callable[[Exception], None]?` | logs | Called on permanent batch failure, and with the ingestor's `errors[].message` when it rejects events. |
+| `product_type` | `str` | `"WEBSOCKET_API"` | Top-level `productType` sent on every event (trimmed and upper-cased; values the SDK does not know are passed through). Override per event with a `productType` key in `push({...})` or `product_type=` on `track_websockets_connection` / `track_starlette_websocket`. |
 
-Close-code mapping: `WS_CLOSE_REASONS` maps standard close codes (1000–1011) to descriptor labels (`NORMAL_CLOSURE`, `ABNORMAL_CLOSURE`, `POLICY_VIOLATION`, …); an exception inside the handler surfaces as `INTERNAL_ERROR`. Retry is fixed at **3 attempts** (`1s / 2s / 4s`); 4xx is non-retryable.
+Close-code mapping: `WS_CLOSE_REASONS` maps standard close codes (1000–1011) to descriptor labels (`NORMAL_CLOSURE`, `ABNORMAL_CLOSURE`, `POLICY_VIOLATION`, …); an exception inside the handler surfaces as `INTERNAL_ERROR`. Retry is fixed at **3 attempts** (`1s / 2s` backoff between them); 408 and 5xx are retried, 429 waits for `Retry-After` (capped at 60 s), and any other 4xx is not retried.
 
 ## Walk me through it
 

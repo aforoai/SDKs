@@ -95,9 +95,10 @@ Constructor arguments for `AforoMqttBilling(...)`:
 | `flush_interval_sec` | `float` | `2.0` | Background flush cadence — tightest of the SDKs, since MQTT is high-volume. |
 | `flush_count` | `int` | `200` | Buffer size that triggers an immediate flush. |
 | `emit_deliver_events` | `bool` | `False` | Emit a `DELIVER` event for each inbound `on_message` (off by default). |
-| `on_error` | `Callable[[Exception], None]?` | logs | Called on permanent batch failure. |
+| `on_error` | `Callable[[Exception], None]?` | logs | Called on permanent batch failure, and with the ingestor's `errors[].message` when it rejects events. |
+| `product_type` | `str` | `"MQTT_BROKER"` | Top-level `productType` sent on every event (trimmed and upper-cased; values the SDK does not know are passed through). Override per event with `push(..., product_type=...)` or `product_type=` on `wrap_paho_client` / `wrap_aiomqtt_client`. |
 
-Event metric names follow `mqtt_broker.<event_type lowercased>` (e.g. `mqtt_broker.publish`, `mqtt_broker.subscribe`). Retry is fixed at **3 attempts** (`1s / 2s / 4s`); 4xx is non-retryable.
+Event metric names follow `mqtt_broker.<event_type lowercased>` (e.g. `mqtt_broker.publish`, `mqtt_broker.subscribe`). Retry is fixed at **3 attempts** (`1s / 2s` backoff between them); 408 and 5xx are retried, 429 waits for `Retry-After` (capped at 60 s), and any other 4xx is not retried.
 
 ## Walk me through it
 

@@ -64,13 +64,14 @@ Each wrapped handler emits one event with `metricName: "grpc_api.rpc_calls"`, `q
 | `productId` | `string` | — (required) | Aforo product id; into each event's `metadata.productId`. |
 | `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. |
 | `ingestorUrl` | `string` | — (required) | Ingestion base URL. SDK appends `/v1/ingest/batch`. Use `https://api.aforo.ai`. |
+| `productType` | `string` | `'GRPC_API'` | Aforo product type sent as top-level `productType` on every event (trimmed + uppercased; unknown values pass through). Override via the wrappers' last argument, e.g. `wrapUnary('GetUser', handler, { productType })`. |
 | `serviceName` | `string` | — (required) | Fully-qualified gRPC service name (e.g. `acme.v1.UserService`); stamped on every event as `grpcService`. |
 | `customerIdExtractor` | `(metadata: Record<string, unknown>) => string \| undefined` | reads `x-customer-id` from `call.metadata.getMap()` | Resolve the customer per call. `undefined` → call is not metered. |
 | `flushCount` | `number` | `50` | Buffered events that trigger an immediate flush. |
 | `flushIntervalMs` | `number` | `5000` | Max ms before a partial batch is flushed. |
-| `onError` | `(error: Error) => void` | logs to `console.error` | Called when a flush fails terminally (after 3 retries). |
+| `onError` | `(error: Error) => void` | logs to `console.error` | Called when a batch is dropped: after 3 attempts on network errors / 408 / 429 (honouring `Retry-After`) / 5xx, immediately on any other 4xx (not retried), and when a 202 reports per-event failures (`errors[].message`). |
 
-Exported symbols: `AforoGrpcBilling` (with `wrapUnary` / `wrapServerStream` / `wrapClientStream` / `wrapBidiStream` / `shutdown`), the `GRPC_STATUS` numeric-code map, and the `AforoGrpcConfig` type.
+Exported symbols: `AforoGrpcBilling` (with `wrapUnary` / `wrapServerStream` / `wrapClientStream` / `wrapBidiStream` / `shutdown`), the `GRPC_STATUS` numeric-code map, and the `AforoGrpcConfig` / `WrapOptions` types.
 
 > gRPC `Metadata.getMap()` returns `string | Buffer` per key. The default extractor string-coerces; a custom `customerIdExtractor` must do the same for non-string keys.
 

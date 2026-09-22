@@ -140,7 +140,7 @@ Content-Type: application/json
 {"events":[{"customerId":"…","metricName":"grpc_api.rpc_calls","quantity":1,"occurredAt":"…","idempotencyKey":"grpc:…","productType":"GRPC_API","grpcService":"acme.v1.UserService","grpcMethod":"GetUser","grpcStatusCode":"OK","grpcCallType":"UNARY","messageCount":1,"executionDurationMs":2,"metadata":{"sdkVersion":"1.0.0","productId":"prod_grpc_user_svc"}}]}
 ```
 
-> ⚠ Flush failures are silent unless you set `OnError`. If nothing lands, set `OnError: func(err error){ log.Println("aforo:", err) }` to surface marshal failures and retry-exhausted drops.
+> ⚠ Flush failures are silent unless you set `OnError`. If nothing lands, set `OnError: func(err error){ log.Println("aforo:", err) }` to surface marshal failures, retry-exhausted drops and ingestor rejections (including `errors[].message`).
 
 ## Configuration reference
 
@@ -151,11 +151,12 @@ Content-Type: application/json
 | `APIKey` | `string` | — (required) | `X-API-Key: <APIKey>`. |
 | `IngestorURL` | `string` | — (required) | Base; `/v1/ingest/batch` is appended. |
 | `ServiceName` | `string` | — (required) | Fully-qualified gRPC service; recorded as `grpcService`. |
+| `ProductType` | `string` | `GRPC_API` | Top-level `productType` on every event; per-event override via `EventOptions`. |
 | `FlushCount` | `int` | `50` | Buffer-size flush threshold. |
 | `FlushInterval` | `time.Duration` | `5s` | Background flush cadence. |
 | `HTTPClient` | `*http.Client` | `&http.Client{Timeout: 10s}` | HTTP client override. |
 | `CustomerExtractor` | `func(context.Context) string` | reads `x-customer-id` metadata | Per-call customer-id resolver. |
-| `OnError` | `func(error)` | no-op | Marshal failures + retry-exhausted drops. |
+| `OnError` | `func(error)` | no-op | Marshal failures, retry-exhausted drops, non-retryable `4xx` rejections, and partial failures (with the ingestor's `errors[].message`). |
 
 gRPC status mapping is the canonical upper-snake name of `status.Code()` (e.g. `codes.Canceled` → `CANCELLED`, `codes.InvalidArgument` → `INVALID_ARGUMENT`): `OK`, `CANCELLED`, `UNKNOWN`, `INVALID_ARGUMENT`, `DEADLINE_EXCEEDED`, `NOT_FOUND`, `ALREADY_EXISTS`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED`, `FAILED_PRECONDITION`, `ABORTED`, `OUT_OF_RANGE`, `UNIMPLEMENTED`, `INTERNAL`, `UNAVAILABLE`, `DATA_LOSS`, `UNAUTHENTICATED`.
 

@@ -6,6 +6,8 @@
 import { readFileSync } from 'node:fs';
 import type { ProxyConfig, TransportType, AforoConfig } from './types.js';
 
+export const DEFAULT_PRODUCT_TYPE = 'MCP_SERVER';
+
 const DEFAULTS: Pick<AforoConfig, 'flushIntervalMs' | 'flushCount' | 'heartbeatIntervalMs' | 'quotaEnforcement' | 'debug'> = {
   flushIntervalMs: 5000,
   flushCount: 50,
@@ -37,6 +39,8 @@ export function loadConfig(cliArgs: Partial<ProxyConfig & { config?: string }>):
     apiKey:          envString('AFORO_API_KEY')           ?? cliArgs.aforo?.apiKey           ?? fileConfig.aforo?.apiKey           ?? '',
     ingestorUrl:     envString('AFORO_INGESTOR_URL')      ?? cliArgs.aforo?.ingestorUrl      ?? fileConfig.aforo?.ingestorUrl      ?? '',
     agentId:         envString('AFORO_AGENT_ID')          ?? cliArgs.aforo?.agentId          ?? fileConfig.aforo?.agentId,
+    customerId:      envString('AFORO_CUSTOMER_ID')       ?? cliArgs.aforo?.customerId       ?? fileConfig.aforo?.customerId,
+    productType:     normalizeProductType(envString('AFORO_PRODUCT_TYPE') ?? cliArgs.aforo?.productType ?? fileConfig.aforo?.productType) ?? DEFAULT_PRODUCT_TYPE,
     quotaEnforcement: envBool('AFORO_QUOTA_ENFORCEMENT')  ?? cliArgs.aforo?.quotaEnforcement ?? fileConfig.aforo?.quotaEnforcement ?? DEFAULTS.quotaEnforcement,
     flushIntervalMs:  envInt('AFORO_FLUSH_INTERVAL_MS')   ?? cliArgs.aforo?.flushIntervalMs  ?? fileConfig.aforo?.flushIntervalMs  ?? DEFAULTS.flushIntervalMs,
     flushCount:       envInt('AFORO_FLUSH_COUNT')          ?? cliArgs.aforo?.flushCount        ?? fileConfig.aforo?.flushCount        ?? DEFAULTS.flushCount,
@@ -75,6 +79,13 @@ function validate(config: ProxyConfig): void {
   } else {
     if (!config.upstream) throw new Error('upstream URL is required for SSE/HTTP transport');
   }
+}
+
+/** Trim + uppercase; blank/non-string -> undefined. Unknown values pass through. */
+export function normalizeProductType(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed.toUpperCase() : undefined;
 }
 
 // ─── Env helpers ────────────────────────────────────────────────────────────

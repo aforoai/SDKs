@@ -8,6 +8,11 @@ All notable changes to `metering-go` are documented here. This project follows [
 - **Breaking (fix):** the tenant API key is sent as `X-API-Key` instead of `Authorization: Bearer`. The ingestor parses Bearer values as JWTs and rejected every request 401 (sending both headers is also 401), so no usage was being delivered.
 - **Breaking (fix):** default ingestor base URL is now `https://api.aforo.ai`, Aforo's public API gateway in front of the ingestor. `ingest.aforo.ai` / `ingestor.aforo.ai` resolve to a static CloudFront/S3 site that answers POSTs with a 301, not the ingestor. Set the base URL explicitly if you relied on the old default.
 - **Breaking (fix):** middleware default metric is `api_calls` (`DefaultMetricName`) instead of `"METHOD /path"`; new `MetricName`, `MetricNameFunc` and `CustomerIDFunc` options, and exported `NormalizePath`. The caller's `X-Api-Key` header is no longer used as the customer id. `OPTIONS` (CORS preflight) requests are no longer metered.
+- Every event now carries the top-level `productType` the ingestor requires in production: new `Options.ProductType` (default `"API"`) and per-event `TrackEvent.ProductType` override (trimmed, upper-cased, unknown values passed through). `MiddlewareOptions.ProductType` sets it for the middleware.
+- `Track` rejects events the ingestor would refuse — blank `CustomerID`/`MetricName`, negative/NaN/Inf `Quantity`, non-RFC 3339 `OccurredAt` — with an error wrapping the new `ErrInvalidEvent`, instead of letting one bad event fail a whole batch. `OccurredAt` is normalized to UTC.
+- `FlushCount` is clamped to 1000, the ingestor's per-request batch limit.
+- A `2xx` batch response with `failed > 0` is now reflected in `FlushResult.Failed`.
+- Middleware events send top-level `endpointPath` (normalized, no query string, ≤ 512 chars), `httpMethod`, `statusCode` and `responseTimeMs`; `TrackEvent` gained matching optional fields.
 
 ## [1.0.0] — 2026-06-29
 

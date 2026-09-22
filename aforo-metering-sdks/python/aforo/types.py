@@ -5,6 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+DEFAULT_PRODUCT_TYPE = "API"
+"""Default ``productType`` stamped on every event by the base SDK."""
+
+MAX_BATCH_SIZE = 1000
+"""The ingestor accepts at most 1000 events per ``POST /v1/ingest/batch``."""
+
 
 @dataclass
 class AforoOptions:
@@ -16,8 +22,14 @@ class AforoOptions:
     base_url: str = "https://api.aforo.ai"
     """Base URL for the Aforo ingestor service."""
 
+    product_type: str = DEFAULT_PRODUCT_TYPE
+    """Default top-level ``productType`` for every event (``API``, ``AGENTIC_API``,
+    ``AI_AGENT``, ``MCP_SERVER``, ``GRPC_API``, ``GRAPHQL_API``, ``WEBSOCKET_API``,
+    ``MQTT_BROKER``). Required by the production ingestor. Trimmed and upper-cased;
+    unknown values are passed through. Override per event with ``track(product_type=...)``."""
+
     flush_count: int = 50
-    """Maximum events to buffer before flushing."""
+    """Maximum events to buffer before flushing (clamped to 1..1000, the ingestor's batch limit)."""
 
     flush_interval: float = 5.0
     """Flush interval in seconds."""
@@ -36,6 +48,9 @@ class AforoOptions:
 
     shutdown_timeout: float = 5.0
     """Graceful shutdown timeout in seconds."""
+
+    heartbeat_interval: float = 30.0
+    """Seconds between session heartbeats while a session is active (see ``start_session``)."""
 
 
 @dataclass
@@ -60,6 +75,13 @@ class TrackEvent:
     metadata: Optional[dict[str, Any]] = None
     """Arbitrary key-value metadata attached to the event."""
 
+    product_type: Optional[str] = None
+    """Per-event ``productType`` override. Defaults to the client's ``product_type``."""
+
+    extra_fields: Optional[dict[str, Any]] = None
+    """Optional top-level ingest fields, using their exact camelCase wire names
+    (e.g. ``{"agentId": "a1", "sessionId": "s1"}`` for ``AI_AGENT``)."""
+
 
 @dataclass
 class ResolvedEvent:
@@ -71,15 +93,23 @@ class ResolvedEvent:
     idempotency_key: str
     occurred_at: str
     metadata: Optional[dict[str, Any]] = None
+    product_type: Optional[str] = None
+    extra_fields: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {
+        d: dict[str, Any] = {}
+        # Optional top-level fields first so the required fields below always win.
+        if self.extra_fields:
+            d.update({k: v for k, v in self.extra_fields.items() if v is not None})
+        d.update({
             "customerId": self.customer_id,
             "metricName": self.metric_name,
             "quantity": self.quantity,
             "idempotencyKey": self.idempotency_key,
             "occurredAt": self.occurred_at,
-        }
+        })
+        if self.product_type:
+            d["productType"] = self.product_type
         if self.metadata:
             d["metadata"] = self.metadata
         return d
@@ -99,6 +129,8 @@ class MiddlewareOptions:
 
     api_key: str
     base_url: str = "https://api.aforo.ai"
+    product_type: str = DEFAULT_PRODUCT_TYPE
+    """``productType`` stamped on every request event. Default ``"API"``."""
     metric_name: Optional[Callable | str] = None
     """Fixed metric or callable. Default ``"api_calls"``; must exist in your Aforo catalog."""
     quantity: Optional[Callable | float] = None

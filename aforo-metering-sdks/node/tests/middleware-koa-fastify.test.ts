@@ -123,3 +123,44 @@ describe('customer, quantity and metadata options', () => {
     expect(mockFetch).not.toHaveBeenCalled();
   });
 });
+
+describe('productType, HTTP fields and quantity <= 0', () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+    mockFetch.mockResolvedValue({ ok: true, status: 202, headers: new Map() });
+  });
+
+  it('koa: sends productType and top-level HTTP fields', async () => {
+    const mw = koaMiddleware({ apiKey: 'k', clientOptions, productType: 'agentic_api' });
+    await mw({ ...koaCtx('POST', { 'x-customer-id': 'cust_1' }), path: '/api/data', status: 201 }, async () => {});
+    await tick();
+    const ev = JSON.parse(mockFetch.mock.calls[0][1].body).events[0];
+    expect(ev).toMatchObject({ productType: 'AGENTIC_API', endpointPath: '/api/data', httpMethod: 'POST', statusCode: 201 });
+    expect(typeof ev.responseTimeMs).toBe('number');
+  });
+
+  it('koa: skips quantity <= 0', async () => {
+    const mw = koaMiddleware({ apiKey: 'k', clientOptions, quantity: 0 });
+    await mw(koaCtx('GET', { 'x-customer-id': 'cust_1' }), async () => {});
+    await tick();
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('fastify: default productType API, path without query, elapsed time', async () => {
+    const hooks: Record<string, Function> = {};
+    await fastifyPlugin({ addHook: (n: string, fn: Function) => { hooks[n] = fn; } }, { apiKey: 'k', clientOptions });
+    await new Promise<void>((resolve) => hooks.onResponse(
+      { url: '/api/data?x=1', method: 'GET', headers: { 'x-customer-id': 'cust_1' } },
+      { statusCode: 200, elapsedTime: 12.6 }, resolve));
+    await tick();
+    const ev = JSON.parse(mockFetch.mock.calls[0][1].body).events[0];
+    expect(ev).toMatchObject({ productType: 'API', endpointPath: '/api/data', httpMethod: 'GET', statusCode: 200, responseTimeMs: 13 });
+  });
+
+  it('fastify: skips quantity <= 0', async () => {
+    await runFastify({ apiKey: 'k', clientOptions, quantity: () => -1 },
+      { url: '/api/data', method: 'GET', headers: { 'x-customer-id': 'cust_1' } });
+    await tick();
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+});

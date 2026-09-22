@@ -138,3 +138,104 @@ class TestTransport:
         result = t.send_sync(_events(1))
 
         assert result.sent == 1
+
+
+def _mock_http(mock_client_cls, *responses):
+    mock_client = MagicMock()
+    mock_client.post.side_effect = list(responses)
+    mock_client.__enter__ = MagicMock(return_value=mock_client)
+    mock_client.__exit__ = MagicMock(return_value=False)
+    mock_client_cls.return_value = mock_client
+    return mock_client
+
+
+def _resp(status, body=None, headers=None):
+    r = MagicMock()
+    r.status_code = status
+    r.headers = headers or {}
+    if body is None:
+        r.json.side_effect = ValueError("no body")
+    else:
+        r.json.return_value = body
+    return r
+
+
+def _t(max_retries=2):
+    return Transport(base_url="https://ingest.test", api_key="k", max_retries=max_retries, retry_base_s=0.01)
+
+
+@patch("aforo.transport.httpx.Client")
+def test_partial_failure_parsed_from_errors_message(mock_client_cls, caplog):
+    _mock_http(mock_client_cls, _resp(202, {
+        "accepted": 1, "duplicates": 0, "failed": 1,
+        "errors": [{"index": 1, "message": "unknown metric"}],
+    }))
+    with caplog.at_level("WARNING", logger="aforo.transport"):
+        result = _t().send_sync(_events(2))
+    assert (result.sent, result.failed) == (1, 1)
+    assert "unknown metric" in caplog.text
+
+
+@patch("aforo.transport.httpx.Client")
+def test_400_logs_errors_message_and_does_not_retry(mock_client_cls, caplog):
+    client = _mock_http(mock_client_cls, _resp(400, {"errors": [{"index": 0, "message": "quantity must be positive"}]}))
+    with caplog.at_level("WARNING", logger="aforo.transport"):
+        result = _t().send_sync(_events(1))
+    assert result.failed == 1
+    assert client.post.call_count == 1
+    assert "quantity must be positive" in caplog.text
+
+
+@patch("aforo.transport.httpx.Client")
+@patch("time.sleep")
+def test_429_honours_retry_after_and_tolerates_http_date(mock_sleep, mock_client_cls):
+    _mock_http(
+        mock_client_cls,
+        _resp(429, headers={"Retry-After": "7"}),
+        _resp(429, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}),
+        _resp(202, {"accepted": 1, "failed": 0}),
+    )
+    result = _t().send_sync(_events(1))
+    assert result.sent == 1
+    assert mock_sleep.call_args_list[0].args[0] == 7.0
+    assert mock_sleep.call_args_list[1].args[0] == pytest.approx(0.02)
+
+
+@patch("aforo.transport.httpx.Client")
+def test_408_is_retried(mock_client_cls):
+    client = _mock_http(mock_client_cls, _resp(408), _resp(202))
+    assert _t().send_sync(_events(1)).sent == 1
+    assert client.post.call_count == 2
+
+
+def test_event_wire_format_has_product_type_and_extra_fields():
+    e = ResolvedEvent(
+        customer_id="c", metric_name="m", quantity=1, idempotency_key="k",
+        occurred_at="2026-03-21T00:00:00Z", product_type="API",
+        extra_fields={"endpointPath": "/x", "customerId": "ignored", "statusCode": None},
+    )
+    d = e.to_dict()
+    assert d["productType"] == "API"
+    assert d["endpointPath"] == "/x"
+    assert d["customerId"] == "c"
+    assert "statusCode" not in d
+
+
+@patch("aforo.transport.httpx.Client")
+def test_send_heartbeat_single_event_request_no_retry(mock_client_cls):
+    client = _mock_http(mock_client_cls, _resp(503))
+    hb = _events(1)[0]
+    assert _t().send_heartbeat(hb) is None
+    assert client.post.call_count == 1
+    body = client.post.call_args.kwargs["json"]
+    assert body == {"events": [hb.to_dict()]}
+    assert client.post.call_args.kwargs["headers"]["X-API-Key"] == "k"
+    assert "Authorization" not in client.post.call_args.kwargs["headers"]
+
+
+@patch("aforo.transport.httpx.Client")
+def test_send_heartbeat_swallows_errors_and_returns_body(mock_client_cls):
+    _mock_http(mock_client_cls, httpx.ConnectError("refused"))
+    assert _t().send_heartbeat(_events(1)[0]) is None
+    _mock_http(mock_client_cls, _resp(202, {"accepted": 0, "killedSessionIds": ["s1"]}))
+    assert _t().send_heartbeat(_events(1)[0]) == {"accepted": 0, "killedSessionIds": ["s1"]}

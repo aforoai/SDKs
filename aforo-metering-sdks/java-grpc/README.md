@@ -65,6 +65,7 @@ Builder options on `AforoGrpcBilling.newBuilder()`:
 | `apiKey` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
 | `ingestorUrl` | `String` | *(required)* | Ingestion host. The SDK appends `/v1/ingest/batch`. Use `https://api.aforo.ai`. |
 | `serviceName` | `String` | *(required)* | Logical service name stamped as `grpcService` and into the idempotency key. |
+| `productType` | `String` | `GRPC_API` | Top-level `productType` on every event (required by the ingestor). Trimmed and uppercased; unknown values are passed through. Per call: `record(method, callType, customerId, status, durationMs, productType)` (a null/blank override uses the client value). |
 | `flushCount` | `int` | `50` | Buffered events that trigger an immediate flush. |
 | `flushIntervalMs` | `long` | `5000` | Background flush cadence (ms). |
 | `customerIdExtractor` | `Function<Metadata, String>` | reads `x-customer-id` metadata | How the per-call customer id is resolved. |
@@ -82,7 +83,7 @@ The interceptor maps gRPC method types automatically:
 | Server-streaming | `SERVER_STREAM` |
 | Bidi-streaming | `BIDI_STREAM` |
 
-Each event carries `metricName = "grpc_api.rpc_calls"`, `quantity = 1`, `productType = "GRPC_API"`, plus `grpcService`, `grpcMethod`, `grpcStatusCode` (the gRPC `Status.Code` name, e.g. `OK` / `UNAVAILABLE` / `DEADLINE_EXCEEDED`), `grpcCallType`, `messageCount`, and `executionDurationMs`.
+Each event carries `metricName = "grpc_api.rpc_calls"`, `quantity = 1`, `productType` (default `"GRPC_API"`, see the `productType` option), plus `grpcService`, `grpcMethod`, `grpcStatusCode` (the gRPC `Status.Code` name, e.g. `OK` / `UNAVAILABLE` / `DEADLINE_EXCEEDED`), `grpcCallType`, `messageCount`, and `executionDurationMs`.
 
 > ⚠ The interceptor emits `messageCount = 1` per call. For exact streaming message counts, call `billing.record(method, callType, customerId, status, durationMs)` directly inside your streaming handler instead of relying on the interceptor's default.
 

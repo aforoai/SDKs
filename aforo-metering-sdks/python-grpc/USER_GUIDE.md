@@ -125,7 +125,8 @@ billing.shutdown()   # flushes the final batch before process exit
 | `service_name` | `str` | required | Stamped as `grpcService`. |
 | `flush_interval_sec` | `float` | `5.0` | Background flush cadence. |
 | `flush_count` | `int` | `50` | Buffer size that forces a flush. |
-| `on_error` | `Callable?` | logs | Called on permanent batch failure. |
+| `on_error` | `Callable?` | logs | Called on permanent batch failure, and with the ingestor's `errors[].message` when it rejects events. |
+| `product_type` | `str` | `"GRPC_API"` | Top-level `productType` sent on every event (trimmed and upper-cased; values the SDK does not know are passed through). Override per event with `record(..., product_type=...)`. |
 | `customer_id_extractor` | `Callable?` | reads `x-customer-id` metadata | Resolve the billed customer. |
 
 `record()` arguments: `method`, `call_type`, `customer_id`, `status`, `message_count`, `duration_ms`, `data_bytes=0`. Exports: `AforoGrpcBilling`, `AforoGrpcInterceptor`, `GRPC_STATUS_LABELS`.

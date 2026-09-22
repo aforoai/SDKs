@@ -70,10 +70,11 @@ Constructor arguments for `AforoGrpcBilling(...)`:
 | `service_name` | `str` | — (required) | Fully-qualified gRPC service; stamped as `grpcService`. |
 | `flush_interval_sec` | `float` | `5.0` | Background flush cadence (daemon thread from construction). |
 | `flush_count` | `int` | `50` | Buffer size that triggers an immediate flush. |
-| `on_error` | `Callable[[Exception], None]?` | logs | Called on permanent batch failure. |
+| `on_error` | `Callable[[Exception], None]?` | logs | Called on permanent batch failure, and with the ingestor's `errors[].message` when it rejects events. |
+| `product_type` | `str` | `"GRPC_API"` | Top-level `productType` sent on every event (trimmed and upper-cased; values the SDK does not know are passed through). Override per event with `record(..., product_type=...)`. |
 | `customer_id_extractor` | `Callable[[Any], str?]?` | reads `x-customer-id` from metadata | Resolve the billed customer from the gRPC context. |
 
-Status mapping: `GRPC_STATUS_LABELS` maps numeric codes to descriptor labels (e.g. `OK`, `NOT_FOUND`, `UNAVAILABLE`); the interceptor records the label as `grpcStatusCode`. Retry is fixed at **3 attempts** (`1s / 2s / 4s`); 4xx from the ingestor is non-retryable.
+Status mapping: `GRPC_STATUS_LABELS` maps numeric codes to descriptor labels (e.g. `OK`, `NOT_FOUND`, `UNAVAILABLE`); the interceptor records the label as `grpcStatusCode`. Retry is fixed at **3 attempts** (`1s / 2s` backoff between them); 408 and 5xx are retried, 429 waits for `Retry-After` (capped at 60 s), and any other 4xx is not retried.
 
 ## Walk me through it
 

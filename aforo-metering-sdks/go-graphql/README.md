@@ -76,6 +76,15 @@ Manual recording — when you compute an accurate complexity yourself:
 billing.Record(customerID, query, operationName, durationMs, hasErrors)
 ```
 
+Product type: every event carries a top-level `productType` — `Config.ProductType` (default `"GRAPHQL_API"`). `Record` accepts an optional trailing `graphqlmetering.EventOptions` to override it. Example:
+
+```go
+billing.Record(customerID, query, operationName, durationMs, hasErrors,
+	graphqlmetering.EventOptions{ProductType: "AGENTIC_API"})
+```
+
+Delivery: `POST /v1/ingest/batch` with `{"events":[...]}`, at most 1000 events per request, `X-API-Key` header. Transport errors, `408`, `429` (honouring `Retry-After`) and `5xx` are retried with the same body; any other `4xx` is reported via `OnError` and not retried.
+
 ## Configuration
 
 `Config`:
@@ -87,11 +96,12 @@ billing.Record(customerID, query, operationName, durationMs, hasErrors)
 | `APIKey` | `string` | — (required) | Sent as `X-API-Key: <APIKey>`. |
 | `IngestorURL` | `string` | — (required) | Ingestor base; the SDK appends `/v1/ingest/batch`. Use `https://api.aforo.ai`. |
 | `SchemaVersion` | `string` | none | If set, attached to event metadata as `schemaVersion`. |
+| `ProductType` | `string` | `GRAPHQL_API` | Top-level `productType` on every event (required by the ingestor). Trimmed + upper-cased; unknown values pass through. Overridable per event via `EventOptions`. |
 | `FlushCount` | `int` | `50` | Flush when the buffer reaches this many events. |
 | `FlushInterval` | `time.Duration` | `5s` | Background flush cadence. |
 | `HTTPClient` | `*http.Client` | `&http.Client{Timeout: 10s}` | Override the HTTP client. |
 | `CustomerExtractor` | `func(*http.Request) string` | reads `X-Customer-Id` | How the middleware resolves the customer id per request. |
-| `OnError` | `func(error)` | no-op | Called on a marshal failure or a flush that exhausts its 3 retries (events dropped). |
+| `OnError` | `func(error)` | no-op | Called on a marshal failure, a flush that exhausts its 3 retries, a non-retryable `4xx` (dropped without retry), or a `2xx` whose body reports `failed > 0` — messages include the ingestor's `errors[].message`. |
 
 There are no required-field defaults for the four required values — `New` returns an error if `TenantID`, `ProductID`, `APIKey`, or `IngestorURL` is empty.
 

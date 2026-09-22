@@ -87,6 +87,7 @@ Point the host's `mcpServers` entry at the proxy with a config file:
     "apiKey": "sk_live_xxx",
     "ingestorUrl": "https://api.aforo.ai",
     "agentId": "agent_claude_desktop",
+    "productType": "MCP_SERVER",
     "quotaEnforcement": false
   }
 }
@@ -171,11 +172,13 @@ Precedence: **env var > CLI flag > config file > default.**
 | `--api-key` | `aforo.apiKey` | `AFORO_API_KEY` | — (required) | `X-API-Key: <apiKey>`. |
 | `--ingestor-url` | `aforo.ingestorUrl` | `AFORO_INGESTOR_URL` | — (required) | Base URL; proxy appends `/v1/ingest/batch` and `/api/v1/quota/check`. |
 | `--agent-id` | `aforo.agentId` | `AFORO_AGENT_ID` | — | Agent id override when traffic lacks `_meta.agent_id`. |
+| — | `aforo.customerId` | `AFORO_CUSTOMER_ID` | — | Customer billed when a `tools/call` carries no `_meta.customer_id` (otherwise the agent id is billed). Also the customer on session heartbeats (else the first call's customer, else `system`). |
+| — | `aforo.productType` | `AFORO_PRODUCT_TYPE` | `MCP_SERVER` | Top-level `productType` on every event (required by the ingestor). Trimmed and uppercased. |
 | `--quota-enforcement` | `aforo.quotaEnforcement` | `AFORO_QUOTA_ENFORCEMENT` | `false` | Pre-flight quota gate (fail-open, 50ms budget). |
 | `--debug` | `aforo.debug` | `AFORO_DEBUG` | `false` | Verbose logging. |
 | — | `aforo.flushIntervalMs` | `AFORO_FLUSH_INTERVAL_MS` | `5000` | Timed flush cadence. |
 | — | `aforo.flushCount` | `AFORO_FLUSH_COUNT` | `50` | Force flush at this buffer size. |
-| — | `aforo.heartbeatIntervalMs` | `AFORO_HEARTBEAT_INTERVAL_MS` | `30000` | Deprecated and ignored: session heartbeats are no longer sent (quantity-0 heartbeat events failed the ingestor's validation and took the whole usage batch down). |
+| — | `aforo.heartbeatIntervalMs` | `AFORO_HEARTBEAT_INTERVAL_MS` | `30000` | Interval between session heartbeats (`system.session.heartbeat`, quantity 1). The first tool call starts the session and sends one immediately; a `SESSION_END` is sent on shutdown. Each heartbeat goes in its own `/v1/ingest/batch` request, never inside a usage batch, so the ingestor intercepts it before billing. Best-effort: no retries, failures ignored. |
 
 ## Troubleshooting
 
@@ -186,7 +189,7 @@ Precedence: **env var > CLI flag > config file > default.**
 | `command is required for stdio transport` | stdio mode with no `--command` | Add `--command` (and `--args` if needed). |
 | `upstream URL is required for SSE/HTTP transport` | sse/http mode with no `--upstream` | Add `--upstream`. |
 | Events POST to `…/v1/ingest/batch/v1/ingest/batch` (404) | `--ingestor-url` included the batch path | Pass only the base URL. |
-| Usage rolls up under `"unknown"` | Traffic carries no `_meta.agent_id` | Set `--agent-id` / `AFORO_AGENT_ID`. |
+| Usage rolls up under `"unknown"` | Traffic carries no `_meta.agent_id` | Set `--agent-id` / `AFORO_AGENT_ID`, and `AFORO_CUSTOMER_ID` (or `_meta.customer_id`) to bill a real customer. |
 | `Flush failed — events dropped` in logs | Auth/tenant error (4xx) or retries exhausted (5xx) | Check `apiKey` + `tenantId`; non-408/429 4xx is not retried. |
 | Quota enforcement never denies under load | The 50ms check failed open on timeout | Expected on a slow path; quota is a soft gate. Raise the limit upstream, don't rely on it for hard blocking. |
 | stdio metering misses calls | Server uses non-newline JSON-RPC framing | Confirm metering on a known tool; report the framing your server uses. |

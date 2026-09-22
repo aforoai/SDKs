@@ -115,6 +115,7 @@ billing.record("ListUsers", "SERVER_STREAM", customerId, "OK", durationMs);
 | `apiKey` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
 | `ingestorUrl` | `String` | *(required)* | Host; SDK appends `/v1/ingest/batch`. |
 | `serviceName` | `String` | *(required)* | `grpcService` field + idempotency key. |
+| `productType` | `String` | `GRPC_API` | Top-level `productType` on every event; trimmed + uppercased. Per call: `record(method, callType, customerId, status, durationMs, productType)` (a null/blank override uses the client value). |
 | `flushCount` | `int` | `50` | Events per immediate flush. |
 | `flushIntervalMs` | `long` | `5000` | Background flush cadence (ms). |
 | `customerIdExtractor` | `Function<Metadata, String>` | `x-customer-id` metadata | Per-call customer-id resolution. |

@@ -34,6 +34,8 @@ const billing = new AforoMcpBilling({
   productId: 'prod_mcp_001',
   apiKey: process.env.AFORO_API_KEY!,
   ingestorUrl: 'https://api.aforo.ai',
+  productType: 'MCP_SERVER',   // default; sent as top-level productType on every event
+  customerId: 'cust_acme',     // optional; else _meta.customer_id, else the agentId
 });
 
 server.setRequestHandler(
@@ -48,7 +50,7 @@ server.setRequestHandler(
 process.on('SIGTERM', () => billing.shutdown());
 ```
 
-The wrapper reads `agent_id` and `session_id` from `request.params._meta`. If a `session_id` is present, the first wrapped call records it as the active session. Session heartbeats are no longer sent: they were `system.session.heartbeat` events with `quantity: 0` sent in the usage batch, and the ingestor rejects quantity 0 and fails the whole batch with 400, taking every real event batched with it down. The ingestor has no dedicated heartbeat endpoint.
+The wrapper reads `agent_id`, `session_id` and `customer_id` from `request.params._meta`. If a `session_id` is present, the first wrapped call starts the session. Session heartbeats (`system.session.heartbeat`) are sent once when the session starts, every `heartbeatIntervalMs` (30s) while it is active, and as a final `SESSION_END` on `endSession()`. Each carries quantity 1, top-level `sessionId`, `productType` and `sessionBoundary`, and the session's customer (`startSession({ customerId })`, the first call's customer, the `customerId` config, else `"system"`). Each heartbeat is POSTed in its **own** `/v1/ingest/batch` request, never inside a usage batch, so the ingestor always intercepts it before billing. Heartbeats are best-effort: sent once, failures reported to `onError` and otherwise ignored, never affecting usage delivery. The timer is unref'd and stops on `endSession()`/`shutdown()`.
 
 > ⚠ `ingestorUrl` is the **base** URL — the SDK appends `/v1/ingest/batch` itself. Pass `https://api.aforo.ai`, not `https://api.aforo.ai/v1/ingest/batch`. A trailing slash is stripped for you.
 
@@ -62,15 +64,18 @@ Pass these to `new AforoMcpBilling({...})`:
 | `productId` | `string` | — (required) | The MCP_SERVER product these events bill against. Carried in event metadata. |
 | `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. |
 | `ingestorUrl` | `string` | — (required) | Base ingestor URL. The SDK appends `/v1/ingest/batch`. |
+| `productType` | `string` | `MCP_SERVER` | Top-level `productType` on every event (required by the ingestor). Per-call override: `recordToolInvocation(..., { productType })`. Trimmed and uppercased. |
+| `customerId` | `string` | unset | Customer billed when a call has no `_meta.customer_id`. Unset: the agentId is billed. Also the heartbeat customer. |
+| `agentId` | `string` | `"unknown"` | Agent id used when a call has no `_meta.agent_id`. |
 | `entitlementMode` | `'SERVER_LEVEL' \| 'TOOL_LEVEL'` | unset | Reserved for entitlement scoping. Accepted but not enforced client-side at this version. |
 | `sessionConfig.idleTimeoutSec` | `number` | unset | Reserved for session idle/duration policy. Accepted; not enforced client-side at this version. |
 | `sessionConfig.maxDurationSec` | `number` | unset | Reserved; same as above. |
 | `flushIntervalMs` | `number` | `5000` | Periodic flush interval. A timer flushes the buffer on this cadence. |
-| `flushCount` | `number` | `50` | Force a flush once the buffer reaches this many events. |
-| `heartbeatIntervalMs` | `number` | `30000` | Deprecated, ignored — heartbeats are no longer sent. |
-| `heartbeatEnabled` | `boolean` | `true` | Deprecated, ignored — heartbeats are no longer sent. |
-| `onError` | `(err: Error) => void` | logs to `console.error` | Called on a non-retryable 4xx or after retries are exhausted. |
-| `onSessionKilled` | `(sessionId, reason) => void` | unset | Fired when a batch response lists the active session in `killedSessionIds`. |
+| `flushCount` | `number` | `50` | Force a flush once the buffer reaches this many events (capped at 1000). |
+| `heartbeatIntervalMs` | `number` | `30000` | Interval between session heartbeats. |
+| `heartbeatEnabled` | `boolean` | `true` | Send session heartbeats while a session is active. |
+| `onError` | `(err: Error) => void` | logs to `console.error` | Called on a non-retryable 4xx, after retries are exhausted, on per-event rejections, on dropped invalid events and on failed heartbeats. |
+| `onSessionKilled` | `(sessionId, reason) => void` | unset | Fired when a batch or heartbeat response lists the active session in `killedSessionIds`. |
 
 ## Walk me through it
 
@@ -78,6 +83,6 @@ Step-by-step from install to a verified metered tool call: [USER_GUIDE.md](USER_
 
 ## What this doesn't cover
 
-This SDK **records** tool usage and reacts to a server kill signal — it does **not** pre-flight a quota check or block a call before it runs. Pre-flight quota gating lives in `@aforo/mcp-proxy` (the sidecar), not here. Delivery is best-effort with a 3-attempt exponential backoff; after that the batch is handed to `onError` and dropped. Heartbeats report uptime and (where the runtime exposes it) process heap — they are not an SLA monitor.
+This SDK **records** tool usage and reacts to a server kill signal — it does **not** pre-flight a quota check or block a call before it runs. Pre-flight quota gating lives in `@aforo/mcp-proxy` (the sidecar), not here. Delivery is best-effort with a 3-attempt exponential backoff (408/429/5xx/network errors; `Retry-After` honoured on 429; other 4xx are not retried); after that the batch is handed to `onError` and dropped. Heartbeats report uptime and (where the runtime exposes it) process heap — they are not an SLA monitor.
 
-> Source note: `package.json` declares version `1.0.0` and the docs track that. The source carries an internal `SDK_VERSION = '1.1.0'` constant (formerly stamped into heartbeat metadata), and `recordToolInvocation` stamps `sdkVersion: '1.0.0'` in its own metadata — an internal inconsistency that is metadata-only and doesn't affect behavior. The authoritative package version is `1.0.0`.
+> Source note: `package.json` declares version `1.0.0` and the docs track that. The source carries an internal `SDK_VERSION = '1.1.0'` constant (stamped into heartbeat metadata), and `recordToolInvocation` stamps `sdkVersion: '1.0.0'` in its own metadata — an internal inconsistency that is metadata-only and doesn't affect behavior. The authoritative package version is `1.0.0`.
