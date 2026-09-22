@@ -36,7 +36,7 @@ const billing = new AforoGraphQlBilling({
   tenantId: 'tenant_acme',
   productId: 'prod_graphql_001',
   apiKey: process.env.AFORO_API_KEY!,
-  ingestorUrl: 'https://usage-ingestor.aforo.ai', // SDK appends /v1/ingest/batch
+  ingestorUrl: 'https://api.aforo.ai', // SDK appends /v1/ingest/batch
   schemaVersion: 'v2.1',
 });
 
@@ -64,7 +64,7 @@ const billing = new AforoGraphQlBilling({
   tenantId: 'tenant_acme',
   productId: 'prod_graphql_001',
   apiKey: process.env.AFORO_API_KEY!,
-  ingestorUrl: 'https://usage-ingestor.aforo.ai',
+  ingestorUrl: 'https://api.aforo.ai',
 });
 
 const app = express();
@@ -74,7 +74,7 @@ app.use('/graphql', billing.middleware(), createHandler({ schema }));
 
 > The middleware records in `res.end`, after the response is produced. It never blocks or fails the request — any error inside the metering path is swallowed.
 
-Every recorded operation emits one event with `metricName: "graphql_api.operations"`, `quantity: 1`, and the operation's type/name/complexity/field-count attached. Ships to `POST https://usage-ingestor.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
+Every recorded operation emits one event with `metricName: "graphql_api.operations"`, `quantity: 1`, and the operation's type/name/complexity/field-count attached. Ships to `POST https://api.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
 
 ## Configuration
 
@@ -85,15 +85,16 @@ Every recorded operation emits one event with `metricName: "graphql_api.operatio
 | `tenantId` | `string` | — (required) | Aforo tenant. Sent as the `X-Tenant-Id` header. Never read from a client header. |
 | `productId` | `string` | — (required) | Aforo product id; attached to each event's `metadata.productId`. |
 | `apiKey` | `string` | — (required) | Aforo API key. Sent as `X-API-Key: <apiKey>`. |
-| `ingestorUrl` | `string` | — (required) | Ingestion base URL. The SDK appends `/v1/ingest/batch` (trailing slash trimmed). Use `https://usage-ingestor.aforo.ai`. |
+| `ingestorUrl` | `string` | — (required) | Ingestion base URL. The SDK appends `/v1/ingest/batch` (trailing slash trimmed). Use `https://api.aforo.ai`. |
+| `productType` | `string` | `'GRAPHQL_API'` | Aforo product type sent as top-level `productType` on every event (trimmed + uppercased; unknown values pass through). Override via `record({ productType })`, `billing.middleware({ productType })` or `aforoApolloPlugin(billing, { productType })`. |
 | `schemaVersion` | `string` | `undefined` | Optional schema version string; copied into each event's `metadata.schemaVersion`. |
 | `customerIdExtractor` | `(context) => string \| undefined` | reads `x-customer-id` from the request/context headers | Resolve the Aforo customer id per operation. Return `undefined` and the operation is not metered. |
 | `complexityScorer` | `(doc, operationName?) => { complexity, fieldCount }` | `fieldCount + 5 × maxDepth` | Override the complexity formula. Receives the parsed `DocumentNode`. |
 | `flushCount` | `number` | `50` | Buffered events that trigger an immediate flush. |
 | `flushIntervalMs` | `number` | `5000` | Max ms before a partial batch is flushed by the background timer. |
-| `onError` | `(error: Error) => void` | logs to `console.error` | Called when a flush fails terminally (after 3 retries). |
+| `onError` | `(error: Error) => void` | logs to `console.error` | Called when a batch is dropped: after 3 attempts on network errors / 408 / 429 (honouring `Retry-After`) / 5xx, immediately on any other 4xx (not retried), and when a 202 reports per-event failures (`errors[].message`). |
 
-Exported symbols: `AforoGraphQlBilling`, `aforoApolloPlugin(billing)`, `defaultComplexityScorer(doc, operationName?)`, and the `AforoGraphQlConfig` type.
+Exported symbols: `AforoGraphQlBilling`, `aforoApolloPlugin(billing, options?)`, `defaultComplexityScorer(doc, operationName?)`, and the `AforoGraphQlConfig` type.
 
 ## Walk me through it
 

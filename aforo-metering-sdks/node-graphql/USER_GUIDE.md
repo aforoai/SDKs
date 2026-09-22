@@ -44,12 +44,12 @@ const billing = new AforoGraphQlBilling({
   tenantId: 'tenant_acme',
   productId: 'prod_graphql_001',
   apiKey: process.env.AFORO_API_KEY!,
-  ingestorUrl: 'https://usage-ingestor.aforo.ai', // SDK appends /v1/ingest/batch
+  ingestorUrl: 'https://api.aforo.ai', // SDK appends /v1/ingest/batch
   schemaVersion: 'v2.1',
 });
 ```
 
-> ⚠ `ingestorUrl` is the **base** URL. Don't put `/v1/ingest/batch` here — the SDK appends it. `https://usage-ingestor.aforo.ai/v1/ingest/batch` would become `…/v1/ingest/batch/v1/ingest/batch`.
+> ⚠ `ingestorUrl` is the **base** URL. Don't put `/v1/ingest/batch` here — the SDK appends it. `https://api.aforo.ai/v1/ingest/batch` would become `…/v1/ingest/batch/v1/ingest/batch`.
 
 ## Step 3 — Wire it into your server
 
@@ -125,11 +125,11 @@ process.on('SIGINT',  async () => { await billing.shutdown(); process.exit(0); }
 
 > ⚠ Without `shutdown()`, a process that exits inside the 5-second window drops the buffered batch. Wire it up before you trust the counts.
 
-The SDK POSTs the batch to `https://usage-ingestor.aforo.ai/v1/ingest/batch` with:
+The SDK POSTs the batch to `https://api.aforo.ai/v1/ingest/batch` with:
 - `X-API-Key: <your api key>`
 - `X-Tenant-Id: tenant_acme`
 
-Confirm it arrived in the Aforo console under the product's usage events (filter to `productType = GRAPHQL_API`). If a flush fails 3× (1s/2s/4s backoff), the `onError` callback fires and the batch is dropped — watch your logs:
+Confirm it arrived in the Aforo console under the product's usage events (filter to `productType = GRAPHQL_API`). Network errors, 408, 429 (honouring `Retry-After`) and 5xx are retried 3× (1s/2s/4s backoff); any other 4xx is not retried. When a batch is dropped, or a 202 reports per-event failures (`errors[].message`), the `onError` callback fires — watch your logs:
 
 ```ts
 const billing = new AforoGraphQlBilling({
@@ -146,6 +146,7 @@ const billing = new AforoGraphQlBilling({
 | `productId` | `string` | — (required) | Aforo product id; into `metadata.productId`. |
 | `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. |
 | `ingestorUrl` | `string` | — (required) | Base URL; SDK appends `/v1/ingest/batch`. |
+| `productType` | `string` | `'GRAPHQL_API'` | Top-level `productType` on every event (trimmed + uppercased; unknown values pass through). Override via `record({ productType })`, `billing.middleware({ productType })` or `aforoApolloPlugin(billing, { productType })`. |
 | `schemaVersion` | `string` | `undefined` | Copied into `metadata.schemaVersion`. |
 | `customerIdExtractor` | `(context) => string \| undefined` | reads `x-customer-id` | Resolve the customer per operation; `undefined` → skip. |
 | `complexityScorer` | `(doc, operationName?) => { complexity, fieldCount }` | `fieldCount + 5 × maxDepth` | Replace the complexity formula. |
@@ -159,7 +160,7 @@ const billing = new AforoGraphQlBilling({
 |---|---|---|
 | No events at all | No customer id resolved | Set the `x-customer-id` header, or supply a `customerIdExtractor`. Operations without a customer are skipped by design. |
 | Events stop after a deploy | Process exited before the 5s timer flushed | Call `await billing.shutdown()` on `SIGTERM`/`SIGINT`. |
-| `…/v1/ingest/batch/v1/ingest/batch` in logs | `ingestorUrl` already includes the path | Set `ingestorUrl` to the base host only (`https://usage-ingestor.aforo.ai`). |
+| `…/v1/ingest/batch/v1/ingest/batch` in logs | `ingestorUrl` already includes the path | Set `ingestorUrl` to the base host only (`https://api.aforo.ai`). |
 | Middleware records nothing | `express.json()` runs after `billing.middleware()`, so `req.body.query` is empty | Register `express.json()` first. |
 | Complexity is always low/0 | Custom scorer returns wrong shape, or operation has few fields | Confirm your `complexityScorer` returns `{ complexity, fieldCount }`; the default counts AST fields + 5×depth. |
 | `onError` firing repeatedly | Wrong `apiKey`/`tenantId`, or ingestor unreachable | Verify the API key and tenant id; confirm the host resolves and accepts `POST /v1/ingest/batch`. |

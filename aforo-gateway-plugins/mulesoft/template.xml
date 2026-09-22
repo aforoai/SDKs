@@ -21,6 +21,9 @@
     - The endpoint is a full URL (aforo_endpoint), used via the request's
       url attribute; it was previously put in host="" with port 443.
     - metricName = default_metric (a catalog metric), not "{method} {path}".
+    - productType = product_type (default "API", trimmed + upper-cased) on
+      every event; the ingestor requires it.
+    - occurredAt is shifted to UTC and formatted with a literal Z.
 -->
 <mule xmlns="http://www.mulesoft.org/schema/mule/core"
       xmlns:http="http://www.mulesoft.org/schema/mule/http"
@@ -69,7 +72,8 @@
                                             "metricName": ('${default_metric}' default 'api_calls'),
                                             "quantity": vars.quantity,
                                             "idempotencyKey": correlationId,
-                                            "occurredAt": now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"},
+                                            "occurredAt": (now() >> "UTC") as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"},
+                                            "productType": (if (trim('${product_type}') == '') 'API' else upper(trim('${product_type}'))),
                                             ("metadata": {
                                                 "gateway": "mulesoft",
                                                 "method": attributes.method default "UNKNOWN",

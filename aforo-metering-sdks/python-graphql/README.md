@@ -40,7 +40,7 @@ billing = AforoGraphQlBilling(
     tenant_id="tenant_acme",
     product_id="prod_graphql_gateway",
     api_key=os.environ["AFORO_API_KEY"],
-    ingestor_url="https://usage-ingestor.aforo.ai",
+    ingestor_url="https://api.aforo.ai",
     schema_version="v2.1",
 )
 
@@ -57,15 +57,15 @@ billing = AforoGraphQlBilling(
     tenant_id="tenant_acme",
     product_id="prod_graphql_gateway",
     api_key=os.environ["AFORO_API_KEY"],
-    ingestor_url="https://usage-ingestor.aforo.ai",
+    ingestor_url="https://api.aforo.ai",
 )
 app = Starlette(routes=[...])
 app = asgi_middleware(billing, path="/graphql")(app)   # only intercepts /graphql
 ```
 
-Works with Ariadne, graphql-core HTTP, Graphene-ASGI, and custom ASGI GraphQL servers. Each metered operation produces one `graphql_api.operations` event POSTed to `https://usage-ingestor.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
+Works with Ariadne, graphql-core HTTP, Graphene-ASGI, and custom ASGI GraphQL servers. Each metered operation produces one `graphql_api.operations` event POSTed to `https://api.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
 
-> ⚠ Events are sent to the ingestor's **`/v1/ingest/batch`** path as `{"events": [...]}`, at most 1000 events per request (larger buffers are split). Set `ingestor_url` to the host only — the SDK appends the path. Use `https://usage-ingestor.aforo.ai`.
+> ⚠ Events are sent to the ingestor's **`/v1/ingest/batch`** path as `{"events": [...]}`, at most 1000 events per request (larger buffers are split). Set `ingestor_url` to the host only — the SDK appends the path. Use `https://api.aforo.ai`.
 
 > `tenant_id` is fixed from your config and sent as a header — never read from a caller-controlled value. The default customer-ID extractor reads `x-customer-id` from request headers (or the Strawberry context); operations with no resolvable customer ID are **not** metered.
 
@@ -82,11 +82,12 @@ Constructor arguments for `AforoGraphQlBilling(...)`:
 | `schema_version` | `str?` | `None` | Stamped on each event for versioned-schema reporting. |
 | `flush_interval_sec` | `float` | `5.0` | Background flush cadence (a daemon thread runs from construction). |
 | `flush_count` | `int` | `50` | Buffer size that triggers an immediate flush. |
-| `on_error` | `Callable[[Exception], None]?` | logs | Called on permanent batch failure. |
+| `on_error` | `Callable[[Exception], None]?` | logs | Called on permanent batch failure, and with the ingestor's `errors[].message` when it rejects events. |
+| `product_type` | `str` | `"GRAPHQL_API"` | Top-level `productType` sent on every event (trimmed and upper-cased; values the SDK does not know are passed through). Override per event with `record(..., product_type=...)`. |
 | `customer_id_extractor` | `Callable[[Any], str?]?` | reads `x-customer-id` | Resolve the billed customer from the request/context. |
 | `complexity_scorer` | `Callable[[doc, op_name], (int, int)]?` | `field_count + 5 × max_depth` | Returns `(complexity, field_count)`. |
 
-Retry is fixed at **3 attempts** with `1s / 2s / 4s` backoff; 4xx is non-retryable.
+Retry is fixed at **3 attempts** (`1s / 2s` backoff between them); 408 and 5xx are retried, 429 waits for `Retry-After` (capped at 60 s), and any other 4xx is not retried.
 
 ## Walk me through it
 

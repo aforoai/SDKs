@@ -4,7 +4,7 @@
 
 ## What you'll build
 
-A Java service that emits one Aforo usage event per billable action and ships those events in batches to `https://usage-ingestor.aforo.ai/v1/ingest/batch`. By the end you'll have a metered event confirmed as landed in Aforo.
+A Java service that emits one Aforo usage event per billable action and ships those events in batches to `https://api.aforo.ai/v1/ingest/batch`. By the end you'll have a metered event confirmed as landed in Aforo.
 
 ## Prerequisites
 
@@ -64,7 +64,7 @@ public class Demo {
 }
 ```
 
-`track(...)` is non-blocking — it enqueues and returns. The event ships on the next 5-second flush, on reaching 50 buffered events, or when `close()` runs. The first two builder args are required (`customerId`, `metricName`); `quantity` defaults to `1`.
+`track(...)` is non-blocking — it enqueues and returns. The event ships on the next 5-second flush, on reaching 50 buffered events, or when `close()` runs. The first two builder args are required (`customerId`, `metricName`); `quantity` defaults to `1` and must be `> 0`. Every event carries a top-level `productType`: the client default (`API`, or `AforoOptions.productType(...)`) unless you override it per event with `.productType("AI_AGENT")`. `track(...)` drops (with a warning) events with a blank `customerId`/`metricName` or `quantity <= 0`, because the ingestor would reject the whole batch.
 
 > ⚠ If you don't pass an `idempotencyKey`, the SDK derives a deterministic one from `customerId + metricName + quantity + occurredAt`. Two identical events generated in the same millisecond collapse to one. Pass an explicit `.idempotencyKey(...)` if you need to keep distinct same-instant events apart.
 
@@ -77,7 +77,8 @@ Add the same dependency, then set the properties:
 aforo:
   enabled: true                 # MUST be exactly "true" — auto-config is off otherwise
   api-key: ${AFORO_API_KEY}
-  base-url: https://usage-ingestor.aforo.ai
+  base-url: https://api.aforo.ai
+  product-type: API             # default; e.g. AGENTIC_API
 ```
 
 That's the whole wiring. `AforoMeteringAutoConfiguration` registers:
@@ -88,7 +89,7 @@ That's the whole wiring. `AforoMeteringAutoConfiguration` registers:
 The filter records one event per request **after** `filterChain.doFilter(...)` returns:
 
 - `metricName` = `aforo.metric-name` (default `api_calls`), or whatever an `AforoServletFilter.MetricNameResolver` bean returns for the request. The metric must exist in your tenant's Aforo catalog: the ingestor rejects an unknown metric, and because it validates a batch as a whole, one rejected event fails every event in that batch. (Earlier versions sent `"<METHOD> <normalized-path>"`, which no catalog contains.)
-- `quantity` = `1`, `metadata` = `{"gateway":"java-servlet","status":<httpStatus>}`.
+- `quantity` = `1`, `metadata` = `{"gateway":"java-servlet","status":<httpStatus>}`, plus top-level `endpointPath` (matched route pattern, else the normalized path; no query string; at most 512 chars), `httpMethod`, `statusCode`, `responseTimeMs`, and `productType` (`AforoServletFilter.productType(...)`, else `aforo.product-type`, default `API`).
 - These paths are skipped by default: `/health`, `/ready`, `/metrics`, `/favicon.ico`, `/actuator`. `OPTIONS` (CORS preflight) requests are never metered.
 
 > ⚠ The filter resolves the customer in this order: an `AforoServletFilter.CustomerIdResolver` bean if you declared one; otherwise the Spring Security principal (only when `aforo.use-principal-as-customer-id: true`) → the `aforo.customer-id-header` header (default `X-Customer-Id`). The caller's `X-Api-Key` is never used — it is a secret, not a customer id. If none resolves, the request is **not** metered (so health checks and unauthenticated probes stay silent).
@@ -109,15 +110,16 @@ A `sent` count equal to what you tracked and `failed == 0` means the ingestor re
 
 - Open the Aforo console → **Ingestion → Recent Events** and filter by your `customerId` (`cust_acme_001`) and `metricName` (`api_calls`). Your event appears within a few seconds of the flush.
 
-To watch the wire during local debugging, point `base-url` / `baseUrl` at a request inspector and confirm the body is `{"events":[{"customerId":...,"metricName":...,"quantity":...,"idempotencyKey":...,"occurredAt":...}]}` with `X-API-Key: <key>`.
+To watch the wire during local debugging, point `base-url` / `baseUrl` at a request inspector and confirm the body is `{"events":[{"customerId":...,"metricName":...,"quantity":...,"idempotencyKey":...,"occurredAt":...,"productType":"API"}]}` with `X-API-Key: <key>`.
 
 ## Configuration reference
 
 | Option (manual) | Spring property | Type | Default | What it does |
 |---|---|---|---|---|
 | `apiKey` (ctor) | `aforo.api-key` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
-| `baseUrl(...)` | `aforo.base-url` | `String` | `https://usage-ingestor.aforo.ai` | Ingestion host; SDK appends `/v1/ingest/batch`. |
-| `flushCount(...)` | `aforo.flush-count` | `int` | `50` | Buffer size that triggers an immediate flush. |
+| `baseUrl(...)` | `aforo.base-url` | `String` | `https://api.aforo.ai` | Ingestion host; SDK appends `/v1/ingest/batch`. |
+| `productType(...)` | `aforo.product-type` | `String` | `API` | Top-level `productType` on every event; per-event `TrackEvent.Builder.productType(...)` wins. |
+| `flushCount(...)` | `aforo.flush-count` | `int` | `50` | Buffer size that triggers an immediate flush; clamped to 1–1000 per batch. |
 | `flushIntervalMs(...)` | `aforo.flush-interval-ms` | `long` | `5000` | Background flush cadence (ms). |
 | `maxQueueSize(...)` | — | `int` | `10000` | Ring-buffer capacity; oldest events overwritten when full. |
 | `maxRetries(...)` | — | `int` | `3` | Retries per batch on 5xx / 408 / 429. |

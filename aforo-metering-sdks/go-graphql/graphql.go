@@ -28,6 +28,7 @@ type Config struct {
 	ProductID         string
 	APIKey            string
 	IngestorURL       string
+	ProductType       string // default "GRAPHQL_API"; sent as top-level productType on every event
 	SchemaVersion     string // optional, attached to event metadata
 	FlushCount        int
 	FlushInterval     time.Duration
@@ -50,6 +51,10 @@ type Billing struct {
 func New(cfg Config) (*Billing, error) {
 	if cfg.TenantID == "" || cfg.ProductID == "" || cfg.APIKey == "" || cfg.IngestorURL == "" {
 		return nil, errors.New("graphqlmetering: TenantID, ProductID, APIKey, IngestorURL are required")
+	}
+	cfg.ProductType = normalizeProductType(cfg.ProductType)
+	if cfg.ProductType == "" {
+		cfg.ProductType = DefaultProductType
 	}
 	if cfg.FlushCount == 0 {
 		cfg.FlushCount = 50
@@ -100,7 +105,7 @@ func (b *Billing) Middleware(next http.Handler) http.Handler {
 		if err := json.Unmarshal(bodyBytes, &req); err != nil || req.Query == "" {
 			return
 		}
-		customerID := b.cfg.CustomerExtractor(r)
+		customerID := strings.TrimSpace(b.cfg.CustomerExtractor(r))
 		if customerID == "" {
 			return
 		}
@@ -109,7 +114,9 @@ func (b *Billing) Middleware(next http.Handler) http.Handler {
 }
 
 // Record emits one billing event manually. Use from custom executors.
-func (b *Billing) Record(customerID, query, operationName string, durationMs int64, hasErrors bool) {
+// An optional EventOptions overrides the event's productType.
+func (b *Billing) Record(customerID, query, operationName string, durationMs int64, hasErrors bool, opts ...EventOptions) {
+	customerID = strings.TrimSpace(customerID)
 	if customerID == "" || query == "" {
 		return
 	}
@@ -130,7 +137,7 @@ func (b *Billing) Record(customerID, query, operationName string, durationMs int
 		"quantity":            1,
 		"occurredAt":          now.Format(time.RFC3339Nano),
 		"idempotencyKey":      capKey(fmt.Sprintf("gql:%s:%s:%s:%d:%s", b.cfg.TenantID, b.cfg.ProductID, opName, now.UnixMilli(), randomSuffix())),
-		"productType":         "GRAPHQL_API",
+		"productType":         b.productTypeFor(opts),
 		"gqlOperationType":    opType,
 		"gqlOperationName":    opName,
 		"gqlComplexity":       complexity,
@@ -186,37 +193,6 @@ func (b *Billing) flush() {
 		}
 		b.send(batch[start:end])
 	}
-}
-
-// send POSTs one chunk of at most maxBatchSize events. The body is marshalled
-// once, so every retry carries the same idempotencyKeys.
-func (b *Billing) send(chunk []map[string]any) {
-	body, err := json.Marshal(map[string]any{"events": chunk})
-	if err != nil {
-		b.cfg.OnError(err)
-		return
-	}
-	for attempt := 1; attempt <= 3; attempt++ {
-		req, _ := http.NewRequest(http.MethodPost, b.url, bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-API-Key", b.cfg.APIKey)
-		req.Header.Set("X-Tenant-Id", b.cfg.TenantID)
-		resp, err := b.client.Do(req)
-		if err == nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				return
-			}
-		} else if attempt == 3 {
-			b.cfg.OnError(err)
-			return
-		}
-		if attempt < 3 {
-			time.Sleep(time.Duration(1<<(attempt-1)) * time.Second)
-		}
-	}
-	b.cfg.OnError(fmt.Errorf("graphqlmetering: flush exhausted retries (dropped %d events)", len(chunk)))
 }
 
 func (b *Billing) Shutdown() error {

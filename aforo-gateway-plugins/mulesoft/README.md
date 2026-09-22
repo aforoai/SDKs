@@ -8,7 +8,7 @@ Anypoint custom policies that meter Standard API requests and MCP Server tool in
 >
 > Nothing in this folder can be deployed to Anypoint as-is, and nothing here has been run on a gateway:
 >
-> - The `*.yaml` files are **not a deployable Anypoint policy format**. A Mule 4 custom policy is a Maven project (`mule-policy` packaging) containing a policy definition YAML (`<name>.yaml` with `id`, `configuration`, …) **plus** a `template.xml` that implements it; the definitions here embed DataWeave/pseudo-flows in YAML, which Anypoint does not execute. They also still send `Authorization: Bearer` + `X-Tenant-Id` and route-shaped metric names (`{method} {path}`), both of which the Aforo ingestor rejects.
+> - The `*.yaml` files are **not a deployable Anypoint policy format**. A Mule 4 custom policy is a Maven project (`mule-policy` packaging) containing a policy definition YAML (`<name>.yaml` with `id`, `configuration`, …) **plus** a `template.xml` that implements it; the definitions here embed DataWeave/pseudo-flows in YAML, which Anypoint does not execute. They also define no transport (no `X-API-Key` header is set anywhere in them) and emit route-shaped metric names (`{method} {path}`), which the Aforo ingestor rejects.
 > - `template.xml` uses elements that do not exist in Mule 4 policies (`<before-call>`, `<after-call>`) and `${...}` placeholders instead of `{{{...}}}`. Only its request contract was corrected (see CHANGELOG); it is a reference, not a policy.
 > - `jwt-validation-config.yaml` carries its Mule flow as a comment to paste into an app — that is not how a gateway policy is applied.
 >
@@ -51,7 +51,7 @@ Publish each policy to your Anypoint organization (Exchange), then apply it to a
 2. Apply `aforo-metering` to the same API — Anypoint enforces it goes after JWT validation.
 3. Set the metering policy's properties (see Configuration).
 
-The descriptors *intend* this batch in the response phase (they currently send it with `Authorization: Bearer` + `X-Tenant-Id` and a route-shaped metric, which the ingestor rejects — see the notice above; the correct contract is `X-API-Key` only and a catalog metric name):
+The descriptors *intend* this batch in the response phase (they define no transport and use a route-shaped metric, which the ingestor rejects — see the notice above; the correct contract is `X-API-Key` only and a catalog metric name):
 
 ```json
 {
@@ -63,6 +63,7 @@ The descriptors *intend* this batch in the response phase (they currently send i
       "quantity": 1,
       "idempotencyKey": "<attributes.requestId>",
       "occurredAt": "2026-06-29T10:15:42.318Z",
+      "productType": "API",
       "endpointPath": "/v1/accounts/123",
       "httpMethod": "GET",
       "statusCode": 200,
@@ -76,7 +77,7 @@ The descriptors *intend* this batch in the response phase (they currently send i
 
 `customerId` is `vars.aforo.customerId` (the verified JWT `customer_id`/`sub`). With no authenticated identity, `events` is `[]`.
 
-When `mcp-enabled = true` and the body is a JSON-RPC `tools/call`, the event carries `metricName: "mcp_server.tool_invocations"`, `productType: "MCP_SERVER"`, `toolName` (`params.name`), `agentId` (`params._meta.agent_id`), and `sessionId` (`Mcp-Session-Id` header).
+When `mcp-enabled = true` and the body is a JSON-RPC `tools/call`, the event carries `metricName: "mcp_server.tool_invocations"`, `toolName` (`params.name`), `agentId` (`params._meta.agent_id`), and `sessionId` (`Mcp-Session-Id` header), with `productType: "MCP_SERVER"` when both `toolName` and `agentId` are present (the ingestor requires both for `MCP_SERVER`); otherwise it keeps `product-type`.
 
 ## Configuration
 
@@ -84,9 +85,10 @@ Set these as policy properties in Anypoint API Manager for the metering policy (
 
 | Property | Used by | Default | What it does |
 |---|---|---|---|
-| `aforo-endpoint` | metering | — (required) | Aforo ingestor batch URL, e.g. `https://usage-ingestor.aforo.ai/v1/ingest/batch`. |
-| `aforo-api-key` | metering | — (required, sensitive) | Aforo API key. Must be sent as `X-API-Key` (the descriptors still send it as Bearer — not fixed). |
+| `aforo-endpoint` | metering | — (required) | Aforo ingestor batch URL, e.g. `https://api.aforo.ai/v1/ingest/batch`. |
+| `aforo-api-key` | metering | — (required, sensitive) | Aforo API key. Must be sent as `X-API-Key` only (`template.xml` does; the descriptors define no transport — not fixed). |
 | `aforo-tenant-id` | metering, margin-guard | — (required) | Admin-pinned tenant; used as the tenant fallback when the JWT carries no `tenant_id`. |
+| `product-type` | metering | `API` | `productType` on every event (trimmed, upper-cased); required by the ingestor. `template.xml` reads it as `${product_type}`. |
 | `mcp-enabled` | metering | `false` | Enable JSON-RPC `tools/call` detection. |
 | `mcp-product-id` | metering | — | Aforo product ID stamped into MCP event metadata. |
 | `jwks-uri` | jwt-validation | — (required) | Aforo JWKS URL, e.g. `https://auth.aforo.ai/.well-known/jwks.json`. |

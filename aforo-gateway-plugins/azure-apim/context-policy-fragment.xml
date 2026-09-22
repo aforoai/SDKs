@@ -25,6 +25,11 @@
                               APIM subscription id (context.Subscription.Id)
                          Never the subscription KEY (a secret), never a request
                          header, never a placeholder like "unknown".
+    aforo-product-type — productType stamped on every event (trimmed,
+                         upper-cased; unknown values passed through). A
+                         set-variable of the same name placed before this
+                         fragment (per-API override) wins, else the Named
+                         Value aforo-product-type, else "API" (also for "none").
     aforo-mcp-body     — the request body, captured only when
                          the Named Value aforo-mcp-enabled is "true" and the method is POST.
                          The request body is not readable in <outbound> unless
@@ -37,6 +42,7 @@
         Named Values are limited to 4096 characters. Use "none" if every
         caller presents an Aforo JWT.
     aforo-mcp-enabled — "true" to capture the body for MCP detection.
+    aforo-product-type — productType on every event, e.g. "API" ("none" = API).
 
   Values must not contain double quotes or backslashes: they are substituted
   into C# string literals.
@@ -55,6 +61,14 @@
             if (entry.Substring(0, idx).Trim() == subId) { return entry.Substring(idx + 1).Trim(); }
         }
         return &quot;&quot;;
+    }" />
+    <!-- productType for every event: a per-API set-variable aforo-product-type
+         placed before this fragment wins, else the Named Value, else "API". -->
+    <set-variable name="aforo-product-type" value="@{
+        var v = context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-product-type&quot;, &quot;&quot;);
+        if (string.IsNullOrWhiteSpace(v)) { v = &quot;{{aforo-product-type}}&quot;; }
+        v = (v ?? &quot;&quot;).Trim().ToUpperInvariant();
+        return (v.Length == 0 || v == &quot;NONE&quot;) ? &quot;API&quot; : v;
     }" />
     <choose>
         <when condition="@(&quot;{{aforo-mcp-enabled}}&quot; == &quot;true&quot; &amp;&amp; context.Request.Method == &quot;POST&quot; &amp;&amp; context.Request.Body != null)">

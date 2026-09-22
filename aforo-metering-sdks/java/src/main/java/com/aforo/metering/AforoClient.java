@@ -29,11 +29,14 @@ public class AforoClient implements AutoCloseable {
     private final RingBuffer buffer;
     private final Transport transport;
     private final int flushCount;
+    private final String productType;
     private final ScheduledExecutorService scheduler;
     private volatile boolean closed = false;
 
     public AforoClient(AforoOptions options) {
-        this.flushCount = options.getFlushCount();
+        // The ingestor accepts 1-1000 events per batch request.
+        this.flushCount = Math.max(1, Math.min(options.getFlushCount(), AforoOptions.MAX_BATCH_SIZE));
+        this.productType = options.getProductType();
         this.buffer = new RingBuffer(options.getMaxQueueSize());
         this.transport = new Transport(
                 options.getBaseUrl(), options.getApiKey(),
@@ -58,9 +61,27 @@ public class AforoClient implements AutoCloseable {
     /**
      * Enqueue a usage event for batched delivery.
      * Non-blocking — returns immediately.
+     *
+     * <p>Events with a blank customerId/metricName or a quantity &lt;= 0 are dropped
+     * (with a warning): the ingestor validates a batch as a whole, so one such event
+     * would fail every event in its batch.</p>
      */
     public void track(TrackEvent event) {
         if (closed) throw new IllegalStateException("AforoClient is closed");
+
+        if (event.getCustomerId() == null || event.getCustomerId().isBlank()) {
+            LOG.warning("Dropping event with missing customerId (metric=" + event.getMetricName() + ")");
+            return;
+        }
+        if (event.getMetricName() == null || event.getMetricName().isBlank()) {
+            LOG.warning("Dropping event with missing metricName");
+            return;
+        }
+        if (!(event.getQuantity() > 0) || Double.isInfinite(event.getQuantity())) {
+            LOG.warning("Dropping event with non-positive quantity " + event.getQuantity()
+                    + " (metric=" + event.getMetricName() + ")");
+            return;
+        }
 
         String occurredAt = event.getOccurredAt() != null
                 ? event.getOccurredAt() : Instant.now().toString();
@@ -69,11 +90,15 @@ public class AforoClient implements AutoCloseable {
                 : IdempotencyKeyGenerator.generate(
                         event.getCustomerId(), event.getMetricName(),
                         event.getQuantity(), occurredAt);
+        String eventProductType = event.getProductType() != null
+                ? event.getProductType() : productType;
 
         ResolvedEvent resolved = new ResolvedEvent(
                 event.getCustomerId(), event.getMetricName(),
                 event.getQuantity(), idempotencyKey, occurredAt,
-                event.getMetadata());
+                event.getMetadata(), eventProductType,
+                event.getEndpointPath(), event.getHttpMethod(),
+                event.getStatusCode(), event.getResponseTimeMs());
 
         buffer.push(resolved);
 

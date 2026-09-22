@@ -1,6 +1,6 @@
 import { AforoClient } from '../client';
 import { MiddlewareOptions } from '../types';
-import { isPreflight, resolveMetricName, firstNonEmpty } from './common';
+import { isPreflight, resolveMetricName, firstNonEmpty, endpointPathOf } from './common';
 
 const DEFAULT_EXCLUDE_PATHS = ['/health', '/ready', '/metrics', '/favicon.ico'];
 
@@ -11,7 +11,7 @@ const DEFAULT_EXCLUDE_PATHS = ['/health', '/ready', '/metrics', '/favicon.ico'];
  *
  * ```typescript
  * import { koaMiddleware } from '@aforo/metering/middleware/koa';
- * app.use(koaMiddleware({ apiKey: process.env.AFORO_API_KEY }));
+ * app.use(koaMiddleware({ apiKey: process.env.AFORO_API_KEY, productType: 'API' }));
  * ```
  */
 export function koaMiddleware(options: MiddlewareOptions) {
@@ -25,6 +25,7 @@ export function koaMiddleware(options: MiddlewareOptions) {
   const excludeStatusCodes = options.excludeStatusCodes ?? [];
 
   return async function aforoMeteringMiddleware(ctx: any, next: any) {
+    const startTime = Date.now();
     await next();
 
     try {
@@ -56,13 +57,24 @@ export function koaMiddleware(options: MiddlewareOptions) {
       }
 
       if (!customerId) return;
+      if (!(quantity > 0)) return; // The ingestor rejects quantity <= 0
 
       let metadata: Record<string, string | number | boolean> | undefined;
       if (options.metadata) {
         metadata = options.metadata(ctx.request, ctx.response);
       }
 
-      client.track({ customerId, metricName, quantity, metadata }).catch(() => {});
+      client.track({
+        customerId,
+        metricName,
+        quantity,
+        metadata,
+        productType: options.productType,
+        endpointPath: endpointPathOf(path),
+        httpMethod: method,
+        statusCode,
+        responseTimeMs: Date.now() - startTime,
+      }).catch(() => {});
     } catch {
       // Never let metering affect the API
     }

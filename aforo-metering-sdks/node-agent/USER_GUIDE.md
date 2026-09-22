@@ -47,6 +47,7 @@ const agent = new AforoAgent({
   productId: 'prod_agent_001',
   apiKey: process.env.AFORO_API_KEY!,
   customerId: 'cust_acme_001',
+  productType: 'AI_AGENT', // default; override per session or per event
   // ingestorUrl: 'http://localhost:8084/v1/ingest/batch', // override for local dev
 });
 ```
@@ -147,7 +148,7 @@ Run your Step 2–5 script. The catcher prints a `POST /v1/ingest/batch` (with a
 ]}
 ```
 
-If you see that batch, the SDK is wired correctly. Then point `ingestorUrl` back at the default (`https://usage-ingestor.aforo.ai/v1/ingest/batch`) and confirm the step/session counts appear against `prod_agent_001` in your Aforo usage view. If the dashboard stays empty but the local catcher saw the batch, the problem is auth or tenant/product scope — see Troubleshooting.
+If you see that batch, the SDK is wired correctly. Then point `ingestorUrl` back at the default (`https://api.aforo.ai/v1/ingest/batch`) and confirm the step/session counts appear against `prod_agent_001` in your Aforo usage view. If the dashboard stays empty but the local catcher saw the batch, the problem is auth or tenant/product scope — see Troubleshooting.
 
 ## Configuration reference
 
@@ -157,9 +158,12 @@ If you see that batch, the SDK is wired correctly. Then point `ingestorUrl` back
 | `productId` | `string` | — (required) | The AI_AGENT product the events bill against. |
 | `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. |
 | `customerId` | `string` | — | Customer billed for the usage. Required here or per session (`startSession({ customerId })`). |
-| `ingestorUrl` | `string` | `https://usage-ingestor.aforo.ai/v1/ingest/batch` | Full batch-ingest URL; override per environment. A trailing `/v1/ingest` is rewritten to `/v1/ingest/batch`. |
+| `productType` | `string` | `AI_AGENT` | Top-level `productType` on every event. Overridable per session (`startSession({ productType })`) and per event (`emitEvent({ productType })`). |
+| `ingestorUrl` | `string` | `https://api.aforo.ai/v1/ingest/batch` | Full batch-ingest URL; override per environment. A trailing `/v1/ingest` is rewritten to `/v1/ingest/batch`. |
 | `flushBatchSize` | `number` | `50` | Buffer size before a forced flush. |
 | `flushIntervalMs` | `number` | `5000` | Max buffer dwell time before a timed flush. |
+| `maxRetries` | `number` | `3` | Attempts per batch for 408/429/5xx/network failures (other 4xx are not retried). |
+| `retryBaseDelayMs` | `number` | `1000` | Base backoff, doubling per attempt; a 429's `Retry-After` wins. |
 | `fetchImpl` | `typeof fetch` | global `fetch` | Custom transport; required on Node < 18. |
 
 ## Troubleshooting
@@ -172,10 +176,10 @@ If you see that batch, the SDK is wired correctly. Then point `ingestorUrl` back
 | `[aforo-agent] ingestor returned 4xx`; dashboard empty | Tenant/product mismatch or unknown metric on the product | Confirm `tenantId`/`productId` match the AI_AGENT product, and that `step_count`/`tokens_total`/`session_count`/`session_completed` exist on it. |
 | Process exits, no events arrive, no error logged | A timed flush never fired before exit | Call `await session.end(...)` (or `await agent.flush()`) before the process exits. |
 | Token charges look doubled | Counting both `agent_step` and `token_usage` for the same step | They're distinct metrics by design — bill against one. |
-| `[aforo-agent] flush failed; dropped N events` repeatedly | Network/DNS failure reaching `ingestorUrl` | Verify the URL is reachable from the agent host. Drops are not retried later — fix connectivity, or front the agent with a gateway plugin if drops are unacceptable. |
+| `[aforo-agent] flush failed; dropped N events` repeatedly | Network/DNS failure reaching `ingestorUrl` | Verify the URL is reachable from the agent host. Each batch is retried up to `maxRetries` times first; after that it is dropped, not retried later — fix connectivity, or front the agent with a gateway plugin if drops are unacceptable. |
 
 ## What this guide does NOT cover
 
-- **Guaranteed delivery.** Flush failures drop the batch with a console warning — no on-disk queue, no retry-later. If a lost event is unacceptable, meter through an Aforo gateway plugin.
+- **Guaranteed delivery.** After its in-flush retries, a failed batch is dropped with a console warning — no on-disk queue, no retry-later. If a lost event is unacceptable, meter through an Aforo gateway plugin.
 - **Quota enforcement.** This SDK records usage; it does not block the agent when a limit is hit. Pre-flight quota gating lives in the MCP proxy (`@aforo/mcp-proxy --quota-enforcement`), not here.
 - **Rate-plan / metric setup.** Creating the AI_AGENT product, its metrics, and its rate plan is done in the Aforo console, not in this SDK.

@@ -33,6 +33,7 @@ const agent = new AforoAgent({
   productId: 'prod_agent_001',
   apiKey: process.env.AFORO_API_KEY!,
   customerId: 'cust_acme_001', // the customer this agent's usage is billed to
+  productType: 'AI_AGENT',      // default; sent as top-level productType on every event
 });
 
 const session = await agent.startSession({
@@ -68,14 +69,17 @@ Pass these to `new AforoAgent({...})`:
 | `productId` | `string` | — (required) | The AI_AGENT product these events bill against. |
 | `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. Use `process.env.AFORO_API_KEY`. |
 | `customerId` | `string` | — | Aforo customer the usage is billed to. Required here or per session via `startSession({ customerId })`; `startSession` throws if neither is set. |
-| `ingestorUrl` | `string` | `https://usage-ingestor.aforo.ai/v1/ingest/batch` | Full batch-ingest URL. Override for local dev or air-gapped deployments. A URL ending in `/v1/ingest` is rewritten to `/v1/ingest/batch`. |
+| `productType` | `string` | `AI_AGENT` | Top-level `productType` on every event (required by the ingestor). Override per session with `startSession({ productType })` or per event with `emitEvent({ productType })`. Trimmed and uppercased. |
+| `ingestorUrl` | `string` | `https://api.aforo.ai/v1/ingest/batch` | Full batch-ingest URL. Override for local dev or air-gapped deployments. A URL ending in `/v1/ingest` is rewritten to `/v1/ingest/batch`. |
 | `flushBatchSize` | `number` | `50` | Buffer this many events before forcing a flush. Lower it for low-volume agents to surface metrics sooner; raise it to amortize per-batch HTTP cost. |
 | `flushIntervalMs` | `number` | `5000` | Max time an event sits in the buffer before a timed flush. `session.end()` flushes regardless. |
+| `maxRetries` | `number` | `3` | Attempts per batch for 408/429/5xx/network failures. Other 4xx are not retried. |
+| `retryBaseDelayMs` | `number` | `1000` | Base backoff between attempts (doubles each time); a 429's `Retry-After` wins. |
 | `fetchImpl` | `typeof fetch` | global `fetch` | Pluggable transport. Required on Node < 18 where there's no global `fetch`; also the seam used in tests. |
 
 ### Per-session and per-step options
 
-`startSession({...})` — `agentId` (required), optional `customerId` (overrides the client's), `sessionId` (a UUID is generated if omitted), `traceId` (defaults to the sessionId), `framework` (`CLAUDE` \| `GPT` \| `LANGCHAIN` \| `CREWAI` \| `AUTOGEN` \| `CUSTOM`), `modelProvider` (`ANTHROPIC` \| `OPENAI` \| `GOOGLE` \| `COHERE` \| `CUSTOM`), `modelName`, and free-form `metadata`.
+`startSession({...})` — `agentId` (required, at most 36 characters), optional `customerId` (overrides the client's), `productType` (overrides the client's), `sessionId` (a UUID is generated if omitted), `traceId` (defaults to the sessionId), `framework` (`CLAUDE` \| `GPT` \| `LANGCHAIN` \| `CREWAI` \| `AUTOGEN` \| `CUSTOM`), `modelProvider` (`ANTHROPIC` \| `OPENAI` \| `GOOGLE` \| `COHERE` \| `CUSTOM`), `modelName`, and free-form `metadata`.
 
 `recordStep({...})` — `stepKind` (`TOOL_CALL` \| `THOUGHT` \| `OBSERVATION` \| `FINAL_ANSWER`, required), optional `capabilityName`, `inputTokens`, `outputTokens`, `durationMs`, `executionStatus` (`SUCCESS` \| `ERROR` \| `TIMEOUT` \| `CANCELLED` \| `HITL_REQUIRED`, defaults `SUCCESS`), `parentStepId`, and `metadata`. The ingestor only accepts `SUCCESS`/`ERROR`/`TIMEOUT` as `executionStatus`, so `CANCELLED` and `HITL_REQUIRED` are sent as `metadata.agentExecutionStatus` instead. `session.recordToolCall(toolName, opts)` is the shortcut for the common `TOOL_CALL` case.
 
@@ -87,4 +91,4 @@ Step-by-step from install to a verified event in Aforo: [USER_GUIDE.md](USER_GUI
 
 ## What this doesn't cover
 
-Delivery is **best-effort**. On an HTTP failure `flush()` logs a warning and **drops** the batch — there's no on-disk queue or dead-letter. That's the same posture as the generic and MCP SDKs: direct SDK emit is for first-party customers running their own agents. For billing where a dropped event is unacceptable, meter through a gateway plugin instead. This SDK also does not enforce quotas — it records usage, it doesn't gate the agent on a limit.
+Delivery is **best-effort**. 408/429/5xx/network failures are retried (`maxRetries`, default 3; `Retry-After` honoured); after that, or on any other 4xx, `flush()` logs a warning and **drops** the batch — there's no on-disk queue or dead-letter. That's the same posture as the generic and MCP SDKs: direct SDK emit is for first-party customers running their own agents. For billing where a dropped event is unacceptable, meter through a gateway plugin instead. This SDK also does not enforce quotas — it records usage, it doesn't gate the agent on a limit.

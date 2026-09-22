@@ -10,7 +10,7 @@ An `aforo-metering` shared flow deployed to your Apigee environment and attached
 
 - An Apigee X (or hybrid) org + environment you can deploy to, with `apigeecli` and `gcloud` authenticated.
 - Permission to create an org-scoped KVM and attach a Flow Hook.
-- An Aforo API key with scope `usage:ingest` (the tenant comes from the key). The metric you bill against (default `api_calls`) registered in your Aforo catalog. Events go to `https://usage-ingestor.aforo.ai/v1/ingest/batch` (set per environment in the KVM).
+- An Aforo API key with scope `usage:ingest` (the tenant comes from the key). The metric you bill against (default `api_calls`) registered in your Aforo catalog. Events go to `https://api.aforo.ai/v1/ingest/batch` (set per environment in the KVM).
 
 ## Step 1 — Import the shared flow from source
 
@@ -48,7 +48,7 @@ The bundle reads the **organization-scoped** KVM `aforo-metering-config` (no `--
 TOKEN="$(gcloud auth print-access-token)"
 apigeecli kvms create --name aforo-metering-config --org "$APIGEE_ORG" --token "$TOKEN"
 kv() { apigeecli kvms entries create --map aforo-metering-config --org "$APIGEE_ORG" --key "$1" --value "$2" --token "$TOKEN"; }
-kv aforo_endpoint https://usage-ingestor.aforo.ai/v1/ingest/batch
+kv aforo_endpoint https://api.aforo.ai/v1/ingest/batch
 kv api_key "$AFORO_API_KEY"
 kv default_metric api_calls
 kv metric_mappings '[{"matchType":"PREFIX","value":"/sms/v1/send","metricName":"sms_sent"}]'
@@ -97,7 +97,7 @@ If `AforoMeteringSendEvent` did not run, check `aforo.skipReason` on the `AforoM
 
 ## Step 7 (optional) — MCP tool-invocation metering
 
-Set the KVM keys `mcp_enabled = true` (and `mcp_product_id`) for proxies fronting an MCP server. For POST requests, the JS parses `request.content`; any JSON-RPC `2.0` body with `method: "tools/call"` emits an `mcp_server.tool_invocations` event with `toolName`, `sessionId` (from `Mcp-Session-Id`), and `executionStatus`.
+Set the KVM keys `mcp_enabled = true` (and `mcp_product_id`) for proxies fronting an MCP server. For POST requests, the JS parses `request.content`; any JSON-RPC `2.0` body with `method: "tools/call"` emits an `mcp_server.tool_invocations` event with `toolName`, `sessionId` (from `Mcp-Session-Id`), and `executionStatus`. Its `productType` is `MCP_SERVER` when `params._meta.agent_id` is present; otherwise it keeps the KVM `product_type` (default `API`), which every other event carries.
 
 > ⚠ `agentId` is read only from the JSON-RPC payload at `params._meta.agent_id`. The `X-Agent-Id` request-header fallback was removed in 2.0.0 — it's client-settable and was a billing-attribution spoof vector.
 

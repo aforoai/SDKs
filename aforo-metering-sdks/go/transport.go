@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -20,9 +21,9 @@ type transport struct {
 
 func newTransport(baseURL, apiKey string, timeout time.Duration, maxRetries int, retryBase time.Duration) *transport {
 	return &transport{
-		url:    baseURL + "/v1/ingest/batch",
-		apiKey: apiKey,
-		client: &http.Client{Timeout: timeout},
+		url:        baseURL + "/v1/ingest/batch",
+		apiKey:     apiKey,
+		client:     &http.Client{Timeout: timeout},
 		maxRetries: maxRetries,
 		retryBase:  retryBase,
 	}
@@ -54,10 +55,16 @@ func (t *transport) send(events []resolvedEvent) FlushResult {
 			}
 			return FlushResult{Failed: len(events)}
 		}
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 
 		status := resp.StatusCode
 		if status >= 200 && status < 300 {
+			// 202 body: {accepted, duplicates, failed, errors:[{index, message}]}
+			var br batchResponse
+			if json.Unmarshal(respBody, &br) == nil && br.Failed > 0 && br.Failed <= len(events) {
+				return FlushResult{Sent: len(events) - br.Failed, Failed: br.Failed}
+			}
 			return FlushResult{Sent: len(events)}
 		}
 

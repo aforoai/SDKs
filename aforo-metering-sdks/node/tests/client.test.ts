@@ -29,18 +29,104 @@ describe('AforoClient', () => {
     await client.shutdown();
   });
 
-  it('should not put session heartbeats into the usage batch', async () => {
-    // Heartbeats (quantity 0, customerId "system") fail the ingestor's @Positive
-    // check and take every real event in the same batch down with them.
-    client.startSession('sess_1');
+  it('sends each session heartbeat in its own request, never in the usage batch', async () => {
+    client.startSession('sess_1', 'mcp_server');
     await client.track({ customerId: 'cust_1', metricName: 'api_calls', quantity: 1 });
     await client.endSession();
 
-    expect(mockFetch).toHaveBeenCalledTimes(1);
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
-    expect(body.events).toHaveLength(1);
-    expect(body.events[0].metricName).toBe('api_calls');
-    expect(body.events.every((e: any) => e.quantity > 0)).toBe(true);
+    const bodies = mockFetch.mock.calls.map((c) => JSON.parse(c[1].body));
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+    for (const [url] of mockFetch.mock.calls) {
+      expect(url).toBe('https://ingest.test.aforo.ai/v1/ingest/batch');
+    }
+
+    const usage = bodies.filter((b) => b.events.some((e: any) => e.metricName === 'api_calls'));
+    expect(usage).toHaveLength(1);
+    expect(usage[0].events).toHaveLength(1);
+    expect(usage[0].events[0].productType).toBe('API');
+
+    const hbs = bodies.filter((b) => b.events[0].metricName === 'system.session.heartbeat');
+    expect(hbs).toHaveLength(2);
+    for (const b of hbs) {
+      expect(b.events).toHaveLength(1);
+      const hb = b.events[0];
+      expect(hb.quantity).toBe(1);
+      expect(hb.customerId).toBe('system');
+      expect(hb.sessionId).toBe('sess_1');
+      expect(hb.productType).toBe('MCP_SERVER');
+      expect(hb.metadata.sessionId).toBe('sess_1');
+      expect(hb.metadata.productType).toBe('MCP_SERVER');
+      expect(new Date(hb.occurredAt).toISOString()).toBe(hb.occurredAt);
+    }
+    expect(hbs.map((b) => b.events[0].sessionBoundary).sort()).toEqual(['HEARTBEAT', 'SESSION_END']);
+    expect(hbs[0].events[0].idempotencyKey).not.toBe(hbs[1].events[0].idempotencyKey);
+  });
+
+  it('emits periodic heartbeats every 30s and stops on endSession/shutdown', async () => {
+    jest.useFakeTimers();
+    try {
+      const c = new AforoClient({ apiKey: 'k', baseUrl: 'https://x.test', flushInterval: 600_000, maxRetries: 0 });
+      c.startSession('sess_p');
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      jest.advanceTimersByTime(30_000);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      const periodic = JSON.parse(mockFetch.mock.calls[1][1].body).events[0];
+      expect(periodic.sessionBoundary).toBe('HEARTBEAT');
+      expect(periodic.productType).toBe('AI_AGENT');
+
+      await c.shutdown();
+      const calls = mockFetch.mock.calls.length;
+      jest.advanceTimersByTime(120_000);
+      expect(mockFetch).toHaveBeenCalledTimes(calls);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('swallows heartbeat failures without affecting usage delivery', async () => {
+    mockFetch.mockReset();
+    mockFetch
+      .mockRejectedValueOnce(new Error('network down')) // first heartbeat
+      .mockResolvedValue({ ok: true, status: 202, headers: new Map() });
+    client.startSession('sess_2');
+    await client.track({ customerId: 'cust_1', metricName: 'api_calls' });
+    const result = await client.flush();
+    expect(result).toEqual({ sent: 1, failed: 0 });
+  });
+
+  it('stamps productType: client default API, client option, per-event override', async () => {
+    await client.track({ customerId: 'c', metricName: 'api_calls' });
+    await client.track({ customerId: 'c', metricName: 'api_calls', productType: ' graphql_api ' });
+    await client.track({ customerId: 'c', metricName: 'api_calls', productType: 'SOMETHING_NEW' });
+    await client.flush();
+    const events = JSON.parse(mockFetch.mock.calls[0][1].body).events;
+    expect(events.map((e: any) => e.productType)).toEqual(['API', 'GRAPHQL_API', 'SOMETHING_NEW']);
+
+    const c2 = new AforoClient({ apiKey: 'k', baseUrl: 'https://x.test', productType: 'agentic_api', flushInterval: 60_000 });
+    await c2.track({ customerId: 'c', metricName: 'api_calls' });
+    await c2.flush();
+    expect(JSON.parse(mockFetch.mock.calls[1][1].body).events[0].productType).toBe('AGENTIC_API');
+    await c2.shutdown();
+  });
+
+  it('rejects blank customerId / metricName and non-positive quantity', async () => {
+    await expect(client.track({ customerId: ' ', metricName: 'api_calls' })).rejects.toThrow('customerId');
+    await expect(client.track({ customerId: 'c', metricName: '' })).rejects.toThrow('metricName');
+    await expect(client.track({ customerId: 'c', metricName: 'm', quantity: 0 })).rejects.toThrow('quantity');
+    await expect(client.track({ customerId: 'c', metricName: 'm', quantity: -1 })).rejects.toThrow('quantity');
+    expect(client.bufferedCount).toBe(0);
+  });
+
+  it('caps flushCount at the 1000-event batch limit', async () => {
+    const c = new AforoClient({ apiKey: 'k', baseUrl: 'https://x.test', flushCount: 5000, flushInterval: 600_000 });
+    for (let i = 0; i < 2500; i++) {
+      await c.track({ customerId: 'c', metricName: 'api_calls' });
+    }
+    await c.flush();
+    const sizes = mockFetch.mock.calls.map((call) => JSON.parse(call[1].body).events.length);
+    expect(Math.max(...sizes)).toBeLessThanOrEqual(1000);
+    expect(sizes.reduce((a, b) => a + b, 0)).toBe(2500);
+    await c.shutdown();
   });
 
   it('should require apiKey', () => {

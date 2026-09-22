@@ -34,7 +34,7 @@ The API key is the only required value. Keep it out of source:
 export AFORO_API_KEY="sk_live_…"
 ```
 
-`base_url` defaults to `https://usage-ingestor.aforo.ai`. Only override it to point at a non-production ingestor.
+`base_url` defaults to `https://api.aforo.ai`. Only override it to point at a non-production ingestor.
 
 ## Step 3 — Create a client and emit one event
 
@@ -42,7 +42,7 @@ export AFORO_API_KEY="sk_live_…"
 import os
 from aforo import AforoClient
 
-client = AforoClient(api_key=os.environ["AFORO_API_KEY"])
+client = AforoClient(api_key=os.environ["AFORO_API_KEY"], product_type="API")
 
 client.track(
     customer_id="cust_1",
@@ -54,7 +54,9 @@ client.track(
 
 `track` returns immediately — the event is enqueued, not sent yet. `quantity` defaults to `1`; `occurred_at` defaults to now (ISO 8601, UTC); `idempotency_key` is auto-derived from `(customer_id, metric_name, quantity, occurred_at)` if you don't pass one.
 
-> ⚠ `customer_id` and `metric_name` are both required. Calling `track()` without either raises `ValueError` — there's no silent no-op. Calling `track()` after `shutdown()` raises `RuntimeError`.
+Every event carries a top-level `productType` — the client's `product_type` (default `"API"`) unless you pass `track(product_type="AI_AGENT")` for that event. The production ingestor requires it.
+
+> ⚠ `customer_id` and `metric_name` are both required and must not be blank, and `quantity` must be `> 0`. Otherwise `track()` raises `ValueError` — there's no silent no-op (the ingestor would reject the event and fail its whole batch). Calling `track()` after `shutdown()` raises `RuntimeError`.
 
 ## Step 4 — Make delivery happen (and confirm it)
 
@@ -101,14 +103,15 @@ from fastapi import FastAPI
 from aforo.middleware.fastapi import AforoMeteringMiddleware
 
 app = FastAPI()
-app.add_middleware(AforoMeteringMiddleware, api_key=os.environ["AFORO_API_KEY"])
+app.add_middleware(AforoMeteringMiddleware, api_key=os.environ["AFORO_API_KEY"],
+                   product_type="API")  # optional; default "API"
 ```
 
 **Flask:**
 
 ```python
 from aforo.middleware.flask import AforoMetering
-AforoMetering(app, api_key=os.environ["AFORO_API_KEY"])
+AforoMetering(app, api_key=os.environ["AFORO_API_KEY"], product_type="API")
 # or app.config["AFORO_API_KEY"] = "…" then AforoMetering(app)
 ```
 
@@ -117,7 +120,10 @@ AforoMetering(app, api_key=os.environ["AFORO_API_KEY"])
 ```python
 MIDDLEWARE = [..., "aforo.middleware.django.AforoMeteringMiddleware"]
 AFORO_API_KEY = os.environ["AFORO_API_KEY"]
+AFORO_PRODUCT_TYPE = "API"  # optional; default "API"
 ```
+
+Each request event carries top-level `productType`, `endpointPath` (path without query string, max 512 chars), `httpMethod`, `statusCode` and `responseTimeMs`.
 
 > ⚠ The middleware only meters requests it can attribute to a customer. Configure `customer_id` (keyword, or `AFORO_CUSTOMER_ID` in Flask config / Django settings); by default it reads `X-Customer-Id` (Django tries `request.user.id` first). The caller's `X-Api-Key` is never used — it is the end user's secret, not a customer id. **No customer ID → the request is silently not metered.** `OPTIONS` (CORS preflight) requests are never metered. Set that header at your gateway/auth layer; do not trust a value the end client can spoof for a customer it doesn't own.
 
@@ -130,14 +136,16 @@ AFORO_API_KEY = os.environ["AFORO_API_KEY"]
 | Option | Type | Default | What it does |
 |---|---|---|---|
 | `api_key` | `str` | required | Aforo API key, sent to the ingestor as `X-API-Key`. |
-| `base_url` | `str` | `https://usage-ingestor.aforo.ai` | Host only; `/v1/ingest/batch` is appended. |
-| `flush_count` | `int` | `50` | Buffer threshold + max batch size. |
+| `base_url` | `str` | `https://api.aforo.ai` | Host only; `/v1/ingest/batch` is appended. |
+| `product_type` | `str` | `"API"` | Top-level `productType` on every event; trimmed + upper-cased, unknown values passed through. Override per event with `track(product_type=...)`. |
+| `flush_count` | `int` | `50` | Buffer threshold + max batch size (clamped to 1..1000). |
 | `flush_interval` | `float` | `5.0` | Background flush cadence (seconds). |
 | `max_queue_size` | `int` | `10000` | Ring-buffer cap; oldest dropped on overflow. |
 | `max_retries` | `int` | `3` | Retries on 5xx/408/429. |
 | `retry_base_s` | `float` | `1.0` | Backoff base: `retry_base_s * 2**attempt`. |
 | `timeout` | `float` | `10.0` | Per-request timeout (seconds). |
 | `shutdown_timeout` | `float` | `5.0` | Drain budget on shutdown. |
+| `heartbeat_interval` | `float` | `30.0` | Seconds between session heartbeats. |
 
 `track(...)` arguments:
 
@@ -149,13 +157,17 @@ AFORO_API_KEY = os.environ["AFORO_API_KEY"]
 | `idempotency_key` | `str?` | auto | Dedupe key; auto-derived if omitted. |
 | `occurred_at` | `str?` | now | ISO-8601 event time (UTC). |
 | `metadata` | `dict?` | `None` | Arbitrary key/values stored with the event. |
+| `product_type` | `str?` | client's | Per-event `productType` override. |
+| `extra_fields` | `dict?` | `None` | Optional top-level ingest fields by their camelCase wire name (`agentId`, `sessionId`, `endpointPath`, …). |
 | `event` | `TrackEvent?` | `None` | Pass a `TrackEvent` instead of keyword args. |
 
-`MiddlewareOptions` (extra knobs for the framework adapters): `metric_name`, `quantity`, `customer_id`, `metadata` (each a constant or a callable over the request/scope), `exclude_paths` (`list[str]`), `exclude_status_codes` (`list[int]`), plus `flush_count` / `flush_interval` / `max_queue_size` forwarded to the client.
+`MiddlewareOptions` (extra knobs for the framework adapters): `product_type` (default `"API"`), `metric_name`, `quantity`, `customer_id`, `metadata` (each a constant or a callable over the request/scope), `exclude_paths` (`list[str]`), `exclude_status_codes` (`list[int]`), plus `flush_count` / `flush_interval` / `max_queue_size` forwarded to the client.
 
-### Session heartbeats (removed)
+### Session heartbeats
 
-`start_session(session_id, product_type="AI_AGENT")` is now a deprecated no-op and `end_session()` only flushes. They used to emit heartbeats, but they were `system.session.heartbeat` events with `quantity: 0` sent in the usage batch, and the ingestor rejects quantity 0 and fails the whole batch with 400, taking every real event batched with it down. The ingestor has no dedicated heartbeat endpoint. Use `track()` for billable usage.
+`start_session(session_id, product_type="AI_AGENT", customer_id=None)` sends a `system.session.heartbeat` event immediately and then every `heartbeat_interval` seconds (default 30) from a daemon thread; `end_session()` stops it, flushes buffered usage, and sends a final `SESSION_END` heartbeat. `shutdown()` also stops it.
+
+Each heartbeat has `quantity: 1` (never billed — the ingestor intercepts heartbeats before billing), top-level `sessionId`, `productType` (the session's) and `sessionBoundary` (`HEARTBEAT` / `SESSION_END`), and `customerId` = the session's `customer_id` (default `"system"`). It is POSTed **on its own** as `{"events": [heartbeat]}` — never mixed into a usage batch, so it always takes the ingestor's synchronous path where heartbeats are intercepted. Heartbeats are best-effort: one attempt, no retry, failures are logged at debug level and never affect usage delivery.
 
 ## Troubleshooting
 

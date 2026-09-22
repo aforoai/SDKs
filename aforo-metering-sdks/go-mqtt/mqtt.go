@@ -8,11 +8,8 @@
 package mqttmetering
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math/rand"
 	"net/http"
 	"strings"
@@ -27,6 +24,7 @@ type Config struct {
 	ProductID         string
 	APIKey            string
 	IngestorURL       string
+	ProductType       string        // default "MQTT_BROKER"; sent as top-level productType on every event
 	EmitDeliverEvents bool          // off by default — DELIVER events are high-volume
 	FlushCount        int           // default 200 — MQTT is highest volume
 	FlushInterval     time.Duration // default 2s
@@ -48,6 +46,10 @@ type Billing struct {
 func New(cfg Config) (*Billing, error) {
 	if cfg.TenantID == "" || cfg.ProductID == "" || cfg.APIKey == "" || cfg.IngestorURL == "" {
 		return nil, errors.New("mqttmetering: TenantID, ProductID, APIKey, IngestorURL are required")
+	}
+	cfg.ProductType = normalizeProductType(cfg.ProductType)
+	if cfg.ProductType == "" {
+		cfg.ProductType = DefaultProductType
 	}
 	if cfg.FlushCount == 0 {
 		cfg.FlushCount = 200
@@ -73,35 +75,37 @@ func New(cfg Config) (*Billing, error) {
 }
 
 // Per-event recording methods — wrap these around your MQTT client API.
+// Each accepts an optional EventOptions to override the event's productType.
 
-func (b *Billing) RecordPublish(customerID, clientID, topic string, qos int, retained bool, payloadBytes int64) {
-	b.push(b.eventOf(customerID, clientID, "PUBLISH", topic, qos, retained, payloadBytes))
+func (b *Billing) RecordPublish(customerID, clientID, topic string, qos int, retained bool, payloadBytes int64, opts ...EventOptions) {
+	b.push(b.eventOf(customerID, clientID, "PUBLISH", topic, qos, retained, payloadBytes, opts))
 }
 
-func (b *Billing) RecordDeliver(customerID, clientID, topic string, qos int, retained bool, payloadBytes int64) {
+func (b *Billing) RecordDeliver(customerID, clientID, topic string, qos int, retained bool, payloadBytes int64, opts ...EventOptions) {
 	if !b.cfg.EmitDeliverEvents {
 		return
 	}
-	b.push(b.eventOf(customerID, clientID, "DELIVER", topic, qos, retained, payloadBytes))
+	b.push(b.eventOf(customerID, clientID, "DELIVER", topic, qos, retained, payloadBytes, opts))
 }
 
-func (b *Billing) RecordSubscribe(customerID, clientID, topicFilter string, qos int) {
-	b.push(b.eventOf(customerID, clientID, "SUBSCRIBE", topicFilter, qos, false, 0))
+func (b *Billing) RecordSubscribe(customerID, clientID, topicFilter string, qos int, opts ...EventOptions) {
+	b.push(b.eventOf(customerID, clientID, "SUBSCRIBE", topicFilter, qos, false, 0, opts))
 }
 
-func (b *Billing) RecordUnsubscribe(customerID, clientID, topicFilter string) {
-	b.push(b.eventOf(customerID, clientID, "UNSUBSCRIBE", topicFilter, 0, false, 0))
+func (b *Billing) RecordUnsubscribe(customerID, clientID, topicFilter string, opts ...EventOptions) {
+	b.push(b.eventOf(customerID, clientID, "UNSUBSCRIBE", topicFilter, 0, false, 0, opts))
 }
 
-func (b *Billing) RecordConnect(customerID, clientID string) {
-	b.push(b.eventOf(customerID, clientID, "CONNECT", "", 0, false, 0))
+func (b *Billing) RecordConnect(customerID, clientID string, opts ...EventOptions) {
+	b.push(b.eventOf(customerID, clientID, "CONNECT", "", 0, false, 0, opts))
 }
 
-func (b *Billing) RecordDisconnect(customerID, clientID string) {
-	b.push(b.eventOf(customerID, clientID, "DISCONNECT", "", 0, false, 0))
+func (b *Billing) RecordDisconnect(customerID, clientID string, opts ...EventOptions) {
+	b.push(b.eventOf(customerID, clientID, "DISCONNECT", "", 0, false, 0, opts))
 }
 
-func (b *Billing) eventOf(customerID, clientID, eventType, topic string, qos int, retained bool, bytesAmt int64) map[string]any {
+func (b *Billing) eventOf(customerID, clientID, eventType, topic string, qos int, retained bool, bytesAmt int64, opts []EventOptions) map[string]any {
+	customerID = strings.TrimSpace(customerID)
 	if customerID == "" {
 		return nil
 	}
@@ -127,7 +131,7 @@ func (b *Billing) eventOf(customerID, clientID, eventType, topic string, qos int
 		"quantity":       1,
 		"occurredAt":     now.Format(time.RFC3339Nano),
 		"idempotencyKey": capKey(fmt.Sprintf("mqtt:%s:%s:%s:%s:%d:%s", b.cfg.TenantID, clientID, eventType, topic, now.UnixMilli(), randomSuffix())),
-		"productType":    "MQTT_BROKER",
+		"productType":    b.productTypeFor(opts),
 		"mqttTopic":      topic,
 		"mqttRetained":   retained,
 		"mqttEventType":  eventType,
@@ -194,37 +198,6 @@ func (b *Billing) flush() {
 		}
 		b.send(batch[start:end])
 	}
-}
-
-// send POSTs one chunk of at most maxBatchSize events. The body is marshalled
-// once, so every retry carries the same idempotencyKeys.
-func (b *Billing) send(chunk []map[string]any) {
-	body, err := json.Marshal(map[string]any{"events": chunk})
-	if err != nil {
-		b.cfg.OnError(err)
-		return
-	}
-	for attempt := 1; attempt <= 3; attempt++ {
-		req, _ := http.NewRequest(http.MethodPost, b.url, bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-API-Key", b.cfg.APIKey)
-		req.Header.Set("X-Tenant-Id", b.cfg.TenantID)
-		resp, err := b.client.Do(req)
-		if err == nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				return
-			}
-		} else if attempt == 3 {
-			b.cfg.OnError(err)
-			return
-		}
-		if attempt < 3 {
-			time.Sleep(time.Duration(1<<(attempt-1)) * time.Second)
-		}
-	}
-	b.cfg.OnError(fmt.Errorf("mqttmetering: flush exhausted retries (dropped %d events)", len(chunk)))
 }
 
 func (b *Billing) Shutdown() error {

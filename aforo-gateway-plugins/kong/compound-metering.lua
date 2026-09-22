@@ -81,12 +81,13 @@ end
 -- Build CompoundUsageEventRequest from extracted measurements
 -- ────────────────────────────────────────────────────────────
 
-function M.build_compound_event(customer_id, measurements, metadata)
+function M.build_compound_event(customer_id, measurements, metadata, product_type)
     if not measurements or #measurements == 0 then return nil end
 
     return {
         correlationId = kong.tools.uuid(),
         customerId    = customer_id,
+        productType   = product_type or "API",
         occurredAt    = ngx.now() * 1000, -- epoch millis
         metadata      = metadata,
         measurements  = measurements,

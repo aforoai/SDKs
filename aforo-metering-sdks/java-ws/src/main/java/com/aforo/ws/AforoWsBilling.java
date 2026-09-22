@@ -39,9 +39,12 @@ public final class AforoWsBilling implements AutoCloseable {
     static final int MAX_EVENTS_PER_REQUEST = 1000;
     private static final int MAX_CUSTOMER_ID = 64;
     private static final int MAX_IDEMPOTENCY_KEY = 255;
+    /** Default top-level {@code productType}; override with {@link Builder#productType(String)}. */
+    public static final String DEFAULT_PRODUCT_TYPE = "WEBSOCKET_API";
 
     private final String tenantId, productId, apiKey;
     private final URI ingestorUri;
+    private final String productType;
     private final boolean perFrameEvents;
     private final int flushCount;
     private final long flushIntervalMs;
@@ -62,6 +65,7 @@ public final class AforoWsBilling implements AutoCloseable {
         this.productId = require(b.productId, "productId");
         this.apiKey = require(b.apiKey, "apiKey");
         this.ingestorUri = URI.create(stripTrailingSlash(require(b.ingestorUrl, "ingestorUrl")) + "/v1/ingest/batch");
+        this.productType = normalizeProductType(b.productType, DEFAULT_PRODUCT_TYPE);
         this.perFrameEvents = b.perFrameEvents;
         this.flushCount = b.flushCount;
         this.flushIntervalMs = b.flushIntervalMs;
@@ -128,7 +132,7 @@ public final class AforoWsBilling implements AutoCloseable {
         e.put("quantity", 1);
         e.put("occurredAt", now.toString());
         e.put("idempotencyKey", idempotencyKey("ws:" + tenantId + ":" + connectionId + ":" + frameType, now));
-        e.put("productType", "WEBSOCKET_API");
+        e.put("productType", productType);
         e.put("wsConnectionId", connectionId);
         e.put("messageCount", frames);
         e.put("dataBytes", bytes);
@@ -208,15 +212,57 @@ public final class AforoWsBilling implements AutoCloseable {
                 .build();
 
         for (int attempt = 1; attempt <= 3; attempt++) {
+            long delayMs = (long) Math.pow(2, attempt - 1) * 1000;
             try {
                 HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-                if (resp.statusCode() >= 200 && resp.statusCode() < 300) return;
+                int status = resp.statusCode();
+                if (status >= 200 && status < 300) {
+                    String rejected = errorMessages(resp.body());
+                    if (!rejected.isEmpty()) LOG.warning("[aforo-ws] ingestor rejected events:" + rejected);
+                    return;
+                }
+                // 4xx other than 408/429 (bad key, invalid event, unknown metric) cannot succeed on retry.
+                if (status >= 400 && status < 500 && status != 408 && status != 429) {
+                    LOG.warning("[aforo-ws] ingestor returned " + status + " — not retrying, dropped "
+                            + events.size() + " events" + errorMessages(resp.body()));
+                    return;
+                }
+                if (status == 429) delayMs = retryAfterMs(resp, delayMs);
             } catch (Exception e) {
                 if (attempt == 3) throw e;
             }
-            Thread.sleep((long) Math.pow(2, attempt - 1) * 1000);
+            if (attempt < 3) Thread.sleep(delayMs);
         }
         LOG.warning("[aforo-ws] flush exhausted retries — dropped " + events.size() + " events");
+    }
+
+    /** {@code errors[].message} from an ingestor batch response, formatted for a log line; "" if none. */
+    private String errorMessages(String body) {
+        if (body == null || body.isBlank()) return "";
+        try {
+            com.fasterxml.jackson.databind.JsonNode errors = mapper.readTree(body).path("errors");
+            if (!errors.isArray() || errors.isEmpty()) return "";
+            StringBuilder sb = new StringBuilder();
+            for (com.fasterxml.jackson.databind.JsonNode err : errors) {
+                sb.append(" [");
+                if (err.has("index")) sb.append(err.get("index").asText()).append(": ");
+                sb.append(err.path("message").asText("")).append(']');
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /** Honours a delta-seconds {@code Retry-After} header on 429; otherwise keeps {@code fallbackMs}. */
+    private static long retryAfterMs(HttpResponse<String> resp, long fallbackMs) {
+        String retryAfter = resp.headers().firstValue("Retry-After").orElse(null);
+        if (retryAfter == null) return fallbackMs;
+        try {
+            return Math.max(0, Long.parseLong(retryAfter.trim())) * 1000;
+        } catch (NumberFormatException e) {
+            return fallbackMs;
+        }
     }
 
     @Override
@@ -258,6 +304,11 @@ public final class AforoWsBilling implements AutoCloseable {
         return s == null || s.length() <= max ? s : s.substring(0, max);
     }
 
+    /** Trim + uppercase; {@code fallback} for null/blank. Unknown values pass through. */
+    private static String normalizeProductType(String s, String fallback) {
+        return s == null || s.isBlank() ? fallback : s.trim().toUpperCase(java.util.Locale.ROOT);
+    }
+
     private static String require(String s, String name) {
         if (s == null || s.isBlank()) throw new IllegalArgumentException(name + " is required");
         return s;
@@ -267,9 +318,13 @@ public final class AforoWsBilling implements AutoCloseable {
         return s.endsWith("/") ? s.substring(0, s.length() - 1) : s;
     }
 
+    /** The client-level {@code productType} stamped on events without a per-call override. */
+    public String getProductType() { return productType; }
+
     public static Builder newBuilder() { return new Builder(); }
 
     public static final class Builder {
+        private String productType;
         private String tenantId, productId, apiKey, ingestorUrl;
         private boolean perFrameEvents = false;
         private int flushCount = 100;
@@ -278,6 +333,11 @@ public final class AforoWsBilling implements AutoCloseable {
         public Builder tenantId(String s) { this.tenantId = s; return this; }
         public Builder productId(String s) { this.productId = s; return this; }
         public Builder apiKey(String s) { this.apiKey = s; return this; }
+        /**
+         * Top-level {@code productType} on every event (default {@code WEBSOCKET_API}).
+         * Trimmed and uppercased; unknown values are passed through.
+         */
+        public Builder productType(String s) { this.productType = s; return this; }
         public Builder ingestorUrl(String s) { this.ingestorUrl = s; return this; }
         public Builder perFrameEvents(boolean b) { this.perFrameEvents = b; return this; }
         public Builder flushCount(int n) { this.flushCount = n; return this; }

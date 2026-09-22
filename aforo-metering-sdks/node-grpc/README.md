@@ -36,7 +36,7 @@ const billing = new AforoGrpcBilling({
   tenantId: 'tenant_acme',
   productId: 'prod_grpc_001',
   apiKey: process.env.AFORO_API_KEY!,
-  ingestorUrl: 'https://usage-ingestor.aforo.ai', // SDK appends /v1/ingest/batch
+  ingestorUrl: 'https://api.aforo.ai', // SDK appends /v1/ingest/batch
   serviceName: 'acme.v1.UserService',
 });
 
@@ -52,7 +52,7 @@ server.addService(UserServiceService, {
 process.on('SIGTERM', async () => { await billing.shutdown(); });
 ```
 
-Each wrapped handler emits one event with `metricName: "grpc_api.rpc_calls"`, `quantity: 1`. Streams emit a single event on stream close carrying the aggregated `messageCount`. The gRPC status code is mapped to a label (`OK`, `NOT_FOUND`, `UNAVAILABLE`, …). Events ship to `POST https://usage-ingestor.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
+Each wrapped handler emits one event with `metricName: "grpc_api.rpc_calls"`, `quantity: 1`. Streams emit a single event on stream close carrying the aggregated `messageCount`. The gRPC status code is mapped to a label (`OK`, `NOT_FOUND`, `UNAVAILABLE`, …). Events ship to `POST https://api.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
 
 ## Configuration
 
@@ -63,14 +63,15 @@ Each wrapped handler emits one event with `metricName: "grpc_api.rpc_calls"`, `q
 | `tenantId` | `string` | — (required) | Aforo tenant. Sent as `X-Tenant-Id`. Never read from a client header. |
 | `productId` | `string` | — (required) | Aforo product id; into each event's `metadata.productId`. |
 | `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. |
-| `ingestorUrl` | `string` | — (required) | Ingestion base URL. SDK appends `/v1/ingest/batch`. Use `https://usage-ingestor.aforo.ai`. |
+| `ingestorUrl` | `string` | — (required) | Ingestion base URL. SDK appends `/v1/ingest/batch`. Use `https://api.aforo.ai`. |
+| `productType` | `string` | `'GRPC_API'` | Aforo product type sent as top-level `productType` on every event (trimmed + uppercased; unknown values pass through). Override via the wrappers' last argument, e.g. `wrapUnary('GetUser', handler, { productType })`. |
 | `serviceName` | `string` | — (required) | Fully-qualified gRPC service name (e.g. `acme.v1.UserService`); stamped on every event as `grpcService`. |
 | `customerIdExtractor` | `(metadata: Record<string, unknown>) => string \| undefined` | reads `x-customer-id` from `call.metadata.getMap()` | Resolve the customer per call. `undefined` → call is not metered. |
 | `flushCount` | `number` | `50` | Buffered events that trigger an immediate flush. |
 | `flushIntervalMs` | `number` | `5000` | Max ms before a partial batch is flushed. |
-| `onError` | `(error: Error) => void` | logs to `console.error` | Called when a flush fails terminally (after 3 retries). |
+| `onError` | `(error: Error) => void` | logs to `console.error` | Called when a batch is dropped: after 3 attempts on network errors / 408 / 429 (honouring `Retry-After`) / 5xx, immediately on any other 4xx (not retried), and when a 202 reports per-event failures (`errors[].message`). |
 
-Exported symbols: `AforoGrpcBilling` (with `wrapUnary` / `wrapServerStream` / `wrapClientStream` / `wrapBidiStream` / `shutdown`), the `GRPC_STATUS` numeric-code map, and the `AforoGrpcConfig` type.
+Exported symbols: `AforoGrpcBilling` (with `wrapUnary` / `wrapServerStream` / `wrapClientStream` / `wrapBidiStream` / `shutdown`), the `GRPC_STATUS` numeric-code map, and the `AforoGrpcConfig` / `WrapOptions` types.
 
 > gRPC `Metadata.getMap()` returns `string | Buffer` per key. The default extractor string-coerces; a custom `customerIdExtractor` must do the same for non-string keys.
 

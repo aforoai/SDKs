@@ -62,13 +62,14 @@ Every artifact ships three docs in its own folder: a **README** (install + quick
 
 ## Common model
 
-Everything here funnels usage to one ingestion API. Base SDKs and the gateway/broker plugins batch events and `POST /v1/ingest/batch` (plugins do it from the log/response phase, non-blocking). The protocol SDKs (GraphQL/gRPC/WebSocket/MQTT) post to `/v1/ingest/events`, and the agent SDK posts to `/v1/ingest` — each package's README states the exact path it uses.
+Everything here funnels usage to one ingestion API. SDKs and the gateway/broker plugins batch events and `POST /v1/ingest/batch` with a body of `{"events":[...]}` (1–1000 events; plugins do it from the log/response phase, non-blocking).
 
-- **Endpoint base:** `https://ingest.aforo.ai` (override per environment); the path is `/v1/ingest/batch`, `/v1/ingest/events`, or `/v1/ingest` depending on the SDK — see the package README.
-- **Auth:** `Authorization: Bearer <AFORO_API_KEY>`
-- **Tenant scope:** your tenant id, supplied via SDK config or plugin config — never read from a client-settable request header
+- **Endpoint base:** `https://api.aforo.ai` (override per environment). The full batch URL is `https://api.aforo.ai/v1/ingest/batch`.
+- **Auth:** `X-API-Key: <AFORO_API_KEY>` — the `sk_live_...` / `sk_test_...` key you create in the Aforo UI. Do not send it as `Authorization: Bearer`: the ingestor parses a Bearer value as a JWT and rejects the request 401, even when `X-API-Key` is also present.
+- **Tenant scope:** derived from the API key on the server. Where an SDK or plugin still asks for a tenant id (the protocol SDKs, Kong), the key's tenant always wins.
+- **Event fields (camelCase):** `customerId`, `metricName` (must match a billable metric in your Aforo catalog), `quantity` (> 0), `occurredAt` (ISO-8601), `idempotencyKey`, and `productType` — one of `API`, `AGENTIC_API`, `AI_AGENT`, `MCP_SERVER`, `GRPC_API`, `GRAPHQL_API`, `WEBSOCKET_API`, `MQTT_BROKER`. `productType` is required in production; every SDK sets it from a client-level option (base SDKs default to `API`, protocol SDKs to their own type) that you can override per event.
 
-Gateway/broker plugins take three values: `aforo_endpoint`, `api_key`, `tenant_id`. Each plugin README shows where to set them.
+Gateway/broker plugins take `aforo_endpoint`, `api_key`, and `product_type` (default `API`); the Kong plugin still also requires `tenant_id`. Each plugin README shows where to set them.
 
 ---
 

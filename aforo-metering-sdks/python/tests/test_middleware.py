@@ -13,14 +13,33 @@ import pytest
 
 from aforo.middleware._common import (
     DEFAULT_METRIC_NAME,
+    http_fields,
+    is_billable_quantity,
     is_preflight,
     resolve_customer_id,
     resolve_metric_name,
+    resolve_product_type,
 )
 
 
 def _tracked(client: MagicMock) -> list[dict]:
     return [c.kwargs for c in client.track.call_args_list]
+
+
+_CORE = ("customer_id", "metric_name", "quantity")
+
+
+def _core(client: MagicMock) -> list[dict]:
+    """The customer/metric/quantity part of each track() call."""
+    return [{k: kw[k] for k in _CORE if k in kw} for kw in _tracked(client)]
+
+
+def _assert_http_fields(kwargs: dict, path: str, method: str, status: int = 200) -> None:
+    fields = kwargs["extra_fields"]
+    assert fields["endpointPath"] == path
+    assert fields["httpMethod"] == method
+    assert fields["statusCode"] == status
+    assert isinstance(fields["responseTimeMs"], int) and fields["responseTimeMs"] >= 0
 
 
 # ─── shared helpers ──────────────────────────────────────────────────────────
@@ -36,6 +55,15 @@ def test_common_helpers():
     assert resolve_customer_id(None, object()) is None
     assert resolve_customer_id("  ", object()) is None
     assert resolve_customer_id(lambda r: 42, object()) == "42"
+    assert resolve_product_type(None) == "API"
+    assert resolve_product_type("  graphql_api ") == "GRAPHQL_API"
+    assert resolve_product_type("custom") == "CUSTOM"
+    assert http_fields("/a/b?x=1", "get", 201, 5) == {
+        "endpointPath": "/a/b", "httpMethod": "GET", "statusCode": 201, "responseTimeMs": 5,
+    }
+    assert len(http_fields("/" + "p" * 600, "GET", 200, None)["endpointPath"]) == 512
+    assert not is_billable_quantity(0) and not is_billable_quantity(-1)
+    assert not is_billable_quantity(None) and is_billable_quantity(0.5)
 
 
 # ─── Flask ───────────────────────────────────────────────────────────────────
@@ -59,8 +87,24 @@ def _flask_app(**kwargs):
 
 def test_flask_default_metric_and_customer_header():
     app, client = _flask_app()
-    app.test_client().get("/users/7", headers={"X-Customer-Id": "cust_1"})
-    assert _tracked(client) == [{"customer_id": "cust_1", "metric_name": "api_calls", "quantity": 1}]
+    app.test_client().get("/users/7?page=2", headers={"X-Customer-Id": "cust_1"})
+    assert _core(client) == [{"customer_id": "cust_1", "metric_name": "api_calls", "quantity": 1}]
+    assert _tracked(client)[0]["product_type"] == "API"
+    _assert_http_fields(_tracked(client)[0], "/users/7", "GET")
+
+
+def test_flask_product_type_option_and_app_config():
+    app, client = _flask_app(product_type=" agentic_api ")
+    app.test_client().get("/users/7", headers={"X-Customer-Id": "c"})
+    assert _tracked(client)[0]["product_type"] == "AGENTIC_API"
+
+    from aforo.middleware.flask import AforoMetering
+
+    app2 = flask.Flask(__name__)
+    app2.config["AFORO_PRODUCT_TYPE"] = "GRAPHQL_API"
+    app2.add_url_rule("/x", "x", lambda: "ok")
+    ext = AforoMetering(app2, api_key="k")
+    assert ext._client.product_type == "GRAPHQL_API"
 
 
 def test_flask_never_uses_x_api_key_as_customer():
@@ -111,11 +155,11 @@ def django_settings():
     if not settings.configured:
         settings.configure(DEBUG=True, ALLOWED_HOSTS=["*"], USE_TZ=True, AFORO_API_KEY="k")
         django.setup()
-    for name in ("AFORO_METRIC_NAME", "AFORO_CUSTOMER_ID"):
+    for name in ("AFORO_METRIC_NAME", "AFORO_CUSTOMER_ID", "AFORO_PRODUCT_TYPE"):
         if hasattr(settings, name):
             delattr(settings, name)
     yield settings
-    for name in ("AFORO_METRIC_NAME", "AFORO_CUSTOMER_ID"):
+    for name in ("AFORO_METRIC_NAME", "AFORO_CUSTOMER_ID", "AFORO_PRODUCT_TYPE"):
         if hasattr(settings, name):
             delattr(settings, name)
 
@@ -133,8 +177,20 @@ def test_django_default_metric_and_customer_header(django_settings):
     from django.test import RequestFactory
 
     mw = _django_mw()
-    mw(RequestFactory().get("/users/7", HTTP_X_CUSTOMER_ID="cust_1"))
-    assert _tracked(mw._client) == [{"customer_id": "cust_1", "metric_name": "api_calls", "quantity": 1}]
+    mw(RequestFactory().get("/users/7?q=1", HTTP_X_CUSTOMER_ID="cust_1"))
+    assert _core(mw._client) == [{"customer_id": "cust_1", "metric_name": "api_calls", "quantity": 1}]
+    assert _tracked(mw._client)[0]["product_type"] == "API"
+    _assert_http_fields(_tracked(mw._client)[0], "/users/7", "GET")
+
+
+def test_django_product_type_setting(django_settings):
+    from django.test import RequestFactory
+
+    django_settings.AFORO_PRODUCT_TYPE = "agentic_api"
+    mw = _django_mw()
+    mw(RequestFactory().post("/users/7", HTTP_X_CUSTOMER_ID="c"))
+    assert _tracked(mw._client)[0]["product_type"] == "AGENTIC_API"
+    _assert_http_fields(_tracked(mw._client)[0], "/users/7", "POST")
 
 
 def test_django_never_uses_x_api_key_and_skips_options(django_settings):
@@ -153,7 +209,7 @@ def test_django_settings_resolvers(django_settings):
     django_settings.AFORO_CUSTOMER_ID = lambda request: "cust_resolved"
     mw = _django_mw()
     mw(RequestFactory().get("/users/7"))
-    assert _tracked(mw._client) == [
+    assert _core(mw._client) == [
         {"customer_id": "cust_resolved", "metric_name": "otp_delivered", "quantity": 1}
     ]
 
@@ -190,6 +246,21 @@ def test_asgi_default_metric_customer_and_exclusions():
     assert len(calls) == 1
     assert calls[0]["customer_id"] == "cust_1"
     assert calls[0]["metric_name"] == "api_calls"
+    assert calls[0]["product_type"] == "API"
+    _assert_http_fields(calls[0], "/users/7", "GET")
+
+
+def test_asgi_product_type_option_and_skips_non_positive_quantity():
+    from starlette.testclient import TestClient
+
+    mw = _asgi_app(product_type="agentic_api", quantity=lambda scope: 0)
+    TestClient(mw).get("/users/7", headers={"X-Customer-Id": "c"})
+    mw._client.track.assert_not_called()
+
+    mw = _asgi_app(product_type="agentic_api")
+    TestClient(mw).get("/users/7?x=1", headers={"X-Customer-Id": "c"})
+    assert _tracked(mw._client)[0]["product_type"] == "AGENTIC_API"
+    _assert_http_fields(_tracked(mw._client)[0], "/users/7", "GET")
 
 
 def test_asgi_metric_name_option():

@@ -52,7 +52,14 @@ export class IngestorClient {
 
         if (response.ok) {
           try {
-            return await response.json() as BatchIngestResponse;
+            const result = await response.json() as BatchIngestResponse;
+            if (result && result.failed > 0) {
+              logger.warn('Ingestor rejected some events', {
+                failed: result.failed,
+                errors: (result.errors ?? []).slice(0, 5).map(e => `#${e.index}: ${e.message}`),
+              });
+            }
+            return result;
           } catch {
             // Old ingestor may return empty 202
             return { accepted: events.length, duplicates: 0, failed: 0 };
@@ -99,6 +106,42 @@ export class IngestorClient {
     }
 
     return null;
+  }
+
+  /**
+   * POST a single event in its own `{"events":[event]}` request, exactly once.
+   *
+   * Used for session heartbeats: they must never share a batch with usage (a
+   * large batch takes the ingestor's high-throughput path, which does not
+   * intercept heartbeats), and a lost heartbeat is superseded by the next one,
+   * so there is no retry. Never throws; resolves to the parsed response, or
+   * null on any failure.
+   */
+  async sendSingle(event: ProxyUsageEvent): Promise<BatchIngestResponse | null> {
+    try {
+      const response = await fetch(`${this.baseUrl}/v1/ingest/batch`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-Key': this.apiKey,
+          'X-Tenant-Id': this.tenantId,
+        },
+        body: JSON.stringify({ events: [event] }),
+        signal: AbortSignal.timeout(this.timeout),
+      });
+      if (!response.ok) {
+        logger.debug('Single-event send rejected', { status: response.status });
+        return null;
+      }
+      try {
+        return await response.json() as BatchIngestResponse;
+      } catch {
+        return { accepted: 1, duplicates: 0, failed: 0 };
+      }
+    } catch (err) {
+      logger.debug('Single-event send failed', { error: (err as Error).message });
+      return null;
+    }
   }
 
   private sleep(ms: number): Promise<void> {

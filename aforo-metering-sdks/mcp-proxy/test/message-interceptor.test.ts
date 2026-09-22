@@ -63,6 +63,16 @@ describe('extractToolCall', () => {
     assert.equal(result.agentId, 'agent_001');
   });
 
+  it('extracts _meta.customer_id when present', () => {
+    const withCustomer = extractToolCall({
+      jsonrpc: '2.0', id: 1, method: 'tools/call',
+      params: { name: 't', _meta: { agent_id: 'a', customer_id: ' cust_1 ' } },
+    });
+    assert.equal(withCustomer?.customerId, 'cust_1');
+    const without = extractToolCall({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 't' } });
+    assert.equal(without?.customerId, undefined);
+  });
+
   it('uses "unknown" for missing agent_id', () => {
     const msg = {
       jsonrpc: '2.0' as const,

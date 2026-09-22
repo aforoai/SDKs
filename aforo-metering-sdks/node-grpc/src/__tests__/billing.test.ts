@@ -58,7 +58,7 @@ const config = () => ({
   tenantId: 'tenant-001',
   productId: 'prod-001',
   apiKey: 'sk_test_abc',
-  ingestorUrl: 'https://usage-ingestor.aforo.ai/',  // trailing slash on purpose — SDK should strip it
+  ingestorUrl: 'https://api.aforo.ai/',  // trailing slash on purpose — SDK should strip it
   serviceName: 'acme.v1.UserService',
 });
 
@@ -228,7 +228,7 @@ describe('flush request shape', () => {
 
     expect(capturedRequests).toHaveLength(1);
     const req = capturedRequests[0];
-    expect(req.url).toBe('https://usage-ingestor.aforo.ai/v1/ingest/batch'); // trailing slash stripped
+    expect(req.url).toBe('https://api.aforo.ai/v1/ingest/batch'); // trailing slash stripped
     expect(req.init.method).toBe('POST');
     const headers = req.init.headers as Record<string, string>;
     expect(headers['Content-Type']).toBe('application/json');
@@ -326,7 +326,7 @@ function assertBatchContract(reqs: Array<{ url: string; init: RequestInit; body:
   const allowedSet = new Set(allowed);
   expect(reqs.length).toBeGreaterThan(0);
   for (const r of reqs) {
-    expect(r.url).toBe('https://usage-ingestor.aforo.ai/v1/ingest/batch');
+    expect(r.url).toBe('https://api.aforo.ai/v1/ingest/batch');
     expect((r.init.headers as Record<string, string>)['X-API-Key']).toBe(apiKey);
     expect(Object.keys(r.body)).toEqual(['events']);
     expect(r.body.events.length).toBeGreaterThan(0);
@@ -381,5 +381,78 @@ describe('ingest batch contract', () => {
     await b.shutdown();
     expect(capturedRequests).toHaveLength(0);
     expect(onError).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('productType', () => {
+  test('defaults to GRPC_API; client option is trimmed + uppercased; per-handler option wins', async () => {
+    const b = new AforoGrpcBilling({ ...config(), flushCount: 100 });
+    b.wrapUnary('A', async () => ({}))(makeCall(), makeCallback().cb);
+    await new Promise((r) => setTimeout(r, 20));
+    await b.shutdown();
+    expect(capturedRequests[0].body.events[0].productType).toBe('GRPC_API');
+
+    capturedRequests = [];
+    const c = new AforoGrpcBilling({ ...config(), flushCount: 100, productType: ' agentic_api ' });
+    c.wrapUnary('A', async () => ({}))(makeCall(), makeCallback().cb);
+    c.wrapUnary('B', async () => ({}), { productType: ' custom_type ' })(makeCall(), makeCallback().cb);
+    c.wrapUnary('C', async () => ({}), { productType: '  ' })(makeCall(), makeCallback().cb);
+    await new Promise((r) => setTimeout(r, 20));
+    await c.shutdown();
+    const byMethod = Object.fromEntries(capturedRequests[0].body.events.map((e: any) => [e.grpcMethod, e.productType]));
+    expect(byMethod).toEqual({ A: 'AGENTIC_API', B: 'CUSTOM_TYPE', C: 'AGENTIC_API' });
+  });
+
+  test('blank grpcService or grpcMethod → event dropped via onError', async () => {
+    const onError = jest.fn();
+    const b = new AforoGrpcBilling({ ...config(), serviceName: '  ', flushCount: 100, onError });
+    b.wrapUnary('M', async () => ({}))(makeCall(), makeCallback().cb);
+    const c = new AforoGrpcBilling({ ...config(), flushCount: 100, onError });
+    c.wrapUnary(' ', async () => ({}))(makeCall(), makeCallback().cb);
+    await new Promise((r) => setTimeout(r, 20));
+    await b.shutdown();
+    await c.shutdown();
+    expect(capturedRequests).toHaveLength(0);
+    expect(onError).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('batch response handling', () => {
+  const resp = (status: number, body: any = {}, headers: Record<string, string> = {}) => ({
+    ok: status >= 200 && status < 300, status, statusText: String(status),
+    headers: { get: (k: string) => headers[k.toLowerCase()] ?? null },
+    json: async () => body,
+  } as unknown as Response);
+  const meter = async (b: AforoGrpcBilling) => {
+    b.wrapUnary('M', async () => ({}))(makeCall(), makeCallback().cb);
+    await new Promise((r) => setTimeout(r, 20));
+    await b.shutdown();
+  };
+
+  test('4xx (not 408/429) is not retried and reports errors[].message', async () => {
+    const onError = jest.fn();
+    nextFetchResponse = () => resp(400, { errors: [{ index: 0, message: 'grpcService is required' }] });
+    await meter(new AforoGrpcBilling({ ...config(), flushCount: 100, onError }));
+    expect(capturedRequests).toHaveLength(1);
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError.mock.calls[0][0].message).toMatch(/HTTP 400.*grpcService is required.*not retried/);
+  });
+
+  test('429 honours Retry-After and 408 is retried; same idempotencyKeys re-sent', async () => {
+    const onError = jest.fn();
+    const seq = [resp(429, {}, { 'retry-after': '0' }), resp(408, {}, { 'retry-after': '0' }), resp(202, { accepted: 1, failed: 0 })];
+    nextFetchResponse = () => seq.shift()!;
+    await meter(new AforoGrpcBilling({ ...config(), flushCount: 100, onError }));
+    expect(capturedRequests).toHaveLength(3);
+    expect(new Set(capturedRequests.map((r) => r.body.events[0].idempotencyKey)).size).toBe(1);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  test('202 with failed > 0 reports per-event errors[].message via onError', async () => {
+    const onError = jest.fn();
+    nextFetchResponse = () => resp(202, { accepted: 0, duplicates: 0, failed: 1, errors: [{ index: 0, message: 'bad event' }] });
+    await meter(new AforoGrpcBilling({ ...config(), flushCount: 100, onError }));
+    expect(capturedRequests).toHaveLength(1);
+    expect(onError.mock.calls[0][0].message).toMatch(/rejected 1 event\(s\).*#0: bad event/);
   });
 });

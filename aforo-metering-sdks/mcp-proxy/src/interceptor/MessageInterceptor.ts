@@ -30,6 +30,8 @@ export interface ParsedToolCall {
   requestId: string | number;
   toolName: string;
   agentId: string;
+  /** From `_meta.customer_id`, when the caller sends one. */
+  customerId?: string;
 }
 
 export interface ParsedToolResponse {
@@ -73,8 +75,10 @@ export function extractToolCall(msg: JsonRpcRequest): ParsedToolCall | null {
   const toolName = (params?.name as string) ?? 'unknown';
   const meta = params?._meta as Record<string, unknown> | undefined;
   const agentId = (meta?.agent_id as string) ?? 'unknown';
+  const customerId = typeof meta?.customer_id === 'string' && meta.customer_id.trim()
+    ? meta.customer_id.trim() : undefined;
 
-  return { requestId: msg.id, toolName, agentId };
+  return { requestId: msg.id, toolName, agentId, ...(customerId ? { customerId } : {}) };
 }
 
 /**

@@ -16,5 +16,6 @@ export function generateIdempotencyKey(
 }
 
 export function generateHeartbeatKey(sessionId: string): string {
-  return `hb:proxy:${sessionId}:${Date.now()}`;
+  // Random suffix: a SESSION_END can fire in the same millisecond as a HEARTBEAT.
+  return `hb:proxy:${sessionId}:${Date.now()}:${Math.random().toString(36).substring(2, 10)}`;
 }

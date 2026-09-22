@@ -12,6 +12,10 @@ import { logger } from '../util/logger.js';
 
 const PROXY_VERSION = '1.0.0';
 const STALE_CALL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+/** Ingestor field limits (IngestUsageEventRequest). */
+const MAX_CUSTOMER_ID = 64;
+const MAX_AGENT_ID = 36;
+const MAX_TOOL_NAME = 64;
 
 export interface ToolCallTrackerConfig {
   buffer: EventBuffer;
@@ -20,6 +24,10 @@ export interface ToolCallTrackerConfig {
   productId: string;
   transport: string;
   agentIdOverride?: string;
+  /** Customer billed when a call carries no `_meta.customer_id` (else the agentId is billed). */
+  customerId?: string;
+  /** productType stamped on tool events (default MCP_SERVER). */
+  productType?: string;
 }
 
 export class ToolCallTracker {
@@ -30,6 +38,8 @@ export class ToolCallTracker {
   private readonly productId: string;
   private readonly transport: string;
   private readonly agentIdOverride?: string;
+  private readonly customerId?: string;
+  private readonly productType: string;
   private cleanupTimer: ReturnType<typeof setInterval>;
   private toolCallCount = 0;
   private errorCount = 0;
@@ -42,30 +52,56 @@ export class ToolCallTracker {
     this.productId = config.productId;
     this.transport = config.transport;
     this.agentIdOverride = config.agentIdOverride;
+    this.customerId = config.customerId?.trim() || undefined;
+    this.productType = config.productType?.trim().toUpperCase() || 'MCP_SERVER';
 
     // Periodically clean up stale in-flight calls
     this.cleanupTimer = setInterval(() => this.cleanupStale(), 60_000);
   }
 
   /**
-   * Register a new tool call request — starts duration timer.
+   * Customer billed for a call: `_meta.customer_id`, else the configured
+   * customerId, else the agent id.
    */
-  trackRequest(call: ParsedToolCall, sessionId: string): void {
+  resolveCustomerId(call: { agentId: string; customerId?: string }): string {
+    return call.customerId || this.customerId || (this.agentIdOverride ?? call.agentId);
+  }
+
+  /**
+   * Register a new tool call request — starts duration timer.
+   *
+   * Returns false (and meters nothing) when the event would be rejected by the
+   * ingestor -- toolName over 64 chars, agentId over 36 or customerId over 64 --
+   * because one invalid event fails the whole batch it is sent in.
+   */
+  trackRequest(call: ParsedToolCall, sessionId: string): boolean {
     const agentId = this.agentIdOverride ?? call.agentId;
+    const customerId = this.resolveCustomerId(call);
+
+    const problems: string[] = [];
+    if (call.toolName.length > MAX_TOOL_NAME) problems.push(`toolName exceeds ${MAX_TOOL_NAME} chars`);
+    if (agentId.length > MAX_AGENT_ID) problems.push(`agentId exceeds ${MAX_AGENT_ID} chars`);
+    if (customerId.length > MAX_CUSTOMER_ID) problems.push(`customerId exceeds ${MAX_CUSTOMER_ID} chars`);
+    if (problems.length > 0) {
+      logger.warn('Tool call not metered', { toolName: call.toolName, requestId: call.requestId, problems });
+      return false;
+    }
 
     this.inFlight.set(call.requestId, {
       toolName: call.toolName,
       agentId,
+      customerId,
       startTime: Date.now(),
       requestId: call.requestId,
     });
 
-    // Auto-start heartbeat on first tool call
+    // Auto-start the session (and its heartbeats) on the first tool call
     if (!this.heartbeat.activeSessionId) {
-      this.heartbeat.startSession(sessionId);
+      this.heartbeat.startSession(sessionId, customerId);
     }
 
     logger.debug('Tool call started', { toolName: call.toolName, requestId: call.requestId });
+    return true;
   }
 
   /**
@@ -86,12 +122,12 @@ export class ToolCallTracker {
     if (response.hasError) this.errorCount++;
 
     const event: ProxyUsageEvent = {
-      customerId: call.agentId,
+      customerId: call.customerId,
       metricName: 'mcp_server.tool_invocations',
       quantity: 1,
       occurredAt: new Date().toISOString(),
       idempotencyKey: generateIdempotencyKey(call.agentId, sessionId, call.toolName, call.requestId),
-      productType: 'MCP_SERVER',
+      productType: this.productType,
       toolName: call.toolName,
       agentId: call.agentId,
       sessionId,

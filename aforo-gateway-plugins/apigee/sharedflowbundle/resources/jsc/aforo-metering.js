@@ -22,9 +22,28 @@
  *   aforo.quantitySource     "1" (default) or "response_size"
  *   aforo.includeMetadata    "false" to omit metadata
  *   aforo.mcpEnabled / aforo.mcpProductId
+ *   aforo.productType        productType on every event (KVM product_type,
+ *                            default "API"; trimmed + upper-cased, unknown
+ *                            values passed through). An MCP tools/call with
+ *                            both toolName and agentId is sent as MCP_SERVER.
  */
 
 var MAX_CUSTOMER_ID_LENGTH = 64;
+
+// Fields each productType must carry. The ingestor validates a batch as a
+// whole and rejects an event missing them, so such events are skipped here.
+// gRPC / GraphQL / WebSocket / MQTT fields are not observable at an HTTP
+// proxy, so those types always skip. Unknown types pass unchecked.
+var PRODUCT_TYPE_REQUIRED_FIELDS = {
+    API: [],
+    AGENTIC_API: [],
+    AI_AGENT: ['agentId', 'sessionId'],
+    MCP_SERVER: ['toolName', 'agentId'],
+    GRPC_API: ['grpcService', 'grpcMethod'],
+    GRAPHQL_API: ['gqlOperationType'],
+    WEBSOCKET_API: ['wsConnectionId'],
+    MQTT_BROKER: ['mqttTopic']
+};
 
 function str(name) {
     var v = context.getVariable(name);
@@ -105,6 +124,7 @@ var customerId = resolveCustomerId();
 var mcpEnabled = str('aforo.mcpEnabled') === 'true';
 var mcpProductId = str('aforo.mcpProductId');
 var includeMetadata = str('aforo.includeMetadata') !== 'false';
+var productType = str('aforo.productType').trim().toUpperCase() || 'API';
 
 var skipReason = '';
 var excludePaths = splitList(str('aforo.excludePaths'));
@@ -168,7 +188,10 @@ if (!skipReason && isMcpToolCall) {
         // Stable per request (was suffixed with Date.now(), so nothing could dedupe).
         idempotencyKey: 'mcp:apigee:' + requestId + ':' + toolName,
         occurredAt: new Date().toISOString(),
-        productType: 'MCP_SERVER',
+        // MCP_SERVER requires toolName AND agentId; without an agentId the
+        // configured productType is kept rather than send an event the
+        // ingestor must reject.
+        productType: (toolName && agentId) ? 'MCP_SERVER' : productType,
         toolName: toolName,
         // agentId: sourced EXCLUSIVELY from the JSON-RPC payload's
         // params._meta.agent_id. Never fall back to the X-Agent-Id
@@ -210,12 +233,19 @@ if (!skipReason && isMcpToolCall) {
             quantity: quantity,
             idempotencyKey: requestId || ('apigee-' + Date.now()),
             occurredAt: new Date().toISOString(),
+            productType: productType,
             endpointPath: path,
             httpMethod: method,
             statusCode: statusCode,
             responseTimeMs: latency,
             trace: trace
         };
+        if (productType === 'AI_AGENT') {
+            // sessionId from the MCP session header; agentId has no trusted
+            // source outside an MCP payload (X-Agent-Id is client-settable,
+            // IDOR finding #11), so AI_AGENT events without one are skipped.
+            if (sessionId) event.sessionId = sessionId;
+        }
         if (includeMetadata) {
             event.metadata = {
                 gateway: 'apigee',
@@ -229,6 +259,15 @@ if (!skipReason && isMcpToolCall) {
                 response_time_ms: latency
             };
         }
+    }
+}
+
+if (event) {
+    var required = PRODUCT_TYPE_REQUIRED_FIELDS[event.productType] || [];
+    var missing = required.filter(function (f) { return !event[f]; });
+    if (missing.length > 0) {
+        skipReason = 'productType ' + event.productType + ' missing ' + missing.join('+');
+        event = null;
     }
 }
 

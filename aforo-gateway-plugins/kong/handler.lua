@@ -370,6 +370,53 @@ local MAX_BUFFER_SIZE = 10000
 -- larger than this, rather than as one oversized request.
 local MAX_BATCH_SIZE = 1000
 
+-- Longest Retry-After (seconds) honoured on a 429 before the next attempt.
+-- The flush runs in a timer, so a longer wait would only hold later slices;
+-- past this the batch is re-buffered for a later flush instead.
+local MAX_RETRY_AFTER_SECONDS = 30
+
+-- productType is REQUIRED by the ingestor in production, and some types carry
+-- fields of their own. The ingestor validates a batch as a whole, so one event
+-- missing its type's fields fails every event it travels with; such events are
+-- skipped at the log phase instead. An AI_AGENT agentId (no trusted source:
+-- X-Agent-Id is client-settable), gRPC service/method, GraphQL operation,
+-- WebSocket connection and MQTT topic are not observable at an HTTP gateway,
+-- so those types are listed only so the check refuses them rather than
+-- poisoning batches. Unknown types are passed through unchecked.
+local DEFAULT_PRODUCT_TYPE = "API"
+local PRODUCT_TYPE_REQUIRED_FIELDS = {
+    API           = {},
+    AGENTIC_API   = {},
+    AI_AGENT      = { "agentId", "sessionId" },
+    MCP_SERVER    = { "toolName", "agentId" },
+    GRPC_API      = { "grpcService", "grpcMethod" },
+    GRAPHQL_API   = { "gqlOperationType" },
+    WEBSOCKET_API = { "wsConnectionId" },
+    MQTT_BROKER   = { "mqttTopic" },
+}
+
+-- conf.product_type trimmed and upper-cased; "API" when unset or blank.
+local function normalize_product_type(value)
+    if type(value) ~= "string" then return DEFAULT_PRODUCT_TYPE end
+    local v = value:match("^%s*(.-)%s*$"):upper()
+    if v == "" then return DEFAULT_PRODUCT_TYPE end
+    return v
+end
+
+-- Required fields this event's productType lacks, or nil when complete.
+local function missing_required_fields(event)
+    local required = PRODUCT_TYPE_REQUIRED_FIELDS[event.productType]
+    if not required then return nil end
+    local missing = {}
+    for _, field in ipairs(required) do
+        local v = event[field]
+        if v == nil or v == "" then
+            missing[#missing + 1] = field
+        end
+    end
+    return #missing > 0 and missing or nil
+end
+
 -- ────────────────────────────────────────────────────────────
 -- Helpers
 -- ────────────────────────────────────────────────────────────
@@ -801,7 +848,21 @@ local function send_batch(conf, batch)
         end
 
         if attempt < max_retries then
-            ngx.sleep(math.pow(2, attempt - 1))
+            local wait = math.pow(2, attempt - 1)
+            -- Honour the ingestor's Retry-After on 429 (delta-seconds form).
+            -- Longer than MAX_RETRY_AFTER_SECONDS: stop here and let the
+            -- caller re-buffer, rather than sleep through the flush.
+            if last_status == 429 then
+                local ra = res.headers and tonumber(res.headers["Retry-After"]
+                    or res.headers["retry-after"])
+                if ra and ra >= 0 then
+                    if ra > MAX_RETRY_AFTER_SECONDS then
+                        break
+                    end
+                    wait = ra
+                end
+            end
+            ngx.sleep(wait)
         end
     end
 
@@ -1052,8 +1113,12 @@ function AforoMeteringHandler:log(conf)
         mcp_info = detect_mcp_tool_call(raw_body)
     end
 
+    -- productType on every event (conf.product_type, default "API").
+    local product_type = normalize_product_type(conf.product_type)
+
     -- Build usage event
     local event = {}
+    event.productType = product_type
 
     if mcp_info then
         event.customerId     = customer_id
@@ -1063,12 +1128,18 @@ function AforoMeteringHandler:log(conf)
                                (request_id or uuid()) .. ":" ..
                                mcp_info.tool_name .. ":" .. tostring(ngx.now())
         event.occurredAt     = iso8601_utc(ngx.now())
-        event.productType    = "MCP_SERVER"
         event.toolName       = mcp_info.tool_name
         event.agentId        = mcp_info.agent_id or headers["x-agent-id"]
         event.sessionId      = session_id
         event.executionStatus = (status >= 200 and status < 300) and "SUCCESS" or "ERROR"
         event.executionDurationMs = tonumber(latency) or 0
+        -- MCP_SERVER requires toolName AND agentId. Classify the tool call as
+        -- MCP_SERVER only when both are known; otherwise keep the configured
+        -- product_type rather than send an event the ingestor must reject.
+        if event.toolName and event.toolName ~= ""
+            and event.agentId and event.agentId ~= "" then
+            event.productType = "MCP_SERVER"
+        end
     else
         event.customerId     = customer_id
         -- Upstream-supplied overrides, read from the response so a client
@@ -1083,6 +1154,14 @@ function AforoMeteringHandler:log(conf)
         event.quantity       = resolve_quantity(conf, response_size, header_quantity)
         event.idempotencyKey = generate_idempotency_key(request_id)
         event.occurredAt     = iso8601_utc(ngx.now())
+    end
+
+    -- quantity must be > 0 (e.g. quantity_source=response_size with an empty
+    -- body); one such event would fail the whole batch.
+    if type(event.quantity) ~= "number" or event.quantity <= 0 then
+        kong.log.debug("[aforo-metering] Skipping ", method, " ", path,
+            " -- quantity is not > 0.")
+        return
     end
 
     -- Top-level HTTP fields (hoisted from metadata for fast ClickHouse queries)
@@ -1150,6 +1229,17 @@ function AforoMeteringHandler:log(conf)
             " -- no customer identity resolved. With jwt_validation_enabled the ",
             "customer_id claim supplies this; otherwise set customer_id_source to a ",
             "Kong consumer. Event not metered.")
+        return
+    end
+
+    -- Refuse to buffer an event its productType makes invalid, for the same
+    -- reason as the customerId skip above: one such event fails its batch.
+    local missing = missing_required_fields(event)
+    if missing then
+        warn_throttled("missing_fields_" .. event.productType, 300,
+            "[aforo-metering] Skipping events: product_type ", event.productType,
+            " requires ", table.concat(missing, ", "), ", which this request did not ",
+            "supply (e.g. ", method, " ", path, "). Repeats suppressed for 300s.")
         return
     end
 

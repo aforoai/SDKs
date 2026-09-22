@@ -100,6 +100,37 @@ export class Transport {
     return { sent: 0, failed: events.length };
   }
 
+  /**
+   * Send a single event in its own request, once, best-effort.
+   *
+   * Used for session heartbeats: a heartbeat must never share a batch with
+   * usage (a large batch takes the high-throughput path, which does not
+   * intercept heartbeats), and a lost heartbeat is simply superseded by the
+   * next one -- so there is no retry and every failure is swallowed.
+   * Resolves to true when the ingestor accepted the request.
+   */
+  async sendSingleBestEffort(event: ResolvedEvent): Promise<boolean> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeout);
+    try {
+      const body: BatchRequest = { events: [event] };
+      const response = await fetch(`${this.baseUrl}/v1/ingest/batch`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-Key': this.apiKey,
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      return response.ok;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }

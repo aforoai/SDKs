@@ -48,7 +48,7 @@ AforoGrpcBilling billing = AforoGrpcBilling.newBuilder()
         .tenantId("tenant_acme")
         .productId("prod_grpc_user_svc")
         .apiKey(System.getenv("AFORO_API_KEY"))
-        .ingestorUrl("https://usage-ingestor.aforo.ai")
+        .ingestorUrl("https://api.aforo.ai")
         .serviceName("acme.v1.UserService")
         .build();
 
@@ -59,7 +59,7 @@ Server server = ServerBuilder.forPort(50051)
         .start();
 ```
 
-> ⚠ `ingestorUrl` is the host only — the SDK appends `/v1/ingest/batch`. Pass `https://usage-ingestor.aforo.ai`, not the full path.
+> ⚠ `ingestorUrl` is the host only — the SDK appends `/v1/ingest/batch`. Pass `https://api.aforo.ai`, not the full path.
 
 ## Step 4 — Make the customer id reachable from metadata
 
@@ -115,6 +115,7 @@ billing.record("ListUsers", "SERVER_STREAM", customerId, "OK", durationMs);
 | `apiKey` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
 | `ingestorUrl` | `String` | *(required)* | Host; SDK appends `/v1/ingest/batch`. |
 | `serviceName` | `String` | *(required)* | `grpcService` field + idempotency key. |
+| `productType` | `String` | `GRPC_API` | Top-level `productType` on every event; trimmed + uppercased. Per call: `record(method, callType, customerId, status, durationMs, productType)` (a null/blank override uses the client value). |
 | `flushCount` | `int` | `50` | Events per immediate flush. |
 | `flushIntervalMs` | `long` | `5000` | Background flush cadence (ms). |
 | `customerIdExtractor` | `Function<Metadata, String>` | `x-customer-id` metadata | Per-call customer-id resolution. |

@@ -6,7 +6,12 @@ package com.aforo.metering.spring;
 public class AforoMeteringProperties {
 
     private String apiKey;
-    private String baseUrl = "https://usage-ingestor.aforo.ai";
+    private String baseUrl = "https://api.aforo.ai";
+    /**
+     * Top-level {@code productType} stamped on every event ({@code aforo.product-type}).
+     * Default {@code API}; e.g. {@code AGENTIC_API}.
+     */
+    private String productType = "API";
     private int flushCount = 50;
     private long flushIntervalMs = 5_000;
 
@@ -32,6 +37,9 @@ public class AforoMeteringProperties {
 
     public String getBaseUrl() { return baseUrl; }
     public void setBaseUrl(String baseUrl) { this.baseUrl = baseUrl; }
+
+    public String getProductType() { return productType; }
+    public void setProductType(String productType) { this.productType = productType; }
 
     public int getFlushCount() { return flushCount; }
     public void setFlushCount(int flushCount) { this.flushCount = flushCount; }

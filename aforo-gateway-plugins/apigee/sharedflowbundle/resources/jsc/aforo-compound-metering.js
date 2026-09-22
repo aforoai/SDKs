@@ -76,6 +76,7 @@ if (enabled !== 'true') {
         var compoundEvent = {
             correlationId: correlationId,
             customerId: customerId,
+            productType: String(context.getVariable('aforo.productType') || '').trim().toUpperCase() || 'API',
             occurredAt: new Date().toISOString(),
             metadata: {
                 gateway: 'apigee',

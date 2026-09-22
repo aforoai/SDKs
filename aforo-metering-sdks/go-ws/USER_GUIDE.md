@@ -12,7 +12,7 @@ A WebSocket server that emits one Aforo `CONNECTION_OPENED` event when a connect
 - A WebSocket library of your choice (gorilla/websocket, nhooyr.io/websocket, gobwas/ws, or a raw `net/http` upgrade).
 - An Aforo API key (`AFORO_API_KEY`), a `tenant_id`, and a `product_id`. All three are SDK config — never read from a client header.
 - A customer id per connection — you pass it to `Open`. Decode it from your auth (header, token, query).
-- Ingestor base URL — `https://usage-ingestor.aforo.ai`.
+- Ingestor base URL — `https://api.aforo.ai`.
 
 ## Step 1 — Add the module from source
 
@@ -49,7 +49,7 @@ billing, err := wsmetering.New(wsmetering.Config{
 	TenantID:    "tenant_acme",
 	ProductID:   "prod_ws_market_feed",
 	APIKey:      os.Getenv("AFORO_API_KEY"),
-	IngestorURL: "https://usage-ingestor.aforo.ai",
+	IngestorURL: "https://api.aforo.ai",
 })
 if err != nil {
 	log.Fatal(err) // returned when any required field is empty
@@ -106,7 +106,7 @@ The buffer flushes every `FlushInterval` (3s) or when it reaches `FlushCount` (1
 The wire call the SDK makes:
 
 ```
-POST https://usage-ingestor.aforo.ai/v1/ingest/batch
+POST https://api.aforo.ai/v1/ingest/batch
 X-API-Key: <AFORO_API_KEY>
 X-Tenant-Id: tenant_acme
 Content-Type: application/json
@@ -114,7 +114,7 @@ Content-Type: application/json
 {"events":[{"customerId":"…","metricName":"websocket_api.connection_closed","quantity":1,"occurredAt":"…","idempotencyKey":"ws:…","productType":"WEBSOCKET_API","wsConnectionId":"ws_…","wsDirection":"SERVER_TO_CLIENT","wsFrameType":"CLOSE","messageCount":42,"dataBytes":8192,"executionDurationMs":15300,"wsCloseReason":"NORMAL_CLOSURE","metadata":{"path":"/ws","event":"CONNECTION_CLOSED","frames":42,"bytes":8192,"closeCode":1000,"sdkVersion":"1.0.0","productId":"prod_ws_market_feed"}}]}
 ```
 
-> ⚠ Flush failures are silent unless you set `OnError`. If nothing lands, set `OnError: func(err error){ log.Println("aforo:", err) }` to surface marshal failures and retry-exhausted drops.
+> ⚠ Flush failures are silent unless you set `OnError`. If nothing lands, set `OnError: func(err error){ log.Println("aforo:", err) }` to surface marshal failures, retry-exhausted drops and ingestor rejections (including `errors[].message`).
 
 ## Configuration reference
 
@@ -125,10 +125,11 @@ Content-Type: application/json
 | `APIKey` | `string` | — (required) | `X-API-Key: <APIKey>`. |
 | `IngestorURL` | `string` | — (required) | Base; `/v1/ingest/batch` is appended. |
 | `PerFrameEvents` | `bool` | `false` | Per-frame event emission in addition to open/close. |
+| `ProductType` | `string` | `WEBSOCKET_API` | Top-level `productType` on every event; per-event override via `EventOptions`. |
 | `FlushCount` | `int` | `100` | Buffer-size flush threshold. |
 | `FlushInterval` | `time.Duration` | `3s` | Background flush cadence. |
 | `HTTPClient` | `*http.Client` | `&http.Client{Timeout: 10s}` | HTTP client override. |
-| `OnError` | `func(error)` | no-op | Marshal failures + retry-exhausted drops. |
+| `OnError` | `func(error)` | no-op | Marshal failures, retry-exhausted drops, non-retryable `4xx` rejections, and partial failures (with the ingestor's `errors[].message`). |
 
 ## Troubleshooting
 

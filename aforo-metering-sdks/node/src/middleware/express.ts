@@ -1,6 +1,6 @@
 import { AforoClient } from '../client';
 import { MiddlewareOptions } from '../types';
-import { isPreflight, resolveMetricName, firstNonEmpty } from './common';
+import { isPreflight, resolveMetricName, firstNonEmpty, endpointPathOf } from './common';
 
 const DEFAULT_EXCLUDE_PATHS = ['/health', '/ready', '/metrics', '/favicon.ico'];
 
@@ -12,7 +12,7 @@ const DEFAULT_EXCLUDE_PATHS = ['/health', '/ready', '/metrics', '/favicon.ico'];
  *
  * ```typescript
  * import { expressMiddleware } from '@aforo/metering/middleware/express';
- * app.use(expressMiddleware({ apiKey: process.env.AFORO_API_KEY }));
+ * app.use(expressMiddleware({ apiKey: process.env.AFORO_API_KEY, productType: 'API' }));
  * ```
  */
 export function expressMiddleware(options: MiddlewareOptions) {
@@ -62,6 +62,7 @@ export function expressMiddleware(options: MiddlewareOptions) {
         }
 
         if (!customerId) return; // Can't meter without a customer
+        if (!(quantity > 0)) return; // The ingestor rejects quantity <= 0
 
         // Build metadata
         let metadata: Record<string, string | number | boolean> | undefined;
@@ -74,6 +75,11 @@ export function expressMiddleware(options: MiddlewareOptions) {
           metricName,
           quantity,
           metadata,
+          productType: options.productType,
+          endpointPath: endpointPathOf(path),
+          httpMethod: method,
+          statusCode,
+          responseTimeMs: Date.now() - startTime,
         }).catch(() => {}); // Fire-and-forget
 
       } catch {

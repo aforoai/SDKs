@@ -68,6 +68,8 @@ const CONFIG = {
   // Presented to the ingestor as X-API-Key. Must be scoped usage:ingest,
   // which is what maps to METERING_AGENT and authorises ingestion.
   ingestApiKey: env('DEMO_INGEST_API_KEY', 'demo-ingest-key'),
+  // productType stamped on every event; the ingestor requires it.
+  productType: env('DEMO_PRODUCT_TYPE', 'API'),
   redisHost: env('DEMO_REDIS_HOST', 'host.docker.internal'),
   redisPort: env('DEMO_REDIS_PORT', '6379'),
 };
@@ -180,6 +182,7 @@ services:
           tenant_id: ${CONFIG.tenantId}
           aforo_endpoint: ${CONFIG.aforoEndpoint}
           api_key: ${CONFIG.ingestApiKey}
+          product_type: ${CONFIG.productType}
 
           # Verify the RS256 signature. With jwt_public_key set, an unverifiable
           # token is rejected -- jwt_allow_unverified_signature stays false.

@@ -574,10 +574,11 @@ product_id()        -> get_cfg(product_id,        <<"prod_mqtt_default">>).
 api_key()           -> get_cfg(api_key,           <<"">>).
 %% /v1/ingest/batch, not /v1/ingest/events (2026-09-21). The plugin POSTs
 %% {"events": [...]}, which is the batch endpoint's contract; /v1/ingest/events
-%% is the single-event, Apigee-format endpoint. And usage-ingestor.aforo.ai,
-%% not ingestor.aforo.ai: the latter resolves to a static CloudFront/S3 site
-%% that answers a POST with a 301, so no event ever reached the ingestor.
-ingestor_url()      -> binary_to_list(get_cfg(ingestor_url, <<"https://usage-ingestor.aforo.ai/v1/ingest/batch">>)).
+%% is the single-event, Apigee-format endpoint. And api.aforo.ai (the
+%% public gateway in front of the ingestor), not ingestor.aforo.ai: the
+%% latter resolves to a static CloudFront/S3 site that answers a POST with
+%% a 301, so no event ever reached the ingestor.
+ingestor_url()      -> binary_to_list(get_cfg(ingestor_url, <<"https://api.aforo.ai/v1/ingest/batch">>)).
 flush_count()       -> get_cfg(flush_count,       500).
 flush_interval_ms() -> get_cfg(flush_interval_ms, 3000).
 emit_deliver_enabled() -> get_cfg(emit_deliver, false).

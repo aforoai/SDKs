@@ -6,10 +6,16 @@ This bundle ships on the Aforo gateway-plugins line; the whole repo is versioned
 
 ## [Unreleased]
 
+### Added
+- KVM key `product_type` (default `API`, trimmed + upper-cased, unknown values passed through): every event now carries the `productType` the ingestor requires in production. The (unwired) compound builder sets it too.
+
+### Fixed (product type)
+- An MCP `tools/call` without `params._meta.agent_id` was sent as `MCP_SERVER` with an empty `agentId`, which the ingestor rejects. It is now `MCP_SERVER` only when both `toolName` and `agentId` are present, otherwise the configured type. Events missing the fields their `productType` requires are not sent (`aforo.skipReason` names the fields).
+
 Brings the shared flow in line with the ingestor contract. **Breaking**: `default_metric` is required, customer identity no longer falls back to the developer app, and JWT validation is now opt-in. Not verified on a live Apigee org.
 
 ### Fixed
-- Docs: the example ingestor URL is now `https://usage-ingestor.aforo.ai/v1/ingest/batch`. `ingest.aforo.ai` is CloudFront in front of S3: a POST gets a 301 from AmazonS3 and never reaches the ingestor.
+- Docs: the example ingestor URL is now `https://api.aforo.ai/v1/ingest/batch`. `ingest.aforo.ai` is CloudFront in front of S3: a POST gets a 301 from AmazonS3 and never reaches the ingestor.
 - **Auth**: the ServiceCallout sent `Authorization: Bearer {api_key}` + `X-Tenant-Id`; the ingestor reads only `X-API-Key` (and rejects Bearer with 401). Now `X-API-Key` alone, from a `private.` variable so it is masked in Debug.
 - **Customer**: `customerId` was `developer.app.name` / `developer.email` / `''` — Apigee names, not Aforo customer ids, and empty ones were sent anyway. Now the verified JWT `customer_id` (`aforo.customer_id`), else the newly implemented `customer_id_source = flow_variable:<name>` (client-controlled variables refused); nothing is sent without one or when it exceeds 64 chars.
 - **Metric**: `{method} {path}` default replaced by `metric_mappings` (EXACT/PREFIX/CONTAINS JSON) + `default_metric`; the pattern applies only if set.

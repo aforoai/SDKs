@@ -53,7 +53,8 @@ import (
 func main() {
 	client := metering.NewClient(metering.Options{
 		APIKey:  os.Getenv("AFORO_API_KEY"),
-		BaseURL: "https://usage-ingestor.aforo.ai", // default; override per environment
+		BaseURL:     "https://api.aforo.ai", // default; override per environment
+		ProductType: "API",                  // default; sent as top-level productType
 	})
 	defer client.Close() // flushes the buffer before exit
 
@@ -62,8 +63,19 @@ func main() {
 		MetricName: "api_calls",
 		Quantity:   1,
 	})
+
+	// Per-event override: the event's ProductType wins over Options.ProductType.
+	client.Track(metering.TrackEvent{
+		CustomerID:  "cust_acme_001",
+		MetricName:  "agent_runs",
+		ProductType: "AGENTIC_API",
+	})
 }
 ```
+
+Every event carries a top-level `productType` (required by the ingestor): `TrackEvent.ProductType` if set, else `Options.ProductType`, else `"API"`. Values are trimmed and upper-cased; unknown values are passed through unchanged.
+
+`Track` returns an error wrapping `metering.ErrInvalidEvent` — and buffers nothing — when `CustomerID` or `MetricName` is blank, `Quantity` is negative/NaN/Inf, or `OccurredAt` is not RFC 3339; one such event would otherwise fail its whole batch at the ingestor. A zero `Quantity` means "unset" and becomes `1`.
 
 `Track` is non-blocking — it pushes onto an in-memory ring buffer and returns. A background goroutine flushes every `FlushInterval`, and any `Track` that pushes the buffer to `FlushCount` triggers an immediate flush. `Close()` stops the goroutine and flushes what's left; skip it and buffered events die with the process.
 
@@ -85,14 +97,14 @@ func main() {
 
 	wrapped := metering.HTTPMiddleware(mux, metering.MiddlewareOptions{
 		APIKey:     os.Getenv("AFORO_API_KEY"),
-		BaseURL:    "https://usage-ingestor.aforo.ai",
+		BaseURL:    "https://api.aforo.ai",
 		MetricName: "api_calls", // must exist in your Aforo catalog
 	})
 	http.ListenAndServe(":8080", wrapped)
 }
 ```
 
-The middleware reads the customer id from `X-Customer-Id` (or `CustomerIDHeader` / `CustomerIDFunc`), records `MetricName` (default `"api_calls"`, or `MetricNameFunc` per request), and emits after the response is written. Requests with no resolvable customer id, and `OPTIONS` (CORS preflight) requests, are not metered. The caller's `X-Api-Key` header is never used as the customer id — it is the end user's secret, not an id.
+The middleware reads the customer id from `X-Customer-Id` (or `CustomerIDHeader` / `CustomerIDFunc`), records `MetricName` (default `"api_calls"`, or `MetricNameFunc` per request) with `productType` (`MiddlewareOptions.ProductType`, default `"API"`) and top-level `endpointPath` (normalized path, no query string, capped at 512 chars), `httpMethod`, `statusCode` and `responseTimeMs`, and emits after the response is written. Requests with no resolvable customer id, and `OPTIONS` (CORS preflight) requests, are not metered. The caller's `X-Api-Key` header is never used as the customer id — it is the end user's secret, not an id.
 
 > ⚠ The metric must exist in your tenant's Aforo catalog: the ingestor rejects an unknown metric, and because it validates a batch as a whole, one rejected event fails every event in that batch. Earlier versions recorded `"<METHOD> <normalized-path>"`, which no catalog contains; use `MetricNameFunc` (with `metering.NormalizePath` if useful) to map routes to catalog metrics.
 
@@ -114,8 +126,9 @@ r.Use(metering.ChiMiddleware(metering.MiddlewareOptions{
 | Option | Type | Default | What it does |
 |---|---|---|---|
 | `APIKey` | `string` | — (required) | Sent as `X-API-Key: <APIKey>`. |
-| `BaseURL` | `string` | `https://usage-ingestor.aforo.ai` | Ingestor base; the client appends `/v1/ingest/batch`. Override per environment. |
-| `FlushCount` | `int` | `50` | Flush when the buffer reaches this many events; also the per-batch drain size. |
+| `BaseURL` | `string` | `https://api.aforo.ai` | Ingestor base; the client appends `/v1/ingest/batch`. Override per environment. |
+| `ProductType` | `string` | `API` | Top-level `productType` on every event; `TrackEvent.ProductType` overrides it per event. Trimmed + upper-cased. |
+| `FlushCount` | `int` | `50` | Flush when the buffer reaches this many events; also the per-batch drain size. Clamped to 1000 (the ingestor's batch limit). |
 | `FlushInterval` | `time.Duration` | `5s` | Background flush cadence. |
 | `MaxQueueSize` | `int` | `10000` | Ring-buffer capacity. When full, the **oldest** event is dropped to make room. |
 | `MaxRetries` | `int` | `3` | Retry attempts per batch on a transport error or retryable status. |
@@ -128,16 +141,17 @@ r.Use(metering.ChiMiddleware(metering.MiddlewareOptions{
 | Option | Type | Default | What it does |
 |---|---|---|---|
 | `APIKey` | `string` | — (required) | API key for the internally-created client. |
-| `BaseURL` | `string` | `https://usage-ingestor.aforo.ai` | Ingestor base for the internal client. |
+| `BaseURL` | `string` | `https://api.aforo.ai` | Ingestor base for the internal client. |
 | `ExcludePaths` | `[]string` | `["/health","/ready","/metrics","/favicon.ico"]` | Path **prefixes** to skip. Setting your own replaces the defaults. |
 | `ExcludeStatusCode` | `[]int` | none | Response status codes to skip (e.g. `404`). |
 | `MetricName` | `string` | `api_calls` (`DefaultMetricName`) | Fixed metric recorded per request. Must exist in your Aforo catalog. |
 | `MetricNameFunc` | `func(*http.Request) string` | nil | Per-request metric; wins over `MetricName`. An empty result falls back to `MetricName`. |
 | `CustomerIDHeader` | `string` | `X-Customer-Id` | Header carrying the Aforo customer id. The caller's `X-Api-Key` is never read. |
 | `CustomerIDFunc` | `func(*http.Request) string` | nil | Per-request customer id; wins over `CustomerIDHeader`. Empty result → request not metered. |
+| `ProductType` | `string` | `ClientOptions.ProductType`, else `API` | Top-level `productType` on every metered request. |
 | `ClientOptions` | `*Options` | nil | Full client tuning; `APIKey`/`BaseURL` from `MiddlewareOptions` override its fields. |
 
-Retry rule (in `transport`): `2xx` → sent; `4xx` except `408`/`429` → dropped, no retry; everything else (including `5xx`, `408`, `429`) is retried with backoff, honoring `Retry-After` on a `429`.
+Retry rule (in `transport`): `2xx` → sent; `4xx` except `408`/`429` → dropped, no retry; everything else (including `5xx`, `408`, `429`) is retried with backoff, honoring `Retry-After` on a `429`. A `2xx` body with `failed > 0` (`errors[].message` per rejected index) is counted in `FlushResult.Failed`.
 
 ## Walk me through it
 

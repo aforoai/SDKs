@@ -25,10 +25,15 @@
   as X-API-Key — the tenant comes from the key), aforo-metric-mappings
   ("KIND|value|metricName;..." or "none"), aforo-default-metric (a catalog
   metric). See outbound-policy.xml for the mapping format.
+
+  productType: aforo-product-type (set by aforo-context from the Named Value
+  aforo-product-type, default "API"). Types whose required fields a gateway
+  cannot supply (AI_AGENT, MCP_SERVER, GRPC_API, GRAPHQL_API, WEBSOCKET_API,
+  MQTT_BROKER) are not metered by this fragment.
 -->
 <fragment>
     <choose>
-        <when condition="@(context.Request.Method != &quot;OPTIONS&quot; &amp;&amp; !string.IsNullOrEmpty(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-customer-id&quot;, &quot;&quot;)) &amp;&amp; context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-customer-id&quot;, &quot;&quot;).Length &lt;= 64)">
+        <when condition="@(Array.IndexOf(new[] { &quot;AI_AGENT&quot;, &quot;MCP_SERVER&quot;, &quot;GRPC_API&quot;, &quot;GRAPHQL_API&quot;, &quot;WEBSOCKET_API&quot;, &quot;MQTT_BROKER&quot; }, context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-product-type&quot;, &quot;API&quot;)) &lt; 0 &amp;&amp; context.Request.Method != &quot;OPTIONS&quot; &amp;&amp; !string.IsNullOrEmpty(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-customer-id&quot;, &quot;&quot;)) &amp;&amp; context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-customer-id&quot;, &quot;&quot;).Length &lt;= 64)">
             <send-one-way-request mode="new">
                 <set-url>{{aforo-endpoint}}</set-url>
                 <set-method>POST</set-method>
@@ -63,6 +68,7 @@
                                 new JProperty("quantity", 1),
                                 new JProperty("idempotencyKey", context.RequestId.ToString()),
                                 new JProperty("occurredAt", DateTime.UtcNow.ToString("o")),
+                                new JProperty("productType", context.Variables.GetValueOrDefault<string>("aforo-product-type", "API")),
                                 new JProperty("endpointPath", path),
                                 new JProperty("httpMethod", context.Request.Method),
                                 new JProperty("statusCode", context.Response.StatusCode),

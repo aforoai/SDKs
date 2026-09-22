@@ -30,13 +30,13 @@ billing = AforoWsBilling(
     tenant_id="tenant_acme",
     product_id="prod_ws_market_feed",
     api_key=os.environ["AFORO_API_KEY"],
-    ingestor_url="https://usage-ingestor.aforo.ai",
+    ingestor_url="https://api.aforo.ai",
 )
 ```
 
 All four arguments are required — the constructor raises `ValueError` if any is empty.
 
-> ⚠ `ingestor_url` is the **host**; this package appends `/v1/ingest/batch`. Pass `https://usage-ingestor.aforo.ai`.
+> ⚠ `ingestor_url` is the **host**; this package appends `/v1/ingest/batch`. Pass `https://api.aforo.ai`.
 
 ## Step 3 — Resolve the customer, then wrap the connection
 
@@ -110,7 +110,8 @@ billing.shutdown()   # flushes the final batch before process exit
 | `flush_interval_sec` | `float` | `3.0` | Background flush cadence. |
 | `flush_count` | `int` | `100` | Buffer size that forces a flush. |
 | `per_frame_events` | `bool` | `False` | One event per frame vs. open + close. |
-| `on_error` | `Callable?` | logs | Called on permanent batch failure. |
+| `on_error` | `Callable?` | logs | Called on permanent batch failure, and with the ingestor's `errors[].message` when it rejects events. |
+| `product_type` | `str` | `"WEBSOCKET_API"` | Top-level `productType` sent on every event (trimmed and upper-cased; values the SDK does not know are passed through). Override per event with a `productType` key in `push({...})` or `product_type=` on `track_websockets_connection` / `track_starlette_websocket`. |
 
 Exports: `AforoWsBilling`, `track_websockets_connection(billing, ws, customer_id)`, `track_starlette_websocket(billing, ws, customer_id)`, `WS_CLOSE_REASONS`. Each tracker helper returns an async context manager.
 
@@ -121,7 +122,7 @@ Exports: `AforoWsBilling`, `track_websockets_connection(billing, ws, customer_id
 | A route emits no events | The connection wasn't wrapped in `track_*`, or `customer_id` was falsy. | Wrap the connection in the `async with` block and resolve `customer_id` first. |
 | Close event missing / counts are zero | The `async with` block never exited cleanly, or the handler returned before entering it. | Ensure the block wraps the whole message loop; counts finalize on exit. |
 | `on_error` fires with "Aforo returned 401/403" | Bad/unscoped API key — 4xx is dropped, not retried. | Fix `api_key`; confirm it matches `tenant_id`. |
-| Events sent, none in console | Wrong `ingestor_url` host, or the metric isn't mapped to a rate plan. | Use `https://usage-ingestor.aforo.ai`; map `websocket_api.connection_closed` (and `.message`) in Aforo. |
+| Events sent, none in console | Wrong `ingestor_url` host, or the metric isn't mapped to a rate plan. | Use `https://api.aforo.ai`; map `websocket_api.connection_closed` (and `.message`) in Aforo. |
 | Event volume far higher than expected | `per_frame_events=True` emits one event per frame. | Switch back to default open+close unless you price per frame. |
 | `wsCloseReason` is `INTERNAL_ERROR` | An exception was raised inside the handler before a clean close. | Expected — fix the handler error; the close is still recorded. |
 

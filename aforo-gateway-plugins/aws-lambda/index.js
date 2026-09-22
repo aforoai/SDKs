@@ -28,6 +28,10 @@
  *   INCLUDE_METADATA     — "false" to omit request metadata
  *   MCP_ENABLED          — "true" to enable MCP JSON-RPC detection
  *   MCP_PRODUCT_ID       — Aforo product ID for MCP metering
+ *   PRODUCT_TYPE         — productType sent on every event (default "API";
+ *                          trimmed + upper-cased, unknown values passed
+ *                          through). MCP tools/call with both toolName and
+ *                          agentId is sent as MCP_SERVER instead.
  *
  * Customer identity: the access-log entry's `customerId` field, which the
  * stage's access-log format must populate from `$context.authorizer.customerId`
@@ -59,6 +63,26 @@ const FLUSH_COUNT = Math.min(MAX_BATCH_EVENTS,
     Math.max(1, parseInt(process.env.FLUSH_COUNT || '50', 10) || 50));
 const INCLUDE_METADATA = process.env.INCLUDE_METADATA !== 'false';
 const MCP_ENABLED = process.env.MCP_ENABLED === 'true';
+const PRODUCT_TYPE = normalizeProductType(process.env.PRODUCT_TYPE);
+
+// Fields each productType must carry. The ingestor validates a batch as a
+// whole, so one event missing them fails every event it travels with; such
+// events are skipped instead. An AI_AGENT agentId (X-Agent-Id is client-
+// settable, never trusted) and gRPC / GraphQL / WebSocket / MQTT fields are not
+// in an API Gateway access log, so those types are listed only so the check
+// refuses them rather than poisoning batches. Unknown types pass unchecked.
+const PRODUCT_TYPE_REQUIRED_FIELDS = {
+    API: [],
+    AGENTIC_API: [],
+    AI_AGENT: ['agentId', 'sessionId'],
+    MCP_SERVER: ['toolName', 'agentId'],
+    GRPC_API: ['grpcService', 'grpcMethod'],
+    GRAPHQL_API: ['gqlOperationType'],
+    WEBSOCKET_API: ['wsConnectionId'],
+    MQTT_BROKER: ['mqttTopic'],
+};
+// Longest Retry-After (ms) honoured on a 429 before the next attempt.
+const MAX_RETRY_AFTER_MS = 30000;
 
 const METRIC_MAPPINGS = parseMetricMappings(process.env.METRIC_MAPPINGS);
 
@@ -72,6 +96,12 @@ const MAX_CUSTOMER_ID_LENGTH = 64;
 const REQUEST_TIMEOUT_MS = 10000;
 const DEADLINE_SAFETY_MS = 1500;
 const MAX_ATTEMPTS = 3;
+
+/** Trim + upper-case a configured productType; "API" when unset or blank. */
+function normalizeProductType(raw) {
+    const v = typeof raw === 'string' ? raw.trim().toUpperCase() : '';
+    return v || 'API';
+}
 
 /**
  * Parse METRIC_MAPPINGS. Invalid config is logged loudly and ignored rather
@@ -158,6 +188,7 @@ function buildUsageEvent(parsed, logEvent) {
         // retries of the same log batch, so a re-sent event deduplicates.
         idempotencyKey: parsed.requestId || `${logEvent.id}`,
         occurredAt: new Date(logEvent.timestamp).toISOString(),
+        productType: PRODUCT_TYPE,
         endpointPath: parsed.path,
         httpMethod: parsed.method,
         statusCode: parsed.status,
@@ -193,9 +224,12 @@ function buildUsageEvent(parsed, logEvent) {
         if (mcpInfo) {
             usageEvent.metricName = 'mcp_server.tool_invocations';
             usageEvent.quantity = 1;
-            usageEvent.productType = 'MCP_SERVER';
             usageEvent.toolName = mcpInfo.toolName;
             usageEvent.agentId = mcpInfo.agentId;
+            // MCP_SERVER requires toolName AND agentId: classify as MCP_SERVER
+            // only when both are known, otherwise keep PRODUCT_TYPE rather
+            // than send an event the ingestor must reject.
+            if (usageEvent.toolName && usageEvent.agentId) usageEvent.productType = 'MCP_SERVER';
             usageEvent.executionStatus = parsed.status >= 200 && parsed.status < 300 ? 'SUCCESS' : 'ERROR';
             usageEvent.executionDurationMs = parsed.latency || 0;
             usageEvent.idempotencyKey = `mcp:${parsed.requestId || logEvent.id}:${mcpInfo.toolName}`;
@@ -206,6 +240,10 @@ function buildUsageEvent(parsed, logEvent) {
     // one zero-byte response (e.g. 204 with QUANTITY_SOURCE=response_size)
     // would fail every event batched with it.
     if (!(Number.isFinite(usageEvent.quantity) && usageEvent.quantity > 0)) return { skip: 'quantity <= 0' };
+
+    const required = PRODUCT_TYPE_REQUIRED_FIELDS[usageEvent.productType] || [];
+    const missing = required.filter(f => usageEvent[f] === undefined || usageEvent[f] === null || usageEvent[f] === '');
+    if (missing.length > 0) return { skip: `productType ${usageEvent.productType} missing ${missing.join('+')}` };
 
     return { event: usageEvent };
 }
@@ -375,6 +413,7 @@ function isPermanentRejection(status) {
  */
 async function sendToAforo(events, deadline) {
     const body = JSON.stringify({ events });
+    let retryAfterMs = null;
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         const timeLeft = deadline - Date.now();
@@ -390,12 +429,18 @@ async function sendToAforo(events, deadline) {
                 return 'rejected';
             }
             console.warn(`Aforo returned ${res.status} — attempt ${attempt}/${MAX_ATTEMPTS}`);
+            retryAfterMs = res.status === 429 ? parseRetryAfter(res.headers && res.headers['retry-after']) : null;
         } catch (err) {
             console.warn(`Request failed — attempt ${attempt}/${MAX_ATTEMPTS}: ${err.message}`);
+            retryAfterMs = null;
         }
 
         if (attempt < MAX_ATTEMPTS) {
-            const backoff = Math.pow(2, attempt - 1) * 1000;
+            // Honour Retry-After on 429; a wait longer than the cap (or the
+            // Lambda deadline) ends the attempts and fails the batch
+            // transiently, so Lambda's async retry re-delivers it later.
+            if (retryAfterMs !== null && retryAfterMs > MAX_RETRY_AFTER_MS) break;
+            const backoff = retryAfterMs !== null ? retryAfterMs : Math.pow(2, attempt - 1) * 1000;
             if (Date.now() + backoff >= deadline) break;
             await sleep(backoff);
         }
@@ -403,6 +448,15 @@ async function sendToAforo(events, deadline) {
 
     console.error(`Batch of ${events.length} event(s) not delivered (transient failure or Lambda deadline)`);
     return 'failed';
+}
+
+/** Retry-After in delta-seconds or HTTP-date form → ms, or null. */
+function parseRetryAfter(value) {
+    if (value === undefined || value === null || value === '') return null;
+    const secs = Number(value);
+    if (Number.isFinite(secs) && secs >= 0) return secs * 1000;
+    const at = Date.parse(value);
+    return Number.isNaN(at) ? null : Math.max(0, at - Date.now());
 }
 
 function doPost(url, body, timeoutMs) {
@@ -429,7 +483,7 @@ function doPost(url, body, timeoutMs) {
         const req = transport.request(options, (res) => {
             let resBody = '';
             res.on('data', (chunk) => { if (resBody.length < 2000) resBody += chunk; });
-            res.on('end', () => resolve({ status: res.statusCode, body: resBody }));
+            res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: resBody }));
         });
 
         req.on('error', reject);
@@ -453,5 +507,7 @@ module.exports = {
     resolveMetricName,
     parseMetricMappings,
     isPermanentRejection,
+    parseRetryAfter,
+    normalizeProductType,
     FLUSH_COUNT,
 };

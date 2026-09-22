@@ -8,6 +8,7 @@
 #   aforo.tenantId        — Tenant identifier
 #   aforo.mcpEnabled      — Enable MCP detection (true/false)
 #   aforo.mcpProductId    — MCP product ID in Aforo
+#   product-type          — productType on every event (default "API")
 
 id: aforo-metering
 name: Aforo Metering Policy
@@ -42,6 +43,15 @@ configuration:
     description: Aforo tenant identifier
     type: string
     optional: false
+  - propertyName: product-type
+    name: Product Type
+    description: >-
+      productType stamped on every event (default API; trimmed and
+      upper-cased). A tools/call with both toolName and agentId is sent as
+      MCP_SERVER; without an agentId it keeps this value.
+    type: string
+    optional: true
+    defaultValue: API
   - propertyName: mcp-product-id
     name: MCP Product ID
     description: Aforo product ID for the MCP server
@@ -84,6 +94,13 @@ template:
     var toolName = if (isMcpToolCall) (requestBody.params.name default "unknown") else ""
     var agentId = if (isMcpToolCall) (requestBody.params._meta.agent_id default "") else ""
     var sessionId = attributes.headers.'Mcp-Session-Id' default ""
+    var configuredProductType = upper(trim((configuration.'product-type' default "API") as String))
+    var productType = if (configuredProductType == "") "API" else configuredProductType
+    // MCP_SERVER requires both toolName and agentId; otherwise keep the configured type.
+    var mcpProductType = if (toolName != "" and agentId != "") "MCP_SERVER" else productType
+    // occurredAt must be ISO-8601 UTC: shift to UTC before formatting with a literal Z
+    // (formatting local time with a literal 'Z' mislabels it).
+    var occurredAtUtc = (now() >> "UTC") as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"}
 
     // Authenticated identity — set by aforo-jwt-validation policy.
     // Never read X-Client-Id / X-Customer-Id / X-Tenant-Id from the
@@ -101,8 +118,8 @@ template:
           metricName: "mcp_server.tool_invocations",
           quantity: 1,
           idempotencyKey: "mcp:mulesoft:" ++ (attributes.requestId default uuid()) ++ ":" ++ toolName ++ ":" ++ now() as String,
-          occurredAt: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"},
-          productType: "MCP_SERVER",
+          occurredAt: occurredAtUtc,
+          productType: mcpProductType,
           toolName: toolName,
           agentId: agentId,
           sessionId: sessionId,
@@ -130,7 +147,8 @@ template:
           metricName: (attributes.method default "UNKNOWN") ++ " " ++ (attributes.requestPath default "/"),
           quantity: 1,
           idempotencyKey: attributes.requestId default uuid(),
-          occurredAt: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"},
+          occurredAt: occurredAtUtc,
+          productType: productType,
           endpointPath: attributes.requestPath default "/",
           httpMethod: attributes.method default "UNKNOWN",
           statusCode: attributes.statusCode default 0,

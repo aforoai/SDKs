@@ -46,12 +46,12 @@ AforoMqttBilling billing = AforoMqttBilling.newBuilder()
         .tenantId("tenant_acme")
         .productId("prod_mqtt_iot_telemetry")
         .apiKey(System.getenv("AFORO_API_KEY"))
-        .ingestorUrl("https://usage-ingestor.aforo.ai")
+        .ingestorUrl("https://api.aforo.ai")
         // .emitDeliverEvents(true)   // opt in to bill inbound DELIVER too
         .build();
 ```
 
-> ⚠ `ingestorUrl` is the host only — the SDK appends `/v1/ingest/batch`. Pass `https://usage-ingestor.aforo.ai`, not the full path.
+> ⚠ `ingestorUrl` is the host only — the SDK appends `/v1/ingest/batch`. Pass `https://api.aforo.ai`, not the full path.
 
 ## Step 4 — Report each MQTT primitive
 
@@ -109,6 +109,7 @@ Runtime.getRuntime().addShutdownHook(new Thread(billing::close));
 | `apiKey` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
 | `ingestorUrl` | `String` | *(required)* | Host; SDK appends `/v1/ingest/batch`. |
 | `emitDeliverEvents` | `boolean` | `false` | `true` = emit `DELIVER` events for inbound messages. |
+| `productType` | `String` | `MQTT_BROKER` | Top-level `productType` on every event; trimmed + uppercased. |
 | `flushCount` | `int` | `200` | Events per immediate flush. |
 | `flushIntervalMs` | `long` | `2000` | Background flush cadence (ms). |
 

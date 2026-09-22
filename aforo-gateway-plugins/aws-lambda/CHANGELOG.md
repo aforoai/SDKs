@@ -6,6 +6,13 @@ This function ships on the Aforo gateway-plugins line; the whole repo is version
 
 ## [Unreleased]
 
+### Added
+- `PRODUCT_TYPE` env var / `ProductType` SAM parameter (default `API`): every event now carries the `productType` the ingestor requires in production. `compound-metering.js` `buildCompoundEvent` takes an optional `productType` (default `PRODUCT_TYPE` / `API`).
+
+### Fixed (product type / retries)
+- MCP `tools/call` is sent as `MCP_SERVER` only when both `toolName` and `agentId` are known; otherwise the configured type is kept, rather than an event the ingestor must reject (failing the whole batch). Entries missing the fields their `productType` requires are skipped.
+- 429 honours `Retry-After` (up to 30 s; longer ends the attempts so Lambda's async retry re-delivers later).
+
 Brings the function in line with the ingestor contract. **Breaking** for deployments: SAM parameters `AforoTenantId` and `CustomerIdSource` were removed, and the stage's access-log format must now include `customerId` from the authorizer context.
 
 ### Fixed
@@ -16,7 +23,7 @@ Brings the function in line with the ingestor contract. **Breaking** for deploym
 - The default metric was `{method} {path}` — never a catalog metric, so every batch failed 400. Added `METRIC_MAPPINGS` (EXACT/PREFIX/CONTAINS, first match wins) and `DEFAULT_METRIC` (`api_calls`); `METRIC_NAME_PATTERN` applies only when explicitly set.
 - Retries: 408 and 429 are now retried; other 4xx are dropped with the response body logged. Batches are sent concurrently under one deadline taken from `context.getRemainingTimeInMillis()`, so retries cannot run past the Lambda timeout or starve later batches. A batch that still fails transiently makes the handler throw so Lambda's async retry re-delivers it (idempotency keys dedupe).
 - `compound-metering.js` required `uuid`, which is not a dependency — now `crypto.randomUUID()`. Its default compound URL is built from the endpoint's origin instead of appended to the batch URL.
-- Default `AforoEndpoint` is now `https://usage-ingestor.aforo.ai/v1/ingest/batch`. `ingest.aforo.ai` is CloudFront in front of S3: a POST gets a 301 from AmazonS3 and never reaches the ingestor.
+- Default `AforoEndpoint` is now `https://api.aforo.ai/v1/ingest/batch`. `ingest.aforo.ai` is CloudFront in front of S3: a POST gets a 301 from AmazonS3 and never reaches the ingestor.
 - `FLUSH_COUNT` is capped at 1000, because the ingestor rejects a larger batch with 400.
 - MCP idempotency key no longer embeds the tenant id or timestamp (`mcp:{requestId}:{tool}`).
 

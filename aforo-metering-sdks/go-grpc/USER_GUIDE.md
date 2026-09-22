@@ -12,7 +12,7 @@ A gRPC server that emits one Aforo billing event per RPC — service, method, gR
 - `google.golang.org/grpc` v1.60.0 (the version this module pins).
 - An Aforo API key (`AFORO_API_KEY`), a `tenant_id`, a `product_id`, and the fully-qualified `service_name`. All four are SDK config — never read from a client header.
 - A customer id reachable from the call context — by default the `x-customer-id` gRPC metadata key.
-- Ingestor base URL — `https://usage-ingestor.aforo.ai`.
+- Ingestor base URL — `https://api.aforo.ai`.
 
 ## Step 1 — Add the module from source
 
@@ -50,7 +50,7 @@ billing, err := grpcmetering.New(grpcmetering.Config{
 	TenantID:    "tenant_acme",
 	ProductID:   "prod_grpc_user_svc",
 	APIKey:      os.Getenv("AFORO_API_KEY"),
-	IngestorURL: "https://usage-ingestor.aforo.ai",
+	IngestorURL: "https://api.aforo.ai",
 	ServiceName: "acme.v1.UserService",
 })
 if err != nil {
@@ -85,7 +85,7 @@ billing, _ := grpcmetering.New(grpcmetering.Config{
 	TenantID:    "tenant_acme",
 	ProductID:   "prod_grpc_user_svc",
 	APIKey:      os.Getenv("AFORO_API_KEY"),
-	IngestorURL: "https://usage-ingestor.aforo.ai",
+	IngestorURL: "https://api.aforo.ai",
 	ServiceName: "acme.v1.UserService",
 	CustomerExtractor: func(ctx context.Context) string {
 		md, ok := metadata.FromIncomingContext(ctx)
@@ -132,7 +132,7 @@ The buffer flushes every `FlushInterval` (5s) or when it reaches `FlushCount` (5
 The wire call the SDK makes:
 
 ```
-POST https://usage-ingestor.aforo.ai/v1/ingest/batch
+POST https://api.aforo.ai/v1/ingest/batch
 X-API-Key: <AFORO_API_KEY>
 X-Tenant-Id: tenant_acme
 Content-Type: application/json
@@ -140,7 +140,7 @@ Content-Type: application/json
 {"events":[{"customerId":"…","metricName":"grpc_api.rpc_calls","quantity":1,"occurredAt":"…","idempotencyKey":"grpc:…","productType":"GRPC_API","grpcService":"acme.v1.UserService","grpcMethod":"GetUser","grpcStatusCode":"OK","grpcCallType":"UNARY","messageCount":1,"executionDurationMs":2,"metadata":{"sdkVersion":"1.0.0","productId":"prod_grpc_user_svc"}}]}
 ```
 
-> ⚠ Flush failures are silent unless you set `OnError`. If nothing lands, set `OnError: func(err error){ log.Println("aforo:", err) }` to surface marshal failures and retry-exhausted drops.
+> ⚠ Flush failures are silent unless you set `OnError`. If nothing lands, set `OnError: func(err error){ log.Println("aforo:", err) }` to surface marshal failures, retry-exhausted drops and ingestor rejections (including `errors[].message`).
 
 ## Configuration reference
 
@@ -151,11 +151,12 @@ Content-Type: application/json
 | `APIKey` | `string` | — (required) | `X-API-Key: <APIKey>`. |
 | `IngestorURL` | `string` | — (required) | Base; `/v1/ingest/batch` is appended. |
 | `ServiceName` | `string` | — (required) | Fully-qualified gRPC service; recorded as `grpcService`. |
+| `ProductType` | `string` | `GRPC_API` | Top-level `productType` on every event; per-event override via `EventOptions`. |
 | `FlushCount` | `int` | `50` | Buffer-size flush threshold. |
 | `FlushInterval` | `time.Duration` | `5s` | Background flush cadence. |
 | `HTTPClient` | `*http.Client` | `&http.Client{Timeout: 10s}` | HTTP client override. |
 | `CustomerExtractor` | `func(context.Context) string` | reads `x-customer-id` metadata | Per-call customer-id resolver. |
-| `OnError` | `func(error)` | no-op | Marshal failures + retry-exhausted drops. |
+| `OnError` | `func(error)` | no-op | Marshal failures, retry-exhausted drops, non-retryable `4xx` rejections, and partial failures (with the ingestor's `errors[].message`). |
 
 gRPC status mapping is the canonical upper-snake name of `status.Code()` (e.g. `codes.Canceled` → `CANCELLED`, `codes.InvalidArgument` → `INVALID_ARGUMENT`): `OK`, `CANCELLED`, `UNKNOWN`, `INVALID_ARGUMENT`, `DEADLINE_EXCEEDED`, `NOT_FOUND`, `ALREADY_EXISTS`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED`, `FAILED_PRECONDITION`, `ABORTED`, `OUT_OF_RANGE`, `UNIMPLEMENTED`, `INTERNAL`, `UNAVAILABLE`, `DATA_LOSS`, `UNAUTHENTICATED`.
 

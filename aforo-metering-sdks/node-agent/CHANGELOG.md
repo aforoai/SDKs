@@ -13,6 +13,12 @@ All notable changes to `@aforoai/agent-metering` are documented here. This proje
 - The ingestor has no `CANCELLED` or `HITL_REQUIRED` execution status, so these are sent as `metadata.agentExecutionStatus`.
 - Flushes are split into requests of at most 1000 events.
 - New optional fields: `StartSessionOptions.customerId`, `StartSessionOptions.traceId` and `RecordStepOptions.parentStepId`.
+- `agentId` over 36 characters (the ingestor's limit) makes `startSession()` throw. `emitEvent()` logs and drops an event with a blank `metricKey`, `sessionId` or `agentId` (or one over 36 chars) or a `value` that is not > 0, instead of buffering it — one invalid event fails its whole batch.
+- Failed batches are retried: 408, 429 (honouring `Retry-After`), 5xx and network errors, up to `maxRetries` attempts (default 3) with exponential backoff from `retryBaseDelayMs` (default 1000). Other 4xx are not retried. Each retry re-sends the same idempotency keys. Per-event rejections in a 2xx response are logged from `errors[].message`.
+
+### Added
+- `productType` option (default `AI_AGENT`) on the client, overridable per session (`startSession({ productType })`) and per event (`emitEvent({ productType })`). It was hard-coded to `AI_AGENT`. Values are trimmed and uppercased; unknown values pass through.
+- `maxRetries` and `retryBaseDelayMs` options.
 
 ## [1.0.0] — 2026-06-29
 

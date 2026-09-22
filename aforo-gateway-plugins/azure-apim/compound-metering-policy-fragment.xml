@@ -86,6 +86,7 @@
                             evt["correlationId"] = context.RequestId.ToString();
                             evt["customerId"] = context.Variables.GetValueOrDefault<string>("aforo-customer-id", "");
                             evt["occurredAt"] = DateTime.UtcNow.ToString("o");
+                            evt["productType"] = context.Variables.GetValueOrDefault<string>("aforo-product-type", "API");
                             evt["measurements"] = JArray.Parse(measurements);
                             evt["metadata"] = new JObject {
                                 ["gateway"] = "azure-apim",

@@ -48,12 +48,12 @@ AforoWsBilling billing = AforoWsBilling.newBuilder()
         .tenantId("tenant_acme")
         .productId("prod_ws_market_feed")
         .apiKey(System.getenv("AFORO_API_KEY"))
-        .ingestorUrl("https://usage-ingestor.aforo.ai")
+        .ingestorUrl("https://api.aforo.ai")
         // .perFrameEvents(true)   // opt in for one event per frame
         .build();
 ```
 
-> ⚠ `ingestorUrl` is the host only — the SDK appends `/v1/ingest/batch`. Pass `https://usage-ingestor.aforo.ai`, not the full path.
+> ⚠ `ingestorUrl` is the host only — the SDK appends `/v1/ingest/batch`. Pass `https://api.aforo.ai`, not the full path.
 
 ## Step 4 — Open, record frames, and close
 
@@ -107,6 +107,7 @@ Runtime.getRuntime().addShutdownHook(new Thread(billing::close));
 | `apiKey` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
 | `ingestorUrl` | `String` | *(required)* | Host; SDK appends `/v1/ingest/batch`. |
 | `perFrameEvents` | `boolean` | `false` | `true` = one event per frame; `false` = OPEN + CLOSE only, aggregated. |
+| `productType` | `String` | `WEBSOCKET_API` | Top-level `productType` on every event; trimmed + uppercased. |
 | `flushCount` | `int` | `100` | Events per immediate flush. |
 | `flushIntervalMs` | `long` | `3000` | Background flush cadence (ms). |
 

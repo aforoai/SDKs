@@ -26,6 +26,14 @@ export function resolveMetricName(options: MiddlewareOptions, req: any, res: any
   return options.metricName || DEFAULT_METRIC_NAME;
 }
 
+/** Longest endpointPath the ingestor accepts. */
+const MAX_ENDPOINT_PATH = 512;
+
+/** Request path without its query string, capped to what the ingestor accepts. */
+export function endpointPathOf(url: string): string {
+  return (url.split('?')[0] || '/').slice(0, MAX_ENDPOINT_PATH);
+}
+
 /** First non-empty string among the candidates, or null. */
 export function firstNonEmpty(...values: unknown[]): string | null {
   for (const v of values) {

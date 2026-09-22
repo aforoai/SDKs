@@ -1,6 +1,6 @@
 import { AforoClient } from '../client';
 import { MiddlewareOptions } from '../types';
-import { isPreflight, resolveMetricName, firstNonEmpty } from './common';
+import { isPreflight, resolveMetricName, firstNonEmpty, endpointPathOf } from './common';
 
 const DEFAULT_EXCLUDE_PATHS = ['/health', '/ready', '/metrics', '/favicon.ico'];
 
@@ -11,7 +11,7 @@ const DEFAULT_EXCLUDE_PATHS = ['/health', '/ready', '/metrics', '/favicon.ico'];
  *
  * ```typescript
  * import { fastifyPlugin } from '@aforo/metering/middleware/fastify';
- * fastify.register(fastifyPlugin, { apiKey: process.env.AFORO_API_KEY });
+ * fastify.register(fastifyPlugin, { apiKey: process.env.AFORO_API_KEY, productType: 'API' });
  * ```
  */
 export async function fastifyPlugin(fastify: any, options: MiddlewareOptions) {
@@ -54,13 +54,28 @@ export async function fastifyPlugin(fastify: any, options: MiddlewareOptions) {
       }
 
       if (!customerId) return done();
+      if (!(quantity > 0)) return done(); // The ingestor rejects quantity <= 0
 
       let metadata: Record<string, string | number | boolean> | undefined;
       if (options.metadata) {
         metadata = options.metadata(request, reply);
       }
 
-      client.track({ customerId, metricName, quantity, metadata }).catch(() => {});
+      const elapsed = typeof reply.elapsedTime === 'number'
+        ? reply.elapsedTime
+        : typeof reply.getResponseTime === 'function' ? reply.getResponseTime() : undefined;
+
+      client.track({
+        customerId,
+        metricName,
+        quantity,
+        metadata,
+        productType: options.productType,
+        endpointPath: endpointPathOf(path),
+        httpMethod: method,
+        statusCode,
+        ...(typeof elapsed === 'number' ? { responseTimeMs: Math.round(elapsed) } : {}),
+      }).catch(() => {});
     } catch {
       // Never let metering affect the API
     }

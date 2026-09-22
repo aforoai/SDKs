@@ -31,13 +31,13 @@ billing = AforoMcpBilling(
     tenant_id="tenant_smartai",
     product_id="prod_mcp_001",
     api_key=os.environ["AFORO_API_KEY"],
-    ingestor_url="https://usage-ingestor.aforo.ai",
+    ingestor_url="https://api.aforo.ai",
 )
 ```
 
 All four arguments are required — the constructor raises `ValueError` if any is empty.
 
-> ⚠ `ingestor_url` is a **host**, not a full path. The client appends `/v1/ingest/batch`. Pass `https://usage-ingestor.aforo.ai`, not `https://usage-ingestor.aforo.ai/v1/ingest/batch`.
+> ⚠ `ingestor_url` is a **host**, not a full path. The client appends `/v1/ingest/batch`. Pass `https://api.aforo.ai`, not `https://api.aforo.ai/v1/ingest/batch`.
 
 ## Step 3 — Wrap your tool handler
 
@@ -48,7 +48,7 @@ Stack the decorator under your MCP `@server.call_tool()` registration:
 @billing.wrap_tool_handler
 async def handle_tool(name: str, arguments: dict, **kwargs):
     # name = tool name, arguments = tool args.
-    # kwargs may carry agent_id and session_id from your server.
+    # kwargs may carry agent_id, session_id and product_type from your server.
     result = await run_tool(name, arguments)
     return [TextContent(type="text", text=result)]
 ```
@@ -73,7 +73,7 @@ Invoke a tool through your MCP client as normal. Then force a flush to confirm d
 await billing.flush()
 ```
 
-`flush()` POSTs the buffered batch and, on a 2xx, parses the response for `killedSessionIds` — if your active session is in that list it clears the session and calls `on_session_killed`. (The ingestor only computes `killedSessionIds` while processing heartbeats, so with heartbeats removed this signal is not expected to fire until a dedicated heartbeat API exists.) Old ingestors that return an empty `202` are handled (the parse is best-effort).
+`flush()` POSTs the buffered batch and, on a 2xx, parses the response for `killedSessionIds` — if your active session is in that list it stops the session's heartbeats and calls `on_session_killed` (heartbeat responses are checked the same way). Old ingestors that return an empty `202` are handled (the parse is best-effort).
 
 ## Step 6 — Verify it landed in Aforo
 
@@ -82,17 +82,17 @@ In the Aforo console, open the usage/events view for your tenant and filter by `
 ## Step 7 — Sessions (optional)
 
 ```python
-await billing.start_session("sess_abc123")   # records the active session
+await billing.start_session("sess_abc123", customer_id="cust_acme")  # heartbeat now + every 30 s
 # ... session runs, tools get called ...
-await billing.end_session()                   # clears the session, then flushes
+await billing.end_session()   # stops heartbeats, flushes, sends SESSION_END
 ```
 
-You don't have to call `start_session` yourself — `wrap_tool_handler` records the session from the first tool call that carries a `session_id`. Session heartbeats are no longer sent: they were `system.session.heartbeat` events with `quantity: 0` sent in the usage batch, and the ingestor rejects quantity 0 and fails the whole batch with 400, taking every real event batched with it down. The ingestor has no dedicated heartbeat endpoint. `heartbeat_enabled` / `heartbeat_interval_sec` are accepted and ignored.
+You don't have to call `start_session` yourself — `wrap_tool_handler` starts the session from the first tool call that carries a `session_id` (using that call's `agent_id` as the heartbeat customer). Heartbeats are `system.session.heartbeat` events with `quantity: 1`, top-level `sessionId`, `productType` (the session's; `start_session(product_type=...)`, default the client's) and `sessionBoundary` (`HEARTBEAT`, or `SESSION_END` from `end_session()`), and `customerId` = `customer_id` (default `"system"`). Each is POSTed **on its own** (`{"events": [heartbeat]}`) — never inside a usage batch — so it always takes the ingestor's synchronous path, where heartbeats are intercepted before billing. They are best-effort: one attempt, no retry, failures logged at debug level. `heartbeat_interval_sec` sets the cadence; `heartbeat_enabled=False` turns periodic heartbeats off.
 
 ## Step 8 — Shut down cleanly
 
 ```python
-await billing.shutdown()   # stops the flush loop, flushes remaining events
+await billing.shutdown()   # stops heartbeats and the flush loop, flushes remaining events
 ```
 
 A hard crash skips this — buffered events that never flushed are lost.
@@ -108,11 +108,12 @@ A hard crash skips this — buffered events that never flushed are lost.
 | `flush_interval_sec` | `float` | `5.0` | Periodic flush cadence (needs `start()`). |
 | `flush_count` | `int` | `50` | Buffer size that triggers an async flush. |
 | `on_error` | `Callable?` | logs | Called on permanent batch failure. |
-| `heartbeat_interval_sec` | `float` | `30.0` | Deprecated, ignored — heartbeats are no longer sent. |
-| `heartbeat_enabled` | `bool` | `True` | Deprecated, ignored — heartbeats are no longer sent. |
+| `heartbeat_interval_sec` | `float` | `30.0` | Seconds between session heartbeats. |
+| `heartbeat_enabled` | `bool` | `True` | Turn periodic session heartbeats off. |
 | `on_session_killed` | `Callable[[str, str], None]?` | `None` | Called on a server kill signal `(session_id, "SERVER_KILL")`. |
+| `product_type` | `str` | `"MCP_SERVER"` | Top-level `productType` on every event; per-call override via the `product_type` handler kwarg or `record_tool_invocation(product_type=...)`. |
 
-Methods: `wrap_tool_handler(handler)`, `record_tool_invocation(tool_name, agent_id, session_id=None, execution_status="SUCCESS", execution_duration_ms=0)`, `start()`, `flush()`, `start_session(session_id)`, `end_session()`, `shutdown()`.
+Methods: `wrap_tool_handler(handler)`, `record_tool_invocation(tool_name, agent_id, session_id=None, execution_status="SUCCESS", execution_duration_ms=0, *, product_type=None)`, `start()`, `flush()`, `start_session(session_id, product_type=None, customer_id=None)`, `end_session()`, `shutdown()`.
 
 ## Troubleshooting
 
@@ -121,10 +122,10 @@ Methods: `wrap_tool_handler(handler)`, `record_tool_invocation(tool_name, agent_
 | No events at all | `await start()` was never called and the buffer hasn't hit `flush_count`. | Call `await billing.start()` once, or `await billing.flush()` to force it. |
 | Every event has `agentId = "unknown"` | The handler didn't receive `agent_id` in `kwargs`. | Pass `agent_id` (and `session_id`) through from your MCP server to the tool handler. |
 | `on_error` fires with "Aforo returned 401/403" | Bad/unscoped API key — 4xx is dropped, not retried. | Fix `api_key`; confirm it belongs to `tenant_id`. |
-| Events sent, none in console | Wrong `ingestor_url` host, or `mcp_server.tool_invocations` isn't mapped to a rate plan. | Use `https://usage-ingestor.aforo.ai`; map the metric in the Aforo console. |
+| Events sent, none in console | Wrong `ingestor_url` host, or `mcp_server.tool_invocations` isn't mapped to a rate plan. | Use `https://api.aforo.ai`; map the metric in the Aforo console. |
 | Session keeps billing after you expected it killed | Kill only clears the SDK's session; it does not abort the in-flight tool call. | Handle the stop in `on_session_killed` and close the session yourself. |
 | Events lost on restart | Buffered events weren't flushed before exit. | `await billing.shutdown()` in your shutdown path. |
 
 ## What this guide does NOT cover
 
-It doesn't define what `mcp_server.tool_invocations` costs — pricing and metric mapping are in the Aforo console. It doesn't enforce quotas before a tool runs; the only server-side control is the post-flush `killedSessionIds` signal, which clears the session rather than blocking calls (The ingestor only computes `killedSessionIds` while processing heartbeats, so with heartbeats removed this signal is not expected to fire until a dedicated heartbeat API exists.) For non-MCP protocols (HTTP, gRPC, GraphQL, WebSocket, MQTT) use the matching package in this SDK repo.
+It doesn't define what `mcp_server.tool_invocations` costs — pricing and metric mapping are in the Aforo console. It doesn't enforce quotas before a tool runs; the only server-side control is the post-flush `killedSessionIds` signal, which stops the session's heartbeats rather than blocking calls. For non-MCP protocols (HTTP, gRPC, GraphQL, WebSocket, MQTT) use the matching package in this SDK repo.

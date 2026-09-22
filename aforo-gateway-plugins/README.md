@@ -40,6 +40,7 @@ All 5 plugins extract these headers from inbound requests and include them in th
   "quantity": 1,
   "idempotencyKey": "req-001",
   "occurredAt": "2026-04-14T10:30:00Z",
+  "productType": "API",
   "endpointPath": "/v1/accounts/123",
   "httpMethod": "GET",
   "statusCode": 200,
@@ -60,6 +61,20 @@ All 5 plugins extract these headers from inbound requests and include them in th
 ```
 
 The 4 HTTP fields (`endpointPath`, `httpMethod`, `statusCode`, `responseTimeMs`) are emitted as **top-level fields** for fast ClickHouse queries, and also duplicated in `metadata` for backward compatibility with older ingestor builds.
+
+## Product type
+
+Every event carries `productType`, which the ingestor requires in production. Each plugin has a setting for it, default `API` (trimmed and upper-cased; unknown values are passed through):
+
+| Plugin | Setting |
+|--------|---------|
+| Kong | `config.product_type` |
+| Apigee | KVM key `product_type` |
+| AWS Lambda | `PRODUCT_TYPE` env var / `ProductType` SAM parameter |
+| Azure APIM | Named Value `aforo-product-type` (per-API override: `set-variable name="aforo-product-type"` before `aforo-context`) |
+| MuleSoft | `product-type` property (`${product_type}` in `template.xml`) |
+
+An MCP `tools/call` is sent as `MCP_SERVER` only when both `toolName` and `agentId` are known; otherwise it keeps the configured type. Events missing the fields their type requires (e.g. `MCP_SERVER` without `agentId`, or `AI_AGENT` / `GRPC_API` / `GRAPHQL_API` / `WEBSOCKET_API` / `MQTT_BROKER`, whose fields an HTTP gateway cannot observe or trust) are skipped rather than sent, because one invalid event fails the whole batch.
 
 ## Install Instructions
 

@@ -8,11 +8,8 @@
 package wsmetering
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math/rand"
 	"net/http"
 	"strings"
@@ -28,6 +25,7 @@ type Config struct {
 	ProductID      string
 	APIKey         string
 	IngestorURL    string
+	ProductType    string        // default "WEBSOCKET_API"; sent as top-level productType on every event
 	PerFrameEvents bool          // off by default — emit only OPEN + CLOSE
 	FlushCount     int           // default 100
 	FlushInterval  time.Duration // default 3s
@@ -48,16 +46,21 @@ type Billing struct {
 }
 
 type ConnectionState struct {
-	customerId string
-	startMs    int64
-	frames     atomic.Int64
-	bytes      atomic.Int64
-	metadata   map[string]any
+	customerId  string
+	productType string
+	startMs     int64
+	frames      atomic.Int64
+	bytes       atomic.Int64
+	metadata    map[string]any
 }
 
 func New(cfg Config) (*Billing, error) {
 	if cfg.TenantID == "" || cfg.ProductID == "" || cfg.APIKey == "" || cfg.IngestorURL == "" {
 		return nil, errors.New("wsmetering: TenantID, ProductID, APIKey, IngestorURL are required")
+	}
+	cfg.ProductType = normalizeProductType(cfg.ProductType)
+	if cfg.ProductType == "" {
+		cfg.ProductType = DefaultProductType
 	}
 	if cfg.FlushCount == 0 {
 		cfg.FlushCount = 100
@@ -83,8 +86,10 @@ func New(cfg Config) (*Billing, error) {
 }
 
 // Open registers a new tracked WebSocket connection. Returns a connection ID
-// you must hold and pass to RecordFrame and Close.
-func (b *Billing) Open(customerID string, metadata map[string]any) string {
+// you must hold and pass to RecordFrame and Close. An optional EventOptions
+// overrides the productType of every event of this connection.
+func (b *Billing) Open(customerID string, metadata map[string]any, opts ...EventOptions) string {
+	customerID = strings.TrimSpace(customerID)
 	if customerID == "" {
 		return ""
 	}
@@ -94,12 +99,13 @@ func (b *Billing) Open(customerID string, metadata map[string]any) string {
 	}
 	connID := fmt.Sprintf("ws_%d_%s", time.Now().UnixNano(), randomSuffix())
 	state := &ConnectionState{
-		customerId: customerID,
-		startMs:    time.Now().UnixMilli(),
-		metadata:   metadata,
+		customerId:  customerID,
+		productType: b.productTypeFor(opts),
+		startMs:     time.Now().UnixMilli(),
+		metadata:    metadata,
 	}
 	b.connections.Store(connID, state)
-	b.push(b.connEvent(customerID, connID, "PING", "SERVER_TO_CLIENT", 0, 0, 0, "", merge(metadata, map[string]any{"event": "CONNECTION_OPENED"})))
+	b.push(b.connEvent(state, connID, "PING", "SERVER_TO_CLIENT", 0, 0, 0, "", merge(metadata, map[string]any{"event": "CONNECTION_OPENED"})))
 	return connID
 }
 
@@ -114,7 +120,7 @@ func (b *Billing) RecordFrame(connID, direction, frameType string, bytes int64) 
 	s.frames.Add(1)
 	s.bytes.Add(bytes)
 	if b.cfg.PerFrameEvents {
-		b.push(b.connEvent(s.customerId, connID, frameType, direction, 1, bytes,
+		b.push(b.connEvent(s, connID, frameType, direction, 1, bytes,
 			time.Now().UnixMilli()-s.startMs, "", s.metadata))
 	}
 }
@@ -136,23 +142,23 @@ func (b *Billing) Close(connID string, closeCode int) {
 		"bytes":     s.bytes.Load(),
 		"closeCode": closeCode,
 	})
-	b.push(b.connEvent(s.customerId, connID, "CLOSE", "SERVER_TO_CLIENT",
+	b.push(b.connEvent(s, connID, "CLOSE", "SERVER_TO_CLIENT",
 		int(s.frames.Load()), s.bytes.Load(), durationMs, reason, meta))
 }
 
-func (b *Billing) connEvent(customerID, connID, frameType, direction string, frames int, bytesAmt, durationMs int64, closeReason string, metadata map[string]any) map[string]any {
+func (b *Billing) connEvent(s *ConnectionState, connID, frameType, direction string, frames int, bytesAmt, durationMs int64, closeReason string, metadata map[string]any) map[string]any {
 	now := time.Now().UTC()
 	metricName := "websocket_api.message"
 	if frameType == "CLOSE" {
 		metricName = "websocket_api.connection_closed"
 	}
 	e := map[string]any{
-		"customerId":          customerID,
+		"customerId":          s.customerId,
 		"metricName":          metricName,
 		"quantity":            1,
 		"occurredAt":          now.Format(time.RFC3339Nano),
 		"idempotencyKey":      fmt.Sprintf("ws:%s:%s:%s:%d:%s", b.cfg.TenantID, connID, frameType, now.UnixMilli(), randomSuffix()),
-		"productType":         "WEBSOCKET_API",
+		"productType":         s.productType,
 		"wsConnectionId":      connID,
 		"messageCount":        frames,
 		"dataBytes":           bytesAmt,
@@ -248,37 +254,6 @@ func (b *Billing) flush() {
 		}
 		b.send(batch[start:end])
 	}
-}
-
-// send POSTs one chunk of at most maxBatchSize events. The body is marshalled
-// once, so every retry carries the same idempotencyKeys.
-func (b *Billing) send(chunk []map[string]any) {
-	body, err := json.Marshal(map[string]any{"events": chunk})
-	if err != nil {
-		b.cfg.OnError(err)
-		return
-	}
-	for attempt := 1; attempt <= 3; attempt++ {
-		req, _ := http.NewRequest(http.MethodPost, b.url, bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-API-Key", b.cfg.APIKey)
-		req.Header.Set("X-Tenant-Id", b.cfg.TenantID)
-		resp, err := b.client.Do(req)
-		if err == nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				return
-			}
-		} else if attempt == 3 {
-			b.cfg.OnError(err)
-			return
-		}
-		if attempt < 3 {
-			time.Sleep(time.Duration(1<<(attempt-1)) * time.Second)
-		}
-	}
-	b.cfg.OnError(fmt.Errorf("wsmetering: flush exhausted retries (dropped %d events)", len(chunk)))
 }
 
 func (b *Billing) Shutdown() error {

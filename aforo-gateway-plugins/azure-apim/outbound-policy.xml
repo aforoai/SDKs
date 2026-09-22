@@ -42,6 +42,13 @@
                              fails the batch with 400.
     aforo-mcp-enabled      — "true" to enable MCP detection
     aforo-mcp-product-id   — MCP product ID stamped in metadata ("none" if unused)
+
+  productType: every event carries aforo-product-type (resolved by aforo-context
+  from the Named Value aforo-product-type, default "API"). A tools/call with both
+  a tool name and params._meta.agent_id is sent as MCP_SERVER; without an agent
+  id it keeps the configured type. Configured types whose required fields a
+  gateway cannot supply (AI_AGENT, MCP_SERVER, GRPC_API, GRAPHQL_API,
+  WEBSOCKET_API, MQTT_BROKER) are not metered, except detected MCP tool calls.
 -->
 <fragment>
     <choose>
@@ -64,7 +71,33 @@
                 }
                 return &quot;{{aforo-default-metric}}&quot;;
             }" />
+            <!-- productType: MCP_SERVER for a tools/call carrying both a tool name
+                 and params._meta.agent_id, else aforo-product-type (set by
+                 aforo-context). "" when the configured type requires fields this
+                 gateway cannot supply: such an event would fail the whole batch,
+                 so it is not sent. -->
+            <set-variable name="aforo-event-product-type" value="@{
+                var configured = context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-product-type&quot;, &quot;API&quot;);
+                if (&quot;{{aforo-mcp-enabled}}&quot; == &quot;true&quot; &amp;&amp; context.Request.Method == &quot;POST&quot;) {
+                    try {
+                        var body = JObject.Parse(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-mcp-body&quot;, &quot;&quot;));
+                        var paramz = body[&quot;params&quot;] as JObject;
+                        var meta = paramz == null ? null : paramz[&quot;_meta&quot;] as JObject;
+                        if (body[&quot;method&quot;]?.ToString() == &quot;tools/call&quot; &amp;&amp; paramz != null
+                            &amp;&amp; !string.IsNullOrEmpty(paramz[&quot;name&quot;]?.ToString())
+                            &amp;&amp; meta != null &amp;&amp; !string.IsNullOrEmpty(meta[&quot;agent_id&quot;]?.ToString())) {
+                            return &quot;MCP_SERVER&quot;;
+                        }
+                    } catch { }
+                }
+                return Array.IndexOf(new[] { &quot;AI_AGENT&quot;, &quot;MCP_SERVER&quot;, &quot;GRPC_API&quot;, &quot;GRAPHQL_API&quot;, &quot;WEBSOCKET_API&quot;, &quot;MQTT_BROKER&quot; }, configured) &gt;= 0 ? &quot;&quot; : configured;
+            }" />
             <choose>
+                <when condition="@(string.IsNullOrEmpty(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-event-product-type&quot;, &quot;&quot;)))">
+                    <trace source="aforo-metering" severity="information">
+                        <message>@(&quot;Not metered: productType &quot; + context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-product-type&quot;, &quot;&quot;) + &quot; requires fields this gateway cannot supply&quot;)</message>
+                    </trace>
+                </when>
                 <!-- MCP JSON-RPC tools/call detection (body captured in <inbound> by aforo-context) -->
                 <when condition="@(&quot;{{aforo-mcp-enabled}}&quot; == &quot;true&quot; &amp;&amp; context.Request.Method == &quot;POST&quot; &amp;&amp; context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-mcp-body&quot;, &quot;&quot;).Contains(&quot;tools/call&quot;))">
                     <send-one-way-request mode="new">
@@ -110,7 +143,7 @@
                                         new JProperty("quantity", 1),
                                         new JProperty("idempotencyKey", "mcp:" + context.RequestId.ToString() + ":" + toolName),
                                         new JProperty("occurredAt", DateTime.UtcNow.ToString("o")),
-                                        new JProperty("productType", "MCP_SERVER"),
+                                        new JProperty("productType", context.Variables.GetValueOrDefault<string>("aforo-event-product-type", "API")),
                                         new JProperty("toolName", toolName),
                                         new JProperty("agentId", agentId),
                                         new JProperty("sessionId", sessionId),
@@ -163,6 +196,7 @@
                                         new JProperty("quantity", 1),
                                         new JProperty("idempotencyKey", context.RequestId.ToString()),
                                         new JProperty("occurredAt", DateTime.UtcNow.ToString("o")),
+                                        new JProperty("productType", context.Variables.GetValueOrDefault<string>("aforo-event-product-type", "API")),
                                         new JProperty("endpointPath", path),
                                         new JProperty("httpMethod", method),
                                         new JProperty("statusCode", statusCode),

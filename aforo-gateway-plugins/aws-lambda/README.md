@@ -29,7 +29,7 @@ cd SDKs/aforo-gateway-plugins/aws-lambda
 sam build
 sam deploy --guided \
   --parameter-overrides \
-    AforoEndpoint=https://usage-ingestor.aforo.ai/v1/ingest/batch \
+    AforoEndpoint=https://api.aforo.ai/v1/ingest/batch \
     AforoApiKey="$AFORO_API_KEY" \
     DefaultMetric=api_calls \
     ApiGatewayLogGroupName=/aws/apigateway/aforo-access-logs
@@ -60,7 +60,7 @@ The values every deployment needs map to SAM parameters / Lambda env vars — `A
 ```bash
 sam deploy \
   --parameter-overrides \
-    AforoEndpoint=https://usage-ingestor.aforo.ai/v1/ingest/batch \
+    AforoEndpoint=https://api.aforo.ai/v1/ingest/batch \
     AforoApiKey="$AFORO_API_KEY" \
     DefaultMetric=api_calls \
     MetricMappings='[{"matchType":"PREFIX","value":"/v1/sms","metricName":"sms_sent"}]' \
@@ -75,7 +75,7 @@ The function reads everything from environment variables (set by the SAM templat
 
 | Env var | SAM parameter | Default | What it does |
 |---------|---------------|---------|--------------|
-| `AFORO_ENDPOINT` | `AforoEndpoint` | `https://usage-ingestor.aforo.ai/v1/ingest/batch` | Aforo ingestor batch URL. |
+| `AFORO_ENDPOINT` | `AforoEndpoint` | `https://api.aforo.ai/v1/ingest/batch` | Aforo ingestor batch URL. |
 | `AFORO_API_KEY` | `AforoApiKey` | — | Aforo API key, scope `usage:ingest`. Sent as `X-API-Key` (alone — an `Authorization: Bearer` header makes the ingestor answer 401). The tenant is derived from the key. |
 | `METRIC_MAPPINGS` | `MetricMappings` | `[]` | JSON array of `{matchType, value, metricName}` rules, first match wins. `matchType` is `EXACT`, `PREFIX` or `CONTAINS` (plain string comparison — same semantics as catalog's `/internal/v1/metrics/gateway-mappings`, which Kong fetches; this Lambda takes the table as config). Invalid JSON is logged and ignored. |
 | `DEFAULT_METRIC` | `DefaultMetric` | `api_calls` | Metric for requests no mapping matches. **Must be registered in the Aforo catalog** — an unknown metric fails the whole batch with 400. |
@@ -83,6 +83,7 @@ The function reads everything from environment variables (set by the SAM templat
 | `QUANTITY_SOURCE` | `QuantitySource` | `1` | `1` = count, `response_size` = response bytes. Entries whose quantity is 0 (e.g. an empty 204) are skipped — the ingestor requires quantity > 0. |
 | `FLUSH_COUNT` | — (set to `50` in template) | `50` | Max events per POST batch. Capped at 1000: the ingestor rejects a larger batch with 400. |
 | `INCLUDE_METADATA` | — (set to `true` in template) | `true` | Include request metadata in the event. Set to `"false"` to omit. |
+| `PRODUCT_TYPE` | `ProductType` | `API` | `productType` sent on every event (trimmed, upper-cased; unknown values passed through) — required by the ingestor. MCP `tools/call` with both `toolName` and `agentId` is sent as `MCP_SERVER`, otherwise keeps this value. Entries missing the fields their type requires are skipped: `AI_AGENT`/`GRPC_API`/`GRAPHQL_API`/`WEBSOCKET_API`/`MQTT_BROKER` need fields an access log does not carry or that cannot be trusted (an agentId from `x-agent-id` is client-settable). |
 | `MCP_ENABLED` | — | `false` | Detect MCP JSON-RPC `tools/call` in the logged request body and emit `mcp_server.tool_invocations`. |
 
 Removed: `AFORO_TENANT_ID` / `AforoTenantId` (the ingestor ignores tenant headers; the tenant comes from the key) and `CUSTOMER_ID_SOURCE` / `CustomerIdSource` (identity now comes only from the authorizer context). `MCP_PRODUCT_ID` and `MARGIN_GUARD_*` were never read by `index.js` and are no longer documented here.
@@ -96,6 +97,6 @@ Step-by-step from `sam deploy` to a verified event in Aforo: see [USER_GUIDE.md]
 ## What this doesn't cover
 
 - **Margin-guard enforcement does not block requests here.** This Lambda processes CloudWatch Logs after the fact and cannot reject a live call. For real-time L2/L3 enforcement, deploy the separate `margin-guard.js` / `authorizer.js` module as an API Gateway Lambda Authorizer (see `AUTHORIZER.md` in this folder). `MARGIN_GUARD_*` env vars on this metering function are informational only.
-- **Delivery.** Batches are sent concurrently under one deadline derived from the Lambda's remaining time. Each is retried up to 3x with exponential backoff on 5xx, 408, 429 and transport errors. Any other 4xx is a permanent rejection: the batch is dropped and the response body logged (retrying would send identical bytes to the same judgement). If a batch still fails transiently, the handler **throws**, so Lambda's async-invocation retry (`MaximumRetryAttempts: 2` in the template) re-delivers the whole log batch; stable `idempotencyKey`s (API Gateway `requestId`) let already-delivered events deduplicate. After Lambda's retries are exhausted the batch is lost unless you configure an on-failure destination/DLQ.
+- **Delivery.** Batches are sent concurrently under one deadline derived from the Lambda's remaining time. Each is retried up to 3x with exponential backoff on 5xx, 408, 429 and transport errors; on 429 the `Retry-After` header is honoured (a wait over 30 s ends the attempts and the batch fails transiently). Any other 4xx is a permanent rejection: the batch is dropped and the response body logged (retrying would send identical bytes to the same judgement). If a batch still fails transiently, the handler **throws**, so Lambda's async-invocation retry (`MaximumRetryAttempts: 2` in the template) re-delivers the whole log batch; stable `idempotencyKey`s (API Gateway `requestId`) let already-delivered events deduplicate. After Lambda's retries are exhausted the batch is lost unless you configure an on-failure destination/DLQ.
 - **It bills from access logs, not the gateway internals.** Customer attribution depends entirely on the access-log format above and on the route using the Aforo authorizer.
 - **Not verified against a live API Gateway.** The unit/handler tests run against a local HTTP server; the access-log `$context` variables and the async-retry behaviour have not been exercised on a real stage.

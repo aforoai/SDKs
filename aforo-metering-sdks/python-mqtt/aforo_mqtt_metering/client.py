@@ -22,7 +22,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     import httpx  # type: ignore
@@ -57,6 +57,74 @@ def _valid_customer_id(customer_id: Any) -> bool:
     return True
 
 
+DEFAULT_PRODUCT_TYPE = "MQTT_BROKER"
+MAX_RETRY_AFTER_SEC = 60.0
+
+
+def _normalize_product_type(product_type: Any, default: str) -> str:
+    """Trim + uppercase. Unknown values pass through; the ingestor is the authority."""
+    value = str(product_type).strip().upper() if product_type is not None else ""
+    return value or default
+
+
+def _post_json(url: str, body: Dict[str, Any], headers: Dict[str, str]) -> Tuple[int, Optional[str], bytes]:
+    """POST JSON; returns (status, Retry-After header, response body). Raises on network errors."""
+    if HAS_HTTPX:
+        with httpx.Client(timeout=10.0) as c:
+            r = c.post(url, json=body, headers=headers)
+            return r.status_code, r.headers.get("Retry-After"), r.content
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"),
+        headers=headers, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            return resp.status, _header(resp, "Retry-After"), _read(resp)
+    except urllib.error.HTTPError as e:
+        return e.code, _header(e, "Retry-After"), _read(e)
+
+
+def _header(resp: Any, name: str) -> Optional[str]:
+    try:
+        value = resp.headers.get(name)
+        return value if isinstance(value, str) else None
+    except Exception:
+        return None
+
+
+def _read(resp: Any) -> bytes:
+    try:
+        data = resp.read()
+        return data if isinstance(data, (bytes, bytearray)) else b""
+    except Exception:
+        return b""
+
+
+def _retry_after_seconds(value: str, default: float) -> float:
+    try:
+        return min(max(0.0, float(value)), MAX_RETRY_AFTER_SEC)
+    except (TypeError, ValueError):
+        return default
+
+
+def _error_messages(raw: bytes) -> List[str]:
+    """Pull errors[].message out of a batch response ({accepted, failed, errors:[{index, message}]})."""
+    try:
+        data = json.loads(raw.decode("utf-8")) if raw else None
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    out: List[str] = []
+    for err in data.get("errors") or []:
+        if isinstance(err, dict) and err.get("message"):
+            prefix = f"[{err['index']}] " if err.get("index") is not None else ""
+            out.append(prefix + str(err["message"]))
+    return out
+
+
 MQTT_EVENT_TYPES = ("PUBLISH", "DELIVER", "SUBSCRIBE", "UNSUBSCRIBE", "CONNECT", "DISCONNECT")
 
 
@@ -88,6 +156,7 @@ class AforoMqttBilling:
         flush_count: int = 200,
         emit_deliver_events: bool = False,
         on_error: Optional[Callable[[Exception], None]] = None,
+        product_type: str = DEFAULT_PRODUCT_TYPE,
     ):
         if not all([tenant_id, product_id, api_key, ingestor_url]):
             raise ValueError("tenant_id, product_id, api_key and ingestor_url are required")
@@ -99,6 +168,8 @@ class AforoMqttBilling:
         self.flush_interval_sec = flush_interval_sec
         self.flush_count = flush_count
         self.emit_deliver_events = emit_deliver_events
+        # Top-level productType on every event; push(product_type=...) overrides per call.
+        self.product_type = _normalize_product_type(product_type, DEFAULT_PRODUCT_TYPE)
         self.on_error = on_error or (lambda e: logger.error(f"[aforo-mqtt] {e}"))
 
         self._buffer: List[Dict[str, Any]] = []
@@ -133,6 +204,7 @@ class AforoMqttBilling:
         client_id: str,
         data_bytes: int = 0,
         metadata: Optional[Dict[str, Any]] = None,
+        product_type: Optional[str] = None,
     ) -> None:
         event_type = str(event_type or "").upper()
         if event_type not in MQTT_EVENT_TYPES:
@@ -160,7 +232,7 @@ class AforoMqttBilling:
             quantity=1,
             occurredAt=now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
             idempotencyKey=_cap_idempotency_key(f"mqtt:{self.tenant_id}:{client_id}:{event_type}:{topic}:{int(now.timestamp() * 1000)}:{uuid.uuid4().hex[:8]}"),
-            productType="MQTT_BROKER",
+            productType=_normalize_product_type(product_type, self.product_type),
             mqttTopic=topic,
             mqttQos=qos,
             mqttRetained=bool(retained),
@@ -205,26 +277,35 @@ class AforoMqttBilling:
         url = f"{self.ingestor_url}/v1/ingest/batch"
 
         for attempt in range(3):
+            delay = float(2 ** attempt)
             try:
-                if HAS_HTTPX:
-                    with httpx.Client(timeout=10.0) as c:
-                        r = c.post(url, json=body, headers=headers)
-                        if 200 <= r.status_code < 300:
-                            return
-                else:
-                    import urllib.request
-                    req = urllib.request.Request(
-                        url, data=json.dumps(body).encode("utf-8"),
-                        headers=headers, method="POST",
-                    )
-                    with urllib.request.urlopen(req, timeout=10.0) as resp:
-                        if 200 <= resp.status < 300:
-                            return
+                status, retry_after, raw = _post_json(url, body, headers)
             except Exception as e:
                 if attempt == 2:
                     self.on_error(e)
                     return
-            time.sleep(2 ** attempt)
+                time.sleep(delay)
+                continue
+            if 200 <= status < 300:
+                # 202 can still carry per-event failures ({failed, errors:[{index, message}]}).
+                messages = _error_messages(raw)
+                if messages:
+                    self.on_error(RuntimeError(
+                        "MQTT metering: ingestor rejected events: " + "; ".join(messages[:5])
+                    ))
+                return
+            if 400 <= status < 500 and status not in (408, 429):
+                # 400 invalid batch / 401 bad key / 422 unknown metric: retrying cannot help.
+                messages = _error_messages(raw)
+                self.on_error(RuntimeError(
+                    f"MQTT metering flush rejected with HTTP {status}, not retrying "
+                    f"(dropped {len(batch)} events)" + (": " + "; ".join(messages[:5]) if messages else "")
+                ))
+                return
+            if status == 429 and retry_after:
+                delay = _retry_after_seconds(retry_after, delay)
+            if attempt < 2:
+                time.sleep(delay)
         self.on_error(RuntimeError(f"MQTT metering flush failed after 3 attempts (dropped {len(batch)} events)"))
 
     def shutdown(self) -> None:
@@ -242,6 +323,7 @@ def wrap_paho_client(
     *,
     customer_id: str,
     client_id: Optional[str] = None,
+    product_type: Optional[str] = None,
 ) -> None:
     """
     Attach metering callbacks to a paho-mqtt client *before* calling .connect().
@@ -270,20 +352,20 @@ def wrap_paho_client(
     orig_unsubscribe = client.unsubscribe
 
     def _on_connect(c, userdata, flags, rc, *args, **kwargs):  # type: ignore[no-untyped-def]
-        billing.push(customer_id=customer_id, topic="", qos=0, retained=False,
+        billing.push(customer_id=customer_id, product_type=product_type, topic="", qos=0, retained=False,
                      event_type="CONNECT", client_id=cid)
         if orig_on_connect:
             return orig_on_connect(c, userdata, flags, rc, *args, **kwargs)
 
     def _on_disconnect(c, userdata, rc, *args, **kwargs):  # type: ignore[no-untyped-def]
-        billing.push(customer_id=customer_id, topic="", qos=0, retained=False,
+        billing.push(customer_id=customer_id, product_type=product_type, topic="", qos=0, retained=False,
                      event_type="DISCONNECT", client_id=cid)
         if orig_on_disconnect:
             return orig_on_disconnect(c, userdata, rc, *args, **kwargs)
 
     def _on_message(c, userdata, msg):  # type: ignore[no-untyped-def]
         billing.push(
-            customer_id=customer_id,
+            customer_id=customer_id, product_type=product_type,
             topic=msg.topic,
             qos=getattr(msg, "qos", 0),
             retained=getattr(msg, "retain", False),
@@ -300,7 +382,7 @@ def wrap_paho_client(
 
     def _publish(topic, payload=None, qos=0, retain=False, **kwargs):  # type: ignore[no-untyped-def]
         billing.push(
-            customer_id=customer_id,
+            customer_id=customer_id, product_type=product_type,
             topic=topic,
             qos=qos,
             retained=retain,
@@ -314,14 +396,14 @@ def wrap_paho_client(
         # Paho accepts str or [(str, qos)] — normalize
         topics = [topic] if isinstance(topic, str) else [t[0] if isinstance(t, tuple) else t for t in topic]
         for t in topics:
-            billing.push(customer_id=customer_id, topic=t, qos=qos, retained=False,
+            billing.push(customer_id=customer_id, product_type=product_type, topic=t, qos=qos, retained=False,
                          event_type="SUBSCRIBE", client_id=cid)
         return orig_subscribe(topic, qos, *args, **kwargs)
 
     def _unsubscribe(topic, *args, **kwargs):  # type: ignore[no-untyped-def]
         topics = [topic] if isinstance(topic, str) else list(topic)
         for t in topics:
-            billing.push(customer_id=customer_id, topic=t, qos=0, retained=False,
+            billing.push(customer_id=customer_id, product_type=product_type, topic=t, qos=0, retained=False,
                          event_type="UNSUBSCRIBE", client_id=cid)
         return orig_unsubscribe(topic, *args, **kwargs)
 
@@ -338,6 +420,7 @@ def wrap_aiomqtt_client(
     *,
     customer_id: str,
     client_id: Optional[str] = None,
+    product_type: Optional[str] = None,
 ) -> None:
     """
     Wrap an aiomqtt.Client's publish/subscribe methods + CONNECT/DISCONNECT
@@ -355,7 +438,7 @@ def wrap_aiomqtt_client(
         cid = cid.decode("utf-8")
 
     # CONNECT marker (best-effort — aiomqtt doesn't expose an on_connect callback)
-    billing.push(customer_id=customer_id, topic="", qos=0, retained=False,
+    billing.push(customer_id=customer_id, product_type=product_type, topic="", qos=0, retained=False,
                  event_type="CONNECT", client_id=cid)
 
     orig_publish = client.publish
@@ -364,7 +447,7 @@ def wrap_aiomqtt_client(
 
     async def _publish(topic, payload=None, qos=0, retain=False, **kwargs):  # type: ignore[no-untyped-def]
         billing.push(
-            customer_id=customer_id,
+            customer_id=customer_id, product_type=product_type,
             topic=topic, qos=qos, retained=retain,
             event_type="PUBLISH", client_id=cid,
             data_bytes=_payload_bytes(payload),
@@ -374,14 +457,14 @@ def wrap_aiomqtt_client(
     async def _subscribe(topic, qos=0, *args, **kwargs):  # type: ignore[no-untyped-def]
         topics = [topic] if isinstance(topic, str) else list(topic)
         for t in topics:
-            billing.push(customer_id=customer_id, topic=str(t), qos=qos, retained=False,
+            billing.push(customer_id=customer_id, product_type=product_type, topic=str(t), qos=qos, retained=False,
                          event_type="SUBSCRIBE", client_id=cid)
         return await orig_subscribe(topic, qos, *args, **kwargs)
 
     async def _unsubscribe(topic, *args, **kwargs):  # type: ignore[no-untyped-def]
         topics = [topic] if isinstance(topic, str) else list(topic)
         for t in topics:
-            billing.push(customer_id=customer_id, topic=str(t), qos=0, retained=False,
+            billing.push(customer_id=customer_id, product_type=product_type, topic=str(t), qos=0, retained=False,
                          event_type="UNSUBSCRIBE", client_id=cid)
         return await orig_unsubscribe(topic, *args, **kwargs)
 

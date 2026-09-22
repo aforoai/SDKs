@@ -2,6 +2,11 @@
 
 This monorepo ships five gateway metering plugins (Kong, Apigee, AWS Lambda, Azure APIM, MuleSoft). The whole repo is versioned as one — every plugin ships together on the same tag.
 
+## Unreleased
+
+- Every event now carries `productType` (required by the ingestor in production): new per-plugin setting, default `API` — Kong `product_type`, Apigee KVM `product_type`, AWS Lambda `PRODUCT_TYPE` / `ProductType`, Azure Named Value `aforo-product-type`, MuleSoft `product-type`. MCP `tools/call` is sent as `MCP_SERVER` only when both `toolName` and `agentId` are present; events missing their type's required fields are skipped rather than failing the batch.
+- Kong and AWS Lambda honour `Retry-After` on 429 (up to 30 s). MuleSoft `occurredAt` is UTC.
+
 ## v2.0.0 — 2026-04-23
 
 **Security release** — tenant-ID IDOR fixes across 4 plugins. **BREAKING** for any deployment that was relying on `X-Customer-Id` / `X-Client-Id` / `X-Agent-Id` / `X-Tenant-Id` request headers or `?customer_id=` query params for billing attribution, rate-limit scope, or margin-guard scope.

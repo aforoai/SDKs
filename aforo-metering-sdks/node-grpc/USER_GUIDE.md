@@ -44,7 +44,7 @@ const billing = new AforoGrpcBilling({
   tenantId: 'tenant_acme',
   productId: 'prod_grpc_001',
   apiKey: process.env.AFORO_API_KEY!,
-  ingestorUrl: 'https://usage-ingestor.aforo.ai', // SDK appends /v1/ingest/batch
+  ingestorUrl: 'https://api.aforo.ai', // SDK appends /v1/ingest/batch
   serviceName: 'acme.v1.UserService',
 });
 ```
@@ -117,7 +117,7 @@ process.on('SIGINT',  async () => { await billing.shutdown(); process.exit(0); }
 
 > ⚠ Without `shutdown()`, a process that exits inside the 5-second window drops the buffered batch.
 
-The batch is POSTed to `https://usage-ingestor.aforo.ai/v1/ingest/batch` with `X-API-Key: <your api key>` and `X-Tenant-Id: tenant_acme`. Confirm in the Aforo console under the product's usage events (filter `productType = GRPC_API`). On 3 consecutive failures (1s/2s/4s backoff) the batch is dropped and `onError` fires — log it:
+The batch is POSTed to `https://api.aforo.ai/v1/ingest/batch` with `X-API-Key: <your api key>` and `X-Tenant-Id: tenant_acme`. Confirm in the Aforo console under the product's usage events (filter `productType = GRPC_API`). Network errors, 408, 429 (honouring `Retry-After`) and 5xx are retried 3× (1s/2s/4s backoff); any other 4xx is not retried. When a batch is dropped, or a 202 reports per-event failures (`errors[].message`), `onError` fires — log it:
 
 ```ts
 const billing = new AforoGrpcBilling({
@@ -134,6 +134,7 @@ const billing = new AforoGrpcBilling({
 | `productId` | `string` | — (required) | Aforo product id; into `metadata.productId`. |
 | `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. |
 | `ingestorUrl` | `string` | — (required) | Base URL; SDK appends `/v1/ingest/batch`. |
+| `productType` | `string` | `'GRPC_API'` | Top-level `productType` on every event (trimmed + uppercased; unknown values pass through). Override via the wrappers' last argument, e.g. `wrapUnary('GetUser', handler, { productType })`. |
 | `serviceName` | `string` | — (required) | FQ service name; stamped as `grpcService`. |
 | `customerIdExtractor` | `(metadata) => string \| undefined` | reads `x-customer-id` | Resolve the customer per call; `undefined` → skip. |
 | `flushCount` | `number` | `50` | Buffered events that trigger an immediate flush. |

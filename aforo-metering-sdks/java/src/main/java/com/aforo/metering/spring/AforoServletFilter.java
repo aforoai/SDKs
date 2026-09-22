@@ -1,6 +1,8 @@
 package com.aforo.metering.spring;
 
 import com.aforo.metering.AforoClient;
+import com.aforo.metering.AforoOptions;
+import com.aforo.metering.PathNormalizer;
 import com.aforo.metering.TrackEvent;
 import jakarta.servlet.Filter;
 import jakarta.servlet.FilterChain;
@@ -40,6 +42,11 @@ import java.util.Objects;
  * secret, not an id. Requests with no customer are not metered.
  *
  * <p>{@code OPTIONS} (CORS preflight) requests are never metered.</p>
+ *
+ * <p>Each event carries top-level {@code endpointPath} (the matched Spring MVC
+ * route pattern, else the normalized request path, without query string),
+ * {@code httpMethod}, {@code statusCode}, {@code responseTimeMs}, and
+ * {@code productType} ({@link #productType(String)}, else the client default).</p>
  */
 public class AforoServletFilter implements Filter {
 
@@ -48,6 +55,12 @@ public class AforoServletFilter implements Filter {
 
     /** Header read for the customer id when no resolver is configured. */
     public static final String DEFAULT_CUSTOMER_ID_HEADER = "X-Customer-Id";
+
+    /** Ingestor limit on {@code endpointPath}. */
+    static final int MAX_ENDPOINT_PATH_LENGTH = 512;
+
+    private static final String BEST_MATCHING_PATTERN_ATTRIBUTE =
+            "org.springframework.web.servlet.HandlerMapping.bestMatchingPattern";
 
     private static final List<String> DEFAULT_EXCLUDE_PATHS = List.of(
             "/health", "/ready", "/metrics", "/favicon.ico", "/actuator");
@@ -71,6 +84,7 @@ public class AforoServletFilter implements Filter {
     private String customerIdHeader = DEFAULT_CUSTOMER_ID_HEADER;
     private CustomerIdResolver customerIdResolver;
     private boolean usePrincipalAsCustomerId;
+    private String productType;
 
     public AforoServletFilter(AforoClient client) {
         this(client, DEFAULT_EXCLUDE_PATHS);
@@ -115,11 +129,22 @@ public class AforoServletFilter implements Filter {
         return this;
     }
 
+    /**
+     * Product type for events recorded by this filter. {@code null} (default)
+     * uses the client's {@link AforoOptions#productType(String)}.
+     */
+    public AforoServletFilter productType(String productType) {
+        this.productType = AforoOptions.normalizeProductType(productType);
+        return this;
+    }
+
     @Override
     public void doFilter(ServletRequest servletRequest, ServletResponse servletResponse,
                          FilterChain filterChain) throws IOException, ServletException {
 
+        long startNanos = System.nanoTime();
         filterChain.doFilter(servletRequest, servletResponse);
+        long responseTimeMs = (System.nanoTime() - startNanos) / 1_000_000L;
 
         // After response — capture event (non-blocking, fire-and-forget)
         try {
@@ -142,6 +167,11 @@ public class AforoServletFilter implements Filter {
 
             client.track(TrackEvent.builder(customerId, resolveMetricName(req, res))
                     .quantity(1)
+                    .productType(productType)
+                    .endpointPath(endpointPath(req, path))
+                    .httpMethod(req.getMethod())
+                    .statusCode(res.getStatus())
+                    .responseTimeMs(responseTimeMs)
                     .metadata(Map.of("gateway", "java-servlet", "status", res.getStatus()))
                     .build());
 
@@ -150,6 +180,16 @@ public class AforoServletFilter implements Filter {
             java.util.logging.Logger.getLogger(AforoServletFilter.class.getName())
                     .log(java.util.logging.Level.FINE, "Metering capture failed", e);
         }
+    }
+
+    /** Route pattern when Spring MVC matched one, else the normalized path; no query, capped. */
+    private static String endpointPath(HttpServletRequest req, String path) {
+        Object pattern = req.getAttribute(BEST_MATCHING_PATTERN_ATTRIBUTE);
+        String normalized = PathNormalizer.normalize(path, pattern instanceof String s ? s : null);
+        int q = normalized.indexOf('?');
+        if (q >= 0) normalized = normalized.substring(0, q);
+        return normalized.length() > MAX_ENDPOINT_PATH_LENGTH
+                ? normalized.substring(0, MAX_ENDPOINT_PATH_LENGTH) : normalized;
     }
 
     private String resolveMetricName(HttpServletRequest req, HttpServletResponse res) {

@@ -53,7 +53,7 @@ func main() {
 		TenantID:    "tenant_acme",
 		ProductID:   "prod_grpc_user_svc",
 		APIKey:      os.Getenv("AFORO_API_KEY"),
-		IngestorURL: "https://usage-ingestor.aforo.ai",
+		IngestorURL: "https://api.aforo.ai",
 		ServiceName: "acme.v1.UserService",
 	})
 	if err != nil {
@@ -76,6 +76,15 @@ Each call emits one event with `metricName` `"grpc_api.rpc_calls"`. The customer
 
 > ⚠ `UnaryInterceptor` and `StreamInterceptor` both record `messageCount = 1` per call. That's correct for unary but undercounts streaming. If you bill per message, call `Record()` from inside the streaming handler with the real count (see the user guide).
 
+Product type: every event carries a top-level `productType` — `Config.ProductType` (default `"GRPC_API"`). `Record` accepts an optional trailing `grpcmetering.EventOptions` to override it per call (the interceptors always use `Config.ProductType`). Example:
+
+```go
+billing.Record(ctx, "GetUser", "UNARY", 1, err, durationMs,
+	grpcmetering.EventOptions{ProductType: "AGENTIC_API"})
+```
+
+Delivery: `POST /v1/ingest/batch` with `{"events":[...]}`, at most 1000 events per request, `X-API-Key` header. Transport errors, `408`, `429` (honouring `Retry-After`) and `5xx` are retried with the same body; any other `4xx` is reported via `OnError` and not retried.
+
 ## Configuration
 
 `Config`:
@@ -85,13 +94,14 @@ Each call emits one event with `metricName` `"grpc_api.rpc_calls"`. The customer
 | `TenantID` | `string` | — (required) | Sent as the `X-Tenant-Id` header on every flush and embedded in idempotency keys. Set by you, never from a client header. |
 | `ProductID` | `string` | — (required) | Recorded in event metadata + idempotency keys. |
 | `APIKey` | `string` | — (required) | Sent as `X-API-Key: <APIKey>`. |
-| `IngestorURL` | `string` | — (required) | Ingestor base; the SDK appends `/v1/ingest/batch`. Use `https://usage-ingestor.aforo.ai`. |
+| `IngestorURL` | `string` | — (required) | Ingestor base; the SDK appends `/v1/ingest/batch`. Use `https://api.aforo.ai`. |
 | `ServiceName` | `string` | — (required) | Fully-qualified gRPC service (e.g. `acme.v1.UserService`); recorded as `grpcService`. |
+| `ProductType` | `string` | `GRPC_API` | Top-level `productType` on every event (required by the ingestor). Trimmed + upper-cased; unknown values pass through. Overridable per event via `EventOptions`. |
 | `FlushCount` | `int` | `50` | Flush when the buffer reaches this many events. |
 | `FlushInterval` | `time.Duration` | `5s` | Background flush cadence. |
 | `HTTPClient` | `*http.Client` | `&http.Client{Timeout: 10s}` | Override the HTTP client used for flushing. |
 | `CustomerExtractor` | `func(context.Context) string` | reads `x-customer-id` metadata | How a call's customer id is resolved. |
-| `OnError` | `func(error)` | no-op | Called on a marshal failure or a flush that exhausts its 3 retries (events dropped). |
+| `OnError` | `func(error)` | no-op | Called on a marshal failure, a flush that exhausts its 3 retries, a non-retryable `4xx` (dropped without retry), or a `2xx` whose body reports `failed > 0` — messages include the ingestor's `errors[].message`. |
 
 `New` returns an error if any of the five required fields is empty.
 

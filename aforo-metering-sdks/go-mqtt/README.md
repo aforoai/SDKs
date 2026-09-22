@@ -56,7 +56,7 @@ func main() {
 		TenantID:    "tenant_acme",
 		ProductID:   "prod_mqtt_iot_telemetry",
 		APIKey:      os.Getenv("AFORO_API_KEY"),
-		IngestorURL: "https://usage-ingestor.aforo.ai",
+		IngestorURL: "https://api.aforo.ai",
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -95,6 +95,15 @@ Each `Record*` call buffers one event; an empty `customerID` records nothing (th
 
 > ⚠ The SDK does not hook the MQTT client — you call `Record*` at the same sites where you call the client's `Connect`/`Subscribe`/`Publish`. If you skip a call site, that traffic isn't metered.
 
+Product type: every event carries a top-level `productType` — `Config.ProductType` (default `"MQTT_BROKER"`). Every `Record*` method accepts an optional trailing `mqttmetering.EventOptions` to override it. Example:
+
+```go
+billing.RecordPublish(customerID, clientID, topic, qos, retained, n,
+	mqttmetering.EventOptions{ProductType: "AGENTIC_API"})
+```
+
+Delivery: `POST /v1/ingest/batch` with `{"events":[...]}`, at most 1000 events per request, `X-API-Key` header. Transport errors, `408`, `429` (honouring `Retry-After`) and `5xx` are retried with the same body; any other `4xx` is reported via `OnError` and not retried.
+
 ## Configuration
 
 `Config`:
@@ -104,12 +113,13 @@ Each `Record*` call buffers one event; an empty `customerID` records nothing (th
 | `TenantID` | `string` | — (required) | Sent as the `X-Tenant-Id` header on every flush and embedded in idempotency keys. Set by you, never from a client header. |
 | `ProductID` | `string` | — (required) | Recorded in event metadata + idempotency keys. |
 | `APIKey` | `string` | — (required) | Sent as `X-API-Key: <APIKey>`. |
-| `IngestorURL` | `string` | — (required) | Ingestor base; the SDK appends `/v1/ingest/batch`. Use `https://usage-ingestor.aforo.ai`. |
+| `IngestorURL` | `string` | — (required) | Ingestor base; the SDK appends `/v1/ingest/batch`. Use `https://api.aforo.ai`. |
 | `EmitDeliverEvents` | `bool` | `false` | When true, `RecordDeliver` emits events. Off by default — inbound delivery is high-volume. |
+| `ProductType` | `string` | `MQTT_BROKER` | Top-level `productType` on every event (required by the ingestor). Trimmed + upper-cased; unknown values pass through. Overridable per event via `EventOptions`. |
 | `FlushCount` | `int` | `200` | Flush when the buffer reaches this many events (highest of the SDKs — MQTT telemetry is the highest-volume). |
 | `FlushInterval` | `time.Duration` | `2s` | Background flush cadence. |
 | `HTTPClient` | `*http.Client` | `&http.Client{Timeout: 10s}` | Override the HTTP client used for flushing. |
-| `OnError` | `func(error)` | no-op | Called on a marshal failure or a flush that exhausts its 3 retries (events dropped). |
+| `OnError` | `func(error)` | no-op | Called on a marshal failure, a flush that exhausts its 3 retries, a non-retryable `4xx` (dropped without retry), or a `2xx` whose body reports `failed > 0` — messages include the ingestor's `errors[].message`. |
 
 `New` returns an error if `TenantID`, `ProductID`, `APIKey`, or `IngestorURL` is empty.
 

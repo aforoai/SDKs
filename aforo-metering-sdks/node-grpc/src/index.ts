@@ -12,8 +12,9 @@
  *     tenantId: 'tenant_acme',
  *     productId: 'prod_grpc_001',
  *     apiKey: process.env.AFORO_API_KEY!,
- *     ingestorUrl: 'https://usage-ingestor.aforo.ai',
+ *     ingestorUrl: 'https://api.aforo.ai',
  *     serviceName: 'acme.v1.UserService',
+ *     // productType defaults to 'GRPC_API'
  *   });
  *
  *   const server = new grpc.Server();
@@ -39,6 +40,11 @@ export interface AforoGrpcConfig {
   productId: string;
   apiKey: string;
   ingestorUrl: string;
+  /**
+   * Aforo product type sent as top-level `productType` on every event (trimmed + uppercased).
+   * Default: `GRPC_API`. Override per handler via the wrappers' `options.productType`.
+   */
+  productType?: string;
   /** Fully-qualified gRPC service name (e.g., acme.v1.UserService). Overridable per-call. */
   serviceName: string;
   /**
@@ -59,6 +65,16 @@ export interface AforoGrpcConfig {
 }
 
 const SDK_VERSION = '1.0.0';
+/** Default top-level `productType` for this SDK. */
+export const DEFAULT_PRODUCT_TYPE = 'GRPC_API';
+/** Upper bound on a server-requested Retry-After wait. */
+const MAX_RETRY_AFTER_MS = 30_000;
+
+/** Per-handler overrides accepted by the wrap* methods. */
+export interface WrapOptions {
+  /** Product type for events from this handler. Default: the client-level `productType`. */
+  productType?: string;
+}
 /** The ingestor rejects batch requests with more than 1000 events. */
 const MAX_BATCH_EVENTS = 1000;
 /** usage-ingestor limits (IngestUsageEventRequest). */
@@ -92,7 +108,7 @@ interface GrpcUsageEvent {
   quantity: number;
   occurredAt: string;
   idempotencyKey: string;
-  productType: 'GRPC_API';
+  productType: string;
   grpcService: string;
   grpcMethod: string;
   grpcStatusCode: string;
@@ -107,6 +123,7 @@ export class AforoGrpcBilling {
   private readonly config: Required<
     Pick<AforoGrpcConfig, 'tenantId' | 'productId' | 'apiKey' | 'ingestorUrl' | 'serviceName'>
   >;
+  private readonly productType: string;
   private readonly flushCount: number;
   private readonly flushIntervalMs: number;
   private readonly onError: (error: Error) => void;
@@ -123,6 +140,7 @@ export class AforoGrpcBilling {
       ingestorUrl: config.ingestorUrl,
       serviceName: config.serviceName,
     };
+    this.productType = normalizeProductType(config.productType) ?? DEFAULT_PRODUCT_TYPE;
     this.flushCount = config.flushCount ?? 50;
     this.flushIntervalMs = config.flushIntervalMs ?? 5000;
     this.onError = config.onError ?? ((err) => console.error('[aforo-grpc]', err.message));
@@ -143,19 +161,20 @@ export class AforoGrpcBilling {
   /** Wrap a unary (single request, single response) handler. */
   wrapUnary<Req, Res>(
     method: string,
-    handler: (call: ServerUnaryCall<Req, Res>) => Promise<Res>
+    handler: (call: ServerUnaryCall<Req, Res>) => Promise<Res>,
+    options: WrapOptions = {}
   ): (call: ServerUnaryCall<Req, Res>, callback: sendUnaryData<Res>) => void {
     return (call, callback) => {
       const start = Date.now();
       const customerId = this.customerIdExtractor(call.metadata.getMap());
       handler(call)
         .then((res) => {
-          this.record(method, 'UNARY', customerId, 'OK', 1, Date.now() - start);
+          this.record(method, 'UNARY', customerId, 'OK', 1, Date.now() - start, undefined, options.productType);
           callback(null, res);
         })
         .catch((err: Error & { code?: number }) => {
           const code = typeof err.code === 'number' ? err.code : 2; // UNKNOWN
-          this.record(method, 'UNARY', customerId, GRPC_STATUS_LABELS[code] ?? 'UNKNOWN', 1, Date.now() - start);
+          this.record(method, 'UNARY', customerId, GRPC_STATUS_LABELS[code] ?? 'UNKNOWN', 1, Date.now() - start, undefined, options.productType);
           callback(err, null);
         });
     };
@@ -164,7 +183,8 @@ export class AforoGrpcBilling {
   /** Wrap a server-streaming handler (counts messages sent; emits one event on stream close). */
   wrapServerStream<Req, Res>(
     method: string,
-    handler: (call: ServerWritableStream<Req, Res>) => Promise<void>
+    handler: (call: ServerWritableStream<Req, Res>) => Promise<void>,
+    options: WrapOptions = {}
   ): (call: ServerWritableStream<Req, Res>) => void {
     return (call) => {
       const start = Date.now();
@@ -178,12 +198,12 @@ export class AforoGrpcBilling {
 
       handler(call)
         .then(() => {
-          this.record(method, 'SERVER_STREAM', customerId, 'OK', messageCount, Date.now() - start);
+          this.record(method, 'SERVER_STREAM', customerId, 'OK', messageCount, Date.now() - start, undefined, options.productType);
           call.end();
         })
         .catch((err: Error & { code?: number }) => {
           const code = typeof err.code === 'number' ? err.code : 2;
-          this.record(method, 'SERVER_STREAM', customerId, GRPC_STATUS_LABELS[code] ?? 'UNKNOWN', messageCount, Date.now() - start);
+          this.record(method, 'SERVER_STREAM', customerId, GRPC_STATUS_LABELS[code] ?? 'UNKNOWN', messageCount, Date.now() - start, undefined, options.productType);
           call.destroy(err);
         });
     };
@@ -192,7 +212,8 @@ export class AforoGrpcBilling {
   /** Wrap a client-streaming handler (counts messages received; emits one event on completion). */
   wrapClientStream<Req, Res>(
     method: string,
-    handler: (call: ServerReadableStream<Req, Res>) => Promise<Res>
+    handler: (call: ServerReadableStream<Req, Res>) => Promise<Res>,
+    options: WrapOptions = {}
   ): (call: ServerReadableStream<Req, Res>, callback: sendUnaryData<Res>) => void {
     return (call, callback) => {
       const start = Date.now();
@@ -202,12 +223,12 @@ export class AforoGrpcBilling {
 
       handler(call)
         .then((res) => {
-          this.record(method, 'CLIENT_STREAM', customerId, 'OK', messageCount, Date.now() - start);
+          this.record(method, 'CLIENT_STREAM', customerId, 'OK', messageCount, Date.now() - start, undefined, options.productType);
           callback(null, res);
         })
         .catch((err: Error & { code?: number }) => {
           const code = typeof err.code === 'number' ? err.code : 2;
-          this.record(method, 'CLIENT_STREAM', customerId, GRPC_STATUS_LABELS[code] ?? 'UNKNOWN', messageCount, Date.now() - start);
+          this.record(method, 'CLIENT_STREAM', customerId, GRPC_STATUS_LABELS[code] ?? 'UNKNOWN', messageCount, Date.now() - start, undefined, options.productType);
           callback(err, null);
         });
     };
@@ -216,7 +237,8 @@ export class AforoGrpcBilling {
   /** Wrap a bidirectional-streaming handler. Counts messages sent + received. */
   wrapBidiStream<Req, Res>(
     method: string,
-    handler: (call: ServerDuplexStream<Req, Res>) => Promise<void>
+    handler: (call: ServerDuplexStream<Req, Res>) => Promise<void>,
+    options: WrapOptions = {}
   ): (call: ServerDuplexStream<Req, Res>) => void {
     return (call) => {
       const start = Date.now();
@@ -231,12 +253,12 @@ export class AforoGrpcBilling {
 
       handler(call)
         .then(() => {
-          this.record(method, 'BIDI_STREAM', customerId, 'OK', messageCount, Date.now() - start);
+          this.record(method, 'BIDI_STREAM', customerId, 'OK', messageCount, Date.now() - start, undefined, options.productType);
           call.end();
         })
         .catch((err: Error & { code?: number }) => {
           const code = typeof err.code === 'number' ? err.code : 2;
-          this.record(method, 'BIDI_STREAM', customerId, GRPC_STATUS_LABELS[code] ?? 'UNKNOWN', messageCount, Date.now() - start);
+          this.record(method, 'BIDI_STREAM', customerId, GRPC_STATUS_LABELS[code] ?? 'UNKNOWN', messageCount, Date.now() - start, undefined, options.productType);
           call.destroy(err);
         });
     };
@@ -251,7 +273,8 @@ export class AforoGrpcBilling {
     status: string,
     messageCount: number,
     durationMs: number,
-    dataBytes?: number
+    dataBytes?: number,
+    productType?: string
   ): void {
     if (!customerId || !customerId.trim()) {
       // No customer resolved — skip metering (non-billable call, e.g. health check)
@@ -263,6 +286,11 @@ export class AforoGrpcBilling {
     }
     const service = this.config.serviceName.slice(0, 255);
     const grpcMethod = method.slice(0, 128);
+    if (!service.trim() || !grpcMethod.trim()) {
+      // grpcService + grpcMethod are required on GRPC_API events; one invalid event fails the whole batch.
+      this.onError(new Error('gRPC metering: grpcService and grpcMethod are required; event dropped'));
+      return;
+    }
     const now = new Date();
     const event: GrpcUsageEvent = {
       customerId,
@@ -271,7 +299,7 @@ export class AforoGrpcBilling {
       occurredAt: now.toISOString(),
       // Tail-trimmed to the ingestor's limit, keeping the unique millis:random suffix.
       idempotencyKey: `grpc:${this.config.tenantId}:${service}:${grpcMethod}:${now.getTime()}:${randomSuffix()}`.slice(-MAX_IDEMPOTENCY_KEY),
-      productType: 'GRPC_API',
+      productType: normalizeProductType(productType) ?? this.productType,
       grpcService: service,
       grpcMethod,
       grpcStatusCode: status,
@@ -307,6 +335,7 @@ export class AforoGrpcBilling {
     const maxRetries = 3;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      let delayMs = Math.pow(2, attempt - 1) * 1000; // 1s, 2s, 4s
       try {
         const res = await fetch(this.config.ingestorUrl.replace(/\/$/, '') + '/v1/ingest/batch', {
           method: 'POST',
@@ -317,20 +346,38 @@ export class AforoGrpcBilling {
           },
           body,
         });
-        if (res.ok) return;
+        if (res.ok) {
+          await this.reportPartialFailures(res);
+          return;
+        }
+        if (!isRetryableStatus(res.status)) {
+          const { details } = await readErrorMessages(res);
+          this.onError(new Error(`Aforo ingestor rejected batch with HTTP ${res.status}${details ? ` — ${details}` : ''} (${batch.length} events dropped, not retried)`));
+          return;
+        }
+        delayMs = parseRetryAfter(res) ?? delayMs;
         if (attempt < maxRetries) {
-          await sleep(Math.pow(2, attempt - 1) * 1000); // 1s, 2s, 4s
+          await sleep(delayMs);
         }
       } catch (err) {
         if (attempt === maxRetries) {
           this.onError(err as Error);
+          return;
         } else {
-          await sleep(Math.pow(2, attempt - 1) * 1000);
+          await sleep(delayMs);
         }
       }
     }
     // Re-queue on total failure? No — dropping avoids unbounded memory growth.
     this.onError(new Error(`Aforo ingestor flush failed after ${maxRetries} attempts (batch of ${batch.length} events dropped)`));
+  }
+
+  /** A 202 can still carry per-event rejections: `{accepted, duplicates, failed, errors:[{index, message}]}`. */
+  private async reportPartialFailures(res: Response): Promise<void> {
+    const { failed, details } = await readErrorMessages(res);
+    if (failed && failed > 0) {
+      this.onError(new Error(`Aforo ingestor rejected ${failed} event(s)${details ? ` — ${details}` : ''}`));
+    }
   }
 
   private startTimer(): void {
@@ -355,6 +402,43 @@ export class AforoGrpcBilling {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
+
+/** Trim + uppercase a product type; blank/non-string → undefined (unknown values pass through). */
+function normalizeProductType(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed.toUpperCase() : undefined;
+}
+
+/** Network errors, 408, 429 and 5xx are transient; every other 4xx (400/401/403/422...) is not. */
+function isRetryableStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500;
+}
+
+/** Retry-After (delta-seconds or HTTP date) in ms, capped at MAX_RETRY_AFTER_MS. */
+function parseRetryAfter(res: Response): number | undefined {
+  const raw = (res as any)?.headers?.get?.('retry-after');
+  if (!raw) return undefined;
+  const secs = Number(raw);
+  if (Number.isFinite(secs) && secs >= 0) return Math.min(secs * 1000, MAX_RETRY_AFTER_MS);
+  const date = Date.parse(raw);
+  if (!Number.isNaN(date)) return Math.min(Math.max(date - Date.now(), 0), MAX_RETRY_AFTER_MS);
+  return undefined;
+}
+
+/** Reads the ingestor's `errors[].message` entries (first 5) from a response body, if any. */
+async function readErrorMessages(res: Response): Promise<{ failed?: number; details: string }> {
+  if (typeof (res as any)?.json !== 'function') return { details: '' };
+  try {
+    const body: any = await res.json();
+    const details = Array.isArray(body?.errors)
+      ? body.errors.slice(0, 5).map((e: any) => `#${e?.index}: ${e?.message}`).join('; ')
+      : typeof body?.message === 'string' ? body.message : '';
+    return { failed: typeof body?.failed === 'number' ? body.failed : undefined, details };
+  } catch {
+    return { details: '' }; // Non-JSON or empty body — nothing to report.
+  }
+}
 
 function randomSuffix(): string {
   return Math.random().toString(36).slice(2, 10);

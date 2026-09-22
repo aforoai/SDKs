@@ -171,3 +171,56 @@ describe('ToolCallTracker', () => {
     // Should not throw
   });
 });
+
+describe('ToolCallTracker attribution, productType and limits', () => {
+  let buffer: StubBuffer;
+  let heartbeat: StubHeartbeat & { customer?: string };
+  const make = (extra: Record<string, unknown> = {}) => new ToolCallTracker({
+    buffer: buffer as any, heartbeat: heartbeat as any,
+    tenantId: 't', productId: 'p', transport: 'stdio', ...extra,
+  });
+
+  beforeEach(() => {
+    buffer = new StubBuffer();
+    heartbeat = new StubHeartbeat();
+    heartbeat.startSession = function (id: string, customer?: string) {
+      this.started = true; this.activeSessionId = id; this.customer = customer;
+    };
+  });
+
+  it('bills _meta.customer_id, then the customerId config, then the agentId', () => {
+    const tracker = make({ customerId: 'cust_cfg' });
+    tracker.trackRequest({ requestId: 1, toolName: 't', agentId: 'a', customerId: 'cust_meta' }, 's');
+    tracker.trackResponse({ requestId: 1, hasError: false, responseBytes: 1 }, 's');
+    tracker.trackRequest({ requestId: 2, toolName: 't', agentId: 'a' }, 's');
+    tracker.trackResponse({ requestId: 2, hasError: false, responseBytes: 1 }, 's');
+    tracker.shutdown();
+
+    const plain = make();
+    plain.trackRequest({ requestId: 3, toolName: 't', agentId: 'agent_x' }, 's');
+    plain.trackResponse({ requestId: 3, hasError: false, responseBytes: 1 }, 's');
+    plain.shutdown();
+
+    assert.deepEqual(buffer.events.map((e) => e.customerId), ['cust_meta', 'cust_cfg', 'agent_x']);
+    assert.equal(heartbeat.customer, 'cust_meta'); // session customer = first call's customer
+  });
+
+  it('stamps the configured productType (default MCP_SERVER)', () => {
+    const tracker = make({ productType: ' agentic_api ' });
+    tracker.trackRequest({ requestId: 1, toolName: 't', agentId: 'a' }, 's');
+    tracker.trackResponse({ requestId: 1, hasError: false, responseBytes: 1 }, 's');
+    tracker.shutdown();
+    assert.equal(buffer.events[0].productType, 'AGENTIC_API');
+  });
+
+  it('does not meter calls whose toolName/agentId/customerId exceed the ingestor limits', () => {
+    const tracker = make();
+    assert.equal(tracker.trackRequest({ requestId: 1, toolName: 'x'.repeat(65), agentId: 'a' }, 's'), false);
+    assert.equal(tracker.trackRequest({ requestId: 2, toolName: 't', agentId: 'a'.repeat(37) }, 's'), false);
+    assert.equal(tracker.trackRequest({ requestId: 3, toolName: 't', agentId: 'a', customerId: 'c'.repeat(65) }, 's'), false);
+    assert.equal(tracker.trackResponse({ requestId: 1, hasError: false, responseBytes: 1 }, 's'), false);
+    tracker.shutdown();
+    assert.equal(buffer.events.length, 0);
+    assert.equal(heartbeat.started, false);
+  });
+});
