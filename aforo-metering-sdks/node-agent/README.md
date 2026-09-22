@@ -68,7 +68,7 @@ Pass these to `new AforoAgent({...})`:
 | `productId` | `string` | — (required) | The AI_AGENT product these events bill against. |
 | `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. Use `process.env.AFORO_API_KEY`. |
 | `customerId` | `string` | — | Aforo customer the usage is billed to. Required here or per session via `startSession({ customerId })`; `startSession` throws if neither is set. |
-| `ingestorUrl` | `string` | `https://usage-ingestor.aforo.ai/v1/ingest/batch` | Full batch-ingest URL. Override for local dev or air-gapped deployments. A URL ending in `/v1/ingest` is rewritten to `/v1/ingest/batch`. |
+| `ingestorUrl` | `string` | `https://api.aforo.ai/v1/ingest/batch` | Full batch-ingest URL. Override for local dev or air-gapped deployments. A URL ending in `/v1/ingest` is rewritten to `/v1/ingest/batch`. |
 | `flushBatchSize` | `number` | `50` | Buffer this many events before forcing a flush. Lower it for low-volume agents to surface metrics sooner; raise it to amortize per-batch HTTP cost. |
 | `flushIntervalMs` | `number` | `5000` | Max time an event sits in the buffer before a timed flush. `session.end()` flushes regardless. |
 | `fetchImpl` | `typeof fetch` | global `fetch` | Pluggable transport. Required on Node < 18 where there's no global `fetch`; also the seam used in tests. |

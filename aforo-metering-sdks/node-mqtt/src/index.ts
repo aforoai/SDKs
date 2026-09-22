@@ -20,7 +20,7 @@
  *     tenantId: 'tenant_acme',
  *     productId: 'prod_mqtt_telemetry',
  *     apiKey: process.env.AFORO_API_KEY!,
- *     ingestorUrl: 'https://usage-ingestor.aforo.ai',
+ *     ingestorUrl: 'https://api.aforo.ai',
  *   });
  *
  *   const broker = aedes();

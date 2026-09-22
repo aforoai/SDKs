@@ -3,7 +3,7 @@ import { RingBuffer } from './buffer';
 import { Transport } from './transport';
 import { generateIdempotencyKey } from './idempotency';
 
-const DEFAULT_BASE_URL = 'https://usage-ingestor.aforo.ai';
+const DEFAULT_BASE_URL = 'https://api.aforo.ai';
 const DEFAULT_FLUSH_COUNT = 50;
 const DEFAULT_FLUSH_INTERVAL = 5_000;
 const DEFAULT_MAX_QUEUE_SIZE = 10_000;

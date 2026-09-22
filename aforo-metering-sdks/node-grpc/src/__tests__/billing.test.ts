@@ -58,7 +58,7 @@ const config = () => ({
   tenantId: 'tenant-001',
   productId: 'prod-001',
   apiKey: 'sk_test_abc',
-  ingestorUrl: 'https://usage-ingestor.aforo.ai/',  // trailing slash on purpose — SDK should strip it
+  ingestorUrl: 'https://api.aforo.ai/',  // trailing slash on purpose — SDK should strip it
   serviceName: 'acme.v1.UserService',
 });
 
@@ -228,7 +228,7 @@ describe('flush request shape', () => {
 
     expect(capturedRequests).toHaveLength(1);
     const req = capturedRequests[0];
-    expect(req.url).toBe('https://usage-ingestor.aforo.ai/v1/ingest/batch'); // trailing slash stripped
+    expect(req.url).toBe('https://api.aforo.ai/v1/ingest/batch'); // trailing slash stripped
     expect(req.init.method).toBe('POST');
     const headers = req.init.headers as Record<string, string>;
     expect(headers['Content-Type']).toBe('application/json');
@@ -326,7 +326,7 @@ function assertBatchContract(reqs: Array<{ url: string; init: RequestInit; body:
   const allowedSet = new Set(allowed);
   expect(reqs.length).toBeGreaterThan(0);
   for (const r of reqs) {
-    expect(r.url).toBe('https://usage-ingestor.aforo.ai/v1/ingest/batch');
+    expect(r.url).toBe('https://api.aforo.ai/v1/ingest/batch');
     expect((r.init.headers as Record<string, string>)['X-API-Key']).toBe(apiKey);
     expect(Object.keys(r.body)).toEqual(['events']);
     expect(r.body.events.length).toBeGreaterThan(0);

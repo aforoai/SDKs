@@ -40,7 +40,7 @@ billing = AforoGraphQlBilling(
     tenant_id="tenant_acme",
     product_id="prod_graphql_gateway",
     api_key=os.environ["AFORO_API_KEY"],
-    ingestor_url="https://usage-ingestor.aforo.ai",
+    ingestor_url="https://api.aforo.ai",
     schema_version="v2.1",
 )
 
@@ -57,15 +57,15 @@ billing = AforoGraphQlBilling(
     tenant_id="tenant_acme",
     product_id="prod_graphql_gateway",
     api_key=os.environ["AFORO_API_KEY"],
-    ingestor_url="https://usage-ingestor.aforo.ai",
+    ingestor_url="https://api.aforo.ai",
 )
 app = Starlette(routes=[...])
 app = asgi_middleware(billing, path="/graphql")(app)   # only intercepts /graphql
 ```
 
-Works with Ariadne, graphql-core HTTP, Graphene-ASGI, and custom ASGI GraphQL servers. Each metered operation produces one `graphql_api.operations` event POSTed to `https://usage-ingestor.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
+Works with Ariadne, graphql-core HTTP, Graphene-ASGI, and custom ASGI GraphQL servers. Each metered operation produces one `graphql_api.operations` event POSTed to `https://api.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
 
-> ⚠ Events are sent to the ingestor's **`/v1/ingest/batch`** path as `{"events": [...]}`, at most 1000 events per request (larger buffers are split). Set `ingestor_url` to the host only — the SDK appends the path. Use `https://usage-ingestor.aforo.ai`.
+> ⚠ Events are sent to the ingestor's **`/v1/ingest/batch`** path as `{"events": [...]}`, at most 1000 events per request (larger buffers are split). Set `ingestor_url` to the host only — the SDK appends the path. Use `https://api.aforo.ai`.
 
 > `tenant_id` is fixed from your config and sent as a header — never read from a caller-controlled value. The default customer-ID extractor reads `x-customer-id` from request headers (or the Strawberry context); operations with no resolvable customer ID are **not** metered.
 

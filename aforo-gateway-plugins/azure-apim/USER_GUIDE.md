@@ -24,7 +24,7 @@ Every Named Value a fragment references must exist, or APIM rejects the policy. 
 RG="<resource-group>"; APIM="<apim-instance>"
 nv() { az apim nv create -g "$RG" --service-name "$APIM" --named-value-id "$1" --display-name "$1" --value "$2" ${3:+--secret true}; }
 
-nv aforo-endpoint "https://usage-ingestor.aforo.ai/v1/ingest/batch"
+nv aforo-endpoint "https://api.aforo.ai/v1/ingest/batch"
 nv aforo-api-key "sk_live_..." secret
 nv aforo-default-metric "api_calls"
 nv aforo-metric-mappings "PREFIX|/sms/v1/send|sms_sent;EXACT|/otp/v1/verify|otp_verified"   # or none

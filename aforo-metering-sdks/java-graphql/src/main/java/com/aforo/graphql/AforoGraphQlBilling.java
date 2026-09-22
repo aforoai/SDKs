@@ -48,7 +48,7 @@ import java.util.logging.Logger;
  *       .tenantId("tenant_acme")
  *       .productId("prod_graphql_unified_gateway")
  *       .apiKey(System.getenv("AFORO_API_KEY"))
- *       .ingestorUrl("https://usage-ingestor.aforo.ai")
+ *       .ingestorUrl("https://api.aforo.ai")
  *       .schemaVersion("v2.1")
  *       .build();
  *

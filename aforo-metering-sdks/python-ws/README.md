@@ -38,7 +38,7 @@ billing = AforoWsBilling(
     tenant_id="tenant_acme",
     product_id="prod_ws_market_feed",
     api_key=os.environ["AFORO_API_KEY"],
-    ingestor_url="https://usage-ingestor.aforo.ai",
+    ingestor_url="https://api.aforo.ai",
 )
 
 async def handler(ws):
@@ -66,7 +66,7 @@ billing = AforoWsBilling(
     tenant_id="tenant_acme",
     product_id="prod_ws_market_feed",
     api_key=os.environ["AFORO_API_KEY"],
-    ingestor_url="https://usage-ingestor.aforo.ai",
+    ingestor_url="https://api.aforo.ai",
 )
 app = FastAPI()
 
@@ -82,7 +82,7 @@ async def ws_handler(ws: WebSocket):
             await ws.send_text(f"echo: {data}")
 ```
 
-Events POST to `https://usage-ingestor.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`. The tracker counts sent/received messages and bytes by wrapping the connection's `send`/`recv`, and emits a close event with `messageCount`, `dataBytes`, and `executionDurationMs` when the `async with` block exits.
+Events POST to `https://api.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`. The tracker counts sent/received messages and bytes by wrapping the connection's `send`/`recv`, and emits a close event with `messageCount`, `dataBytes`, and `executionDurationMs` when the `async with` block exits.
 
 > ⚠ Events are sent to the ingestor's **`/v1/ingest/batch`** path as `{"events": [...]}`, at most 1000 events per request (larger buffers are split). Set `ingestor_url` to the host only — the SDK appends the path.
 

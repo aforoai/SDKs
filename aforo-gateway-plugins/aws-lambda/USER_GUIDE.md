@@ -10,7 +10,7 @@ A Lambda subscribed to your API Gateway access-log group. Each batch of log entr
 
 - AWS API Gateway with **access logging enabled** on the stage, emitting **JSON** entries to a CloudWatch log group.
 - AWS SAM CLI authenticated to the target account/region.
-- An Aforo API key with scope `usage:ingest` (the tenant is derived from the key — there is no tenant id setting). Events go to `https://usage-ingestor.aforo.ai/v1/ingest/batch` (override `AforoEndpoint`).
+- An Aforo API key with scope `usage:ingest` (the tenant is derived from the key — there is no tenant id setting). Events go to `https://api.aforo.ai/v1/ingest/batch` (override `AforoEndpoint`).
 - Node.js 20 runtime is set in the template (`nodejs20.x`).
 - The **Aforo Lambda Authorizer** (`authorizer.js`, see [AUTHORIZER.md](AUTHORIZER.md)) on every route you want metered. It is the only source of `customerId`; routes without it are not metered.
 - The metric(s) you will bill against already registered in the Aforo catalog (at minimum the `DefaultMetric`, `api_calls` by default). An unknown metric name fails the whole batch with 400.
@@ -34,7 +34,7 @@ cd SDKs/aforo-gateway-plugins/aws-lambda
 sam build
 sam deploy --guided \
   --parameter-overrides \
-    AforoEndpoint=https://usage-ingestor.aforo.ai/v1/ingest/batch \
+    AforoEndpoint=https://api.aforo.ai/v1/ingest/batch \
     AforoApiKey="$AFORO_API_KEY" \
     DefaultMetric=api_calls \
     MetricMappings='[{"matchType":"PREFIX","value":"/v1/sms","metricName":"sms_sent"}]' \
@@ -101,7 +101,7 @@ Set `MCP_ENABLED=true` on the function (`mcp_server.tool_invocations` must exist
 ```bash
 aws lambda update-function-configuration \
   --function-name aforo-metering \
-  --environment "Variables={AFORO_ENDPOINT=https://usage-ingestor.aforo.ai/v1/ingest/batch,AFORO_API_KEY=$AFORO_API_KEY,DEFAULT_METRIC=api_calls,MCP_ENABLED=true}"
+  --environment "Variables={AFORO_ENDPOINT=https://api.aforo.ai/v1/ingest/batch,AFORO_API_KEY=$AFORO_API_KEY,DEFAULT_METRIC=api_calls,MCP_ENABLED=true}"
 ```
 
 > ⚠ MCP detection needs the request body in the access log (`requestBody`). API Gateway does not log bodies by default; you'll need a logging integration that captures it, or the MCP branch never triggers.

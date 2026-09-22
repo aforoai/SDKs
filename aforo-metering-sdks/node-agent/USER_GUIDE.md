@@ -147,7 +147,7 @@ Run your Step 2–5 script. The catcher prints a `POST /v1/ingest/batch` (with a
 ]}
 ```
 
-If you see that batch, the SDK is wired correctly. Then point `ingestorUrl` back at the default (`https://usage-ingestor.aforo.ai/v1/ingest/batch`) and confirm the step/session counts appear against `prod_agent_001` in your Aforo usage view. If the dashboard stays empty but the local catcher saw the batch, the problem is auth or tenant/product scope — see Troubleshooting.
+If you see that batch, the SDK is wired correctly. Then point `ingestorUrl` back at the default (`https://api.aforo.ai/v1/ingest/batch`) and confirm the step/session counts appear against `prod_agent_001` in your Aforo usage view. If the dashboard stays empty but the local catcher saw the batch, the problem is auth or tenant/product scope — see Troubleshooting.
 
 ## Configuration reference
 
@@ -157,7 +157,7 @@ If you see that batch, the SDK is wired correctly. Then point `ingestorUrl` back
 | `productId` | `string` | — (required) | The AI_AGENT product the events bill against. |
 | `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. |
 | `customerId` | `string` | — | Customer billed for the usage. Required here or per session (`startSession({ customerId })`). |
-| `ingestorUrl` | `string` | `https://usage-ingestor.aforo.ai/v1/ingest/batch` | Full batch-ingest URL; override per environment. A trailing `/v1/ingest` is rewritten to `/v1/ingest/batch`. |
+| `ingestorUrl` | `string` | `https://api.aforo.ai/v1/ingest/batch` | Full batch-ingest URL; override per environment. A trailing `/v1/ingest` is rewritten to `/v1/ingest/batch`. |
 | `flushBatchSize` | `number` | `50` | Buffer size before a forced flush. |
 | `flushIntervalMs` | `number` | `5000` | Max buffer dwell time before a timed flush. |
 | `fetchImpl` | `typeof fetch` | global `fetch` | Custom transport; required on Node < 18. |

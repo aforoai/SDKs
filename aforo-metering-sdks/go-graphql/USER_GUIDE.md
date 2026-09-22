@@ -12,7 +12,7 @@ A GraphQL server that emits one Aforo billing event per operation — type, name
 - An Aforo API key (`AFORO_API_KEY`), a `tenant_id`, and a `product_id`. All three are SDK config — never read from a client header.
 - A GraphQL HTTP handler that accepts POST with a JSON `{ "query": "...", "operationName": "..." }` body.
 - A way to identify the customer per request — by default the `X-Customer-Id` header your gateway/auth sets.
-- Ingestor base URL — `https://usage-ingestor.aforo.ai`.
+- Ingestor base URL — `https://api.aforo.ai`.
 
 ## Step 1 — Add the module from source
 
@@ -49,7 +49,7 @@ billing, err := graphqlmetering.New(graphqlmetering.Config{
 	TenantID:    "tenant_acme",
 	ProductID:   "prod_graphql_unified_gateway",
 	APIKey:      os.Getenv("AFORO_API_KEY"),
-	IngestorURL: "https://usage-ingestor.aforo.ai",
+	IngestorURL: "https://api.aforo.ai",
 })
 if err != nil {
 	log.Fatal(err) // returned when any required field is empty
@@ -87,7 +87,7 @@ billing, _ := graphqlmetering.New(graphqlmetering.Config{
 	TenantID:    "tenant_acme",
 	ProductID:   "prod_graphql_unified_gateway",
 	APIKey:      os.Getenv("AFORO_API_KEY"),
-	IngestorURL: "https://usage-ingestor.aforo.ai",
+	IngestorURL: "https://api.aforo.ai",
 	CustomerExtractor: func(r *http.Request) string {
 		return decodeJWTSubject(r.Header.Get("Authorization"))
 	},
@@ -120,7 +120,7 @@ The buffer flushes every `FlushInterval` (5s) or when it reaches `FlushCount` (5
 The wire call the SDK makes:
 
 ```
-POST https://usage-ingestor.aforo.ai/v1/ingest/batch
+POST https://api.aforo.ai/v1/ingest/batch
 X-API-Key: <AFORO_API_KEY>
 X-Tenant-Id: tenant_acme
 Content-Type: application/json

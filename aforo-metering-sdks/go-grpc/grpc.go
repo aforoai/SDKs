@@ -7,7 +7,7 @@
 //	    TenantID:    "tenant_acme",
 //	    ProductID:   "prod_grpc_user_svc",
 //	    APIKey:      os.Getenv("AFORO_API_KEY"),
-//	    IngestorURL: "https://usage-ingestor.aforo.ai",
+//	    IngestorURL: "https://api.aforo.ai",
 //	    ServiceName: "acme.v1.UserService",
 //	})
 //	defer billing.Shutdown(context.Background())

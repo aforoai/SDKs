@@ -46,7 +46,7 @@ const billing = new AforoMqttBilling({
   tenantId: 'tenant_acme',
   productId: 'prod_mqtt_001',
   apiKey: process.env.AFORO_API_KEY!,
-  ingestorUrl: 'https://usage-ingestor.aforo.ai', // SDK appends /v1/ingest/batch
+  ingestorUrl: 'https://api.aforo.ai', // SDK appends /v1/ingest/batch
 });
 
 const broker = aedes();
@@ -65,13 +65,13 @@ process.on('SIGTERM', async () => { await billing.shutdown(); });
 import mqtt from 'mqtt';
 import { AforoMqttBilling } from '@aforo/mqtt-metering';
 
-const billing = new AforoMqttBilling({ tenantId: 'tenant_acme', productId: 'prod_mqtt_001', apiKey: process.env.AFORO_API_KEY!, ingestorUrl: 'https://usage-ingestor.aforo.ai' });
+const billing = new AforoMqttBilling({ tenantId: 'tenant_acme', productId: 'prod_mqtt_001', apiKey: process.env.AFORO_API_KEY!, ingestorUrl: 'https://api.aforo.ai' });
 const client = mqtt.connect('mqtts://broker.example.com', { clientId: `device-${deviceId}` });
 
 billing.wrapMqttClient(client, { customerId: 'cust_acme_001' });
 ```
 
-Each event uses `metricName: "mqtt_broker.<event>"` (`mqtt_broker.publish`, `mqtt_broker.subscribe`, …) with `quantity: 1`, and carries `mqttTopic`, `mqttQos`, `mqttRetained`, `mqttClientId`, and `dataBytes`. Events ship to `POST https://usage-ingestor.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
+Each event uses `metricName: "mqtt_broker.<event>"` (`mqtt_broker.publish`, `mqtt_broker.subscribe`, …) with `quantity: 1`, and carries `mqttTopic`, `mqttQos`, `mqttRetained`, `mqttClientId`, and `dataBytes`. Events ship to `POST https://api.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
 
 > **`DELIVER` (fan-out) events are dropped unless `emitDeliverEvents: true`.** This gate applies in **both** modes — client-mode inbound `message` deliveries and any broker delivery path are skipped by default because fan-out is high-volume. `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, `CONNECT`, and `DISCONNECT` are always metered.
 
@@ -84,7 +84,7 @@ Each event uses `metricName: "mqtt_broker.<event>"` (`mqtt_broker.publish`, `mqt
 | `tenantId` | `string` | — (required) | Aforo tenant. Sent as `X-Tenant-Id`. Never read from a client header. |
 | `productId` | `string` | — (required) | Aforo product id; into each event's `metadata.productId`. |
 | `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. |
-| `ingestorUrl` | `string` | — (required) | Ingestion base URL. SDK appends `/v1/ingest/batch`. Use `https://usage-ingestor.aforo.ai`. |
+| `ingestorUrl` | `string` | — (required) | Ingestion base URL. SDK appends `/v1/ingest/batch`. Use `https://api.aforo.ai`. |
 | `emitDeliverEvents` | `boolean` | `false` | Emit a `DELIVER` event per fan-out delivery. Off → `DELIVER` events are dropped (both modes). |
 | `flushCount` | `number` | `200` | Buffered events that trigger an immediate flush. Highest default of the SDKs — MQTT is very high-volume. |
 | `flushIntervalMs` | `number` | `2000` | Max ms before a partial batch is flushed. |

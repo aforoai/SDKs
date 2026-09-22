@@ -31,13 +31,13 @@ billing = AforoMcpBilling(
     tenant_id="tenant_smartai",
     product_id="prod_mcp_001",
     api_key=os.environ["AFORO_API_KEY"],
-    ingestor_url="https://usage-ingestor.aforo.ai",
+    ingestor_url="https://api.aforo.ai",
 )
 ```
 
 All four arguments are required — the constructor raises `ValueError` if any is empty.
 
-> ⚠ `ingestor_url` is a **host**, not a full path. The client appends `/v1/ingest/batch`. Pass `https://usage-ingestor.aforo.ai`, not `https://usage-ingestor.aforo.ai/v1/ingest/batch`.
+> ⚠ `ingestor_url` is a **host**, not a full path. The client appends `/v1/ingest/batch`. Pass `https://api.aforo.ai`, not `https://api.aforo.ai/v1/ingest/batch`.
 
 ## Step 3 — Wrap your tool handler
 
@@ -121,7 +121,7 @@ Methods: `wrap_tool_handler(handler)`, `record_tool_invocation(tool_name, agent_
 | No events at all | `await start()` was never called and the buffer hasn't hit `flush_count`. | Call `await billing.start()` once, or `await billing.flush()` to force it. |
 | Every event has `agentId = "unknown"` | The handler didn't receive `agent_id` in `kwargs`. | Pass `agent_id` (and `session_id`) through from your MCP server to the tool handler. |
 | `on_error` fires with "Aforo returned 401/403" | Bad/unscoped API key — 4xx is dropped, not retried. | Fix `api_key`; confirm it belongs to `tenant_id`. |
-| Events sent, none in console | Wrong `ingestor_url` host, or `mcp_server.tool_invocations` isn't mapped to a rate plan. | Use `https://usage-ingestor.aforo.ai`; map the metric in the Aforo console. |
+| Events sent, none in console | Wrong `ingestor_url` host, or `mcp_server.tool_invocations` isn't mapped to a rate plan. | Use `https://api.aforo.ai`; map the metric in the Aforo console. |
 | Session keeps billing after you expected it killed | Kill only clears the SDK's session; it does not abort the in-flight tool call. | Handle the stop in `on_session_killed` and close the session yourself. |
 | Events lost on restart | Buffered events weren't flushed before exit. | `await billing.shutdown()` in your shutdown path. |
 

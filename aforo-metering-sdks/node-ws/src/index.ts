@@ -18,7 +18,7 @@
  *     tenantId: 'tenant_acme',
  *     productId: 'prod_ws_market_feed',
  *     apiKey: process.env.AFORO_API_KEY!,
- *     ingestorUrl: 'https://usage-ingestor.aforo.ai',
+ *     ingestorUrl: 'https://api.aforo.ai',
  *   });
  *
  *   const wss = new WebSocketServer({ port: 8080 });

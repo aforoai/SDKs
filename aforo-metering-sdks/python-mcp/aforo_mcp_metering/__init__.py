@@ -11,7 +11,7 @@ Usage:
         tenant_id="tenant_smartai",
         product_id="prod_mcp_001",
         api_key=os.environ["AFORO_API_KEY"],
-        ingestor_url="https://usage-ingestor.aforo.ai",
+        ingestor_url="https://api.aforo.ai",
     )
 
     @server.call_tool()

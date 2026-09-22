@@ -81,7 +81,7 @@ def billing_config():
         tenant_id="tenant-001",
         product_id="prod-001",
         api_key="sk_test_abc",
-        ingestor_url="https://usage-ingestor.aforo.ai/",  # trailing slash stripped
+        ingestor_url="https://api.aforo.ai/",  # trailing slash stripped
         service_name="acme.v1.UserService",
     )
 
@@ -142,7 +142,7 @@ def test_record_emits_event_with_correct_shape(http_collector, billing_config):
     _wait_until(lambda: len(http_collector.requests) == 1)
 
     req = http_collector.requests[0]
-    assert req["url"] == "https://usage-ingestor.aforo.ai/v1/ingest/batch"  # trailing slash stripped
+    assert req["url"] == "https://api.aforo.ai/v1/ingest/batch"  # trailing slash stripped
     assert req["method"] == "POST"
     assert req["headers"]["Content-type"] == "application/json"
     assert req["headers"]["X-api-key"] == "sk_test_abc"

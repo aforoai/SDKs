@@ -6,7 +6,7 @@ All notable changes to `aforo-ws-metering` are documented here. This project fol
 
 ### Fixed
 - **Breaking (fix):** the tenant API key is sent as `X-API-Key` instead of `Authorization: Bearer`. The ingestor parses Bearer values as JWTs and rejected every request 401 (sending both headers is also 401), so no usage was being delivered.
-- Docs and examples use the real ingestor host `https://usage-ingestor.aforo.ai` (`ingest.aforo.ai` / `ingestor.aforo.ai` serve a static site, not the ingestor).
+- Docs and examples use `https://api.aforo.ai`, Aforo's public API gateway in front of the ingestor (`ingest.aforo.ai` / `ingestor.aforo.ai` serve a static site, not the ingestor).
 - **Breaking (fix):** batches are POSTed to `/v1/ingest/batch` instead of `/v1/ingest/events`. `/v1/ingest/events` is the Apigee-format single-event endpoint and does not accept `{"events": [...]}`, so no usage was being recorded. Each flush is split into requests of at most 1000 events (the ingestor's batch limit).
 - **Breaking (fix):** connection/frame duration is sent as `executionDurationMs`; the old `durationMs` field does not exist on the ingestor and was silently dropped. `push()` still accepts `durationMs` in its input for compatibility.
 - `wsDirection` / `wsFrameType` are normalised to the ingestor's allowed values, `wsCloseReason` is capped at 32 characters, and events with a blank or over-64-character `customerId` (or no `wsConnectionId`) are dropped client-side instead of being rejected by the ingestor.

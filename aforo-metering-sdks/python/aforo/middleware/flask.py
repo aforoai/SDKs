@@ -55,7 +55,7 @@ class AforoMetering:
 
     def init_app(self, app: Any) -> None:
         api_key = self._kwargs.get("api_key", app.config.get("AFORO_API_KEY", ""))
-        base_url = self._kwargs.get("base_url", app.config.get("AFORO_BASE_URL", "https://usage-ingestor.aforo.ai"))
+        base_url = self._kwargs.get("base_url", app.config.get("AFORO_BASE_URL", "https://api.aforo.ai"))
         if self._metric_name is None:
             self._metric_name = app.config.get("AFORO_METRIC_NAME", DEFAULT_METRIC_NAME)
         if self._customer_id is None:

@@ -16,7 +16,7 @@
  *     tenantId: 'tenant_acme',
  *     productId: 'prod_graphql_001',
  *     apiKey: process.env.AFORO_API_KEY!,
- *     ingestorUrl: 'https://usage-ingestor.aforo.ai',
+ *     ingestorUrl: 'https://api.aforo.ai',
  *     schemaVersion: 'v2.1',
  *   });
  *

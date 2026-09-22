@@ -43,7 +43,7 @@ The four `aforo.*` credentials are required for every transport. Supply them as 
 export AFORO_API_KEY="sk_live_xxx"
 export AFORO_TENANT_ID="tenant_smartai"
 export AFORO_PRODUCT_ID="prod_mcp_fs"
-export AFORO_INGESTOR_URL="https://usage-ingestor.aforo.ai"
+export AFORO_INGESTOR_URL="https://api.aforo.ai"
 ```
 
 > ⚠ `--ingestor-url` (or `AFORO_INGESTOR_URL`) is the **base** URL. The proxy appends `/v1/ingest/batch` for events and `/api/v1/quota/check` for quota — don't include those paths yourself.
@@ -85,7 +85,7 @@ Point the host's `mcpServers` entry at the proxy with a config file:
     "tenantId": "tenant_smartai",
     "productId": "prod_mcp_fs",
     "apiKey": "sk_live_xxx",
-    "ingestorUrl": "https://usage-ingestor.aforo.ai",
+    "ingestorUrl": "https://api.aforo.ai",
     "agentId": "agent_claude_desktop",
     "quotaEnforcement": false
   }
@@ -140,7 +140,7 @@ Make a tool call. The catcher prints `POST /v1/ingest/batch` with a body like:
 ]}
 ```
 
-If you see that hit `/v1/ingest/batch`, the proxy is metering. Point `--ingestor-url` back at `https://usage-ingestor.aforo.ai` and confirm `mcp_server.tool_invocations` shows up against `prod_mcp_fs` in your Aforo usage view.
+If you see that hit `/v1/ingest/batch`, the proxy is metering. Point `--ingestor-url` back at `https://api.aforo.ai` and confirm `mcp_server.tool_invocations` shows up against `prod_mcp_fs` in your Aforo usage view.
 
 ## Step 6 — (Optional) turn on quota enforcement
 

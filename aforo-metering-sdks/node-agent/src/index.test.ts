@@ -224,7 +224,7 @@ describe('AforoAgent — ingest batch contract', () => {
     await session.end({ taskCompleted: true });
 
     expect(calls).toHaveLength(1);
-    expect(calls[0].url).toBe('https://usage-ingestor.aforo.ai/v1/ingest/batch');
+    expect(calls[0].url).toBe('https://api.aforo.ai/v1/ingest/batch');
     expect(calls[0].headers['X-API-Key']).toBe('sk_test_abcdef');
     expect(Object.keys(calls[0].body as object)).toEqual(['events']);
     const events = (calls[0].body as any).events;

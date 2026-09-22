@@ -33,7 +33,7 @@ const billing = new AforoMcpBilling({
   tenantId: 'tenant_smartai',
   productId: 'prod_mcp_001',
   apiKey: process.env.AFORO_API_KEY!,
-  ingestorUrl: 'https://usage-ingestor.aforo.ai',
+  ingestorUrl: 'https://api.aforo.ai',
 });
 
 server.setRequestHandler(
@@ -50,7 +50,7 @@ process.on('SIGTERM', () => billing.shutdown());
 
 The wrapper reads `agent_id` and `session_id` from `request.params._meta`. If a `session_id` is present, the first wrapped call records it as the active session. Session heartbeats are no longer sent: they were `system.session.heartbeat` events with `quantity: 0` sent in the usage batch, and the ingestor rejects quantity 0 and fails the whole batch with 400, taking every real event batched with it down. The ingestor has no dedicated heartbeat endpoint.
 
-> ⚠ `ingestorUrl` is the **base** URL — the SDK appends `/v1/ingest/batch` itself. Pass `https://usage-ingestor.aforo.ai`, not `https://usage-ingestor.aforo.ai/v1/ingest/batch`. A trailing slash is stripped for you.
+> ⚠ `ingestorUrl` is the **base** URL — the SDK appends `/v1/ingest/batch` itself. Pass `https://api.aforo.ai`, not `https://api.aforo.ai/v1/ingest/batch`. A trailing slash is stripped for you.
 
 ## Configuration
 

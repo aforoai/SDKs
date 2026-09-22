@@ -37,7 +37,7 @@ billing = AforoGrpcBilling(
     tenant_id="tenant_acme",
     product_id="prod_grpc_user_svc",
     api_key=os.environ["AFORO_API_KEY"],
-    ingestor_url="https://usage-ingestor.aforo.ai",
+    ingestor_url="https://api.aforo.ai",
     service_name="acme.v1.UserService",
 )
 
@@ -51,7 +51,7 @@ server.start()
 server.wait_for_termination()
 ```
 
-Every unary RPC is now metered — one `grpc_api.rpc_calls` event with `grpcStatusCode`, `grpcCallType=UNARY`, and `executionDurationMs`, POSTed to `https://usage-ingestor.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
+Every unary RPC is now metered — one `grpc_api.rpc_calls` event with `grpcStatusCode`, `grpcCallType=UNARY`, and `executionDurationMs`, POSTed to `https://api.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
 
 > ⚠ Events are sent to the ingestor's **`/v1/ingest/batch`** path as `{"events": [...]}`, at most 1000 events per request (larger buffers are split). Set `ingestor_url` to the host only — the SDK appends the path.
 

@@ -30,14 +30,14 @@ billing = AforoGrpcBilling(
     tenant_id="tenant_acme",
     product_id="prod_grpc_user_svc",
     api_key=os.environ["AFORO_API_KEY"],
-    ingestor_url="https://usage-ingestor.aforo.ai",
+    ingestor_url="https://api.aforo.ai",
     service_name="acme.v1.UserService",
 )
 ```
 
 All five arguments are required — the constructor raises `ValueError` if any (including `service_name`) is missing.
 
-> ⚠ `ingestor_url` is the **host**; this package appends `/v1/ingest/batch`. Pass `https://usage-ingestor.aforo.ai`.
+> ⚠ `ingestor_url` is the **host**; this package appends `/v1/ingest/batch`. Pass `https://api.aforo.ai`.
 
 ## Step 3 — Add the interceptor
 
@@ -137,7 +137,7 @@ billing.shutdown()   # flushes the final batch before process exit
 | Unary calls metered, streaming calls aren't | The interceptor auto-wraps unary only. | Call `billing.record(...)` in the streaming handler's `finally`. |
 | Some calls never metered | No `x-customer-id` in metadata, so the extractor returned nothing. | Send the metadata client-side or supply a `customer_id_extractor`. |
 | `on_error` fires with "Aforo returned 401/403" | Bad/unscoped API key — 4xx is dropped, not retried. | Fix `api_key`; confirm it matches `tenant_id`. |
-| Events sent, none in console | Wrong `ingestor_url` host, or `grpc_api.rpc_calls` isn't mapped to a rate plan. | Use `https://usage-ingestor.aforo.ai`; map the metric in Aforo. |
+| Events sent, none in console | Wrong `ingestor_url` host, or `grpc_api.rpc_calls` isn't mapped to a rate plan. | Use `https://api.aforo.ai`; map the metric in Aforo. |
 | `grpcStatusCode` shows `UNKNOWN` for errors | The numeric code wasn't in `GRPC_STATUS_LABELS` (defaults to `UNKNOWN`, code 2). | Expected for unusual codes; pass an explicit `status` label via `record()` if you need precision. |
 | Final batch lost on shutdown | `shutdown()` not called before exit. | Call `billing.shutdown()` in your server-stop path. |
 

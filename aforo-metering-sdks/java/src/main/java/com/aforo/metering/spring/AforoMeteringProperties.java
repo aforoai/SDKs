@@ -6,7 +6,7 @@ package com.aforo.metering.spring;
 public class AforoMeteringProperties {
 
     private String apiKey;
-    private String baseUrl = "https://usage-ingestor.aforo.ai";
+    private String baseUrl = "https://api.aforo.ai";
     private int flushCount = 50;
     private long flushIntervalMs = 5_000;
 

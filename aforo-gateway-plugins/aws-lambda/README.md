@@ -29,7 +29,7 @@ cd SDKs/aforo-gateway-plugins/aws-lambda
 sam build
 sam deploy --guided \
   --parameter-overrides \
-    AforoEndpoint=https://usage-ingestor.aforo.ai/v1/ingest/batch \
+    AforoEndpoint=https://api.aforo.ai/v1/ingest/batch \
     AforoApiKey="$AFORO_API_KEY" \
     DefaultMetric=api_calls \
     ApiGatewayLogGroupName=/aws/apigateway/aforo-access-logs
@@ -60,7 +60,7 @@ The values every deployment needs map to SAM parameters / Lambda env vars — `A
 ```bash
 sam deploy \
   --parameter-overrides \
-    AforoEndpoint=https://usage-ingestor.aforo.ai/v1/ingest/batch \
+    AforoEndpoint=https://api.aforo.ai/v1/ingest/batch \
     AforoApiKey="$AFORO_API_KEY" \
     DefaultMetric=api_calls \
     MetricMappings='[{"matchType":"PREFIX","value":"/v1/sms","metricName":"sms_sent"}]' \
@@ -75,7 +75,7 @@ The function reads everything from environment variables (set by the SAM templat
 
 | Env var | SAM parameter | Default | What it does |
 |---------|---------------|---------|--------------|
-| `AFORO_ENDPOINT` | `AforoEndpoint` | `https://usage-ingestor.aforo.ai/v1/ingest/batch` | Aforo ingestor batch URL. |
+| `AFORO_ENDPOINT` | `AforoEndpoint` | `https://api.aforo.ai/v1/ingest/batch` | Aforo ingestor batch URL. |
 | `AFORO_API_KEY` | `AforoApiKey` | — | Aforo API key, scope `usage:ingest`. Sent as `X-API-Key` (alone — an `Authorization: Bearer` header makes the ingestor answer 401). The tenant is derived from the key. |
 | `METRIC_MAPPINGS` | `MetricMappings` | `[]` | JSON array of `{matchType, value, metricName}` rules, first match wins. `matchType` is `EXACT`, `PREFIX` or `CONTAINS` (plain string comparison — same semantics as catalog's `/internal/v1/metrics/gateway-mappings`, which Kong fetches; this Lambda takes the table as config). Invalid JSON is logged and ignored. |
 | `DEFAULT_METRIC` | `DefaultMetric` | `api_calls` | Metric for requests no mapping matches. **Must be registered in the Aforo catalog** — an unknown metric fails the whole batch with 400. |

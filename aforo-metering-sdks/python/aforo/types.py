@@ -13,7 +13,7 @@ class AforoOptions:
     api_key: str
     """Aforo API key for authentication."""
 
-    base_url: str = "https://usage-ingestor.aforo.ai"
+    base_url: str = "https://api.aforo.ai"
     """Base URL for the Aforo ingestor service."""
 
     flush_count: int = 50
@@ -98,7 +98,7 @@ class MiddlewareOptions:
     """Options for framework middleware."""
 
     api_key: str
-    base_url: str = "https://usage-ingestor.aforo.ai"
+    base_url: str = "https://api.aforo.ai"
     metric_name: Optional[Callable | str] = None
     """Fixed metric or callable. Default ``"api_calls"``; must exist in your Aforo catalog."""
     quantity: Optional[Callable | float] = None

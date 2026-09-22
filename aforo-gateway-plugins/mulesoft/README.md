@@ -84,7 +84,7 @@ Set these as policy properties in Anypoint API Manager for the metering policy (
 
 | Property | Used by | Default | What it does |
 |---|---|---|---|
-| `aforo-endpoint` | metering | — (required) | Aforo ingestor batch URL, e.g. `https://usage-ingestor.aforo.ai/v1/ingest/batch`. |
+| `aforo-endpoint` | metering | — (required) | Aforo ingestor batch URL, e.g. `https://api.aforo.ai/v1/ingest/batch`. |
 | `aforo-api-key` | metering | — (required, sensitive) | Aforo API key. Must be sent as `X-API-Key` (the descriptors still send it as Bearer — not fixed). |
 | `aforo-tenant-id` | metering, margin-guard | — (required) | Admin-pinned tenant; used as the tenant fallback when the JWT carries no `tenant_id`. |
 | `mcp-enabled` | metering | `false` | Enable JSON-RPC `tools/call` detection. |

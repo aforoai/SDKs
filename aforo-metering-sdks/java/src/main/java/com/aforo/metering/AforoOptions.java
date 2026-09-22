@@ -6,7 +6,7 @@ package com.aforo.metering;
 public class AforoOptions {
 
     private final String apiKey;
-    private String baseUrl = "https://usage-ingestor.aforo.ai";
+    private String baseUrl = "https://api.aforo.ai";
     private int flushCount = 50;
     private long flushIntervalMs = 5_000;
     private int maxQueueSize = 10_000;

@@ -10,7 +10,7 @@ describe('Transport', () => {
   beforeEach(() => {
     mockFetch.mockReset();
     transport = new Transport({
-      baseUrl: 'https://usage-ingestor.aforo.ai',
+      baseUrl: 'https://api.aforo.ai',
       apiKey: 'test-key',
       timeout: 5000,
       maxRetries: 2,
@@ -42,7 +42,7 @@ describe('Transport', () => {
     expect(mockFetch).toHaveBeenCalledTimes(1);
 
     const [url, options] = mockFetch.mock.calls[0];
-    expect(url).toBe('https://usage-ingestor.aforo.ai/v1/ingest/batch');
+    expect(url).toBe('https://api.aforo.ai/v1/ingest/batch');
     expect(options.method).toBe('POST');
     expect(options.headers['X-API-Key']).toBe('test-key');
     // The ingestor parses Authorization: Bearer as a JWT and rejects an API key

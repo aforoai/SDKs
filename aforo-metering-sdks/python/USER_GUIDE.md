@@ -34,7 +34,7 @@ The API key is the only required value. Keep it out of source:
 export AFORO_API_KEY="sk_live_…"
 ```
 
-`base_url` defaults to `https://usage-ingestor.aforo.ai`. Only override it to point at a non-production ingestor.
+`base_url` defaults to `https://api.aforo.ai`. Only override it to point at a non-production ingestor.
 
 ## Step 3 — Create a client and emit one event
 
@@ -130,7 +130,7 @@ AFORO_API_KEY = os.environ["AFORO_API_KEY"]
 | Option | Type | Default | What it does |
 |---|---|---|---|
 | `api_key` | `str` | required | Aforo API key, sent to the ingestor as `X-API-Key`. |
-| `base_url` | `str` | `https://usage-ingestor.aforo.ai` | Host only; `/v1/ingest/batch` is appended. |
+| `base_url` | `str` | `https://api.aforo.ai` | Host only; `/v1/ingest/batch` is appended. |
 | `flush_count` | `int` | `50` | Buffer threshold + max batch size. |
 | `flush_interval` | `float` | `5.0` | Background flush cadence (seconds). |
 | `max_queue_size` | `int` | `10000` | Ring-buffer cap; oldest dropped on overflow. |

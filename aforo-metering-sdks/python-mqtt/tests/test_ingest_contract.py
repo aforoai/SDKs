@@ -59,7 +59,7 @@ def _make():
         tenant_id="tenant-001",
         product_id="prod-001",
         api_key="sk_contract",
-        ingestor_url="https://usage-ingestor.aforo.ai/",
+        ingestor_url="https://api.aforo.ai/",
         flush_count=10_000,
         flush_interval_sec=3600,
     )
@@ -85,7 +85,7 @@ def test_posts_batch_to_v1_ingest_batch_with_dto_shape(monkeypatch):
 
     assert len(h.requests) == 1
     req = h.requests[0]
-    assert req["url"] == "https://usage-ingestor.aforo.ai/v1/ingest/batch"
+    assert req["url"] == "https://api.aforo.ai/v1/ingest/batch"
     assert req["headers"]["x-api-key"] == "sk_contract"
     assert "authorization" not in req["headers"]
     assert set(req["body"].keys()) == {"events"}

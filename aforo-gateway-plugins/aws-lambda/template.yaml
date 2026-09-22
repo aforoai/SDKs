@@ -9,7 +9,7 @@ Parameters:
   AforoEndpoint:
     Type: String
     Description: Aforo usage ingestor batch endpoint URL
-    Default: https://usage-ingestor.aforo.ai/v1/ingest/batch
+    Default: https://api.aforo.ai/v1/ingest/batch
   AforoApiKey:
     Type: String
     Description: >-

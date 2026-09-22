@@ -53,7 +53,7 @@ func main() {
 		TenantID:    "tenant_acme",
 		ProductID:   "prod_graphql_unified_gateway",
 		APIKey:      os.Getenv("AFORO_API_KEY"),
-		IngestorURL: "https://usage-ingestor.aforo.ai",
+		IngestorURL: "https://api.aforo.ai",
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -85,7 +85,7 @@ billing.Record(customerID, query, operationName, durationMs, hasErrors)
 | `TenantID` | `string` | — (required) | Sent as the `X-Tenant-Id` header on every flush and embedded in idempotency keys. Set by you, never from a client header. |
 | `ProductID` | `string` | — (required) | Recorded in event metadata + idempotency keys. |
 | `APIKey` | `string` | — (required) | Sent as `X-API-Key: <APIKey>`. |
-| `IngestorURL` | `string` | — (required) | Ingestor base; the SDK appends `/v1/ingest/batch`. Use `https://usage-ingestor.aforo.ai`. |
+| `IngestorURL` | `string` | — (required) | Ingestor base; the SDK appends `/v1/ingest/batch`. Use `https://api.aforo.ai`. |
 | `SchemaVersion` | `string` | none | If set, attached to event metadata as `schemaVersion`. |
 | `FlushCount` | `int` | `50` | Flush when the buffer reaches this many events. |
 | `FlushInterval` | `time.Duration` | `5s` | Background flush cadence. |

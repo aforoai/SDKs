@@ -72,7 +72,7 @@ export interface AforoAgentConfig {
   customerId?: string;
   /**
    * Aforo usage-ingestor batch URL. Defaults to
-   * {@code https://usage-ingestor.aforo.ai/v1/ingest/batch} — override for
+   * {@code https://api.aforo.ai/v1/ingest/batch} — override for
    * local dev or air-gapped deployments. A URL ending in {@code /v1/ingest}
    * (the old default) is rewritten to {@code /v1/ingest/batch}.
    */
@@ -163,7 +163,7 @@ interface IngestEvent {
   metadata: Record<string, unknown>;
 }
 
-const DEFAULT_INGESTOR = 'https://usage-ingestor.aforo.ai/v1/ingest/batch';
+const DEFAULT_INGESTOR = 'https://api.aforo.ai/v1/ingest/batch';
 /** The ingestor rejects batches over 1000 events. */
 const MAX_BATCH_EVENTS = 1000;
 /** executionStatus values the ingestor accepts; others ride in metadata.agentExecutionStatus. */

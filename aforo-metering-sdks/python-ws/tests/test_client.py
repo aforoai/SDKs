@@ -50,7 +50,7 @@ def cfg():
         tenant_id="tenant-001",
         product_id="prod-ws-001",
         api_key="sk_ws_abc",
-        ingestor_url="https://usage-ingestor.aforo.ai",
+        ingestor_url="https://api.aforo.ai",
     )
 
 

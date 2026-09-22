@@ -30,7 +30,7 @@ aforo-mcp-proxy --transport stdio \
   --command "npx" --args "-y,@modelcontextprotocol/server-filesystem,/tmp" \
   --tenant tenant_smartai --product prod_mcp_fs \
   --api-key "$AFORO_API_KEY" \
-  --ingestor-url https://usage-ingestor.aforo.ai
+  --ingestor-url https://api.aforo.ai
 ```
 
 **SSE** — front a network MCP server. The proxy listens on `--port` and forwards to `--upstream`:
@@ -40,7 +40,7 @@ aforo-mcp-proxy --transport sse \
   --upstream http://localhost:8080/sse --port 3100 --host 127.0.0.1 \
   --tenant tenant_smartai --product prod_mcp_fs \
   --api-key "$AFORO_API_KEY" \
-  --ingestor-url https://usage-ingestor.aforo.ai
+  --ingestor-url https://api.aforo.ai
 ```
 
 **Streamable HTTP** — same shape as SSE, `--transport streamable-http`.
@@ -69,7 +69,7 @@ Put the proxy in front of the server in the host's `mcpServers` block, with the 
     "tenantId": "tenant_smartai",
     "productId": "prod_mcp_fs",
     "apiKey": "sk_live_xxx",
-    "ingestorUrl": "https://usage-ingestor.aforo.ai",
+    "ingestorUrl": "https://api.aforo.ai",
     "agentId": "agent_claude_desktop",
     "quotaEnforcement": false,
     "debug": false
@@ -102,7 +102,7 @@ The proxy resolves each value with this precedence: **environment variable > CLI
 | — | `aforo.flushCount` | `AFORO_FLUSH_COUNT` | `50` | Force a flush at this buffer size. |
 | — | `aforo.heartbeatIntervalMs` | `AFORO_HEARTBEAT_INTERVAL_MS` | `30000` | Deprecated and ignored: session heartbeats are no longer sent (quantity-0 heartbeat events failed the ingestor's validation and took the whole usage batch down). |
 
-> ⚠ The four `aforo.*` credentials (`tenantId`, `productId`, `apiKey`, `ingestorUrl`) are required and validated at startup — a missing one exits with a non-zero code and an error, it doesn't run unmetered. Pass `--ingestor-url` as the **base** URL (`https://usage-ingestor.aforo.ai`); the proxy appends `/v1/ingest/batch` for events and calls `/api/v1/quota/check` for quota.
+> ⚠ The four `aforo.*` credentials (`tenantId`, `productId`, `apiKey`, `ingestorUrl`) are required and validated at startup — a missing one exits with a non-zero code and an error, it doesn't run unmetered. Pass `--ingestor-url` as the **base** URL (`https://api.aforo.ai`); the proxy appends `/v1/ingest/batch` for events and calls `/api/v1/quota/check` for quota.
 
 ## Walk me through it
 

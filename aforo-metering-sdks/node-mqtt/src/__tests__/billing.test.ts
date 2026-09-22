@@ -27,7 +27,7 @@ const config = () => ({
   tenantId: 'tenant-001',
   productId: 'prod-mqtt-001',
   apiKey: 'sk_mqtt_abc',
-  ingestorUrl: 'https://usage-ingestor.aforo.ai',
+  ingestorUrl: 'https://api.aforo.ai',
 });
 
 const drainedEvents = () => capturedRequests.flatMap(r => r.body?.events ?? []);
@@ -261,7 +261,7 @@ function assertBatchContract(reqs: any[], apiKey: string, allowed: string[]) {
   const allowedSet = new Set(allowed);
   expect(reqs.length).toBeGreaterThan(0);
   for (const r of reqs) {
-    expect(r.url).toBe('https://usage-ingestor.aforo.ai/v1/ingest/batch');
+    expect(r.url).toBe('https://api.aforo.ai/v1/ingest/batch');
     expect((r.init.headers as Record<string, string>)['X-API-Key']).toBe(apiKey);
     expect(Object.keys(r.body)).toEqual(['events']);
     expect(r.body.events.length).toBeGreaterThan(0);

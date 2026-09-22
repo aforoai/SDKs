@@ -44,13 +44,13 @@ const billing = new AforoMcpBilling({
   tenantId: 'tenant_smartai',
   productId: 'prod_mcp_001',
   apiKey: process.env.AFORO_API_KEY!,
-  ingestorUrl: 'https://usage-ingestor.aforo.ai',
+  ingestorUrl: 'https://api.aforo.ai',
 });
 ```
 
 The constructor validates `tenantId`, `productId`, `apiKey`, and `ingestorUrl` and throws if any is missing — and it starts the periodic flush timer immediately.
 
-> ⚠ `ingestorUrl` is the **base** URL. The SDK appends `/v1/ingest/batch`. Pass `https://usage-ingestor.aforo.ai` — not the full batch path. A trailing slash is trimmed for you, so either form of the base works.
+> ⚠ `ingestorUrl` is the **base** URL. The SDK appends `/v1/ingest/batch`. Pass `https://api.aforo.ai` — not the full batch path. A trailing slash is trimmed for you, so either form of the base works.
 
 ## Step 3 — Wrap your tool handler
 
@@ -92,7 +92,7 @@ const billing = new AforoMcpBilling({
   tenantId: 'tenant_smartai',
   productId: 'prod_mcp_001',
   apiKey: process.env.AFORO_API_KEY!,
-  ingestorUrl: 'https://usage-ingestor.aforo.ai',
+  ingestorUrl: 'https://api.aforo.ai',
   onSessionKilled: (sessionId, reason) => {
     console.warn(`Aforo killed session ${sessionId}: ${reason}`);
     // tear down the agent connection on your side
@@ -138,7 +138,7 @@ Invoke a wrapped tool. The catcher prints `POST /v1/ingest/batch` with a body li
 ]}
 ```
 
-If you see that batch hit `/v1/ingest/batch`, the wrapper is wired correctly. Point `ingestorUrl` back at `https://usage-ingestor.aforo.ai` and confirm `mcp_server.tool_invocations` shows up against `prod_mcp_001` in your Aforo usage view. Empty dashboard but the catcher saw the batch → it's auth or tenant/product scope (Troubleshooting).
+If you see that batch hit `/v1/ingest/batch`, the wrapper is wired correctly. Point `ingestorUrl` back at `https://api.aforo.ai` and confirm `mcp_server.tool_invocations` shows up against `prod_mcp_001` in your Aforo usage view. Empty dashboard but the catcher saw the batch → it's auth or tenant/product scope (Troubleshooting).
 
 ## Configuration reference
 

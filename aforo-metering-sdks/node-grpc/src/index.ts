@@ -12,7 +12,7 @@
  *     tenantId: 'tenant_acme',
  *     productId: 'prod_grpc_001',
  *     apiKey: process.env.AFORO_API_KEY!,
- *     ingestorUrl: 'https://usage-ingestor.aforo.ai',
+ *     ingestorUrl: 'https://api.aforo.ai',
  *     serviceName: 'acme.v1.UserService',
  *   });
  *

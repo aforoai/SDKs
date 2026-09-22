@@ -48,7 +48,7 @@ AforoGrpcBilling billing = AforoGrpcBilling.newBuilder()
         .tenantId("tenant_acme")
         .productId("prod_grpc_user_svc")
         .apiKey(System.getenv("AFORO_API_KEY"))
-        .ingestorUrl("https://usage-ingestor.aforo.ai")
+        .ingestorUrl("https://api.aforo.ai")
         .serviceName("acme.v1.UserService")
         .build();
 
@@ -59,7 +59,7 @@ Server server = ServerBuilder.forPort(50051)
         .start();
 ```
 
-> ⚠ `ingestorUrl` is the host only — the SDK appends `/v1/ingest/batch`. Pass `https://usage-ingestor.aforo.ai`, not the full path.
+> ⚠ `ingestorUrl` is the host only — the SDK appends `/v1/ingest/batch`. Pass `https://api.aforo.ai`, not the full path.
 
 ## Step 4 — Make the customer id reachable from metadata
 

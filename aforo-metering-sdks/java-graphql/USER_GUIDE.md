@@ -47,7 +47,7 @@ AforoGraphQlBilling billing = AforoGraphQlBilling.newBuilder()
         .tenantId("tenant_acme")
         .productId("prod_graphql_unified_gateway")
         .apiKey(System.getenv("AFORO_API_KEY"))
-        .ingestorUrl("https://usage-ingestor.aforo.ai")
+        .ingestorUrl("https://api.aforo.ai")
         .schemaVersion("v2.1")           // optional
         .build();
 
@@ -56,7 +56,7 @@ GraphQL gql = GraphQL.newGraphQL(schema)
         .build();
 ```
 
-> ⚠ `ingestorUrl` is the host only — the SDK appends `/v1/ingest/batch` itself. Pass `https://usage-ingestor.aforo.ai`, not `https://usage-ingestor.aforo.ai/v1/ingest/batch`.
+> ⚠ `ingestorUrl` is the host only — the SDK appends `/v1/ingest/batch` itself. Pass `https://api.aforo.ai`, not `https://api.aforo.ai/v1/ingest/batch`.
 
 ## Step 4 — Put the customer id on the execution context
 
@@ -121,7 +121,7 @@ Runtime.getRuntime().addShutdownHook(new Thread(billing::close));
 |---|---|---|
 | `IllegalArgumentException: <field> is required` at build | A required builder field (`tenantId` / `productId` / `apiKey` / `ingestorUrl`) is blank | Set all four; they're validated in the constructor. |
 | No events appear, no errors logged | Customer id not on the execution context, so every op is skipped | Put `x-customer-id` on the `graphQLContext` map, or supply a `customerIdExtractor`. |
-| Events POST to a 404 | `ingestorUrl` already includes the path | Pass the host only (`https://usage-ingestor.aforo.ai`); the SDK appends `/v1/ingest/batch`. |
+| Events POST to a 404 | `ingestorUrl` already includes the path | Pass the host only (`https://api.aforo.ai`); the SDK appends `/v1/ingest/batch`. |
 | `flush exhausted retries — dropped N events` in logs | Ingestor returned non-2xx on all 3 attempts (bad key, unknown metric, network) | Verify the key + `X-Tenant-Id`; ensure the `graphql_api.operations` metric exists in Aforo. |
 | `gqlComplexity` looks too low | Query is anonymous / aliased in a way the parser counts differently | Complexity is `field_count + 5 × max_depth` over the parsed AST; name your operations and inspect `gqlFieldCount` to sanity-check. |
 | Subscriptions not metered | A persistent subscription completes only when it closes; the instrumentation records on completion | For long-lived subscriptions, call `billing.record(...)` at your own checkpoints. |
