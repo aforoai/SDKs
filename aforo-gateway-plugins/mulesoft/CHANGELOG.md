@@ -4,6 +4,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [Unreleased]
 
+### Added
+- `product-type` property (default `API`, trimmed + upper-cased) in `mule-policy.yaml` / `mcp-mule-policy.yaml`, and `${product_type}` in `template.xml`: every event carries the `productType` the ingestor requires in production. A `tools/call` is `MCP_SERVER` only when both `toolName` and `agentId` are present (an MCP_SERVER event without `agentId` is rejected); otherwise the configured type.
+
+### Fixed (occurredAt)
+- `occurredAt` is shifted to UTC before formatting with a literal `Z` (`template.xml` and both descriptors; the descriptors mislabelled local time as `Z`).
+
 ### Status
 - Marked **NOT PRODUCTION-READY** in the README and user guide: the YAML files are not a deployable Anypoint policy format and `template.xml` uses elements that do not exist in Mule 4 policies. A rebuild as a Mule 4 custom policy (mule-policy Maven project) or Flex Gateway PDK policy is required; the README lists what it needs. No full rewrite was attempted.
 
@@ -16,7 +22,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 - `metricName` is `default_metric` (default `api_calls`) instead of `{method} {path}`; `occurredAt` uses a real offset instead of a literal `'Z'` on local time; only 2xx counts as success (4xx was treated as success and silently swallowed).
 
 ### Not fixed
-- The YAML descriptors still send `Authorization: Bearer` + `X-Tenant-Id` and route-shaped metric names; they are superseded by the required rebuild.
+- The YAML descriptors define no transport (no `X-API-Key` header) and still use route-shaped metric names; they are superseded by the required rebuild.
 
 ## [2.0.0] — 2026-06-29
 

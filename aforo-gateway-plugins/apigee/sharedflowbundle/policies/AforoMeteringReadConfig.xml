@@ -4,6 +4,7 @@
      by the JavaScript policies and step conditions.
 
      Required keys: aforo_endpoint, api_key, default_metric.
+     Optional product_type (default API) is the productType on every event.
      api_key is assigned to a private.* variable so it is masked in Debug
      sessions. tenant_id is used ONLY by margin guard (when the JWT carries
      no tenant_id); it is never sent to the ingestor, which takes the
@@ -44,6 +45,9 @@
     </Get>
     <Get assignTo="aforo.includeMetadata">
         <Key><Parameter>include_metadata</Parameter></Key>
+    </Get>
+    <Get assignTo="aforo.productType">
+        <Key><Parameter>product_type</Parameter></Key>
     </Get>
     <Get assignTo="aforo.mcpEnabled">
         <Key><Parameter>mcp_enabled</Parameter></Key>

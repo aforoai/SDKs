@@ -30,6 +30,7 @@ nv aforo-default-metric "api_calls"
 nv aforo-metric-mappings "PREFIX|/sms/v1/send|sms_sent;EXACT|/otp/v1/verify|otp_verified"   # or none
 nv aforo-subscription-customer-map "acme-prod=cust_123;globex=cust_456"                       # or none
 nv aforo-mcp-enabled "false"
+nv aforo-product-type "API"
 nv aforo-mcp-product-id "none"
 ```
 

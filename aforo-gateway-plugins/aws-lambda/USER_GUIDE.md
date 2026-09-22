@@ -96,7 +96,7 @@ Then confirm the event under the matching customer + metric (`api_calls` unless 
 
 ## Step 6 (optional) — MCP tool-invocation metering
 
-Set `MCP_ENABLED=true` on the function (`mcp_server.tool_invocations` must exist in your catalog). For POST entries whose logged `requestBody` is JSON-RPC `2.0` with `method: "tools/call"`, the event becomes `mcp_server.tool_invocations` carrying `toolName`, `agentId`, and `executionStatus`.
+Set `MCP_ENABLED=true` on the function (`mcp_server.tool_invocations` must exist in your catalog). For POST entries whose logged `requestBody` is JSON-RPC `2.0` with `method: "tools/call"`, the event becomes `mcp_server.tool_invocations` carrying `toolName`, `agentId`, and `executionStatus`, with `productType: "MCP_SERVER"` when both `toolName` and `agentId` are known (otherwise it keeps `PRODUCT_TYPE`, default `API`, which every other event carries).
 
 ```bash
 aws lambda update-function-configuration \

@@ -71,7 +71,7 @@ function extractMeasurements(responseBody, extractionPaths, dimensionPaths) {
 
 // ── Build compound event ──────────────────────────────────
 
-function buildCompoundEvent(customerId, measurements, metadata) {
+function buildCompoundEvent(customerId, measurements, metadata, productType) {
     if (!measurements || measurements.length === 0) return null;
     // Same rule as index.js: an event without an Aforo customer id can never
     // be accepted, so it is not built. Pass the authorizer's customerId.
@@ -79,6 +79,7 @@ function buildCompoundEvent(customerId, measurements, metadata) {
     return {
         correlationId: crypto.randomUUID(),
         customerId,
+        productType: (productType || process.env.PRODUCT_TYPE || 'API').trim().toUpperCase() || 'API',
         occurredAt: new Date().toISOString(),
         metadata,
         measurements,

@@ -23,8 +23,9 @@ const server = http.createServer((req, res) => {
     req.on('data', c => body += c);
     req.on('end', () => {
         captured.push({ headers: req.headers, url: req.url, body: JSON.parse(body) });
-        const status = nextStatuses.length ? nextStatuses.shift() : 202;
-        res.writeHead(status, { 'Content-Type': 'application/json' });
+        const next = nextStatuses.length ? nextStatuses.shift() : 202;
+        const status = typeof next === 'object' ? next.status : next;
+        res.writeHead(status, Object.assign({ 'Content-Type': 'application/json' }, next.headers || {}));
         res.end(JSON.stringify({ status }));
     });
 });
@@ -184,6 +185,7 @@ async function handlerTests() {
     assertEquals(evs[1].metricName, 'api_calls', 'default metric');
     assert(!JSON.stringify(req.body).includes('SECRET'), 'API key value never appears in the payload');
     assert(evs.every(e => e.quantity > 0 && !isNaN(Date.parse(e.occurredAt))), 'quantity > 0 and ISO occurredAt');
+    assert(evs.every(e => e.productType === 'API'), 'productType defaults to API on every event');
 
     console.log('\nTest 9: 400 is dropped without retry (no poison pill, no throw)');
     captured.length = 0; nextStatuses = [400];
@@ -195,6 +197,22 @@ async function handlerTests() {
     captured.length = 0; nextStatuses = [429];
     await handler(cwEvent([{ requestId: 'c1', httpMethod: 'GET', resourcePath: '/a', status: '200', customerId: 'c' }]), ctx);
     assertEquals(captured.length, 2, '429 then 202 → two attempts');
+
+    console.log('\nTest 10a: 429 Retry-After is honoured; one beyond the cap ends the attempts');
+    captured.length = 0; nextStatuses = [{ status: 429, headers: { 'Retry-After': '1' } }];
+    let t = Date.now();
+    await handler(cwEvent([{ requestId: 'c2', httpMethod: 'GET', resourcePath: '/a', status: '200', customerId: 'c' }]), ctx);
+    assertEquals(captured.length, 2, '429 then 202 → two attempts');
+    assert(Date.now() - t >= 950, 'waited the Retry-After second before retrying');
+    captured.length = 0; nextStatuses = [{ status: 429, headers: { 'Retry-After': '3600' } }];
+    let threw429 = false;
+    t = Date.now();
+    try {
+        await handler(cwEvent([{ requestId: 'c3', httpMethod: 'GET', resourcePath: '/a', status: '200', customerId: 'c' }]), ctx);
+    } catch { threw429 = true; }
+    assertEquals(captured.length, 1, 'no retry when Retry-After exceeds the cap');
+    assert(threw429 && Date.now() - t < 1000, 'fails transiently at once so Lambda re-delivers later');
+    nextStatuses = [];
 
     console.log('\nTest 11: persistent 5xx throws so Lambda async retry re-delivers');
     captured.length = 0; nextStatuses = [503, 503, 503];
@@ -221,6 +239,31 @@ async function handlerTests() {
     process.env.FLUSH_COUNT = '5000';
     assertEquals(require('../index').FLUSH_COUNT, 1000, 'FLUSH_COUNT=5000 → 1000');
     delete process.env.FLUSH_COUNT;
+
+    console.log('\nTest 13b: PRODUCT_TYPE is configurable; MCP_SERVER only with toolName + agentId');
+    delete require.cache[require.resolve('../index')];
+    process.env.PRODUCT_TYPE = '  agentic_api ';
+    process.env.MCP_ENABLED = 'true';
+    let m = require('../index');
+    const le = { id: 'p', timestamp: 0 };
+    const base = { method: 'GET', path: '/a', status: 200, customerId: 'c', requestId: 'p1' };
+    assertEquals(m.buildUsageEvent(base, le).event.productType, 'AGENTIC_API', 'PRODUCT_TYPE trimmed and upper-cased');
+    const call = (meta) => JSON.stringify({ jsonrpc: '2.0', method: 'tools/call', params: { name: 'search', _meta: meta } });
+    const withAgent = m.buildUsageEvent({ ...base, method: 'POST', requestBody: call({ agent_id: 'a1' }) }, le).event;
+    assertEquals(withAgent.productType, 'MCP_SERVER', 'tools/call with agentId → MCP_SERVER');
+    const noAgent = m.buildUsageEvent({ ...base, method: 'POST', requestBody: call({}) }, le).event;
+    assertEquals(noAgent.productType, 'AGENTIC_API', 'tools/call without agentId keeps PRODUCT_TYPE');
+    delete require.cache[require.resolve('../index')];
+    process.env.PRODUCT_TYPE = 'AI_AGENT';
+    m = require('../index');
+    assert(m.buildUsageEvent(base, le).skip.startsWith('productType AI_AGENT missing'), 'AI_AGENT without agentId/sessionId skipped');
+    const forged = m.buildUsageEvent({ ...base, headers: { 'x-agent-id': 'forged', 'x-session-id': 's' } }, le);
+    assert(forged.skip && forged.skip.startsWith('productType AI_AGENT missing'), 'X-Agent-Id header never used as agentId');
+    delete require.cache[require.resolve('../index')];
+    process.env.PRODUCT_TYPE = 'NEW_TYPE';
+    assertEquals(require('../index').buildUsageEvent(base, le).event.productType, 'NEW_TYPE', 'unknown type passed through');
+    delete process.env.PRODUCT_TYPE;
+    delete process.env.MCP_ENABLED;
 
     console.log('\nTest 13: response_size quantity 0 is skipped');
     // Re-load with QUANTITY_SOURCE=response_size.

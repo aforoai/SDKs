@@ -97,7 +97,7 @@ If `AforoMeteringSendEvent` did not run, check `aforo.skipReason` on the `AforoM
 
 ## Step 7 (optional) — MCP tool-invocation metering
 
-Set the KVM keys `mcp_enabled = true` (and `mcp_product_id`) for proxies fronting an MCP server. For POST requests, the JS parses `request.content`; any JSON-RPC `2.0` body with `method: "tools/call"` emits an `mcp_server.tool_invocations` event with `toolName`, `sessionId` (from `Mcp-Session-Id`), and `executionStatus`.
+Set the KVM keys `mcp_enabled = true` (and `mcp_product_id`) for proxies fronting an MCP server. For POST requests, the JS parses `request.content`; any JSON-RPC `2.0` body with `method: "tools/call"` emits an `mcp_server.tool_invocations` event with `toolName`, `sessionId` (from `Mcp-Session-Id`), and `executionStatus`. Its `productType` is `MCP_SERVER` when `params._meta.agent_id` is present; otherwise it keeps the KVM `product_type` (default `API`), which every other event carries.
 
 > ⚠ `agentId` is read only from the JSON-RPC payload at `params._meta.agent_id`. The `X-Agent-Id` request-header fallback was removed in 2.0.0 — it's client-settable and was a billing-attribution spoof vector.
 

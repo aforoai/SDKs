@@ -41,6 +41,7 @@ the exact variables.
 | `DEMO_CUSTOMER_ID` | **Customers** → open the customer → its id (a UUID, not the display name) |
 | `DEMO_SUBSCRIPTION_ID` | **Subscriptions** → the subscription binding that customer to an offering |
 | `DEMO_KEY_ID` | **Developer Hub → Credentials** → create an API key → the `keyId` it returns. Not the `sk_live_…` secret — the plugin never sees that |
+| `DEMO_PRODUCT_TYPE` | Optional, default `API`. The plugin's `product_type`, sent as `productType` on every event |
 | `DEMO_TEAM_ID` | **Customers → Teams**, if you use teams |
 
 Two of these decide whether the demo shows anything interesting:

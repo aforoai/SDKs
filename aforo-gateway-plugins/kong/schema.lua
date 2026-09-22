@@ -37,6 +37,14 @@ return {
                             description = "Aforo tenant identifier",
                         },
                     },
+                    -- Product type
+                    {
+                        product_type = {
+                            type = "string",
+                            default = "API",
+                            description = "Aforo productType sent on every event (trimmed, upper-cased): API, AGENTIC_API, AI_AGENT, MCP_SERVER, GRPC_API, GRAPHQL_API, WEBSOCKET_API or MQTT_BROKER. The ingestor requires it. MCP tools/call (mcp_enabled) is sent as MCP_SERVER when both toolName and agentId are known. Events missing the fields their type requires (MCP_SERVER: toolName + agentId) are skipped rather than sent, because one invalid event fails the whole batch. AI_AGENT / GRPC_API / GRAPHQL_API / WEBSOCKET_API / MQTT_BROKER need fields an HTTP gateway cannot observe or trust (agentId, gRPC/GraphQL/WebSocket/MQTT fields), so every non-MCP event would be skipped.",
+                        },
+                    },
                     -- Metric configuration
                     {
                         metric_name_pattern = {

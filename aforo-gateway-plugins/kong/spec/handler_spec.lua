@@ -58,7 +58,8 @@ ngx.shared = { aforo_buffer = new_shared_dict() }
 ngx.timers = {}
 ngx.timer = { at = function(delay, fn, ...) table.insert(ngx.timers, { delay = delay, fn = fn, args = { ... } }); return true end }
 ngx.now = function() return 1788268682.221 end
-ngx.sleep = function() end
+ngx.sleeps = {}
+ngx.sleep = function(s) table.insert(ngx.sleeps, s) end
 ngx.worker = ngx.worker or { pid = function() return 1 end }
 ngx.escape_uri = ngx.escape_uri or function(s) return s end
 
@@ -74,7 +75,7 @@ package.loaded["resty.http"] = {
                 if http_mock.on_request then http_mock.on_request(#http_mock.requests) end
                 local r = table.remove(http_mock.responses, 1) or { status = 202 }
                 if r.err then return nil, r.err end
-                return { status = r.status, body = r.body or "" }
+                return { status = r.status, body = r.body or "", headers = r.headers or {} }
             end,
         }
     end,
@@ -402,6 +403,28 @@ describe("aforo-metering handler", function()
             assert.equals(1, #buffered())
         end)
 
+        it("honours Retry-After on 429 and re-buffers past the cap", function()
+            fill(1)
+            ngx.sleeps = {}
+            http_mock.responses = {
+                { status = 429, headers = { ["Retry-After"] = "7" } },
+                { status = 202 },
+            }
+            handler._flush_buffer(false, conf)
+            assert.same({ 7 }, ngx.sleeps)
+            assert.equals(0, #buffered())
+
+            fill(1)
+            ngx.sleeps = {}
+            http_mock.requests = {}
+            http_mock.responses = { { status = 429, headers = { ["Retry-After"] = "3600" } } }
+            handler._flush_buffer(false, conf)
+            -- No hour-long sleep inside the timer: one attempt, then re-buffered.
+            assert.equals(1, #http_mock.requests)
+            assert.same({}, ngx.sleeps)
+            assert.equals(1, #buffered())
+        end)
+
         it("keeps the oldest when a re-buffer would exceed MAX_BUFFER_SIZE", function()
             fill(10, "old")
             http_mock.responses = { { status = 500 }, { status = 500 }, { status = 500 } }
@@ -416,6 +439,77 @@ describe("aforo-metering handler", function()
             assert.equals("old1", events[1].customerId)
             assert.equals("old10", events[10].customerId)
             assert.equals("new9990", events[10000].customerId)
+        end)
+    end)
+    -- ── productType ─────────────────────────────────────────────
+    describe("product_type", function()
+        local BUFFER_KEY = "aforo:events"
+        local dict
+        local function conf(pt)
+            return {
+                aforo_endpoint = "http://ingestor.test/v1/ingest/batch",
+                api_key = "sk_test_key",
+                default_metric = "api_calls",
+                product_type = pt,
+                mcp_enabled = true,
+                exclude_paths = {},
+                exclude_status_codes = {},
+            }
+        end
+        local function buffered()
+            local l = dict.store[BUFFER_KEY]
+            local out = {}
+            for i = 1, (l and #l or 0) do out[i] = cjson.decode(l[i]) end
+            return out
+        end
+        local function log(c, method, raw_body, headers)
+            mock_kong.request._headers = headers or {}
+            mock_kong.ctx.shared = {
+                aforo_jwt_claims = { customer_id = "cust_a" },
+                aforo_raw_body = raw_body,
+            }
+            local orig = mock_kong.request.get_method
+            mock_kong.request.get_method = function() return method or "GET" end
+            handler:log(c)
+            mock_kong.request.get_method = orig
+        end
+        local TOOL_CALL = '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"search"}}'
+
+        before_each(function()
+            dict = new_shared_dict()
+            ngx.shared.aforo_buffer = dict
+            ngx.timers = {}
+        end)
+
+        it("defaults to API on every event", function()
+            log(conf(nil))
+            assert.equals("API", buffered()[1].productType)
+        end)
+
+        it("trims and upper-cases the configured value, passing unknown types through", function()
+            log(conf("  agentic_api "))
+            log(conf("NEW_TYPE"))
+            local events = buffered()
+            assert.equals("AGENTIC_API", events[1].productType)
+            assert.equals("NEW_TYPE", events[2].productType)
+        end)
+
+        it("skips events missing the fields their type requires", function()
+            log(conf("GRAPHQL_API"))
+            log(conf("AI_AGENT"))
+            -- X-Agent-Id is client-settable, never a source for agentId.
+            log(conf("AI_AGENT"), "GET", nil, { ["x-agent-id"] = "agent_forged", ["Mcp-Session-Id"] = "s1" })
+            assert.equals(0, #buffered())
+        end)
+
+        it("sends an MCP tool call as MCP_SERVER only when agentId is known", function()
+            log(conf("API"), "POST", TOOL_CALL, { ["x-agent-id"] = "agent_1" })
+            log(conf("API"), "POST", TOOL_CALL, {})
+            local events = buffered()
+            assert.equals(2, #events)
+            assert.equals("MCP_SERVER", events[1].productType)
+            assert.equals("search", events[1].toolName)
+            assert.equals("API", events[2].productType)
         end)
     end)
     -- ── Pre-flight quota check ──────────────────────────────────

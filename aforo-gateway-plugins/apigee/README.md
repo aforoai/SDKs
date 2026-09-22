@@ -55,6 +55,7 @@ kv() { apigeecli kvms entries create --map aforo-metering-config --org "$APIGEE_
 kv aforo_endpoint  https://api.aforo.ai/v1/ingest/batch
 kv api_key         "$AFORO_API_KEY"          # scope usage:ingest; sent as X-API-Key
 kv default_metric  api_calls                  # must exist in your Aforo catalog
+kv product_type    API                        # optional; productType on every event
 kv metric_mappings '[{"matchType":"PREFIX","value":"/sms/v1/send","metricName":"sms_sent"}]'
 kv jwt_validation_enabled true               # or set customer_id_source (see below)
 kv aforo_jwks_uri  https://auth.aforo.ai/.well-known/jwks.json
@@ -89,6 +90,7 @@ The bundle reads config from the organization-scoped KVM `aforo-metering-config`
 | `exclude_status_codes` | `aforo.excludeStatusCodes` | — | Comma-separated status codes not to meter (e.g. `401,403,429`). |
 | `quantity_source` | `aforo.quantitySource` | `1` | `1` per call, or `response_size` (response `Content-Length`). Quantity ≤ 0 is not sent. |
 | `include_metadata` | `aforo.includeMetadata` | `true` | `false` omits metadata. |
+| `product_type` | `aforo.productType` | `API` | `productType` sent on every event (trimmed, upper-cased; unknown values passed through) — required by the ingestor. An MCP `tools/call` is sent as `MCP_SERVER` only when both `toolName` and `params._meta.agent_id` are present, otherwise it keeps this value. Events missing the fields their type requires are not sent (`aforo.skipReason` says which): `AI_AGENT` needs an agentId, which has no trusted source outside an MCP payload; `GRPC_API`/`GRAPHQL_API`/`WEBSOCKET_API`/`MQTT_BROKER` need fields an HTTP proxy cannot observe. |
 | `mcp_enabled` / `mcp_product_id` | `aforo.mcpEnabled` / `aforo.mcpProductId` | off | MCP `tools/call` detection (these were read by the JS but never loaded from the KVM). |
 | `margin_guard_enabled` / `margin_guard_url` | `aforo.marginGuardEnabled` / `aforo.marginGuardUrl` | off | Margin-guard pre-flight (these were read by the JS but never loaded, so it could not run). Uses the JWT `customer_id`/`tenant_id`. |
 | `tenant_id` | `aforo.tenantId` | — | Margin guard only, when the JWT has no `tenant_id`. **Not sent to the ingestor.** |

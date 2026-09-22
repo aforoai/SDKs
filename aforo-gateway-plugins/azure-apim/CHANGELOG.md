@@ -4,6 +4,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [Unreleased]
 
+### Added
+- Named Value `aforo-product-type` (default `API`; `none` = `API`), resolved once by `aforo-context` into the variable `aforo-product-type` (a per-API `set-variable` before `aforo-context` overrides it). Every metering and compound event now carries the `productType` the ingestor requires in production. **Breaking**: the Named Value must exist.
+
+### Fixed (product type)
+- MCP `tools/call` without `params._meta.agent_id` was sent as `MCP_SERVER` with an empty `agentId`, which the ingestor rejects. It is now `MCP_SERVER` only when both tool name and agent id are present, otherwise the configured type. Configured types whose required fields a gateway cannot supply are not metered (traced) rather than sent invalid.
+
 Brings the fragments in line with Azure's policy-fragment rules and the ingestor contract. **Breaking**: new required fragment `aforo-context` and new Named Values (`aforo-default-metric`, `aforo-metric-mappings`, `aforo-subscription-customer-map`, `aforo-org-service-url`); compound path Named Values change format. None of this has been run on a live APIM instance.
 
 ### Fixed

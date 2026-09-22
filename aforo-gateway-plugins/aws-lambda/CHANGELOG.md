@@ -6,6 +6,13 @@ This function ships on the Aforo gateway-plugins line; the whole repo is version
 
 ## [Unreleased]
 
+### Added
+- `PRODUCT_TYPE` env var / `ProductType` SAM parameter (default `API`): every event now carries the `productType` the ingestor requires in production. `compound-metering.js` `buildCompoundEvent` takes an optional `productType` (default `PRODUCT_TYPE` / `API`).
+
+### Fixed (product type / retries)
+- MCP `tools/call` is sent as `MCP_SERVER` only when both `toolName` and `agentId` are known; otherwise the configured type is kept, rather than an event the ingestor must reject (failing the whole batch). Entries missing the fields their `productType` requires are skipped.
+- 429 honours `Retry-After` (up to 30 s; longer ends the attempts so Lambda's async retry re-delivers later).
+
 Brings the function in line with the ingestor contract. **Breaking** for deployments: SAM parameters `AforoTenantId` and `CustomerIdSource` were removed, and the stage's access-log format must now include `customerId` from the authorizer context.
 
 ### Fixed

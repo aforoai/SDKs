@@ -45,6 +45,14 @@ Parameters:
     Description: Quantity source (1 = count, response_size = bytes)
     Default: '1'
     AllowedValues: ['1', 'response_size']
+  ProductType:
+    Type: String
+    Description: >-
+      Aforo productType sent on every event (API, AGENTIC_API, AI_AGENT, ...).
+      The ingestor requires it. MCP tools/call with both toolName and agentId
+      is sent as MCP_SERVER instead. Events missing their type's required
+      fields are skipped rather than sent.
+    Default: API
 
 Resources:
   AforoMeteringFunction:
@@ -64,6 +72,7 @@ Resources:
           DEFAULT_METRIC: !Ref DefaultMetric
           METRIC_NAME_PATTERN: !Ref MetricNamePattern
           QUANTITY_SOURCE: !Ref QuantitySource
+          PRODUCT_TYPE: !Ref ProductType
           FLUSH_COUNT: '50'
           INCLUDE_METADATA: 'true'
       # Async invocation (CloudWatch Logs): the handler throws when a batch

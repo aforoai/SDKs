@@ -88,7 +88,9 @@ Each metered call POSTs to `{{aforo-endpoint}}` with the header `X-API-Key: {{af
 
 Not metered: `OPTIONS` (CORS preflights) and requests with no resolvable customer (or one longer than 64 characters).
 
-When `aforo-mcp-enabled` is `true` and the POST body (captured in `<inbound>` by `aforo-context`) is a JSON-RPC `tools/call`, the event instead carries `metricName: "mcp_server.tool_invocations"`, `productType: "MCP_SERVER"`, `toolName`, `agentId` (from `params._meta.agent_id`), and `sessionId` (from `Mcp-Session-Id`).
+When `aforo-mcp-enabled` is `true` and the POST body (captured in `<inbound>` by `aforo-context`) is a JSON-RPC `tools/call`, the event instead carries `metricName: "mcp_server.tool_invocations"`, `toolName`, `agentId` (from `params._meta.agent_id`), and `sessionId` (from `Mcp-Session-Id`), with `productType: "MCP_SERVER"` when `params._meta.agent_id` is present (the ingestor requires it for `MCP_SERVER`); without one the event keeps the configured `aforo-product-type`.
+
+Every event carries `productType`, which the ingestor requires: the Named Value `aforo-product-type` (default `API`; `none` = `API`), trimmed and upper-cased. A per-API override is a `<set-variable name="aforo-product-type" value="AGENTIC_API" />` placed before `aforo-context` in that API's `<inbound>`. Configured types whose required fields a gateway cannot supply (`AI_AGENT`, `MCP_SERVER`, `GRPC_API`, `GRAPHQL_API`, `WEBSOCKET_API`, `MQTT_BROKER`) are not metered (a trace records why), because one invalid event fails the batch; detected MCP tool calls are still sent as `MCP_SERVER`.
 
 ## Configuration
 
@@ -101,6 +103,7 @@ Create these as APIM **Named Values** (mark `aforo-api-key` Secret). The fragmen
 | `aforo-default-metric` | metering | Metric for requests no mapping matches, e.g. `api_calls`. **Must be registered in the Aforo catalog** — an unknown metric fails the batch with 400. |
 | `aforo-metric-mappings` | metering | Endpoint→metric rules, first match wins: `KIND\|value\|metricName` separated by `;`, `KIND` = `EXACT`, `PREFIX` or `CONTAINS`, matched against the client-facing path (`context.Request.OriginalUrl.Path`, which includes the API URL suffix). E.g. `PREFIX\|/sms/v1/send\|sms_sent;EXACT\|/otp/v1/verify\|otp_verified`. `none` = no mappings. Same semantics as catalog's `/internal/v1/metrics/gateway-mappings`, supplied as config because these fragments do not fetch it. |
 | `aforo-subscription-customer-map` | context | `subscriptionId=customerId` pairs separated by `;` — the Aforo customer for callers without an Aforo JWT. `none` if every caller presents one. Max 4096 characters (a Named Value limit). |
+| `aforo-product-type` | context | `productType` on every event, e.g. `API` (`none` = `API`). Overridable per API with a `set-variable` of the same name before `aforo-context`. |
 | `aforo-mcp-enabled` | context, metering | `true` to detect JSON-RPC `tools/call` and emit MCP events; otherwise `false`. |
 | `aforo-mcp-product-id` | metering | Aforo product ID stamped into MCP event metadata; `none` if unused. |
 | `aforo-jwks-uri` | jwt-validation | URL given to `<openid-config>`. That element expects an **OpenID discovery document** (`…/.well-known/openid-configuration`), not a bare JWKS URL — see "What this doesn't cover". |

@@ -148,7 +148,9 @@ console.log('\nTest 3: X-Agent-Id header is not trusted (security regression gua
     const payload = JSON.parse(ctx.getStoredPayload());
     const event = payload.events[0];
 
-    assertEquals(event.productType, 'MCP_SERVER', 'MCP detection triggered');
+    assertEquals(event.metricName, 'mcp_server.tool_invocations', 'MCP detection triggered');
+    // MCP_SERVER requires agentId: without one the configured type is kept.
+    assertEquals(event.productType, 'API', 'no agentId → not MCP_SERVER (configured product_type kept)');
     assertEquals(event.toolName, 'search_docs', 'toolName from JSON-RPC payload');
     assertEquals(event.agentId, '',
         'agentId is EMPTY (forged X-Agent-Id header is ignored) — IDOR fix 2026-04-23');
@@ -178,6 +180,7 @@ console.log('\nTest 4: agent_id from JSON-RPC params._meta is trusted');
 
     assertEquals(event.agentId, 'agent_legit',
         'agentId comes from JSON-RPC payload, not the forged header');
+    assertEquals(event.productType, 'MCP_SERVER', 'toolName + agentId → MCP_SERVER');
 })();
 
 function eventOf(ctx) {
@@ -265,6 +268,30 @@ console.log('\nTest 7: OPTIONS, exclude_paths, exclude_status_codes, zero quanti
     assertEquals(ctx.vars['aforo.sendEvent'], 'true', 'normal request is sent');
     assertEquals(eventOf(ctx).idempotencyKey, 'msg-001', 'idempotencyKey = messageid');
     assert(!isNaN(Date.parse(eventOf(ctx).occurredAt)), 'occurredAt is ISO-8601');
+})();
+
+// Test 7b: productType
+console.log('\nTest 7b: productType from KVM product_type (default API), per-type required fields');
+(function() {
+    let ctx = createMockContext({});
+    runPolicy(ctx);
+    assertEquals(eventOf(ctx).productType, 'API', 'default productType API');
+    ctx = createMockContext({ 'aforo.productType': ' agentic_api ' });
+    runPolicy(ctx);
+    assertEquals(eventOf(ctx).productType, 'AGENTIC_API', 'KVM value trimmed and upper-cased');
+    ctx = createMockContext({ 'aforo.productType': 'NEW_TYPE' });
+    runPolicy(ctx);
+    assertEquals(eventOf(ctx).productType, 'NEW_TYPE', 'unknown type passed through');
+    ctx = createMockContext({ 'aforo.productType': 'GRAPHQL_API' });
+    runPolicy(ctx);
+    assertEquals(ctx.vars['aforo.sendEvent'], 'false', 'GRAPHQL_API without gqlOperationType not sent');
+    assertEquals(ctx.vars['aforo.skipReason'], 'productType GRAPHQL_API missing gqlOperationType', 'skip reason names the field');
+    ctx = createMockContext({ 'aforo.productType': 'AI_AGENT', 'request.header.Mcp-Session-Id': 's1',
+        'request.header.X-Agent-Id': 'agent_forged' });
+    runPolicy(ctx);
+    assertEquals(ctx.vars['aforo.sendEvent'], 'false', 'AI_AGENT never takes agentId from X-Agent-Id');
+    const xml = fs.readFileSync(path.resolve(__dirname, '../sharedflowbundle/policies/AforoMeteringReadConfig.xml'), 'utf8');
+    assert(/<Get assignTo="aforo\.productType">\s*<Key><Parameter>product_type<\/Parameter>/.test(xml), 'KVM product_type read into aforo.productType');
 })();
 
 // Test 8: bundle XML contract checks (static)
