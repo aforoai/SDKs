@@ -25,7 +25,7 @@ npm i @aforo/mqtt-metering mqtt    # client mode
 It isn't on npm yet. Build from source and link it:
 
 ```bash
-cd aforo-metering-sdks/node-mqtt
+cd SDKs/aforo-metering-sdks/node-mqtt
 npm install
 npm run build      # produces dist/
 

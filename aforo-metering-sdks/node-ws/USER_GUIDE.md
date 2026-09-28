@@ -24,7 +24,7 @@ npm i @aforo/ws-metering ws
 It isn't on npm yet. Build from source and link it:
 
 ```bash
-cd aforo-metering-sdks/node-ws
+cd SDKs/aforo-metering-sdks/node-ws
 npm install
 npm run build      # produces dist/
 

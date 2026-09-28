@@ -22,5 +22,5 @@ Initial public distribution packaging — README, user guide, and versioning.
 - Documented AST complexity scoring (`default_complexity_scorer`, override via `complexity_scorer`) and customer-ID resolution (`x-customer-id` default, override via `customer_id_extractor`).
 - Full configuration reference; one `graphql_api.operations` event per operation, delivered to `POST https://ingest.aforo.ai/v1/ingest/events` with Bearer auth and an `X-Tenant-Id` header.
 
-[Unreleased]: https://github.com/aforoai/aforo-metering-sdks/compare/python-graphql-v1.0.0...HEAD
-[1.0.0]: https://github.com/aforoai/aforo-metering-sdks/releases/tag/python-graphql-v1.0.0
+[Unreleased]: https://github.com/aforoai/SDKs/compare/python-graphql-v1.0.0...HEAD
+[1.0.0]: https://github.com/aforoai/SDKs/releases/tag/python-graphql-v1.0.0

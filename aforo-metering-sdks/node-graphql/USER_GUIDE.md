@@ -24,7 +24,7 @@ npm i @aforo/graphql-metering graphql
 It isn't on npm yet. Build from source and link it:
 
 ```bash
-cd aforo-metering-sdks/node-graphql
+cd SDKs/aforo-metering-sdks/node-graphql
 npm install
 npm run build      # produces dist/
 

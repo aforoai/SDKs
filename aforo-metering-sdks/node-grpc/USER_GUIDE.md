@@ -24,7 +24,7 @@ npm i @aforo/grpc-metering @grpc/grpc-js
 It isn't on npm yet. Build from source and link it:
 
 ```bash
-cd aforo-metering-sdks/node-grpc
+cd SDKs/aforo-metering-sdks/node-grpc
 npm install
 npm run build      # produces dist/
 

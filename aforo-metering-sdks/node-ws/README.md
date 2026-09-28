@@ -16,7 +16,7 @@ npm i @aforo/ws-metering ws
 
 ```bash
 # from the SDKs repo root
-cd aforo-metering-sdks/node-ws
+cd SDKs/aforo-metering-sdks/node-ws
 npm install
 npm run build          # tsc → dist/
 

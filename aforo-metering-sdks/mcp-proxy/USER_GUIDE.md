@@ -23,8 +23,8 @@ npm i -g @aforo/mcp-proxy
 Not on npm yet, so install from source for now:
 
 ```bash
-git clone https://github.com/aforoai/aforo-metering-sdks.git
-cd aforo-metering-sdks/mcp-proxy
+git clone https://github.com/aforoai/SDKs.git
+cd SDKs/aforo-metering-sdks/mcp-proxy
 npm install && npm run build
 npm link        # exposes `aforo-mcp-proxy` on your PATH
 ```

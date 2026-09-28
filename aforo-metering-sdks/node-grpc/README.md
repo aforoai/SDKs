@@ -16,7 +16,7 @@ npm i @aforo/grpc-metering @grpc/grpc-js
 
 ```bash
 # from the SDKs repo root
-cd aforo-metering-sdks/node-grpc
+cd SDKs/aforo-metering-sdks/node-grpc
 npm install
 npm run build          # tsc → dist/
 

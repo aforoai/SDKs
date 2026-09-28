@@ -16,11 +16,17 @@ pip install "aforo-metering[django]"
 pip install "aforo-metering[flask]"
 ```
 
-**Not yet on PyPI — install from source for now.** Clone the SDK repo and install this package in editable mode:
+**Not yet on PyPI — install from source for now.** Straight from GitHub:
 
 ```bash
-git clone https://github.com/aforoai/aforo-metering-python.git
-cd aforo-metering-python          # the folder holding pyproject.toml
+pip install "git+https://github.com/aforoai/SDKs.git#subdirectory=aforo-metering-sdks/python"
+```
+
+Or clone the repo and install this package in editable mode, for local development:
+
+```bash
+git clone https://github.com/aforoai/SDKs.git
+cd SDKs/aforo-metering-sdks/python          # the folder holding pyproject.toml
 pip install -e .
 # with a framework extra:
 pip install -e ".[fastapi]"

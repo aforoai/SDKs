@@ -18,8 +18,8 @@ pip install "aforo-ws-metering[httpx]"        # faster HTTP flush than stdlib ur
 **Not yet on PyPI — install from source for now:**
 
 ```bash
-git clone https://github.com/aforoai/aforo-metering-sdks.git
-cd aforo-metering-sdks/python-ws     # folder holding setup.py
+git clone https://github.com/aforoai/SDKs.git
+cd SDKs/aforo-metering-sdks/python-ws     # folder holding setup.py
 pip install -e .
 pip install -e ".[fastapi]"          # or [websockets] / [httpx]
 ```

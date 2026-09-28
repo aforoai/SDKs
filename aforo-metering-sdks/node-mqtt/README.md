@@ -23,7 +23,7 @@ npm i @aforo/mqtt-metering mqtt    # client mode
 
 ```bash
 # from the SDKs repo root
-cd aforo-metering-sdks/node-mqtt
+cd SDKs/aforo-metering-sdks/node-mqtt
 npm install
 npm run build          # tsc → dist/
 

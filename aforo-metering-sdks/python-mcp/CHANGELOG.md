@@ -27,5 +27,5 @@ Initial public distribution packaging — README, user guide, and versioning.
 - Documented session heartbeats (`start_session` / `end_session`, periodic `system.session.heartbeat`) and the server-driven `killedSessionIds` / `on_session_killed` signal.
 - Full configuration reference; events deliver to `POST https://ingest.aforo.ai/v1/ingest/batch` with Bearer auth and an `X-Tenant-Id` header.
 
-[Unreleased]: https://github.com/aforoai/aforo-metering-sdks/compare/python-mcp-v1.0.0...HEAD
-[1.0.0]: https://github.com/aforoai/aforo-metering-sdks/releases/tag/python-mcp-v1.0.0
+[Unreleased]: https://github.com/aforoai/SDKs/compare/python-mcp-v1.0.0...HEAD
+[1.0.0]: https://github.com/aforoai/SDKs/releases/tag/python-mcp-v1.0.0

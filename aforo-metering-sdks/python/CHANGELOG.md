@@ -32,5 +32,5 @@ Initial public distribution packaging — README, user guide, and versioning.
 - Full configuration reference for `AforoOptions`, `track()` arguments, and `MiddlewareOptions`.
 - Events deliver to `POST https://ingest.aforo.ai/v1/ingest/batch` with Bearer auth.
 
-[Unreleased]: https://github.com/aforoai/aforo-metering-python/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/aforoai/aforo-metering-python/releases/tag/v1.0.0
+[Unreleased]: https://github.com/aforoai/SDKs/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/aforoai/SDKs/releases/tag/v1.0.0

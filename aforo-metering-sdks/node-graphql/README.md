@@ -16,7 +16,7 @@ npm i @aforo/graphql-metering graphql
 
 ```bash
 # from the SDKs repo root
-cd aforo-metering-sdks/node-graphql
+cd SDKs/aforo-metering-sdks/node-graphql
 npm install
 npm run build          # tsc → dist/
 

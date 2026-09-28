@@ -23,8 +23,8 @@ npm i @aforo/mcp-metering
 Not on npm yet, so install from source for now:
 
 ```bash
-git clone https://github.com/aforoai/aforo-metering-sdks.git
-cd aforo-metering-sdks/node-mcp
+git clone https://github.com/aforoai/SDKs.git
+cd SDKs/aforo-metering-sdks/node-mcp
 npm install && npm run build
 npm pack        # produces aforo-mcp-metering-1.0.0.tgz
 ```

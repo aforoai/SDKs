@@ -23,8 +23,8 @@ npm i @aforoai/agent-metering
 It isn't on npm yet, so for now install from source:
 
 ```bash
-git clone https://github.com/aforoai/aforo-metering-sdks.git
-cd aforo-metering-sdks/node-agent
+git clone https://github.com/aforoai/SDKs.git
+cd SDKs/aforo-metering-sdks/node-agent
 npm install && npm run build
 npm pack        # produces aforoai-agent-metering-1.0.0.tgz
 ```
