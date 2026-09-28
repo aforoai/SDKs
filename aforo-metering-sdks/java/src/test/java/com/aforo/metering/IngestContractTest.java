@@ -104,6 +104,55 @@ class IngestContractTest {
         assertThat(parsed).isBeforeOrEqualTo(Instant.now());
     }
 
+    /**
+     * Regression: the default key used to be
+     * SHA256(customerId:metricName:quantity:occurredAt). occurredAt only carries
+     * millisecond precision, so two genuinely distinct events inside one millisecond
+     * hashed to the same key and the ingestor answered DUPLICATE and dropped the second
+     * one — real usage silently lost (under-billing). Two calls sharing an explicit
+     * occurredAt reproduce exactly the input the old hash saw.
+     */
+    @Test
+    void sameInstantEventsGetDistinctIdempotencyKeys() {
+        String sameInstant = "2026-03-21T00:00:00.000Z";
+        try (var client = new AforoClient(options())) {
+            for (int i = 0; i < 2; i++) {
+                client.track(TrackEvent.builder("cust_1", "sms.sent")
+                        .quantity(1)
+                        .occurredAt(sameInstant)
+                        .build());
+            }
+            client.flush();
+        }
+        JsonNode events = bodies.get(0).get("events");
+        assertThat(events.size()).isEqualTo(2);
+        assertThat(events.get(0).get("occurredAt").asText())
+                .isEqualTo(events.get(1).get("occurredAt").asText())
+                .isEqualTo(sameInstant);
+        assertThat(events.get(0).get("idempotencyKey").asText())
+                .as("two distinct events must not share a key — the ingestor would drop one")
+                .isNotEqualTo(events.get(1).get("idempotencyKey").asText());
+    }
+
+    /** An explicit key is how a caller opts INTO dedup — it must survive verbatim. */
+    @Test
+    void explicitIdempotencyKeyIsPreservedVerbatim() {
+        try (var client = new AforoClient(options())) {
+            for (int i = 0; i < 2; i++) {
+                client.track(TrackEvent.builder("cust_1", "sms.sent")
+                        .quantity(1)
+                        .occurredAt("2026-03-21T00:00:00.000Z")
+                        .idempotencyKey("caller-owned-key")
+                        .build());
+            }
+            client.flush();
+        }
+        JsonNode events = bodies.get(0).get("events");
+        assertThat(events.size()).isEqualTo(2);
+        assertThat(events.get(0).get("idempotencyKey").asText()).isEqualTo("caller-owned-key");
+        assertThat(events.get(1).get("idempotencyKey").asText()).isEqualTo("caller-owned-key");
+    }
+
     @Test
     void clientProductTypeAndPerEventOverride() {
         try (var client = new AforoClient(options().productType("agentic_api"))) {

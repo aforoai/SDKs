@@ -1,7 +1,7 @@
 import { AforoOptions, TrackEvent, ResolvedEvent, FlushResult } from './types';
 import { RingBuffer } from './buffer';
 import { Transport } from './transport';
-import { generateIdempotencyKey } from './idempotency';
+import { generateRandomKey } from './idempotency';
 
 const DEFAULT_BASE_URL = 'https://api.aforo.ai';
 const DEFAULT_PRODUCT_TYPE = 'API';
@@ -201,8 +201,13 @@ export class AforoClient {
       customerId: event.customerId,
       metricName: event.metricName,
       quantity,
-      idempotencyKey: event.idempotencyKey
-        ?? generateIdempotencyKey(event.customerId, event.metricName, quantity, occurredAt),
+      // Minted once, here, when the event is enqueued — never at flush/retry
+      // time, so a retried batch carries the same keys and the ingestor
+      // deduplicates it. A caller-supplied key is passed through verbatim;
+      // otherwise each event gets its own random UUID. A deterministic hash of
+      // the event fields would make two genuinely distinct events in the same
+      // millisecond collide, and the ingestor would silently drop the second.
+      idempotencyKey: event.idempotencyKey ?? generateRandomKey(),
       occurredAt,
       productType: normalizeProductType(event.productType) ?? this.productType,
       ...(event.metadata ? { metadata: event.metadata } : {}),

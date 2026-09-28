@@ -81,6 +81,8 @@ process.on('beforeExit', () => aforo.shutdown());
 
 In the Aforo console, open **Ingestion → Recent Events** and filter by your `customerId`/`metricName`. A successful batch returns `{ accepted, duplicates, failed }` from `POST /v1/ingest/batch`; duplicates (same idempotency key) are counted, not double-billed.
 
+> **Idempotency keys.** If you don't pass `idempotencyKey`, the SDK mints a fresh random UUID v4 for each event, so two genuinely distinct events are never confused — even when they share customer, metric, quantity and timestamp. (It used to derive the key by hashing those four fields, which made same-millisecond events collide and silently dropped the second one.) The key is minted once, when `track()` enqueues the event, and never changes, so a retried batch is still deduplicated. **If you want dedup — e.g. an at-least-once pipeline replaying the same logical event — pass your own `idempotencyKey`;** that value is sent verbatim and is the only thing the ingestor dedupes on.
+
 ## Configuration reference
 
 See the full `AforoOptions` and `TrackEvent` tables in the [README](README.md#configuration). The fields that most affect behavior: `productType` ("API"; override per event with `track({ productType })`), `flushCount` (50, capped at 1000), `flushInterval` (5000 ms), `maxQueueSize` (10000, oldest-dropped on overflow), `maxRetries` (3), `timeout` (10000 ms).

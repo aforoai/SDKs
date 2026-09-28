@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .buffer import RingBuffer
-from .idempotency import generate_idempotency_key
+from .idempotency import generate_random_key
 from .transport import Transport
 from .types import (
     DEFAULT_PRODUCT_TYPE,
@@ -257,10 +257,14 @@ class AforoClient:
         if occurred_at is None:
             occurred_at = _utc_now_iso()
 
+        # Minted once, here, when the event is enqueued — never at flush/retry
+        # time, so a retried batch carries the same keys and the ingestor
+        # deduplicates it. A caller-supplied key is passed through verbatim;
+        # otherwise each event gets its own random UUID. A deterministic hash of
+        # the event fields would make two genuinely distinct events in the same
+        # millisecond collide, and the ingestor would silently drop the second.
         if idempotency_key is None:
-            idempotency_key = generate_idempotency_key(
-                customer_id, metric_name, quantity, occurred_at
-            )
+            idempotency_key = generate_random_key()
 
         resolved = ResolvedEvent(
             customer_id=customer_id,

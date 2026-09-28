@@ -113,13 +113,27 @@ function resolveCustomerId() {
     return '';
 }
 
+// Unique-per-event id, used only when Apigee gives us no `messageid`.
+// Rhino has no crypto.randomUUID, so combine the clock with two random draws.
+function uniqueEventId() {
+    return 'apigee-' + Date.now().toString(36)
+        + '-' + Math.random().toString(36).substring(2, 10)
+        + Math.random().toString(36).substring(2, 10);
+}
+
 var method = str('request.verb') || 'UNKNOWN';
 var basepath = str('proxy.basepath');
 var suffix = str('proxy.pathsuffix');
 var path = ((basepath === '/' ? '' : basepath) + suffix) || '/';
 var statusCode = parseInt(str('response.status.code') || '0', 10);
 var latency = parseInt(str('target.latency') || '0', 10);
-var requestId = str('messageid');
+// Apigee always sets `messageid`, unique per request — that is what makes the
+// idempotency key unique, and it is stable across a retried POST to the
+// ingestor so a re-sent event deduplicates. If it is ever absent, fall back to
+// a value that is still unique per event rather than one distinct requests
+// would share: two different requests must never collapse into one billed
+// event (the ingestor answers DUPLICATE and silently drops the second).
+var requestId = str('messageid') || uniqueEventId();
 var customerId = resolveCustomerId();
 var mcpEnabled = str('aforo.mcpEnabled') === 'true';
 var mcpProductId = str('aforo.mcpProductId');
@@ -186,6 +200,8 @@ if (!skipReason && isMcpToolCall) {
         metricName: 'mcp_server.tool_invocations',
         quantity: 1,
         // Stable per request (was suffixed with Date.now(), so nothing could dedupe).
+        // requestId is Apigee's per-request `messageid`, so this is unique per
+        // tool call yet identical on a retry of the same call.
         idempotencyKey: 'mcp:apigee:' + requestId + ':' + toolName,
         occurredAt: new Date().toISOString(),
         // MCP_SERVER requires toolName AND agentId; without an agentId the
@@ -231,7 +247,7 @@ if (!skipReason && isMcpToolCall) {
             customerId: customerId,
             metricName: resolveMetricName(method, path),
             quantity: quantity,
-            idempotencyKey: requestId || ('apigee-' + Date.now()),
+            idempotencyKey: requestId,
             occurredAt: new Date().toISOString(),
             productType: productType,
             endpointPath: path,

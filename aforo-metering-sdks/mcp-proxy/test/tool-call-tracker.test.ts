@@ -213,6 +213,29 @@ describe('ToolCallTracker attribution, productType and limits', () => {
     assert.equal(buffer.events[0].productType, 'AGENTIC_API');
   });
 
+  // Regression: the key used to be a hash of
+  // agentId:sessionId:toolName:requestId:Date.now(). A client is free to re-use a
+  // JSON-RPC id, and Date.now() has only millisecond resolution, so two genuinely
+  // separate invocations of the same tool hashed to one key — the ingestor
+  // answered DUPLICATE and silently dropped the second, under-billing the call.
+  it('gives two identical tool calls in the same millisecond distinct idempotency keys', () => {
+    const tracker = make();
+    const realNow = Date.now;
+    const frozen = realNow();
+    Date.now = () => frozen; // both calls land in the same millisecond
+    try {
+      for (let i = 0; i < 2; i++) {
+        tracker.trackRequest({ requestId: 1, toolName: 't', agentId: 'a' }, 's');
+        tracker.trackResponse({ requestId: 1, hasError: false, responseBytes: 1 }, 's');
+      }
+    } finally {
+      Date.now = realNow;
+      tracker.shutdown();
+    }
+    assert.equal(buffer.events.length, 2);
+    assert.notEqual(buffer.events[0].idempotencyKey, buffer.events[1].idempotencyKey);
+  });
+
   it('does not meter calls whose toolName/agentId/customerId exceed the ingestor limits', () => {
     const tracker = make();
     assert.equal(tracker.trackRequest({ requestId: 1, toolName: 'x'.repeat(65), agentId: 'a' }, 's'), false);

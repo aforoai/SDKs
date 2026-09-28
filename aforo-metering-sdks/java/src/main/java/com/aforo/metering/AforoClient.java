@@ -85,11 +85,15 @@ public class AforoClient implements AutoCloseable {
 
         String occurredAt = event.getOccurredAt() != null
                 ? event.getOccurredAt() : Instant.now().toString();
+        // Minted once, here, when the event is enqueued — never at flush/retry time, so a
+        // retried batch carries the same keys and the ingestor deduplicates it. A
+        // caller-supplied key is passed through verbatim; otherwise each event gets its
+        // own random UUID. A deterministic hash of the event fields would make two
+        // genuinely distinct events in the same millisecond collide, and the ingestor
+        // would silently drop the second one.
         String idempotencyKey = event.getIdempotencyKey() != null
                 ? event.getIdempotencyKey()
-                : IdempotencyKeyGenerator.generate(
-                        event.getCustomerId(), event.getMetricName(),
-                        event.getQuantity(), occurredAt);
+                : IdempotencyKeyGenerator.generateRandom();
         String eventProductType = event.getProductType() != null
                 ? event.getProductType() : productType;
 

@@ -176,7 +176,64 @@ describe('AforoClient', () => {
     await client.flush();
 
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
-    expect(body.events[0].idempotencyKey).toMatch(/^[0-9a-f]{32}$/);
+    expect(body.events[0].idempotencyKey).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
+  });
+
+  // Regression: the default key used to be SHA256(customerId:metric:quantity:occurredAt).
+  // occurredAt has millisecond precision, so two distinct events inside one
+  // millisecond hashed to the same key and the ingestor answered DUPLICATE and
+  // dropped the second one — real usage silently lost.
+  it('should give two identical events in the same millisecond different keys', async () => {
+    // Freeze only the clock — timers and promises stay real so flush() still works.
+    jest.useFakeTimers({
+      now: 1_764_000_000_000,
+      doNotFake: [
+        'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval',
+        'setImmediate', 'clearImmediate', 'nextTick', 'queueMicrotask',
+        'performance', 'hrtime',
+      ],
+    });
+
+    try {
+      await client.track({ customerId: 'cust_1', metricName: 'api_calls', quantity: 1 });
+      await client.track({ customerId: 'cust_1', metricName: 'api_calls', quantity: 1 });
+      await client.flush();
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body.events).toHaveLength(2);
+      // Identical customer, metric, quantity AND occurredAt — the frozen clock
+      // guarantees the exact input the old SHA-256 default hashed.
+      expect(body.events[0].occurredAt).toBe(body.events[1].occurredAt);
+      expect(body.events[0].idempotencyKey).not.toBe(body.events[1].idempotencyKey);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('should preserve an explicit key verbatim even for colliding events', async () => {
+    await client.track({
+      customerId: 'cust_1',
+      metricName: 'api_calls',
+      quantity: 1,
+      occurredAt: '2026-03-21T00:00:00.000Z',
+      idempotencyKey: 'caller-owned-key',
+    });
+    await client.track({
+      customerId: 'cust_1',
+      metricName: 'api_calls',
+      quantity: 1,
+      occurredAt: '2026-03-21T00:00:00.000Z',
+      idempotencyKey: 'caller-owned-key',
+    });
+    await client.flush();
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.events.map((e: { idempotencyKey: string }) => e.idempotencyKey)).toEqual([
+      'caller-owned-key',
+      'caller-owned-key',
+    ]);
   });
 
   it('should use caller-provided idempotency key', async () => {

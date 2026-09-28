@@ -20,6 +20,16 @@ class TestIdempotencyKey:
         assert len(key) == 32
         assert re.match(r"^[0-9a-f]{32}$", key)
 
+    def test_collides_within_one_millisecond(self):
+        """Documents WHY this helper is no longer the client default: occurred_at
+        only carries millisecond precision, so two genuinely distinct events in
+        one millisecond hash to one key and the ingestor drops the second as a
+        DUPLICATE. Callers who want that dedup opt in by passing the key."""
+        same_ms = "2026-03-21T00:00:00.000Z"
+        assert generate_idempotency_key("cust_1", "sms.sent", 1, same_ms) == (
+            generate_idempotency_key("cust_1", "sms.sent", 1, same_ms)
+        )
+
 
 class TestRandomKey:
     def test_unique(self):

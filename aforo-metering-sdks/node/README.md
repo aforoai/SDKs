@@ -73,7 +73,7 @@ The middleware hooks `res.on('finish')`, so it runs after the response is sent �
 | `timeout` | `number` (ms) | `10000` | Per-request timeout. |
 | `shutdownTimeoutMs` | `number` (ms) | `5000` | Max time `shutdown()` waits for a final flush. |
 
-`track(event)` — `event: TrackEvent`: `customerId` (required, non-blank), `metricName` (required, non-blank), `quantity` (default 1, must be > 0 — otherwise `track()` throws), `productType` (overrides the client default for this event), `idempotencyKey` (auto-generated if omitted), `occurredAt` (ISO string or epoch ms; defaults to now), `metadata` (string/number/boolean map).
+`track(event)` — `event: TrackEvent`: `customerId` (required, non-blank), `metricName` (required, non-blank), `quantity` (default 1, must be > 0 — otherwise `track()` throws), `productType` (overrides the client default for this event), `idempotencyKey` (a fresh random UUID v4 per event if omitted — pass your own key if you want the ingestor to deduplicate retries), `occurredAt` (ISO string or epoch ms; defaults to now), `metadata` (string/number/boolean map).
 
 ### Sessions
 

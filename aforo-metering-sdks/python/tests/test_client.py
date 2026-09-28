@@ -1,5 +1,6 @@
 """Tests for aforo.client — AforoClient."""
 
+import re
 import time
 from unittest.mock import patch, MagicMock
 
@@ -251,7 +252,60 @@ class TestAforoClient:
             client.flush()
 
             call_args = mock_transport.send_sync.call_args[0][0]
-            assert len(call_args[0].idempotency_key) == 32
+            assert re.match(
+                r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                call_args[0].idempotency_key,
+            )
+        finally:
+            client.shutdown()
+            patcher.stop()
+
+    def test_same_millisecond_events_get_distinct_keys(self):
+        """Regression: the default key used to be
+        SHA256(customer_id:metric_name:quantity:occurred_at). ``occurred_at`` has
+        millisecond precision, so two distinct events inside one millisecond
+        hashed to the same key and the ingestor answered DUPLICATE and dropped
+        the second one -- real usage silently lost (under-billing).
+        """
+        patcher, mock_transport = self._mock_transport()
+        frozen = "2026-03-21T00:00:00.000Z"
+        try:
+            with patch("aforo.client._utc_now_iso", return_value=frozen):
+                client = AforoClient(api_key="key", flush_interval=999)
+                client.track(customer_id="cust_1", metric_name="sms.sent", quantity=1)
+                client.track(customer_id="cust_1", metric_name="sms.sent", quantity=1)
+                client.flush()
+
+            sent = mock_transport.send_sync.call_args[0][0]
+            assert len(sent) == 2
+            # Identical customer, metric, quantity AND occurred_at -- the frozen
+            # clock reproduces exactly what the old SHA-256 default hashed.
+            assert sent[0].occurred_at == sent[1].occurred_at == frozen
+            assert sent[0].idempotency_key != sent[1].idempotency_key
+        finally:
+            client.shutdown()
+            patcher.stop()
+
+    def test_explicit_key_preserved_verbatim_for_colliding_events(self):
+        """An explicit key is how a caller opts INTO dedup -- never rewritten."""
+        patcher, mock_transport = self._mock_transport()
+        try:
+            client = AforoClient(api_key="key", flush_interval=999)
+            for _ in range(2):
+                client.track(
+                    customer_id="cust_1",
+                    metric_name="sms.sent",
+                    quantity=1,
+                    occurred_at="2026-03-21T00:00:00.000Z",
+                    idempotency_key="caller-owned-key",
+                )
+            client.flush()
+
+            sent = mock_transport.send_sync.call_args[0][0]
+            assert [e.idempotency_key for e in sent] == [
+                "caller-owned-key",
+                "caller-owned-key",
+            ]
         finally:
             client.shutdown()
             patcher.stop()

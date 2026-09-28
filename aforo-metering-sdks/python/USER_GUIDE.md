@@ -52,7 +52,9 @@ client.track(
 )
 ```
 
-`track` returns immediately — the event is enqueued, not sent yet. `quantity` defaults to `1`; `occurred_at` defaults to now (ISO 8601, UTC); `idempotency_key` is auto-derived from `(customer_id, metric_name, quantity, occurred_at)` if you don't pass one.
+`track` returns immediately — the event is enqueued, not sent yet. `quantity` defaults to `1`; `occurred_at` defaults to now (ISO 8601, UTC); `idempotency_key` defaults to a fresh random UUID v4 per event if you don't pass one.
+
+> **Idempotency keys.** Each event gets its own random key, so two genuinely distinct events are never confused — even when they share customer, metric, quantity and timestamp. (It used to be derived by hashing those four fields; `occurred_at` has only millisecond precision, so same-millisecond events collided and the ingestor silently dropped the second one.) The key is minted once, when `track()` enqueues the event, and never changes, so a retried batch is still deduplicated. **If you want dedup — e.g. an at-least-once pipeline replaying the same logical event — pass your own `idempotency_key`;** that value is sent verbatim and is the only thing the ingestor dedupes on.
 
 Every event carries a top-level `productType` — the client's `product_type` (default `"API"`) unless you pass `track(product_type="AI_AGENT")` for that event. The production ingestor requires it.
 
@@ -154,7 +156,7 @@ Each request event carries top-level `productType`, `endpointPath` (path without
 | `customer_id` | `str` | required | Billed entity. |
 | `metric_name` | `str` | required | Metric you're metering. |
 | `quantity` | `float` | `1` | Amount of usage. |
-| `idempotency_key` | `str?` | auto | Dedupe key; auto-derived if omitted. |
+| `idempotency_key` | `str?` | random UUID v4 | Dedupe key. Omit it and each event gets its own unique key; pass one to opt into dedup. |
 | `occurred_at` | `str?` | now | ISO-8601 event time (UTC). |
 | `metadata` | `dict?` | `None` | Arbitrary key/values stored with the event. |
 | `product_type` | `str?` | client's | Per-event `productType` override. |

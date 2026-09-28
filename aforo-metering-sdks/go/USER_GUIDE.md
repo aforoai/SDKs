@@ -113,9 +113,9 @@ Field defaults applied inside `Track`:
 
 `Track` returns an error wrapping `metering.ErrInvalidEvent` (and buffers nothing) for a blank `CustomerID` / `MetricName`, a negative / NaN / Inf `Quantity`, or an unparseable `OccurredAt` — the ingestor would otherwise reject the whole batch the event lands in.
 - `OccurredAt` is set to now (`RFC3339Nano`, UTC) if empty.
-- `IdempotencyKey` is auto-derived (SHA-256 of `customerID:metricName:quantity:occurredAt`, first 32 hex chars) if empty.
+- `IdempotencyKey` defaults to a fresh random UUID v4 per event if empty.
 
-> ⚠ The auto idempotency key is deterministic over those four fields. Two `Track` calls with the same customer, metric, quantity, AND timestamp string produce the same key and dedupe downstream. If you want each call counted separately, set a distinct `OccurredAt` or pass your own `IdempotencyKey`.
+> **Idempotency keys.** Each event gets its own random key, so two genuinely distinct `Track` calls are never confused — even when they share customer, metric, quantity and `OccurredAt`. (It used to be SHA-256 of those four fields, which made same-timestamp calls collide so the ingestor silently dropped the second one.) The key is minted once, when `Track` enqueues the event, and never changes, so a retried batch is still deduplicated. **If you want dedup — e.g. an at-least-once pipeline replaying the same logical event — pass your own `IdempotencyKey`;** that value is sent verbatim and is the only thing the ingestor dedupes on.
 
 ## Step 5 — Force a flush and verify it landed
 
@@ -183,7 +183,7 @@ Content-Type: application/json
 | Events never arrive, no error | Process exited before a flush and `Close()` wasn't called | Add `defer client.Close()` / call it in your signal handler. The buffer is in-memory only. |
 | `Flush()` returns `Failed > 0` repeatedly | Bad API key, wrong `BaseURL`, or `4xx` from the ingestor | Verify `AFORO_API_KEY`, confirm `BaseURL`, and check the metric exists for the key's tenant. Non-`408`/`429` `4xx` is not retried. |
 | Middleware records nothing for some requests | No resolvable customer id, excluded path prefix, or excluded status | Confirm `X-Customer-Id` (or your `CustomerIDHeader` / `CustomerIDFunc`) is set upstream and the path/status isn't in the exclude lists. |
-| Two identical calls show as one event | Auto idempotency key collided (same customer/metric/quantity/`OccurredAt`) | Vary `OccurredAt` or pass a distinct `IdempotencyKey`. |
+| Two identical calls show as one event | You passed the same explicit `IdempotencyKey` for both | Leave `IdempotencyKey` empty (each event then gets its own UUID) or pass distinct keys. |
 | Older events seem missing under load | Buffer hit `MaxQueueSize` and dropped oldest entries | Raise `MaxQueueSize`, lower `FlushInterval`, or lower `FlushCount` so flushes drain sooner. |
 
 ## What this guide does NOT cover

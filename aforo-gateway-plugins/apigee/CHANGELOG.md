@@ -7,6 +7,7 @@ This bundle ships on the Aforo gateway-plugins line; the whole repo is versioned
 ## [Unreleased]
 
 ### Added
+- Fallback idempotency key when Apigee supplies no `messageid`: `messageid` is still the key (unique per request, stable across a retried ingest POST, so retries deduplicate), but the fallback is now unique per event instead of `'apigee-' + Date.now()` / an empty `requestId` segment. Two distinct requests sharing one key would make the ingestor answer DUPLICATE and silently drop the second, under-billing the caller.
 - KVM key `product_type` (default `API`, trimmed + upper-cased, unknown values passed through): every event now carries the `productType` the ingestor requires in production. The (unwired) compound builder sets it too.
 
 ### Fixed (product type)

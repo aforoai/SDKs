@@ -66,7 +66,7 @@ public class Demo {
 
 `track(...)` is non-blocking — it enqueues and returns. The event ships on the next 5-second flush, on reaching 50 buffered events, or when `close()` runs. The first two builder args are required (`customerId`, `metricName`); `quantity` defaults to `1` and must be `> 0`. Every event carries a top-level `productType`: the client default (`API`, or `AforoOptions.productType(...)`) unless you override it per event with `.productType("AI_AGENT")`. `track(...)` drops (with a warning) events with a blank `customerId`/`metricName` or `quantity <= 0`, because the ingestor would reject the whole batch.
 
-> ⚠ If you don't pass an `idempotencyKey`, the SDK derives a deterministic one from `customerId + metricName + quantity + occurredAt`. Two identical events generated in the same millisecond collapse to one. Pass an explicit `.idempotencyKey(...)` if you need to keep distinct same-instant events apart.
+> **Idempotency keys.** If you don't pass an `idempotencyKey`, the SDK mints a fresh random UUID v4 per event, so two genuinely distinct events are never confused — even when they share customer, metric, quantity and `occurredAt`. (It used to derive the key by hashing those four fields, so two identical events in the same millisecond collapsed into one and the second was silently dropped.) The key is minted once, when `track(...)` enqueues the event, and never changes, so a retried batch is still deduplicated. **If you want dedup — e.g. an at-least-once pipeline replaying the same logical event — pass your own `.idempotencyKey(...)`;** that value is sent verbatim and is the only thing the ingestor dedupes on.
 
 ## Step 4 — (Spring Boot) meter every request automatically
 

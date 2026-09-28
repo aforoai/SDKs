@@ -268,6 +268,17 @@ console.log('\nTest 7: OPTIONS, exclude_paths, exclude_status_codes, zero quanti
     assertEquals(ctx.vars['aforo.sendEvent'], 'true', 'normal request is sent');
     assertEquals(eventOf(ctx).idempotencyKey, 'msg-001', 'idempotencyKey = messageid');
     assert(!isNaN(Date.parse(eventOf(ctx).occurredAt)), 'occurredAt is ISO-8601');
+
+    // Without a messageid the key must still be unique per event: two distinct
+    // requests sharing one key would make the ingestor answer DUPLICATE and
+    // silently drop the second, under-billing the caller.
+    const a = createMockContext({ 'messageid': '' });
+    runPolicy(a);
+    const b = createMockContext({ 'messageid': '' });
+    runPolicy(b);
+    assert(!!eventOf(a).idempotencyKey, 'fallback idempotencyKey is non-empty');
+    assert(eventOf(a).idempotencyKey !== eventOf(b).idempotencyKey,
+        'two messageid-less requests get different idempotency keys');
 })();
 
 // Test 7b: productType
