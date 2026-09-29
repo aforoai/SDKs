@@ -62,9 +62,11 @@ public class AforoClient implements AutoCloseable {
      * Enqueue a usage event for batched delivery.
      * Non-blocking — returns immediately.
      *
-     * <p>Events with a blank customerId/metricName or a quantity &lt;= 0 are dropped
-     * (with a warning): the ingestor validates a batch as a whole, so one such event
-     * would fail every event in its batch.</p>
+     * <p>Events the ingestor would refuse — a blank or over-long customerId /
+     * metricName / idempotencyKey, a quantity &lt;= 0 or with more digits than the
+     * server accepts — are dropped with a warning. Such an event is rejected
+     * server-side and never billed, and because flushing happens in the background
+     * nobody would see that rejection. See {@link EventLimits}.</p>
      */
     public void track(TrackEvent event) {
         if (closed) throw new IllegalStateException("AforoClient is closed");
@@ -96,6 +98,13 @@ public class AforoClient implements AutoCloseable {
                 : IdempotencyKeyGenerator.generateRandom();
         String eventProductType = event.getProductType() != null
                 ? event.getProductType() : productType;
+
+        String violation = EventLimits.describeViolation(event.getCustomerId(), event.getMetricName(),
+                idempotencyKey, eventProductType, event.getQuantity());
+        if (violation != null) {
+            LOG.warning("Dropping event: " + violation);
+            return;
+        }
 
         ResolvedEvent resolved = new ResolvedEvent(
                 event.getCustomerId(), event.getMetricName(),

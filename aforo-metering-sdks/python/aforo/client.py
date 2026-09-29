@@ -12,6 +12,7 @@ from typing import Optional
 
 from .buffer import RingBuffer
 from .idempotency import generate_random_key
+from .limits import describe_limit_violation
 from .transport import Transport
 from .types import (
     DEFAULT_PRODUCT_TYPE,
@@ -266,6 +267,23 @@ class AforoClient:
         if idempotency_key is None:
             idempotency_key = generate_random_key()
 
+        # Checked before the event enters the buffer: an event that breaks one of
+        # the ingestor's compiled-in field constraints is rejected server-side and
+        # never billed, and because flushing happens in the background nobody
+        # would ever see that rejection.
+        resolved_product_type = _normalize_product_type(product_type) or self._product_type
+        violation = describe_limit_violation({
+            "customerId": customer_id,
+            "metricName": metric_name,
+            "quantity": quantity,
+            "idempotencyKey": idempotency_key,
+            "occurredAt": occurred_at,
+            "productType": resolved_product_type,
+            **(extra_fields or {}),
+        })
+        if violation:
+            raise ValueError(violation)
+
         resolved = ResolvedEvent(
             customer_id=customer_id,
             metric_name=metric_name,
@@ -273,7 +291,7 @@ class AforoClient:
             idempotency_key=idempotency_key,
             occurred_at=occurred_at,
             metadata=metadata,
-            product_type=_normalize_product_type(product_type) or self._product_type,
+            product_type=resolved_product_type,
             extra_fields=dict(extra_fields) if extra_fields else None,
         )
 

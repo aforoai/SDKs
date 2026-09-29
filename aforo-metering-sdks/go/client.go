@@ -57,8 +57,10 @@ func (c *AforoClient) Track(event TrackEvent) error {
 	}
 	c.mu.Unlock()
 
-	// Reject events the ingestor would refuse: one invalid event fails the
-	// whole batch server-side, so it must never reach the buffer.
+	// Reject events the ingestor would refuse. Such an event is dropped
+	// server-side and never billed, and because flushing happens in the
+	// background nobody would see that rejection — so it is reported here, to
+	// the caller that produced it, and never enters the buffer.
 	if strings.TrimSpace(event.CustomerID) == "" {
 		return fmt.Errorf("%w: CustomerID is required", ErrInvalidEvent)
 	}
@@ -80,6 +82,9 @@ func (c *AforoClient) Track(event TrackEvent) error {
 			return fmt.Errorf("%w: OccurredAt must be an RFC 3339 timestamp: %v", ErrInvalidEvent, err)
 		}
 		event.OccurredAt = ts.UTC().Format(time.RFC3339Nano)
+	}
+	if err := checkFieldLimits(&event); err != nil {
+		return err
 	}
 	// Minted once, here, when the event is enqueued — never at flush/retry time,
 	// so a retried batch carries the same keys and the ingestor deduplicates it.

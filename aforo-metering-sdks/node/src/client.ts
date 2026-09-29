@@ -2,6 +2,7 @@ import { AforoOptions, TrackEvent, ResolvedEvent, FlushResult } from './types';
 import { RingBuffer } from './buffer';
 import { Transport } from './transport';
 import { generateRandomKey } from './idempotency';
+import { describeLimitViolation } from './limits';
 
 const DEFAULT_BASE_URL = 'https://api.aforo.ai';
 const DEFAULT_PRODUCT_TYPE = 'API';
@@ -175,9 +176,16 @@ export class AforoClient {
    * Returns immediately — does not await HTTP.
    * Triggers a flush if the buffer reaches flushCount.
    *
-   * Throws if `customerId` or `metricName` is blank, or if `quantity` is not
-   * a positive number: the ingestor would reject the event and, because it
-   * validates a batch as a whole, every other event batched with it.
+   * Throws if the event breaks any constraint the ingestor enforces — a blank
+   * or over-long `customerId` / `metricName` / `idempotencyKey`, a `quantity`
+   * that is not positive or carries more than 14 integer digits / 6 decimal
+   * places, an `occurredAt` that is not an ISO-8601 instant, or any other
+   * capped field that is too long. Limits the server makes configurable (event
+   * age, clock skew, metadata size) are left to the server, so the SDK can
+   * never refuse usage a given deployment would accept. Such an event is rejected by the ingestor and never billed,
+   * and because flushing happens in the background nobody would see that
+   * rejection — so it is reported here instead, and never enters the buffer.
+   * See `limits.ts` for the limits and where each one comes from.
    */
   async track(event: TrackEvent): Promise<void> {
     if (this.closed) {
@@ -197,19 +205,36 @@ export class AforoClient {
       throw new Error('quantity must be a positive number (> 0)');
     }
 
+    const productType = normalizeProductType(event.productType) ?? this.productType;
+    // Minted once, here, when the event is enqueued — never at flush/retry
+    // time, so a retried batch carries the same keys and the ingestor
+    // deduplicates it. A caller-supplied key is passed through verbatim;
+    // otherwise each event gets its own random UUID. A deterministic hash of
+    // the event fields would make two genuinely distinct events in the same
+    // millisecond collide, and the ingestor would silently drop the second.
+    // Minted before the limit check so an over-long caller-supplied key is
+    // reported here rather than silently dropped by the server later.
+    const idempotencyKey = event.idempotencyKey ?? generateRandomKey();
+
+    const violation = describeLimitViolation({
+      customerId: event.customerId,
+      metricName: event.metricName,
+      quantity,
+      idempotencyKey,
+      occurredAt,
+      productType,
+      endpointPath: event.endpointPath,
+      httpMethod: event.httpMethod,
+    });
+    if (violation) throw new Error(violation);
+
     const resolved: ResolvedEvent = {
       customerId: event.customerId,
       metricName: event.metricName,
       quantity,
-      // Minted once, here, when the event is enqueued — never at flush/retry
-      // time, so a retried batch carries the same keys and the ingestor
-      // deduplicates it. A caller-supplied key is passed through verbatim;
-      // otherwise each event gets its own random UUID. A deterministic hash of
-      // the event fields would make two genuinely distinct events in the same
-      // millisecond collide, and the ingestor would silently drop the second.
-      idempotencyKey: event.idempotencyKey ?? generateRandomKey(),
+      idempotencyKey,
       occurredAt,
-      productType: normalizeProductType(event.productType) ?? this.productType,
+      productType,
       ...(event.metadata ? { metadata: event.metadata } : {}),
       ...(event.endpointPath !== undefined ? { endpointPath: event.endpointPath } : {}),
       ...(event.httpMethod !== undefined ? { httpMethod: event.httpMethod } : {}),
