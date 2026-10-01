@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `com.aforo:grpc-metering` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
+All notable changes to `ai.aforo:grpc-metering` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 

@@ -1,5 +1,5 @@
 /**
- * Real-server integration test for @aforo/grpc-metering.
+ * Real-server integration test for @aforoai/grpc-metering.
  *
  * Where the unit tests use mock ServerUnaryCall objects, this file:
  *   - spins up a REAL @grpc/grpc-js Server on a random localhost port

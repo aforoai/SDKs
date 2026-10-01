@@ -10,7 +10,7 @@ const DEFAULT_EXCLUDE_PATHS = ['/health', '/ready', '/metrics', '/favicon.ico'];
  * Captures after `await next()` completes — runs after the response is generated.
  *
  * ```typescript
- * import { koaMiddleware } from '@aforo/metering/middleware/koa';
+ * import { koaMiddleware } from '@aforoai/metering/middleware/koa';
  * app.use(koaMiddleware({ apiKey: process.env.AFORO_API_KEY, productType: 'API' }));
  * ```
  */

@@ -1,4 +1,4 @@
-# @aforo/graphql-metering — User Guide
+# @aforoai/graphql-metering — User Guide
 
 **Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** Node.js engineers running a GraphQL server (Apollo Server 4, `graphql-http`, or `express-graphql`) who need per-operation usage metered into Aforo.
 
@@ -18,7 +18,7 @@ A GraphQL server that emits one Aforo usage event per operation — tagged with 
 Once published, this is one line:
 
 ```bash
-npm i @aforo/graphql-metering graphql
+npm i @aforoai/graphql-metering graphql
 ```
 
 It isn't on npm yet. Build from source and link it:
@@ -38,7 +38,7 @@ npm install graphql
 Construct it once, at server startup. The constructor starts a background flush timer immediately.
 
 ```ts
-import { AforoGraphQlBilling } from '@aforo/graphql-metering';
+import { AforoGraphQlBilling } from '@aforoai/graphql-metering';
 
 const billing = new AforoGraphQlBilling({
   tenantId: 'tenant_acme',
@@ -58,7 +58,7 @@ const billing = new AforoGraphQlBilling({
 ```ts
 import { ApolloServer } from '@apollo/server';
 import { startStandaloneServer } from '@apollo/server/standalone';
-import { aforoApolloPlugin } from '@aforo/graphql-metering';
+import { aforoApolloPlugin } from '@aforoai/graphql-metering';
 
 const server = new ApolloServer({
   typeDefs,

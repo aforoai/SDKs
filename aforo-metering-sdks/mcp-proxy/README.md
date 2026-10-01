@@ -1,4 +1,4 @@
-# @aforo/mcp-proxy
+# @aforoai/mcp-proxy
 
 A sidecar that meters an MCP server you can't modify. It sits between the client and the server, watches the JSON-RPC traffic, and bills each `tools/call` to Aforo — over stdio, SSE, or Streamable HTTP. Best when you don't own the MCP server's source (or don't want to touch it) and the gateway-plugin path doesn't fit.
 
@@ -7,7 +7,7 @@ A sidecar that meters an MCP server you can't modify. It sits between the client
 ## Install
 
 ```bash
-npm i -g @aforo/mcp-proxy
+npm i -g @aforoai/mcp-proxy
 ```
 
 > **Not yet on the public npm registry.** Until it's published, install from source:

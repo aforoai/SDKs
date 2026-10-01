@@ -1,4 +1,4 @@
-# com.aforo:graphql-metering
+# ai.aforo:graphql-metering
 
 Meter every GraphQL operation without touching your resolvers. Install one `Instrumentation` on your `graphql-java` schema and each query/mutation/subscription emits a billing event with AST-accurate complexity scoring (`field_count + 5 × max_depth`).
 
@@ -10,7 +10,7 @@ Intended (once published to Maven Central):
 
 ```xml
 <dependency>
-  <groupId>com.aforo</groupId>
+  <groupId>ai.aforo</groupId>
   <artifactId>graphql-metering</artifactId>
   <version>1.0.0</version>
 </dependency>

@@ -1,4 +1,4 @@
-# @aforo/ws-metering — User Guide
+# @aforoai/ws-metering — User Guide
 
 **Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** Node.js engineers running a WebSocket server (`ws`, Fastify-WebSocket, Socket.io, Deno, Bun) who need per-connection usage metered into Aforo.
 
@@ -18,7 +18,7 @@ A WebSocket server that emits an Aforo usage event when a connection opens and a
 Once published:
 
 ```bash
-npm i @aforo/ws-metering ws
+npm i @aforoai/ws-metering ws
 ```
 
 It isn't on npm yet. Build from source and link it:
@@ -38,7 +38,7 @@ npm install ws     # only if using wrapServer
 Construct it once at startup. It starts a background flush timer immediately.
 
 ```ts
-import { AforoWsBilling } from '@aforo/ws-metering';
+import { AforoWsBilling } from '@aforoai/ws-metering';
 
 const billing = new AforoWsBilling({
   tenantId: 'tenant_acme',

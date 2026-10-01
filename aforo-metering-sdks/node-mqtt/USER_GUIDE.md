@@ -1,4 +1,4 @@
-# @aforo/mqtt-metering — User Guide
+# @aforoai/mqtt-metering — User Guide
 
 **Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** Node.js engineers running an Aedes MQTT broker, or an `mqtt.js` client against a third-party broker, who need MQTT usage metered into Aforo.
 
@@ -17,9 +17,9 @@ A metered MQTT pipeline: either a broker that emits an Aforo event for every cli
 Once published:
 
 ```bash
-npm i @aforo/mqtt-metering aedes   # broker mode
+npm i @aforoai/mqtt-metering aedes   # broker mode
 # or
-npm i @aforo/mqtt-metering mqtt    # client mode
+npm i @aforoai/mqtt-metering mqtt    # client mode
 ```
 
 It isn't on npm yet. Build from source and link it:
@@ -39,7 +39,7 @@ npm install aedes  # broker mode, OR: npm install mqtt
 Construct it once at startup. It starts a background flush timer immediately.
 
 ```ts
-import { AforoMqttBilling } from '@aforo/mqtt-metering';
+import { AforoMqttBilling } from '@aforoai/mqtt-metering';
 
 const billing = new AforoMqttBilling({
   tenantId: 'tenant_acme',

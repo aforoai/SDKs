@@ -3,7 +3,7 @@
  *
  * Thin wrapper that turns the agent's runtime lifecycle (start session →
  * record step → record tool call → end session) into Aforo metering events.
- * Sits one layer above the generic {@code @aforo/metering} ingestor client
+ * Sits one layer above the generic {@code @aforoai/metering} ingestor client
  * (no peer dependency — events are POSTed directly so the SDK is
  * stand-alone) and is parallel to {@code @aforoai/mcp-metering}'s
  * {@code wrapToolHandler} but for AI agent product types.

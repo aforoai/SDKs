@@ -1,5 +1,5 @@
 {
-  "name": "@aforo/mcp-metering",
+  "name": "@aforoai/mcp-metering",
   "version": "1.0.0",
   "description": "Aforo MCP Server Metering SDK — wraps MCP tool handlers with usage billing",
   "main": "dist/index.js",

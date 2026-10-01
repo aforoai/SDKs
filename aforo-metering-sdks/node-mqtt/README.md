@@ -1,4 +1,4 @@
-# @aforo/mqtt-metering
+# @aforoai/mqtt-metering
 
 Meter MQTT traffic into Aforo two ways: hook an Aedes broker you operate to meter every PUBLISH/SUBSCRIBE/CONNECT/DISCONNECT, or wrap an `mqtt.js` client to meter what it publishes and receives against a third-party broker (AWS IoT, HiveMQ Cloud, EMQ X Cloud).
 
@@ -14,9 +14,9 @@ Meter MQTT traffic into Aforo two ways: hook an Aedes broker you operate to mete
 Intended public install (once published):
 
 ```bash
-npm i @aforo/mqtt-metering aedes   # broker mode
+npm i @aforoai/mqtt-metering aedes   # broker mode
 # or
-npm i @aforo/mqtt-metering mqtt    # client mode
+npm i @aforoai/mqtt-metering mqtt    # client mode
 ```
 
 > **Not yet on the public npm registry — install from source for now.** `aedes` and `mqtt` are **optional** peer dependencies — install only the one your mode needs.
@@ -40,7 +40,7 @@ npm install mqtt       # client mode
 ```ts
 import aedes from 'aedes';
 import { createServer } from 'net';
-import { AforoMqttBilling } from '@aforo/mqtt-metering';
+import { AforoMqttBilling } from '@aforoai/mqtt-metering';
 
 const billing = new AforoMqttBilling({
   tenantId: 'tenant_acme',
@@ -63,7 +63,7 @@ process.on('SIGTERM', async () => { await billing.shutdown(); });
 
 ```ts
 import mqtt from 'mqtt';
-import { AforoMqttBilling } from '@aforo/mqtt-metering';
+import { AforoMqttBilling } from '@aforoai/mqtt-metering';
 
 const billing = new AforoMqttBilling({ tenantId: 'tenant_acme', productId: 'prod_mqtt_001', apiKey: process.env.AFORO_API_KEY!, ingestorUrl: 'https://api.aforo.ai' });
 const client = mqtt.connect('mqtts://broker.example.com', { clientId: `device-${deviceId}` });

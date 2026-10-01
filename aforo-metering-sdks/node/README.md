@@ -1,4 +1,4 @@
-# @aforo/metering
+# @aforoai/metering
 
 Track API usage from your Node service and send it to Aforo for billing. A buffered, batched, retrying client plus drop-in Express / Fastify / Koa middleware — `track()` returns immediately and events flush in the background, so metering never sits in your request path.
 
@@ -7,7 +7,7 @@ Track API usage from your Node service and send it to Aforo for billing. A buffe
 ## Install
 
 ```bash
-npm i @aforo/metering
+npm i @aforoai/metering
 ```
 
 > **Not yet on the public npm registry.** Until it's published, install from source:
@@ -26,7 +26,7 @@ Requires Node >= 18 (uses the built-in `fetch`).
 Meter a single event:
 
 ```ts
-import { AforoClient } from '@aforo/metering';
+import { AforoClient } from '@aforoai/metering';
 
 const aforo = new AforoClient({ apiKey: process.env.AFORO_API_KEY!, productType: 'API' });
 
@@ -39,7 +39,7 @@ await aforo.shutdown();
 Or meter every HTTP request with middleware — no per-route code:
 
 ```ts
-import { expressMiddleware } from '@aforo/metering/middleware/express';
+import { expressMiddleware } from '@aforoai/metering/middleware/express';
 
 app.use(expressMiddleware({
   apiKey: process.env.AFORO_API_KEY!,

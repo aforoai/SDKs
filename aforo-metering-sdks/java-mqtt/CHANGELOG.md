@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `com.aforo:mqtt-metering` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
+All notable changes to `ai.aforo:mqtt-metering` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 

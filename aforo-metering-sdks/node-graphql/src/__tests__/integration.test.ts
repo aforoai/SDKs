@@ -1,5 +1,5 @@
 /**
- * Real-server integration test for @aforo/graphql-metering.
+ * Real-server integration test for @aforoai/graphql-metering.
  *
  * Where the unit tests use a fake req/res object, this file:
  *   - builds a real GraphQL schema with the `graphql` peer dep

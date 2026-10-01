@@ -1,5 +1,5 @@
 {
-  "name": "@aforo/mcp-proxy",
+  "name": "@aforoai/mcp-proxy",
   "version": "1.0.0",
   "description": "Aforo MCP Transport Proxy — transparent sidecar for metering stdio/SSE/HTTP MCP servers",
   "license": "Apache-2.0",

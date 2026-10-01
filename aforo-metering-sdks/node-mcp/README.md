@@ -1,4 +1,4 @@
-# @aforo/mcp-metering
+# @aforoai/mcp-metering
 
 Wrap your MCP server's tool handlers so every `tools/call` is metered for billing, with session tracking — without changing your tool logic. Best when you own the MCP server source and want metering inline, not a sidecar.
 
@@ -7,7 +7,7 @@ Wrap your MCP server's tool handlers so every `tools/call` is metered for billin
 ## Install
 
 ```bash
-npm i @aforo/mcp-metering
+npm i @aforoai/mcp-metering
 ```
 
 > **Not yet on the public npm registry.** Until it's published, install from source:
@@ -26,7 +26,7 @@ Requires Node >= 18 (uses the built-in `fetch` and `AbortSignal.timeout`).
 Wrap the handler you already pass to `setRequestHandler`. The wrapper times the call, fires a usage event, and re-throws any error unchanged:
 
 ```ts
-import { AforoMcpBilling } from '@aforo/mcp-metering';
+import { AforoMcpBilling } from '@aforoai/mcp-metering';
 import { CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
 const billing = new AforoMcpBilling({
@@ -83,6 +83,6 @@ Step-by-step from install to a verified metered tool call: [USER_GUIDE.md](USER_
 
 ## What this doesn't cover
 
-This SDK **records** tool usage and reacts to a server kill signal — it does **not** pre-flight a quota check or block a call before it runs. Pre-flight quota gating lives in `@aforo/mcp-proxy` (the sidecar), not here. Delivery is best-effort with a 3-attempt exponential backoff (408/429/5xx/network errors; `Retry-After` honoured on 429; other 4xx are not retried); after that the batch is handed to `onError` and dropped. Heartbeats report uptime and (where the runtime exposes it) process heap — they are not an SLA monitor.
+This SDK **records** tool usage and reacts to a server kill signal — it does **not** pre-flight a quota check or block a call before it runs. Pre-flight quota gating lives in `@aforoai/mcp-proxy` (the sidecar), not here. Delivery is best-effort with a 3-attempt exponential backoff (408/429/5xx/network errors; `Retry-After` honoured on 429; other 4xx are not retried); after that the batch is handed to `onError` and dropped. Heartbeats report uptime and (where the runtime exposes it) process heap — they are not an SLA monitor.
 
 > Source note: `package.json` declares version `1.0.0` and the docs track that. The source carries an internal `SDK_VERSION = '1.1.0'` constant (stamped into heartbeat metadata), and `recordToolInvocation` stamps `sdkVersion: '1.0.0'` in its own metadata — an internal inconsistency that is metadata-only and doesn't affect behavior. The authoritative package version is `1.0.0`.

@@ -1,4 +1,4 @@
-# @aforo/graphql-metering
+# @aforoai/graphql-metering
 
 Meter every GraphQL operation — query, mutation, subscription — with AST-derived complexity scoring, and ship the usage events to Aforo without touching your resolvers. Drops in as an Apollo Server 4 plugin or an Express/`graphql-http` middleware.
 
@@ -9,7 +9,7 @@ Meter every GraphQL operation — query, mutation, subscription — with AST-der
 Intended public install (once published):
 
 ```bash
-npm i @aforo/graphql-metering graphql
+npm i @aforoai/graphql-metering graphql
 ```
 
 > **Not yet on the public npm registry — install from source for now.** `graphql` is a peer dependency (`^15 || ^16`), so install it in your app.
@@ -30,7 +30,7 @@ npm install graphql    # peer dependency, in your app
 ```ts
 import { ApolloServer } from '@apollo/server';
 import { startStandaloneServer } from '@apollo/server/standalone';
-import { AforoGraphQlBilling, aforoApolloPlugin } from '@aforo/graphql-metering';
+import { AforoGraphQlBilling, aforoApolloPlugin } from '@aforoai/graphql-metering';
 
 const billing = new AforoGraphQlBilling({
   tenantId: 'tenant_acme',
@@ -58,7 +58,7 @@ Express / `graphql-http` / `express-graphql` — use the middleware instead of t
 ```ts
 import express from 'express';
 import { createHandler } from 'graphql-http/lib/use/express';
-import { AforoGraphQlBilling } from '@aforo/graphql-metering';
+import { AforoGraphQlBilling } from '@aforoai/graphql-metering';
 
 const billing = new AforoGraphQlBilling({
   tenantId: 'tenant_acme',

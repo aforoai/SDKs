@@ -1,4 +1,4 @@
-# @aforo/mcp-metering — User Guide
+# @aforoai/mcp-metering — User Guide
 
 **Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** engineers who own an MCP server's source and want to meter `tools/call` invocations for Aforo billing.
 
@@ -17,7 +17,7 @@ An MCP server whose tool handlers are wrapped so each invocation fires an Aforo 
 Public install (once published):
 
 ```bash
-npm i @aforo/mcp-metering
+npm i @aforoai/mcp-metering
 ```
 
 Not on npm yet, so install from source for now:
@@ -38,7 +38,7 @@ npm i /path/to/aforo-metering-sdks/node-mcp/aforo-mcp-metering-1.0.0.tgz
 ## Step 2 — Create the billing client
 
 ```ts
-import { AforoMcpBilling } from '@aforo/mcp-metering';
+import { AforoMcpBilling } from '@aforoai/mcp-metering';
 
 const billing = new AforoMcpBilling({
   tenantId: 'tenant_smartai',
@@ -176,6 +176,6 @@ If you see that batch hit `/v1/ingest/batch`, the wrapper is wired correctly. Po
 
 ## What this guide does NOT cover
 
-- **Pre-flight quota / blocking a call before it runs.** This SDK meters after the fact and only reacts to a kill signal on the next flush. Use `@aforo/mcp-proxy --quota-enforcement` for a pre-flight gate.
-- **Metering MCP servers you don't own the source of.** Use the proxy sidecar (`@aforo/mcp-proxy`) for stdio/SSE/HTTP servers you can't modify.
+- **Pre-flight quota / blocking a call before it runs.** This SDK meters after the fact and only reacts to a kill signal on the next flush. Use `@aforoai/mcp-proxy --quota-enforcement` for a pre-flight gate.
+- **Metering MCP servers you don't own the source of.** Use the proxy sidecar (`@aforoai/mcp-proxy`) for stdio/SSE/HTTP servers you can't modify.
 - **Product / metric / rate-plan setup.** Creating the MCP_SERVER product and its `mcp_server.tool_invocations` metric is done in the Aforo console.

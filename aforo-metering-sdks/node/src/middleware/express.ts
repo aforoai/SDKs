@@ -11,7 +11,7 @@ const DEFAULT_EXCLUDE_PATHS = ['/health', '/ready', '/metrics', '/favicon.ico'];
  * Zero latency impact on the API call itself.
  *
  * ```typescript
- * import { expressMiddleware } from '@aforo/metering/middleware/express';
+ * import { expressMiddleware } from '@aforoai/metering/middleware/express';
  * app.use(expressMiddleware({ apiKey: process.env.AFORO_API_KEY, productType: 'API' }));
  * ```
  */

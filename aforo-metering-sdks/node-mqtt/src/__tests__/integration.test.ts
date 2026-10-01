@@ -1,5 +1,5 @@
 /**
- * Real-broker integration test for @aforo/mqtt-metering.
+ * Real-broker integration test for @aforoai/mqtt-metering.
  *
  * Where the unit tests in billing.test.ts use a fake EventEmitter to
  * stand in for the broker, this file spins up a REAL aedes broker on

@@ -1,4 +1,4 @@
-# com.aforo:metering — User Guide
+# ai.aforo:metering — User Guide
 
 **Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** Java backend engineers wiring usage metering into a service (plain Java or Spring Boot 3.x).
 
@@ -27,7 +27,7 @@ Then add the dependency to your service's `pom.xml`:
 
 ```xml
 <dependency>
-  <groupId>com.aforo</groupId>
+  <groupId>ai.aforo</groupId>
   <artifactId>metering</artifactId>
   <version>1.0.0</version>
 </dependency>

@@ -1,4 +1,4 @@
-# com.aforo:metering
+# ai.aforo:metering
 
 Track API usage from any Java service and let Aforo handle batching, retry, and delivery. Drop in a Spring Boot servlet filter to meter every request automatically, or call `AforoClient.track(...)` by hand when you decide what counts.
 
@@ -10,7 +10,7 @@ Intended (once published to Maven Central):
 
 ```xml
 <dependency>
-  <groupId>com.aforo</groupId>
+  <groupId>ai.aforo</groupId>
   <artifactId>metering</artifactId>
   <version>1.0.0</version>
 </dependency>

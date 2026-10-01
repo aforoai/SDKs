@@ -1,5 +1,5 @@
 {
-  "name": "@aforo/metering",
+  "name": "@aforoai/metering",
   "version": "1.0.0",
   "description": "Aforo usage metering SDK — track API usage events with batching, retry, and framework middleware",
   "main": "dist/cjs/index.js",
