@@ -64,6 +64,11 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/aforoai/aforo-metering-node.git"
+    "url": "git+https://github.com/aforoai/SDKs.git",
+    "directory": "aforo-metering-sdks/node"
+  },
+  "homepage": "https://github.com/aforoai/SDKs/tree/main/aforo-metering-sdks/node#readme",
+  "bugs": {
+    "url": "https://github.com/aforoai/SDKs/issues"
   }
 }
