@@ -6,6 +6,8 @@ This function ships on the Aforo gateway-plugins line; the whole repo is version
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-10-01
+
 ### Added
 - `PRODUCT_TYPE` env var / `ProductType` SAM parameter (default `API`): every event now carries the `productType` the ingestor requires in production. `compound-metering.js` `buildCompoundEvent` takes an optional `productType` (default `PRODUCT_TYPE` / `API`).
 

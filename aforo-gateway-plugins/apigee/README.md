@@ -2,7 +2,7 @@
 
 An Apigee shared-flow bundle that builds a usage event from each API call and POSTs it to Aforo. The metering step runs in `PostClientFlow`, after the response is returned, so it adds no latency to the API response.
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 > Apigee bundles carry no manifest version field, so the version for this artifact lives in the top-level [`VERSION`](VERSION) file. It matches the version stated here and in the changelog.
 

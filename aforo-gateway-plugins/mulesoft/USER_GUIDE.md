@@ -1,6 +1,6 @@
 # Aforo Metering — MuleSoft Anypoint Custom Policy — User Guide
 
-**Version:** 2.0.0 · **Updated:** 2026-06-29 · **Audience:** engineers who own a MuleSoft Anypoint API and need gateway-level metering for Aforo billing.
+**Version:** 2.1.0 · **Updated:** 2026-10-01 · **Audience:** engineers who own a MuleSoft Anypoint API and need gateway-level metering for Aforo billing.
 
 > ⛔ **NOT PRODUCTION-READY.** The artifacts this guide walks through are not a deployable Anypoint policy format and have not been run on a gateway. Follow the rebuild guidance at the top of [README.md](README.md) before using this guide.
 

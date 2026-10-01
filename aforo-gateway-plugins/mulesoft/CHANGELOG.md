@@ -4,6 +4,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-10-01
+
 ### Added
 - `product-type` property (default `API`, trimmed + upper-cased) in `mule-policy.yaml` / `mcp-mule-policy.yaml`, and `${product_type}` in `template.xml`: every event carries the `productType` the ingestor requires in production. A `tools/call` is `MCP_SERVER` only when both `toolName` and `agentId` are present (an MCP_SERVER event without `agentId` is rejected); otherwise the configured type.
 

@@ -1,6 +1,6 @@
 {
   "name": "aforo-metering-lambda",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Aforo API metering for AWS API Gateway via CloudWatch Logs",
   "main": "index.js",
   "scripts": {

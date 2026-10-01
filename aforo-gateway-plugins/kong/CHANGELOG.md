@@ -6,6 +6,8 @@ This plugin ships on the Aforo gateway-plugins line; the whole repo is versioned
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-10-01
+
 ### Added
 - `product_type` config (default `API`, trimmed + upper-cased, unknown values passed through): every event now carries the `productType` the ingestor requires in production. `compound-metering.lua` `build_compound_event` takes an optional `product_type` (default `API`).
 

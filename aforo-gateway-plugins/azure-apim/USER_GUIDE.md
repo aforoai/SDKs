@@ -1,6 +1,6 @@
 # Aforo Metering — Azure APIM Policy — User Guide
 
-**Version:** 2.0.0 (+ unreleased contract fixes) · **Updated:** 2026-09-21 · **Audience:** engineers who own an Azure API Management instance and need gateway-level metering for Aforo billing.
+**Version:** 2.1.0 · **Updated:** 2026-10-01 · **Audience:** engineers who own an Azure API Management instance and need gateway-level metering for Aforo billing.
 
 > ⚠ These fragments have not been executed on a live APIM instance. Follow this guide on a non-production instance first and use APIM request tracing to confirm each step.
 

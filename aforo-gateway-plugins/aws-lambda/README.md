@@ -2,9 +2,9 @@
 
 An AWS Lambda function that subscribes to API Gateway CloudWatch access logs, parses each entry, and batch-POSTs usage events to Aforo. It runs off the log stream asynchronously, so it adds nothing to your request path.
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
-> Version lives in [`package.json`](package.json) (`"version": "2.0.0"`). It matches the version stated here and in the changelog.
+> Version lives in [`package.json`](package.json) (`"version": "2.1.0"`). It matches the version stated here and in the changelog.
 
 ## Install
 
