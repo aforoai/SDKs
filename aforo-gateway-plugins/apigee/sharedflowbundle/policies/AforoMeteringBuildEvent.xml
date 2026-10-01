@@ -2,7 +2,7 @@
 <!-- Runs the JavaScript that builds the Aforo usage event payload from
      Apigee context variables. The output is stored in flow variable
      'aforo.eventPayload' for the ServiceCallout policy to send. -->
-<Javascript name="AforoMeteringBuildEvent" timeLimit="2000">
+<Javascript name="AforoMeteringBuildEvent" timeLimit="500" continueOnError="true">
     <DisplayName>Aforo Metering - Build Event Payload</DisplayName>
     <ResourceURL>jsc://aforo-metering.js</ResourceURL>
 </Javascript>

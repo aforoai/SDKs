@@ -1,117 +1,116 @@
-# Aforo Metering — MuleSoft Anypoint Custom Policy — User Guide
+# Aforo Usage Metering — MuleSoft custom policy — User Guide
 
-**Version:** 2.1.0 · **Updated:** 2026-10-01 · **Audience:** engineers who own a MuleSoft Anypoint API and need gateway-level metering for Aforo billing.
+**Version:** 2.2.0 · **Updated:** 2026-10-02 · **Audience:** engineers who run a Mule 4 API in Anypoint API Manager and want one Aforo usage event per call.
 
-> ⛔ **NOT PRODUCTION-READY.** The artifacts this guide walks through are not a deployable Anypoint policy format and have not been run on a gateway. Follow the rebuild guidance at the top of [README.md](README.md) before using this guide.
+> The package builds and its structure is checked in CI, but it has not been applied on a Mule runtime from this repository. Do Step 5 on a test API before you bill from it.
 
-## What you'll build
+## What you end up with
 
-A MuleSoft API in Anypoint API Manager with JWT validation + Aforo metering applied, emitting a usage event after every response with customer/tenant identity taken from the verified JWT. By the end you'll have called the API and confirmed the event landed in Aforo — plus a forged-header check proving a spoofed `X-Client-Id` is ignored.
+The `aforo-metering` policy in your Exchange, applied to one API after MuleSoft's JWT Validation policy. After each response it posts one event to `https://api.aforo.ai/v1/ingest/batch` with the customer id from the verified token. The API response is not changed or delayed.
 
-## Prerequisites
+## Before you start
 
-- An **Anypoint Platform** org with API Manager, and an API you can apply policies to.
-- The **Mule JWT Module** available to your gateway (`com.mulesoft.modules:mule-jwt-module`, classifier `mule-plugin`).
-- Aforo `ingestor_url`, `api_key`, `tenant_id`, and your Aforo **JWKS URI** + **issuer**.
-- Two test JWTs signed by that JWKS with different `customer_id` claims (for the security check in Step 6).
-- Optional: pricing-service URL (margin-guard), usage-ingestor quota URL (pre-flight quota).
+- A Mule 4 API instance (runtime 4.4.0 or later) in API Manager. Flex Gateway and Mule 3 are not supported.
+- JDK 17 and Maven 3.9, if you publish the policy yourself.
+- Your Anypoint organization id, and a connected app or user with Exchange Contributor and API Manager "Manage Policies".
+- An Aforo API key and your workspace id.
+- A metric named `api_calls` in your Aforo catalog, or the name of the metric you want to bill (Step 3).
+- Tokens whose `customer_id` (or `sub`) claim is the Aforo customer id.
 
-## Step 1 — Publish the policy descriptors to your org
+## Step 1 — Publish the policy to your Exchange
 
-Publish each YAML to Anypoint Exchange so it appears in API Manager's policy list. At minimum you need `jwt-validation-config.yaml` and `mule-policy.yaml`.
+From Aforo: Integrations → your MuleSoft connection → Metering → Deploy. This publishes the policy and applies it; skip to Step 5.
 
-```bash
-cd SDKs/aforo-gateway-plugins/mulesoft
-# Publish via the Anypoint CLI or Exchange UI. Policy ids are declared in each file:
-#   aforo-jwt-validation, aforo-metering, aforo-mcp-metering,
-#   aforo-margin-guard, aforo-preflight-quota, aforo-compound-metering
-```
+Yourself:
 
-> ⚠ `jwt-validation-config.yaml` is a descriptor *plus* an inline Mule flow (in its comment block). Paste that flow into your gateway project (`src/main/mule/aforo-jwt-validation.xml`) and add the Mule JWT Module dependency — the descriptor alone doesn't validate tokens.
+1. Add the Exchange credentials to `~/.m2/settings.xml`:
 
-## Step 2 — Set JWT validation secrets
+   ```xml
+   <servers>
+     <server>
+       <id>exchange-server</id>
+       <username>~~~Client~~~</username>
+       <password>CLIENT_ID~?~CLIENT_SECRET</password>
+     </server>
+   </servers>
+   ```
 
-In Anypoint Runtime Secrets Manager (or secure properties), set:
+2. Build and publish:
 
-```
-AFORO_JWKS_URI   = https://auth.aforo.ai/.well-known/jwks.json
-AFORO_JWT_ISSUER = https://auth.aforo.ai
-```
+   ```bash
+   cd mulesoft/aforo-metering
+   mvn clean deploy -Danypoint.org.id=YOUR_ORG_ID
+   ```
 
-## Step 3 — Apply JWT validation to the API
+> Exchange versions are immutable. If 2.2.0 is already in your Exchange, `mvn deploy` returns 409; raise `<version>` in `pom.xml` (and `VERSION`) to publish a change.
 
-In API Manager → your API → Policies → Apply, select **Aforo JWT Validation**. This declares the `aforo-jwt-validated` capability that the metering policy requires.
+## Step 2 — Apply JWT Validation
 
-## Step 4 — Apply the metering policy
+In API Manager → your API → Policies, apply MuleSoft's **JWT Validation** policy with your JWKS URL and issuer. The metering policy reads the claims this policy verified. Without it there is no verified customer and nothing is metered.
 
-Apply **Aforo Metering Policy** to the same API.
+## Step 3 — Apply Aforo Usage Metering
 
-> ⚠ Anypoint enforces ordering via `requiredCharacteristics`. If JWT validation isn't applied first, Anypoint **rejects** the metering policy configuration — that's the security boundary working, not a bug. Apply JWT validation, then metering.
-
-Set the metering policy properties:
+Policies → Add policy → Custom → **Aforo Usage Metering**. Give it a higher order number than JWT Validation.
 
 | Property | Value |
 |---|---|
 | `aforo-endpoint` | `https://api.aforo.ai/v1/ingest/batch` |
-| `aforo-api-key` | your Aforo API key (sensitive) |
-| `aforo-tenant-id` | `tenant_acme` (admin-pinned tenant fallback) |
-| `mcp-enabled` | `false` (set `true` only if fronting an MCP server) |
+| `aforo-api-key` | your Aforo API key |
+| `aforo-tenant-id` | your workspace id |
+| `default-metric` | leave empty for `api_calls`, or the catalog metric to bill |
+| `metric-mappings` | optional, e.g. `PREFIX\|/v1/search\|search_calls;EXACT\|/v1/export\|exports` |
+| `product-type` | leave empty for `API` |
 
-## Step 5 — Enable MCP metering (only if fronting an MCP server)
+> The policy cannot check a metric name against your catalog. A name the catalog does not have is rejected by the ingestor for that event, and the runtime logs `usage event rejected by the ingestor, not retried` with the response body.
 
-Either set `mcp-enabled = true` on the standard `aforo-metering` policy, or apply the dedicated `aforo-mcp-metering` policy. Both branch on a JSON-RPC `tools/call` body and emit `mcp_server.tool_invocations`.
+Every other property is optional; the full list is in the README's Configuration table.
 
-> ⚠ `agentId` is read only from the request body's `params._meta.agent_id` — the `X-Agent-Id` header fallback was removed in v2.0.0. If your clients don't put the agent in `_meta`, `agentId` is empty.
+## Step 4 — MCP servers only
 
-## Step 6 — Call the API and verify it landed
+Set `mcp-enabled` to `true` and `mcp-product-id` to the Aforo product id. A JSON-RPC `tools/call` POST is then sent as `mcp_server.tool_invocations` with `toolName` from `params.name`.
 
-Call through the gateway with a valid JWT and trace headers:
+> `agentId` comes only from `params._meta.agent_id` in the request body. A call without it is sent with the configured `product-type`, not `MCP_SERVER`, because the ingestor rejects an `MCP_SERVER` event with no agent.
 
-```bash
-curl -X GET "https://<your-app>.cloudhub.io/v1/accounts/123" \
-  -H "Authorization: Bearer <JWT_FOR_cust_legit>" \
-  -H "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" \
-  -H "tracestate: congo=t61rcWkgMzE"
-```
-
-In Aforo's usage view, filter to your tenant and confirm one event with `customerId = cust_legit` (the JWT value), `metricName = "GET /v1/accounts/123"`, `statusCode = 200`, `trace.traceparent = 00-4bf9...`.
-
-Now the security check and the no-JWT check:
+## Step 5 — Call the API and check the event
 
 ```bash
-# Forged X-Client-Id must be IGNORED — event still attributes to the JWT customer.
-curl -X GET "https://<your-app>.cloudhub.io/v1/accounts/123" \
-  -H "Authorization: Bearer <JWT_FOR_cust_legit>" \
-  -H "X-Client-Id: cust_victim"
-# Expected: ingestor event carries customerId=cust_legit, NOT cust_victim.
-
-# No JWT → 401 at the validation policy, request never reaches metering.
-curl -X GET "https://<your-app>.cloudhub.io/v1/accounts/123"
-# Expected: 401 invalid_token.
+curl "https://<your-app>.cloudhub.io/v1/accounts/123" \
+  -H "Authorization: Bearer <JWT_FOR_cust_legit>"
 ```
 
-> ⚠ If the forged-header request produces `customerId=cust_victim`, the IDOR has regressed — you're running a pre-v2.0.0 policy. Re-publish `mule-policy.yaml`.
+In Aforo, one event: `customerId=cust_legit`, `metricName=api_calls`, `productType=API`, `executionStatus=SUCCESS`, `statusCode=200`.
 
-This is exactly TEST 1–2 from [`tests/policy-contract.md`](tests/policy-contract.md); run the full matrix there before shipping a fork.
+Then the three checks that matter:
 
-## Configuration reference
+```bash
+# A forged header is ignored: the event still carries cust_legit.
+curl "https://<your-app>.cloudhub.io/v1/accounts/123" \
+  -H "Authorization: Bearer <JWT_FOR_cust_legit>" -H "X-Client-Id: cust_victim"
 
-See the README's Configuration table for every property. Core: `aforo-endpoint`, `aforo-api-key`, `aforo-tenant-id`. JWT: `jwks-uri`/`AFORO_JWKS_URI`, `jwt-issuer`/`AFORO_JWT_ISSUER`, `jwks-cache-ttl-seconds`, `org-service-token-check-url`. MCP: `mcp-enabled`, `mcp-product-id`. Margin-guard: `enabled`, `marginGuardUrl`, `tenantId`. Quota: `enabled`, `preflightUrl`, `fallback`. Compound: `enabled`, `extractionPaths`, `dimensionPaths`, `ingestorUrl`.
+# No token: 401 from JWT Validation, no event.
+curl "https://<your-app>.cloudhub.io/v1/accounts/123"
+
+# Preflight: no event.
+curl -X OPTIONS "https://<your-app>.cloudhub.io/v1/accounts/123"
+```
+
+The full matrix is [`tests/policy-contract.md`](tests/policy-contract.md).
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Anypoint won't let me apply the metering policy | The API has no `aforo-jwt-validation` policy, so the `aforo-jwt-validated` capability the metering policy requires is missing. | Apply JWT validation first (Step 3), then metering. |
-| Event lands but `events` array is empty / no event at all | `vars.aforo.customerId` or `vars.aforo.tenantId` is empty — the metering policy fails closed and writes no event. | Confirm the JWT validation flow actually sets those vars (the inline flow's Step 3). A valid token with no `customer_id`/`sub` and `tenant_id` won't be metered. |
-| Forged `X-Client-Id` shows up as the customer | You're running a pre-v2.0.0 policy that trusted the header. | Re-publish `mule-policy.yaml` / `mcp-mule-policy.yaml`. v2.0.0 reads only `vars.aforo.*`. |
-| 401 on every request after applying JWT validation | Wrong `AFORO_JWKS_URI`/`AFORO_JWT_ISSUER`, expired token, or the Mule JWT Module flow isn't wired. | Verify the secrets and that the inline JWT flow + `mule-jwt-module` dependency are in the gateway project. |
-| No event reaches the ingestor, request succeeded | The metering POST runs `afterResponse` and is best-effort; `aforo-endpoint` unreachable or `aforo-api-key` wrong. | Check gateway logs for the HTTP requester error. There's no on-gateway buffer for standard metering. |
-| Margin-guard returns 429 unexpectedly | The quick-check resolved a customer + tenant and blocked (L3) or throttled (L2). | Confirm the endpoint should be guarded; public endpoints with no resolved `vars.aforo.customerId` skip the check by design. |
-| MCP requests metered as standard API | `mcp-enabled` is `false`, or the body isn't a JSON-RPC `tools/call` (must be `jsonrpc: "2.0"`, `method: "tools/call"`). | Set `mcp-enabled = true` and confirm the request body shape. |
+| No events, API calls succeed | JWT Validation is missing or runs after this policy, or the token has neither `customer_id` nor `sub` | Give JWT Validation the lower order number; set `customer-id-claim` to the claim your tokens carry |
+| WARN `usage event rejected by the ingestor, not retried: HTTP 400` | Metric name not in the catalog, or unknown customer | Read the body in the log line; fix `default-metric` / `metric-mappings` or create the metric |
+| WARN `usage event rejected ... HTTP 401` | Wrong `aforo-api-key` | Replace the key |
+| WARN `usage event dropped: the metric name is empty or longer than 255 characters` | A mapping rule with an empty third part, or an over-long name | Fix the rule |
+| WARN `usage event not delivered (up to 3 attempts)` | The ingestor was unreachable or answered 5xx / 408 / 429 three times | Check `aforo-endpoint` and egress from the runtime |
+| 401 / 403 / 429 calls are missing from usage | Excluded by default | Set `exclude-status-codes` to `none` or to your own list |
+| MCP calls arrive as `API` | `mcp-enabled` is off, the body is not a JSON-RPC `tools/call`, or it has no `_meta.agent_id` | Turn it on; send the agent id in `_meta` |
+| Policy fails to apply after a configuration change | A value contains a double quote or `$` | Remove it |
 
-## What this guide does NOT cover
+## What this guide does not cover
 
-- **Building/deploying the Mule gateway app itself** (CloudHub/RTF, the JWT-module wiring beyond the supplied inline flow). That's your Anypoint deployment.
-- **The Aforo product/rate-plan configuration** that consumes these events — set that up in the Aforo console.
-- **Compound-metering path design** — the policy runs whatever `extractionPaths` map you supply against your response body; designing it for your payload is on you.
+- The specification files next to the package (`mcp-mule-policy.yaml`, `compound-metering-policy.yaml`, `margin-guard-policy.yaml`, `preflight-quota-policy.yaml`, `jwt-validation-config.yaml`). None of them is installable.
+- Flex Gateway. Its policies are built with the Policy Development Kit.
+- Creating the metric, product and rate plan in Aforo.

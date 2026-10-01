@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Aforo Usage Metering — Mule 4 custom policy (API Manager, Mule runtime
+  gateway). Layout follows MuleSoft's api-gateway-custom-policy-archetype.
+
+  Build:    mvn clean package
+  Publish:  mvn clean deploy -Danypoint.org.id=<your Anypoint organization id>
+            (credentials: server id "exchange-server" in ~/.m2/settings.xml)
+
+  Exchange requires the groupId of a published asset to be the organization
+  id, so groupId is a property. The default is a placeholder: a jar built
+  without -Danypoint.org.id is fine for inspection and for publishing
+  through the Exchange API (which takes the group from the URL), but
+  `mvn deploy` needs the real id.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>${anypoint.org.id}</groupId>
+    <artifactId>aforo-metering</artifactId>
+    <version>2.2.0</version>
+    <!-- Same number as ../VERSION; tests/policy.test.cjs fails when they differ. -->
+
+    <name>Aforo Usage Metering</name>
+    <description>Sends one usage event per API call to Aforo, after the response, without adding latency.</description>
+
+    <packaging>mule-policy</packaging>
+
+    <properties>
+        <anypoint.org.id>00000000-0000-0000-0000-000000000000</anypoint.org.id>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.build.outputTimestamp>2026-10-01T00:00:00Z</project.build.outputTimestamp>
+        <mule.maven.plugin.version>4.10.1</mule.maven.plugin.version>
+        <exchange.url>https://maven.anypoint.mulesoft.com/api/v3/organizations/${anypoint.org.id}/maven</exchange.url>
+        <http.connector.version>1.10.3</http.connector.version>
+        <securePropertyModuleVersion>1.2.7</securePropertyModuleVersion>
+    </properties>
+
+    <dependencies>
+        <!-- The policy posts the usage event itself. -->
+        <dependency>
+            <groupId>org.mule.connectors</groupId>
+            <artifactId>mule-http-connector</artifactId>
+            <version>${http.connector.version}</version>
+            <classifier>mule-plugin</classifier>
+        </dependency>
+        <!-- Lets the gateway hand the API key over encrypted when the
+             runtime has gateway encryption turned on. -->
+        <dependency>
+            <groupId>com.mulesoft.modules</groupId>
+            <artifactId>mule-secure-configuration-property-module</artifactId>
+            <version>${securePropertyModuleVersion}</version>
+            <classifier>mule-plugin</classifier>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.mule.tools.maven</groupId>
+                <artifactId>mule-maven-plugin</artifactId>
+                <version>${mule.maven.plugin.version}</version>
+                <extensions>true</extensions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-deploy-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>upload-template</id>
+                        <phase>deploy</phase>
+                        <goals>
+                            <goal>deploy-file</goal>
+                        </goals>
+                        <configuration>
+                            <repositoryId>exchange-server</repositoryId>
+                            <url>${exchange.url}</url>
+                            <file>${project.basedir}/${project.artifactId}.yaml</file>
+                            <generatePom>false</generatePom>
+                            <groupId>${project.groupId}</groupId>
+                            <artifactId>${project.artifactId}</artifactId>
+                            <version>${project.version}</version>
+                            <packaging>yaml</packaging>
+                            <classifier>policy-definition</classifier>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+    <distributionManagement>
+        <repository>
+            <id>exchange-server</id>
+            <name>Anypoint Exchange</name>
+            <url>${exchange.url}</url>
+            <layout>default</layout>
+        </repository>
+    </distributionManagement>
+
+    <repositories>
+        <repository>
+            <id>anypoint-exchange</id>
+            <name>Anypoint Exchange (public assets)</name>
+            <url>https://maven.anypoint.mulesoft.com/api/v3/maven</url>
+            <layout>default</layout>
+        </repository>
+        <repository>
+            <id>mulesoft-releases</id>
+            <name>MuleSoft Releases</name>
+            <url>https://repository.mulesoft.org/releases/</url>
+            <layout>default</layout>
+        </repository>
+    </repositories>
+
+    <pluginRepositories>
+        <pluginRepository>
+            <id>mule-plugin</id>
+            <name>Mule Repository</name>
+            <url>https://repository.mulesoft.org/nexus/content/repositories/public/</url>
+        </pluginRepository>
+    </pluginRepositories>
+</project>

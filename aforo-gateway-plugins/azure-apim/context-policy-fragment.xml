@@ -1,78 +1,107 @@
 <!--
   Aforo Request Context — Azure APIM Policy Fragment (fragment id: aforo-context)
 
-  REQUIRED by every other Aforo fragment. Include it in the <inbound> section,
-  AFTER aforo-jwt-validation (if you use it) and BEFORE aforo-preflight /
-  aforo-margin-guard:
+  OPTIONAL. Include it in the inbound section when you want the settings of
+  aforo-metering to come from Named Values, the customer to come from a
+  verified Aforo JWT or a subscription-to-customer map, or MCP request
+  bodies to be captured for detection:
 
     <inbound>
         <base />
-        <include-fragment fragment-id="aforo-jwt-validation" />   (optional)
+        <include-fragment fragment-id="aforo-jwt-validation" />   (optional, first)
         <include-fragment fragment-id="aforo-context" />
         ...
     </inbound>
 
-  It sets these context variables, which the metering / compound / preflight
-  fragments read (fragments cannot include other fragments, so the resolution
-  lives here once):
+  Installs made from release 2.1.0 already include it and already have the
+  Named Values below; nothing changes for them. An install that does not
+  include it keeps working: aforo-metering then bills the APIM subscription
+  id and reads its settings from context variables only.
 
-    aforo-customer-id  — the Aforo customer id this request is billed to, or ""
-                         when none can be resolved (the request is then NOT
-                         metered). Resolution order:
-                           1. customer_id claim of the verified Aforo JWT
-                              (aforo-jwt-payload, set by aforo-jwt-validation)
-                           2. the Named Value aforo-subscription-customer-map lookup of the
-                              APIM subscription id (context.Subscription.Id)
-                         Never the subscription KEY (a secret), never a request
-                         header, never a placeholder like "unknown".
-    aforo-product-type — productType stamped on every event (trimmed,
-                         upper-cased; unknown values passed through). A
-                         set-variable of the same name placed before this
-                         fragment (per-API override) wins, else the Named
-                         Value aforo-product-type, else "API" (also for "none").
-    aforo-mcp-body     — the request body, captured only when
-                         the Named Value aforo-mcp-enabled is "true" and the method is POST.
-                         The request body is not readable in <outbound> unless
-                         it was read with preserveContent in <inbound>.
+  It sets these context variables. In every case a variable of the same
+  name that is already set (non-blank) before this fragment wins, so a
+  per-API set-variable overrides the Named Value:
 
-  Named Values (all must EXIST — APIM rejects a policy that references an
-  undefined Named Value; use the value "none" to leave one empty):
+    aforo-customer-id     — the Aforo customer this request is billed to, or ""
+                            (the request is then NOT metered). Order:
+                              1. aforo-customer-id set before this fragment
+                              2. customer_id claim of the verified Aforo JWT
+                                 (aforo-jwt-payload, which only
+                                 aforo-jwt-validation sets, after validate-jwt
+                                 has checked signature, issuer and expiry)
+                              3. the subscription map, looked up by
+                                 context.Subscription.Id
+                            Never the subscription KEY (a secret), never a
+                            request header, never a placeholder.
+    aforo-product-type    — productType for every event (trimmed, upper-cased;
+                            blank or "none" = API).
+    aforo-metric-mappings — endpoint-to-metric rules for aforo-metering.
+    aforo-default-metric  — metric for requests no rule matches.
+    aforo-mcp-body        — the request body, captured only when the Named
+                            Value aforo-mcp-enabled is "true" and the method
+                            is POST.
+
+  Named Values this fragment references. All five must EXIST (APIM rejects a
+  policy that references an undefined Named Value); use the value "none" to
+  leave one empty:
     aforo-subscription-customer-map — "subscriptionId=customerId" pairs
-        separated by ";", e.g. "acme-prod=cust_123;globex=cust_456".
-        Named Values are limited to 4096 characters. Use "none" if every
-        caller presents an Aforo JWT.
-    aforo-mcp-enabled — "true" to capture the body for MCP detection.
-    aforo-product-type — productType on every event, e.g. "API" ("none" = API).
+        separated by ";", for example "acme-prod=cust_123;globex=cust_456".
+        A Named Value holds at most 4096 characters.
+    aforo-product-type     — for example "API"
+    aforo-metric-mappings  — "KIND|value|metricName;..." (see outbound-policy.xml)
+    aforo-default-metric   — for example "api_calls"
+    aforo-mcp-enabled      — "true" to capture the body for MCP detection
 
   Values must not contain double quotes or backslashes: they are substituted
   into C# string literals.
+
+  The expressions stay inside the subset azure-apim/tests/policy.test.cjs
+  can run (var, foreach, if; no lambdas, no null-conditional operators).
 -->
 <fragment>
     <set-variable name="aforo-customer-id" value="@{
-        var payload = context.Variables.GetValueOrDefault&lt;object&gt;(&quot;aforo-jwt-payload&quot;, null) as JObject;
-        var fromJwt = payload == null ? null : payload[&quot;customer_id&quot;]?.ToString();
-        if (!string.IsNullOrWhiteSpace(fromJwt)) { return fromJwt.Trim(); }
-        if (context.Subscription == null || string.IsNullOrEmpty(context.Subscription.Id)) { return &quot;&quot;; }
+        var existing = context.Variables.ContainsKey("aforo-customer-id")
+            ? Convert.ToString(context.Variables["aforo-customer-id"]) : "";
+        if (existing != null && existing.Trim().Length > 0) { return existing.Trim(); }
+        var payload = context.Variables.GetValueOrDefault<object>("aforo-jwt-payload", null) as JObject;
+        if (payload != null) {
+            var fromJwt = Convert.ToString(payload["customer_id"]);
+            if (fromJwt != null && fromJwt.Trim().Length > 0) { return fromJwt.Trim(); }
+        }
+        if (context.Subscription == null || string.IsNullOrEmpty(context.Subscription.Id)) { return ""; }
         var subId = context.Subscription.Id;
-        var map = &quot;{{aforo-subscription-customer-map}}&quot;;
-        foreach (var entry in map.Split(new[] { &quot;;&quot;, &quot;\n&quot; }, StringSplitOptions.RemoveEmptyEntries)) {
-            var idx = entry.IndexOf(&quot;=&quot;);
-            if (idx &lt;= 0) { continue; }
+        var map = context.Variables.ContainsKey("aforo-subscription-customer-map")
+            ? Convert.ToString(context.Variables["aforo-subscription-customer-map"]) : "";
+        if (map == null || map.Trim().Length == 0) { map = "{{aforo-subscription-customer-map}}"; }
+        foreach (var entry in map.Split(';', '\n')) {
+            var idx = entry.IndexOf("=");
+            if (idx <= 0) { continue; }
             if (entry.Substring(0, idx).Trim() == subId) { return entry.Substring(idx + 1).Trim(); }
         }
-        return &quot;&quot;;
+        return "";
     }" />
-    <!-- productType for every event: a per-API set-variable aforo-product-type
-         placed before this fragment wins, else the Named Value, else "API". -->
     <set-variable name="aforo-product-type" value="@{
-        var v = context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-product-type&quot;, &quot;&quot;);
-        if (string.IsNullOrWhiteSpace(v)) { v = &quot;{{aforo-product-type}}&quot;; }
-        v = (v ?? &quot;&quot;).Trim().ToUpperInvariant();
-        return (v.Length == 0 || v == &quot;NONE&quot;) ? &quot;API&quot; : v;
+        var v = context.Variables.ContainsKey("aforo-product-type")
+            ? Convert.ToString(context.Variables["aforo-product-type"]) : "";
+        if (v == null || v.Trim().Length == 0) { v = "{{aforo-product-type}}"; }
+        v = v.Trim().ToUpperInvariant();
+        return (v.Length == 0 || v == "NONE") ? "API" : v;
+    }" />
+    <set-variable name="aforo-metric-mappings" value="@{
+        var v = context.Variables.ContainsKey("aforo-metric-mappings")
+            ? Convert.ToString(context.Variables["aforo-metric-mappings"]) : "";
+        if (v == null || v.Trim().Length == 0) { v = "{{aforo-metric-mappings}}"; }
+        return v;
+    }" />
+    <set-variable name="aforo-default-metric" value="@{
+        var v = context.Variables.ContainsKey("aforo-default-metric")
+            ? Convert.ToString(context.Variables["aforo-default-metric"]) : "";
+        if (v == null || v.Trim().Length == 0) { v = "{{aforo-default-metric}}"; }
+        return v;
     }" />
     <choose>
-        <when condition="@(&quot;{{aforo-mcp-enabled}}&quot; == &quot;true&quot; &amp;&amp; context.Request.Method == &quot;POST&quot; &amp;&amp; context.Request.Body != null)">
-            <set-variable name="aforo-mcp-body" value="@(context.Request.Body.As&lt;string&gt;(preserveContent: true))" />
+        <when condition="@("{{aforo-mcp-enabled}}" == "true" && context.Request.Method == "POST" && context.Request.Body != null)">
+            <set-variable name="aforo-mcp-body" value="@(context.Request.Body.As<string>(preserveContent: true))" />
         </when>
     </choose>
 </fragment>

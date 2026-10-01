@@ -42,7 +42,12 @@ return {
                         product_type = {
                             type = "string",
                             default = "API",
-                            description = "Aforo productType sent on every event (trimmed, upper-cased): API, AGENTIC_API, AI_AGENT, MCP_SERVER, GRPC_API, GRAPHQL_API, WEBSOCKET_API or MQTT_BROKER. The ingestor requires it. MCP tools/call (mcp_enabled) is sent as MCP_SERVER when both toolName and agentId are known. Events missing the fields their type requires (MCP_SERVER: toolName + agentId) are skipped rather than sent, because one invalid event fails the whole batch. AI_AGENT / GRPC_API / GRAPHQL_API / WEBSOCKET_API / MQTT_BROKER need fields an HTTP gateway cannot observe or trust (agentId, gRPC/GraphQL/WebSocket/MQTT fields), so every non-MCP event would be skipped.",
+                            description = "productType sent on plain HTTP events (trimmed, upper-cased; default API). "
+                                .. "Protocol events set their own: MCP tools/call is MCP_SERVER when toolName and agentId are known, "
+                                .. "gRPC / GraphQL / WebSocket detection set GRPC_API / GRAPHQL_API / WEBSOCKET_API, and a request "
+                                .. "carrying a trace id is AGENTIC_API. The ingestor requires the field. An event missing the fields "
+                                .. "its type requires (e.g. AI_AGENT needs agentId + sessionId, which an HTTP gateway cannot observe) "
+                                .. "is skipped and counted, not sent.",
                         },
                     },
                     -- Metric configuration
@@ -50,7 +55,7 @@ return {
                         metric_name_pattern = {
                             type = "string",
                             default = "{method} {path}",
-                            description = "DEPRECATED. Template for metric name: {method}, {path}, {service}, {route}, {consumer}. Produces one metric per endpoint, which Aforo rejects unless every endpoint is registered in the catalog as its own metric. Prefer metric_mappings. Honoured only when set to something other than the default.",
+                            description = "Fixed metric name or template ({method}, {path}, {service}, {route}, {consumer}). Used only when set to something other than the default \"{method} {path}\": the default would produce one metric per endpoint, which the ingestor refuses unless each is a catalog metric. Resolution order: metric_header response header, mappings_url, metric_mappings, metric_name_pattern, default_metric.",
                         },
                     },
                     {
@@ -129,7 +134,31 @@ return {
                             -- the JWT's customer_id claim takes precedence over
                             -- the consumer source — see handler.lua.
                             one_of = { "consumer" },
-                            description = "Customer ID source. Only Kong consumer identity is accepted (JWT claim takes precedence when JWT validation is enabled).",
+                            description = "Kong consumer identity (custom_id, else username, else id). The only accepted value. A verified JWT takes precedence when configured: customer_id_jwt_claim (JWT verified by Kong's jwt plugin; exclusive), else jwt_validation_enabled (JWT verified by this plugin). No identity, no event.",
+                        },
+                    },
+                    -- Customer id from a JWT that Kong's bundled `jwt` plugin
+                    -- already verified on the same route/service. The claim is
+                    -- read from kong.ctx.shared.authenticated_jwt_token, which
+                    -- that plugin sets only after the signature check passes;
+                    -- the Authorization header is never parsed directly. When
+                    -- set, this is the only source: the Kong consumer on a jwt
+                    -- route is the token issuer, not the caller. No verified
+                    -- token, or no such claim -> the request is not metered.
+                    {
+                        customer_id_jwt_claim = {
+                            type = "string",
+                            required = false,
+                            len_min = 1,
+                            description = "Claim of the Kong-verified JWT to use as customerId (e.g. 'tenant_id'). Requires Kong's jwt plugin on the same route or service.",
+                        },
+                    },
+                    {
+                        customer_id_jwt_exclude_claims = {
+                            type = "array",
+                            elements = { type = "string", len_min = 1 },
+                            default = {},
+                            description = "With customer_id_jwt_claim: a verified token carrying any of these claims (present and not false/empty) is not metered. Example: staff impersonation tokens.",
                         },
                     },
                     -- Batching
@@ -171,6 +200,87 @@ return {
                             description = "Aforo product ID for MCP server metering (required when mcp_enabled=true)",
                         },
                     },
+                    -- executionStatus overrides (OUTCOME_BASED pricing).
+                    -- Exact upstream status code -> canonical outcome. Wins
+                    -- over the default table (README "Execution status
+                    -- mapping"). Also applies to gRPC, which maps each
+                    -- grpc-status to an equivalent HTTP code first
+                    -- (UNAUTHENTICATED=401, PERMISSION_DENIED=403,
+                    -- RESOURCE_EXHAUSTED=429, ...). Example:
+                    --   { ["404"] = "VALIDATION_FAILED", ["429"] = "ERROR" }
+                    {
+                        status_outcomes = {
+                            type = "map",
+                            required = false,
+                            keys = { type = "string", match = "^[2-5]%d%d$" },
+                            values = {
+                                type = "string",
+                                one_of = {
+                                    "SUCCESS", "PARTIAL", "TIMEOUT", "ERROR",
+                                    "VALIDATION_FAILED", "FAILED", "FAILURE",
+                                    "CANCELLED", "PENDING", "BLOCKED", "HITL_REQUIRED",
+                                },
+                            },
+                            description = "Per-status-code executionStatus overrides, e.g. {\"404\": \"VALIDATION_FAILED\"}. Keys are exact HTTP codes 200-599.",
+                        },
+                    },
+                    -- gRPC detection
+                    {
+                        grpc_enabled = {
+                            type = "boolean",
+                            default = false,
+                            description = "Enable gRPC detection (via Content-Type: application/grpc) for per-method billing",
+                        },
+                    },
+                    {
+                        grpc_product_id = {
+                            type = "string",
+                            description = "Aforo product ID for gRPC metering (required when grpc_enabled=true)",
+                        },
+                    },
+                    {
+                        grpc_path_prefix = {
+                            type = "string",
+                            -- No default: Kong rejects "" as a string default
+                            -- ("length must be at least 1"). Unset = no prefix.
+                            description = "Optional Kong route prefix to strip before parsing gRPC service/method. Leave empty if gRPC is routed at /. Example: '/grpc' for paths like /grpc/acme.UserService/GetUser",
+                        },
+                    },
+                    -- GraphQL detection
+                    {
+                        graphql_enabled = {
+                            type = "boolean",
+                            default = false,
+                            description = "Enable GraphQL detection (HTTP POST with application/json containing {query}) for per-operation billing",
+                        },
+                    },
+                    {
+                        graphql_product_id = {
+                            type = "string",
+                            description = "Aforo product ID for GraphQL metering (required when graphql_enabled=true)",
+                        },
+                    },
+                    {
+                        graphql_path_pattern = {
+                            type = "string",
+                            default = "graphql",
+                            description = "Substring required in the request path to consider an HTTP POST a GraphQL operation. Default: 'graphql' (also matches 'gql').",
+                        },
+                    },
+                    -- WebSocket detection
+                    {
+                        websocket_enabled = {
+                            type = "boolean",
+                            default = false,
+                            description = "Enable WebSocket detection. Emits one CONNECTION_OPENED event per successful 101 handshake. Frame-level metering requires @aforo/ws-metering SDK.",
+                        },
+                    },
+                    {
+                        websocket_product_id = {
+                            type = "string",
+                            description = "Aforo product ID for WebSocket metering (required when websocket_enabled=true)",
+                        },
+                    },
                     -- ── JWT Validation ──
                     -- Enable to validate Aforo RS256 JWTs before metering.
                     -- Checks: expiry, issuer, jti blocklist, client revocation.
@@ -180,7 +290,7 @@ return {
                         jwt_validation_enabled = {
                             type = "boolean",
                             default = false,
-                            description = "Validate Aforo JWT in the access phase before metering",
+                            description = "Verify the Aforo RS256 JWT in the access phase (signature against jwt_public_key, exp, nbf, iss, revocation) and answer 401 when it fails. Its customer_id claim then identifies the customer.",
                         },
                     },
                     {
@@ -193,21 +303,21 @@ return {
                     {
                         jwt_jwks_uri = {
                             type = "string",
-                            description = "Aforo JWKS URI for RS256 public key resolution (e.g. https://auth.smartai.com/.well-known/jwks.json). Used when lua-resty-jwt is installed.",
+                            description = "Accepted for compatibility; NOT used. No JWKS fetch is implemented, so a JWKS-only configuration verifies nothing and tokens are rejected. Set jwt_public_key, or verify tokens with Kong's jwt plugin and set customer_id_jwt_claim.",
                         },
                     },
                     {
                         jwt_public_key = {
                             type = "string",
                             encrypted = true,
-                            description = "PEM-encoded RSA public key for offline RS256 verification. Alternative to jwt_jwks_uri for static key setups.",
+                            description = "PEM-encoded RSA PUBLIC key of the token issuer. With jwt_validation_enabled the plugin verifies the RS256 signature against it (resty.openssl) before reading any claim. A private key is refused.",
                         },
                     },
                     {
                         jwt_allow_unverified_signature = {
                             type = "boolean",
                             default = false,
-                            description = "DANGEROUS. Accept JWTs whose RS256 signature could not be verified (lua-resty-jwt missing, or no jwt_public_key set). Defaults to false: unverifiable tokens are rejected. Enable ONLY when signatures are already verified upstream (Kong Enterprise native JWT plugin, service mesh, external authorizer). With this true and no verification upstream, any caller can mint a token naming any customer_id/tenant_id.",
+                            description = "DANGEROUS. Let a JWT through when this plugin cannot verify its signature (no jwt_public_key). For deployments that verify the token before it reaches this plugin. Since 2.2.0 such a token grants ACCESS only: its claims are not used for customerId or keyId unless Kong's jwt plugin verified the same token. With this true and nothing verifying upstream, any caller can mint a token.",
                         },
                     },
                     -- Redis host/port are shared with rate-limit enforcement above.

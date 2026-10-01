@@ -50,9 +50,39 @@ Parameters:
     Description: >-
       Aforo productType sent on every event (API, AGENTIC_API, AI_AGENT, ...).
       The ingestor requires it. MCP tools/call with both toolName and agentId
-      is sent as MCP_SERVER instead. Events missing their type's required
+      is sent as MCP_SERVER instead; with API, a request carrying a W3C
+      traceparent is sent as AGENTIC_API. Events missing their type's required
       fields are skipped rather than sent.
     Default: API
+  ExcludeStatusCodes:
+    Type: String
+    Description: >-
+      Comma-separated HTTP status codes that are not metered. A list replaces
+      the default; "none" meters every status.
+    Default: '401,403,429'
+  StatusOutcomes:
+    Type: String
+    Description: >-
+      Optional executionStatus overrides for OUTCOME_BASED pricing, e.g.
+      "404=VALIDATION_FAILED,429=ERROR". Leave empty for the default table
+      (400/422 VALIDATION_FAILED, 401/403/429 BLOCKED, other 4xx/5xx ERROR).
+    Default: ''
+  CustomerIdSource:
+    Type: String
+    Description: >-
+      Where the customer id comes from. "consumer": the Aforo authorizer's
+      customerId ($context.authorizer.customerId), then the IAM caller
+      ($context.identity.caller). "authorizer": the authorizer's customerId
+      only. The API key value and the client IP are never used.
+    Default: consumer
+    AllowedValues: [consumer, authorizer]
+  AforoTenantId:
+    Type: String
+    Description: >-
+      Optional, kept for stacks deployed before 2.2.0. Not sent to Aforo (the
+      tenant is derived from the API key). It is part of the MCP idempotency
+      key and a property on the EMF metrics; keep the value you already use.
+    Default: ''
 
 Resources:
   AforoMeteringFunction:
@@ -73,15 +103,48 @@ Resources:
           METRIC_NAME_PATTERN: !Ref MetricNamePattern
           QUANTITY_SOURCE: !Ref QuantitySource
           PRODUCT_TYPE: !Ref ProductType
+          CUSTOMER_ID_SOURCE: !Ref CustomerIdSource
+          EXCLUDE_STATUS_CODES: !Ref ExcludeStatusCodes
+          STATUS_OUTCOMES: !Ref StatusOutcomes
+          AFORO_TENANT_ID: !Ref AforoTenantId
           FLUSH_COUNT: '50'
           INCLUDE_METADATA: 'true'
-      # Async invocation (CloudWatch Logs): the handler throws when a batch
-      # fails transiently so Lambda retries it; idempotency keys dedupe.
+      # Delivery guarantee: when a batch fails transiently (network, 5xx,
+      # 408, 429) after the in-handler retries, the handler THROWS instead
+      # of returning 200, so Lambda's async invocation retries redeliver the
+      # same log events (the ingestor dedups on stable idempotency keys —
+      # see index.js). When those retries ALSO exhaust, the failed
+      # invocation record (containing the original compressed log payload)
+      # lands in the OnFailure queue below instead of being discarded — the
+      # terminal loss becomes observable and replayable. Alarm on this
+      # queue's ApproximateNumberOfMessagesVisible > 0. A permanent 4xx is
+      # dropped without a throw (EMF metric EventsRejected).
       EventInvokeConfig:
         MaximumRetryAttempts: 2
+        MaximumEventAgeInSeconds: 21600
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt AforoMeteringFailureQueue.Arn
       Tags:
         aforo-managed: 'true'
         purpose: metering
+
+  # Terminal failure destination — receives the failed async invocation
+  # record after the Lambda's in-handler retries AND CloudWatch's async
+  # retries are exhausted. 14-day retention gives operators two weeks to
+  # replay (re-invoke the function with the recorded event payload)
+  # before the events are truly lost.
+  AforoMeteringFailureQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: aforo-metering-failures
+      MessageRetentionPeriod: 1209600  # 14 days (maximum)
+      Tags:
+        - Key: aforo-managed
+          Value: 'true'
+        - Key: purpose
+          Value: metering-failure-dlq
 
   AforoMeteringLogPermission:
     Type: AWS::Lambda::Permission
@@ -107,3 +170,13 @@ Outputs:
   FunctionName:
     Description: Name of the Lambda function
     Value: !Ref AforoMeteringFunction
+  FailureQueueUrl:
+    Description: >-
+      SQS queue receiving failed invocation records after all retries
+      exhaust. Alarm on ApproximateNumberOfMessagesVisible > 0 — a
+      message here is a permanently-undelivered batch of usage events
+      (replayable for 14 days).
+    Value: !Ref AforoMeteringFailureQueue
+  FailureQueueArn:
+    Description: ARN of the failure queue
+    Value: !GetAtt AforoMeteringFailureQueue.Arn

@@ -109,6 +109,53 @@ jobs:
             luajit -b "$f" /dev/null
           done
 
+  kong-busted:
+    name: Kong plugin (busted, Lua 5.1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install Lua 5.1, LuaRocks, busted, lua-cjson
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua5.1 liblua5.1-0-dev luarocks openssl
+          sudo luarocks --lua-version=5.1 install busted
+          sudo luarocks --lua-version=5.1 install lua-cjson
+      - name: busted spec/
+        working-directory: aforo-gateway-plugins/kong
+        run: busted spec/
+
+  gateway-plugin-tests:
+    name: Gateway plugins (AWS, Apigee, Azure, MuleSoft)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: ingest auth standard (X-API-Key, api.aforo.ai)
+        working-directory: aforo-gateway-plugins
+        run: node tests/ingest-auth-standard.test.cjs
+      - name: AWS Lambda
+        working-directory: aforo-gateway-plugins/aws-lambda
+        run: npm test
+      - name: Apigee
+        working-directory: aforo-gateway-plugins
+        run: node apigee/tests/unit-tests.cjs
+      - name: Azure APIM (policy expressions against a mock context)
+        working-directory: aforo-gateway-plugins
+        run: node azure-apim/tests/policy.test.cjs
+      - name: MuleSoft (structure)
+        working-directory: aforo-gateway-plugins
+        run: node mulesoft/tests/policy.test.cjs
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: MuleSoft (package the policy jar)
+        working-directory: aforo-gateway-plugins/mulesoft/aforo-metering
+        run: mvn -B -ntp clean package
+
   emqx-erlang:
     name: EMQX plugin (rebar3 compile)
     runs-on: ubuntu-latest
@@ -164,8 +211,16 @@ jobs:
                   print(f"FAIL {path}: {e}")
                   fail += 1
 
+          # Azure APIM policies are uploaded as format "rawxml": a C# policy
+          # expression may hold unescaped quotes inside an attribute, which a
+          # strict XML parser refuses. azure-apim/tests/policy.test.cjs checks
+          # them with the expressions masked (gateway-plugin-tests job).
+          RAWXML = 'aforo-gateway-plugins/azure-apim/'
+
           for base in ('aforo-gateway-plugins', 'aforo-emqx-plugin'):
               for path in glob.glob(f'{base}/**/*.xml', recursive=True):
+                  if path.startswith(RAWXML) or '/target/' in path:
+                      continue
                   check(path, 'xml')
               for path in glob.glob(f'{base}/**/*.json', recursive=True):
                   check(path, 'json')
@@ -180,7 +235,7 @@ jobs:
     # One stable check to require in branch protection — green only if every
     # blocking job above passed. (emqx-erlang is informational, not required.)
     if: always()
-    needs: [go, node, python, java, kong-lua, gateway-config]
+    needs: [go, node, python, java, kong-lua, kong-busted, gateway-plugin-tests, gateway-config]
     runs-on: ubuntu-latest
     steps:
       - name: Verify required jobs succeeded
