@@ -1,67 +1,88 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <!-- Reads Aforo configuration from the organization-scoped KVM
-     'aforo-metering-config'. Values are stored as flow variables for use
-     by the JavaScript policies and step conditions.
-
-     Required keys: aforo_endpoint, api_key, default_metric.
-     Optional product_type (default API) is the productType on every event.
-     api_key is assigned to a private.* variable so it is masked in Debug
-     sessions. tenant_id is used ONLY by margin guard (when the JWT carries
-     no tenant_id); it is never sent to the ingestor, which takes the
-     tenant from the API key. -->
-<KeyValueMapOperations name="AforoMeteringReadConfig" mapIdentifier="aforo-metering-config">
+     'aforo-metering-config' into flow variables.
+     Every variable is private.aforo.*: Apigee X and hybrid encrypt every
+     KVM and reject a Get whose assignTo does not start with "private."
+     (it also keeps the API key out of debug sessions).
+     continueOnError=true: a missing or unreadable KVM must not fail the
+     API call. The send steps do not run without an endpoint.
+     tenant_id is used only by margin guard (when the JWT carries no
+     tenant_id). It is never sent to the ingestor, which takes the tenant
+     from the API key. -->
+<KeyValueMapOperations name="AforoMeteringReadConfig" mapIdentifier="aforo-metering-config" continueOnError="true">
     <DisplayName>Aforo Metering - Read Config from KVM</DisplayName>
     <ExpiryTimeInSecs>300</ExpiryTimeInSecs>
     <Scope>organization</Scope>
-    <Get assignTo="aforo.endpoint">
+    <Get assignTo="private.aforo.endpoint">
         <Key><Parameter>aforo_endpoint</Parameter></Key>
     </Get>
     <Get assignTo="private.aforo.apiKey">
         <Key><Parameter>api_key</Parameter></Key>
     </Get>
-    <Get assignTo="aforo.tenantId">
+    <Get assignTo="private.aforo.tenantId">
         <Key><Parameter>tenant_id</Parameter></Key>
     </Get>
-    <Get assignTo="aforo.metricMappings">
+    <!-- Metric name. Precedence in aforo-metering.js: first matching
+         metric_mappings rule, then metric_name_pattern (when set), then
+         default_metric, then "api_calls". -->
+    <Get assignTo="private.aforo.metricMappings">
         <Key><Parameter>metric_mappings</Parameter></Key>
     </Get>
-    <Get assignTo="aforo.defaultMetric">
-        <Key><Parameter>default_metric</Parameter></Key>
-    </Get>
-    <Get assignTo="aforo.metricNamePattern">
+    <Get assignTo="private.aforo.metricNamePattern">
         <Key><Parameter>metric_name_pattern</Parameter></Key>
     </Get>
-    <Get assignTo="aforo.quantitySource">
+    <Get assignTo="private.aforo.defaultMetric">
+        <Key><Parameter>default_metric</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo.quantitySource">
         <Key><Parameter>quantity_source</Parameter></Key>
     </Get>
-    <Get assignTo="aforo.customerIdSource">
+    <Get assignTo="private.aforo.customerIdSource">
         <Key><Parameter>customer_id_source</Parameter></Key>
     </Get>
-    <Get assignTo="aforo.excludePaths">
+    <!-- Exclusions, applied by aforo-metering.js (sets aforo.skip).
+         exclude_paths: CSV of path prefixes; absent -> /health,/ready,/metrics.
+         exclude_status_codes: CSV of HTTP codes; absent -> 401,403,429.
+         Set either to "none" to exclude nothing. -->
+    <Get assignTo="private.aforo.excludePaths">
         <Key><Parameter>exclude_paths</Parameter></Key>
     </Get>
-    <Get assignTo="aforo.excludeStatusCodes">
+    <Get assignTo="private.aforo.excludeStatusCodes">
         <Key><Parameter>exclude_status_codes</Parameter></Key>
     </Get>
-    <Get assignTo="aforo.includeMetadata">
+    <!-- Optional executionStatus overrides: "404=VALIDATION_FAILED,429=ERROR" -->
+    <Get assignTo="private.aforo.statusOutcomes">
+        <Key><Parameter>status_outcomes</Parameter></Key>
+    </Get>
+    <!-- Retries after a failed send: 0 or 1. Absent or invalid -> 1.
+         Values above 1 are treated as 1. The connect (1 s) and response
+         (2 s) timeouts are fixed in the ServiceCallout policies: Apigee
+         does not accept a flow variable there. -->
+    <Get assignTo="private.aforo.maxRetries">
+        <Key><Parameter>max_retries</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo.includeMetadata">
         <Key><Parameter>include_metadata</Parameter></Key>
     </Get>
-    <Get assignTo="aforo.productType">
+    <!-- productType on every event. Absent -> API. -->
+    <Get assignTo="private.aforo.productType">
         <Key><Parameter>product_type</Parameter></Key>
     </Get>
-    <Get assignTo="aforo.mcpEnabled">
+    <Get assignTo="private.aforo.mcpEnabled">
         <Key><Parameter>mcp_enabled</Parameter></Key>
     </Get>
-    <Get assignTo="aforo.mcpProductId">
+    <Get assignTo="private.aforo.mcpProductId">
         <Key><Parameter>mcp_product_id</Parameter></Key>
     </Get>
-    <Get assignTo="aforo.jwtValidationEnabled">
+    <!-- "true" turns JWT validation on, "false" turns it off. Absent ->
+         on only when aforo_jwks_uri is set (see sharedflows/default.xml). -->
+    <Get assignTo="private.aforo.jwtValidationEnabled">
         <Key><Parameter>jwt_validation_enabled</Parameter></Key>
     </Get>
-    <Get assignTo="aforo.marginGuardEnabled">
+    <Get assignTo="private.aforo.marginGuardEnabled">
         <Key><Parameter>margin_guard_enabled</Parameter></Key>
     </Get>
-    <Get assignTo="aforo.marginGuardUrl">
+    <Get assignTo="private.aforo.marginGuardUrl">
         <Key><Parameter>margin_guard_url</Parameter></Key>
     </Get>
 </KeyValueMapOperations>

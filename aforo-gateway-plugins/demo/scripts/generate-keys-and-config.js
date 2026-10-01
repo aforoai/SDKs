@@ -199,10 +199,9 @@ ${indent(publicKey, 12)}
           jwt_redis_host: ${CONFIG.redisHost}
           jwt_redis_port: ${CONFIG.redisPort}
 
-          # Endpoint -> metric. Without this the plugin falls back to
-          # "{method} {path}", producing a metric per endpoint that the catalog
-          # does not know, and every event is rejected as an unknown metric.
-          # These names must exist in YOUR catalog -- edit to match.
+          # Endpoint -> metric. Unmapped paths bill as default_metric.
+          # These names must exist in YOUR catalog -- edit to match; the
+          # ingestor refuses an event whose metric it does not know.
           metric_mappings:
             - path_pattern: "^/api/orders"
               metric_name: ${CONFIG.orderMetric}

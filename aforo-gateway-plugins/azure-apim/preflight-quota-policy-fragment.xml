@@ -2,86 +2,105 @@
     Aforo Pre-Flight Quota Check Policy Fragment for Azure APIM
     (fragment id: aforo-preflight)
 
-    Calls usage-ingestor /api/v1/quota/check synchronously before proxying.
-    Fail-open: returns ALLOW if the check times out or fails.
+    Calls the ingestor's /api/v1/quota/check synchronously before the request
+    is proxied. The call has a fixed 1 second timeout. When the check times
+    out, errors or answers anything but 200, the fallback decision applies
+    (ALLOW unless you set DENY).
 
-    A policy fragment cannot contain section elements. Include this in
-    <inbound> AFTER aforo-context (which resolves aforo-customer-id):
+    A fragment holds statements only. Include it in the inbound section,
+    after aforo-context when you use that fragment:
 
       <inbound>
           <base />
-          <include-fragment fragment-id="aforo-jwt-validation" />   (optional)
-          <include-fragment fragment-id="aforo-context" />
           <include-fragment fragment-id="aforo-preflight" />
       </inbound>
 
-    Skipped for OPTIONS and when no Aforo customer was resolved. The customer
-    sent is the resolved Aforo customer id — never the APIM subscription key,
-    which is a credential.
+    Settings are CONTEXT VARIABLES, set with set-variable before the include.
+    A Named Value is not a context variable: to use one, pass it through
+    set-variable, value = the Named Value in double braces. Release 2.1.0
+    read the same names as Named Values directly; see CHANGELOG 2.2.0 for
+    the lines to add.
 
-    Named Values (double-brace syntax):
-      aforo-preflight-enabled:    "true" | "false"
-      aforo-preflight-url:        Usage ingestor quota check URL (…/api/v1/quota/check)
-      aforo-preflight-fallback:   "ALLOW" or "DENY" when the check errors
-      aforo-api-key:              Aforo API key (Secret), sent as X-API-Key.
-                                  The key needs quotas:read (unverified for a
-                                  usage:ingest-only key).
+      aforo-preflight-enabled   "true" to switch this fragment on
+      aforo-preflight-url       https://api.aforo.ai/api/v1/quota/check
+      aforo-preflight-fallback  "ALLOW" (default) or "DENY"
+      aforo-api-key             optional. When the variable is absent the
+                                Named Value aforo-api-key is used (it must
+                                exist). Sent as X-API-Key.
+      aforo-customer-id         the Aforo customer. Absent: the APIM
+                                subscription id. Empty, over 64 characters,
+                                or no subscription: the check is skipped.
+                                Never the subscription key, which is a
+                                credential.
+
+    Skipped for OPTIONS, when no customer resolves, and when
+    aforo-preflight-url is empty. aforo-preflight-timeout-ms was documented
+    in earlier releases and never read; it has no effect.
 -->
 <fragment>
-        <choose>
-            <when condition="@(&quot;{{aforo-preflight-enabled}}&quot; == &quot;true&quot; &amp;&amp; context.Request.Method != &quot;OPTIONS&quot; &amp;&amp; !string.IsNullOrEmpty(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-customer-id&quot;, &quot;&quot;)))">
-                <send-request mode="new" response-variable-name="preflightResponse" timeout="1" ignore-error="true">
-                    <set-url>{{aforo-preflight-url}}</set-url>
-                    <set-method>POST</set-method>
-                    <set-header name="Content-Type" exists-action="override">
-                        <value>application/json</value>
-                    </set-header>
-                    <set-header name="X-API-Key" exists-action="override">
-                        <value>{{aforo-api-key}}</value>
-                    </set-header>
-                    <set-body><![CDATA[@{
-                        var body = new JObject();
-                        body["customerId"] = context.Variables.GetValueOrDefault<string>("aforo-customer-id", "");
-                        return body.ToString(Newtonsoft.Json.Formatting.None);
-                    }]]></set-body>
-                </send-request>
+    <set-variable name="aforo-preflight-customer" value="@{
+        var c = "";
+        if (context.Variables.ContainsKey("aforo-customer-id")) { c = Convert.ToString(context.Variables["aforo-customer-id"]); }
+        else if (context.Subscription != null) { c = context.Subscription.Id; }
+        if (c == null) { c = ""; }
+        c = c.Trim();
+        return c.Length > 64 ? "" : c;
+    }" />
+    <choose>
+        <when condition="@(context.Variables.GetValueOrDefault<string>("aforo-preflight-enabled", "false") == "true" && context.Request.Method != "OPTIONS" && Convert.ToString(context.Variables["aforo-preflight-customer"]).Length > 0 && context.Variables.GetValueOrDefault<string>("aforo-preflight-url", "").Trim().Length > 0)">
+            <send-request mode="new" response-variable-name="preflightResponse" timeout="1" ignore-error="true">
+                <set-url>@(context.Variables.GetValueOrDefault<string>("aforo-preflight-url", "").Trim())</set-url>
+                <set-method>POST</set-method>
+                <set-header name="Content-Type" exists-action="override">
+                    <value>application/json</value>
+                </set-header>
+                <set-header name="X-API-Key" exists-action="override">
+                    <value>@(context.Variables.ContainsKey("aforo-api-key") ? Convert.ToString(context.Variables["aforo-api-key"]) : "{{aforo-api-key}}")</value>
+                </set-header>
+                <set-body>@{
+                    var body = new JObject();
+                    body["customerId"] = Convert.ToString(context.Variables["aforo-preflight-customer"]);
+                    return body.ToString(Newtonsoft.Json.Formatting.None);
+                }</set-body>
+            </send-request>
 
-                <!-- Parse response and enforce decision -->
-                <choose>
-                    <when condition="@(context.Variables.ContainsKey(&quot;preflightResponse&quot;))">
-                        <set-variable name="preflightDecision" value="@{
-                            try {
-                                var response = ((IResponse)context.Variables[&quot;preflightResponse&quot;]);
-                                if (response == null || response.StatusCode != 200) { return &quot;{{aforo-preflight-fallback}}&quot;; }
-                                var body = response.Body.As&lt;JObject&gt;();
-                                var data = body[&quot;data&quot;] ?? body;
-                                return data[&quot;decision&quot;]?.ToString() ?? &quot;ALLOW&quot;;
-                            } catch {
-                                return &quot;{{aforo-preflight-fallback}}&quot;;
-                            }
-                        }" />
+            <choose>
+                <when condition="@(context.Variables.ContainsKey("preflightResponse"))">
+                    <set-variable name="preflightDecision" value="@{
+                        var fallback = context.Variables.GetValueOrDefault<string>("aforo-preflight-fallback", "ALLOW").Trim().ToUpperInvariant() == "DENY" ? "DENY" : "ALLOW";
+                        try {
+                            var response = ((IResponse)context.Variables["preflightResponse"]);
+                            if (response == null || response.StatusCode != 200) { return fallback; }
+                            var body = response.Body.As<JObject>();
+                            /* The ingestor wraps every 2xx as success + data + meta. */
+                            var data = body["data"] ?? body;
+                            return data["decision"]?.ToString() ?? "ALLOW";
+                        } catch {
+                            return fallback;
+                        }
+                    }" />
 
-                        <choose>
-                            <when condition="@(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;preflightDecision&quot;) == &quot;DENY&quot;)">
-                                <return-response>
-                                    <set-status code="429" reason="Too Many Requests" />
-                                    <set-header name="Content-Type" exists-action="override">
-                                        <value>application/json</value>
-                                    </set-header>
-                                    <set-header name="Retry-After" exists-action="override">
-                                        <value>60</value>
-                                    </set-header>
-                                    <set-body>{"message": "Rate limit exceeded"}</set-body>
-                                </return-response>
-                            </when>
-                            <when condition="@(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;preflightDecision&quot;) == &quot;WARN&quot;)">
-                                <set-header name="X-RateLimit-Warning" exists-action="override">
-                                    <value>approaching-limit</value>
+                    <choose>
+                        <when condition="@(context.Variables.GetValueOrDefault<string>("preflightDecision") == "DENY")">
+                            <return-response>
+                                <set-status code="429" reason="Too Many Requests" />
+                                <set-header name="Content-Type" exists-action="override">
+                                    <value>application/json</value>
                                 </set-header>
-                            </when>
-                        </choose>
-                    </when>
-                </choose>
-            </when>
-        </choose>
+                                <set-header name="Retry-After" exists-action="override">
+                                    <value>60</value>
+                                </set-header>
+                                <set-body>{"message": "Rate limit exceeded"}</set-body>
+                            </return-response>
+                        </when>
+                        <when condition="@(context.Variables.GetValueOrDefault<string>("preflightDecision") == "WARN")">
+                            <set-header name="X-RateLimit-Warning" exists-action="override">
+                                <value>approaching-limit</value>
+                            </set-header>
+                        </when>
+                    </choose>
+                </when>
+            </choose>
+        </when>
+    </choose>
 </fragment>

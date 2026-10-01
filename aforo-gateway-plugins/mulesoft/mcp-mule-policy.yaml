@@ -1,16 +1,14 @@
-# Aforo MCP Server Metering — MuleSoft Custom Policy
-# Extends standard metering with MCP JSON-RPC tools/call detection.
+# Aforo MCP Server Metering — specification of the MCP-only event script.
+#
+# NOT an installable policy. The installable policy is the package in
+# aforo-metering/ (set mcp-enabled there). This file documents the same
+# script for teams that build their own policy; tests/policy.test.cjs
+# keeps its exclusion block, idempotency keys and event gate in step with
+# aforo-metering/src/main/mule/template.xml. It defines no transport: send
+# the result to the ingestor with X-API-Key only.
 #
 # When a POST request contains a JSON-RPC 2.0 tools/call payload,
 # extracts tool_name and agent_id for MCP-specific billing.
-#
-# Configuration properties (set in Anypoint API Manager):
-#   aforo.endpoint       — Aforo ingestor batch URL
-#   aforo.apiKey          — Aforo API key
-#   aforo.tenantId        — Tenant identifier
-#   aforo.mcpEnabled      — Enable MCP detection (true/false)
-#   aforo.mcpProductId    — MCP product ID in Aforo
-#   product-type          — productType on every event (default "API")
 
 id: aforo-mcp-metering
 name: Aforo MCP Metering Policy
@@ -52,7 +50,13 @@ configuration:
       MCP_SERVER; without an agentId it keeps this value.
     type: string
     optional: true
-    defaultValue: API
+  - propertyName: default-metric
+    name: Default Metric
+    description: >-
+      Metric name for requests that are not MCP tool calls. Leave empty
+      for "api_calls". {method} and {path} are replaced.
+    type: string
+    optional: true
   - propertyName: mcp-product-id
     name: MCP Product ID
     description: Aforo product ID for the MCP server
@@ -64,6 +68,30 @@ configuration:
     type: boolean
     optional: true
     defaultValue: false
+  - propertyName: status-outcomes
+    name: executionStatus Overrides
+    description: >-
+      Optional per-status-code executionStatus overrides for OUTCOME_BASED
+      pricing, e.g. "404=VALIDATION_FAILED,429=ERROR". Exact HTTP codes
+      200-599; invalid entries are ignored.
+    type: string
+    optional: true
+  - propertyName: exclude-status-codes
+    name: Status Codes Not Metered
+    description: >-
+      Comma-separated HTTP status codes that produce no usage event.
+      Leave empty for the default "401,403,429". A value replaces the
+      default. "none" meters every status.
+    type: string
+    optional: true
+  - propertyName: exclude-paths
+    name: Paths Not Metered
+    description: >-
+      Comma-separated path prefixes that produce no usage event. Leave
+      empty for the default "/health,/ready,/metrics". A value replaces
+      the default. "none" meters every path.
+    type: string
+    optional: true
 
 # DataWeave transformation for MCP event extraction
 # Applied in the response phase (after upstream responds)
@@ -91,13 +119,113 @@ template:
     var toolName = if (isMcpToolCall) (requestBody.params.name default "unknown") else ""
     var agentId = if (isMcpToolCall) (requestBody.params._meta.agent_id default "") else ""
     var sessionId = attributes.headers.'Mcp-Session-Id' default ""
-    var configuredProductType = upper(trim((configuration.'product-type' default "API") as String))
+    var configuredProductType = upper(trim((configuration.'product-type' default "") as String))
     var productType = if (configuredProductType == "") "API" else configuredProductType
-    // MCP_SERVER requires both toolName and agentId; otherwise keep the configured type.
-    var mcpProductType = if (toolName != "" and agentId != "") "MCP_SERVER" else productType
+    // MCP_SERVER requires an agentId; without one keep the configured type.
+    var mcpProductType = if ((agentId as String) != "") "MCP_SERVER" else productType
+    var configuredDefaultMetric = trim((configuration.'default-metric' default "") as String)
+    var requestMethod = (attributes.method default "UNKNOWN") as String
+    var requestPath = (attributes.requestPath default "/") as String
+    // Same rule as the package: "api_calls" unless set; {method} / {path} are replaced.
+    var defaultMetric =
+      ((if (configuredDefaultMetric == "") "api_calls" else configuredDefaultMetric)
+        replace "{method}" with requestMethod) replace "{path}" with requestPath
+    var isPreflight = upper(requestMethod) == "OPTIONS"
     // occurredAt must be ISO-8601 UTC: shift to UTC before formatting with a literal Z
     // (formatting local time with a literal 'Z' mislabels it).
     var occurredAtUtc = (now() >> "UTC") as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"}
+
+    // ── Outcome classification (OUTCOME_BASED pricing) ──
+    // Maps the upstream HTTP status to the server's executionStatus value
+    // space. OUTCOME_BASED rate plans bill each event at a per-status
+    // weight; every other pricing model ignores the field. Shared rule —
+    // identical in all five gateway plugins (README "Execution status
+    // mapping"). Default table (policy locked 2026-09-30):
+    //   2xx/3xx -> SUCCESS, 408/504 -> TIMEOUT, 499 -> CANCELLED,
+    //   400/422 -> VALIDATION_FAILED, 401/403/429 -> BLOCKED,
+    //   every other 4xx and 5xx (404 included) -> ERROR,
+    //   unknown / 0 / missing / 1xx / out of range -> null (field OMITTED
+    //   via the conditional-field form below — never null or "").
+    // Overrides: the `status-outcomes` property ("404=VALIDATION_FAILED,
+    // 429=ERROR") — exact codes 200-599 win over the default; invalid
+    // entries are ignored; if a code is listed twice the last valid entry wins.
+    // The response payload is NOT inspected for JSON-RPC errors: Mule
+    // streams the response, and reading `payload` here would buffer it.
+    var allowedOutcomes = ["SUCCESS", "PARTIAL", "TIMEOUT", "ERROR",
+      "VALIDATION_FAILED", "FAILED", "FAILURE", "CANCELLED", "PENDING",
+      "BLOCKED", "HITL_REQUIRED"]
+    var statusOutcomeOverrides =
+      (((configuration.'status-outcomes' default "") as String) splitBy ",")
+        reduce ((part, acc = {}) -> do {
+          var kv = trim(part) splitBy "="
+          var code = trim(kv[0] default "")
+          var outcome = upper(trim(kv[1] default ""))
+          ---
+          if ((sizeOf(kv) == 2) and (code matches /[2-5][0-9][0-9]/)
+              and (allowedOutcomes contains outcome))
+            // Drop an earlier entry for the same code first: ++ keeps both
+            // keys and a lookup returns the FIRST, so without this the first
+            // entry won. Last valid entry wins, as on the other four gateways.
+            (acc - code) ++ {(code): outcome}
+          else acc
+        })
+    fun outcomeFromStatus(status) =
+      if (not (status is Number)) null
+      else if (status < 200 or status > 599) null
+      else if (statusOutcomeOverrides[(status as String)] != null)
+        statusOutcomeOverrides[(status as String)]
+      else if (status < 400) "SUCCESS"
+      else if (status == 408 or status == 504) "TIMEOUT"
+      else if (status == 499) "CANCELLED"
+      else if (status == 400 or status == 422) "VALIDATION_FAILED"
+      else if (status == 401 or status == 403 or status == 429) "BLOCKED"
+      else "ERROR"
+    var executionStatus = outcomeFromStatus(attributes.statusCode)
+
+    // ── Exclusions (requests that are NOT metered at all) ── [shared block]
+    // Same behaviour as Kong (exclude_status_codes / exclude_paths), AWS
+    // Lambda (EXCLUDE_STATUS_CODES), Apigee (KVM exclude_status_codes /
+    // exclude_paths) and Azure APIM (aforo-exclude-status-codes /
+    // aforo-exclude-paths): an excluded request yields an EMPTY events
+    // array, and the transport (template.xml) makes no outbound call for
+    // an empty array.
+    //   exclude-status-codes — CSV of HTTP codes. Absent or blank -> the
+    //     default 401,403,429. A value replaces the default. "none"
+    //     excludes nothing. Entries that aren't whole numbers 100-599 are
+    //     ignored.
+    //   exclude-paths — CSV of path prefixes. Absent or blank -> the
+    //     default /health,/ready,/metrics (Kong's default). A value
+    //     replaces the default; "none" excludes nothing. A path is excluded
+    //     when it equals an entry or starts with it.
+    // Never raises on malformed config: a value that is neither text nor a
+    // number is read as blank, and junk entries are dropped.
+    var defaultExcludeStatusCodes = [401, 403, 429]
+    var defaultExcludePaths = ["/health", "/ready", "/metrics"]
+    fun csvEntries(raw) = do {
+      var text = if (raw is String) raw else if (raw is Number) (raw as String) else ""
+      ---
+      ((text splitBy ",") map ((entry) -> trim(entry))) filter ((entry) -> sizeOf(entry) > 0)
+    }
+    fun isExcludeNothing(entries) =
+      (sizeOf(entries) == 1) and (lower(entries[0]) == "none")
+    var excludeStatusEntries = csvEntries(configuration.'exclude-status-codes')
+    var excludeStatusCodes =
+      if (isEmpty(excludeStatusEntries)) defaultExcludeStatusCodes
+      else if (isExcludeNothing(excludeStatusEntries)) []
+      else (excludeStatusEntries filter ((entry) -> entry matches /[1-5][0-9][0-9]/))
+        map ((entry) -> entry as Number)
+    var excludePathEntries = csvEntries(configuration.'exclude-paths')
+    var excludePaths =
+      if (isEmpty(excludePathEntries)) defaultExcludePaths
+      else if (isExcludeNothing(excludePathEntries)) []
+      else excludePathEntries
+    var isExcludedStatus =
+      (attributes.statusCode is Number) and (excludeStatusCodes contains attributes.statusCode)
+    var isExcludedPath =
+      (attributes.requestPath is String) and
+      (not isEmpty(excludePaths filter ((prefix) -> attributes.requestPath startsWith prefix)))
+    var isExcluded = isExcludedStatus or isExcludedPath
+    // ── end exclusions ── [shared block]
 
     // Authenticated identity — set by aforo-jwt-validation policy.
     // Never read X-Client-Id / X-Customer-Id / X-Tenant-Id from the
@@ -105,22 +233,33 @@ template:
     var authenticatedCustomerId = vars.aforo.customerId default ""
     var authenticatedTenantId = vars.aforo.tenantId default ""
     var hasAuthenticatedIdentity = (authenticatedCustomerId != "") and (authenticatedTenantId != "")
+    var isMeterable = hasAuthenticatedIdentity and (not isExcluded) and (not isPreflight)
+      and (sizeOf(authenticatedCustomerId) <= 64)
 
     ---
     {
-      events: if (hasAuthenticatedIdentity) [
+      // No event for OPTIONS, an excluded status code or path, a request
+      // with no verified customer, or a customer id over 64 characters.
+      events: if (isMeterable) [
         if (isMcpToolCall) {
           customerId: authenticatedCustomerId,
           tenantId: authenticatedTenantId,
           metricName: "mcp_server.tool_invocations",
           quantity: 1,
-          idempotencyKey: "mcp:mulesoft:" ++ (attributes.requestId default uuid()) ++ ":" ++ toolName ++ ":" ++ now() as String,
+          // Idempotency key FROZEN (A+ delivery-guarantee prompt 4): stable
+          // request identity only (requestId + toolName — unique per
+          // invocation); now() suffix removed so redelivery of the same
+          // built payload carries an identical key and dedups at the
+          // ingestor instead of double-billing. Same key as the package
+          // template (aforo-metering/src/main/mule/template.xml).
+          idempotencyKey: "mcp:mulesoft:" ++ (attributes.requestId default uuid()) ++ ":" ++ toolName,
           occurredAt: occurredAtUtc,
           productType: mcpProductType,
           toolName: toolName,
           agentId: agentId,
           sessionId: sessionId,
-          executionStatus: if (attributes.statusCode >= 200 and attributes.statusCode < 300) "SUCCESS" else "ERROR",
+          // Shared outcome table: 2xx stays SUCCESS; 504 -> TIMEOUT (was ERROR).
+          (executionStatus: executionStatus) if executionStatus != null,
           executionDurationMs: attributes.responseTime default 0,
           metadata: {
             gateway: "mulesoft",
@@ -131,11 +270,12 @@ template:
         } else {
           customerId: authenticatedCustomerId,
           tenantId: authenticatedTenantId,
-          metricName: (attributes.method default "UNKNOWN") ++ " " ++ (attributes.requestPath default "/"),
+          metricName: defaultMetric,
           quantity: 1,
           idempotencyKey: attributes.requestId default uuid(),
           occurredAt: occurredAtUtc,
           productType: productType,
+          (executionStatus: executionStatus) if executionStatus != null,
           metadata: {
             gateway: "mulesoft",
             method: attributes.method,

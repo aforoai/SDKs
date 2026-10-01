@@ -10,8 +10,8 @@ Every artifact in this repo carries its own version, recorded in **both code and
 | Python SDKs | `pyproject.toml` / `setup.py` `version` | PyPI, on a git tag |
 | Java SDKs | `pom.xml` `<version>` | Maven Central, on a git tag |
 | Go SDKs | a `VERSION` file (Go has no manifest version field) | tag `aforo-metering-sdks/<pkg>/vX.Y.Z` (the module's repo subpath); import path is `github.com/aforoai/SDKs/aforo-metering-sdks/<pkg>` |
-| Kong plugin | `*.rockspec` version | LuaRocks + GitHub Release |
-| Other gateway plugins (Apigee/AWS/Azure/MuleSoft) | `package.json` (AWS) or a `VERSION` file | GitHub Release |
+| Kong plugin | `*.rockspec` version (the `VERSION` constant in `handler.lua` carries the same number) | LuaRocks + GitHub Release |
+| Other gateway plugins (Apigee/AWS/Azure/MuleSoft) | `package.json` (AWS) or a `VERSION` file (MuleSoft: also `aforo-metering/pom.xml`) | GitHub Release |
 | EMQX plugin | `src/aforo_metering.app.src` `{vsn, ...}` | GitHub Release |
 | IaC templates | a `VERSION` file | GitHub Release |
 
@@ -34,11 +34,11 @@ Each artifact versions independently. A Kong-plugin patch does not bump the Node
 | Artifact | Version |
 |---|---|
 | `aforo-metering-sdks/` — all Node, Python, Java, Go SDKs + `mcp-proxy` | `1.0.0` |
-| `aforo-gateway-plugins/` — `kong`, `aws-lambda`, `apigee`, `azure-apim`, `mulesoft` | `2.1.0` |
+| `aforo-gateway-plugins/` — `kong`, `aws-lambda`, `apigee`, `azure-apim`, `mulesoft` | `2.2.0` |
 | `aforo-emqx-plugin/` | `0.1.0` (experimental) |
 | `aforo-gateway-plugins/aws-cloudformation`, `aforo-gateway-plugins/azure-arm-templates` | `1.0.0` |
 
-The gateway plugins sit at `2.1.0` (`2.0.0` was their security-hardened release); the SDKs are on their own `1.x` line; the EMQX broker plugin is pre-1.0 (experimental). These are independent lines, not a single repo-wide version.
+The gateway plugins sit at `2.2.0` (`2.0.0` was their security-hardened release; `2.2.0` merged the internal line into `2.1.0`); the SDKs are on their own `1.x` line; the EMQX broker plugin is pre-1.0 (experimental). These are independent lines, not a single repo-wide version.
 
 ## Releasing
 

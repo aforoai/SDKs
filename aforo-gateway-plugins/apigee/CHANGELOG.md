@@ -6,6 +6,60 @@ This bundle ships on the Aforo gateway-plugins line; the whole repo is versioned
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-10-02
+
+Merges the 2.1.0 public release with the working line that the Aforo one-click install deploys. Every KVM entry either side read is still read. Mirror work by Gowtham and Eswar.
+
+### From the working line
+- **Bounded redelivery.** One retry (`AforoMeteringRetryGate`, `AforoMeteringSendEventRetry1`) when the first send could not connect or got a 5xx, and failed within 1.2 s. Timeouts are 1 s connect / 2 s response; the most a broken ingestor adds to an API call is about 4 s. KVM `max_retries` (`0` or `1`).
+- **Delivery-failure record.** `AforoMeteringLogDeliveryFailure` prints `USAGE EVENT DROPPED` and sets `aforo.meteringDelivery*` variables.
+- **`executionStatus`** on every event from the response status, with KVM `status_outcomes` overrides.
+- **Default exclusions.** With no entry, 401/403/429 and `/health`, `/ready`, `/metrics` are not metered. A configured list replaces the default; `none` meters everything.
+- **Apigee X.** Every KVM value is read into a `private.aforo.*` variable (Apigee X rejects anything else), the KVM reads have `continueOnError="true"`, and the flow is documented for `PostProxyFlowHook` (it cannot run in `PostClientFlow`).
+- **Idempotency key** is the Apigee `messageid`, then the `x-request-id` header, then a one-time random value. No clock component. Compound `correlationId` is a UUID derived from the same identity.
+- **AGENTIC_API** detection from `traceparent` / `x-trace-id`.
+
+### From 2.1.0
+- Customer identity never falls back to a credential; no identity means no event. `customer_id_source = flow_variable:<name>`.
+- `metric_mappings` and `default_metric`.
+- `product_type` on every event; per-type required fields.
+- `OPTIONS` and quantity ≤ 0 are not metered; `quantity_source = response_size`; `include_metadata = false`.
+- `X-API-Key` is the only credential header. `X-Tenant-Id` is no longer sent to the ingestor (the working line still sent it).
+- JWT validation and margin guard are opt-in; the RaiseFault fix; `mcp_enabled` / `mcp_product_id` / `margin_guard_*` read from the KVM.
+
+### Added
+- A 408 from the ingestor is retried like a 5xx (inside the same 1.2 s window). A 429 is not re-sent; its `Retry-After` is recorded in `aforo.meteringDeliveryRetryAfter`.
+- A 4xx drop logs the first 500 characters of the ingestor's response.
+- `customer_id_source = jwt`: only the verified JWT claim.
+- `metric_name_pattern` placeholders `{basepath}` and `{pathsuffix}`.
+- `flow_variable:` names that hold a secret or a client IP are refused (`client_id`, `consumerkey`, `client_secret`, `apikey`, `access_token`, `client.ip`).
+- A metric name that is empty or longer than 255 characters, or an MCP tool name longer than 64, is not sent.
+
+### Behaviour changes for a 2.1.0 install
+- **Customer.** With no `customer_id_source`, a call without a verified JWT claim now falls back to `developer.app.name`, then `developer.email` (the working line's source). 2.1.0 sent nothing. Set `customer_id_source` to `jwt` to keep the 2.1.0 behaviour. A configured `flow_variable:` source behaves as in 2.1.0.
+- **Exclusions.** 2.1.0 excluded nothing unless configured. Now 401/403/429 and `/health`, `/ready`, `/metrics` are excluded by default. Set `exclude_status_codes` / `exclude_paths` to `none` for the 2.1.0 behaviour.
+- **JWT.** `jwt_validation_enabled = true` still turns validation on. It now also turns on when `aforo_jwks_uri` is set and the flag is absent. Set `jwt_validation_enabled` to `false` to keep it off.
+- **Send gate.** The send step is conditioned on `aforo.meteringSend` and `aforo.skip`. `aforo.sendEvent` and `aforo.skipReason` are still set. `aforo.eventPayload` is left unset (not `""`) when there is no event.
+- **Flow variables.** KVM values are in `private.aforo.<name>`, not `aforo.<name>`. A proxy that sets `aforo.<name>` itself is still honoured when the KVM has no value.
+- **Trace header.** A call with a valid `traceparent` is sent as `AGENTIC_API` when `product_type` is `API`.
+- **Fallback key.** With no `messageid`, the key is the `x-request-id` header before a random value.
+
+### Behaviour changes for a working-line install
+- **Metric.** With no `metric_name_pattern` in the KVM the metric is `default_metric` / `api_calls`, not `{method} {path}`. The one-click install writes the pattern, so those installs are unchanged.
+- **Path.** `endpointPath`, `{path}` and `metadata.path` are the proxy base path plus the path suffix, not the suffix alone. Use `{pathsuffix}` in the pattern for the old value.
+- **No identity, no event.** An event with an empty `customerId` is no longer sent. `apiproxy.consumerkey` is no longer a customer source in the unwired compound and preflight scripts.
+- **`productType`** is on every event (default `API`).
+- **MCP** `tools/call` without `params._meta.agent_id` keeps the configured `productType` instead of `MCP_SERVER`.
+- **`include_metadata = false`** and **`quantity_source = response_size`** now take effect.
+- **Margin guard** runs only when `margin_guard_enabled` is `true`.
+
+### Deprecated aliases
+- Flow variable `aforo.sendEvent` — use `aforo.meteringSend` / `aforo.skip`.
+- Non-private `aforo.<setting>` variables as the KVM target — the KVM now fills `private.aforo.<setting>`; the non-private name is read only as a per-proxy override.
+- `jwt_validation_enabled` absent with `aforo_jwks_uri` set — set the flag explicitly.
+
+No KVM key was renamed or removed.
+
 ## [2.1.0] — 2026-10-01
 
 ### Added

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Decides whether the first send is retried. Sets aforo.meteringRetry
+     and aforo.meteringFirstAttempt (delivered / rejected / failed).
+     continueOnError=true: if this script fails, nothing is retried and the
+     API call is unaffected. -->
+<Javascript name="AforoMeteringRetryGate" timeLimit="200" continueOnError="true">
+    <DisplayName>Aforo Metering - Retry Gate</DisplayName>
+    <ResourceURL>jsc://aforo-metering-retry-gate.js</ResourceURL>
+</Javascript>

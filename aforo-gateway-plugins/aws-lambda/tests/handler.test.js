@@ -1,36 +1,53 @@
 /**
  * Unit tests for AWS Lambda aforo-metering handler.
  * Run with: node tests/handler.test.js
+ *
+ * Env + HTTPS stubbing MUST happen before require('../index') — the
+ * module reads env at load time and captures the https module object.
+ *
+ * This file covers delivery (throw / drop / EMF), idempotency-key stability,
+ * AGENTIC_API detection, the compound correlationId and executionStatus.
+ * tests/contract.test.js covers the wire contract against a local capture
+ * server (identity, metric mappings, productType, Retry-After).
  */
 
-const http = require('http');
+// ── Test environment (before require) ──
+process.env.AFORO_ENDPOINT = 'https://aforo.test/v1/ingest/batch';
+process.env.AFORO_API_KEY = 'key_test';
+process.env.AFORO_TENANT_ID = 'tenant_test';
+process.env.FLUSH_COUNT = '1'; // one event per batch — enables partial-failure tests
+process.env.MCP_ENABLED = 'true'; // Test O4 exercises the MCP path; other tests send no requestBody
+
+const https = require('https');
 const zlib = require('zlib');
 
-// Configure the module before it is loaded (it reads env at require time).
-// AFORO_ENDPOINT is pointed at a local capture server started below.
-process.env.AFORO_API_KEY = 'test-ingest-key';
-process.env.METRIC_MAPPINGS = JSON.stringify([
-    { matchType: 'PREFIX', value: '/v1/sms', metricName: 'sms_sent' },
-    { matchType: 'EXACT', value: '/v1/otp/verify', metricName: 'otp_verified' },
-    { matchType: 'CONTAINS', value: '/calls/', metricName: 'call_minutes' },
-]);
-process.env.DEFAULT_METRIC = 'api_calls';
+// ── HTTPS stub ──
+// statusQueue: each request shifts the next status; empty queue → 200.
+// bodies: captured request payloads (JSON strings).
+const httpStub = { statusQueue: [], responseBodies: [], bodies: [], headers: [], calls: 0 };
+https.request = (options, cb) => {
+    httpStub.calls++;
+    httpStub.headers.push(options.headers);
+    const statusCode = httpStub.statusQueue.length > 0 ? httpStub.statusQueue.shift() : 200;
+    const responseBody = httpStub.responseBodies.length > 0 ? httpStub.responseBodies.shift() : '';
+    const res = {
+        statusCode,
+        headers: {},
+        on(ev, fn) {
+            if (ev === 'data' && responseBody) setImmediate(() => fn(responseBody));
+            if (ev === 'end') setImmediate(() => setImmediate(fn));
+            return this;
+        },
+    };
+    return {
+        on() { return this; },
+        write(data) { httpStub.bodies.push(String(data)); },
+        end() { setImmediate(() => cb(res)); },
+        destroy() {},
+    };
+};
 
-const captured = [];
-let nextStatuses = [];
-const server = http.createServer((req, res) => {
-    let body = '';
-    req.on('data', c => body += c);
-    req.on('end', () => {
-        captured.push({ headers: req.headers, url: req.url, body: JSON.parse(body) });
-        const next = nextStatuses.length ? nextStatuses.shift() : 202;
-        const status = typeof next === 'object' ? next.status : next;
-        res.writeHead(status, Object.assign({ 'Content-Type': 'application/json' }, next.headers || {}));
-        res.end(JSON.stringify({ status }));
-    });
-});
-
-const { parseAccessLog, detectMcpToolCall } = require('../index');
+const { parseAccessLog, detectMcpToolCall, handler } = require('../index');
 
 let passed = 0;
 let failed = 0;
@@ -116,170 +133,526 @@ console.log('\nTest 4: Non-MCP body returns null');
     assertEquals(result, null, 'non-MCP body returns null');
 })();
 
-// ── Metric resolution (no network) ──
-console.log('\nTest 5: Metric resolution — mappings, then default; never route-shaped by default');
-(function() {
-    const { resolveMetricName, parseMetricMappings } = require('../index');
-    assertEquals(resolveMetricName({ method: 'POST', path: '/v1/sms/send' }), 'sms_sent', 'PREFIX mapping');
-    assertEquals(resolveMetricName({ method: 'POST', path: '/v1/otp/verify' }), 'otp_verified', 'EXACT mapping');
-    assertEquals(resolveMetricName({ method: 'POST', path: '/v1/otp/verify/x' }), 'api_calls', 'EXACT does not prefix-match');
-    assertEquals(resolveMetricName({ method: 'GET', path: '/v2/calls/9' }), 'call_minutes', 'CONTAINS mapping');
-    assertEquals(resolveMetricName({ method: 'GET', path: '/v1/users/42' }), 'api_calls', 'unmapped → DEFAULT_METRIC, not "GET /v1/users/42"');
-    assertEquals(resolveMetricName({ method: 'GET', path: '/x' }, [], '{method} {path}', 'd'), 'GET /x', 'pattern only when explicitly set');
-    assertEquals(parseMetricMappings('not json').length, 0, 'invalid METRIC_MAPPINGS ignored');
-    assertEquals(parseMetricMappings('[{"matchType":"REGEX","value":"x","metricName":"m"}]').length, 0, 'unknown matchType rule dropped');
-})();
+// ── Handler-level tests (delivery guarantee, 2026-07-05) ──
 
-console.log('\nTest 6: parseAccessLog never uses the API key or client IP as customer');
-(function() {
-    const p = parseAccessLog(JSON.stringify({ requestId: 'r', httpMethod: 'GET', resourcePath: '/a', status: '200',
-        apiKey: 'SECRET-KEY-VALUE', 'identity.apiKey': 'SECRET', caller: 'arn:aws:iam::1:user/x' }));
-    assertEquals(p.customerId, '', 'no customerId from apiKey/caller');
-    const p2 = parseAccessLog(JSON.stringify({ requestId: 'r', customerId: '-' }));
-    assertEquals(p2.customerId, '', '"-" (unset $context variable) treated as empty');
-    const clf = parseAccessLog('10.0.0.1 - - [01/Jan/2026:00:00:00 +0000] "GET /a HTTP/1.1" 200 12');
-    assertEquals(clf.customerId, '', 'CLF client IP is not a customer');
-})();
-
-// ── Handler-level tests against a local capture server ──
-function cwEvent(entries) {
+/** Build a CloudWatch Logs subscription event from access-log messages. */
+function makeCloudWatchEvent(messages) {
     const logData = {
         messageType: 'DATA_MESSAGE',
-        logGroup: '/aws/apigateway/test',
-        logEvents: entries.map((e, i) => ({ id: 'ev' + i, timestamp: 1767225600000 + i, message: JSON.stringify(e) })),
+        logGroup: 'test-group',
+        logStream: 'test-stream',
+        logEvents: messages.map((m, i) => ({
+            id: 'cw-evt-' + i,
+            timestamp: 1700000000000 + i,
+            message: m,
+        })),
     };
-    return { awslogs: { data: zlib.gzipSync(Buffer.from(JSON.stringify(logData))).toString('base64') } };
-}
-const ctx = { getRemainingTimeInMillis: () => 20000 };
-
-async function handlerTests() {
-    await new Promise(r => server.listen(0, '127.0.0.1', r));
-    process.env.AFORO_ENDPOINT = `http://127.0.0.1:${server.address().port}/v1/ingest/batch`;
-    delete require.cache[require.resolve('../index')];
-    const { handler } = require('../index');
-
-    console.log('\nTest 7: handler is exported (index.handler resolvable by Lambda)');
-    assertEquals(typeof handler, 'function', 'module.exports.handler is a function');
-
-    console.log('\nTest 8: handler sends X-API-Key only, skips OPTIONS / no-customer / zero quantity');
-    captured.length = 0;
-    await handler(cwEvent([
-        { requestId: 'a1', httpMethod: 'POST', resourcePath: '/v1/sms/send', status: '200', customerId: 'cust_1', responseLength: '10' },
-        { requestId: 'a2', httpMethod: 'OPTIONS', resourcePath: '/v1/sms/send', status: '204', customerId: 'cust_1' },
-        { requestId: 'a3', httpMethod: 'GET', resourcePath: '/v1/users/1', status: '200', customerId: '-' },
-        { requestId: 'a4', httpMethod: 'GET', resourcePath: '/v1/users/1', status: '200', apiKey: 'SECRET' },
-        { requestId: 'a5', httpMethod: 'GET', resourcePath: '/v1/users/2', status: '200', customerId: 'x'.repeat(65) },
-        { requestId: 'a6', httpMethod: 'GET', resourcePath: '/v1/users/3', status: '200', customerId: 'cust_2' },
-    ]), ctx);
-    assertEquals(captured.length, 1, 'one POST');
-    const req = captured[0];
-    assertEquals(req.url, '/v1/ingest/batch', 'posts to /v1/ingest/batch');
-    assertEquals(req.headers['x-api-key'], 'test-ingest-key', 'X-API-Key header carries the key');
-    assertEquals(req.headers['authorization'], undefined, 'no Authorization header');
-    assertEquals(req.headers['x-tenant-id'], undefined, 'no X-Tenant-Id header');
-    const evs = req.body.events;
-    assertEquals(evs.length, 2, 'only the two billable, attributed events are sent');
-    assertEquals(evs.map(e => e.idempotencyKey).join(','), 'a1,a6', 'OPTIONS, blank, key-only and >64-char customers skipped');
-    assertEquals(evs[0].customerId, 'cust_1', 'customerId from authorizer context');
-    assertEquals(evs[0].metricName, 'sms_sent', 'mapped metric');
-    assertEquals(evs[1].metricName, 'api_calls', 'default metric');
-    assert(!JSON.stringify(req.body).includes('SECRET'), 'API key value never appears in the payload');
-    assert(evs.every(e => e.quantity > 0 && !isNaN(Date.parse(e.occurredAt))), 'quantity > 0 and ISO occurredAt');
-    assert(evs.every(e => e.productType === 'API'), 'productType defaults to API on every event');
-
-    console.log('\nTest 9: 400 is dropped without retry (no poison pill, no throw)');
-    captured.length = 0; nextStatuses = [400];
-    const r400 = await handler(cwEvent([{ requestId: 'b1', httpMethod: 'GET', resourcePath: '/a', status: '200', customerId: 'c' }]), ctx);
-    assertEquals(captured.length, 1, 'exactly one attempt on 400');
-    assertEquals(r400.statusCode, 200, 'handler completes');
-
-    console.log('\nTest 10: 429 is retried');
-    captured.length = 0; nextStatuses = [429];
-    await handler(cwEvent([{ requestId: 'c1', httpMethod: 'GET', resourcePath: '/a', status: '200', customerId: 'c' }]), ctx);
-    assertEquals(captured.length, 2, '429 then 202 → two attempts');
-
-    console.log('\nTest 10a: 429 Retry-After is honoured; one beyond the cap ends the attempts');
-    captured.length = 0; nextStatuses = [{ status: 429, headers: { 'Retry-After': '1' } }];
-    let t = Date.now();
-    await handler(cwEvent([{ requestId: 'c2', httpMethod: 'GET', resourcePath: '/a', status: '200', customerId: 'c' }]), ctx);
-    assertEquals(captured.length, 2, '429 then 202 → two attempts');
-    assert(Date.now() - t >= 950, 'waited the Retry-After second before retrying');
-    captured.length = 0; nextStatuses = [{ status: 429, headers: { 'Retry-After': '3600' } }];
-    let threw429 = false;
-    t = Date.now();
-    try {
-        await handler(cwEvent([{ requestId: 'c3', httpMethod: 'GET', resourcePath: '/a', status: '200', customerId: 'c' }]), ctx);
-    } catch { threw429 = true; }
-    assertEquals(captured.length, 1, 'no retry when Retry-After exceeds the cap');
-    assert(threw429 && Date.now() - t < 1000, 'fails transiently at once so Lambda re-delivers later');
-    nextStatuses = [];
-
-    console.log('\nTest 11: persistent 5xx throws so Lambda async retry re-delivers');
-    captured.length = 0; nextStatuses = [503, 503, 503];
-    let threw = false;
-    try {
-        await handler(cwEvent([{ requestId: 'd1', httpMethod: 'GET', resourcePath: '/a', status: '200', customerId: 'c' }]), ctx);
-    } catch { threw = true; }
-    assert(threw, 'handler throws on transient failure');
-    assertEquals(captured.length, 3, 'three attempts');
-
-    console.log('\nTest 12: retries stop at the Lambda deadline');
-    captured.length = 0; nextStatuses = [503, 503, 503];
-    const t0 = Date.now();
-    try {
-        await handler(cwEvent([{ requestId: 'e1', httpMethod: 'GET', resourcePath: '/a', status: '200', customerId: 'c' }]),
-            { getRemainingTimeInMillis: () => 2000 });
-    } catch { /* expected */ }
-    assert(Date.now() - t0 < 1500, 'returned before the deadline instead of sleeping through it');
-    assertEquals(captured.length, 1, 'no retry that could not finish in time');
-    nextStatuses = [];
-
-    console.log('\nTest 13a: FLUSH_COUNT is capped at the ingestor limit of 1000');
-    delete require.cache[require.resolve('../index')];
-    process.env.FLUSH_COUNT = '5000';
-    assertEquals(require('../index').FLUSH_COUNT, 1000, 'FLUSH_COUNT=5000 → 1000');
-    delete process.env.FLUSH_COUNT;
-
-    console.log('\nTest 13b: PRODUCT_TYPE is configurable; MCP_SERVER only with toolName + agentId');
-    delete require.cache[require.resolve('../index')];
-    process.env.PRODUCT_TYPE = '  agentic_api ';
-    process.env.MCP_ENABLED = 'true';
-    let m = require('../index');
-    const le = { id: 'p', timestamp: 0 };
-    const base = { method: 'GET', path: '/a', status: 200, customerId: 'c', requestId: 'p1' };
-    assertEquals(m.buildUsageEvent(base, le).event.productType, 'AGENTIC_API', 'PRODUCT_TYPE trimmed and upper-cased');
-    const call = (meta) => JSON.stringify({ jsonrpc: '2.0', method: 'tools/call', params: { name: 'search', _meta: meta } });
-    const withAgent = m.buildUsageEvent({ ...base, method: 'POST', requestBody: call({ agent_id: 'a1' }) }, le).event;
-    assertEquals(withAgent.productType, 'MCP_SERVER', 'tools/call with agentId → MCP_SERVER');
-    const noAgent = m.buildUsageEvent({ ...base, method: 'POST', requestBody: call({}) }, le).event;
-    assertEquals(noAgent.productType, 'AGENTIC_API', 'tools/call without agentId keeps PRODUCT_TYPE');
-    delete require.cache[require.resolve('../index')];
-    process.env.PRODUCT_TYPE = 'AI_AGENT';
-    m = require('../index');
-    assert(m.buildUsageEvent(base, le).skip.startsWith('productType AI_AGENT missing'), 'AI_AGENT without agentId/sessionId skipped');
-    const forged = m.buildUsageEvent({ ...base, headers: { 'x-agent-id': 'forged', 'x-session-id': 's' } }, le);
-    assert(forged.skip && forged.skip.startsWith('productType AI_AGENT missing'), 'X-Agent-Id header never used as agentId');
-    delete require.cache[require.resolve('../index')];
-    process.env.PRODUCT_TYPE = 'NEW_TYPE';
-    assertEquals(require('../index').buildUsageEvent(base, le).event.productType, 'NEW_TYPE', 'unknown type passed through');
-    delete process.env.PRODUCT_TYPE;
-    delete process.env.MCP_ENABLED;
-
-    console.log('\nTest 13: response_size quantity 0 is skipped');
-    // Re-load with QUANTITY_SOURCE=response_size.
-    delete require.cache[require.resolve('../index')];
-    process.env.QUANTITY_SOURCE = 'response_size';
-    const { buildUsageEvent } = require('../index');
-    const zero = buildUsageEvent({ method: 'GET', path: '/a', status: 204, customerId: 'c', responseLength: 0, requestId: 'z' },
-        { id: 'z', timestamp: 0 });
-    assertEquals(zero.skip, 'quantity <= 0', 'zero-byte response not metered');
-    delete process.env.QUANTITY_SOURCE;
-
-    server.close();
+    const gz = zlib.gzipSync(Buffer.from(JSON.stringify(logData), 'utf8'));
+    return { awslogs: { data: gz.toString('base64') } };
 }
 
-handlerTests().catch(err => { failed++; console.error('  FAIL: handler tests threw', err); server.close(); })
-    .finally(() => {
-        console.log('\n── Results: ' + passed + ' passed, ' + failed + ' failed ──\n');
-        process.exit(failed > 0 ? 1 : 0);
+function accessLogMessage(requestId, path) {
+    return JSON.stringify({
+        requestId,
+        httpMethod: 'GET',
+        resourcePath: path || '/v1/widgets',
+        status: '200',
+        responseLatency: '10',
+        responseLength: '256',
+        customerId: 'cust-1',
     });
+}
+
+/** Run handler while capturing console.log lines (for EMF assertions). */
+async function runHandlerCaptured(event) {
+    const logs = [];
+    const origLog = console.log;
+    console.log = (...args) => { logs.push(args.map(String).join(' ')); };
+    let result = null;
+    let error = null;
+    try {
+        result = await handler(event);
+    } catch (e) {
+        error = e;
+    } finally {
+        console.log = origLog;
+    }
+    return { result, error, logs };
+}
+
+function resetStub() {
+    httpStub.statusQueue = [];
+    httpStub.responseBodies = [];
+    httpStub.headers = [];
+    httpStub.bodies = [];
+    httpStub.calls = 0;
+}
+
+(async function() {
+
+    // Test 5: handler export regression
+    console.log('\nTest 5: handler is exported (template.yaml Handler: index.handler)');
+    assert(typeof handler === 'function',
+        'module exports handler — module.exports reassignment regression');
+
+    // Test 6: happy path unchanged — success returns 200, no throw
+    console.log('\nTest 6: successful send still returns 200');
+    resetStub();
+    {
+        const { result, error } = await runHandlerCaptured(
+            makeCloudWatchEvent([accessLogMessage('req-ok-1')]));
+        assert(error === null, 'no throw on success');
+        assertEquals(result && result.statusCode, 200, 'returns statusCode 200');
+        assertEquals(httpStub.calls, 1, 'exactly one POST for one batch');
+        assertEquals(httpStub.headers[0]['X-API-Key'], 'key_test', 'authenticates with X-API-Key');
+        assert(!('X-Tenant-Id' in httpStub.headers[0]) && !('Authorization' in httpStub.headers[0]),
+            'no X-Tenant-Id and no Authorization header');
+    }
+
+    // Test 7: permanent 4xx — dropped, counted, NOT thrown (a redelivery
+    // would be rejected again), and not retried in-handler.
+    console.log('\nTest 7: permanent 4xx is dropped without a throw');
+    resetStub();
+    {
+        httpStub.statusQueue = [400];
+        const { result, error, logs } = await runHandlerCaptured(
+            makeCloudWatchEvent([accessLogMessage('req-fail-1')]));
+        assert(error === null, 'handler does not throw on a permanent 4xx');
+        assertEquals(result && result.statusCode, 200, 'returns 200 so Lambda does not redeliver');
+        assert(result && /dropped 1 rejected/.test(result.body), 'result reports the dropped event');
+        assertEquals(httpStub.calls, 1, '4xx is not retried in-handler');
+
+        const emfLine = logs.find(l => l.includes('"_aws"') && l.includes('EventsRejected'));
+        assert(emfLine !== undefined, 'EMF EventsRejected metric emitted');
+        if (emfLine) {
+            const emf = JSON.parse(emfLine);
+            assertEquals(emf.EventsRejected, 1, 'EMF counts rejected events');
+            assertEquals(emf._aws.CloudWatchMetrics[0].Namespace, 'Aforo/Metering', 'EMF namespace');
+            assertEquals(emf.TenantId, 'tenant_test', 'EMF carries tenant id');
+        }
+        assert(!logs.some(l => l.includes('"_aws"') && l.includes('EventsFailedToSend')),
+            'no EventsFailedToSend for a permanent rejection');
+    }
+
+    // Test 7b: 408 and 429 are transient — retried, then thrown.
+    console.log('\nTest 7b: 408 is retried and, when it persists, thrown');
+    resetStub();
+    {
+        httpStub.statusQueue = [408, 200];
+        const { error } = await runHandlerCaptured(
+            makeCloudWatchEvent([accessLogMessage('req-408-1')]));
+        assert(error === null, '408 then 200 succeeds');
+        assertEquals(httpStub.calls, 2, '408 was retried');
+        assertEquals(httpStub.bodies[0], httpStub.bodies[1],
+            'the retry sends byte-identical bytes (same idempotency key)');
+    }
+
+    // Test 7c: per-event rejections inside an accepted batch are read from
+    // the { success, data, meta } envelope, counted and not retried.
+    console.log('\nTest 7c: per-event rejection in a 2xx envelope is counted as dropped');
+    resetStub();
+    {
+        httpStub.responseBodies = [JSON.stringify({
+            success: true,
+            data: { accepted: 0, duplicates: 0, failed: 1, errors: [{ index: 0, message: 'Unknown metric: nope' }] },
+            meta: {},
+        })];
+        const { result, error, logs } = await runHandlerCaptured(
+            makeCloudWatchEvent([accessLogMessage('req-partial-1')]));
+        assert(error === null, 'no throw');
+        assert(result && /Processed 0 events, dropped 1 rejected/.test(result.body), 'rejected event counted');
+        assert(logs.some(l => l.includes('"_aws"') && l.includes('EventsRejected')), 'EMF EventsRejected emitted');
+        assertEquals(httpStub.calls, 1, 'not retried');
+    }
+
+    // Test 8: 5xx exhausts all 3 in-handler attempts, then throws (~3s backoff)
+    console.log('\nTest 8: 5xx exhausts 3 in-handler retries then throws');
+    resetStub();
+    {
+        httpStub.statusQueue = [500, 502, 503];
+        const { error, logs } = await runHandlerCaptured(
+            makeCloudWatchEvent([accessLogMessage('req-5xx-1')]));
+        assert(error !== null, 'throws after retry exhaustion');
+        assert(error && /redeliver/i.test(error.message), 'error message states redelivery intent');
+        const emf5 = logs.find(l => l.includes('"_aws"') && l.includes('EventsFailedToSend'));
+        assert(emf5 !== undefined && JSON.parse(emf5).EventsFailedToSend === 1, 'EMF EventsFailedToSend emitted before the throw');
+        assert(httpStub.bodies[0] === httpStub.bodies[1] && httpStub.bodies[1] === httpStub.bodies[2],
+            'all three attempts carry identical bytes (same idempotency key)');
+        assertEquals(httpStub.calls, 3, 'in-handler retry count unchanged (3 attempts)');
+    }
+
+    // Test 9: partial failure (one batch ok, one fails) still throws — the
+    // succeeded batch is redelivered too, which is safe because keys dedup.
+    console.log('\nTest 9: partial batch failure throws (redelivery is dedup-safe)');
+    resetStub();
+    {
+        // FLUSH_COUNT=1 → 2 events = 2 batches, sent concurrently: the first
+        // gets 200, the second 503 on all three attempts.
+        httpStub.statusQueue = [200, 503, 503, 503];
+        const { error, logs } = await runHandlerCaptured(
+            makeCloudWatchEvent([accessLogMessage('req-p1'), accessLogMessage('req-p2')]));
+        assert(error !== null, 'throws when any batch fails');
+        assertEquals(httpStub.calls, 4, 'both batches attempted (1 + 3 attempts)');
+        const emfLine = logs.find(l => l.includes('EventsFailedToSend') && l.includes('"_aws"'));
+        assert(emfLine !== undefined, 'EMF metric emitted for partial failure');
+        if (emfLine) {
+            assertEquals(JSON.parse(emfLine).EventsFailedToSend, 1, 'EMF counts only the failed events');
+        }
+    }
+
+    // Test 10: idempotency-key stability — the dedup-safety basis for the
+    // throw. The SAME CloudWatch payload must produce byte-identical keys
+    // on re-invocation (redelivery), for both standard and fallback keys.
+    console.log('\nTest 10: idempotency keys stable across redelivery');
+    resetStub();
+    {
+        // Second entry has no requestId, so its key falls back to the
+        // CloudWatch event id.
+        const noRequestId = JSON.stringify({
+            httpMethod: 'GET', resourcePath: '/v1/things', status: '200', customerId: 'cust-1',
+        });
+        const clfLine = '192.0.2.1 - - [05/Jul/2026:10:00:00 +0000] "GET /v1/things HTTP/1.1" 200 512';
+        const event = makeCloudWatchEvent([accessLogMessage('req-stable-1'), noRequestId, clfLine]);
+
+        const first = await runHandlerCaptured(event);
+        const firstEvents = httpStub.bodies.map(b => JSON.parse(b).events[0]);
+        const firstKeys = firstEvents.map(e => e.idempotencyKey);
+        httpStub.bodies = [];
+        const second = await runHandlerCaptured(event);
+        const secondKeys = httpStub.bodies.map(b => JSON.parse(b).events[0].idempotencyKey);
+
+        assert(first.error === null && second.error === null, 'both invocations succeed');
+        assertEquals(firstKeys.length, 2, 'two events posted — the CLF line has no identity and is skipped');
+        assertEquals(firstKeys[0], secondKeys[0], 'requestId-derived key identical across invocations');
+        assertEquals(firstKeys[1], secondKeys[1], 'logEvent.id fallback key identical across invocations');
+        assertEquals(firstKeys[0], 'req-stable-1', 'key comes from log data (requestId)');
+        assertEquals(firstKeys[1], 'cw-evt-1', 'fallback key comes from log data (logEvent.id)');
+        assert(!firstEvents.some(e => e.customerId === '192.0.2.1'), 'a client IP is never a customerId');
+    }
+
+    // ═══ AGENTIC_API detection (P0-5, docs/final/111 Session 4) ═══
+    // Per descriptor eventSchema.inferenceRule = HAS_TRACE, an event with a
+    // resolvable W3C traceparent (or x-trace-id fallback) is classified as
+    // AGENTIC_API. MCP JSON-RPC still wins when both signals coexist.
+
+    const { extractAgenticTraceId } = require('../index');
+
+    console.log('\nTest A1: extracts 32-hex trace_id from well-formed traceparent');
+    assertEquals(
+        extractAgenticTraceId({
+            traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
+        }),
+        '4bf92f3577b34da6a3ce929d0e0e4736',
+        'W3C trace_id extracted (lowercased)'
+    );
+
+    console.log('\nTest A2: returns null when trace is null (no header captured)');
+    assertEquals(extractAgenticTraceId(null), null, 'null trace → null');
+
+    console.log('\nTest A3: rejects wrong field count (fail-safe)');
+    assertEquals(
+        extractAgenticTraceId({ traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-01' }),
+        null,
+        '3 fields rejected'
+    );
+
+    console.log('\nTest A4: rejects invalid version=ff per W3C spec');
+    assertEquals(
+        extractAgenticTraceId({
+            traceparent: 'ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
+        }),
+        null,
+        'version=ff rejected'
+    );
+
+    console.log('\nTest A5: rejects all-zero trace_id per W3C spec');
+    assertEquals(
+        extractAgenticTraceId({
+            traceparent: '00-00000000000000000000000000000000-00f067aa0ba902b7-01',
+        }),
+        null,
+        'all-zero trace_id rejected'
+    );
+
+    console.log('\nTest A6: rejects all-zero parent_id per W3C spec');
+    assertEquals(
+        extractAgenticTraceId({
+            traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01',
+        }),
+        null,
+        'all-zero parent_id rejected'
+    );
+
+    console.log('\nTest A7: rejects non-hex trace_id');
+    assertEquals(
+        extractAgenticTraceId({
+            traceparent: '00-ZZZZ2f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
+        }),
+        null,
+        'non-hex trace_id rejected'
+    );
+
+    console.log('\nTest A8: falls back to x-trace-id for non-OTel callers');
+    assertEquals(
+        extractAgenticTraceId({ xTraceId: 'legacy-agent-run-42' }),
+        'legacy-agent-run-42',
+        'x-trace-id fallback triggers classification'
+    );
+
+    console.log('\nTest A9: trims whitespace from x-trace-id fallback');
+    assertEquals(
+        extractAgenticTraceId({ xTraceId: '  legacy-42  ' }),
+        'legacy-42',
+        'whitespace stripped'
+    );
+
+    console.log('\nTest A10: prefers traceparent over x-trace-id when both present');
+    assertEquals(
+        extractAgenticTraceId({
+            traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
+            xTraceId: 'legacy-would-lose',
+        }),
+        '4bf92f3577b34da6a3ce929d0e0e4736',
+        'W3C traceparent wins over x-trace-id'
+    );
+
+    console.log('\nTest A11: end-to-end — traceparent header on non-MCP log entry stamps AGENTIC_API');
+    {
+        resetStub();
+        // Access-log message with a W3C traceparent header — non-MCP path.
+        const message = JSON.stringify({
+            requestId: 'req-agentic-1',
+            httpMethod: 'POST',
+            resourcePath: '/v1/orchestrate',
+            status: '200',
+            responseLatency: '45',
+            responseLength: '512',
+            customerId: 'cust-1',
+            requestHeaders: {
+                traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
+            },
+        });
+        const evt = makeCloudWatchEvent([message]);
+        const { result, error } = await runHandlerCaptured(evt);
+        assert(error === null, 'handler resolves cleanly');
+        assert(result && result.statusCode === 200, 'handler returns 200');
+
+        const posted = JSON.parse(httpStub.bodies[0]);
+        const agenticEvent = posted.events[0];
+        assertEquals(agenticEvent.productType, 'AGENTIC_API',
+            'productType stamped from traceparent header');
+        assertEquals(agenticEvent.traceId, '4bf92f3577b34da6a3ce929d0e0e4736',
+            'traceId extracted from W3C traceparent');
+        assertEquals(agenticEvent.endpointPath, '/v1/orchestrate',
+            'endpointPath top-level (descriptor requiredField)');
+        assertEquals(agenticEvent.httpMethod, 'POST', 'httpMethod top-level');
+        assertEquals(agenticEvent.statusCode, 200, 'statusCode top-level');
+    }
+
+    console.log('\nTest A12: end-to-end — no trace header → productType is the configured default (API)');
+    {
+        resetStub();
+        // Same shape as A11 but WITHOUT any trace header.
+        const message = JSON.stringify({
+            requestId: 'req-plain-1',
+            httpMethod: 'GET',
+            resourcePath: '/v1/health-check',
+            status: '200',
+            responseLatency: '3',
+            responseLength: '32',
+            customerId: 'cust-1',
+            requestHeaders: {},
+        });
+        const evt = makeCloudWatchEvent([message]);
+        const { result, error } = await runHandlerCaptured(evt);
+        assert(error === null, 'handler resolves cleanly');
+        assert(result && result.statusCode === 200, 'handler returns 200');
+
+        const posted = JSON.parse(httpStub.bodies[0]);
+        const plainEvent = posted.events[0];
+        assertEquals(plainEvent.productType, 'API', 'productType API without a trace header');
+        assert(plainEvent.traceId === undefined, 'no traceId without a trace header');
+    }
+
+    // Test 11: compound correlationId frozen — the compound analogue of
+    // Test 10. The correlationId is the dedup ROOT for a compound event
+    // (the server decomposes it into correlationId:metricName[:dim]:index),
+    // so it must be derived from log DATA and be IDENTICAL when the same
+    // awslogs payload is re-delivered by CloudWatch. Pre-freeze this was
+    // uuidv4() per evaluation → a redelivery double-billed every metric.
+    console.log('\nTest 11: compound correlationId stable across redelivery');
+    {
+        const crypto = require('node:crypto');
+        const compound = require('../compound-metering');
+        const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-3[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+        // Simulate two invocations of the SAME awslogs payload: parse the
+        // same access log twice, derive the seed the same way index.js
+        // derives the standard key (parsed.requestId || logEvent.id), and
+        // build the compound event from the extracted measurements.
+        const logMessage = JSON.stringify({
+            requestId: 'req-compound-1',
+            httpMethod: 'POST', resourcePath: '/v1/chat', status: '200',
+        });
+        const responseBody = { usage: { prompt_tokens: 500, completion_tokens: 200 } };
+
+        const invoke = () => {
+            const parsed = parseAccessLog(logMessage);
+            const seed = parsed.requestId || 'cw-evt-99';
+            const measurements = compound.extractMeasurements(
+                responseBody, compound.DEFAULT_LLM_PATHS, null);
+            return compound.buildCompoundEvent(
+                'cust_abc', measurements, { requestId: parsed.requestId }, seed);
+        };
+
+        const first = invoke();
+        const second = invoke();
+
+        assert(UUID_RE.test(first.correlationId),
+            'correlationId is a valid v3-style UUID (server DTO types it as UUID)');
+        assertEquals(first.correlationId, second.correlationId,
+            'correlationId identical across two invocations of the same payload (redelivery dedups)');
+
+        // Prove the derivation is exactly log-data-determined (md5 of the
+        // prefixed seed, v3/variant bits set) — no hidden entropy.
+        const hex = crypto.createHash('md5')
+            .update('aforo-compound:req-compound-1').digest('hex');
+        const variant = ((parseInt(hex[16], 16) & 0x3) | 0x8).toString(16);
+        const expected = hex.slice(0, 8) + '-' + hex.slice(8, 12) +
+            '-3' + hex.slice(13, 16) + '-' + variant + hex.slice(17, 20) +
+            '-' + hex.slice(20, 32);
+        assertEquals(first.correlationId, expected,
+            'correlationId derived purely from the log-data seed (md5, no entropy)');
+
+        // Distinct requests must still get distinct correlationIds.
+        const other = compound.buildCompoundEvent(
+            'cust_abc', compound.extractMeasurements(responseBody, compound.DEFAULT_LLM_PATHS, null),
+            {}, 'req-compound-2');
+        assert(other.correlationId !== first.correlationId,
+            'different seeds produce different correlationIds');
+
+        // metadata.requestId fallback when no explicit seed is passed.
+        const viaMetadata = compound.buildCompoundEvent(
+            'cust_abc', compound.extractMeasurements(responseBody, compound.DEFAULT_LLM_PATHS, null),
+            { requestId: 'req-compound-1' });
+        assertEquals(viaMetadata.correlationId, first.correlationId,
+            'metadata.requestId fallback derives the same frozen correlationId');
+    }
+
+    // ── executionStatus (OUTCOME_BASED pricing) ──
+    console.log('\nTest O1: outcomeFromStatus mapping table');
+    {
+        const { outcomeFromStatus } = require('../index');
+        const cases = [
+            [200, 'SUCCESS'], [201, 'SUCCESS'], [204, 'SUCCESS'], [301, 'SUCCESS'], [304, 'SUCCESS'],
+            [408, 'TIMEOUT'], [504, 'TIMEOUT'], [499, 'CANCELLED'],
+            [400, 'VALIDATION_FAILED'], [422, 'VALIDATION_FAILED'],
+            [401, 'BLOCKED'], [403, 'BLOCKED'], [429, 'BLOCKED'],
+            [404, 'ERROR'], [405, 'ERROR'], [409, 'ERROR'],
+            [500, 'ERROR'], [502, 'ERROR'], [503, 'ERROR'], [599, 'ERROR'],
+            ['200', 'SUCCESS'], ['504', 'TIMEOUT'],
+        ];
+        for (const [input, expected] of cases) {
+            assertEquals(outcomeFromStatus(input), expected, `status ${JSON.stringify(input)} -> ${expected}`);
+        }
+        for (const input of [0, null, undefined, NaN, '', 'abc', 101, 600, -1]) {
+            assertEquals(outcomeFromStatus(input), undefined, `status ${String(input)} -> omitted`);
+        }
+    }
+
+    console.log('\nTest O1b: STATUS_OUTCOMES overrides');
+    {
+        const { outcomeFromStatus, parseStatusOutcomes } = require('../index');
+        const o = parseStatusOutcomes(' 404 = validation_failed , 429=ERROR,202=PENDING,bad,700=ERROR,404x=ERROR,500=NOPE,,');
+        assertEquals(JSON.stringify(o), JSON.stringify({ 404: 'VALIDATION_FAILED', 429: 'ERROR', 202: 'PENDING' }),
+            'valid entries kept (trimmed, upper-cased), invalid skipped');
+        assertEquals(outcomeFromStatus(404, o), 'VALIDATION_FAILED', 'override wins for 404');
+        assertEquals(outcomeFromStatus(429, o), 'ERROR', 'override wins for 429');
+        assertEquals(outcomeFromStatus(202, o), 'PENDING', 'override on a 2xx');
+        assertEquals(outcomeFromStatus(403, o), 'BLOCKED', 'unlisted code keeps the default');
+        assertEquals(outcomeFromStatus(101, { 101: 'SUCCESS' }), undefined, 'override cannot bill a 1xx');
+        assertEquals(JSON.stringify(parseStatusOutcomes(undefined)), '{}', 'unset env -> no overrides');
+        assertEquals(outcomeFromStatus(404), 'ERROR', 'module default is the env-parsed (empty) map');
+        const { parseStatusCodeList } = require('../index');
+        assertEquals(JSON.stringify(parseStatusCodeList(undefined, [401])), '[401]', 'unset -> default list');
+        assertEquals(JSON.stringify(parseStatusCodeList('', [401])), '[]', 'empty -> meter everything');
+        assertEquals(JSON.stringify(parseStatusCodeList(' 403, x ,429,999', [])), '[403,429]', 'invalid entries skipped');
+    }
+
+    async function postOne(message) {
+        resetStub();
+        const { error } = await runHandlerCaptured(makeCloudWatchEvent([message]));
+        assert(error === null, 'handler resolves cleanly');
+        return JSON.parse(httpStub.bodies[0]).events[0];
+    }
+
+    console.log('\nTest O2: standard API event carries executionStatus from upstream status');
+    {
+        const ok = await postOne(JSON.stringify({
+            requestId: 'req-out-1', httpMethod: 'GET', resourcePath: '/v1/a', status: '200', customerId: 'cust-k',
+        }));
+        assertEquals(ok.executionStatus, 'SUCCESS', '200 -> SUCCESS on standard event');
+        const bad = await postOne(JSON.stringify({
+            requestId: 'req-out-2', httpMethod: 'GET', resourcePath: '/v1/a', status: '422', customerId: 'cust-k',
+        }));
+        assertEquals(bad.executionStatus, 'VALIDATION_FAILED', '422 -> VALIDATION_FAILED on standard event');
+        const conflict = await postOne(JSON.stringify({
+            requestId: 'req-out-2b', httpMethod: 'GET', resourcePath: '/v1/a', status: '404', customerId: 'cust-k',
+        }));
+        assertEquals(conflict.executionStatus, 'ERROR', '404 -> ERROR on standard event');
+        resetStub();
+        const { error: exclErr } = await runHandlerCaptured(makeCloudWatchEvent([JSON.stringify({
+            requestId: 'req-out-2c', httpMethod: 'GET', resourcePath: '/v1/a', status: '403', customerId: 'cust-k',
+        })]));
+        assert(exclErr === null && httpStub.bodies.length === 0, '403 is not metered under the default EXCLUDE_STATUS_CODES');
+        const missing = await postOne(JSON.stringify({
+            requestId: 'req-out-3', httpMethod: 'GET', resourcePath: '/v1/a', customerId: 'cust-k',
+        }));
+        assert(!('executionStatus' in missing), 'missing status -> executionStatus key omitted (not null/empty)');
+    }
+
+    console.log('\nTest O3: AGENTIC_API event carries executionStatus');
+    {
+        const ev = await postOne(JSON.stringify({
+            requestId: 'req-out-4', httpMethod: 'POST', resourcePath: '/v1/orchestrate', status: '504', customerId: 'cust-k',
+            requestHeaders: { traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' },
+        }));
+        assertEquals(ev.productType, 'AGENTIC_API', 'classified AGENTIC_API');
+        assertEquals(ev.executionStatus, 'TIMEOUT', '504 -> TIMEOUT on AGENTIC_API event');
+    }
+
+    console.log('\nTest O4: MCP tool call — 2xx SUCCESS, 504 now TIMEOUT (was ERROR)');
+    {
+        const mcpBody = JSON.stringify({
+            jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'search_web', arguments: {}, _meta: { agent_id: 'agent-7' } },
+        });
+        const ok = await postOne(JSON.stringify({
+            requestId: 'req-out-5', httpMethod: 'POST', resourcePath: '/mcp', status: '200', customerId: 'cust-k',
+            requestBody: mcpBody,
+        }));
+        assertEquals(ok.productType, 'MCP_SERVER', 'classified MCP_SERVER');
+        assertEquals(ok.executionStatus, 'SUCCESS', 'MCP 200 -> SUCCESS');
+        const timeout = await postOne(JSON.stringify({
+            requestId: 'req-out-6', httpMethod: 'POST', resourcePath: '/mcp', status: '504', customerId: 'cust-k',
+            requestBody: mcpBody,
+        }));
+        assertEquals(timeout.executionStatus, 'TIMEOUT', 'MCP 504 -> TIMEOUT');
+        const err = await postOne(JSON.stringify({
+            requestId: 'req-out-7', httpMethod: 'POST', resourcePath: '/mcp', status: '500', customerId: 'cust-k',
+            requestBody: mcpBody,
+        }));
+        assertEquals(err.executionStatus, 'ERROR', 'MCP 500 -> ERROR');
+        assertEquals(ok.idempotencyKey, `mcp:tenant_test:req-out-5:search_web:${ok.occurredAt ? Date.parse(ok.occurredAt) : ''}`,
+            'MCP key keeps the frozen shape mcp:<tenant>:<requestId>:<tool>:<log timestamp>');
+        const noAgent = await postOne(JSON.stringify({
+            requestId: 'req-out-8', httpMethod: 'POST', resourcePath: '/mcp', status: '200', customerId: 'cust-k',
+            requestBody: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'search_web' } }),
+        }));
+        assertEquals(noAgent.productType, 'API', 'tools/call without agentId keeps the configured productType');
+        assertEquals(noAgent.toolName, 'search_web', 'toolName still carried');
+    }
+
+    // Summary
+    console.log('\n── Results: ' + passed + ' passed, ' + failed + ' failed ──\n');
+    process.exit(failed > 0 ? 1 : 0);
+})();

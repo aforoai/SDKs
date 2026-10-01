@@ -1,0 +1,556 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Aforo Usage Metering — Mule 4 custom policy template.
+
+  Order of work for one API call:
+    1. Before the flow: remember the request line, headers, a request id
+       minted once, and the start time. With MCP detection on, also the JSON
+       body of a POST.
+    2. The flow runs (execute-next). The response goes back to the caller
+       untouched: everything below runs on a copy of the event inside an
+       async scope.
+    3. After the flow: build the usage event ONCE, then post it to the Aforo
+       ingestor with two retries. An empty events array sends nothing
+       (OPTIONS, excluded status / path, no verified customer, customer id
+       over 64 characters, quantity 0, unusable metric name).
+
+  The metering script between the BEGIN / END markers is the only copy in
+  this repository. It reads three names, all prepared in this file:
+    attributes     one object holding the request line, request headers and
+                   the response status (set by the first transform)
+    vars.aforo     the caller's identity, from claims of the JWT that
+                   MuleSoft's JWT Validation policy verified; when those
+                   claims carry no customer, the vars.aforo.* values an
+                   aforo-jwt-validation flow set from its own verified JWT
+    configuration  the policy properties, rendered by Handlebars
+  No request header is read for identity.
+
+  Triple-brace Handlebars names are rendered by the gateway when the
+  policy is applied; they are the properties aforo-metering.yaml declares.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:http-policy="http://www.mulesoft.org/schema/mule/http-policy"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:secure-properties="http://www.mulesoft.org/schema/mule/secure-properties"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/http-policy http://www.mulesoft.org/schema/mule/http-policy/current/mule-http-policy.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/secure-properties http://www.mulesoft.org/schema/mule/secure-properties/current/mule-secure-properties.xsd">
+
+    {{#if encrypted}}
+    <secure-properties:config key="${anypoint.platform.encryption_key}" file="${encryptedPropertiesFile}" name="encryptionConfiguration">
+        <secure-properties:encrypt algorithm="AES" mode="CBC"/>
+    </secure-properties:config>
+    {{/if}}
+
+    <http-policy:proxy name="{{{policyId}}}-aforo-metering">
+        <http-policy:source>
+
+            <!-- 1. Request facts. A failure here must never fail the API
+                 call: it is swallowed and the request is simply not metered. -->
+            <try>
+                <set-variable variableName="aforoRequestHeaders" value="#[attributes.headers]"/>
+                <!-- requestId is minted here, once per request, and is the
+                     idempotency identity of the event (Rule: freeze the key
+                     before any retry). It is not taken from a request header,
+                     so a caller cannot make two calls share one key. -->
+                <set-variable variableName="aforoRequest" value="#[{
+                    method: attributes.method,
+                    requestPath: attributes.requestPath,
+                    requestId: uuid(),
+                    startedAtMs: now() as Number {unit: 'milliseconds'}
+                }]"/>
+                <error-handler>
+                    <on-error-continue type="ANY" logException="false"/>
+                </error-handler>
+            </try>
+            {{#if mcp-enabled}}
+            <!-- MCP detection needs the JSON-RPC request body. Only POST
+                 requests with a JSON content type are read. -->
+            <try>
+                <set-variable variableName="aforoRequestContent" value="#[if ((attributes.method == 'POST') and (lower(attributes.headers.'content-type' default '') contains 'json')) (payload.^raw as String {encoding: 'UTF-8'}) else null]"/>
+                <error-handler>
+                    <on-error-continue type="ANY" logException="false"/>
+                </error-handler>
+            </try>
+            {{/if}}
+
+            <!-- 2. The API itself. -->
+            <http-policy:execute-next/>
+
+            <!-- 3. Meter. Async scope: works on a copy of the event, so the
+                 response is not changed and not delayed. -->
+            <async>
+                <try>
+                    <choice>
+                        <when expression="#[vars.aforoRequest != null]">
+                            <!-- Identity from the verified JWT only. -->
+                            <set-variable variableName="aforo" value="#[%dw 2.0
+output application/java
+var claims = authentication.properties.claims default {}
+var customerClaim = if (isEmpty('{{{customer-id-claim}}}')) 'customer_id' else '{{{customer-id-claim}}}'
+var tenantClaim = '{{{tenant-id-claim}}}'
+// Second source, read only when the claims above name no customer:
+// vars.aforo.* as set by an aforo-jwt-validation flow from a JWT that flow
+// verified (the 2.1.0 identity model). A flow variable is never set by
+// the caller; no request header is read here.
+var prior = if (vars.aforo is Object) vars.aforo else {}
+fun text(v) = if (v == null) '' else trim(v as String)
+var claimCustomer = if (text(claims[customerClaim]) != '') text(claims[customerClaim]) else text(claims.sub)
+var claimTenant = if (isEmpty(tenantClaim)) '{{{aforo-tenant-id}}}' else text(claims[tenantClaim])
+---
+{
+    customerId: if (claimCustomer != '') claimCustomer else text(prior.customerId),
+    tenantId: if (claimTenant != '') claimTenant else text(prior.tenantId)
+}]"/>
+
+                            <!-- One attributes object for the metering script:
+                                 request facts captured above plus the response
+                                 status. Header names are lower-cased;
+                                 Mcp-Session-Id is also kept under the spelling
+                                 the script reads. -->
+                            <ee:transform>
+                                <ee:message>
+                                    <ee:set-attributes><![CDATA[%dw 2.0
+output application/java
+var requestHeaders = (vars.aforoRequestHeaders default {}) mapObject ((value, key) -> {(lower(key as String)): value})
+var mcpSession = requestHeaders.'mcp-session-id'
+---
+{
+    method: vars.aforoRequest.method,
+    requestPath: vars.aforoRequest.requestPath,
+    requestId: vars.aforoRequest.requestId,
+    requestContent: vars.aforoRequestContent,
+    headers: requestHeaders ++ (if (mcpSession != null) {'Mcp-Session-Id': mcpSession} else {}),
+    statusCode: attributes.statusCode,
+    // Response size without reading (and buffering) the response body.
+    responseContentLength: dw::Runtime::try(() -> (attributes.headers.'content-length' as Number)).result,
+    responseTime: (now() as Number {unit: "milliseconds"}) - vars.aforoRequest.startedAtMs
+}]]></ee:set-attributes>
+                                </ee:message>
+                            </ee:transform>
+
+                            <!-- Build the payload ONCE, before the retry scope.
+                                 It holds {"events": [...]} — one event, or an
+                                 empty array when the request is excluded (status
+                                 code / path) or has no authenticated customer. -->
+                            <ee:transform>
+                                <ee:message>
+                                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+
+// Policy properties, as the script below expects them.
+var configuration = {
+  "mcp-enabled": {{#if mcp-enabled}}true{{else}}false{{/if}},
+  "mcp-product-id": "{{{mcp-product-id}}}",
+  "status-outcomes": "{{{status-outcomes}}}",
+  "exclude-status-codes": "{{{exclude-status-codes}}}",
+  "exclude-paths": "{{{exclude-paths}}}",
+  "product-type": "{{{product-type}}}",
+  "default-metric": "{{{default-metric}}}",
+  "metric-mappings": "{{{metric-mappings}}}",
+  "quantity-source": "{{{quantity-source}}}",
+  "include-metadata": "{{{include-metadata}}}",
+  // Deprecated aliases (2.1.0 names). Read only when the property above is blank.
+  "product_type": "{{{product_type}}}",
+  "default_metric": "{{{default_metric}}}",
+  "quantity_source": "{{{quantity_source}}}",
+  "include_metadata": "{{{include_metadata}}}"
+}
+// `try` lives in dw::Runtime and returns {success, result}. The script
+// below calls try(...) and expects the value or null.
+fun try(delegate) = dw::Runtime::try(delegate).result
+
+// >>> BEGIN metering script — the only copy; tests/policy.test.cjs locks its invariants
+var requestBody = try(() -> read(attributes.requestContent, "application/json")) default null
+var isMcpToolCall = (
+  configuration.'mcp-enabled' == true and
+  attributes.method == "POST" and
+  requestBody != null and
+  requestBody.jsonrpc == "2.0" and
+  requestBody.method == "tools/call"
+)
+var toolName = if (isMcpToolCall) (requestBody.params.name default "unknown") else ""
+var agentId = if (isMcpToolCall) (requestBody.params._meta.agent_id default "") else ""
+var sessionId = attributes.headers.'Mcp-Session-Id' default ""
+
+// ── Settings with a deprecated alias ──
+// The canonical property wins; the alias is read only when it is blank.
+fun setting(name, alias) = do {
+  var canonical = trim((configuration[name] default "") as String)
+  var fallback = if (alias == null) "" else trim((configuration[alias] default "") as String)
+  ---
+  if (canonical != "") canonical else fallback
+}
+
+// ── productType ── top-level on every event; the ingestor requires it.
+// `product-type` (alias `product_type`), trimmed + upper-cased, default
+// API. A tools/call is MCP_SERVER only when the request names an agent
+// (the ingestor rejects MCP_SERVER without agentId); without one it keeps
+// the configured type. A request with a trace id is AGENTIC_API (below).
+var configuredProductType = upper(setting("product-type", "product_type"))
+var productType = if (configuredProductType == "") "API" else configuredProductType
+var mcpProductType = if ((agentId as String) != "") "MCP_SERVER" else productType
+
+// occurredAt is ISO-8601 UTC: shift to UTC before formatting with a
+// literal Z (formatting local time with a literal 'Z' mislabels it).
+var occurredAtUtc = (now() >> "UTC") as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"}
+
+// ── Metric name ──
+// 1. `metric-mappings`: rules "KIND|value|metricName" separated by ";",
+//    KIND = EXACT, PREFIX or CONTAINS, compared with the request path as
+//    plain text; the first matching rule wins.
+// 2. `default-metric` (alias `default_metric`), default "api_calls". The
+//    tokens {method} and {path} are replaced, so "{method} {path}"
+//    restores the route-shaped name earlier builds sent.
+// A name that is empty or longer than 255 characters is never sent: the
+// event is dropped and the transport logs a WARN. The policy cannot know
+// the catalog; a name the catalog lacks is rejected by the ingestor.
+var requestMethod = (attributes.method default "UNKNOWN") as String
+var requestPath = (attributes.requestPath default "/") as String
+var metricRules =
+  ((setting("metric-mappings", null) splitBy ";")
+    map ((rule) -> (rule splitBy "|") map ((part) -> trim(part))))
+    filter ((rule) -> (sizeOf(rule) == 3)
+      and (["EXACT", "PREFIX", "CONTAINS"] contains upper(rule[0]))
+      and (rule[1] != ""))
+var matchedRule = (metricRules filter ((rule) ->
+  if (upper(rule[0]) == "EXACT") requestPath == rule[1]
+  else if (upper(rule[0]) == "PREFIX") requestPath startsWith rule[1]
+  else requestPath contains rule[1]))[0]
+var defaultMetricSetting = setting("default-metric", "default_metric")
+var defaultMetric =
+  ((if (defaultMetricSetting == "") "api_calls" else defaultMetricSetting)
+    replace "{method}" with requestMethod) replace "{path}" with requestPath
+var metricName = if (matchedRule != null) matchedRule[2] else defaultMetric
+var isMetricSendable = (sizeOf(metricName) > 0) and (sizeOf(metricName) <= 255)
+
+// ── Quantity ── `quantity-source` (alias `quantity_source`):
+// "request_count" (default) -> 1; "response_size" -> the response
+// Content-Length in bytes. The response body is never read. No
+// Content-Length (chunked response) or 0 -> quantity 0 -> no event.
+var quantitySource = lower(setting("quantity-source", "quantity_source"))
+var quantity =
+  if (quantitySource == "response_size")
+    (if (attributes.responseContentLength is Number) attributes.responseContentLength else 0)
+  else 1
+
+// `include-metadata` (alias `include_metadata`): "false" leaves the
+// metadata object off the event. Anything else, or blank, keeps it.
+var includeMetadata = lower(setting("include-metadata", "include_metadata")) != "false"
+
+// CORS preflight is never a billable call.
+var isPreflight = upper(requestMethod) == "OPTIONS"
+
+// ── Outcome classification (OUTCOME_BASED pricing) ──
+// Maps the upstream HTTP status to the server's executionStatus value
+// space. OUTCOME_BASED rate plans bill each event at a per-status
+// weight; every other pricing model ignores the field. Shared rule —
+// identical in all five gateway plugins (README "Execution status
+// mapping"). Default table (policy locked 2026-09-30):
+//   2xx/3xx -> SUCCESS, 408/504 -> TIMEOUT, 499 -> CANCELLED,
+//   400/422 -> VALIDATION_FAILED, 401/403/429 -> BLOCKED,
+//   every other 4xx and 5xx (404 included) -> ERROR,
+//   unknown / 0 / missing / 1xx / out of range -> null (field OMITTED
+//   via the conditional-field form below — never null or "").
+// Overrides: the `status-outcomes` property ("404=VALIDATION_FAILED,
+// 429=ERROR") — exact codes 200-599 win over the default; invalid
+// entries are ignored; if a code is listed twice the last valid entry wins.
+// The response payload is NOT inspected for JSON-RPC errors: Mule
+// streams the response, and reading `payload` here would buffer it.
+var allowedOutcomes = ["SUCCESS", "PARTIAL", "TIMEOUT", "ERROR",
+  "VALIDATION_FAILED", "FAILED", "FAILURE", "CANCELLED", "PENDING",
+  "BLOCKED", "HITL_REQUIRED"]
+var statusOutcomeOverrides =
+  (((configuration.'status-outcomes' default "") as String) splitBy ",")
+    reduce ((part, acc = {}) -> do {
+      var kv = trim(part) splitBy "="
+      var code = trim(kv[0] default "")
+      var outcome = upper(trim(kv[1] default ""))
+      ---
+      if ((sizeOf(kv) == 2) and (code matches /[2-5][0-9][0-9]/)
+          and (allowedOutcomes contains outcome))
+        // Drop an earlier entry for the same code first: ++ keeps both
+        // keys and a lookup returns the FIRST, so without this the first
+        // entry won. Last valid entry wins, as on the other four gateways.
+        (acc - code) ++ {(code): outcome}
+      else acc
+    })
+fun outcomeFromStatus(status) =
+  if (not (status is Number)) null
+  else if (status < 200 or status > 599) null
+  else if (statusOutcomeOverrides[(status as String)] != null)
+    statusOutcomeOverrides[(status as String)]
+  else if (status < 400) "SUCCESS"
+  else if (status == 408 or status == 504) "TIMEOUT"
+  else if (status == 499) "CANCELLED"
+  else if (status == 400 or status == 422) "VALIDATION_FAILED"
+  else if (status == 401 or status == 403 or status == 429) "BLOCKED"
+  else "ERROR"
+var executionStatus = outcomeFromStatus(attributes.statusCode)
+
+// AGENTIC_API classification — per descriptor
+// eventSchema.inferenceRule = HAS_TRACE (agentic_api.json), an event
+// with a resolvable trace id is classified as AGENTIC_API. Preferred
+// source is the W3C traceparent header (parsed for its 32-hex
+// trace_id field); fallback is x-trace-id per descriptor
+// tracing.allowFallback = true (non-OTel callers). MCP JSON-RPC
+// still wins the productType — the standard-event branch below is
+// the only site that stamps AGENTIC_API. Malformed traceparent
+// falls through cleanly; never invent a productType from an
+// unparseable header.
+var traceparentHeader = attributes.headers.'traceparent' default null
+var xTraceIdHeader = attributes.headers.'x-trace-id' default null
+var traceparentParts = if (traceparentHeader != null) (traceparentHeader splitBy "-") else []
+// W3C format: version-trace_id-parent_id-flags (hex widths 2-32-16-2).
+// Invalid per spec: version=="ff", trace_id all zeros, parent_id all zeros.
+var isValidTraceparent = (
+  sizeOf(traceparentParts) == 4 and
+  traceparentParts[0] matches /^[0-9a-fA-F]{2}$/ and
+  lower(traceparentParts[0]) != "ff" and
+  traceparentParts[1] matches /^[0-9a-fA-F]{32}$/ and
+  traceparentParts[1] != "00000000000000000000000000000000" and
+  traceparentParts[2] matches /^[0-9a-fA-F]{16}$/ and
+  traceparentParts[2] != "0000000000000000" and
+  traceparentParts[3] matches /^[0-9a-fA-F]{2}$/
+)
+// Portable trim — `dw::core::Strings::trim` requires an explicit
+// import in some Mule 4.x runtimes; the core `replace <regex> with`
+// form is unambiguous across every DataWeave 2.0 version and needs
+// no imports.
+var trimmedXTrace = if (xTraceIdHeader != null) (xTraceIdHeader replace /^\s+|\s+$/ with "") else ""
+// traceparent (W3C) takes precedence over x-trace-id (fallback).
+var agenticTraceId = (
+  if (isValidTraceparent) lower(traceparentParts[1])
+  else if (sizeOf(trimmedXTrace) > 0) trimmedXTrace
+  else null
+)
+var isAgenticApi = (not isMcpToolCall) and (agenticTraceId != null)
+
+// ── Exclusions (requests that are NOT metered at all) ── [shared block]
+// Same behaviour as Kong (exclude_status_codes / exclude_paths), AWS
+// Lambda (EXCLUDE_STATUS_CODES), Apigee (KVM exclude_status_codes /
+// exclude_paths) and Azure APIM (aforo-exclude-status-codes /
+// aforo-exclude-paths): an excluded request yields an EMPTY events
+// array, and the transport (template.xml) makes no outbound call for
+// an empty array.
+//   exclude-status-codes — CSV of HTTP codes. Absent or blank -> the
+//     default 401,403,429. A value replaces the default. "none"
+//     excludes nothing. Entries that aren't whole numbers 100-599 are
+//     ignored.
+//   exclude-paths — CSV of path prefixes. Absent or blank -> the
+//     default /health,/ready,/metrics (Kong's default). A value
+//     replaces the default; "none" excludes nothing. A path is excluded
+//     when it equals an entry or starts with it.
+// Never raises on malformed config: a value that is neither text nor a
+// number is read as blank, and junk entries are dropped.
+var defaultExcludeStatusCodes = [401, 403, 429]
+var defaultExcludePaths = ["/health", "/ready", "/metrics"]
+fun csvEntries(raw) = do {
+  var text = if (raw is String) raw else if (raw is Number) (raw as String) else ""
+  ---
+  ((text splitBy ",") map ((entry) -> trim(entry))) filter ((entry) -> sizeOf(entry) > 0)
+}
+fun isExcludeNothing(entries) =
+  (sizeOf(entries) == 1) and (lower(entries[0]) == "none")
+var excludeStatusEntries = csvEntries(configuration.'exclude-status-codes')
+var excludeStatusCodes =
+  if (isEmpty(excludeStatusEntries)) defaultExcludeStatusCodes
+  else if (isExcludeNothing(excludeStatusEntries)) []
+  else (excludeStatusEntries filter ((entry) -> entry matches /[1-5][0-9][0-9]/))
+    map ((entry) -> entry as Number)
+var excludePathEntries = csvEntries(configuration.'exclude-paths')
+var excludePaths =
+  if (isEmpty(excludePathEntries)) defaultExcludePaths
+  else if (isExcludeNothing(excludePathEntries)) []
+  else excludePathEntries
+var isExcludedStatus =
+  (attributes.statusCode is Number) and (excludeStatusCodes contains attributes.statusCode)
+var isExcludedPath =
+  (attributes.requestPath is String) and
+  (not isEmpty(excludePaths filter ((prefix) -> attributes.requestPath startsWith prefix)))
+var isExcluded = isExcludedStatus or isExcludedPath
+// ── end exclusions ── [shared block]
+
+// Authenticated identity — set by aforo-jwt-validation policy.
+// Never read X-Client-Id / X-Customer-Id / X-Tenant-Id from the
+// request: they are client-settable and therefore spoofable.
+var authenticatedCustomerId = vars.aforo.customerId default ""
+var authenticatedTenantId = vars.aforo.tenantId default ""
+var hasAuthenticatedIdentity = (authenticatedCustomerId != "") and (authenticatedTenantId != "")
+
+// Why a request produces no event; null when it is metered. An MCP tool
+// call always has quantity 1 and a fixed metric name.
+var skipReason =
+  if (isPreflight) "options"
+  else if (isExcluded) "excluded"
+  else if (not hasAuthenticatedIdentity) "no-identity"
+  else if (sizeOf(authenticatedCustomerId) > 64) "customer-id-too-long"
+  else if ((not isMcpToolCall) and (quantity <= 0)) "quantity"
+  else if ((not isMcpToolCall) and (not isMetricSendable)) "metric"
+  else null
+var isMeterable = skipReason == null
+
+---
+{
+  // Present only when the events array is empty, so it is never sent.
+  (skipReason: skipReason) if (not isMeterable),
+  // No event for OPTIONS, an excluded status code or path, a request
+  // with no verified customer, a customer id over 64 characters, a
+  // quantity of 0 or an unusable metric name.
+  events: if (isMeterable) [
+    if (isMcpToolCall) {
+      customerId: authenticatedCustomerId,
+      tenantId: authenticatedTenantId,
+      metricName: "mcp_server.tool_invocations",
+      quantity: 1,
+      // Idempotency key FROZEN (A+ delivery-guarantee prompt 4): stable
+      // request identity only — requestId + toolName is already unique
+      // per invocation (one tools/call per HTTP request). The now()
+      // suffix was removed: a per-evaluation clock makes every delivery
+      // attempt look like a new event, defeating ingest dedup and
+      // double-billing on redelivery. The uuid() fallback only fires
+      // when requestId is absent and is materialized once into the
+      // payload, so retries of the built payload still dedup.
+      idempotencyKey: "mcp:mulesoft:" ++ (attributes.requestId default uuid()) ++ ":" ++ toolName,
+      occurredAt: occurredAtUtc,
+      productType: mcpProductType,
+      toolName: toolName,
+      agentId: agentId,
+      sessionId: sessionId,
+      // Shared outcome table: 2xx stays SUCCESS; 504 -> TIMEOUT (was ERROR).
+      (executionStatus: executionStatus) if executionStatus != null,
+      executionDurationMs: attributes.responseTime default 0,
+      endpointPath: attributes.requestPath default "/",
+      httpMethod: attributes.method default "UNKNOWN",
+      statusCode: attributes.statusCode default 0,
+      responseTimeMs: attributes.responseTime default 0,
+      trace: {
+        traceparent: attributes.headers.'traceparent' default null,
+        tracestate: attributes.headers.'tracestate' default null,
+        xTraceId: attributes.headers.'x-trace-id' default null,
+        xRequestId: attributes.headers.'x-request-id' default null
+      },
+      (metadata: {
+        gateway: "mulesoft",
+        productId: configuration.'mcp-product-id' default "",
+        status: attributes.statusCode,
+        path: attributes.requestPath
+      }) if includeMetadata
+    } else {
+      customerId: authenticatedCustomerId,
+      tenantId: authenticatedTenantId,
+      metricName: metricName,
+      quantity: quantity,
+      idempotencyKey: attributes.requestId default uuid(),
+      occurredAt: occurredAtUtc,
+      endpointPath: attributes.requestPath default "/",
+      httpMethod: attributes.method default "UNKNOWN",
+      statusCode: attributes.statusCode default 0,
+      responseTimeMs: attributes.responseTime default 0,
+      // Outcome for OUTCOME_BASED pricing (standard API + AGENTIC_API).
+      (executionStatus: executionStatus) if executionStatus != null,
+      // AGENTIC_API classification — top-level productType + traceId so
+      // SchemaBasedEventValidator.getTopLevelField reads them via the
+      // P0-6 DTO-first lookup (metadata is not searched for descriptor
+      // requiredFields endpoint/method/status_code/trace_id).
+      // Without a trace id the event carries the configured product type.
+      productType: if (isAgenticApi) "AGENTIC_API" else productType,
+      (traceId: agenticTraceId) if isAgenticApi,
+      trace: {
+        traceparent: attributes.headers.'traceparent' default null,
+        tracestate: attributes.headers.'tracestate' default null,
+        xTraceId: attributes.headers.'x-trace-id' default null,
+        xRequestId: attributes.headers.'x-request-id' default null
+      },
+      (metadata: {
+        gateway: "mulesoft",
+        method: attributes.method,
+        path: attributes.requestPath,
+        status: attributes.statusCode
+      }) if includeMetadata
+    }
+  ] else []
+}
+// <<< END shared script
+]]></ee:set-payload>
+                                </ee:message>
+                            </ee:transform>
+
+                            <!-- An empty events array means "do not meter this
+                                 request": no outbound call is made. -->
+                            <choice>
+                                <when expression="#[sizeOf(payload.events default []) > 0]">
+                                    <!-- Bounded redelivery. The payload,
+                                         including the idempotencyKey, was built
+                                         once above; until-successful re-sends
+                                         the SAME bytes, so the ingestor dedups a
+                                         redelivery instead of billing it twice.
+
+                                         Retried: transport errors, 5xx, 408 and
+                                         429. Any other 4xx is a permanent
+                                         rejection: it is not retried, and the
+                                         response body is logged below. After 3
+                                         attempts MULE:RETRY_EXHAUSTED lands in
+                                         the on-error-continue below. The wait
+                                         between attempts is fixed; Retry-After
+                                         is not read. All of it runs in the
+                                         async scope, after the response.
+
+                                         The API key is the only credential: no
+                                         Authorization header and no
+                                         X-Tenant-Id (the ingestor takes the
+                                         workspace from the key). -->
+                                    <until-successful maxRetries="2" millisBetweenRetries="1000">
+                                        <http:request method="POST" url="{{{aforo-endpoint}}}" responseTimeout="10000">
+                                            <http:headers><![CDATA[#[{
+                                                "Content-Type": "application/json",
+                                                "X-API-Key": "{{{aforo-api-key}}}"
+                                            }]]]></http:headers>
+                                            <http:response-validator>
+                                                <http:success-status-code-validator values="200..299,400..407,409..428,430..499" />
+                                            </http:response-validator>
+                                        </http:request>
+                                    </until-successful>
+                                    <!-- A 4xx other than 408 / 429: the ingestor
+                                         refused the event (unknown metric name,
+                                         unknown customer, bad key). Say why. -->
+                                    <choice>
+                                        <when expression="#[(attributes.statusCode default 200) >= 400]">
+                                            <logger level="WARN"
+                                                    message="#[%dw 2.0
+output application/java
+var body = dw::Runtime::try(() -> (payload.^raw as String {encoding: 'UTF-8'})).result default ''
+---
+'[aforo-metering] usage event rejected by the ingestor, not retried: HTTP ' ++ (attributes.statusCode as String) ++ ' ' ++ (if (sizeOf(body) > 500) body[0 to 499] else body)]" />
+                                        </when>
+                                    </choice>
+                                </when>
+                                <when expression="#[payload.skipReason == 'metric']">
+                                    <logger level="WARN"
+                                            message="[aforo-metering] usage event dropped: the metric name is empty or longer than 255 characters. Check metric-mappings and default-metric." />
+                                </when>
+                                <when expression="#[payload.skipReason != null]">
+                                    <logger level="DEBUG"
+                                            message="#['[aforo-metering] not metered: ' ++ (payload.skipReason as String)]" />
+                                </when>
+                            </choice>
+                        </when>
+                    </choice>
+
+                    <error-handler>
+                        <on-error-continue type="ANY" logException="false">
+                            <logger level="WARN"
+                                    message="#['[aforo-metering] usage event not delivered (up to 3 attempts): ' ++ (error.description default 'unknown error') ++ '. The idempotencyKey is fixed, so a later redelivery cannot bill twice.']" />
+                        </on-error-continue>
+                    </error-handler>
+                </try>
+            </async>
+
+        </http-policy:source>
+    </http-policy:proxy>
+</mule>
