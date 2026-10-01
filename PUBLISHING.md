@@ -32,16 +32,16 @@ registry namespaces additionally needs org-owner / registry-account-owner rights
 
 ---
 
-## Step A — Maven namespace decision (do first)
+## Step A — Maven namespace (decided: `ai.aforo`)
 
-The Java poms use `com.aforo` today. Keep it (no change) **or** switch to
-`ai.aforo` (edit `<groupId>` in the five `aforo-metering-sdks/java*/pom.xml`).
-Maven Central requires you to *own* whichever namespace you pick. Settle this
-before claiming the namespace in Step C.
+The Java poms use `ai.aforo`, which matches the `aforo.ai` domain. Maven Central
+requires you to *own* the namespace and checks it with a DNS TXT record on that
+domain (the `aforo.ai` zone is in Aforo's AWS Route 53). `com.aforo` would need
+aforo.com, which Aforo does not control. Claim `ai.aforo` in Step C.
 
 ## Step B — npm setup
 
-1. **[web]** Confirm Aforo owns the `@aforo` scope on npmjs.org.
+1. **[web]** Confirm Aforo owns the `@aforoai` scope on npmjs.org (the storefront widgets already publish under it).
 2. **[laptop]** Set the publish token (an npm *automation* token with publish rights):
    ```bash
    gh secret set NPM_TOKEN --repo aforoai/SDKs
@@ -168,7 +168,7 @@ pre-release (npm `--tag next`, a PyPI pre-release version, etc.).
 - [x] Repo **public**, branch protection on `main`, CI a **required** check
 - [x] Maven poms carry Central metadata + signing (in the `release` profile)
 - [x] Contact addresses in `SECURITY.md` / `SUPPORT.md` (support@aforo.ai)
-- [ ] Maven namespace decided (`com.aforo` vs `ai.aforo`) — Step A
+- [x] Maven namespace decided: `ai.aforo` — Step A
 - [ ] Registry namespaces claimed + secrets/OIDC configured — Steps B/C/D
 - [ ] `@aforoai/sdk-maintainers` team has members — Step E
 - [ ] Customer docs on docs.aforo.ai published, then announce
