@@ -173,6 +173,13 @@ def fixture():
     }
 
     billing.shutdown()
+    # flush_count=1 starts one flush thread per event, and shutdown() does not
+    # wait for them. Let any still in flight finish while the capture server is
+    # up: otherwise one fails, backs off, and retries into the next test's
+    # patched urlopen.
+    for t in threading.enumerate():
+        if t is not threading.current_thread() and getattr(t, "_target", None) == billing._flush:
+            t.join(timeout=5)
     broker.stop()
     capture_server.shutdown()
     capture_thread.join(timeout=2)

@@ -30,6 +30,36 @@ func TestClient_Track(t *testing.T) {
 	}
 }
 
+func TestClient_AutoKeysUniquePerTrackCall(t *testing.T) {
+	// No caller key = dedup opt-out. Two same-instant identical events must
+	// get DISTINCT random keys (the old content-hash fallback collapsed
+	// them — the H4 bug Aforo ingest fixed server-side in April 2026).
+	client := NewClient(Options{
+		APIKey:        "test-key",
+		BaseURL:       "http://localhost:19999",
+		FlushCount:    100,
+		FlushInterval: time.Minute,
+		MaxRetries:    0,
+	})
+	defer client.Close()
+
+	same := TrackEvent{CustomerID: "cust_1", MetricName: "api_calls", Quantity: 1, OccurredAt: "2026-07-05T00:00:00Z"}
+	a, b := same, same
+	if err := client.Track(a); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := client.Track(b); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	events := client.buf.drainUpTo(10)
+	if len(events) != 2 {
+		t.Fatalf("expected 2 buffered events, got %d", len(events))
+	}
+	if events[0].IdempotencyKey == events[1].IdempotencyKey {
+		t.Fatalf("auto keys collapsed for identical same-instant events: %s", events[0].IdempotencyKey)
+	}
+}
+
 func TestClient_TrackAfterClose(t *testing.T) {
 	client := NewClient(Options{
 		APIKey:        "test-key",

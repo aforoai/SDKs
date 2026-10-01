@@ -109,6 +109,30 @@ def _make_fail_hard_handler() -> Any:
     )
 
 
+def _make_denied_handler() -> Any:
+    def behavior(_request: Dict[str, Any], context: Any) -> Dict[str, Any]:
+        context.abort(grpc.StatusCode.PERMISSION_DENIED, "nope")
+        return {}  # unreachable
+    return grpc.unary_unary_rpc_method_handler(
+        behavior,
+        request_deserializer=_deserialize,
+        response_serializer=_serialize,
+    )
+
+
+def _make_set_code_handler() -> Any:
+    # set_code() + a normal return: no exception reaches the interceptor.
+    def behavior(_request: Dict[str, Any], context: Any) -> Dict[str, Any]:
+        context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+        context.set_details("bad field")
+        return {}
+    return grpc.unary_unary_rpc_method_handler(
+        behavior,
+        request_deserializer=_deserialize,
+        response_serializer=_serialize,
+    )
+
+
 # ── Fixtures ──────────────────────────────────────────────────────────
 
 @pytest.fixture
@@ -138,6 +162,8 @@ def fixture():
     handlers: Dict[str, Any] = {
         "SayHello": _make_say_hello_handler(),
         "FailHard": _make_fail_hard_handler(),
+        "Denied": _make_denied_handler(),
+        "SetCode": _make_set_code_handler(),
     }
     generic = grpc.method_handlers_generic_handler("aforo.test.Greeter", handlers)
     server.add_generic_rpc_handlers((generic,))
@@ -202,6 +228,7 @@ def test_unary_success_emits_OK_event(fixture):
     assert ev["grpcCallType"] == "UNARY"
     assert ev["customerId"] == "cust_grpc_001"
     assert ev["executionDurationMs"] >= 0
+    assert ev["executionStatus"] == "SUCCESS"
 
 
 def test_unary_handler_error_emits_mapped_status(fixture):
@@ -215,11 +242,39 @@ def test_unary_handler_error_emits_mapped_status(fixture):
     events = _wait_for_events(fixture["captured"], lambda evs: len(evs) >= 1)
     ev = events[0]
     assert ev["grpcMethod"] == "FailHard"
-    # The interceptor's grpc.RpcError branch maps to INVALID_ARGUMENT (code 3).
-    # If a different exception path is taken the SDK falls back to INTERNAL —
-    # accept either, but assert it's a real failure label, not OK.
-    assert ev["grpcStatusCode"] in {"INVALID_ARGUMENT", "INTERNAL"}
+    # context.abort() raises a plain Exception; the code it set on the context
+    # must win over the INTERNAL fallback for that exception.
+    assert ev["grpcStatusCode"] == "INVALID_ARGUMENT"
     assert ev["customerId"] == "cust_grpc_002"
+    assert ev["executionStatus"] == "VALIDATION_FAILED"
+
+
+def test_abort_permission_denied_records_blocked(fixture):
+    with pytest.raises(grpc.RpcError) as exc_info:
+        _channel_call(
+            fixture["port"], "Denied", {},
+            metadata=(("x-customer-id", "cust_grpc_denied"),),
+        )
+    assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
+
+    ev = _wait_for_events(fixture["captured"], lambda evs: len(evs) >= 1)[0]
+    assert ev["grpcMethod"] == "Denied"
+    assert ev["grpcStatusCode"] == "PERMISSION_DENIED"
+    assert ev["executionStatus"] == "BLOCKED"
+
+
+def test_set_code_then_return_records_that_code(fixture):
+    with pytest.raises(grpc.RpcError) as exc_info:
+        _channel_call(
+            fixture["port"], "SetCode", {},
+            metadata=(("x-customer-id", "cust_grpc_setcode"),),
+        )
+    assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+
+    ev = _wait_for_events(fixture["captured"], lambda evs: len(evs) >= 1)[0]
+    assert ev["grpcMethod"] == "SetCode"
+    assert ev["grpcStatusCode"] == "INVALID_ARGUMENT"
+    assert ev["executionStatus"] == "VALIDATION_FAILED"
 
 
 def test_no_customer_id_metadata_is_silently_skipped(fixture):

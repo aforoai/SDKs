@@ -23,6 +23,14 @@
 import { AforoMqttBilling } from '../index';
 import * as http from 'http';
 import { AddressInfo } from 'net';
+import {
+  INTEGRATION_TEST_TIMEOUT_MS,
+  onceOrError,
+  runCleanups,
+  trackFetch,
+  waitFor,
+  type FetchTracker,
+} from '../../test-support/timing';
 
 // Conditional require so the test silently no-ops if peers aren't installed.
 // Aedes 0.5x ships as an ESM-default-export package; under
@@ -60,9 +68,25 @@ interface Fixture {
   ingestorUrl: string;
   captured: CapturedRequest[];
   billing: AforoMqttBilling;
+  /** Every mqtt.js client a test opened — force-closed in teardown whatever the outcome. */
+  clients: any[];
+  /** Extra SDK instances a single test created; shut down alongside `billing`. */
+  extraBillings: AforoMqttBilling[];
+  /** Extra servers a single test created; closed after every flush has landed. */
+  extraServers: http.Server[];
+  fetches: FetchTracker;
+}
+
+function closeHttpServer(server: http.Server): Promise<void> {
+  return new Promise<void>((resolve) => {
+    server.close(() => resolve());
+    // Keep-alive sockets from the SDK's fetch would otherwise hold close() open.
+    (server as any).closeAllConnections?.();
+  });
 }
 
 async function setup(): Promise<Fixture> {
+  const fetches = trackFetch();
   // ── 1. Capture HTTP ingestor on a random port
   const captured: CapturedRequest[] = [];
   const ingestorServer = http.createServer((req, res) => {
@@ -98,7 +122,6 @@ async function setup(): Promise<Fixture> {
     tenantId: 'tenant-integ-001',
     productId: 'prod-mqtt-integ',
     apiKey: 'sk_integ',
-    onError: () => {}, // ignore teardown-race flush noise
     ingestorUrl,
     flushCount: 1,             // flush after every event so the test is deterministic
     flushIntervalMs: 60_000,   // long timer; flushCount=1 dominates
@@ -107,33 +130,64 @@ async function setup(): Promise<Fixture> {
     resolveCustomerId: (clientId) => `cust_${clientId}`,
   });
 
-  return { brokerPort, brokerServer, aedes, ingestorServer, ingestorUrl, captured, billing };
+  return {
+    brokerPort, brokerServer, aedes, ingestorServer, ingestorUrl, captured, billing,
+    clients: [], extraBillings: [], extraServers: [], fetches,
+  };
 }
 
+/** Connect a real mqtt.js client, tracked for teardown. Rejects with the real error if the connect fails. */
+async function connectClient(f: Fixture, clientId: string): Promise<any> {
+  const client = mqttPkg.connect(`mqtt://127.0.0.1:${f.brokerPort}`, { clientId });
+  f.clients.push(client);
+  await onceOrError(client, 'connect');
+  return client;
+}
+
+/**
+ * Quiesce, then close — in dependency order, and independent of how the test
+ * ended. Clients are force-ended first: an mqtt.js client left connected is
+ * exactly what makes aedes.close() / server.close() hang. Then wait for the
+ * broker to see them gone (that is when the SDK emits its disconnect event),
+ * flush, wait for every in-flight flush to land, and only then close the
+ * broker and the ingestors being flushed to.
+ */
 async function teardown(f: Fixture): Promise<void> {
-  await f.billing.shutdown();
-  await new Promise<void>((r) => f.aedes.close(() => r()));
-  await new Promise<void>((r) => f.brokerServer.close(() => r()));
-  await new Promise<void>((r) => f.ingestorServer.close(() => r()));
+  await runCleanups([
+    ['force-end clients', () => { for (const c of f.clients) c.end(true); }],
+    ['broker sees clients gone', () =>
+      waitFor(
+        () => f.aedes.connectedClients === 0,
+        () => `aedes.connectedClients to reach 0 (now ${f.aedes.connectedClients})`,
+      )],
+    ...f.extraBillings.map((b, i): [string, () => unknown] => [`extraBillings[${i}].shutdown`, () => b.shutdown()]),
+    ['billing.shutdown', () => f.billing.shutdown()],
+    ['in-flight flushes', () =>
+      waitFor(() => f.fetches.pending() === 0, () => `SDK fetches to settle (pending=${f.fetches.pending()})`)],
+    ['aedes.close', () => new Promise<void>((r) => f.aedes.close(() => r()))],
+    ['broker server.close', () => new Promise<void>((r) => f.brokerServer.close(() => r()))],
+    ...f.extraServers.map((srv, i): [string, () => unknown] => [`extraServers[${i}].close`, () => closeHttpServer(srv)]),
+    ['ingestor.close', () => closeHttpServer(f.ingestorServer)],
+    ['restore fetch', () => f.fetches.restore()],
+  ]);
 }
 
 function flatEvents(captured: CapturedRequest[]): any[] {
   return captured.flatMap((r) => r.body?.events ?? []);
 }
 
-async function waitForEvents(
+/** Wait until the captured events satisfy `predicate`; returns them. */
+function waitForEvents(
   captured: CapturedRequest[],
   predicate: (events: any[]) => boolean,
-  timeoutMs = 2000,
+  what: string,
 ): Promise<any[]> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const events = flatEvents(captured);
-    if (predicate(events)) return events;
-    await new Promise((r) => setTimeout(r, 25));
-  }
-  throw new Error(
-    `waitForEvents timed out after ${timeoutMs}ms. captured=${JSON.stringify(captured, null, 2)}`,
+  return waitFor(
+    () => {
+      const events = flatEvents(captured);
+      return predicate(events) ? events : undefined;
+    },
+    () => `${what}. captured=${JSON.stringify(captured, null, 2)}`,
   );
 }
 
@@ -153,15 +207,12 @@ describe('Real-broker integration (aedes + mqtt.js)', () => {
 
   afterEach(async () => {
     await teardown(fix);
-  });
+  }, INTEGRATION_TEST_TIMEOUT_MS);
 
   itIfPeers(
     'PUBLISH event traverses real MQTT pub → aedes hook → SDK → ingestor',
     async () => {
-      const client = mqttPkg.connect(`mqtt://127.0.0.1:${fix.brokerPort}`, {
-        clientId: 'device-int-001',
-      });
-      await new Promise<void>((r) => client.once('connect', () => r()));
+      const client = await connectClient(fix, 'device-int-001');
 
       client.publish('sensors/room-a/temperature', Buffer.from('22.7'), { qos: 1, retain: false });
 
@@ -169,6 +220,7 @@ describe('Real-broker integration (aedes + mqtt.js)', () => {
       const events = await waitForEvents(
         fix.captured,
         (evs) => evs.some((e: any) => e.mqttEventType === 'PUBLISH'),
+        'a PUBLISH event',
       );
 
       const pub = events.find((e: any) => e.mqttEventType === 'PUBLISH');
@@ -181,18 +233,14 @@ describe('Real-broker integration (aedes + mqtt.js)', () => {
       expect(pub.customerId).toBe('cust_device-int-001');
       expect(pub.dataBytes).toBe(4); // "22.7"
 
-      await new Promise<void>((r) => client.end(false, {}, () => r()));
     },
-    10_000,
+    INTEGRATION_TEST_TIMEOUT_MS,
   );
 
   itIfPeers(
     'SUBSCRIBE event traverses real MQTT subscribe → aedes hook → SDK → ingestor',
     async () => {
-      const client = mqttPkg.connect(`mqtt://127.0.0.1:${fix.brokerPort}`, {
-        clientId: 'device-int-002',
-      });
-      await new Promise<void>((r) => client.once('connect', () => r()));
+      const client = await connectClient(fix, 'device-int-002');
 
       await new Promise<void>((r, rj) =>
         client.subscribe('alerts/critical', { qos: 2 }, (err: any) => (err ? rj(err) : r())),
@@ -201,6 +249,7 @@ describe('Real-broker integration (aedes + mqtt.js)', () => {
       const events = await waitForEvents(
         fix.captured,
         (evs) => evs.some((e: any) => e.mqttEventType === 'SUBSCRIBE'),
+        'a SUBSCRIBE event',
       );
 
       const sub = events.find((e: any) => e.mqttEventType === 'SUBSCRIBE');
@@ -210,9 +259,8 @@ describe('Real-broker integration (aedes + mqtt.js)', () => {
       expect(sub.mqttClientId).toBe('device-int-002');
       expect(sub.customerId).toBe('cust_device-int-002');
 
-      await new Promise<void>((r) => client.end(false, {}, () => r()));
     },
-    10_000,
+    INTEGRATION_TEST_TIMEOUT_MS,
   );
 
   itIfPeers(
@@ -230,6 +278,7 @@ describe('Real-broker integration (aedes + mqtt.js)', () => {
           res.end();
         });
       });
+      fix.extraServers.push(sniffServer);
       await new Promise<void>((r) => sniffServer.listen(0, '127.0.0.1', r));
       const port = (sniffServer.address() as AddressInfo).port;
 
@@ -237,38 +286,27 @@ describe('Real-broker integration (aedes + mqtt.js)', () => {
         tenantId: 'tenant-headers',
         productId: 'prod-headers',
         apiKey: 'sk_header_check',
-        onError: () => {}, // ignore teardown-race flush noise
         ingestorUrl: `http://127.0.0.1:${port}/ingest`,
         flushCount: 1,
       });
+      fix.extraBillings.push(billing2);
       billing2.wrapAedesBroker(fix.aedes as any, {
         resolveCustomerId: (clientId) => `cust_${clientId}`,
       });
 
-      const client = mqttPkg.connect(`mqtt://127.0.0.1:${fix.brokerPort}`, {
-        clientId: 'device-int-headers',
-      });
-      await new Promise<void>((r) => client.once('connect', () => r()));
+      const client = await connectClient(fix, 'device-int-headers');
       client.publish('h/test', Buffer.from('x'), { qos: 0, retain: false });
 
-      // Wait until at least one request reached the sniffer.
-      const deadline = Date.now() + 2000;
-      while (sniffed.length === 0 && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 25));
-      }
-
-      expect(sniffed.length).toBeGreaterThan(0);
-      // The SDK's two ingestors will both fire — pick any sniffed
-      // request and assert headers came through.
-      const headers = sniffed[0];
+      const headers = await waitFor(
+        () => sniffed[0],
+        () => 'a request to reach the header-sniffing ingestor',
+      );
+      // Both SDK instances are wired to the broker; every request that reaches
+      // the sniffer comes from billing2.
       expect(headers['x-api-key']).toBe('sk_header_check');
       expect(headers['authorization']).toBeUndefined();
       expect(headers['x-tenant-id']).toBe('tenant-headers');
-
-      await new Promise<void>((r) => client.end(false, {}, () => r()));
-      await billing2.shutdown();
-      await new Promise<void>((r) => sniffServer.close(() => r()));
     },
-    10_000,
+    INTEGRATION_TEST_TIMEOUT_MS,
   );
 });

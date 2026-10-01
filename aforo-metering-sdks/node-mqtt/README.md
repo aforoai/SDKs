@@ -2,7 +2,7 @@
 
 Meter MQTT traffic into Aforo two ways: hook an Aedes broker you operate to meter every PUBLISH/SUBSCRIBE/CONNECT/DISCONNECT, or wrap an `mqtt.js` client to meter what it publishes and receives against a third-party broker (AWS IoT, HiveMQ Cloud, EMQ X Cloud).
 
-**Version:** 1.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 1.2.2 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 | Mode | When to use | Entry point |
 |---|---|---|
@@ -19,7 +19,7 @@ npm i @aforoai/mqtt-metering aedes   # broker mode
 npm i @aforoai/mqtt-metering mqtt    # client mode
 ```
 
-> **Not yet on the public npm registry — install from source for now.** `aedes` and `mqtt` are **optional** peer dependencies — install only the one your mode needs.
+> **Install `1.2.2` or later. `1.0.0` on npm was built from an older copy of this code and lacks the fixes listed in the changelog.** If `1.2.2` is not on npm yet, install from source with the steps below. `aedes` and `mqtt` are **optional** peer dependencies — install only the one your mode needs.
 
 ```bash
 # from the SDKs repo root
@@ -89,7 +89,8 @@ Each event uses `metricName: "mqtt_broker.<event>"` (`mqtt_broker.publish`, `mqt
 | `emitDeliverEvents` | `boolean` | `false` | Emit a `DELIVER` event per fan-out delivery. Off → `DELIVER` events are dropped (both modes). |
 | `flushCount` | `number` | `200` | Buffered events that trigger an immediate flush. Highest default of the SDKs — MQTT is very high-volume. |
 | `flushIntervalMs` | `number` | `2000` | Max ms before a partial batch is flushed. |
-| `onError` | `(error: Error) => void` | logs to `console.error` | Called when a batch is dropped: after 3 attempts on network errors / 408 / 429 (honouring `Retry-After`) / 5xx, immediately on any other 4xx (not retried), and when a 202 reports per-event failures (`errors[].message`). |
+| `onError` | `(error: Error) => void` | logs to `console.error` | Called once per delivery problem: a batch dropped after 3 attempts (network errors / 408 / 429 honouring `Retry-After` / 5xx), a batch refused with any other 4xx (not retried; the message includes the ingestor's `errors[].message`), per-event failures reported in a 2xx response, and an unusable `executionStatus`. Exceptions it throws are swallowed. |
+| `onDrop` | `(events, reason) => void` | none | Receives events that were permanently dropped, with reason `invalid`, `rejected` or `retry_exhausted`. See [Dropped events](#dropped-events). |
 
 Mode-specific options:
 
@@ -103,7 +104,42 @@ Mode-specific options:
 
 Every event carries `mqttQos` (0/1/2) and `mqttRetained` — use them in Aforo rate-plan filter conditions to price QoS ≥ 1 or retained messages separately.
 
-Exported symbols: `AforoMqttBilling` (with `wrapAedesBroker` / `wrapMqttClient` / `shutdown`) and the `AforoMqttConfig` / `AedesBrokerOptions` / `MqttClientOptions` types.
+Exported symbols: `AforoMqttBilling` (with `wrapAedesBroker` / `wrapMqttClient` / `shutdown` / `droppedCount`), `mqttConnectTopic` / `mqttDisconnectTopic`, `DEFAULT_PRODUCT_TYPE`, and the `AforoMqttConfig` / `AedesBrokerOptions` / `MqttClientOptions` / `MqttUsageEvent` / `DropReason` types.
+
+## Execution status
+
+Outcome-based pricing bills each event at the weight set for its `executionStatus`; events without one bill at full price. The SDK trims and upper-cases the value and leaves the key out of the event when it is unset or blank. Accepted values: `SUCCESS`, `PARTIAL`, `TIMEOUT`, `ERROR`, `VALIDATION_FAILED`, `FAILED`, `FAILURE`, `CANCELLED`, `PENDING`, `BLOCKED`, `HITL_REQUIRED`. Any other value (or a Promise returned by an async resolver) is reported through `onError` and left off the event — the event itself is still sent — because the server would reject the event. Resolvers must be synchronous.
+
+The SDK never sets `executionStatus` on its own: the broker hook sees no success or failure signal, and client publishes are metered before the broker acknowledges them. Pass it yourself, as a string or as a function called for each event:
+
+```typescript
+billing.wrapAedesBroker(broker, {
+  resolveCustomerId: (clientId) => customerIdLookup(clientId),
+  // (event, clientId) => status | undefined
+  executionStatus: (event) => (event.mqttTopic.startsWith('alerts/') ? 'SUCCESS' : undefined),
+});
+
+billing.wrapMqttClient(client, { customerId: 'cust_42', executionStatus: 'SUCCESS' });
+```
+
+## Dropped events
+
+The SDK does not throw into your broker or client handlers for event content. An event that cannot be delivered is counted in `billing.droppedCount`, logged with `console.warn`, and passed to the optional `onDrop(events, reason)` hook. Events handed to the hook keep their `idempotencyKey`, so storing them and re-submitting later is dedup-safe. Exceptions thrown by the hook are swallowed.
+
+| Reason | When |
+|---|---|
+| `invalid` | The event failed a client-side check and was never buffered or sent: `customerId` longer than 64 characters, a missing or whitespace-only `mqttTopic`, or `productType` longer than 20. These are never truncated. A topic longer than 500 characters, or a client id longer than 128, is not a drop: it is cut to the limit and the event is sent (one warning per label). The warning names the field, the limit and the value (first 80 characters); it is logged for the first occurrence per field and for every 1000th after that. |
+| `rejected` | The ingestor refused the batch with a 4xx other than 408 / 429 (not retried), or named individual events in the `errors[]` of a 2xx response — then only those events are dropped. When a 2xx reports `failed > 0` without a usable `index`, the count is added to `droppedCount` and `onDrop` is not called. |
+| `retry_exhausted` | Network errors, 408, 429 or 5xx persisted through 3 attempts (1s / 2s / 4s backoff; `Retry-After` honoured up to 30 s). |
+
+A call with no resolvable customer id is not billable; it is skipped and is not counted as a drop.
+
+```ts
+const billing = new AforoMqttBilling({
+  // …
+  onDrop: (events, reason) => deadLetterQueue.push({ reason, events }),
+});
+```
 
 ## Walk me through it
 

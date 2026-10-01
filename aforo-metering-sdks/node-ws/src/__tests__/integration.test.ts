@@ -21,6 +21,14 @@
 import { AforoWsBilling } from '../index';
 import * as http from 'http';
 import { AddressInfo } from 'net';
+import {
+  INTEGRATION_TEST_TIMEOUT_MS,
+  onceOrError,
+  runCleanups,
+  trackFetch,
+  waitFor,
+  type FetchTracker,
+} from '../../test-support/timing';
 
 let WSServer: any;
 let WSClient: any;
@@ -46,9 +54,28 @@ interface Fixture {
   ingestorServer: http.Server;
   captured: CapturedRequest[];
   billing: AforoWsBilling;
+  /** Frames the real server has received, per connection, in arrival order. */
+  serverSockets: Array<{ received: number; closed: boolean }>;
+  /** Every client a test opened — force-closed in teardown whatever the outcome. */
+  clients: any[];
+  /** Extra resources a single test created (second billing, sniff server). */
+  extraCleanups: Array<[name: string, run: () => unknown]>;
+  fetches: FetchTracker;
+}
+
+/** The fixture of the test currently running; torn down in afterEach. */
+let current: Fixture | undefined;
+
+function closeHttpServer(server: http.Server): Promise<void> {
+  return new Promise<void>((resolve) => {
+    server.close(() => resolve());
+    // Keep-alive sockets from the SDK's fetch would otherwise hold close() open.
+    (server as any).closeAllConnections?.();
+  });
 }
 
 async function setup(perFrameEvents = false): Promise<Fixture> {
+  const fetches = trackFetch();
   const captured: CapturedRequest[] = [];
   const ingestorServer = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -68,16 +95,13 @@ async function setup(perFrameEvents = false): Promise<Fixture> {
   const ingestorPort = (ingestorServer.address() as AddressInfo).port;
 
   const wss = new WSServer({ port: 0, host: '127.0.0.1' });
-  await new Promise<void>((r) => wss.once('listening', () => r()));
+  await onceOrError(wss, 'listening');
   const wssPort = wss.address().port;
 
   const billing = new AforoWsBilling({
     tenantId: 'tenant-int-ws',
     productId: 'prod-int-ws',
     apiKey: 'sk_int_ws',
-    // A final flush during teardown can race the just-closed ingestor server;
-    // that late failure is expected here and must not log after the test ends.
-    onError: () => {},
     ingestorUrl: `http://127.0.0.1:${ingestorPort}/ingest`,
     flushCount: 1,
     flushIntervalMs: 60_000,
@@ -91,32 +115,67 @@ async function setup(perFrameEvents = false): Promise<Fixture> {
     },
   });
 
-  return { wssPort, wss, ingestorServer, captured, billing };
+  // Server-side view of each connection. Registered AFTER wrapServer, so by
+  // the time these counters move the SDK's own listeners have already run.
+  const serverSockets: Fixture['serverSockets'] = [];
+  wss.on('connection', (ws: any) => {
+    const state = { received: 0, closed: false };
+    serverSockets.push(state);
+    ws.on('message', () => { state.received++; });
+    ws.on('close', () => { state.closed = true; });
+  });
+
+  current = { wssPort, wss, ingestorServer, captured, billing, serverSockets, clients: [], extraCleanups: [], fetches };
+  return current;
 }
 
+/** Open a real client, tracked for teardown. Rejects with the real error if the connect fails. */
+async function connect(f: Fixture, pathAndQuery: string): Promise<any> {
+  const client = new WSClient(`ws://127.0.0.1:${f.wssPort}${pathAndQuery}`);
+  f.clients.push(client);
+  await onceOrError(client, 'open');
+  return client;
+}
+
+/**
+ * Quiesce, then close — in dependency order, and independent of how the test
+ * ended: drop every client, wait for the server to see them gone (that is when
+ * the SDK emits CONNECTION_CLOSED), flush, wait for every in-flight flush to
+ * land, and only then close the ingestor it is flushing to.
+ */
 async function teardown(f: Fixture): Promise<void> {
-  await f.billing.shutdown();
-  await new Promise<void>((r) => f.wss.close(() => r()));
-  await new Promise<void>((r) => f.ingestorServer.close(() => r()));
+  await runCleanups([
+    ['terminate clients', () => { for (const c of f.clients) c.terminate(); }],
+    ['terminate server-side sockets', () => { for (const ws of f.wss.clients) ws.terminate(); }],
+    ['server sockets closed', () =>
+      waitFor(() => f.wss.clients.size === 0, () => `wss.clients to empty (size=${f.wss.clients.size})`)],
+    ...f.extraCleanups.filter(([name]) => name.startsWith('billing')),
+    ['billing.shutdown', () => f.billing.shutdown()],
+    ['in-flight flushes', () =>
+      waitFor(() => f.fetches.pending() === 0, () => `SDK fetches to settle (pending=${f.fetches.pending()})`)],
+    ['wss.close', () => new Promise<void>((r) => f.wss.close(() => r()))],
+    ...f.extraCleanups.filter(([name]) => !name.startsWith('billing')),
+    ['ingestor.close', () => closeHttpServer(f.ingestorServer)],
+    ['restore fetch', () => f.fetches.restore()],
+  ]);
 }
 
 function flatEvents(captured: CapturedRequest[]): any[] {
   return captured.flatMap((r) => r.body?.events ?? []);
 }
 
-async function waitForEvents(
+/** Wait until the captured events satisfy `predicate`; returns them. */
+function waitForEvents(
   captured: CapturedRequest[],
   predicate: (events: any[]) => boolean,
-  timeoutMs = 2000,
+  what: string,
 ): Promise<any[]> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const events = flatEvents(captured);
-    if (predicate(events)) return events;
-    await new Promise((r) => setTimeout(r, 25));
-  }
-  throw new Error(
-    `waitForEvents timed out. captured=${JSON.stringify(captured, null, 2)}`,
+  return waitFor(
+    () => {
+      const events = flatEvents(captured);
+      return predicate(events) ? events : undefined;
+    },
+    () => `${what}. captured=${JSON.stringify(captured, null, 2)}`,
   );
 }
 
@@ -126,103 +185,101 @@ describe('Real-broker integration (ws.WebSocketServer + ws client)', () => {
     return;
   }
 
+  afterEach(async () => {
+    const f = current;
+    current = undefined;
+    if (f) await teardown(f);
+  }, INTEGRATION_TEST_TIMEOUT_MS);
+
   itIfPeers(
     'CONNECTION_OPENED is emitted on real handshake; customer_id resolved from req URL',
     async () => {
       const fix = await setup();
-      try {
-        const client = new WSClient(`ws://127.0.0.1:${fix.wssPort}/?cid=cust_alpha`);
-        await new Promise<void>((r, rj) => {
-          client.once('open', () => r());
-          client.once('error', rj);
-        });
+      await connect(fix, '/?cid=cust_alpha');
 
-        const events = await waitForEvents(
-          fix.captured,
-          (evs) => evs.some((e: any) => e.metadata?.event === 'CONNECTION_OPENED'),
-        );
+      const events = await waitForEvents(
+        fix.captured,
+        (evs) => evs.some((e: any) => e.metadata?.event === 'CONNECTION_OPENED'),
+        'a CONNECTION_OPENED event',
+      );
 
-        const opened = events.find((e: any) => e.metadata?.event === 'CONNECTION_OPENED');
-        expect(opened).toBeDefined();
-        expect(opened.customerId).toBe('cust_alpha');
-        expect(opened.productType).toBe('WEBSOCKET_API');
-        expect(opened.wsFrameType).toBe('PING');           // SDK uses PING as the lifecycle "open" marker
-        expect(opened.wsDirection).toBe('SERVER_TO_CLIENT');
-        expect(opened.metadata.event).toBe('CONNECTION_OPENED');
-
-        client.close();
-      } finally {
-        await teardown(fix);
-      }
+      const opened = events.find((e: any) => e.metadata?.event === 'CONNECTION_OPENED');
+      expect(opened).toBeDefined();
+      expect(opened.customerId).toBe('cust_alpha');
+      expect(opened.productType).toBe('WEBSOCKET_API');
+      expect(opened.wsFrameType).toBe('PING');           // SDK uses PING as the lifecycle "open" marker
+      expect(opened.wsDirection).toBe('SERVER_TO_CLIENT');
+      expect(opened.metadata.event).toBe('CONNECTION_OPENED');
     },
-    10_000,
+    INTEGRATION_TEST_TIMEOUT_MS,
   );
 
   itIfPeers(
     'CONNECTION_CLOSED carries aggregated message count + bytes after real frames',
     async () => {
       const fix = await setup();
-      try {
-        const client = new WSClient(`ws://127.0.0.1:${fix.wssPort}/?cid=cust_beta`);
-        await new Promise<void>((r, rj) => {
-          client.once('open', () => r());
-          client.once('error', rj);
-        });
+      const client = await connect(fix, '/?cid=cust_beta');
 
-        // Send a few client→server frames
-        client.send('hello-1');     // 7 bytes
-        client.send('hello-22');    // 8 bytes
-        client.send(Buffer.from([1, 2, 3, 4, 5])); // 5 bytes binary
+      // Send a few client→server frames
+      client.send('hello-1');     // 7 bytes
+      client.send('hello-22');    // 8 bytes
+      client.send(Buffer.from([1, 2, 3, 4, 5])); // 5 bytes binary
 
-        // Give the server time to receive them
-        await new Promise((r) => setTimeout(r, 100));
-        client.close(1000, 'normal');
+      // Close only once the server has actually received all three frames.
+      await waitFor(
+        () => fix.serverSockets[0]?.received === 3,
+        () => `server to receive 3 frames (received=${fix.serverSockets[0]?.received})`,
+      );
+      client.close(1000, 'normal');
 
-        const events = await waitForEvents(
-          fix.captured,
-          (evs) => evs.some((e: any) => e.metadata?.event === 'CONNECTION_CLOSED'),
-        );
+      const events = await waitForEvents(
+        fix.captured,
+        (evs) => evs.some((e: any) => e.metadata?.event === 'CONNECTION_CLOSED'),
+        'a CONNECTION_CLOSED event',
+      );
 
-        const closed = events.find((e: any) => e.metadata?.event === 'CONNECTION_CLOSED');
-        expect(closed).toBeDefined();
-        expect(closed.customerId).toBe('cust_beta');
-        expect(closed.productType).toBe('WEBSOCKET_API');
-        expect(closed.messageCount).toBe(3);     // 3 frames received
-        expect(closed.dataBytes).toBe(7 + 8 + 5); // sum of payload bytes
-        expect(closed.wsCloseReason).toBe('NORMAL_CLOSURE');
-        expect(closed.executionDurationMs).toBeGreaterThanOrEqual(0);
-      } finally {
-        await teardown(fix);
-      }
+      const closed = events.find((e: any) => e.metadata?.event === 'CONNECTION_CLOSED');
+      expect(closed).toBeDefined();
+      expect(closed.customerId).toBe('cust_beta');
+      expect(closed.productType).toBe('WEBSOCKET_API');
+      expect(closed.messageCount).toBe(3);     // 3 frames received
+      expect(closed.dataBytes).toBe(7 + 8 + 5); // sum of payload bytes
+      expect(closed.wsCloseReason).toBe('NORMAL_CLOSURE');
+      expect(closed.executionDurationMs).toBeGreaterThanOrEqual(0);
     },
-    10_000,
+    INTEGRATION_TEST_TIMEOUT_MS,
   );
 
   itIfPeers(
     'connections without resolved customerId are silently skipped (no metering)',
     async () => {
       const fix = await setup();
-      try {
-        // No ?cid=... query → extractCustomerId returns null → skip metering
-        const client = new WSClient(`ws://127.0.0.1:${fix.wssPort}/`);
-        await new Promise<void>((r, rj) => {
-          client.once('open', () => r());
-          client.once('error', rj);
-        });
-        client.close();
 
-        // Give it 200ms — enough time that any spurious event would have flushed
-        await new Promise((r) => setTimeout(r, 200));
-        await fix.billing.shutdown();
+      // No ?cid=... query → extractCustomerId returns null → skip metering
+      const anonymous = await connect(fix, '/');
+      anonymous.close();
+      await waitFor(
+        () => fix.serverSockets[0]?.closed,
+        () => 'server to see the anonymous connection close',
+      );
 
-        expect(flatEvents(fix.captured)).toHaveLength(0);
-      } finally {
-        // shutdown() already called above, but teardown is idempotent
-        await new Promise<void>((r) => fix.wss.close(() => r()));
-        await new Promise<void>((r) => fix.ingestorServer.close(() => r()));
-      }
+      // Proving "nothing was emitted" by sleeping is a guess. Instead send a
+      // sentinel connection AFTER it that must be metered: once the sentinel's
+      // full lifecycle has reached the ingestor, anything the anonymous
+      // connection had emitted would be there too.
+      const sentinel = await connect(fix, '/?cid=cust_sentinel');
+      sentinel.close();
+      const events = await waitForEvents(
+        fix.captured,
+        (evs) => evs.some((e: any) => e.customerId === 'cust_sentinel' && e.metadata?.event === 'CONNECTION_CLOSED'),
+        'the sentinel CONNECTION_CLOSED event',
+      );
+
+      expect(events.filter((e: any) => e.customerId !== 'cust_sentinel')).toEqual([]);
+      // The two events are separate fire-and-forget POSTs — arrival order is not guaranteed.
+      expect(events.map((e: any) => e.metadata?.event).sort()).toEqual(['CONNECTION_CLOSED', 'CONNECTION_OPENED']);
     },
-    10_000,
+    INTEGRATION_TEST_TIMEOUT_MS,
   );
 
   itIfPeers(
@@ -239,6 +296,7 @@ describe('Real-broker integration (ws.WebSocketServer + ws client)', () => {
           res.end();
         });
       });
+      fix.extraCleanups.push(['sniffServer.close', () => closeHttpServer(sniffServer)]);
       await new Promise<void>((r) => sniffServer.listen(0, '127.0.0.1', r));
       const port = (sniffServer.address() as AddressInfo).port;
 
@@ -246,39 +304,24 @@ describe('Real-broker integration (ws.WebSocketServer + ws client)', () => {
         tenantId: 'tenant-headers',
         productId: 'prod-headers',
         apiKey: 'sk_header_check',
-        onError: () => {}, // suppress the teardown-race flush failure (see setup())
         ingestorUrl: `http://127.0.0.1:${port}/ingest`,
         flushCount: 1,
       });
+      fix.extraCleanups.push(['billing2.shutdown', () => billing2.shutdown()]);
       billing2.wrapServer(fix.wss as any, {
         extractCustomerId: () => 'cust_header_test',
       });
 
-      try {
-        const client = new WSClient(`ws://127.0.0.1:${fix.wssPort}/`);
-        await new Promise<void>((r, rj) => {
-          client.once('open', () => r());
-          client.once('error', rj);
-        });
+      await connect(fix, '/');
 
-        const deadline = Date.now() + 2000;
-        while (sniffed.length === 0 && Date.now() < deadline) {
-          await new Promise((r) => setTimeout(r, 25));
-        }
-
-        expect(sniffed.length).toBeGreaterThan(0);
-        const headers = sniffed[0];
-        expect(headers['x-api-key']).toBe('sk_header_check');
-        expect(headers['authorization']).toBeUndefined();
-        expect(headers['x-tenant-id']).toBe('tenant-headers');
-
-        client.close();
-      } finally {
-        await billing2.shutdown();
-        await new Promise<void>((r) => sniffServer.close(() => r()));
-        await teardown(fix);
-      }
+      const headers = await waitFor(
+        () => sniffed[0],
+        () => 'a request to reach the header-sniffing ingestor',
+      );
+      expect(headers['x-api-key']).toBe('sk_header_check');
+      expect(headers['authorization']).toBeUndefined();
+      expect(headers['x-tenant-id']).toBe('tenant-headers');
     },
-    10_000,
+    INTEGRATION_TEST_TIMEOUT_MS,
   );
 });

@@ -1,10 +1,10 @@
 # @aforoai/mcp-metering — User Guide
 
-**Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** engineers who own an MCP server's source and want to meter `tools/call` invocations for Aforo billing.
+**Version:** 1.3.2 · **Updated:** 2026-10-01 · **Audience:** engineers who own an MCP server's source and want to meter `tools/call` invocations for Aforo billing.
 
 ## What you'll build
 
-An MCP server whose tool handlers are wrapped so each invocation fires an Aforo usage event with the tool name, agent id, status, and duration . By the end you'll have confirmed a metered tool call reached the ingestor, not just that the tool returned.
+An MCP server whose tool handlers are wrapped so each invocation fires an Aforo usage event with the tool name, agent id, status, and duration. By the end you'll have confirmed a metered tool call reached the ingestor, not just that the tool returned.
 
 ## Prerequisites
 
@@ -20,19 +20,19 @@ Public install (once published):
 npm i @aforoai/mcp-metering
 ```
 
-Not on npm yet, so install from source for now:
+Install `1.3.2` or later. `1.0.0` on npm was built from an older copy of this code and lacks the fixes listed in the changelog. If `1.3.2` is not on npm yet, install from source:
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
 cd SDKs/aforo-metering-sdks/node-mcp
 npm install && npm run build
-npm pack        # produces aforo-mcp-metering-1.0.0.tgz
+npm pack        # produces aforo-mcp-metering-1.3.2.tgz
 ```
 
 Then in your MCP server project:
 
 ```bash
-npm i /path/to/aforo-metering-sdks/node-mcp/aforo-mcp-metering-1.0.0.tgz
+npm i /path/to/aforo-metering-sdks/node-mcp/aforo-mcp-metering-1.3.2.tgz
 ```
 
 ## Step 2 — Create the billing client
@@ -72,6 +72,10 @@ server.setRequestHandler(
 ```
 
 > ⚠ The wrapper pulls `agent_id`, `session_id` and `customer_id` from `request.params._meta`. The customer is `_meta.customer_id`, else the `customerId` config, else the agentId. If the calling agent doesn't set `_meta.agent_id` and no `agentId` config is set, the event's `agentId` (and, without a customer, its `customerId`) fall back to the literal string `"unknown"` — your usage rolls up under one phantom customer. Make sure your agents stamp `_meta.agent_id`, or set `agentId` / `customerId` in the config.
+
+The wrapper sets `executionStatus`: `SUCCESS` for a normal result, `ERROR` for a result with `isError: true` or a thrown error, `TIMEOUT` for a `TimeoutError` or MCP error code `-32001`. Pass `{ statusResolver }` as the second argument to decide it yourself (see the [README](README.md#execution-status-and-dropped-events)).
+
+A tool invocation the ingestor would reject (blank tool name, `agentId` over 36 characters, `customerId` or `sessionId` over 64) is not sent and does not throw: it is counted in `billing.droppedCount`, WARN-logged, and passed to `onDrop` with reason `'invalid'`. A tool name over 64 characters is cut to 64 and the event is still sent.
 
 ## Step 4 — Manage the session (optional but recommended)
 
@@ -159,7 +163,8 @@ If you see that batch hit `/v1/ingest/batch`, the wrapper is wired correctly. Po
 | `agentId` | `string` | `"unknown"` | Agent id when a call has no `_meta.agent_id`. |
 | `heartbeatIntervalMs` | `number` | `30000` | Interval between session heartbeats. |
 | `heartbeatEnabled` | `boolean` | `true` | Send session heartbeats while a session is active. |
-| `onError` | `(err) => void` | `console.error` | Called on non-retryable 4xx, after retries exhausted, on per-event rejections, dropped invalid events and failed heartbeats. |
+| `onError` | `(err) => void` | `console.error` | Called on non-retryable 4xx, after retries exhausted, on per-event rejections, a bad `statusResolver` and failed heartbeats. |
+| `onDrop` | `(events, reason) => void` | unset | Called with usage events the SDK is about to lose (`retry_exhausted`, `rejected`, `invalid`). Dropped events are also counted in `billing.droppedCount` and WARN-logged. |
 | `onSessionKilled` | `(sessionId, reason) => void` | unset | Fired when a flush or heartbeat response lists the active session as killed. |
 
 ## Troubleshooting
@@ -172,6 +177,7 @@ If you see that batch hit `/v1/ingest/batch`, the wrapper is wired correctly. Po
 | `Aforo ingestor returned 401/403 — not retrying` via `onError` | Bad API key or tenant mismatch | Check `AFORO_API_KEY` and that `tenantId` matches the product. 4xx (except 408/429) is not retried. |
 | Dashboard empty though `onError` never fired | Unknown metric on the product, or wrong `productId` | Confirm `mcp_server.tool_invocations` exists on the MCP_SERVER product and `productId` is correct. |
 | Session kill is observed late | Kill signals only arrive on a batch flush or heartbeat response | Lower `heartbeatIntervalMs` / `flushIntervalMs`, or pre-gate calls with the proxy's quota enforcement for real-time blocking. |
+| `Dropped N event(s)` or `Invalid tool invocation dropped` WARN | A batch failed, was rejected, or an event failed a client-side check | Read the reason in the WARN; pass `onDrop` to capture the events (`retry_exhausted`, `rejected`, `invalid`). |
 | Process exits, last few events missing | Exited mid-flush-interval without `shutdown()` | `await billing.shutdown()` on SIGTERM/SIGINT before exit. |
 
 ## What this guide does NOT cover

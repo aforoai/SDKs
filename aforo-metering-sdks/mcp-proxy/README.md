@@ -1,8 +1,8 @@
 # @aforoai/mcp-proxy
 
-A sidecar that meters an MCP server you can't modify. It sits between the client and the server, watches the JSON-RPC traffic, and bills each `tools/call` to Aforo — over stdio, SSE, or Streamable HTTP. Best when you don't own the MCP server's source (or don't want to touch it) and the gateway-plugin path doesn't fit.
+A sidecar that meters an MCP server you can't modify. It sits between the client and the server, watches the JSON-RPC traffic, and bills each `tools/call` to Aforo — over stdio, SSE, or Streamable HTTP. Use it when you don't own the MCP server's source (or don't want to change it) and the gateway-plugin path doesn't fit.
 
-**Version:** 1.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 1.2.2 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -10,7 +10,7 @@ A sidecar that meters an MCP server you can't modify. It sits between the client
 npm i -g @aforoai/mcp-proxy
 ```
 
-> **Not yet on the public npm registry.** Until it's published, install from source:
+> **Install `1.2.2` or later. `1.0.0` on npm was built from an older copy of this code and lacks the fixes listed in the changelog.** If `1.2.2` is not on npm yet, install from source:
 > ```bash
 > git clone https://github.com/aforoai/SDKs.git
 > cd SDKs/aforo-metering-sdks/mcp-proxy
@@ -99,13 +99,43 @@ The proxy resolves each value with this precedence: **environment variable > CLI
 | `--agent-id` | `aforo.agentId` | `AFORO_AGENT_ID` | — | Agent id override when the traffic doesn't carry `_meta.agent_id`. |
 | — | `aforo.customerId` | `AFORO_CUSTOMER_ID` | — | Customer billed when a `tools/call` carries no `_meta.customer_id` (otherwise the agent id is billed). Also the customer on session heartbeats (else the first call's customer, else `system`). |
 | — | `aforo.productType` | `AFORO_PRODUCT_TYPE` | `MCP_SERVER` | Top-level `productType` on every event (required by the ingestor). Trimmed and uppercased. |
+| — | `aforo.statusResolver` | — | — | Library use only: overrides the `executionStatus` decided for each tool call (see below). |
+| — | `aforo.onDrop` | — | — | Library use only: called with usage events the proxy is about to lose (see below). |
 | `--quota-enforcement` | `aforo.quotaEnforcement` | `AFORO_QUOTA_ENFORCEMENT` | `false` | Pre-flight quota gate before each `tools/call` (see below). |
+| `--response-timeout-ms` | `aforo.responseTimeoutMs` | `AFORO_RESPONSE_TIMEOUT_MS` | `300000` | How long a tool call may wait for its response before it is metered as `TIMEOUT` (5 minutes). Raise it for tools that legitimately run longer: a response that arrives after the timeout is not metered again. |
 | `--debug` | `aforo.debug` | `AFORO_DEBUG` | `false` | Verbose logging. |
 | — | `aforo.flushIntervalMs` | `AFORO_FLUSH_INTERVAL_MS` | `5000` | Buffer dwell time before a timed flush. |
-| — | `aforo.flushCount` | `AFORO_FLUSH_COUNT` | `50` | Force a flush at this buffer size. |
+| — | `aforo.flushCount` | `AFORO_FLUSH_COUNT` | `50` | Force a flush at this buffer size. A flush holding more than 1000 events is sent in requests of at most 1000. |
 | — | `aforo.heartbeatIntervalMs` | `AFORO_HEARTBEAT_INTERVAL_MS` | `30000` | Interval between session heartbeats (`system.session.heartbeat`, quantity 1). The first tool call starts the session and sends one immediately; a `SESSION_END` is sent on shutdown. Each heartbeat goes in its own `/v1/ingest/batch` request, never inside a usage batch, so the ingestor intercepts it before billing. Best-effort: no retries, failures ignored. |
 
 > ⚠ The four `aforo.*` credentials (`tenantId`, `productId`, `apiKey`, `ingestorUrl`) are required and validated at startup — a missing one exits with a non-zero code and an error, it doesn't run unmetered. Pass `--ingestor-url` as the **base** URL (`https://api.aforo.ai`); the proxy appends `/v1/ingest/batch` for events and calls `/api/v1/quota/check` for quota.
+
+## What each tool call is billed as
+
+| Wire outcome | `executionStatus` |
+|---|---|
+| Result without `isError: true` | `SUCCESS` |
+| Result with `isError: true` | `ERROR` |
+| JSON-RPC error `-32001` (request timeout) | `TIMEOUT` |
+| Any other JSON-RPC error | `ERROR` |
+| No response within the response timeout | `TIMEOUT` (once) |
+| Still waiting when the proxy shuts down (SIGTERM/SIGINT) | `CANCELLED` (once, before the final flush) |
+
+A library `statusResolver` can override these. It must be synchronous and return one of the 11 canonical statuses (`SUCCESS`, `PARTIAL`, `TIMEOUT`, `ERROR`, `VALIDATION_FAILED`, `FAILED`, `FAILURE`, `CANCELLED`, `PENDING`, `BLOCKED`, `HITL_REQUIRED`); a Promise or any other value is logged and the default is used. Calls are matched to responses by session and JSON-RPC id, so two Streamable HTTP clients reusing id `1` are metered separately. The `sse` mode serves a single client: every POST shares one session.
+
+Each tool call's idempotency key is minted once, when its event is created, and reused by every flush retry.
+
+## Dropped events
+
+A usage event the proxy loses is counted, WARN-logged, and — when the proxy is embedded as a library — passed to `aforo.onDrop(events, reason)`. Events keep their idempotency keys, so re-sending them is dedup-safe. The CLI has no flag for the hook; it logs.
+
+| `reason` | When |
+|---|---|
+| `retry_exhausted` | A batch failed all 3 attempts (network error, 5xx, 408, 429). |
+| `rejected` | The ingestor refused the batch with a non-retryable 4xx, or refused these events individually inside a batch it otherwise accepted. |
+| `invalid` | The tool call's event would be rejected by the ingestor: `agentId` over 36 characters, `customerId` over 64, or `sessionId` over 64. The call is still forwarded to the MCP server; its event is not sent. The WARN is logged for the first such call and then every 1000th. A `toolName` over 64 characters is not a drop: it is cut to 64 on the event and the call is metered (one WARN per label). |
+
+When a 2xx response reports failures without saying which events, the count is logged and `onDrop` is not called. A failed session heartbeat is not a drop.
 
 ## Walk me through it
 
@@ -113,4 +143,4 @@ Step-by-step from install to a verified metered call: [USER_GUIDE.md](USER_GUIDE
 
 ## What this doesn't cover
 
-Metering happens in the proxy's observe path, so it never blocks a tool call — **except** when `--quota-enforcement` is on, which adds a pre-flight check with a 50ms latency budget that **fails open** (network/timeout error → the call proceeds, unmetered-by-quota). Event delivery is best-effort: a 3-attempt backoff, then the batch is dropped (5xx/408/429 retried, other 4xx not). The proxy meters `tools/call`; `tools/list`, `resources/read`, and `prompts/get` are tracked for analytics, and protocol chatter (`initialize`, `ping`, notifications) is ignored. It does not transform tool payloads, rewrite responses, or add auth to the upstream server.
+Metering happens in the proxy's observe path, so it never blocks a tool call — **except** when `--quota-enforcement` is on, which adds a pre-flight check with a 50ms latency budget that **fails open** (network/timeout error → the call proceeds, unmetered-by-quota). Event delivery is best-effort: a 3-attempt backoff, then the batch is dropped and reported (5xx/408/429 retried, `Retry-After` honoured on 429; other 4xx not retried). The proxy meters `tools/call`; `tools/list`, `resources/read`, and `prompts/get` are tracked for analytics, and protocol chatter (`initialize`, `ping`, notifications) is ignored. It does not transform tool payloads, rewrite responses, or add auth to the upstream server.

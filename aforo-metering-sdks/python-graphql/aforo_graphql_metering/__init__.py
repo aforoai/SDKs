@@ -5,6 +5,9 @@ from .client import (
     default_complexity_scorer,
     strawberry_extension,
     asgi_middleware,
+    normalize_execution_status,
+    outcome_from_graphql_result,
+    outcome_from_http_status,
 )
 
 __all__ = [
@@ -12,5 +15,8 @@ __all__ = [
     "default_complexity_scorer",
     "strawberry_extension",
     "asgi_middleware",
+    "normalize_execution_status",
+    "outcome_from_graphql_result",
+    "outcome_from_http_status",
 ]
-__version__ = "1.0.0"
+__version__ = "1.2.1"

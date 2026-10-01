@@ -109,12 +109,35 @@ describe('AforoClient', () => {
     await c2.shutdown();
   });
 
-  it('rejects blank customerId / metricName and non-positive quantity', async () => {
-    await expect(client.track({ customerId: ' ', metricName: 'api_calls' })).rejects.toThrow('customerId');
-    await expect(client.track({ customerId: 'c', metricName: '' })).rejects.toThrow('metricName');
-    await expect(client.track({ customerId: 'c', metricName: 'm', quantity: 0 })).rejects.toThrow('quantity');
-    await expect(client.track({ customerId: 'c', metricName: 'm', quantity: -1 })).rejects.toThrow('quantity');
-    expect(client.bufferedCount).toBe(0);
+  it('drops blank customerId / metricName and non-positive quantity as invalid, without throwing', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const drops: Array<{ events: any[]; reason: string }> = [];
+    const c = new AforoClient({
+      apiKey: 'k', baseUrl: 'https://x.test', flushInterval: 600_000,
+      onDrop: (events, reason) => drops.push({ events, reason }),
+    });
+    try {
+      await expect(c.track({ customerId: ' ', metricName: 'api_calls' })).resolves.toBeUndefined();
+      await expect(c.track({ customerId: 'c', metricName: '' })).resolves.toBeUndefined();
+      await expect(c.track({ customerId: 'c', metricName: 'm', quantity: 0 })).resolves.toBeUndefined();
+      await expect(c.track({ customerId: 'c', metricName: 'm', quantity: -1, idempotencyKey: 'neg-1' })).resolves.toBeUndefined();
+      await expect(c.track(undefined as any)).resolves.toBeUndefined();
+
+      expect(c.bufferedCount).toBe(0);
+      expect(c.droppedCount).toBe(5);
+      expect(drops.map((d) => d.reason)).toEqual(['invalid', 'invalid', 'invalid', 'invalid', 'invalid']);
+      expect(drops[3].events[0].idempotencyKey).toBe('neg-1');
+      expect(drops[0].events[0].idempotencyKey).toBeTruthy();
+      // Throttled: the first invalid event is logged, the next four are not.
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('customerId is required'));
+
+      await c.flush();
+      expect(mockFetch).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+      await c.shutdown();
+    }
   });
 
   it('caps flushCount at the 1000-event batch limit', async () => {
@@ -171,14 +194,19 @@ describe('AforoClient', () => {
     expect(client.bufferedCount).toBe(0);
   });
 
-  it('should generate idempotency keys automatically', async () => {
+  it('should generate idempotency keys automatically (unique random UUID per track call)', async () => {
+    // No caller key = dedup opt-out. Two same-instant identical events must
+    // get DISTINCT keys (the old content-hash fallback collapsed them - the
+    // H4 bug Aforo ingest fixed server-side in April 2026).
+    await client.track({ customerId: 'cust_1', metricName: 'api_calls', quantity: 1 });
     await client.track({ customerId: 'cust_1', metricName: 'api_calls', quantity: 1 });
     await client.flush();
 
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
-    expect(body.events[0].idempotencyKey).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
-    );
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+    expect(body.events[0].idempotencyKey).toMatch(uuidRe);
+    expect(body.events[1].idempotencyKey).toMatch(uuidRe);
+    expect(body.events[0].idempotencyKey).not.toBe(body.events[1].idempotencyKey);
   });
 
   // Regression: the default key used to be SHA256(customerId:metric:quantity:occurredAt).
@@ -259,6 +287,50 @@ describe('AforoClient', () => {
 
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     expect(body.events[0].metadata).toEqual({ model: 'gpt-4o', feature: 'chat' });
+  });
+
+  it('should send executionStatus normalized to upper case when provided', async () => {
+    await client.track({
+      customerId: 'cust_1',
+      metricName: 'api_calls',
+      executionStatus: '  timeout ',
+    });
+    await client.flush();
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.events[0].executionStatus).toBe('TIMEOUT');
+  });
+
+  it('should omit an unknown or over-long executionStatus, warn, and still send the event', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await client.track({ customerId: 'cust_1', metricName: 'api_calls', quantity: 3, executionStatus: 'bogus' });
+      await client.track({ customerId: 'cust_1', metricName: 'api_calls', executionStatus: 'X'.repeat(21) });
+      await client.track({ customerId: 'cust_1', metricName: 'api_calls', executionStatus: 'hitl_required' });
+      await client.flush();
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body.events).toHaveLength(3);
+      expect('executionStatus' in body.events[0]).toBe(false);
+      expect(body.events[0].quantity).toBe(3);
+      expect(body.events[0].customerId).toBe('cust_1');
+      expect('executionStatus' in body.events[1]).toBe(false);
+      expect(body.events[2].executionStatus).toBe('HITL_REQUIRED');
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('Unknown executionStatus "BOGUS"'));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('should omit executionStatus when not provided or blank', async () => {
+    await client.track({ customerId: 'cust_1', metricName: 'api_calls' });
+    await client.track({ customerId: 'cust_1', metricName: 'api_calls', executionStatus: '   ' });
+    await client.flush();
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.events).toHaveLength(2);
+    expect('executionStatus' in body.events[0]).toBe(false);
+    expect('executionStatus' in body.events[1]).toBe(false);
   });
 
   it('should default quantity to 1', async () => {

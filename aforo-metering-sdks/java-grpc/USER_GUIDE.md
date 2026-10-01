@@ -1,6 +1,6 @@
 # ai.aforo:grpc-metering — User Guide
 
-**Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** Java engineers running a `grpc-java` server who need per-RPC usage metering.
+**Version:** 1.2.2 · **Updated:** 2026-10-01 · **Audience:** Java engineers running a `grpc-java` server who need per-RPC usage metering.
 
 ## What you'll build
 
@@ -27,7 +27,7 @@ Add to your service's `pom.xml`:
 <dependency>
   <groupId>ai.aforo</groupId>
   <artifactId>grpc-metering</artifactId>
-  <version>1.0.0</version>
+  <version>1.2.2</version>
 </dependency>
 ```
 
@@ -115,7 +115,7 @@ billing.record("ListUsers", "SERVER_STREAM", customerId, "OK", durationMs);
 | `apiKey` | `String` | *(required)* | Aforo API key, sent as `X-API-Key`. |
 | `ingestorUrl` | `String` | *(required)* | Host; SDK appends `/v1/ingest/batch`. |
 | `serviceName` | `String` | *(required)* | `grpcService` field + idempotency key. |
-| `productType` | `String` | `GRPC_API` | Top-level `productType` on every event; trimmed + uppercased. Per call: `record(method, callType, customerId, status, durationMs, productType)` (a null/blank override uses the client value). |
+| `productType` | `String` | `GRPC_API` | Top-level `productType` on every event; trimmed + uppercased. Per call: `record(method, callType, customerId, status, durationMs, executionStatus, productType)` (a null/blank override uses the client value). |
 | `flushCount` | `int` | `50` | Events per immediate flush. |
 | `flushIntervalMs` | `long` | `5000` | Background flush cadence (ms). |
 | `customerIdExtractor` | `Function<Metadata, String>` | `x-customer-id` metadata | Per-call customer-id resolution. |
@@ -127,7 +127,9 @@ billing.record("ListUsers", "SERVER_STREAM", customerId, "OK", durationMs);
 | `IllegalArgumentException: <field> is required` at build | A required builder field (`tenantId` / `productId` / `apiKey` / `ingestorUrl` / `serviceName`) is blank | Set all five; they're validated in the constructor. |
 | No events appear, no errors logged | Customer id not on metadata, so every call is skipped | Have the client send `x-customer-id`, or supply a `customerIdExtractor`. |
 | Events POST to a 404 | `ingestorUrl` already includes the path | Pass the host only; the SDK appends `/v1/ingest/batch`. |
-| `flush exhausted retries — dropped N events` in logs | Ingestor returned non-2xx on all 3 attempts (bad key, unknown metric, network) | Verify the key + `X-Tenant-Id`; ensure the `grpc_api.rpc_calls` metric exists in Aforo. |
+| `flush exhausted retries — dropped N events` in logs | Network error, 5xx, 408 or 429 on all 3 attempts | Check connectivity to `ingestorUrl`; the batch is reported to `onDrop` with `RETRY_EXHAUSTED`. |
+| `ingestor returned 4xx — not retrying` or `Dropped N event(s) — REJECTED` in logs | Bad key, unknown metric, or an event the ingestor refused; a 4xx other than 408/429 is sent once | Verify the key + `X-Tenant-Id`; ensure the `grpc_api.rpc_calls` metric exists in Aforo. The log line carries the ingestor's `errors[].message`. |
+| `Dropping invalid event: ...` in logs, `droppedCount()` grows | The event breaks an ingestor field limit (`DropReason.INVALID`) and was not sent | The message names the field, the limit and the value. See [Dropped events](README.md#dropped-events). |
 | Streaming calls all show `messageCount = 1` | The interceptor counts one event per call, not per message | Call `billing.record(...)` inside the streaming handler for exact counts. |
 | `grpcStatusCode` is `UNKNOWN` for errors you expected to classify | Your handler threw a raw exception rather than setting a `Status` | Map errors to gRPC `Status` codes in your service; the SDK reports whatever code the call closes with. |
 

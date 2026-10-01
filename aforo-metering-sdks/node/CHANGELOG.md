@@ -2,23 +2,54 @@
 
 All notable changes to this package are documented here. Format follows [Keep a Changelog](https://keepachangelog.com); versioning follows [SemVer](https://semver.org).
 
-## [Unreleased]
+## [1.1.2] - 2026-10-01
 
-### Fixed
-- **Fix:** `track()` now rejects events the ingestor's compiled-in field constraints would refuse — `customerId` over 64 chars, `metricName` over 255, `idempotencyKey` over 255, `productType` over 20, a `quantity` with more than 14 integer digits or 6 decimal places, and a malformed `occurredAt`. Such an event is rejected server-side and never billed, and because flushing happens in the background nobody ever saw that rejection; now it throws at the call site, before the event is buffered. Nothing is truncated or rounded — that would change what you are billed. Limits the server makes configurable (`max-age-days`, `future-tolerance-minutes`, `max-metadata-bytes`) are deliberately left to the server, so the SDK can never refuse usage your deployment would accept.
-- **Breaking (fix):** an event with no caller-supplied `idempotencyKey` now gets a fresh random UUID v4 instead of `SHA256(customerId:metricName:quantity:occurredAt)`. `occurredAt` only carries millisecond precision, so two genuinely distinct events for the same customer, metric and quantity inside one millisecond produced the SAME key; the ingestor answered DUPLICATE and silently dropped the second one, under-billing high-throughput callers (bulk SMS, per-request middleware). The key is still minted once, when `track()` enqueues the event, so retries re-send the same keys and a replayed batch is still deduplicated. **Callers who relied on the deterministic key for dedup must now pass their own `idempotencyKey`** — an explicit key is still sent verbatim. `generateIdempotencyKey()` remains available for that purpose but is no longer the default.
-- **Breaking (fix):** the tenant API key is sent as `X-API-Key` instead of `Authorization: Bearer`. The ingestor parses Bearer values as JWTs and rejected every request 401 (sending both headers is also 401), so no usage was being delivered.
-- **Breaking (fix):** default ingestor base URL is now `https://api.aforo.ai`, Aforo's public API gateway in front of the ingestor. `ingest.aforo.ai` / `ingestor.aforo.ai` resolve to a static CloudFront/S3 site that answers POSTs with a 301, not the ingestor. Set the base URL explicitly if you relied on the old default.
-- **Breaking (fix):** middleware (express/koa/fastify) default metric is `api_calls` instead of `"METHOD /path"`, which no catalog contains; configure `metricName` (fixed or resolver) to a metric in your Aforo catalog. The caller's `X-Api-Key` header is no longer used as the customer id (it leaked a secret into billing data). `OPTIONS` (CORS preflight) requests are no longer metered.
-- **Fix:** session heartbeats (`system.session.heartbeat`) are no longer sent in the usage batch; with quantity 0 the ingestor rejected them and failed the whole batch with 400.
-- **Fix:** `startSession()` / `endSession()` send heartbeats again, now in a shape the ingestor accepts: quantity 1, top-level `sessionId`, `productType` and `sessionBoundary` (`HEARTBEAT` on start and every 30s, `SESSION_END` on `endSession()`), unique idempotency key. Each heartbeat is POSTed in its own `{"events":[heartbeat]}` request so it always takes the ingestor's synchronous path (where it is intercepted before billing), never mixed into a usage batch. Heartbeats are best-effort: sent once, failures ignored, never affecting usage delivery; the timer is unref'd and stops on `endSession()`/`shutdown()`.
+### Changed
+- **Middlewares (express / koa / fastify): a path or method longer than the ingestor's limit is truncated, and the event is sent.** `endpointPath` is cut to 512 characters and `httpMethod` to 16, counted in UTF-16 code units as the server counts them; a cut never leaves half a surrogate pair. `endpointPath` was already cut to 512 but could split a surrogate pair; `httpMethod` over 16 dropped the event. One WARN is logged per label name per process.
+- The idempotency key is unaffected: it is a random UUID minted per event, not derived from the path.
+
+### Unchanged
+- Fields the caller sets are never altered. An over-long `customerId`, `metricName` (fixed or returned by a `metricName` resolver), `idempotencyKey`, `productType`, or an `endpointPath` / `httpMethod` passed to `track()` still drops the event with reason `'invalid'`.
 
 ### Added
-- `productType` is sent as a top-level field on every event (required by the ingestor in production). Set a client default with `new AforoClient({ productType })` (default `"API"`) and override per event with `track({ productType })`; values are trimmed and uppercased, unknown values pass through. The express/koa/fastify middlewares take a `productType` option too.
-- Middlewares send top-level `endpointPath` (path without query string, max 512 chars), `httpMethod`, `statusCode` and `responseTimeMs`, and skip requests whose quantity is `<= 0`.
-- `track()` rejects a blank `customerId`/`metricName` or a quantity `<= 0` with an error instead of queueing an event that would fail its whole batch.
+- Export: `truncateToLimit(value, max)`.
+
+## [1.1.1] - 2026-10-01
+
+### Fixed
+- **2xx responses are read from the `{success, data}` envelope.** The ingestor wraps every 2xx JSON body, so `failed`, `errors[]` arrive under `data`. They were read at the top level, where they are never present, so events the ingestor rejected inside a 2xx response were counted as sent. A bare (unwrapped) body is still accepted.
+
+## [1.1.0] - 2026-10-01
+
+Merge of the public-repo fixes (verified against the production ingestor) with the working repo's drop observability and `executionStatus` support.
+
+### Changed
+- **Auth header.** The API key is sent as `X-API-Key`; `Authorization` is no longer sent.
+- **Default base URL** is `https://api.aforo.ai`.
+- **Middleware (express / koa / fastify).** Default metric is `api_calls` (was `"METHOD /path"`, which no catalog contains); set `metricName` to a fixed name or a `(req, res) => string` resolver. The caller's `X-Api-Key` header is never used as the customer id. `OPTIONS` requests and requests whose quantity is `<= 0` are not metered.
+- **Session heartbeats.** `startSession()` / `endSession()` send `system.session.heartbeat` with quantity 1 and top-level `sessionId` / `productType` / `sessionBoundary`. Each heartbeat is POSTed alone as `{"events":[heartbeat]}`, once, outside the usage buffer. A failed heartbeat is not a usage drop: it is not counted in `droppedCount` and not passed to `onDrop`.
 - `flushCount` is capped at 1000, the ingestor's per-request batch limit.
-- `BatchResponse.errors[]` is typed `{ index, message }` (the ingestor's shape) and includes optional `killedSessionIds`.
+
+### Added
+- `productType` as a top-level field on every event: client option (default `"API"`) and per-event override, trimmed and upper-cased. The middlewares take a `productType` option.
+- Top-level `endpointPath`, `httpMethod`, `statusCode`, `responseTimeMs` on `track()`; the middlewares fill them in.
+- **Client-side validation, reported as a drop.** An event the ingestor would reject — blank `customerId` / `metricName`, `quantity <= 0`, a field over the server's size limit (`customerId` 64, `metricName` 255, `idempotencyKey` 255, `productType` 20, `endpointPath` 512, `httpMethod` 16), a `quantity` with more than 14 integer digits or 6 decimal places, a malformed `occurredAt` — is not buffered and not sent. `track()` does not throw for it. It is counted in `droppedCount`, WARN-logged (first occurrence, then every 1000th) with the field, the limit and the value, and passed to `onDrop` with the new reason `'invalid'`. Nothing is truncated or rounded. Server-configurable limits (event age, clock skew, metadata size) are not checked client-side.
+- **Partial batch failures.** A 2xx response that reports per-event `errors[]` drops only those events (reason `'rejected'`); when the response gives a failure count without indexes, the count is added to `droppedCount` and logged, and `onDrop` is not called. The server's error message is included in the WARN for rejected batches.
+- Exports: `DEFAULT_METRIC_NAME`, `MAX_LENGTHS`, `MAX_QUANTITY_INTEGER_DIGITS`, `MAX_QUANTITY_DECIMAL_PLACES`, `describeLimitViolation`. `DropReason` gains `'invalid'`.
+
+### Unchanged
+- `executionStatus` handling, idempotency keys (one random UUID per event, minted when `track()` enqueues it, reused by every retry; a caller key is sent verbatim), `onDrop` reasons `overflow` / `retry_exhausted` / `rejected`, and the `/v1/ingest/batch` wire shape.
+
+## [1.0.1] - 2026-09-30
+
+### Added
+- Optional `executionStatus` on `track()`, trimmed and upper-cased. Accepted: `SUCCESS`, `PARTIAL`, `TIMEOUT`, `ERROR`, `VALIDATION_FAILED`, `FAILED`, `FAILURE`, `CANCELLED`, `PENDING`, `BLOCKED`, `HITL_REQUIRED`. An unknown or over-20-character value is WARN-logged and left off the event; the event is still sent.
+- Drop observability: `droppedCount`, WARN log, and the opt-in `onDrop(events, reason)` hook. Dropped events keep their idempotency keys.
+
+### Fixed
+- Keyless events get a random UUID instead of a content hash, which collapsed distinct same-millisecond events.
+- ESM build: `npm run build` failed at the ESM step and the ESM output could not be imported.
+- `shutdown()` clears its escape timer and deregisters its `SIGTERM` / `SIGINT` handlers.
 
 ## [1.0.0] — 2026-06-29
 

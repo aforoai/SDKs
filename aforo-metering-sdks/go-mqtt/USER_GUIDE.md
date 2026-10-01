@@ -1,6 +1,6 @@
 # mqtt-metering-go — User Guide
 
-**Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** Go engineers metering MQTT usage from the client/device side.
+**Version:** 1.2.2 · **Updated:** 2026-10-01 · **Audience:** Go engineers metering MQTT usage from the client/device side.
 
 ## What you'll build
 
@@ -14,9 +14,9 @@ A Go MQTT client that emits one Aforo billing event per MQTT action — `CONNECT
 - A customer id and a client id per device/session — you pass both to the `Record*` methods.
 - Ingestor base URL — `https://api.aforo.ai`.
 
-## Step 1 — Add the module from source
+## Step 1 — Add the module
 
-`go get github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt` does not resolve yet (proxy not live). Clone and `replace`:
+Releases are git tags of the form `aforo-metering-sdks/go-mqtt/vX.Y.Z` on github.com/aforoai/SDKs. Use `v1.2.2` or later: `v1.0.0` was tagged from an older copy of this code and lacks the fixes listed in the changelog. Until the `v1.2.2` tag exists, `go get github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt@main` resolves to a pseudo-version of the default branch. To build against a local checkout, clone and `replace`:
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
@@ -24,7 +24,7 @@ git clone https://github.com/aforoai/SDKs.git
 
 ```go
 // go.mod (your service)
-require github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt v1.0.0
+require github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt v1.2.2
 
 replace github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt => ../SDKs/aforo-metering-sdks/go-mqtt
 ```
@@ -127,7 +127,7 @@ Content-Type: application/json
 {"events":[{"customerId":"cust_acme_001","metricName":"mqtt_broker.publish","quantity":1,"occurredAt":"…","idempotencyKey":"mqtt:…","productType":"MQTT_BROKER","mqttTopic":"devices/001/status","mqttQos":0,"mqttRetained":false,"mqttEventType":"PUBLISH","mqttClientId":"device-001","dataBytes":16,"metadata":{"sdkVersion":"1.0.0","productId":"prod_mqtt_iot_telemetry"}}]}
 ```
 
-> ⚠ Flush failures are silent unless you set `OnError`. If nothing lands, set `OnError: func(err error){ log.Println("aforo:", err) }` to surface marshal failures, retry-exhausted drops and ingestor rejections (including `errors[].message`).
+> ⚠ Drops are WARN-logged through the standard `log` package and counted in `DroppedCount()`; the reason for a failed flush is only reported to `OnError`. If nothing lands, set `OnError: func(err error){ log.Println("aforo:", err) }` to surface marshal failures, retry-exhausted drops and ingestor rejections (including `errors[].message`).
 
 ## Configuration reference
 
@@ -143,8 +143,33 @@ Content-Type: application/json
 | `FlushInterval` | `time.Duration` | `2s` | Background flush cadence. |
 | `HTTPClient` | `*http.Client` | `&http.Client{Timeout: 10s}` | HTTP client override. |
 | `OnError` | `func(error)` | no-op | Marshal failures, retry-exhausted drops, non-retryable `4xx` rejections, and partial failures (with the ingestor's `errors[].message`). |
+| `OnDrop` | `func([]map[string]any, DropReason)` | `nil` | Opt-in hook called with events the SDK drops (`retry_exhausted`, `rejected`, `invalid`). See [Dropped events](#dropped-events). |
 
 Tier filtering: every event carries `mqttQos` (0/1/2) and `mqttRetained`, so Aforo descriptor filter conditions can charge selectively (e.g. `mqtt_qos in ['1','2']`, or premium for `mqtt_retained == true`).
+
+## Dropped events
+
+An event the SDK cannot deliver is never lost silently. `billing.DroppedCount()` returns the running total, each drop is WARN-logged, and the opt-in `Config.OnDrop(events, reason)` hook receives the events (with their idempotency keys, so re-submitting them later is dedup-safe).
+
+| `DropReason` | When |
+|---|---|
+| `mqttmetering.DropRetryExhausted` (`retry_exhausted`) | A batch failed all 3 attempts (transport error, `408`, `429`, `5xx`). |
+| `mqttmetering.DropRejected` (`rejected`) | The ingestor answered a non-retryable `4xx`, or refused individual events in a `2xx` partial-failure response. In the partial case only the events named by `errors[].index` are passed to `OnDrop`; failures the ingestor does not identify are counted but not attributed to an event. |
+| `mqttmetering.DropInvalid` (`invalid`) | The event failed client-side validation and was never buffered: a blank or whitespace topic on a publish/deliver/subscribe/unsubscribe event, `customerId` over 64 characters or `productType` over 20. A topic over 500 or a client id over 128 is not dropped — both come from the MQTT client, so they are truncated to the limit without splitting a character, the event is sent, and a WARN is logged once per label. The invalid-drop WARN log names the field, the limit and the value (throttled: first occurrence, then every 1000th); `OnError` is called too. |
+
+A call with no customer id is not metered and is not a drop. An unknown `executionStatus` is not a drop either: the status is left off (or replaced by the derived one) and the event is sent.
+
+```go
+OnDrop: func(events []map[string]any, reason mqttmetering.DropReason) {
+	log.Printf("aforo: %d event(s) dropped: %s", len(events), reason)
+},
+```
+
+Idempotency keys are minted once, when the event is recorded. Every retry re-sends the same body, so a retried batch is deduplicated by the ingestor.
+
+## Execution status
+
+See [Execution status (outcome-based pricing)](README.md#execution-status-outcome-based-pricing) in the README for the values, how the status is derived and how to set your own.
 
 ## Troubleshooting
 
@@ -153,8 +178,8 @@ Tier filtering: every event carries `mqttQos` (0/1/2) and `mqttRetained`, so Afo
 | `New` returns an error | A required field is empty | Set `TenantID`, `ProductID`, `APIKey`, `IngestorURL`. |
 | Publishes/subscribes not metered | No matching `Record*` call at that site | Add the `Record*` call next to each MQTT client call you bill. |
 | Inbound traffic missing | `EmitDeliverEvents` is `false` (default) | Set `EmitDeliverEvents: true` and call `RecordDeliver` in your message handler. |
-| Nothing records for a session | Empty `customerID` passed to `Record*` | Resolve and pass a non-empty customer id; an empty id is silently skipped. |
-| Events drop with no log | Flush exhausted 3 retries and `OnError` is unset | Set `OnError`; verify `APIKey`, `IngestorURL`, and that the tenant owns the metric. |
+| Nothing records for a session | Empty `customerID` passed to `Record*` | Resolve and pass a non-empty customer id; an empty id is skipped (not metered, not counted as a drop). |
+| `DroppedCount()` rises with reason `retry_exhausted` | Flush exhausted its 3 attempts | Set `OnError`; verify `APIKey`, `IngestorURL`, and that the tenant owns the metric. |
 | Large gaps at shutdown | Process exited before a flush with a full-ish buffer | Always `defer billing.Shutdown()`; consider lowering `FlushCount`/`FlushInterval`. |
 
 ## What this guide does NOT cover

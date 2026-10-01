@@ -166,14 +166,25 @@ def _t(max_retries=2):
 
 @patch("aforo.transport.httpx.Client")
 def test_partial_failure_parsed_from_errors_message(mock_client_cls, caplog):
-    _mock_http(mock_client_cls, _resp(202, {
+    _mock_http(mock_client_cls, _resp(202, {"success": True, "data": {
         "accepted": 1, "duplicates": 0, "failed": 1,
         "errors": [{"index": 1, "message": "unknown metric"}],
-    }))
+    }}))
     with caplog.at_level("WARNING", logger="aforo.transport"):
         result = _t().send_sync(_events(2))
     assert (result.sent, result.failed) == (1, 1)
     assert "unknown metric" in caplog.text
+    # The rejected event is identified, so the client drops exactly that one.
+    assert result.reason == "rejected"
+    assert result.failed_indices == [1]
+
+
+@patch("aforo.transport.httpx.Client")
+def test_partial_failure_without_usable_indices_names_no_event(mock_client_cls):
+    _mock_http(mock_client_cls, _resp(202, {"accepted": 1, "failed": 2, "errors": [{"message": "x"}]}))
+    result = _t().send_sync(_events(3))
+    assert (result.sent, result.failed, result.reason) == (1, 2, "rejected")
+    assert result.failed_indices is None
 
 
 @patch("aforo.transport.httpx.Client")
@@ -182,6 +193,7 @@ def test_400_logs_errors_message_and_does_not_retry(mock_client_cls, caplog):
     with caplog.at_level("WARNING", logger="aforo.transport"):
         result = _t().send_sync(_events(1))
     assert result.failed == 1
+    assert result.reason == "rejected"
     assert client.post.call_count == 1
     assert "quantity must be positive" in caplog.text
 
@@ -237,5 +249,5 @@ def test_send_heartbeat_single_event_request_no_retry(mock_client_cls):
 def test_send_heartbeat_swallows_errors_and_returns_body(mock_client_cls):
     _mock_http(mock_client_cls, httpx.ConnectError("refused"))
     assert _t().send_heartbeat(_events(1)[0]) is None
-    _mock_http(mock_client_cls, _resp(202, {"accepted": 0, "killedSessionIds": ["s1"]}))
+    _mock_http(mock_client_cls, _resp(202, {"success": True, "data": {"accepted": 0, "killedSessionIds": ["s1"]}}))
     assert _t().send_heartbeat(_events(1)[0]) == {"accepted": 0, "killedSessionIds": ["s1"]}

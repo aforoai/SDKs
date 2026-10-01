@@ -1,6 +1,6 @@
 # ai.aforo:metering — User Guide
 
-**Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** Java backend engineers wiring usage metering into a service (plain Java or Spring Boot 3.x).
+**Version:** 1.1.2 · **Updated:** 2026-10-01 · **Audience:** Java backend engineers wiring usage metering into a service (plain Java or Spring Boot 3.x).
 
 ## What you'll build
 
@@ -29,7 +29,7 @@ Then add the dependency to your service's `pom.xml`:
 <dependency>
   <groupId>ai.aforo</groupId>
   <artifactId>metering</artifactId>
-  <version>1.0.0</version>
+  <version>1.1.2</version>
 </dependency>
 ```
 
@@ -64,7 +64,7 @@ public class Demo {
 }
 ```
 
-`track(...)` is non-blocking — it enqueues and returns. The event ships on the next 5-second flush, on reaching 50 buffered events, or when `close()` runs. The first two builder args are required (`customerId`, `metricName`); `quantity` defaults to `1` and must be `> 0`. Every event carries a top-level `productType`: the client default (`API`, or `AforoOptions.productType(...)`) unless you override it per event with `.productType("AI_AGENT")`. `track(...)` drops (with a warning) events with a blank `customerId`/`metricName` or `quantity <= 0`, because the ingestor would reject the whole batch.
+`track(...)` is non-blocking — it enqueues and returns. The event ships on the next 5-second flush, on reaching 50 buffered events, or when `close()` runs. The first two builder args are required (`customerId`, `metricName`); `quantity` defaults to `1` and must be `> 0`. Every event carries a top-level `productType`: the client default (`API`, or `AforoOptions.productType(...)`) unless you override it per event with `.productType("AI_AGENT")`. An event the ingestor would refuse — blank `customerId`/`metricName`, `quantity <= 0`, or a field over its length limit — is not sent: `track(...)` does not throw; the event is counted in `client.droppedCount()`, logged, and passed to the `onDrop` hook with `DropReason.INVALID`. Add `.executionStatus("SUCCESS")` (or another of the 11 accepted statuses) when the metric is priced by outcome. Both are described in the [README](README.md#dropped-events).
 
 > **Idempotency keys.** If you don't pass an `idempotencyKey`, the SDK mints a fresh random UUID v4 per event, so two genuinely distinct events are never confused — even when they share customer, metric, quantity and `occurredAt`. (It used to derive the key by hashing those four fields, so two identical events in the same millisecond collapsed into one and the second was silently dropped.) The key is minted once, when `track(...)` enqueues the event, and never changes, so a retried batch is still deduplicated. **If you want dedup — e.g. an at-least-once pipeline replaying the same logical event — pass your own `.idempotencyKey(...)`;** that value is sent verbatim and is the only thing the ingestor dedupes on.
 
@@ -88,7 +88,7 @@ That's the whole wiring. `AforoMeteringAutoConfiguration` registers:
 
 The filter records one event per request **after** `filterChain.doFilter(...)` returns:
 
-- `metricName` = `aforo.metric-name` (default `api_calls`), or whatever an `AforoServletFilter.MetricNameResolver` bean returns for the request. The metric must exist in your tenant's Aforo catalog: the ingestor rejects an unknown metric, and because it validates a batch as a whole, one rejected event fails every event in that batch. (Earlier versions sent `"<METHOD> <normalized-path>"`, which no catalog contains.)
+- `metricName` = `aforo.metric-name` (default `api_calls`), or whatever an `AforoServletFilter.MetricNameResolver` bean returns for the request. The metric must exist in your tenant's Aforo catalog: the ingestor rejects events for an unknown metric, and they are dropped with reason `REJECTED`. (Earlier versions sent `"<METHOD> <normalized-path>"`, which no catalog contains.)
 - `quantity` = `1`, `metadata` = `{"gateway":"java-servlet","status":<httpStatus>}`, plus top-level `endpointPath` (matched route pattern, else the normalized path; no query string; at most 512 chars), `httpMethod`, `statusCode`, `responseTimeMs`, and `productType` (`AforoServletFilter.productType(...)`, else `aforo.product-type`, default `API`).
 - These paths are skipped by default: `/health`, `/ready`, `/metrics`, `/favicon.ico`, `/actuator`. `OPTIONS` (CORS preflight) requests are never metered.
 
@@ -121,7 +121,8 @@ To watch the wire during local debugging, point `base-url` / `baseUrl` at a requ
 | `productType(...)` | `aforo.product-type` | `String` | `API` | Top-level `productType` on every event; per-event `TrackEvent.Builder.productType(...)` wins. |
 | `flushCount(...)` | `aforo.flush-count` | `int` | `50` | Buffer size that triggers an immediate flush; clamped to 1–1000 per batch. |
 | `flushIntervalMs(...)` | `aforo.flush-interval-ms` | `long` | `5000` | Background flush cadence (ms). |
-| `maxQueueSize(...)` | — | `int` | `10000` | Ring-buffer capacity; oldest events overwritten when full. |
+| `maxQueueSize(...)` | — | `int` | `10000` | Ring-buffer capacity; the oldest event is evicted (and reported as `OVERFLOW`) when full. |
+| `onDrop(...)` | — | `BiConsumer<List<ResolvedEvent>, DropReason>` | *(none)* | Receives events the SDK is about to lose (`OVERFLOW`, `RETRY_EXHAUSTED`, `REJECTED`, `INVALID`). |
 | `maxRetries(...)` | — | `int` | `3` | Retries per batch on 5xx / 408 / 429. |
 | `retryBaseMs(...)` | — | `long` | `1000` | Base backoff (ms), doubles per attempt; `429` honors `Retry-After`. |
 | `timeoutMs(...)` | — | `long` | `10000` | HTTP connect timeout (ms). |
@@ -136,7 +137,8 @@ To watch the wire during local debugging, point `base-url` / `baseUrl` at a requ
 |---|---|---|
 | Spring auto-config does nothing | `aforo.enabled` is unset or not the literal `true` | Set `aforo.enabled: true`. It's gated by `@ConditionalOnProperty(havingValue = "true")`. |
 | `IllegalArgumentException: apiKey is required` at startup | `AFORO_API_KEY` is empty / not exported | Export the env var and confirm it reaches `aforo.api-key` / `AforoOptions`. |
-| `flush()` returns `failed > 0` | Ingestor returned a non-2xx. 4xx (except 408/429) is **not** retried — usually a bad/expired key or an unknown `metricName` | Check the key; create the metric in Aforo so its name matches `metricName`; check service logs at `FINE` for the status code. |
+| `flush()` returns `failed > 0` | The ingestor returned a non-2xx, or a 2xx that refused some events in `errors[]`. 4xx (except 408/429) is **not** retried — usually a bad/expired key or an unknown `metricName` | Check the key; create the metric in Aforo so its name matches `metricName`. The `WARNING` log line carries the status code and the ingestor's `errors[].message`; an `onDrop` hook receives the affected events. |
+| `droppedCount()` grows but nothing is sent | Events are failing client-side validation (`DropReason.INVALID`) | Read the `Dropping invalid event: ...` warning — it names the field, the limit and the value. |
 | Events tracked but never appear in Aforo | Process exited before a flush, or the customer resolved to `null` in the filter | Use try-with-resources / `close()`; ensure `X-Customer-Id` (or your resolver / opted-in principal) is present so the filter doesn't skip the request. |
 | `IllegalStateException: AforoClient is closed` | `track(...)` called after `close()` | Don't reuse a closed client; build a new `AforoClient` (or keep the Spring-managed bean for the app lifetime). |
 | Health checks show up as metered traffic | A custom filter path or non-default excludes | The default excludes are `/health /ready /metrics /favicon.ico /actuator`. Construct `AforoServletFilter(client, yourExcludeList)` directly if you need different ones. |

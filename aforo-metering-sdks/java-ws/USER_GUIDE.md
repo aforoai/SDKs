@@ -1,6 +1,6 @@
 # ai.aforo:ws-metering — User Guide
 
-**Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** Java engineers running a WebSocket server (Jakarta WebSocket, Spring WebSocket, Netty, Undertow) who need connection/frame/byte metering.
+**Version:** 1.2.1 · **Updated:** 2026-10-01 · **Audience:** Java engineers running a WebSocket server (Jakarta WebSocket, Spring WebSocket, Netty, Undertow) who need connection/frame/byte metering.
 
 ## What you'll build
 
@@ -27,7 +27,7 @@ Add to your service's `pom.xml`:
 <dependency>
   <groupId>ai.aforo</groupId>
   <artifactId>ws-metering</artifactId>
-  <version>1.0.0</version>
+  <version>1.2.1</version>
 </dependency>
 ```
 
@@ -120,7 +120,9 @@ Runtime.getRuntime().addShutdownHook(new Thread(billing::close));
 | CLOSE event missing | `closeConnection` was never called (e.g. abnormal disconnect) or the process died first | Call `closeConnection` from `@OnClose` / your error path; flush before shutdown. |
 | Events POST to a 404 | `ingestorUrl` already includes the path | Pass the host only; the SDK appends `/v1/ingest/batch`. |
 | Far more events than connections | `perFrameEvents(true)` is set | That's per-frame mode. Leave it `false` for aggregated OPEN/CLOSE only. |
-| `flush exhausted retries — dropped N events` in logs | Ingestor returned non-2xx on all 3 attempts | Verify the key + `X-Tenant-Id`; ensure the `websocket_api.*` metrics exist in Aforo. |
+| `flush exhausted retries — dropped N events` in logs | Network error, 5xx, 408 or 429 on all 3 attempts | Check connectivity to `ingestorUrl`; the batch is reported to `onDrop` with `RETRY_EXHAUSTED`. |
+| `ingestor returned 4xx — not retrying` or `Dropped N event(s) — REJECTED` in logs | Bad key, unknown metric, or an event the ingestor refused; a 4xx other than 408/429 is sent once | Verify the key + `X-Tenant-Id`; ensure the `websocket_api.*` metric exists in Aforo. The log line carries the ingestor's `errors[].message`. |
+| `Dropping invalid event: ...` in logs, `droppedCount()` grows | The event breaks an ingestor field limit (`DropReason.INVALID`) and was not sent | The message names the field, the limit and the value. See [Dropped events](README.md#dropped-events). |
 
 ## What this guide does NOT cover
 

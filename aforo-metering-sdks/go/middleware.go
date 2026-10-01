@@ -5,7 +5,6 @@ import (
 	"regexp"
 	"strings"
 	"time"
-	"unicode/utf8"
 )
 
 var (
@@ -29,9 +28,6 @@ const DefaultMetricName = "api_calls"
 // DefaultCustomerIDHeader is the request header read for the customer id when
 // CustomerIDFunc is not set.
 const DefaultCustomerIDHeader = "X-Customer-Id"
-
-// maxEndpointPathLen is the ingestor's limit for the top-level endpointPath field.
-const maxEndpointPathLen = 512
 
 // MiddlewareOptions configures the HTTP middleware.
 type MiddlewareOptions struct {
@@ -97,6 +93,10 @@ func HTTPMiddleware(next http.Handler, opts MiddlewareOptions) http.Handler {
 		metricName = DefaultMetricName
 	}
 
+	// endpointPath and httpMethod come from the caller of the metered API, so
+	// they are truncated to the ingestor's limits instead of dropping the event.
+	labels := &labelTruncator{}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Wrap response writer to capture status code
 		sw := &statusWriter{ResponseWriter: w, statusCode: 200}
@@ -147,8 +147,8 @@ func HTTPMiddleware(next http.Handler, opts MiddlewareOptions) http.Handler {
 			CustomerID:     customerID,
 			MetricName:     metric,
 			Quantity:       1,
-			EndpointPath:   truncateUTF8(normalizePath(path), maxEndpointPathLen),
-			HTTPMethod:     r.Method,
+			EndpointPath:   labels.truncate("endpointPath", normalizePath(path), maxEndpointPathLen),
+			HTTPMethod:     labels.truncate("httpMethod", r.Method, maxHTTPMethodLen),
 			StatusCode:     sw.statusCode,
 			ResponseTimeMs: elapsed.Milliseconds(),
 		})
@@ -156,8 +156,12 @@ func HTTPMiddleware(next http.Handler, opts MiddlewareOptions) http.Handler {
 }
 
 // Gin users: there is no Gin-specific helper here because this package imports
-// no web framework (zero deps). Wrap HTTPMiddleware instead, e.g.
-//   router.Use(gin.WrapH(metering.HTTPMiddleware(next, opts)))
+// no web framework (zero deps), and a Go interface cannot carry the field
+// access (c.Writer, c.Request) a native gin.HandlerFunc needs. Wrap
+// HTTPMiddleware instead, e.g.
+//
+//	router.Use(gin.WrapH(metering.HTTPMiddleware(next, opts)))
+//
 // or call client.Track(...) directly from a gin.HandlerFunc.
 
 // ChiMiddleware returns a Chi-compatible middleware function.
@@ -188,17 +192,6 @@ func normalizePath(path string) string {
 		}
 	}
 	return strings.Join(segments, "/")
-}
-
-// truncateUTF8 cuts s to at most max bytes without splitting a rune.
-func truncateUTF8(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	for max > 0 && !utf8.RuneStart(s[max]) {
-		max--
-	}
-	return s[:max]
 }
 
 // statusWriter wraps http.ResponseWriter to capture the status code.

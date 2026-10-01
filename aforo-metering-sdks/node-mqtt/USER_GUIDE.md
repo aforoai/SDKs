@@ -1,6 +1,6 @@
 # @aforoai/mqtt-metering — User Guide
 
-**Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** Node.js engineers running an Aedes MQTT broker, or an `mqtt.js` client against a third-party broker, who need MQTT usage metered into Aforo.
+**Version:** 1.2.2 · **Updated:** 2026-10-01 · **Audience:** Node.js engineers running an Aedes MQTT broker, or an `mqtt.js` client against a third-party broker, who need MQTT usage metered into Aforo.
 
 ## What you'll build
 
@@ -22,7 +22,7 @@ npm i @aforoai/mqtt-metering aedes   # broker mode
 npm i @aforoai/mqtt-metering mqtt    # client mode
 ```
 
-It isn't on npm yet. Build from source and link it:
+Install `1.2.2` or later. `1.0.0` on npm was built from an older copy of this code and lacks the fixes listed in the changelog. If `1.2.2` is not on npm yet, install from source:
 
 ```bash
 cd SDKs/aforo-metering-sdks/node-mqtt
@@ -121,6 +121,11 @@ The batch is POSTed to `https://api.aforo.ai/v1/ingest/batch` with `X-API-Key: <
 new AforoMqttBilling({ /* … */, onError: (err) => myLogger.error('aforo mqtt flush failed', err) });
 ```
 
+## Outcomes and dropped events
+
+- **`executionStatus`** — the outcome used by outcome-based pricing. How this SDK sets it, the accepted values and how to override it: [README → Execution status](README.md#execution-status).
+- **Dropped events** — the SDK does not throw into your broker or client handlers for event content. Events it cannot deliver are counted in `billing.droppedCount`, logged with `console.warn`, and passed to `onDrop(events, reason)`. The three reasons (`invalid`, `rejected`, `retry_exhausted`) and what triggers each: [README → Dropped events](README.md#dropped-events).
+
 ## Configuration reference
 
 | Option | Type | Default | What it does |
@@ -133,7 +138,8 @@ new AforoMqttBilling({ /* … */, onError: (err) => myLogger.error('aforo mqtt f
 | `emitDeliverEvents` | `boolean` | `false` | Emit `DELIVER` (fan-out) events. Off → dropped, both modes. |
 | `flushCount` | `number` | `200` | Buffered events that trigger an immediate flush. |
 | `flushIntervalMs` | `number` | `2000` | Max ms before a partial batch is flushed. |
-| `onError` | `(error: Error) => void` | `console.error` | Terminal flush-failure callback. |
+| `onError` | `(error: Error) => void` | `console.error` | Called once per delivery problem: dropped or refused batch, per-event failures in a 2xx response, unusable `executionStatus`. |
+| `onDrop` | `(events, reason) => void` | none | Receives permanently dropped events with reason `invalid`, `rejected` or `retry_exhausted`. |
 | `resolveCustomerId` | `(clientId, username?) => string \| undefined \| Promise<…>` | — (broker, required) | Map client id → customer; `undefined` → skip. |
 | `resolveMetadata` | `(clientId) => Record<string, unknown> \| undefined` | `undefined` (broker) | Optional per-client tags. |
 | `customerId` | `string` | — (client, required) | Customer for all traffic on this client. |
@@ -150,6 +156,8 @@ new AforoMqttBilling({ /* … */, onError: (err) => myLogger.error('aforo mqtt f
 | `…/v1/ingest/batch/v1/ingest/batch` in logs | `ingestorUrl` already includes the path | Set `ingestorUrl` to the base host only. |
 | `mqttClientId` is `mqtt-client` for every client-mode event | No `clientId` configured and `client.options.clientId` unset | Pass `clientId` in the `wrapMqttClient` options, or set it on the mqtt.js connection. |
 | `onError` firing repeatedly | Wrong `apiKey`/`tenantId`, or ingestor unreachable | Verify credentials and that the host accepts `POST /v1/ingest/batch`. |
+| `droppedCount` rises and the warning says `invalid` | An event failed a client-side check (`customerId` longer than 64 characters, a missing or whitespace-only `mqttTopic`, or `productType` longer than 20) | Fix the value named in the warning; these values are not truncated. (A topic over 500 characters, or a client id over 128, is cut to the limit and the event is still sent.) `onDrop` receives the event. |
+| `droppedCount` rises and the warning says `rejected` | The ingestor refused the batch (4xx) or specific events | Read the `onError` message — it carries the ingestor's `errors[].message`. |
 
 ## What this guide does NOT cover
 

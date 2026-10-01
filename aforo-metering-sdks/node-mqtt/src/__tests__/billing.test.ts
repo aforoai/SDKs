@@ -281,7 +281,7 @@ function assertBatchContract(reqs: any[], apiKey: string, allowed: string[]) {
 
 describe('ingest batch contract', () => {
   const FIELDS = ['customerId', 'metricName', 'quantity', 'occurredAt', 'idempotencyKey', 'productType', 'metadata', 'mqttTopic', 'mqttQos', 'mqttRetained',
-    'mqttEventType', 'mqttClientId', 'dataBytes'];
+    'mqttEventType', 'mqttClientId', 'dataBytes', 'executionStatus'];
 
   test('events carry only IngestUsageEventRequest fields; CONNECT/DISCONNECT get a $SYS topic', async () => {
     const billing = new AforoMqttBilling({ ...config(), flushCount: 100 });
@@ -313,17 +313,27 @@ describe('ingest batch contract', () => {
     assertBatchContract(capturedRequests, 'sk_mqtt_abc', FIELDS);
   });
 
-  test('over-long topic and clientId are trimmed to ingestor limits', async () => {
-    const billing = new AforoMqttBilling({ ...config(), flushCount: 100 });
-    const client: any = new EventEmitter();
-    client.publish = jest.fn();
-    billing.wrapMqttClient(client, { customerId: 'cust_001', clientId: 'k'.repeat(300) });
-    client.publish('t'.repeat(900), 'x');
+  test('over-long customerId: dropped as invalid — not truncated, not thrown, not sent', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const onError = jest.fn();
+    const drops: Array<{ events: any[]; reason: string }> = [];
+    const billing = new AforoMqttBilling({
+      ...config(), flushCount: 100, onError,
+      onDrop: (events, reason) => drops.push({ events, reason }),
+    });
+    const longCustomer: any = new EventEmitter();
+    longCustomer.publish = jest.fn();
+    billing.wrapMqttClient(longCustomer, { customerId: 'c'.repeat(65), clientId: 'k'.repeat(300) });
+    expect(() => longCustomer.publish('t'.repeat(900), 'x')).not.toThrow();
     await billing.shutdown();
-    const ev = drainedEvents()[0];
-    expect(ev.mqttTopic.length).toBe(500);
-    expect(ev.mqttClientId.length).toBe(128);
-    expect(ev.idempotencyKey.length).toBeLessThanOrEqual(255);
+    expect(capturedRequests).toHaveLength(0);
+    expect(billing.droppedCount).toBe(1);
+    expect(drops.map((d) => d.reason)).toEqual(['invalid']);
+    expect(drops[0].events[0].customerId).toHaveLength(65); // handed over as-is, never truncated
+    expect(drops[0].events[0].idempotencyKey.length).toBeLessThanOrEqual(255);
+    expect(onError).not.toHaveBeenCalled();
+    expect(warn.mock.calls.map((c) => c[0]).join('\n')).toMatch(/customerId is 65 chars, limit 64/);
+    warn.mockRestore();
   });
 });
 
@@ -357,19 +367,32 @@ describe('productType', () => {
     ]);
   });
 
-  test('blank / whitespace mqttTopic is dropped client-side', async () => {
-    const b = new AforoMqttBilling({ ...config(), flushCount: 100 });
+  test('blank / whitespace mqttTopic is dropped as invalid; the WARN is throttled', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const reasons: string[] = [];
+    const b = new AforoMqttBilling({ ...config(), flushCount: 5000, onDrop: (_e, r) => reasons.push(r) });
     const c: any = new EventEmitter();
-    c.publish = jest.fn();
+    const upstream = jest.fn();
+    c.publish = upstream;
     b.wrapMqttClient(c, { customerId: 'cust_001' });
     c.publish('', 'x');
-    c.publish('   ', 'x');
+    for (let i = 0; i < 1000; i++) c.publish('   ', 'x');
     await b.shutdown();
+    expect(upstream).toHaveBeenCalledTimes(1001); // the wrapped publish still runs
     expect(capturedRequests).toHaveLength(0);
+    expect(b.droppedCount).toBe(1001);
+    expect(new Set(reasons)).toEqual(new Set(['invalid']));
+    expect(warn).toHaveBeenCalledTimes(2); // 1st and 1000th
+    expect(warn.mock.calls[0][0]).toMatch(/invalid: mqttTopic is required/);
+    warn.mockRestore();
   });
 });
 
 describe('batch response handling', () => {
+  let warn: jest.SpyInstance;
+  beforeEach(() => { warn = jest.spyOn(console, 'warn').mockImplementation(() => {}); });
+  afterEach(() => { warn.mockRestore(); });
+
   const resp = (status: number, body: any = {}, headers: Record<string, string> = {}) => ({
     ok: status >= 200 && status < 300, status, statusText: String(status),
     headers: { get: (k: string) => headers[k.toLowerCase()] ?? null },
@@ -381,40 +404,65 @@ describe('batch response handling', () => {
       return next();
     }) as any;
   };
+  /** Publishes `count` messages on topics t/0 … t/{count-1}, then shuts down. */
+  const meter = async (overrides: Record<string, unknown>, count = 1) => {
+    const b = new AforoMqttBilling({ ...config(), flushCount: 100, ...overrides });
+    const c: any = new EventEmitter();
+    c.publish = jest.fn();
+    b.wrapMqttClient(c, { customerId: 'cust_001' });
+    for (let i = 0; i < count; i++) c.publish(`t/${i}`, 'x');
+    await b.shutdown();
+    return b;
+  };
 
-  test('4xx (not 408/429) is not retried and reports errors[].message', async () => {
+  test('4xx (not 408/429) is not retried, reports errors[].message, and drops the batch as rejected', async () => {
     const onError = jest.fn();
+    const onDrop = jest.fn();
     respondWith(() => resp(400, { errors: [{ index: 0, message: 'field is required' }] }));
-    await meterOnce(onError);
+    const b = await meter({ onError, onDrop });
     expect(capturedRequests).toHaveLength(1);
     expect(onError).toHaveBeenCalledTimes(1);
     expect(onError.mock.calls[0][0].message).toMatch(/HTTP 400.*field is required.*not retried/);
+    expect(b.droppedCount).toBe(1);
+    expect(onDrop).toHaveBeenCalledTimes(1);
+    expect(onDrop.mock.calls[0][1]).toBe('rejected');
   });
 
   test('429 honours Retry-After and 408 is retried; same idempotencyKeys re-sent', async () => {
     const onError = jest.fn();
     const seq = [resp(429, {}, { 'retry-after': '0' }), resp(408, {}, { 'retry-after': '0' }), resp(202, { accepted: 1, failed: 0 })];
     respondWith(() => seq.shift()!);
-    await meterOnce(onError);
+    const b = await meter({ onError });
     expect(capturedRequests).toHaveLength(3);
     expect(new Set(capturedRequests.map((r: any) => r.body.events[0].idempotencyKey)).size).toBe(1);
     expect(onError).not.toHaveBeenCalled();
+    expect(b.droppedCount).toBe(0);
   });
 
-  test('202 with failed > 0 reports per-event errors[].message via onError', async () => {
+  test('202 with failed > 0 reports errors[].message and drops only the events named by index', async () => {
     const onError = jest.fn();
-    respondWith(() => resp(202, { accepted: 0, duplicates: 0, failed: 1, errors: [{ index: 0, message: 'bad event' }] }));
-    await meterOnce(onError);
+    const onDrop = jest.fn();
+    respondWith(() => resp(202, { success: true, data: { accepted: 2, duplicates: 0, failed: 1, errors: [{ index: 1, message: 'bad event' }] } }));
+    const b = await meter({ onError, onDrop }, 3);
     expect(capturedRequests).toHaveLength(1);
-    expect(onError.mock.calls[0][0].message).toMatch(/rejected 1 event\(s\).*#0: bad event/);
+    expect(onError.mock.calls[0][0].message).toMatch(/rejected 1 event\(s\).*#1: bad event/);
+    expect(b.droppedCount).toBe(1);
+    expect(onDrop).toHaveBeenCalledTimes(1);
+    expect(onDrop.mock.calls[0][1]).toBe('rejected');
+    expect(onDrop.mock.calls[0][0].map((e: any) => e.mqttTopic)).toEqual(['t/1']);
+  });
+
+  test('202 with failed > 0 but no usable index counts the drops without naming events', async () => {
+    const onDrop = jest.fn();
+    respondWith(() => resp(202, { accepted: 1, failed: 2 }));
+    const b = await meter({ onError: () => {}, onDrop }, 3);
+    expect(b.droppedCount).toBe(2);
+    expect(onDrop).not.toHaveBeenCalled();
+  });
+
+  test('a throwing onError never turns a delivered batch into a retry', async () => {
+    respondWith(() => resp(202, { accepted: 0, failed: 1, errors: [{ index: 0, message: 'bad' }] }));
+    await meter({ onError: () => { throw new Error('hook bug'); } });
+    expect(capturedRequests).toHaveLength(1);
   });
 });
-
-async function meterOnce(onError: (e: Error) => void) {
-  const b = new AforoMqttBilling({ ...config(), flushCount: 100, onError });
-  const c: any = new EventEmitter();
-  c.publish = jest.fn();
-  b.wrapMqttClient(c, { customerId: 'cust_001' });
-  c.publish('t/1', 'x');
-  await b.shutdown();
-}

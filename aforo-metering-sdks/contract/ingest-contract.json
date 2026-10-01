@@ -1,0 +1,136 @@
+{
+  "version": 1,
+  "description": "AUTHORITATIVE Aforo usage-ingestor ingest contract. Derived from the REAL controllers + request DTOs in aforo-nextgen-usage-ingestor-service — never from any SDK's own constants. Every SDK test suite in this repo loads THIS file and asserts its observed wire request (endpoint path + body shape) against it. Guard purpose (A+ delivery-guarantee prompt 7): the 2026-07-05 D1 incident shipped 16 transport-variant SDKs that posted a BATCH body to /v1/ingest/events (a SINGLE-event endpoint) — every real flush 400'd, 100% event loss, hidden by 17 green suites that each asserted the SDK's OWN wrong constant. A test that validates the SDK against the SDK has zero contract coverage; this file is the independent source of truth.",
+  "maintenance": "If an ingest endpoint or request DTO changes in aforo-nextgen-usage-ingestor-service, update this file FROM THE CONTROLLER/DTO CODE (re-verify the file:line references below) in the same change that updates the SDKs. Never edit this file to match an SDK — that inverts the guard.",
+  "derivedFrom": {
+    "usageEventController": "aforo-nextgen-usage-ingestor-service/src/main/java/com/aforo/billing/ingestor/controller/UsageEventController.java (POST mappings: /v1/ingest L106, /v1/ingest/test L144, /v1/ingest/events L185, /v1/ingest/batch L245, /v1/ingest/async-batch L284; each also serves an /api/v1 alias for the Kong gateway route)",
+    "compoundIngestController": "aforo-nextgen-usage-ingestor-service/src/main/java/com/aforo/billing/ingestor/controller/CompoundIngestController.java (POST /api/v1/ingest/compound L61, POST /api/v1/ingest/compound/batch L179 — NOTE: compound has NO bare /v1 alias)",
+    "dtos": {
+      "IngestUsageEventRequest": "dto/IngestUsageEventRequest.java (required: customerId @NotBlank L39, metricName @NotBlank L45, quantity @NotNull @Positive L51-52, occurredAt @NotNull L57, idempotencyKey @NotBlank L62)",
+      "IngestBatchRequest": "dto/IngestBatchRequest.java (events @NotEmpty @Size(max=1000) @Valid L16-20)",
+      "ApigeeEventRequest": "dto/ApigeeEventRequest.java (required: eventType @NotBlank L40, metricKey @NotBlank L45, value @NotNull L50, idempotencyKey @NotBlank — required since 2026-07-05 producer-edge audit #15, customerId @NotBlank @Size(max=64) — required since f37c1db)",
+      "CompoundUsageEventRequest": "dto/CompoundUsageEventRequest.java (required: correlationId @NotNull UUID-TYPED L46-49, customerId @NotBlank L51, occurredAt @NotNull L57, measurements @NotEmpty @Size(max=50) L71-72)",
+      "MetricMeasurement": "dto/MetricMeasurement.java (required: metricName @NotBlank L32, quantity @NotNull @Positive L38-39)",
+      "BatchCompoundUsageEventRequest": "dto/BatchCompoundUsageEventRequest.java (events @NotEmpty @Size(max=500))"
+    }
+  },
+  "endpoints": {
+    "/v1/ingest": {
+      "cardinality": "single",
+      "dto": "IngestUsageEventRequest",
+      "requiredFields": ["customerId", "metricName", "quantity", "occurredAt", "idempotencyKey"],
+      "forbiddenTopLevelKeys": ["events"],
+      "notes": "Binds ONE event. Posting a batch wrapper {events:[...]} here 400s (customerId/metricName/... missing at top level). Per-event customerId is required — there is no header/tenant fallback on this DTO."
+    },
+    "/v1/ingest/events": {
+      "cardinality": "single",
+      "dto": "ApigeeEventRequest",
+      "requiredFields": ["eventType", "metricKey", "value", "idempotencyKey", "customerId"],
+      "forbiddenTopLevelKeys": ["events"],
+      "notes": "Apigee-format SINGLE event (this was the D1 bug: transport variants posted {events:[...]} here and every flush 400'd). customerId is @NotBlank @Size(max=64) since usage-ingestor f37c1db (re-verified 2026-10-01) — the old tenant fallback billed usage to a customer that was really the tenant. idempotencyKey is @NotBlank since 2026-07-05."
+    },
+    "/v1/ingest/batch": {
+      "cardinality": "batch-wrapped",
+      "dto": "IngestBatchRequest",
+      "batchKey": "events",
+      "maxEvents": 1000,
+      "eventDto": "IngestUsageEventRequest",
+      "eventRequiredFields": ["customerId", "metricName", "quantity", "occurredAt", "idempotencyKey"],
+      "eventOptionalFields": {
+        "executionStatus": {
+          "type": "string",
+          "maxLength": 20,
+          "values": ["SUCCESS", "PARTIAL", "TIMEOUT", "ERROR", "VALIDATION_FAILED", "FAILED", "FAILURE", "CANCELLED", "PENDING", "BLOCKED", "HITL_REQUIRED"],
+          "derivedFrom": "IngestUsageEventRequest.java executionStatus + SchemaBasedEventValidator FALLBACK_ENUM_FIELD_VALUES"
+        }
+      },
+      "notes": "Body is an OBJECT {\"events\":[...]}, not a bare array (bare array = /v1/ingest/async-batch shape). Each element is a full IngestUsageEventRequest incl. per-event customerId + idempotencyKey. The gql*/grpc*/ws*/mqtt* protocol fields the transport variants send live on this event DTO (V14) and are optional."
+    },
+    "/v1/ingest/async-batch": {
+      "cardinality": "bare-array",
+      "dto": "List<IngestUsageEventRequest>",
+      "maxEvents": 10000,
+      "eventRequiredFields": ["customerId", "metricName", "quantity", "occurredAt", "idempotencyKey"],
+      "notes": "Body is a BARE JSON ARRAY of events (no {events:} wrapper). No SDK in this repo targets it today; documented so the array-vs-wrapper distinction can't be guessed wrong."
+    },
+    "/api/v1/ingest/compound": {
+      "cardinality": "single",
+      "dto": "CompoundUsageEventRequest",
+      "requiredFields": ["correlationId", "customerId", "occurredAt", "measurements"],
+      "typeConstraints": { "correlationId": "uuid" },
+      "measurementRequiredFields": ["metricName", "quantity"],
+      "maxMeasurements": 50,
+      "forbiddenTopLevelKeys": ["events"],
+      "notes": "correlationId is UUID-TYPED server-side — a non-UUID string 400s and silently drops the event (Rule #21 / 2026-07-05 gateway freeze). ONLY the /api-prefixed path exists; /v1/ingest/compound is NOT mapped. Used by gateway plugins, not by SDKs in this repo."
+    },
+    "/api/v1/ingest/compound/batch": {
+      "cardinality": "batch-wrapped",
+      "dto": "BatchCompoundUsageEventRequest",
+      "batchKey": "events",
+      "maxEvents": 500,
+      "eventDto": "CompoundUsageEventRequest",
+      "eventRequiredFields": ["correlationId", "customerId", "occurredAt", "measurements"],
+      "notes": "Batch of compound events. Same UUID correlationId constraint per element. No SDK in this repo targets it today."
+    }
+  },
+  "responses": {
+    "description": "Shape of 2xx RESPONSE bodies. aforo-common's ApiResponseAdvice wraps every 2xx JSON controller body in {success, data, meta} (only /internal/, /actuator and the API-doc paths are excluded), so the DTO a controller returns arrives under 'data'. A client that reads a DTO field at the top level sees undefined and silently does nothing — this is how mcp-proxy quota enforcement never denied, and how no SDK counted per-event rejections or saw killedSessionIds (all fixed 2026-10-01). Every client in this repo reads 'data' when it is an object and falls back to the bare body. Error bodies (4xx/5xx, RFC 7807 ProblemDetail) are NOT wrapped.",
+    "derivedFrom": {
+      "envelope": "aforo-nextgen-common/src/main/java/com/aforo/billing/common/config/ApiResponseAdvice.java (beforeBodyWrite → ApiResponse.success(body); isExcludedPath)",
+      "quotaCheck": "aforo-nextgen-usage-ingestor-service preflight/PreFlightQuotaController.java (POST /api/v1/quota/check, always 200) + dto/PreFlightCheckRequest.java (customerId @NotBlank; metricName, estimatedQuantity optional) + dto/PreFlightCheckResponse.java (@JsonInclude NON_NULL)",
+      "ingestBatch": "controller/UsageEventController.java ingestBatch (202) + dto/IngestBatchResponse.java"
+    },
+    "envelope": { "dataKey": "data", "wrapperKeys": ["success", "data", "meta"], "bareShapeAccepted": true },
+    "/api/v1/quota/check": {
+      "method": "POST",
+      "status": 200,
+      "requestRequiredFields": ["customerId"],
+      "requestOptionalFields": ["metricName", "estimatedQuantity"],
+      "decisionField": "decision",
+      "decisions": ["ALLOW", "WARN", "DENY"],
+      "blockingDecisions": ["DENY"],
+      "dataFields": ["decision", "reason", "currentUsage", "limit", "retryAfterMs", "tierName", "headers"],
+      "examples": {
+        "deny": { "success": true, "data": { "decision": "DENY", "reason": "Rate limit exceeded", "currentUsage": 1000, "limit": 1000, "retryAfterMs": 60000, "headers": { "X-RateLimit-Limit": "1000", "X-RateLimit-Remaining": "0" } } },
+        "warn": { "success": true, "data": { "decision": "WARN", "reason": "Approaching limit", "currentUsage": 950, "limit": 1000 } },
+        "allow": { "success": true, "data": { "decision": "ALLOW", "reason": "Passed" } }
+      },
+      "notes": "Always HTTP 200 — the decision is in the body. The server fails open (ALLOW) on its own errors; clients fail open on timeout, non-200, or a body with no recognisable decision."
+    },
+    "/v1/ingest/batch": {
+      "status": 202,
+      "dataFields": ["accepted", "duplicates", "failed", "errors", "killedSessionIds"],
+      "examples": {
+        "partialFailure": { "success": true, "data": { "accepted": 0, "duplicates": 0, "failed": 1, "errors": [{ "index": 0, "message": "unknown metric" }] } },
+        "killedSession": { "success": true, "data": { "accepted": 0, "duplicates": 0, "failed": 0, "killedSessionIds": ["s1"] } }
+      }
+    }
+  },
+  "sdks": {
+    "node": { "endpoint": "/v1/ingest/batch" },
+    "node-graphql": { "endpoint": "/v1/ingest/batch" },
+    "node-grpc": { "endpoint": "/v1/ingest/batch" },
+    "node-mqtt": { "endpoint": "/v1/ingest/batch" },
+    "node-ws": { "endpoint": "/v1/ingest/batch" },
+    "node-mcp": { "endpoint": "/v1/ingest/batch" },
+    "node-agent": { "endpoint": "/v1/ingest/events" },
+    "mcp-proxy": { "endpoint": "/v1/ingest/batch" },
+    "python": { "endpoint": "/v1/ingest/batch" },
+    "python-agent": { "endpoint": "/v1/ingest/batch" },
+    "python-graphql": { "endpoint": "/v1/ingest/batch" },
+    "python-grpc": { "endpoint": "/v1/ingest/batch" },
+    "python-mqtt": { "endpoint": "/v1/ingest/batch" },
+    "python-ws": { "endpoint": "/v1/ingest/batch" },
+    "python-mcp": { "endpoint": "/v1/ingest/batch" },
+    "java": { "endpoint": "/v1/ingest/batch" },
+    "java-graphql": { "endpoint": "/v1/ingest/batch" },
+    "java-grpc": { "endpoint": "/v1/ingest/batch" },
+    "java-mqtt": { "endpoint": "/v1/ingest/batch" },
+    "java-ws": { "endpoint": "/v1/ingest/batch" },
+    "go": { "endpoint": "/v1/ingest/batch" },
+    "go-graphql": { "endpoint": "/v1/ingest/batch" },
+    "go-grpc": { "endpoint": "/v1/ingest/batch" },
+    "go-mqtt": { "endpoint": "/v1/ingest/batch" },
+    "go-ws": { "endpoint": "/v1/ingest/batch" }
+  }
+}

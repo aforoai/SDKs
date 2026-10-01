@@ -3,7 +3,7 @@
     <modelVersion>4.0.0</modelVersion>
     <groupId>ai.aforo</groupId>
     <artifactId>mqtt-metering</artifactId>
-    <version>1.0.0</version>
+    <version>1.2.2</version>
     <packaging>jar</packaging>
     <name>Aforo MQTT Metering SDK (Java)</name>
     <description>Aforo MQTT Metering SDK — wrapper for Eclipse Paho MQTT client (sync + async) that meters PUBLISH/SUBSCRIBE/CONNECT/DISCONNECT events.</description>

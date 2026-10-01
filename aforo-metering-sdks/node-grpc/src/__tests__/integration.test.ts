@@ -24,6 +24,13 @@
 import { AforoGrpcBilling } from '../index';
 import * as http from 'http';
 import { AddressInfo } from 'net';
+import {
+  INTEGRATION_TEST_TIMEOUT_MS,
+  runCleanups,
+  trackFetch,
+  waitFor,
+  type FetchTracker,
+} from '../../test-support/timing';
 
 let grpcPkg: any;
 try {
@@ -46,6 +53,19 @@ interface Fixture {
   ingestorServer: http.Server;
   captured: CapturedRequest[];
   billing: AforoGrpcBilling;
+  /** Every gRPC client a test opened — closed in teardown whatever the outcome. */
+  clients: any[];
+  /** Extra resources a single test created; run in order, before the fixture's own. */
+  extraCleanups: Array<[name: string, run: () => unknown]>;
+  fetches: FetchTracker;
+}
+
+function closeHttpServer(server: http.Server): Promise<void> {
+  return new Promise<void>((resolve) => {
+    server.close(() => resolve());
+    // Keep-alive sockets from the SDK's fetch would otherwise hold close() open.
+    (server as any).closeAllConnections?.();
+  });
 }
 
 // Minimal "Greeter" service definition — same shape protoc would generate
@@ -80,6 +100,7 @@ function greeterServiceDefinition() {
 }
 
 async function setup(): Promise<Fixture> {
+  const fetches = trackFetch();
   const captured: CapturedRequest[] = [];
   const ingestorServer = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -102,7 +123,6 @@ async function setup(): Promise<Fixture> {
     tenantId: 'tenant-int-grpc',
     productId: 'prod-int-grpc',
     apiKey: 'sk_int_grpc',
-    onError: () => {}, // ignore teardown-race flush noise
     ingestorUrl: `http://127.0.0.1:${ingestorPort}`,
     serviceName: 'aforo.test.Greeter',
     flushCount: 1,
@@ -133,38 +153,55 @@ async function setup(): Promise<Fixture> {
     });
   });
 
-  return { serverPort: port, server, ingestorServer, captured, billing };
+  return { serverPort: port, server, ingestorServer, captured, billing, clients: [], extraCleanups: [], fetches };
 }
 
+/**
+ * Quiesce, then close — in dependency order, and independent of how the test
+ * ended: close every client, flush, wait for every in-flight flush to land,
+ * and only then stop the servers. forceShutdown (not tryShutdown) so a call a
+ * failed test left open cannot hold teardown hostage.
+ */
 async function teardown(f: Fixture): Promise<void> {
-  await f.billing.shutdown();
-  await new Promise<void>((r) => f.server.tryShutdown(() => r()));
-  await new Promise<void>((r) => f.ingestorServer.close(() => r()));
+  await runCleanups([
+    ['close clients', () => { for (const c of f.clients) c.close(); }],
+    ...f.extraCleanups,
+    ['billing.shutdown', () => f.billing.shutdown()],
+    ['in-flight flushes', () =>
+      waitFor(() => f.fetches.pending() === 0, () => `SDK fetches to settle (pending=${f.fetches.pending()})`)],
+    ['grpc server.forceShutdown', () => f.server.forceShutdown()],
+    ['ingestor.close', () => closeHttpServer(f.ingestorServer)],
+    ['restore fetch', () => f.fetches.restore()],
+  ]);
 }
 
 function flatEvents(captured: CapturedRequest[]): any[] {
   return captured.flatMap((r) => r.body?.events ?? []);
 }
 
-async function waitForEvents(
+/** Wait until the captured events satisfy `predicate`; returns them. */
+function waitForEvents(
   captured: CapturedRequest[],
   predicate: (events: any[]) => boolean,
-  timeoutMs = 2000,
+  what: string,
 ): Promise<any[]> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const events = flatEvents(captured);
-    if (predicate(events)) return events;
-    await new Promise((r) => setTimeout(r, 25));
-  }
-  throw new Error(`waitForEvents timed out. captured=${JSON.stringify(captured, null, 2)}`);
+  return waitFor(
+    () => {
+      const events = flatEvents(captured);
+      return predicate(events) ? events : undefined;
+    },
+    () => `${what}. captured=${JSON.stringify(captured, null, 2)}`,
+  );
 }
 
 // Build a generic gRPC client around the service definition (no proto loader)
-function makeClient(port: number): any {
+// and track it on the fixture so teardown closes it.
+function makeClient(f: Fixture, port: number = f.serverPort): any {
   const def = greeterServiceDefinition();
   const ClientCtor = grpcPkg.makeGenericClientConstructor(def, 'Greeter', {});
-  return new ClientCtor(`127.0.0.1:${port}`, grpcPkg.credentials.createInsecure());
+  const client = new ClientCtor(`127.0.0.1:${port}`, grpcPkg.credentials.createInsecure());
+  f.clients.push(client);
+  return client;
 }
 
 describe('Real-server integration (@grpc/grpc-js Server + Client)', () => {
@@ -181,12 +218,12 @@ describe('Real-server integration (@grpc/grpc-js Server + Client)', () => {
 
   afterEach(async () => {
     await teardown(fix);
-  });
+  }, INTEGRATION_TEST_TIMEOUT_MS);
 
   itIfPeer(
     'unary success: real RPC through wire → metering event with OK status',
     async () => {
-      const client = makeClient(fix.serverPort);
+      const client = makeClient(fix);
       const md = new grpcPkg.Metadata();
       md.add('x-customer-id', 'cust_grpc_001');
 
@@ -198,7 +235,7 @@ describe('Real-server integration (@grpc/grpc-js Server + Client)', () => {
       });
       expect(resp.message).toBe('hello world');
 
-      const events = await waitForEvents(fix.captured, (evs) => evs.length >= 1);
+      const events = await waitForEvents(fix.captured, (evs) => evs.length >= 1, 'the metering event');
       const ev = events[0];
       expect(ev.productType).toBe('GRPC_API');
       expect(ev.grpcService).toBe('aforo.test.Greeter');
@@ -208,41 +245,38 @@ describe('Real-server integration (@grpc/grpc-js Server + Client)', () => {
       expect(ev.customerId).toBe('cust_grpc_001');
       expect(ev.executionDurationMs).toBeGreaterThanOrEqual(0);
 
-      client.close();
     },
-    15_000,
+    INTEGRATION_TEST_TIMEOUT_MS,
   );
 
   itIfPeer(
     'unary error: thrown handler error → metering event with mapped status code',
     async () => {
-      const client = makeClient(fix.serverPort);
+      const client = makeClient(fix);
       const md = new grpcPkg.Metadata();
       md.add('x-customer-id', 'cust_grpc_002');
 
-      await new Promise<void>((resolve) => {
-        client.failHard({ name: 'whatever' }, md, (err: any) => {
-          expect(err).toBeTruthy();
-          expect(err.code).toBe(grpcPkg.status.INVALID_ARGUMENT);
-          resolve();
-        });
+      // Assert outside the callback: an expect() that throws inside it would
+      // be an uncaught exception and leave this promise pending forever.
+      const err: any = await new Promise((resolve) => {
+        client.failHard({ name: 'whatever' }, md, (e: any) => resolve(e));
       });
+      expect(err).toBeTruthy();
+      expect(err.code).toBe(grpcPkg.status.INVALID_ARGUMENT);
 
-      const events = await waitForEvents(fix.captured, (evs) => evs.length >= 1);
+      const events = await waitForEvents(fix.captured, (evs) => evs.length >= 1, 'the metering event');
       const ev = events[0];
       expect(ev.grpcMethod).toBe('FailHard');
       expect(ev.grpcStatusCode).toBe('INVALID_ARGUMENT');
       expect(ev.customerId).toBe('cust_grpc_002');
 
-      client.close();
     },
-    15_000,
+    INTEGRATION_TEST_TIMEOUT_MS,
   );
 
   itIfPeer(
-    'authorization + tenant headers reach the ingestor',
+    'X-API-Key + tenant headers reach the ingestor (no Authorization)',
     async () => {
-      const client = makeClient(fix.serverPort);
       const md = new grpcPkg.Metadata();
       md.add('x-customer-id', 'cust_grpc_headers');
 
@@ -257,6 +291,7 @@ describe('Real-server integration (@grpc/grpc-js Server + Client)', () => {
           res.end();
         });
       });
+      fix.extraCleanups.push(['sniffServer.close', () => closeHttpServer(sniffServer)]);
       await new Promise<void>((r) => sniffServer.listen(0, '127.0.0.1', r));
       const port = (sniffServer.address() as AddressInfo).port;
 
@@ -264,12 +299,13 @@ describe('Real-server integration (@grpc/grpc-js Server + Client)', () => {
         tenantId: 'tenant-headers',
         productId: 'prod-headers',
         apiKey: 'sk_header_check',
-        onError: () => {}, // ignore teardown-race flush noise
         ingestorUrl: `http://127.0.0.1:${port}`,
         serviceName: 'aforo.test.Greeter',
         flushCount: 1,
         customerIdExtractor: (m: any) => m && m['x-customer-id'],
       });
+      // unshift: must run (and its flush land) before the sniff server closes.
+      fix.extraCleanups.unshift(['billing2.shutdown', () => billing2.shutdown()]);
 
       // Re-bind a separate handler for header check (avoid stomping fix.billing)
       const sniffServer2Def = greeterServiceDefinition();
@@ -278,37 +314,27 @@ describe('Real-server integration (@grpc/grpc-js Server + Client)', () => {
         sayHello: billing2.wrapUnary('SayHello', async () => ({ message: 'sniff' })),
         failHard: billing2.wrapUnary('FailHard', async () => ({ message: 'unused' })),
       });
+      fix.extraCleanups.push(['sniff grpc server.forceShutdown', () => sniffSrv.forceShutdown()]);
       const sniffPort: number = await new Promise((resolve, reject) => {
         sniffSrv.bindAsync('127.0.0.1:0', grpcPkg.ServerCredentials.createInsecure(), (err: any, p: number) => {
           if (err) return reject(err);
           resolve(p);
         });
       });
-      const client2 = makeClient(sniffPort);
+      const client2 = makeClient(fix, sniffPort);
 
-      try {
-        await new Promise<void>((resolve) => {
-          client2.sayHello({ name: 'sniff' }, md, () => resolve());
-        });
+      await new Promise<void>((resolve, reject) => {
+        client2.sayHello({ name: 'sniff' }, md, (err: any) => (err ? reject(err) : resolve()));
+      });
 
-        const deadline = Date.now() + 2000;
-        while (sniffed.length === 0 && Date.now() < deadline) {
-          await new Promise((r) => setTimeout(r, 25));
-        }
-
-        expect(sniffed.length).toBeGreaterThan(0);
-        const headers = sniffed[0];
-        expect(headers['x-api-key']).toBe('sk_header_check');
-        expect(headers['authorization']).toBeUndefined();
-        expect(headers['x-tenant-id']).toBe('tenant-headers');
-      } finally {
-        client2.close();
-        client.close();
-        await billing2.shutdown();
-        await new Promise<void>((r) => sniffSrv.tryShutdown(() => r()));
-        await new Promise<void>((r) => sniffServer.close(() => r()));
-      }
+      const headers = await waitFor(
+        () => sniffed[0],
+        () => 'a request to reach the header-sniffing ingestor',
+      );
+      expect(headers['x-api-key']).toBe('sk_header_check');
+      expect(headers['authorization']).toBeUndefined();
+      expect(headers['x-tenant-id']).toBe('tenant-headers');
     },
-    15_000,
+    INTEGRATION_TEST_TIMEOUT_MS,
   );
 });

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional, Union
 
+from ..limits import truncate_label
+
 DEFAULT_METRIC_NAME = "api_calls"
 """Metric recorded per request when ``metric_name`` is not configured.
 
@@ -59,12 +61,15 @@ def http_fields(
 ) -> dict:
     """Top-level HTTP fields the ingestor understands (camelCase wire names).
 
-    ``endpointPath`` is the request path without the query string, capped at 512.
+    ``endpointPath`` (the request path without the query string) and
+    ``httpMethod`` come from the incoming request, so an over-long value is cut
+    to the ingestor's limit (512 / 16 UTF-16 code units) and the event is still
+    sent -- dropping it would let a caller avoid metering with a long path.
     """
     endpoint = (path or "/").split("?", 1)[0] or "/"
     fields: dict = {
-        "endpointPath": endpoint[:512],
-        "httpMethod": (method or "UNKNOWN").upper()[:16],
+        "endpointPath": truncate_label("endpointPath", endpoint),
+        "httpMethod": truncate_label("httpMethod", (method or "UNKNOWN").upper()),
         "statusCode": int(status_code),
     }
     if response_time_ms is not None:

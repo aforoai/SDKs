@@ -187,6 +187,7 @@ class AforoGraphQlIntegrationTest {
         assertThat(ev).containsEntry("customerId", "cust_query_001");
         assertThat(((Number) ev.get("gqlComplexity")).intValue()).isGreaterThan(0);
         assertThat(ev).containsEntry("gqlHasErrors", Boolean.FALSE);
+        assertThat(ev).containsEntry("executionStatus", "SUCCESS");
     }
 
     @Test
@@ -229,6 +230,9 @@ class AforoGraphQlIntegrationTest {
         assertThat(events).isNotEmpty();
         Map<String, Object> ev = events.get(0);
         assertThat(ev).containsEntry("gqlHasErrors", Boolean.TRUE);
+        // Validation failure → data key absent → VALIDATION_FAILED
+        assertThat(result.isDataPresent()).isFalse();
+        assertThat(ev).containsEntry("executionStatus", "VALIDATION_FAILED");
         assertThat(ev).containsEntry("customerId", "cust_err_001");
     }
 }

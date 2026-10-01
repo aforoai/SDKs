@@ -48,16 +48,82 @@ export interface AforoWsConfig {
   perFrameEvents?: boolean;
   /** Callback for terminal flush failures. */
   onError?: (error: Error) => void;
+  /**
+   * Opt-in hook receiving events that were permanently dropped (retry
+   * exhaustion, a rejection by the ingestor, or a failed client-side check —
+   * see DropReason). Events keep their idempotency keys,
+   * so persisting and re-submitting them after recovery is dedup-safe.
+   * Exceptions thrown by the hook are swallowed. Default: none (drops are
+   * still counted in droppedCount and WARN-logged).
+   */
+  onDrop?: (events: WsUsageEvent[], reason: DropReason) => void;
 }
+
+/**
+ * Why events were permanently dropped. `retry_exhausted`: the ingestor stayed
+ * unreachable / kept answering 408, 429 or 5xx. `rejected`: the ingestor
+ * refused the batch (non-retryable 4xx) or individual events of an accepted
+ * batch. `invalid`: the event failed a client-side check and was never sent.
+ * The buffer is unbounded (drained at flush start), so unlike the core SDK
+ * there is no 'overflow' reason here.
+ */
+export type DropReason = 'retry_exhausted' | 'rejected' | 'invalid';
 
 export interface WrapServerOptions {
   /** Extract Aforo customer ID from the upgrade request. */
   extractCustomerId: (req: any) => string | undefined;
   /** Optional per-connection metadata (product-defined tags). */
   extractMetadata?: (req: any) => Record<string, unknown> | undefined;
+  /**
+   * Optional outcome of the request (used by OUTCOME_BASED pricing, which bills
+   * each event at the weight set for its status). Events without a status bill
+   * at full price. Trimmed and upper-cased by the SDK; blank is treated as absent.
+   * Accepted values: SUCCESS, PARTIAL, TIMEOUT, ERROR, VALIDATION_FAILED, FAILED,
+   * FAILURE, CANCELLED, PENDING, BLOCKED, HITL_REQUIRED (max 20 chars). Any other
+   * value — or a Promise from an async resolver — is reported through `onError`
+   * and left off the event (the event is still sent), because the server would
+   * reject the event.
+   *
+   * This is the outcome of the CONNECTION: it is set on the closing event only
+   * (CONNECTION_CLOSED, and the synthetic close emitted on a socket error).
+   * CONNECTION_OPENED and per-frame MESSAGE events never carry it, so a status
+   * meant for the connection (e.g. ERROR on an abnormal close) can't zero out
+   * every frame under OUTCOME_BASED pricing. WebSocket frames carry no
+   * success/failure signal, so the SDK never derives one: pass a fixed string,
+   * or a synchronous function called with the closing event (and the upgrade
+   * request) that returns the status or undefined.
+   */
+  executionStatus?: string | ((event: WsUsageEvent, req: any) => string | undefined);
   /** Product type for connections accepted by this server. Default: the client-level `productType`. */
   productType?: string;
 }
+
+/** Options for trackConnection(). */
+export interface TrackConnectionOptions {
+  customerId: string;
+  metadata?: Record<string, unknown>;
+  /**
+   * Optional outcome of the request (used by OUTCOME_BASED pricing, which bills
+   * each event at the weight set for its status). Events without a status bill
+   * at full price. Trimmed and upper-cased by the SDK; blank is treated as absent.
+   * Accepted values: SUCCESS, PARTIAL, TIMEOUT, ERROR, VALIDATION_FAILED, FAILED,
+   * FAILURE, CANCELLED, PENDING, BLOCKED, HITL_REQUIRED (max 20 chars). Any other
+   * value — or a Promise from an async resolver — is reported through `onError`
+   * and left off the event (the event is still sent), because the server would
+   * reject the event.
+   *
+   * The outcome of the connection, set on its closing event only
+   * (CONNECTION_CLOSED, or the synthetic close on a socket error) — never on
+   * CONNECTION_OPENED or per-frame events. Never derived by the SDK: pass a
+   * fixed string, or a synchronous function called with the closing event that
+   * returns the status or undefined.
+   */
+  executionStatus?: string | ((event: WsUsageEvent) => string | undefined);
+  /** Product type for this connection's events (trimmed + uppercased). Default: the client-level `productType`. */
+  productType?: string;
+}
+
+type ExecutionStatusOption = TrackConnectionOptions['executionStatus'];
 
 /** Minimal WebSocket surface — matches `ws` WebSocket, Fastify socket, Deno, Bun. */
 interface MinimalWs {
@@ -73,7 +139,7 @@ interface MinimalWss {
   on(event: 'connection', fn: (ws: MinimalWs, req: any) => void): void;
 }
 
-const SDK_VERSION = '1.0.0';
+const SDK_VERSION = '1.2.1';
 /** Default top-level `productType` for this SDK. */
 export const DEFAULT_PRODUCT_TYPE = 'WEBSOCKET_API';
 /** Upper bound on a server-requested Retry-After wait. */
@@ -83,6 +149,7 @@ const MAX_BATCH_EVENTS = 1000;
 /** usage-ingestor limits (IngestUsageEventRequest). */
 const MAX_CUSTOMER_ID = 64;
 const MAX_IDEMPOTENCY_KEY = 255;
+const MAX_PRODUCT_TYPE = 20;
 
 // Close reason code → descriptor enum label
 const CLOSE_REASONS: Record<number, string> = {
@@ -100,7 +167,7 @@ const CLOSE_REASONS: Record<number, string> = {
   4000: 'IDLE_TIMEOUT',       // common app-level range
 };
 
-interface WsUsageEvent {
+export interface WsUsageEvent {
   customerId: string;
   metricName: string;
   quantity: number;
@@ -115,6 +182,8 @@ interface WsUsageEvent {
   dataBytes: number;
   executionDurationMs: number;
   metadata?: Record<string, unknown>;
+  /** Normalized (trimmed, upper-cased) execution status; omitted when not set. */
+  executionStatus?: string;
 }
 
 export class AforoWsBilling {
@@ -127,8 +196,13 @@ export class AforoWsBilling {
   private readonly perFrameEvents: boolean;
   private readonly onError: (error: Error) => void;
 
+  private readonly onDrop?: (events: WsUsageEvent[], reason: DropReason) => void;
+
   private buffer: WsUsageEvent[] = [];
   private flushTimer: ReturnType<typeof setInterval> | null = null;
+  private dropped = 0;
+  /** Invalid-event count per field, for WARN throttling. */
+  private readonly invalidSeen = new Map<string, number>();
 
   constructor(config: AforoWsConfig) {
     this.config = {
@@ -142,6 +216,7 @@ export class AforoWsBilling {
     this.flushIntervalMs = config.flushIntervalMs ?? 3000;
     this.perFrameEvents = config.perFrameEvents ?? false;
     this.onError = config.onError ?? ((err) => console.error('[aforo-ws]', err.message));
+    this.onDrop = config.onDrop;
     this.startTimer();
   }
 
@@ -151,20 +226,23 @@ export class AforoWsBilling {
       const customerId = options.extractCustomerId(req);
       if (!customerId || !customerId.trim()) return; // no customer resolved → skip metering
       const metadata = options.extractMetadata?.(req);
-      this.trackConnection(ws, { customerId, metadata, productType: options.productType });
+      const status = options.executionStatus;
+      this.trackConnection(ws, {
+        customerId,
+        metadata,
+        executionStatus: typeof status === 'function' ? (event) => status(event, req) : status,
+        productType: options.productType,
+      });
     });
   }
 
   /** Track a single WebSocket connection. Returns an unsubscribe function. */
   trackConnection(
     ws: MinimalWs,
-    opts: { customerId: string; metadata?: Record<string, unknown>; productType?: string }
+    opts: TrackConnectionOptions
   ): () => void {
-    if (!opts.customerId || !opts.customerId.trim()) return () => {};
-    if (opts.customerId.length > MAX_CUSTOMER_ID) {
-      this.onError(new Error(`WebSocket metering: customerId longer than ${MAX_CUSTOMER_ID} chars; connection not metered`));
-      return () => {};
-    }
+    // No customer resolved — the connection is not billable, not a drop.
+    if (typeof opts.customerId !== 'string' || !opts.customerId.trim()) return () => {};
     const connectionId = randomUUID();
     const productType = normalizeProductType(opts.productType) ?? this.productType;
     const start = Date.now();
@@ -227,6 +305,8 @@ export class AforoWsBilling {
       return origSend(data, cb);
     };
 
+    // opts.executionStatus is the connection's outcome: only the closing events
+    // below carry it (same as the Python SDK), never OPENED or per-frame events.
     ws.on('close', (code: number) => {
       // Emit CONNECTION_CLOSED with aggregated counters — this is the billing anchor.
       this.push({
@@ -248,7 +328,7 @@ export class AforoWsBilling {
           recvBytes,
           closeCode: code,
         },
-      });
+      }, opts.executionStatus);
     });
 
     ws.on('error', (err: Error) => {
@@ -263,7 +343,7 @@ export class AforoWsBilling {
         dataBytes: sentBytes + recvBytes,
         executionDurationMs: Date.now() - start,
         metadata: { ...(opts.metadata ?? {}), event: 'CONNECTION_ERROR', error: err.message },
-      });
+      }, opts.executionStatus);
     });
 
     return () => {
@@ -271,7 +351,10 @@ export class AforoWsBilling {
     };
   }
 
-  private push(partial: Omit<WsUsageEvent, 'metricName' | 'quantity' | 'occurredAt' | 'idempotencyKey'>): void {
+  private push(
+    partial: Omit<WsUsageEvent, 'metricName' | 'quantity' | 'occurredAt' | 'idempotencyKey' | 'executionStatus'>,
+    executionStatus?: ExecutionStatusOption
+  ): void {
     const now = new Date();
     const event: WsUsageEvent = {
       ...partial,
@@ -280,7 +363,8 @@ export class AforoWsBilling {
         : 'websocket_api.message',
       quantity: 1,
       occurredAt: now.toISOString(),
-      // Tail-trimmed to the ingestor's limit, keeping the unique millis:random suffix.
+      // Minted once, here. SDK-generated; tail-trimmed to the ingestor's limit,
+      // keeping the unique millis:random suffix.
       idempotencyKey: `ws:${this.config.tenantId}:${partial.wsConnectionId}:${partial.wsFrameType}:${now.getTime()}:${randomSuffix()}`.slice(-MAX_IDEMPOTENCY_KEY),
       metadata: {
         ...(partial.metadata ?? {}),
@@ -288,6 +372,21 @@ export class AforoWsBilling {
         productId: this.config.productId,
       },
     };
+    const checked = checkExecutionStatus(resolveExecutionStatus(executionStatus, event));
+    if (checked.problem) this.reportError(new Error(`[aforo-ws] ${checked.problem}`));
+    if (checked.status) event.executionStatus = checked.status;
+
+    // An event the ingestor would reject is not sent (one bad event fails its
+    // whole batch): it is dropped here with reason 'invalid', never thrown
+    // into the socket handlers.
+    const invalid =
+      tooLong('customerId', event.customerId, MAX_CUSTOMER_ID) ??
+      tooLong('productType', event.productType, MAX_PRODUCT_TYPE);
+    if (invalid) {
+      this.recordInvalid(event, invalid);
+      return;
+    }
+
     this.buffer.push(event);
     if (this.buffer.length >= this.flushCount) {
       void this.flush();
@@ -309,9 +408,11 @@ export class AforoWsBilling {
     const maxRetries = 3;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      let delayMs = Math.pow(2, attempt - 1) * 1000;
+      let delayMs = Math.pow(2, attempt - 1) * 1000; // 1s, 2s, 4s
+      let res: Response | undefined;
+      let networkError: Error | undefined;
       try {
-        const res = await fetch(this.config.ingestorUrl.replace(/\/$/, '') + '/v1/ingest/batch', {
+        res = await fetch(this.config.ingestorUrl.replace(/\/$/, '') + '/v1/ingest/batch', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -320,32 +421,106 @@ export class AforoWsBilling {
           },
           body,
         });
+      } catch (err) {
+        networkError = err as Error;
+      }
+
+      if (res) {
         if (res.ok) {
-          await this.reportPartialFailures(res);
+          await this.handlePartialFailures(res, batch);
           return;
         }
         if (!isRetryableStatus(res.status)) {
-          const { details } = await readErrorMessages(res);
-          this.onError(new Error(`WebSocket metering batch rejected with HTTP ${res.status}${details ? ` — ${details}` : ''} (dropped ${batch.length} events, not retried)`));
+          // 4xx other than 408/429: the same body would be refused again.
+          const { details } = await readBatchResult(res, batch.length);
+          this.recordDrop(batch, 'rejected');
+          this.reportError(new Error(`WebSocket metering batch rejected with HTTP ${res.status}${details ? ` — ${details}` : ''} (dropped ${batch.length} events, not retried)`));
           return;
         }
         delayMs = parseRetryAfter(res) ?? delayMs;
-      } catch (err) {
-        if (attempt === maxRetries) {
-          this.onError(err as Error);
-          return;
-        }
+      } else if (attempt === maxRetries) {
+        this.recordDrop(batch, 'retry_exhausted');
+        this.reportError(networkError ?? new Error('WebSocket metering request failed'));
+        return;
       }
       if (attempt < maxRetries) await sleep(delayMs);
     }
-    this.onError(new Error(`WebSocket metering flush failed after ${maxRetries} attempts (dropped ${batch.length} events)`));
+    // Not re-queued: dropping avoids unbounded memory growth.
+    this.recordDrop(batch, 'retry_exhausted');
+    this.reportError(new Error(`WebSocket metering flush failed after ${maxRetries} attempts (dropped ${batch.length} events)`));
   }
 
-  /** A 202 can still carry per-event rejections: `{accepted, duplicates, failed, errors:[{index, message}]}`. */
-  private async reportPartialFailures(res: Response): Promise<void> {
-    const { failed, details } = await readErrorMessages(res);
-    if (failed && failed > 0) {
-      this.onError(new Error(`Aforo ingestor rejected ${failed} event(s)${details ? ` — ${details}` : ''}`));
+  /**
+   * A 2xx can still carry per-event rejections:
+   * `{accepted, duplicates, failed, errors:[{index, message}]}`. Events the
+   * response names by index are dropped with reason 'rejected'; a `failed`
+   * count the response does not attribute to an index is counted only.
+   */
+  private async handlePartialFailures(res: Response, batch: WsUsageEvent[]): Promise<void> {
+    const { failed, details, indexes } = await readBatchResult(res, batch.length);
+    if (failed <= 0) return;
+    if (indexes.length > 0) this.recordDrop(indexes.map((i) => batch[i]), 'rejected');
+    const unattributed = Math.min(failed, batch.length) - indexes.length;
+    if (unattributed > 0) {
+      this.dropped += unattributed;
+      console.warn(
+        `[aforo-ws] Dropped ${unattributed} event(s) — rejected, not identified by the ingestor (${this.dropped} total dropped).`,
+      );
+    }
+    this.reportError(new Error(`Aforo ingestor rejected ${failed} event(s)${details ? ` — ${details}` : ''}`));
+  }
+
+  /** Invoke onError; a hook bug must never break metering or flushing. */
+  private reportError(err: Error): void {
+    try {
+      this.onError(err);
+    } catch {
+      // ignore
+    }
+  }
+
+  /** Number of events permanently dropped since this instance was created. */
+  get droppedCount(): number {
+    return this.dropped;
+  }
+
+  /**
+   * Account for permanently lost events: bump the counter, WARN-log, and
+   * invoke the opt-in onDrop hook. The buffer is drained at flush start, so
+   * drops here are bounded by flush cadence — no log throttle needed.
+   */
+  private recordDrop(events: WsUsageEvent[], reason: DropReason): void {
+    this.dropped += events.length;
+    console.warn(
+      `[aforo-ws] Dropped ${events.length} event(s) — ${reason} (${this.dropped} total dropped).`,
+    );
+    this.notifyDrop(events, reason);
+  }
+
+  /**
+   * Account for an event that failed a client-side check: never buffered,
+   * never sent. Runs on the hot path, so the WARN is throttled per field
+   * (first occurrence, then every 1000th).
+   */
+  private recordInvalid(event: WsUsageEvent, invalid: InvalidField): void {
+    this.dropped += 1;
+    const seen = (this.invalidSeen.get(invalid.field) ?? 0) + 1;
+    this.invalidSeen.set(invalid.field, seen);
+    if (seen === 1 || seen % 1000 === 0) {
+      console.warn(
+        `[aforo-ws] Dropped 1 event — invalid: ${invalid.problem} ` +
+          `(${seen} for ${invalid.field}, ${this.dropped} total dropped).`,
+      );
+    }
+    this.notifyDrop([event], 'invalid');
+  }
+
+  private notifyDrop(events: WsUsageEvent[], reason: DropReason): void {
+    if (!this.onDrop) return;
+    try {
+      this.onDrop(events, reason);
+    } catch {
+      // A hook bug must never break metering or flushing.
     }
   }
 
@@ -353,12 +528,10 @@ export class AforoWsBilling {
     if (this.flushTimer) return;
     this.flushTimer = setInterval(() => { void this.flush(); }, this.flushIntervalMs);
     // Unref so the background timer never blocks host-process exit (final flush still needs shutdown()).
-    if (this.flushTimer && typeof this.flushTimer === 'object' && 'unref' in this.flushTimer) {
-      this.flushTimer.unref();
-    }
     if (typeof (this.flushTimer as any).unref === 'function') (this.flushTimer as any).unref();
   }
 
+  /** Flush any buffered events and stop the background timer. Call before process exit. */
   async shutdown(): Promise<void> {
     if (this.flushTimer) {
       clearInterval(this.flushTimer);
@@ -379,11 +552,74 @@ function estimateBytes(data: any): number {
   return 0;
 }
 
+/** Statuses the Aforo ingestor accepts (contract/ingest-contract.json, max 20 chars). */
+const CANONICAL_EXECUTION_STATUSES: ReadonlySet<string> = new Set([
+  'SUCCESS', 'PARTIAL', 'TIMEOUT', 'ERROR', 'VALIDATION_FAILED', 'FAILED',
+  'FAILURE', 'CANCELLED', 'PENDING', 'BLOCKED', 'HITL_REQUIRED',
+]);
+
+/**
+ * Check a caller-supplied status. `{ status }` when canonical; `{ problem }`
+ * when it has to be left off the event (an unknown value would make the
+ * ingestor reject the event; a Promise from an async resolver can't be
+ * awaited on this path); `{}` when blank or absent.
+ */
+function checkExecutionStatus(value: unknown): { status?: string; problem?: string } {
+  if (value !== null && typeof value === 'object' && typeof (value as any).then === 'function') {
+    // Swallow a later rejection so it doesn't surface as an unhandled rejection.
+    (value as PromiseLike<unknown>).then(undefined, () => {});
+    return { problem: 'executionStatus resolver returned a Promise — resolvers must be synchronous; field omitted' };
+  }
+  const status = normalizeExecutionStatus(value);
+  if (!status) return {};
+  if (!CANONICAL_EXECUTION_STATUSES.has(status)) {
+    return {
+      problem: `unknown executionStatus "${status.slice(0, 40)}" — field omitted. ` +
+        `Expected one of: ${[...CANONICAL_EXECUTION_STATUSES].join(', ')}`,
+    };
+  }
+  return { status };
+}
+
+/** Trim + upper-case; blank/absent → undefined (key omitted from the wire body). */
+function normalizeExecutionStatus(value?: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed.toUpperCase() : undefined;
+}
+
+function resolveExecutionStatus(option: ExecutionStatusOption, event: WsUsageEvent): unknown {
+  if (typeof option !== 'function') return option;
+  try {
+    return option(event);
+  } catch {
+    return undefined; // a resolver bug must never break metering
+  }
+}
+
 /** Trim + uppercase a product type; blank/non-string → undefined (unknown values pass through). */
 function normalizeProductType(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
   return trimmed ? trimmed.toUpperCase() : undefined;
+}
+
+/** A client-side check an event failed: which field, and a message naming the limit and the value. */
+interface InvalidField {
+  field: string;
+  problem: string;
+}
+
+/** The offending value for a WARN line, cut to 80 chars. */
+function preview(value: unknown): string {
+  const text = typeof value === 'string' ? value : String(value);
+  return JSON.stringify(text.length > 80 ? `${text.slice(0, 80)}…` : text);
+}
+
+/** Limits mirror the ingestor's IngestUsageEventRequest; over-limit values are never truncated. */
+function tooLong(field: string, value: unknown, max: number): InvalidField | undefined {
+  if (typeof value !== 'string' || value.length <= max) return undefined;
+  return { field, problem: `${field} is ${value.length} chars, limit ${max}: ${preview(value)}` };
 }
 
 /** Network errors, 408, 429 and 5xx are transient; every other 4xx (400/401/403/422...) is not. */
@@ -402,17 +638,33 @@ function parseRetryAfter(res: Response): number | undefined {
   return undefined;
 }
 
-/** Reads the ingestor's `errors[].message` entries (first 5) from a response body, if any. */
-async function readErrorMessages(res: Response): Promise<{ failed?: number; details: string }> {
-  if (typeof (res as any)?.json !== 'function') return { details: '' };
+/**
+ * Reads the ingestor's batch response body, if any: the `failed` count, the
+ * first 5 `errors[].message` entries, and the batch indexes `errors[]` names.
+ */
+async function readBatchResult(
+  res: Response,
+  batchSize: number,
+): Promise<{ failed: number; details: string; indexes: number[] }> {
+  const none = { failed: 0, details: '', indexes: [] };
+  if (typeof (res as any)?.json !== 'function') return none;
   try {
-    const body: any = await res.json();
-    const details = Array.isArray(body?.errors)
-      ? body.errors.slice(0, 5).map((e: any) => `#${e?.index}: ${e?.message}`).join('; ')
+    const body: any = unwrapEnvelope(await res.json());
+    const errors: any[] | undefined = Array.isArray(body?.errors) ? body.errors : undefined;
+    const details = errors
+      ? errors.slice(0, 5).map((e: any) => `#${e?.index}: ${e?.message}`).join('; ')
       : typeof body?.message === 'string' ? body.message : '';
-    return { failed: typeof body?.failed === 'number' ? body.failed : undefined, details };
+    const indexes = [
+      ...new Set(
+        (errors ?? [])
+          .map((e: any) => e?.index)
+          .filter((i: unknown): i is number => Number.isInteger(i) && (i as number) >= 0 && (i as number) < batchSize),
+      ),
+    ].sort((a, b) => a - b);
+    const failed = typeof body?.failed === 'number' && body.failed > 0 ? body.failed : 0;
+    return { failed, details, indexes };
   } catch {
-    return { details: '' }; // Non-JSON or empty body — nothing to report.
+    return none; // Non-JSON or empty body — nothing to report.
   }
 }
 
@@ -425,3 +677,12 @@ function sleep(ms: number): Promise<void> {
 }
 
 export const WS_CLOSE_REASONS = CLOSE_REASONS;
+
+/**
+ * The ingestor wraps every 2xx JSON body in `{success, data, meta}`. Returns
+ * the inner `data` object when present, else the body unchanged (bare shape).
+ */
+function unwrapEnvelope(body: any): any {
+  const data = body && typeof body === 'object' && !Array.isArray(body) ? body.data : undefined;
+  return data && typeof data === 'object' && !Array.isArray(data) ? data : body;
+}

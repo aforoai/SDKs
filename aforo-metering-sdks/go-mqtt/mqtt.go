@@ -14,10 +14,35 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-const sdkVersion = "1.0.0"
+const sdkVersion = "1.2.2"
+
+// Ingestor limits for the MQTT fields (IngestUsageEventRequest @Size).
+const (
+	maxMqttTopicLen    = 500
+	maxMqttClientIDLen = 128
+)
+
+// DropReason describes why a buffered batch was permanently dropped.
+// The buffer is unbounded (drained at flush start), so unlike the core SDK
+// there is no overflow reason here.
+type DropReason string
+
+const (
+	// DropRetryExhausted — the batch failed after all transport retries.
+	DropRetryExhausted DropReason = "retry_exhausted"
+	// DropRejected — the ingestor answered a non-retryable 4xx, refused the
+	// event individually in a 2xx partial-failure response, or the batch
+	// could not be serialized.
+	DropRejected DropReason = "rejected"
+	// DropInvalid — the event failed client-side validation (a required field
+	// was blank or a field exceeded the ingestor's limit) and was never
+	// buffered.
+	DropInvalid DropReason = "invalid"
+)
 
 type Config struct {
 	TenantID          string
@@ -30,6 +55,13 @@ type Config struct {
 	FlushInterval     time.Duration // default 2s
 	HTTPClient        *http.Client
 	OnError           func(error)
+	// OnDrop is an OPT-IN hook invoked with events the SDK is about to lose
+	// permanently (retry exhaustion, a rejection by the ingestor, or
+	// client-side validation — see DropReason). Events keep
+	// their idempotency keys, so re-submitting them after recovery is
+	// dedup-safe. Default: nil (drops are still counted in DroppedCount()
+	// and WARN-logged). Panics in the hook are recovered.
+	OnDrop func(events []map[string]any, reason DropReason)
 }
 
 type Billing struct {
@@ -37,10 +69,19 @@ type Billing struct {
 	url    string
 	client *http.Client
 
-	mu     sync.Mutex
-	buffer []map[string]any
-	stop   chan struct{}
-	wg     sync.WaitGroup
+	mu       sync.Mutex
+	buffer   []map[string]any
+	stop     chan struct{}
+	stopOnce sync.Once
+	dropped  atomic.Int64
+	// invalidDrops throttles the DropInvalid WARN log.
+	invalidDrops atomic.Int64
+	// truncWarned holds the label names already WARN-logged as truncated.
+	truncWarned sync.Map
+	// retryBackoffBase is the exponential-backoff base (default 1s) —
+	// package-private so tests can skip real sleeps.
+	retryBackoffBase time.Duration
+	wg               sync.WaitGroup
 }
 
 func New(cfg Config) (*Billing, error) {
@@ -64,10 +105,11 @@ func New(cfg Config) (*Billing, error) {
 		cfg.OnError = func(err error) {}
 	}
 	b := &Billing{
-		cfg:    cfg,
-		url:    strings.TrimRight(cfg.IngestorURL, "/") + "/v1/ingest/batch",
-		client: cfg.HTTPClient,
-		stop:   make(chan struct{}),
+		cfg:              cfg,
+		url:              strings.TrimRight(cfg.IngestorURL, "/") + "/v1/ingest/batch",
+		client:           cfg.HTTPClient,
+		stop:             make(chan struct{}),
+		retryBackoffBase: time.Second,
 	}
 	b.wg.Add(1)
 	go b.flushLoop()
@@ -75,10 +117,22 @@ func New(cfg Config) (*Billing, error) {
 }
 
 // Per-event recording methods — wrap these around your MQTT client API.
-// Each accepts an optional EventOptions to override the event's productType.
+// Each accepts optional EventOptions (productType override, explicit
+// ExecutionStatus) and has a *WithOptions form taking a single EventOptions.
+//
+// A blank customerID is not metered. An event the ingestor would refuse (blank
+// topic on a topic event, a field over its limit) is not buffered: it is
+// counted in DroppedCount(), WARN-logged and handed to OnDrop with DropInvalid.
+// topic and clientID are the exception: they originate from the MQTT client,
+// so a topic over 500 or a client id over 128 characters is truncated and the
+// event is still sent.
 
 func (b *Billing) RecordPublish(customerID, clientID, topic string, qos int, retained bool, payloadBytes int64, opts ...EventOptions) {
 	b.push(b.eventOf(customerID, clientID, "PUBLISH", topic, qos, retained, payloadBytes, opts))
+}
+
+func (b *Billing) RecordPublishWithOptions(customerID, clientID, topic string, qos int, retained bool, payloadBytes int64, opts EventOptions) {
+	b.RecordPublish(customerID, clientID, topic, qos, retained, payloadBytes, opts)
 }
 
 func (b *Billing) RecordDeliver(customerID, clientID, topic string, qos int, retained bool, payloadBytes int64, opts ...EventOptions) {
@@ -88,20 +142,40 @@ func (b *Billing) RecordDeliver(customerID, clientID, topic string, qos int, ret
 	b.push(b.eventOf(customerID, clientID, "DELIVER", topic, qos, retained, payloadBytes, opts))
 }
 
+func (b *Billing) RecordDeliverWithOptions(customerID, clientID, topic string, qos int, retained bool, payloadBytes int64, opts EventOptions) {
+	b.RecordDeliver(customerID, clientID, topic, qos, retained, payloadBytes, opts)
+}
+
 func (b *Billing) RecordSubscribe(customerID, clientID, topicFilter string, qos int, opts ...EventOptions) {
 	b.push(b.eventOf(customerID, clientID, "SUBSCRIBE", topicFilter, qos, false, 0, opts))
+}
+
+func (b *Billing) RecordSubscribeWithOptions(customerID, clientID, topicFilter string, qos int, opts EventOptions) {
+	b.RecordSubscribe(customerID, clientID, topicFilter, qos, opts)
 }
 
 func (b *Billing) RecordUnsubscribe(customerID, clientID, topicFilter string, opts ...EventOptions) {
 	b.push(b.eventOf(customerID, clientID, "UNSUBSCRIBE", topicFilter, 0, false, 0, opts))
 }
 
+func (b *Billing) RecordUnsubscribeWithOptions(customerID, clientID, topicFilter string, opts EventOptions) {
+	b.RecordUnsubscribe(customerID, clientID, topicFilter, opts)
+}
+
 func (b *Billing) RecordConnect(customerID, clientID string, opts ...EventOptions) {
 	b.push(b.eventOf(customerID, clientID, "CONNECT", "", 0, false, 0, opts))
 }
 
+func (b *Billing) RecordConnectWithOptions(customerID, clientID string, opts EventOptions) {
+	b.RecordConnect(customerID, clientID, opts)
+}
+
 func (b *Billing) RecordDisconnect(customerID, clientID string, opts ...EventOptions) {
 	b.push(b.eventOf(customerID, clientID, "DISCONNECT", "", 0, false, 0, opts))
+}
+
+func (b *Billing) RecordDisconnectWithOptions(customerID, clientID string, opts EventOptions) {
+	b.RecordDisconnect(customerID, clientID, opts)
 }
 
 func (b *Billing) eventOf(customerID, clientID, eventType, topic string, qos int, retained bool, bytesAmt int64, opts []EventOptions) map[string]any {
@@ -109,28 +183,31 @@ func (b *Billing) eventOf(customerID, clientID, eventType, topic string, qos int
 	if customerID == "" {
 		return nil
 	}
-	if len(customerID) > 64 {
-		b.cfg.OnError(fmt.Errorf("mqttmetering: customerId longer than 64 chars, event dropped"))
-		return nil
-	}
-	if topic == "" {
+	invalid := ""
+	if strings.TrimSpace(topic) == "" {
 		switch eventType {
 		case "CONNECT", "DISCONNECT":
 			// mqttTopic is required for MQTT_BROKER events; session events have
 			// no topic, so use the broker-style $SYS client topic.
 			topic = fmt.Sprintf("$SYS/clients/%s/%s", clientID, strings.ToLower(eventType)+"ed")
 		default:
-			b.cfg.OnError(fmt.Errorf("mqttmetering: empty topic on %s, event dropped", eventType))
-			return nil
+			invalid = fmt.Sprintf("mqttTopic is required on %s (got %q)", eventType, truncate(topic, 80))
 		}
 	}
 	now := time.Now().UTC()
+	// The key is built from the full topic and client id, before truncation.
+	key := idempotencyKeyFor(b.cfg.TenantID, clientID, eventType, topic, now.UnixMilli(), randomSuffix())
+	// Topic and client id always originate from the MQTT client's message
+	// (integration code only hands them on), so they are truncated to the
+	// ingestor's limits instead of dropping the event.
+	topic = b.truncateLabel("mqttTopic", topic, maxMqttTopicLen)
+	clientID = b.truncateLabel("mqttClientId", clientID, maxMqttClientIDLen)
 	e := map[string]any{
 		"customerId":     customerID,
 		"metricName":     "mqtt_broker." + strings.ToLower(eventType),
 		"quantity":       1,
 		"occurredAt":     now.Format(time.RFC3339Nano),
-		"idempotencyKey": capKey(fmt.Sprintf("mqtt:%s:%s:%s:%s:%d:%s", b.cfg.TenantID, clientID, eventType, topic, now.UnixMilli(), randomSuffix())),
+		"idempotencyKey": key,
 		"productType":    b.productTypeFor(opts),
 		"mqttTopic":      topic,
 		"mqttRetained":   retained,
@@ -146,6 +223,27 @@ func (b *Billing) eventOf(customerID, clientID, eventType, topic string, qos int
 	// ingestor reject the event.
 	if qos >= 0 && qos <= 2 {
 		e["mqttQos"] = qos
+	}
+	withExecutionStatus(e, executionStatusFor(opts))
+	// An event the ingestor would refuse is dropped here (DropInvalid)
+	// instead of failing server-side unseen. customerId and productType are
+	// never truncated.
+	if invalid == "" {
+		for _, c := range []struct {
+			field, value string
+			max          int
+		}{
+			{"customerId", customerID, maxCustomerIDLen},
+			{"productType", e["productType"].(string), maxProductTypeLen},
+		} {
+			if invalid = tooLong(c.field, c.value, c.max); invalid != "" {
+				break
+			}
+		}
+	}
+	if invalid != "" {
+		b.dropInvalid(e, invalid)
+		return nil
 	}
 	return e
 }
@@ -178,41 +276,18 @@ func (b *Billing) flushLoop() {
 	}
 }
 
-// maxBatchSize is the ingestor's per-request cap on POST /v1/ingest/batch.
-const maxBatchSize = 1000
-
-func (b *Billing) flush() {
-	b.mu.Lock()
-	if len(b.buffer) == 0 {
-		b.mu.Unlock()
-		return
-	}
-	batch := b.buffer
-	b.buffer = nil
-	b.mu.Unlock()
-
-	for start := 0; start < len(batch); start += maxBatchSize {
-		end := start + maxBatchSize
-		if end > len(batch) {
-			end = len(batch)
-		}
-		b.send(batch[start:end])
-	}
-}
-
 func (b *Billing) Shutdown() error {
-	close(b.stop)
+	b.stopOnce.Do(func() { close(b.stop) })
 	b.wg.Wait()
 	return nil
 }
 
-// capKey keeps idempotency keys within the ingestor's 255-char limit (topics
-// can be up to 500 chars). The unique tail (millis + random suffix) is kept.
-func capKey(k string) string {
-	if len(k) > 255 {
-		return k[len(k)-255:]
-	}
-	return k
+// idempotencyKeyFor returns
+// "mqtt:<tenant>:<clientId>:<eventType>:<topic>:<millis>:<suffix>". A topic can
+// be 500 characters, so the key can exceed the ingestor's 255; see boundedKey
+// for what happens then (the topic is digested, the key is never cut).
+func idempotencyKeyFor(tenantID, clientID, eventType, topic string, millis int64, suffix string) string {
+	return boundedKey(fmt.Sprintf("mqtt:%s:%s:%s:", tenantID, clientID, eventType), topic, fmt.Sprintf(":%d:%s", millis, suffix))
 }
 
 var alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"

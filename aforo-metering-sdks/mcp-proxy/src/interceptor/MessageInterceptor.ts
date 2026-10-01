@@ -4,7 +4,7 @@
  * detects tool calls and their responses, delegates to ToolCallTracker.
  */
 
-import type { JsonRpcMessage, JsonRpcRequest, JsonRpcResponse } from '../types.js';
+import type { JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse } from '../types.js';
 import { logger } from '../util/logger.js';
 
 /** Methods we meter (bill for tool invocations) */
@@ -36,7 +36,12 @@ export interface ParsedToolCall {
 
 export interface ParsedToolResponse {
   requestId: string | number;
+  /** A JSON-RPC error response (the call failed at the protocol level). */
   hasError: boolean;
+  /** The JSON-RPC `result` — a tool reports its own failure with `isError: true` here. */
+  result?: unknown;
+  /** The JSON-RPC `error` object, when present. */
+  error?: JsonRpcError;
   responseBytes: number;
 }
 
@@ -90,6 +95,8 @@ export function extractToolResponse(msg: JsonRpcResponse, rawBytes: number): Par
   return {
     requestId: msg.id,
     hasError: msg.error != null,
+    result: msg.result,
+    error: msg.error ?? undefined,
     responseBytes: rawBytes,
   };
 }

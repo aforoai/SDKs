@@ -18,7 +18,25 @@ import (
 	"time"
 )
 
-const sdkVersion = "1.0.0"
+const sdkVersion = "1.2.1"
+
+// DropReason describes why a buffered batch was permanently dropped.
+// The buffer is unbounded (drained at flush start), so unlike the core SDK
+// there is no overflow reason here.
+type DropReason string
+
+const (
+	// DropRetryExhausted — the batch failed after all transport retries.
+	DropRetryExhausted DropReason = "retry_exhausted"
+	// DropRejected — the ingestor answered a non-retryable 4xx, refused the
+	// event individually in a 2xx partial-failure response, or the batch
+	// could not be serialized.
+	DropRejected DropReason = "rejected"
+	// DropInvalid — the event failed client-side validation (a required field
+	// was blank or a field exceeded the ingestor's limit) and was never
+	// buffered.
+	DropInvalid DropReason = "invalid"
+)
 
 type Config struct {
 	TenantID       string
@@ -31,6 +49,13 @@ type Config struct {
 	FlushInterval  time.Duration // default 3s
 	HTTPClient     *http.Client
 	OnError        func(error)
+	// OnDrop is an OPT-IN hook invoked with events the SDK is about to lose
+	// permanently (retry exhaustion, a rejection by the ingestor, or
+	// client-side validation — see DropReason). Events keep
+	// their idempotency keys, so re-submitting them after recovery is
+	// dedup-safe. Default: nil (drops are still counted in DroppedCount()
+	// and WARN-logged). Panics in the hook are recovered.
+	OnDrop func(events []map[string]any, reason DropReason)
 }
 
 type Billing struct {
@@ -42,7 +67,14 @@ type Billing struct {
 	mu          sync.Mutex
 	buffer      []map[string]any
 	stop        chan struct{}
-	wg          sync.WaitGroup
+	stopOnce    sync.Once
+	dropped     atomic.Int64
+	// invalidDrops throttles the DropInvalid WARN log.
+	invalidDrops atomic.Int64
+	// retryBackoffBase is the exponential-backoff base (default 1s) —
+	// package-private so tests can skip real sleeps.
+	retryBackoffBase time.Duration
+	wg               sync.WaitGroup
 }
 
 type ConnectionState struct {
@@ -75,10 +107,11 @@ func New(cfg Config) (*Billing, error) {
 		cfg.OnError = func(err error) {}
 	}
 	b := &Billing{
-		cfg:    cfg,
-		url:    strings.TrimRight(cfg.IngestorURL, "/") + "/v1/ingest/batch",
-		client: cfg.HTTPClient,
-		stop:   make(chan struct{}),
+		cfg:              cfg,
+		url:              strings.TrimRight(cfg.IngestorURL, "/") + "/v1/ingest/batch",
+		client:           cfg.HTTPClient,
+		stop:             make(chan struct{}),
+		retryBackoffBase: time.Second,
 	}
 	b.wg.Add(1)
 	go b.flushLoop()
@@ -86,32 +119,59 @@ func New(cfg Config) (*Billing, error) {
 }
 
 // Open registers a new tracked WebSocket connection. Returns a connection ID
-// you must hold and pass to RecordFrame and Close. An optional EventOptions
-// overrides the productType of every event of this connection.
+// you must hold and pass to RecordFrame and Close. Optional EventOptions set
+// the productType of every event of this connection and the executionStatus
+// of the CONNECTION_OPENED event.
+//
+// A blank customerID is not metered ("" is returned). A customerID or
+// productType over the ingestor's limit is refused the same way and reported
+// through DroppedCount() / OnDrop with DropInvalid.
 func (b *Billing) Open(customerID string, metadata map[string]any, opts ...EventOptions) string {
 	customerID = strings.TrimSpace(customerID)
 	if customerID == "" {
 		return ""
 	}
-	if len(customerID) > 64 {
-		b.cfg.OnError(fmt.Errorf("wsmetering: customerId longer than 64 chars, connection not metered"))
-		return ""
+	productType := b.productTypeFor(opts)
+	for _, c := range []struct {
+		field, value string
+		max          int
+	}{
+		{"customerId", customerID, maxCustomerIDLen},
+		{"productType", productType, maxProductTypeLen},
+	} {
+		if msg := tooLong(c.field, c.value, c.max); msg != "" {
+			// The connection is not metered; the hook gets the fields known so far.
+			b.dropInvalid(map[string]any{"customerId": customerID, "productType": productType, "metadata": metadata}, msg+"; connection not metered")
+			return ""
+		}
 	}
 	connID := fmt.Sprintf("ws_%d_%s", time.Now().UnixNano(), randomSuffix())
 	state := &ConnectionState{
 		customerId:  customerID,
-		productType: b.productTypeFor(opts),
+		productType: productType,
 		startMs:     time.Now().UnixMilli(),
 		metadata:    metadata,
 	}
 	b.connections.Store(connID, state)
-	b.push(b.connEvent(state, connID, "PING", "SERVER_TO_CLIENT", 0, 0, 0, "", merge(metadata, map[string]any{"event": "CONNECTION_OPENED"})))
+	b.push(withExecutionStatus(b.connEvent(state, connID, "PING", "SERVER_TO_CLIENT", 0, 0, 0, "", merge(metadata, map[string]any{"event": "CONNECTION_OPENED"})), executionStatusFor(opts)))
 	return connID
+}
+
+// OpenWithOptions is Open with optional fields for the CONNECTION_OPENED event.
+func (b *Billing) OpenWithOptions(customerID string, metadata map[string]any, opts EventOptions) string {
+	return b.Open(customerID, metadata, opts)
 }
 
 // RecordFrame increments per-connection counters. Emits per-frame events
 // only when Config.PerFrameEvents is true.
 func (b *Billing) RecordFrame(connID, direction, frameType string, bytes int64) {
+	b.RecordFrameWithOptions(connID, direction, frameType, bytes, EventOptions{})
+}
+
+// RecordFrameWithOptions is RecordFrame with optional fields for the
+// per-frame event. The options are unused when Config.PerFrameEvents is off,
+// because no per-frame event is emitted then.
+func (b *Billing) RecordFrameWithOptions(connID, direction, frameType string, bytes int64, opts EventOptions) {
 	v, ok := b.connections.Load(connID)
 	if !ok {
 		return
@@ -120,8 +180,8 @@ func (b *Billing) RecordFrame(connID, direction, frameType string, bytes int64) 
 	s.frames.Add(1)
 	s.bytes.Add(bytes)
 	if b.cfg.PerFrameEvents {
-		b.push(b.connEvent(s, connID, frameType, direction, 1, bytes,
-			time.Now().UnixMilli()-s.startMs, "", s.metadata))
+		b.push(withExecutionStatus(b.connEvent(s, connID, frameType, direction, 1, bytes,
+			time.Now().UnixMilli()-s.startMs, "", s.metadata), opts.ExecutionStatus))
 	}
 }
 
@@ -129,6 +189,12 @@ func (b *Billing) RecordFrame(connID, direction, frameType string, bytes int64) 
 // with the aggregated counters. closeCode follows standard WebSocket codes
 // (1000 normal, 1006 abnormal, 1008 policy, 4xxx app-level → IDLE_TIMEOUT).
 func (b *Billing) Close(connID string, closeCode int) {
+	b.CloseWithOptions(connID, closeCode, EventOptions{})
+}
+
+// CloseWithOptions is Close with optional fields for the CONNECTION_CLOSED
+// event.
+func (b *Billing) CloseWithOptions(connID string, closeCode int, opts EventOptions) {
 	v, loaded := b.connections.LoadAndDelete(connID)
 	if !loaded {
 		return
@@ -142,8 +208,8 @@ func (b *Billing) Close(connID string, closeCode int) {
 		"bytes":     s.bytes.Load(),
 		"closeCode": closeCode,
 	})
-	b.push(b.connEvent(s, connID, "CLOSE", "SERVER_TO_CLIENT",
-		int(s.frames.Load()), s.bytes.Load(), durationMs, reason, meta))
+	b.push(withExecutionStatus(b.connEvent(s, connID, "CLOSE", "SERVER_TO_CLIENT",
+		int(s.frames.Load()), s.bytes.Load(), durationMs, reason, meta), opts.ExecutionStatus))
 }
 
 func (b *Billing) connEvent(s *ConnectionState, connID, frameType, direction string, frames int, bytesAmt, durationMs int64, closeReason string, metadata map[string]any) map[string]any {
@@ -234,30 +300,8 @@ func (b *Billing) flushLoop() {
 	}
 }
 
-// maxBatchSize is the ingestor's per-request cap on POST /v1/ingest/batch.
-const maxBatchSize = 1000
-
-func (b *Billing) flush() {
-	b.mu.Lock()
-	if len(b.buffer) == 0 {
-		b.mu.Unlock()
-		return
-	}
-	batch := b.buffer
-	b.buffer = nil
-	b.mu.Unlock()
-
-	for start := 0; start < len(batch); start += maxBatchSize {
-		end := start + maxBatchSize
-		if end > len(batch) {
-			end = len(batch)
-		}
-		b.send(batch[start:end])
-	}
-}
-
 func (b *Billing) Shutdown() error {
-	close(b.stop)
+	b.stopOnce.Do(func() { close(b.stop) })
 	b.wg.Wait()
 	return nil
 }

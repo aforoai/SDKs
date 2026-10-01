@@ -19,25 +19,46 @@ import (
 // may raise max-age-days to 365 for backfills — so enforcing the default here
 // would make the SDK refuse usage its own server would accept and bill.
 //
-// Nothing here truncates or rounds: that would change what is billed.
+// Nothing here truncates or rounds: that would change what is billed. The one
+// exception lives in the HTTP middleware (labels.go): endpointPath and
+// httpMethod, which it reads from the incoming request, are truncated to these
+// limits before Track is called, so an over-long request is still metered.
 const (
 	maxCustomerIDLen     = 64
 	maxMetricNameLen     = 255
 	maxIdempotencyKeyLen = 255
 	maxProductTypeLen    = 20
+	maxEndpointPathLen   = 512
+	maxHTTPMethodLen     = 16
 
 	// @Digits(integer = 14, fraction = 6) — usage_events.quantity is NUMERIC(20,6).
 	maxQuantityIntegerDigits = 14
 	maxQuantityDecimalPlaces = 6
 )
 
+// charLen counts UTF-16 code units, which is what the server's @Size counts
+// (Java String.length()). Counting bytes would refuse multi-byte values the
+// ingestor accepts.
+func charLen(value string) int {
+	n := 0
+	for _, r := range value {
+		if r > 0xFFFF {
+			n += 2
+		} else {
+			n++
+		}
+	}
+	return n
+}
+
 func lengthErr(field, value string, max int) error {
-	if len(value) <= max {
+	n := charLen(value)
+	if n <= max {
 		return nil
 	}
-	return fmt.Errorf("%w: %s is %d characters, exceeding the ingestor's %d-character limit; "+
-		"shorten it — the SDK will not truncate it, because a truncated id bills the wrong thing",
-		ErrInvalidEvent, field, len(value), max)
+	return fmt.Errorf("%w: %s is %d characters, exceeding the ingestor's %d-character limit "+
+		"(value %q); shorten it — the SDK will not truncate it, because a truncated id bills the wrong thing",
+		ErrInvalidEvent, field, n, max, truncateForLog(value))
 }
 
 // quantityErr counts digits as the server's BigDecimal will, working from the
@@ -73,7 +94,9 @@ func checkFieldLimits(event *TrackEvent) error {
 		{"CustomerID", event.CustomerID, maxCustomerIDLen},
 		{"MetricName", event.MetricName, maxMetricNameLen},
 		{"IdempotencyKey", event.IdempotencyKey, maxIdempotencyKeyLen},
-		{"ProductType", event.ProductType, maxProductTypeLen},
+		{"ProductType", strings.TrimSpace(event.ProductType), maxProductTypeLen},
+		{"EndpointPath", event.EndpointPath, maxEndpointPathLen},
+		{"HTTPMethod", event.HTTPMethod, maxHTTPMethodLen},
 	} {
 		if err := lengthErr(check.field, check.value, check.max); err != nil {
 			return err

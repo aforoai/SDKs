@@ -1,11 +1,18 @@
 """Aforo WebSocket Metering SDK."""
 
-from .client import AforoWsBilling, track_websockets_connection, track_starlette_websocket, WS_CLOSE_REASONS
+from .client import (
+    AforoWsBilling,
+    track_websockets_connection,
+    track_starlette_websocket,
+    WS_CLOSE_REASONS,
+    normalize_execution_status,
+)
 
 __all__ = [
     "AforoWsBilling",
     "track_websockets_connection",
     "track_starlette_websocket",
     "WS_CLOSE_REASONS",
+    "normalize_execution_status",
 ]
-__version__ = "1.0.0"
+__version__ = "1.2.1"

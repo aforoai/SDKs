@@ -154,6 +154,9 @@ async def test_CONNECTION_OPENED_and_CLOSED_on_real_websocket_roundtrip():
         assert closed["metadata"]["recvCount"] == 3
         assert closed["metadata"]["recvBytes"] == 7 + 8 + 5
         assert closed["executionDurationMs"] >= 0
+        # Explicit only: nothing was set, so no status on either event
+        assert "executionStatus" not in closed
+        assert "executionStatus" not in opened
 
         billing.shutdown()
     finally:

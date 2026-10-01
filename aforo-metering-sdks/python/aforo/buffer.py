@@ -27,10 +27,17 @@ class RingBuffer:
 
     def push(self, event: ResolvedEvent) -> bool:
         """Add an event. Returns True if added without overflow."""
+        return self.push_evict(event) is None
+
+    def push_evict(self, event: ResolvedEvent) -> Optional[ResolvedEvent]:
+        """Add an event. On overflow, returns the evicted OLDEST event so the
+        caller can surface the drop; returns None when no eviction occurred."""
         with self._lock:
-            was_full = len(self._buf) == self._capacity
-            self._buf.append(event)  # deque(maxlen) auto-drops oldest
-            return not was_full
+            evicted = None
+            if len(self._buf) == self._capacity:
+                evicted = self._buf[0]  # deque(maxlen) will auto-drop this
+            self._buf.append(event)
+            return evicted
 
     def drain(self) -> list[ResolvedEvent]:
         """Remove and return all events."""

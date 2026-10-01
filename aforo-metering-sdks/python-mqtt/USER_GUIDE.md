@@ -1,6 +1,6 @@
 # aforo-mqtt-metering — User Guide
 
-**Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** Python engineers running an MQTT client against a managed broker who need per-event billing.
+**Version:** 1.2.2 · **Updated:** 2026-10-01 · **Audience:** Python engineers running an MQTT client against a managed broker who need per-event billing.
 
 ## What you'll build
 
@@ -16,7 +16,7 @@ An MQTT client whose PUBLISH / SUBSCRIBE / UNSUBSCRIBE / CONNECT / DISCONNECT ev
 ## Step 1 — Install
 
 ```bash
-pip install -e .                  # from python-mqtt/ (not yet on PyPI)
+pip install -e .                  # from python-mqtt/ (or: pip install "aforo-mqtt-metering>=1.2.2")
 pip install -e ".[paho]"          # or [aiomqtt] / [httpx]
 ```
 
@@ -115,9 +115,12 @@ billing.shutdown()   # flushes the final batch before process exit
 | `flush_count` | `int` | `200` | Buffer size that forces a flush. |
 | `emit_deliver_events` | `bool` | `False` | Bill inbound `on_message` deliveries. |
 | `on_error` | `Callable?` | logs | Called on permanent batch failure, and with the ingestor's `errors[].message` when it rejects events. |
+| `on_drop` | `Callable[[list[dict], str], None]?` | `None` | Called with events that will not be delivered and the reason (`invalid`, `rejected`, `retry_exhausted`). Pass by keyword. |
 | `product_type` | `str` | `"MQTT_BROKER"` | Top-level `productType` sent on every event (trimmed and upper-cased; values the SDK does not know are passed through). Override per event with `push(..., product_type=...)` or `product_type=` on `wrap_paho_client` / `wrap_aiomqtt_client`. |
 
 Exports: `AforoMqttBilling`, `wrap_paho_client(billing, client, customer_id=...)`, `wrap_aiomqtt_client(billing, client, customer_id=..., client_id=...)`. Metric names: `mqtt_broker.<event_type>` (publish / subscribe / unsubscribe / connect / disconnect / deliver).
+
+Execution status (`executionStatus`, used by OUTCOME_BASED pricing) is described in the [README](README.md#execution-status-executionstatus).
 
 ## Troubleshooting
 
@@ -125,7 +128,8 @@ Exports: `AforoMqttBilling`, `wrap_paho_client(billing, client, customer_id=...)
 |---|---|---|
 | No events at all | The client was wrapped after connecting/publishing, or never wrapped. | Call `wrap_paho_client` / `wrap_aiomqtt_client` before you publish/subscribe. |
 | Inbound messages not billed | `emit_deliver_events` defaults to `False`. | Set `emit_deliver_events=True` if you price received messages. |
-| `on_error` fires with "Aforo returned 401/403" | Bad/unscoped API key — 4xx is dropped, not retried. | Fix `api_key`; confirm it matches `tenant_id`. |
+| `on_error` fires with "flush rejected with HTTP 401" (or 403) | Bad or unscoped API key. A 4xx other than 408 / 429 is not retried; the batch is dropped with reason `rejected`. | Fix `api_key`; confirm it matches `tenant_id`. Replay the batch from an `on_drop` hook if you keep one. |
+| `billing.dropped_count` is above 0 | Events were dropped: `invalid` (failed a client-side check), `rejected` (ingestor refused them) or `retry_exhausted`. | Read the WARNING log line for the reason; see [Dropped events](README.md#dropped-events). |
 | Events sent, none in console | Wrong `ingestor_url` host, or `mqtt_broker.*` isn't mapped to a rate plan. | Use `https://api.aforo.ai`; map the metric in Aforo. |
 | QoS tier never applies | Filter condition not set on the rate plan. | Add `mqtt_qos IN ("1","2")` (or similar) to the rate plan in the console. |
 | Event volume far higher than expected | `emit_deliver_events=True` on a wildcard subscription. | Turn it off, or narrow the subscription topics. |

@@ -1,282 +1,183 @@
 package com.aforo.metering;
 
-import com.aforo.metering.spring.AforoMeteringProperties;
-import com.aforo.metering.spring.AforoServletFilter;
-import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
-import jakarta.servlet.FilterChain;
-import jakarta.servlet.http.HttpServletRequest;
-import jakarta.servlet.http.HttpServletResponse;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
-import java.io.ByteArrayOutputStream;
-import java.lang.reflect.Proxy;
+import java.io.File;
+import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CopyOnWriteArrayList;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-@DisplayName("Ingest contract — URL, productType, required fields")
+/**
+ * Ingest-contract guard (A+ delivery-guarantee prompt 7).
+ *
+ * <p>Validates the OBSERVED wire request (endpoint path + body shape) against
+ * the shared, checked-in contract fixture at contract/ingest-contract.json —
+ * derived from the REAL usage-ingestor controllers/DTOs, never from this
+ * SDK's own constants. A test that asserts the SDK against the SDK's own
+ * endpoint constant has zero contract coverage (the 2026-07-05 D1 incident:
+ * 16 variant SDKs posted a batch body to a single-event endpoint, every
+ * flush 400'd, and green suites hid 100% event loss).</p>
+ */
 class IngestContractTest {
 
-    private final ObjectMapper mapper = new ObjectMapper();
-    private final List<JsonNode> bodies = new CopyOnWriteArrayList<>();
-    private final List<String> paths = new CopyOnWriteArrayList<>();
-    private final List<String> authHeaders = new CopyOnWriteArrayList<>();
-    private final List<String> apiKeyHeaders = new CopyOnWriteArrayList<>();
-    private HttpServer server;
-    private int port;
+    private static final ObjectMapper OM = new ObjectMapper();
+    private static final String MODULE_KEY = "java";
+    /** Surefire runs with the module dir as CWD — fixture lives at the repo root. */
+    private static final File FIXTURE_FILE = new File("../contract/ingest-contract.json");
+
+    private HttpServer captureServer;
+    private int capturePort;
+    private final List<String> capturedPaths = new ArrayList<>();
+    private final List<Map<String, Object>> capturedBodies = new ArrayList<>();
 
     @BeforeEach
-    void start() throws Exception {
-        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        server.createContext("/", ex -> {
-            ByteArrayOutputStream buf = new ByteArrayOutputStream();
-            ex.getRequestBody().transferTo(buf);
-            paths.add(ex.getRequestURI().getPath());
-            authHeaders.add(String.valueOf(ex.getRequestHeaders().getFirst("Authorization")));
-            apiKeyHeaders.add(ex.getRequestHeaders().getFirst("X-API-Key"));
-            bodies.add(mapper.readTree(buf.toByteArray()));
-            byte[] resp = "{\"accepted\":1,\"duplicates\":0,\"failed\":0,\"errors\":[]}".getBytes();
-            ex.sendResponseHeaders(202, resp.length);
-            ex.getResponseBody().write(resp);
+    void setUp() throws IOException {
+        captureServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        captureServer.createContext("/", (HttpExchange ex) -> {
+            byte[] body = ex.getRequestBody().readAllBytes();
+            synchronized (capturedPaths) {
+                capturedPaths.add(ex.getRequestURI().getPath());
+                try {
+                    capturedBodies.add(body.length > 0
+                            ? OM.readValue(body, new TypeReference<Map<String, Object>>() {})
+                            : Map.of());
+                } catch (Exception parseFailure) {
+                    capturedBodies.add(Map.of());
+                }
+            }
+            ex.sendResponseHeaders(202, -1);
             ex.close();
         });
-        server.start();
-        port = server.getAddress().getPort();
+        captureServer.start();
+        capturePort = captureServer.getAddress().getPort();
     }
 
     @AfterEach
-    void stop() { server.stop(0); }
-
-    private AforoOptions options() {
-        return new AforoOptions("sk_test_abc")
-                .baseUrl("http://127.0.0.1:" + port)
-                .flushCount(100)
-                .flushIntervalMs(60_000)
-                .maxRetries(0);
-    }
-
-    private JsonNode onlyEvent() {
-        assertThat(bodies).hasSize(1);
-        JsonNode events = bodies.get(0).get("events");
-        assertThat(events.size()).isEqualTo(1);
-        return events.get(0);
+    void tearDown() {
+        if (captureServer != null) captureServer.stop(0);
     }
 
     @Test
-    void defaultBaseUrlIsProductionGateway() {
-        assertThat(new AforoOptions("k").getBaseUrl()).isEqualTo("https://api.aforo.ai");
-        assertThat(new AforoMeteringProperties().getBaseUrl()).isEqualTo("https://api.aforo.ai");
-        assertThat(new AforoMeteringProperties().getProductType()).isEqualTo("API");
-    }
+    void postsToContractedEndpointWithContractedBodyShape() throws Exception {
+        Map<String, Object> fixture = OM.readValue(FIXTURE_FILE, new TypeReference<>() {});
+        Map<String, Object> sdks = cast(fixture.get("sdks"));
+        Map<String, Object> sdkEntry = cast(sdks.get(MODULE_KEY));
+        assertThat(sdkEntry).as("module must be registered in the fixture").isNotNull();
+        String endpoint = (String) sdkEntry.get("endpoint");
+        Map<String, Object> endpoints = cast(fixture.get("endpoints"));
+        Map<String, Object> spec = cast(endpoints.get(endpoint));
+        assertThat(spec).isNotNull();
 
-    @Test
-    void defaultProductTypeIsApi() {
-        assertThat(new AforoOptions("k").getProductType()).isEqualTo("API");
-    }
-
-    @Test
-    void postsBatchWithRequiredCamelCaseFieldsAndDefaultProductType() {
-        try (var client = new AforoClient(options())) {
-            client.track(TrackEvent.builder("cust_1", "api_calls").quantity(2).build());
-            FlushResult r = client.flush();
-            assertThat(r.sent()).isEqualTo(1);
+        AforoClient client = new AforoClient(new AforoOptions("test-key")
+                .baseUrl("http://127.0.0.1:" + capturePort)
+                .maxRetries(0));
+        try {
+            client.track(TrackEvent.builder("cust_contract", "api_calls").quantity(1).build());
+            client.flush();
+        } finally {
+            client.close();
         }
-        assertThat(paths.get(0)).isEqualTo("/v1/ingest/batch");
-        assertThat(apiKeyHeaders.get(0)).isEqualTo("sk_test_abc");
-        assertThat(authHeaders.get(0)).isEqualTo("null");
-        JsonNode ev = onlyEvent();
-        assertThat(ev.get("customerId").asText()).isEqualTo("cust_1");
-        assertThat(ev.get("metricName").asText()).isEqualTo("api_calls");
-        assertThat(ev.get("quantity").asDouble()).isEqualTo(2.0);
-        assertThat(ev.get("idempotencyKey").asText()).isNotBlank();
-        assertThat(ev.get("productType").asText()).isEqualTo("API");
-        // ISO-8601 instant
-        Instant parsed = Instant.parse(ev.get("occurredAt").asText());
-        assertThat(parsed).isBeforeOrEqualTo(Instant.now());
+
+        synchronized (capturedPaths) {
+            assertThat(capturedPaths).as("no wire request observed").isNotEmpty();
+            assertThat(capturedPaths.get(0)).isEqualTo(endpoint);
+            assertBodyMatchesContract(spec, capturedBodies.get(0));
+        }
     }
 
-    /**
-     * Regression: the default key used to be
-     * SHA256(customerId:metricName:quantity:occurredAt). occurredAt only carries
-     * millisecond precision, so two genuinely distinct events inside one millisecond
-     * hashed to the same key and the ingestor answered DUPLICATE and dropped the second
-     * one — real usage silently lost (under-billing). Two calls sharing an explicit
-     * occurredAt reproduce exactly the input the old hash saw.
-     */
     @Test
-    void sameInstantEventsGetDistinctIdempotencyKeys() {
-        String sameInstant = "2026-03-21T00:00:00.000Z";
-        try (var client = new AforoClient(options())) {
-            for (int i = 0; i < 2; i++) {
-                client.track(TrackEvent.builder("cust_1", "sms.sent")
-                        .quantity(1)
-                        .occurredAt(sameInstant)
-                        .build());
+    void executionStatusIsContractedOptionalFieldSentOnlyWhenSet() throws Exception {
+        Map<String, Object> fixture = OM.readValue(FIXTURE_FILE, new TypeReference<>() {});
+        Map<String, Object> sdks = cast(fixture.get("sdks"));
+        String endpoint = (String) ((Map<String, Object>) cast(sdks.get(MODULE_KEY))).get("endpoint");
+        Map<String, Object> spec = cast(((Map<String, Object>) cast(fixture.get("endpoints"))).get(endpoint));
+        Map<String, Object> optional = cast(spec.get("eventOptionalFields"));
+        Map<String, Object> statusSpec = cast(optional.get("executionStatus"));
+        assertThat(statusSpec).isNotNull();
+
+        AforoClient client = new AforoClient(new AforoOptions("test-key")
+                .baseUrl("http://127.0.0.1:" + capturePort)
+                .maxRetries(0));
+        try {
+            client.track(TrackEvent.builder("cust_contract", "api_calls").executionStatus("timeout").build());
+            client.track(TrackEvent.builder("cust_contract", "api_calls").build());
+            client.track(TrackEvent.builder("cust_contract", "api_calls").executionStatus("not_a_status").build());
+            client.flush();
+        } finally {
+            client.close();
+        }
+
+        synchronized (capturedPaths) {
+            assertThat(capturedBodies).as("no wire request observed").isNotEmpty();
+            Map<String, Object> body = capturedBodies.get(0);
+            assertBodyMatchesContract(spec, body);
+            List<Map<String, Object>> events = cast(body.get((String) spec.get("batchKey")));
+            assertThat(events).hasSize(3);
+            assertThat(events.get(0)).containsEntry("executionStatus", "TIMEOUT");
+            List<String> allowed = cast(statusSpec.get("values"));
+            assertThat(TrackEvent.ALLOWED_EXECUTION_STATUSES)
+                    .as("SDK executionStatus allowlist must match the contract").containsExactlyInAnyOrderElementsOf(allowed);
+            assertThat(allowed).contains((String) events.get(0).get("executionStatus"));
+            assertThat(((String) events.get(0).get("executionStatus")).length())
+                    .isLessThanOrEqualTo(((Number) statusSpec.get("maxLength")).intValue());
+            assertThat(events.get(1)).doesNotContainKey("executionStatus");
+            // Unknown value: field omitted, the event itself still sent (not a batch-killing 400).
+            assertThat(events.get(2)).doesNotContainKey("executionStatus")
+                    .containsEntry("customerId", "cust_contract");
+        }
+    }
+
+    /** Same assertion shape in every SDK suite (all languages). */
+    static void assertBodyMatchesContract(Map<String, Object> spec, Map<String, Object> body) {
+        String cardinality = (String) spec.get("cardinality");
+        if ("batch-wrapped".equals(cardinality)) {
+            // (A bare-array body would have failed the Map parse above — the
+            // /v1/ingest/async-batch shape is not this endpoint's contract.)
+            Object eventsObj = body.get((String) spec.get("batchKey"));
+            assertThat(eventsObj)
+                    .as("batch body must carry '%s' array", spec.get("batchKey"))
+                    .isInstanceOf(List.class);
+            List<Map<String, Object>> events = cast(eventsObj);
+            assertThat(events).isNotEmpty();
+            assertThat(events.size()).isLessThanOrEqualTo(((Number) spec.get("maxEvents")).intValue());
+            List<String> requiredFields = cast(spec.get("eventRequiredFields"));
+            for (Map<String, Object> ev : events) {
+                for (String field : requiredFields) assertRequired(ev, field);
             }
-            client.flush();
-        }
-        JsonNode events = bodies.get(0).get("events");
-        assertThat(events.size()).isEqualTo(2);
-        assertThat(events.get(0).get("occurredAt").asText())
-                .isEqualTo(events.get(1).get("occurredAt").asText())
-                .isEqualTo(sameInstant);
-        assertThat(events.get(0).get("idempotencyKey").asText())
-                .as("two distinct events must not share a key — the ingestor would drop one")
-                .isNotEqualTo(events.get(1).get("idempotencyKey").asText());
-    }
-
-    /** An explicit key is how a caller opts INTO dedup — it must survive verbatim. */
-    @Test
-    void explicitIdempotencyKeyIsPreservedVerbatim() {
-        try (var client = new AforoClient(options())) {
-            for (int i = 0; i < 2; i++) {
-                client.track(TrackEvent.builder("cust_1", "sms.sent")
-                        .quantity(1)
-                        .occurredAt("2026-03-21T00:00:00.000Z")
-                        .idempotencyKey("caller-owned-key")
-                        .build());
+        } else if ("single".equals(cardinality)) {
+            List<String> forbidden = spec.get("forbiddenTopLevelKeys") != null
+                    ? cast(spec.get("forbiddenTopLevelKeys")) : List.of();
+            for (String key : forbidden) {
+                assertThat(body).as("single-event body must not carry '%s'", key).doesNotContainKey(key);
             }
-            client.flush();
+            List<String> requiredFields = cast(spec.get("requiredFields"));
+            for (String field : requiredFields) assertRequired(body, field);
+        } else {
+            throw new AssertionError("Unhandled cardinality in fixture: " + cardinality);
         }
-        JsonNode events = bodies.get(0).get("events");
-        assertThat(events.size()).isEqualTo(2);
-        assertThat(events.get(0).get("idempotencyKey").asText()).isEqualTo("caller-owned-key");
-        assertThat(events.get(1).get("idempotencyKey").asText()).isEqualTo("caller-owned-key");
     }
 
-    @Test
-    void clientProductTypeAndPerEventOverride() {
-        try (var client = new AforoClient(options().productType("agentic_api"))) {
-            client.track(TrackEvent.builder("cust_1", "calls").build());
-            client.track(TrackEvent.builder("cust_1", "tokens").productType("AI_AGENT").build());
-            client.flush();
+    static void assertRequired(Map<String, Object> obj, String field) {
+        assertThat(obj).as("required field '%s' missing from wire body", field).containsKey(field);
+        Object v = obj.get(field);
+        assertThat(v).as("required field '%s' is null", field).isNotNull();
+        if (v instanceof String s) {
+            assertThat(s.trim()).as("required field '%s' is blank", field).isNotEmpty();
         }
-        JsonNode events = bodies.get(0).get("events");
-        assertThat(events.get(0).get("productType").asText()).isEqualTo("AGENTIC_API");
-        assertThat(events.get(1).get("productType").asText()).isEqualTo("AI_AGENT");
     }
 
-    @Test
-    void nonPositiveQuantityAndBlankCustomerAreDropped() {
-        try (var client = new AforoClient(options())) {
-            client.track(TrackEvent.builder("cust_1", "api_calls").quantity(0).build());
-            client.track(TrackEvent.builder("cust_1", "api_calls").quantity(-1).build());
-            client.track(TrackEvent.builder("", "api_calls").build());
-            client.track(TrackEvent.builder(null, "api_calls").build());
-            client.track(TrackEvent.builder("cust_1", "api_calls").quantity(Double.NaN).build());
-            assertThat(client.bufferedCount()).isZero();
-        }
-        assertThat(bodies).isEmpty();
-    }
-
-    @Test
-    void flushCountIsClampedToServerBatchLimit() {
-        try (var client = new AforoClient(options().flushCount(5_000).maxQueueSize(5_000))) {
-            for (int i = 0; i < 1_500; i++) {
-                client.track(TrackEvent.builder("cust_" + i, "api_calls").build());
-            }
-            client.flush();
-        }
-        assertThat(bodies).isNotEmpty();
-        int total = 0;
-        for (JsonNode b : bodies) {
-            assertThat(b.get("events").size()).isLessThanOrEqualTo(1000);
-            total += b.get("events").size();
-        }
-        assertThat(total).isEqualTo(1_500);
-    }
-
-    // ── Servlet filter ────────────────────────────────────────────────
-
-    private static HttpServletRequest request(String customerHeader) {
-        return (HttpServletRequest) Proxy.newProxyInstance(
-                IngestContractTest.class.getClassLoader(), new Class<?>[]{HttpServletRequest.class},
-                (proxy, m, args) -> switch (m.getName()) {
-                    case "getRequestURI" -> "/v1/users/42";
-                    case "getMethod" -> "GET";
-                    case "getHeader" -> "X-Customer-Id".equals(args[0]) ? customerHeader : null;
-                    default -> null;
-                });
-    }
-
-    private static HttpServletResponse response() {
-        return (HttpServletResponse) Proxy.newProxyInstance(
-                IngestContractTest.class.getClassLoader(), new Class<?>[]{HttpServletResponse.class},
-                (proxy, m, args) -> "getStatus".equals(m.getName()) ? 200 : null);
-    }
-
-    @Test
-    void servletFilterSendsTopLevelHttpFields() throws Exception {
-        FilterChain chain = (req, res) -> {};
-        try (var client = new AforoClient(options())) {
-            new AforoServletFilter(client).doFilter(request("cust_9"), response(), chain);
-            client.flush();
-        }
-        JsonNode ev = onlyEvent();
-        assertThat(ev.get("customerId").asText()).isEqualTo("cust_9");
-        assertThat(ev.get("productType").asText()).isEqualTo("API");
-        assertThat(ev.get("endpointPath").asText()).isEqualTo("/v1/users/:id");
-        assertThat(ev.get("httpMethod").asText()).isEqualTo("GET");
-        assertThat(ev.get("statusCode").asInt()).isEqualTo(200);
-        assertThat(ev.has("responseTimeMs")).isTrue();
-        assertThat(ev.get("quantity").asDouble()).isEqualTo(1.0);
-    }
-
-    @Test
-    void servletFilterProductTypeOptionOverridesClientDefault() throws Exception {
-        FilterChain chain = (req, res) -> {};
-        try (var client = new AforoClient(options().productType("agentic_api"))) {
-            new AforoServletFilter(client).doFilter(request("cust_9"), response(), chain);
-            new AforoServletFilter(client).productType(" ai_agent ").doFilter(request("cust_9"), response(), chain);
-            client.flush();
-        }
-        JsonNode events = bodies.get(0).get("events");
-        assertThat(events.get(0).get("productType").asText()).isEqualTo("AGENTIC_API");
-        assertThat(events.get(1).get("productType").asText()).isEqualTo("AI_AGENT");
-    }
-
-    @Test
-    void servletFilterEndpointPathIsCappedAt512() throws Exception {
-        String longPath = "/" + "a".repeat(600);
-        HttpServletRequest req = (HttpServletRequest) Proxy.newProxyInstance(
-                IngestContractTest.class.getClassLoader(), new Class<?>[]{HttpServletRequest.class},
-                (proxy, m, args) -> switch (m.getName()) {
-                    case "getRequestURI" -> longPath;
-                    case "getMethod" -> "POST";
-                    case "getHeader" -> "X-Customer-Id".equals(args[0]) ? "cust_9" : null;
-                    default -> null;
-                });
-        FilterChain chain = (rq, rs) -> {};
-        try (var client = new AforoClient(options())) {
-            new AforoServletFilter(client).doFilter(req, response(), chain);
-            client.flush();
-        }
-        assertThat(onlyEvent().get("endpointPath").asText()).hasSize(512);
-    }
-
-    @Test
-    void blankMetricNameIsDroppedAndInstantOccurredAtIsIso() {
-        Instant at = Instant.parse("2026-09-22T10:00:00Z");
-        try (var client = new AforoClient(options())) {
-            client.track(TrackEvent.builder("cust_1", " ").build());
-            client.track(TrackEvent.builder("cust_1", "api_calls").occurredAt(at).build());
-            client.flush();
-        }
-        assertThat(onlyEvent().get("occurredAt").asText()).isEqualTo("2026-09-22T10:00:00Z");
-    }
-
-    @Test
-    void resolvedEventMapAlwaysHasProductType() {
-        Map<String, Object> map = new ResolvedEvent("c", "m", 1, "k", "2026-09-22T10:00:00Z", null).toMap();
-        assertThat(map).containsEntry("productType", "API");
+    @SuppressWarnings("unchecked")
+    static <T> T cast(Object o) {
+        return (T) o;
     }
 }

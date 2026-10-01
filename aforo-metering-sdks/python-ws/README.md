@@ -2,7 +2,7 @@
 
 Meter WebSocket traffic — connection duration, message counts, and bytes — by wrapping a connection from the `websockets` library or a FastAPI/Starlette `WebSocket` route. One open + one close event per connection by default, or one event per frame.
 
-**Version:** 1.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 1.2.2 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -15,7 +15,7 @@ pip install "aforo-ws-metering[fastapi]"      # FastAPI / Starlette
 pip install "aforo-ws-metering[httpx]"        # faster HTTP flush than stdlib urllib
 ```
 
-**Not yet on PyPI — install from source for now:**
+**Install `1.2.2` or later. `1.0.0` on PyPI was built from an older copy of this code and lacks the fixes listed in the changelog.** If `1.2.2` is not on PyPI yet, install from source:
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
@@ -102,9 +102,49 @@ Constructor arguments for `AforoWsBilling(...)`:
 | `flush_count` | `int` | `100` | Buffer size that triggers an immediate flush. |
 | `per_frame_events` | `bool` | `False` | Emit one event per inbound/outbound frame instead of open+close. |
 | `on_error` | `Callable[[Exception], None]?` | logs | Called on permanent batch failure, and with the ingestor's `errors[].message` when it rejects events. |
+| `on_drop` | `Callable[[list[dict], str], None]?` | `None` | Called with events that will not be delivered and the reason (`invalid`, `rejected`, `retry_exhausted`). See [Dropped events](#dropped-events). Pass by keyword. |
 | `product_type` | `str` | `"WEBSOCKET_API"` | Top-level `productType` sent on every event (trimmed and upper-cased; values the SDK does not know are passed through). Override per event with a `productType` key in `push({...})` or `product_type=` on `track_websockets_connection` / `track_starlette_websocket`. |
 
-Close-code mapping: `WS_CLOSE_REASONS` maps standard close codes (1000–1011) to descriptor labels (`NORMAL_CLOSURE`, `ABNORMAL_CLOSURE`, `POLICY_VIOLATION`, …); an exception inside the handler surfaces as `INTERNAL_ERROR`. Retry is fixed at **3 attempts** (`1s / 2s` backoff between them); 408 and 5xx are retried, 429 waits for `Retry-After` (capped at 60 s), and any other 4xx is not retried.
+Close-code mapping: `WS_CLOSE_REASONS` maps standard close codes (1000–1011) to descriptor labels (`NORMAL_CLOSURE`, `ABNORMAL_CLOSURE`, `POLICY_VIOLATION`, …); an exception inside the handler surfaces as `INTERNAL_ERROR`. Retry is fixed at **3 attempts** (`1s / 2s` backoff between them); 408 and 5xx are retried, 429 waits for `Retry-After` (capped at 60 s), and any other 4xx is not retried and the batch is dropped with reason `rejected`.
+
+## Execution status (`executionStatus`)
+
+Each event can carry an execution status. OUTCOME_BASED rate plans bill each event at the weight set for its status; events without one bill at full price.
+
+The SDK doesn't derive one: an event carries a status only when you set it. With the connection helpers, the value you set goes on the `CONNECTION_CLOSED` event; a close with or without an exception sends no status otherwise. Frame events and `CONNECTION_OPENED` carry no status.
+
+To send your own value:
+
+```python
+async with await track_websockets_connection(billing, ws, customer_id,
+                                             execution_status="PARTIAL") as t:
+    ...
+    t.execution_status = "TIMEOUT"   # or change it inside the block
+
+billing.push({"customerId": "cust_42", "wsConnectionId": conn_id, "wsFrameType": "TEXT"},
+             execution_status="SUCCESS")
+```
+
+`execution_status` is keyword-only (`push()` also reads an `executionStatus` key in the dict when the keyword isn't given). The SDK trims and upper-cases it and leaves it off the event when it's blank. Accepted values: `SUCCESS`, `PARTIAL`, `TIMEOUT`, `ERROR`, `VALIDATION_FAILED`, `FAILED`, `FAILURE`, `CANCELLED`, `PENDING`, `BLOCKED`, `HITL_REQUIRED` — any other value is logged as a warning and left off the event, since the ingestor would reject the event.
+
+## Dropped events
+
+An event that will never reach Aforo is counted in `billing.dropped_count`, logged at WARNING, and passed to the opt-in `on_drop(events, reason)` hook. The events keep their idempotency keys, so sending them again later cannot double-bill.
+
+| Reason | When |
+|---|---|
+| `invalid` | The event failed a client-side check (a blank `customerId`, one longer than 64 characters, or no `wsConnectionId`). It is not buffered or sent. `push()` does not raise for event content. |
+| `rejected` | The ingestor answered 4xx (other than 408 / 429) for the batch, or refused individual events inside a 202 response. |
+| `retry_exhausted` | Network errors, 5xx, 408 or 429 on all 3 attempts. |
+
+```python
+def on_drop(events, reason):
+    dead_letter.write(reason, events)
+
+billing = AforoWsBilling(..., on_drop=on_drop)
+```
+
+When a 202 response reports refused events without a usable `index`, they are counted in `dropped_count` but not passed to the hook, since the SDK cannot tell which events they were. Exceptions raised by the hook are swallowed. An unknown `executionStatus` is not a drop: the field is left off and the event is still sent.
 
 ## Walk me through it
 

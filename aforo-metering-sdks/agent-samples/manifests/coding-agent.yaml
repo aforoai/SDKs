@@ -1,0 +1,105 @@
+# Aforo AI_AGENT reference manifest — Coding Agent
+# Includes governance block with HITL + audit — useful for exercising review workflows.
+
+name: Aforo Coding Agent
+description: Developer productivity agent — reads files, writes changes, runs tests, and explains diffs. Human-in-the-loop enforced on file writes.
+overview: |
+  The Coding Agent operates against a developer's repository via a scoped
+  workspace. All writes require an operator override before landing on disk;
+  reads and diff explanations run without approval.
+
+version: 2.0.1
+
+tags:
+  - development
+  - code-review
+  - devops
+
+modelProvider: OPENAI
+defaultModel: gpt-4o
+
+capabilities:
+  - name: read_file
+    description: Read a file from the developer's repo, optionally scoped to a line range.
+    costTier: STANDARD
+    rateLimit:
+      requestsPerMinute: 120
+    input_schema:
+      type: object
+      required: [path]
+      properties:
+        path:
+          type: string
+        start_line:
+          type: integer
+          minimum: 1
+        end_line:
+          type: integer
+          minimum: 1
+
+  - name: write_file
+    description: Write or replace a file in the developer's repo. HITL-gated.
+    costTier: PREMIUM
+    rateLimit:
+      requestsPerMinute: 20
+    input_schema:
+      type: object
+      required: [path, content]
+      properties:
+        path:
+          type: string
+        content:
+          type: string
+        create_only:
+          type: boolean
+          default: false
+          description: If true, fail when the file already exists.
+
+  - name: run_tests
+    description: Execute a test suite and return pass/fail summary plus failing test details.
+    costTier: PREMIUM
+    rateLimit:
+      requestsPerMinute: 10
+    input_schema:
+      type: object
+      required: [test_command]
+      properties:
+        test_command:
+          type: string
+        working_directory:
+          type: string
+        env:
+          type: object
+          additionalProperties:
+            type: string
+
+  - name: explain_diff
+    description: Explain a git diff in plain English and call out risky changes.
+    costTier: STANDARD
+    rateLimit:
+      requestsPerMinute: 60
+    input_schema:
+      type: object
+      required: [diff]
+      properties:
+        diff:
+          type: string
+          maxLength: 100000
+        risk_focus:
+          type: string
+          enum: [security, correctness, performance, all]
+          default: all
+
+runtime:
+  max_steps: 40
+  max_tokens: 12000
+
+session:
+  idle_timeout_minutes: 20
+  max_concurrent_sessions: 5
+
+governance:
+  hitl_required_for:
+    - write_file
+  content_filter: strict
+  audit_all_writes: true

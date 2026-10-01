@@ -2,19 +2,18 @@
 
 Per-operation GraphQL metering for Go servers. Wrap your `/graphql` HTTP handler (gqlgen, graphql-go, or anything that speaks the GraphQL-over-HTTP POST shape) and Aforo gets one billing event per operation — operation type, name, an approximate complexity score, error flag, and duration — batched and retried in the background.
 
-**Version:** 1.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 1.2.2 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 Reach for this when you bill GraphQL by the operation (or by complexity tier) and want the type/name/complexity extracted for you at the HTTP boundary, or when you already compute an accurate complexity score and just want a clean `Record()` to ship it.
 
 ## Install
 
-Intended public install once published:
 
 ```bash
 go get github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql
 ```
 
-**Not yet published — `go get github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql` resolves once this repo is public and the module is tagged** (`aforo-metering-sdks/go-graphql/v1.0.0`). Until then, vendor it from source with a local `replace`:
+Releases are git tags of the form `aforo-metering-sdks/go-graphql/vX.Y.Z` on [github.com/aforoai/SDKs](https://github.com/aforoai/SDKs) (this version: `aforo-metering-sdks/go-graphql/v1.2.2`). Use `v1.2.2` or later: `v1.0.0` was tagged from an older copy of this code and lacks the fixes listed in the changelog. Until the `v1.2.2` tag exists, `go get github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql@main` resolves to a pseudo-version of the default branch. To build against a local checkout instead, use a `replace`:
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
@@ -22,7 +21,7 @@ git clone https://github.com/aforoai/SDKs.git
 
 ```go
 // go.mod (your service)
-require github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql v1.0.0
+require github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql v1.2.2
 
 replace github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql => ../SDKs/aforo-metering-sdks/go-graphql
 ```
@@ -76,14 +75,14 @@ Manual recording — when you compute an accurate complexity yourself:
 billing.Record(customerID, query, operationName, durationMs, hasErrors)
 ```
 
-Product type: every event carries a top-level `productType` — `Config.ProductType` (default `"GRAPHQL_API"`). `Record` accepts an optional trailing `graphqlmetering.EventOptions` to override it. Example:
+Product type: every event carries a top-level `productType` — `Config.ProductType` (default `"GRAPHQL_API"`). `Record` accepts optional trailing `graphqlmetering.EventOptions` to override it; the same options carry `ExecutionStatus`, and `RecordWithOptions` is the single-options form. Example:
 
 ```go
 billing.Record(customerID, query, operationName, durationMs, hasErrors,
 	graphqlmetering.EventOptions{ProductType: "AGENTIC_API"})
 ```
 
-Delivery: `POST /v1/ingest/batch` with `{"events":[...]}`, at most 1000 events per request, `X-API-Key` header. Transport errors, `408`, `429` (honouring `Retry-After`) and `5xx` are retried with the same body; any other `4xx` is reported via `OnError` and not retried.
+Delivery: `POST /v1/ingest/batch` with `{"events":[...]}`, at most 1000 events per request, `X-API-Key` header. Transport errors, `408`, `429` (honouring `Retry-After`) and `5xx` are retried with the same body; any other `4xx` is not retried: the batch is dropped with reason `rejected` and reported via `OnError` (see [Dropped events](#dropped-events)).
 
 ## Configuration
 
@@ -102,12 +101,50 @@ Delivery: `POST /v1/ingest/batch` with `{"events":[...]}`, at most 1000 events p
 | `HTTPClient` | `*http.Client` | `&http.Client{Timeout: 10s}` | Override the HTTP client. |
 | `CustomerExtractor` | `func(*http.Request) string` | reads `X-Customer-Id` | How the middleware resolves the customer id per request. |
 | `OnError` | `func(error)` | no-op | Called on a marshal failure, a flush that exhausts its 3 retries, a non-retryable `4xx` (dropped without retry), or a `2xx` whose body reports `failed > 0` — messages include the ingestor's `errors[].message`. |
+| `OnDrop` | `func([]map[string]any, DropReason)` | `nil` | Opt-in hook called with events the SDK drops (`retry_exhausted`, `rejected`, `invalid`). See [Dropped events](#dropped-events). |
 
 There are no required-field defaults for the four required values — `New` returns an error if `TenantID`, `ProductID`, `APIKey`, or `IngestorURL` is empty.
 
 ## Walk me through it
 
 Step-by-step from install to "I can see the operation in Aforo" lives in [USER_GUIDE.md](USER_GUIDE.md).
+
+## Execution status (outcome-based pricing)
+
+OUTCOME_BASED rate plans weight each operation by its `executionStatus`.
+
+The middleware derives it from the response body (`OutcomeFromGraphQLResponse`): no errors → `SUCCESS`, errors with data → `PARTIAL`, errors with `"data": null` (failed during execution) → `ERROR`, errors with no `data` key (parse or validation failure) → `VALIDATION_FAILED`. When the body isn't a single GraphQL response (or is over 1 MiB) it falls back to the HTTP status (`OutcomeFromHTTPStatus`): 2xx/3xx `SUCCESS`, 408/504 `TIMEOUT`, 499 `CANCELLED`, 400/422 `VALIDATION_FAILED`, 401/403/429 `BLOCKED`, other 4xx/5xx `ERROR`. A handler can set its own value with `SetExecutionStatus(r.Context(), "...")`, which always wins.
+
+`Record` sends no status unless you pass one. For manual recording, pass `EventOptions` (to `Record` or `RecordWithOptions`):
+
+```go
+billing.RecordWithOptions(customerID, query, opName, durMs, hasErrors,
+	graphqlmetering.EventOptions{
+		ExecutionStatus: graphqlmetering.OutcomeFromGraphQLResponse(responseJSON),
+	})
+```
+
+Accepted values: `SUCCESS`, `PARTIAL`, `TIMEOUT`, `ERROR`, `VALIDATION_FAILED`, `FAILED`, `FAILURE`, `CANCELLED`, `PENDING`, `BLOCKED`, `HITL_REQUIRED`. The SDK trims and upper-cases the value; a blank value is left out of the event. Any other value is WARN-logged and left off the event; the event is still sent.
+
+## Dropped events
+
+An event the SDK cannot deliver is never lost silently. `billing.DroppedCount()` returns the running total, each drop is WARN-logged, and the opt-in `Config.OnDrop(events, reason)` hook receives the events (with their idempotency keys, so re-submitting them later is dedup-safe).
+
+| `DropReason` | When |
+|---|---|
+| `graphqlmetering.DropRetryExhausted` (`retry_exhausted`) | A batch failed all 3 attempts (transport error, `408`, `429`, `5xx`). |
+| `graphqlmetering.DropRejected` (`rejected`) | The ingestor answered a non-retryable `4xx`, or refused individual events in a `2xx` partial-failure response. In the partial case only the events named by `errors[].index` are passed to `OnDrop`; failures the ingestor does not identify are counted but not attributed to an event. |
+| `graphqlmetering.DropInvalid` (`invalid`) | The event failed client-side validation and was never buffered: `customerId` over 64 characters, or `productType` over 20. An operation name over 255 is not dropped — it comes from the client's request, so it is truncated to 255 characters without splitting a character, the event is sent, and a WARN is logged once (`Middleware` and `Record` alike). The invalid-drop WARN log names the field, the limit and the value (throttled: first occurrence, then every 1000th); `OnError` is called too. |
+
+A call with no customer id is not metered and is not a drop. An unknown `executionStatus` is not a drop either: the status is left off (or replaced by the derived one) and the event is sent.
+
+```go
+OnDrop: func(events []map[string]any, reason graphqlmetering.DropReason) {
+	log.Printf("aforo: %d event(s) dropped: %s", len(events), reason)
+},
+```
+
+Idempotency keys are minted once, when the event is recorded. Every retry re-sends the same body, so a retried batch is deduplicated by the ingestor.
 
 ## What this doesn't cover
 

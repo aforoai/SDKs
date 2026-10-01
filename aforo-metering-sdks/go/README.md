@@ -2,19 +2,18 @@
 
 A zero-dependency Go metering client for Aforo. Buffer usage events in-process, batch them, and ship them to Aforo's ingestor with retry — plus an `http.Handler` middleware (and a Chi adapter) that meters every request without touching your handler code.
 
-**Version:** 1.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 1.1.2 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 Reach for this when your Go service already knows who the customer is and what to count, and you want Aforo to own buffering, batching, and retry instead of writing that yourself. The middleware path is for the common case: meter one event per HTTP request, keyed by an inbound customer-id header, with no per-handler changes.
 
 ## Install
 
-Intended public install once published:
 
 ```bash
 go get github.com/aforoai/SDKs/aforo-metering-sdks/go
 ```
 
-**Not yet published — `go get github.com/aforoai/SDKs/aforo-metering-sdks/go` resolves once this repo is public and the module is tagged** (`aforo-metering-sdks/go/v1.0.0`). Until then, vendor it from source with a local `replace`:
+Releases are git tags of the form `aforo-metering-sdks/go/vX.Y.Z` on [github.com/aforoai/SDKs](https://github.com/aforoai/SDKs) (this version: `aforo-metering-sdks/go/v1.1.2`). Use `v1.1.2` or later: `v1.0.0` was tagged from an older copy of this code and lacks the fixes listed in the changelog. Until the `v1.1.2` tag exists, `go get github.com/aforoai/SDKs/aforo-metering-sdks/go@main` resolves to a pseudo-version of the default branch. To build against a local checkout instead, use a `replace`:
 
 ```bash
 # 1. Clone the SDK distribution repo next to your service
@@ -26,7 +25,7 @@ git clone https://github.com/aforoai/SDKs.git
 
 ```go
 // go.mod (your service)
-require github.com/aforoai/SDKs/aforo-metering-sdks/go v1.0.0
+require github.com/aforoai/SDKs/aforo-metering-sdks/go v1.1.2
 
 replace github.com/aforoai/SDKs/aforo-metering-sdks/go => ../SDKs/aforo-metering-sdks/go
 ```
@@ -75,7 +74,7 @@ func main() {
 
 Every event carries a top-level `productType` (required by the ingestor): `TrackEvent.ProductType` if set, else `Options.ProductType`, else `"API"`. Values are trimmed and upper-cased; unknown values are passed through unchanged.
 
-`Track` returns an error wrapping `metering.ErrInvalidEvent` — and buffers nothing — when `CustomerID` or `MetricName` is blank, `Quantity` is negative/NaN/Inf, or `OccurredAt` is not RFC 3339; one such event would otherwise fail its whole batch at the ingestor. A zero `Quantity` means "unset" and becomes `1`.
+`Track` returns an error wrapping `metering.ErrInvalidEvent` — and buffers nothing — when `CustomerID` or `MetricName` is blank, `Quantity` is negative/NaN/Inf, `OccurredAt` is not RFC 3339, or a field exceeds the ingestor's limit. The event is also counted in `DroppedCount()` and passed to `OnDrop` with reason `invalid` (see [Dropped events](#dropped-events)). A zero `Quantity` means "unset" and becomes `1`.
 
 `Track` is non-blocking — it pushes onto an in-memory ring buffer and returns. A background goroutine flushes every `FlushInterval`, and any `Track` that pushes the buffer to `FlushCount` triggers an immediate flush. `Close()` stops the goroutine and flushes what's left; skip it and buffered events die with the process.
 
@@ -135,6 +134,7 @@ r.Use(metering.ChiMiddleware(metering.MiddlewareOptions{
 | `RetryBase` | `time.Duration` | `1s` | Base for exponential backoff (`RetryBase × 2^attempt`). |
 | `Timeout` | `time.Duration` | `10s` | Per-request HTTP timeout. |
 | `ShutdownTimeout` | `time.Duration` | `5s` | Accepted by `Options`; reserved for shutdown coordination. |
+| `OnDrop` | `func([]TrackEvent, DropReason)` | `nil` | Opt-in hook called with events the SDK drops (`overflow`, `retry_exhausted`, `rejected`, `invalid`). See [Dropped events](#dropped-events). |
 
 `MiddlewareOptions`:
 
@@ -151,11 +151,38 @@ r.Use(metering.ChiMiddleware(metering.MiddlewareOptions{
 | `ProductType` | `string` | `ClientOptions.ProductType`, else `API` | Top-level `productType` on every metered request. |
 | `ClientOptions` | `*Options` | nil | Full client tuning; `APIKey`/`BaseURL` from `MiddlewareOptions` override its fields. |
 
-Retry rule (in `transport`): `2xx` → sent; `4xx` except `408`/`429` → dropped, no retry; everything else (including `5xx`, `408`, `429`) is retried with backoff, honoring `Retry-After` on a `429`. A `2xx` body with `failed > 0` (`errors[].message` per rejected index) is counted in `FlushResult.Failed`.
+Retry rule (in `transport`): `2xx` → sent; `4xx` except `408`/`429` → dropped, no retry; everything else (including `5xx`, `408`, `429`) is retried with backoff, honoring `Retry-After` on a `429`. A `2xx` body with `failed > 0` is counted in `FlushResult.Failed`, and the events named by `errors[].index` are dropped with reason `rejected`.
 
 ## Walk me through it
 
 Step-by-step from install to "I can see the event in Aforo" lives in [USER_GUIDE.md](USER_GUIDE.md).
+
+## Dropped events
+
+An event the SDK cannot deliver is never lost silently. `client.DroppedCount()` returns the running total, each drop is WARN-logged, and the opt-in `Options.OnDrop(events, reason)` hook receives the events as `TrackEvent`s with their idempotency keys, so passing them back to `Track` later is dedup-safe.
+
+| `DropReason` | When |
+|---|---|
+| `metering.DropOverflow` (`overflow`) | The ring buffer was full; the oldest event was evicted. Log throttled (first, then every 1000th). |
+| `metering.DropRetryExhausted` (`retry_exhausted`) | A batch failed after `MaxRetries` retries (transport error, `408`, `429`, `5xx`). |
+| `metering.DropRejected` (`rejected`) | The ingestor answered a non-retryable `4xx`, or refused individual events in a `2xx` partial-failure response. In the partial case only the events named by `errors[].index` are passed to `OnDrop`; failures the ingestor does not identify are counted but not attributed to an event. |
+| `metering.DropInvalid` (`invalid`) | `Track` refused the event (blank `CustomerID`/`MetricName`, negative/NaN/Inf `Quantity`, non-RFC 3339 `OccurredAt`, or a field over the ingestor's limit). `Track` also returns an error wrapping `metering.ErrInvalidEvent`. The WARN log names the field, the limit and the value (throttled: first, then every 1000th). Nothing you pass to `Track` is truncated or rounded. |
+
+Field limits mirror the ingestor: `CustomerID` 64, `MetricName` 255, `IdempotencyKey` 255, `ProductType` 20, `EndpointPath` 512, `HTTPMethod` 16 characters; `Quantity` at most 14 integer digits and 6 decimal places. Limits the server makes configurable (event age, clock skew, metadata size) are left to the server. The HTTP middleware (`HTTPMiddleware`, `ChiMiddleware`) reads `endpointPath` and `httpMethod` from the incoming request, so it truncates them to 512 and 16 characters instead of dropping the event — otherwise a caller of your API could avoid metering with an over-long URL. The cut never splits a character, and a WARN is logged once per label. Values you pass to `Track` yourself are not truncated; over the limit they are dropped as `invalid`.
+
+Idempotency keys are minted once, when `Track` enqueues the event (random UUID v4 unless you set `IdempotencyKey`). Retries re-send the same keys.
+
+## Execution status (outcome-based pricing)
+
+`TrackEvent.ExecutionStatus` is optional. OUTCOME_BASED rate plans bill each event at the weight set for its status; an event without a status bills at full weight. The SDK trims and upper-cases the value. Accepted values: `SUCCESS`, `PARTIAL`, `TIMEOUT`, `ERROR`, `VALIDATION_FAILED`, `FAILED`, `FAILURE`, `CANCELLED`, `PENDING`, `BLOCKED`, `HITL_REQUIRED`. Any other value (or one longer than 20 characters) is WARN-logged and left off; the event itself is still sent. The HTTP middleware does not set a status.
+
+```go
+client.Track(metering.TrackEvent{
+	CustomerID:      "cust_acme_001",
+	MetricName:      "api_calls",
+	ExecutionStatus: "PARTIAL",
+})
+```
 
 ## What this doesn't cover
 

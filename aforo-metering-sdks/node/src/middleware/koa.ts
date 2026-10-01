@@ -1,6 +1,6 @@
-import { AforoClient } from '../client';
-import { MiddlewareOptions } from '../types';
-import { isPreflight, resolveMetricName, firstNonEmpty, endpointPathOf } from './common';
+import { AforoClient } from '../client.js';
+import { MiddlewareOptions } from '../types.js';
+import { isPreflight, resolveMetricName, firstNonEmpty, endpointPathOf, httpMethodOf } from './common.js';
 
 const DEFAULT_EXCLUDE_PATHS = ['/health', '/ready', '/metrics', '/favicon.ico'];
 
@@ -71,7 +71,7 @@ export function koaMiddleware(options: MiddlewareOptions) {
         metadata,
         productType: options.productType,
         endpointPath: endpointPathOf(path),
-        httpMethod: method,
+        httpMethod: httpMethodOf(method),
         statusCode,
         responseTimeMs: Date.now() - startTime,
       }).catch(() => {});

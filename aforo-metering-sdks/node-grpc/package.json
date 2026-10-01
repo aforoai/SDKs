@@ -1,6 +1,6 @@
 {
   "name": "@aforoai/grpc-metering",
-  "version": "1.0.0",
+  "version": "1.2.2",
   "description": "Aforo gRPC Metering SDK — wraps gRPC server handlers to auto-emit per-method billing events to Aforo's usage ingestor.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

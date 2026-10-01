@@ -6,7 +6,7 @@
 
     <groupId>ai.aforo</groupId>
     <artifactId>grpc-metering</artifactId>
-    <version>1.0.0</version>
+    <version>1.2.2</version>
     <packaging>jar</packaging>
 
     <name>Aforo gRPC Metering SDK (Java)</name>
