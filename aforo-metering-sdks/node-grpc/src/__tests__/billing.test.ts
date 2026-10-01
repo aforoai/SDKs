@@ -1,8 +1,8 @@
 /**
  * Tests for AforoGrpcBilling — covers the buffer/flush/retry pattern
  * that's shared (with minor variations) across all 4 Node SDKs:
- * @aforo/grpc-metering, @aforo/graphql-metering, @aforo/ws-metering,
- * @aforo/mqtt-metering. If this test breaks, the same bug is likely
+ * @aforoai/grpc-metering, @aforoai/graphql-metering, @aforoai/ws-metering,
+ * @aforoai/mqtt-metering. If this test breaks, the same bug is likely
  * present in the sibling packages.
  */
 

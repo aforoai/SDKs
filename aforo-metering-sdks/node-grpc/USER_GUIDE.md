@@ -1,4 +1,4 @@
-# @aforo/grpc-metering — User Guide
+# @aforoai/grpc-metering — User Guide
 
 **Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** Node.js engineers running a `@grpc/grpc-js` server who need per-RPC usage metered into Aforo.
 
@@ -18,7 +18,7 @@ A gRPC server where every RPC — unary and all three stream shapes — emits on
 Once published:
 
 ```bash
-npm i @aforo/grpc-metering @grpc/grpc-js
+npm i @aforoai/grpc-metering @grpc/grpc-js
 ```
 
 It isn't on npm yet. Build from source and link it:
@@ -38,7 +38,7 @@ npm install @grpc/grpc-js
 Construct it once at startup. It starts a background flush timer immediately.
 
 ```ts
-import { AforoGrpcBilling } from '@aforo/grpc-metering';
+import { AforoGrpcBilling } from '@aforoai/grpc-metering';
 
 const billing = new AforoGrpcBilling({
   tenantId: 'tenant_acme',

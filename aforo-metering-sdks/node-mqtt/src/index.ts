@@ -1,5 +1,5 @@
 /**
- * @aforo/mqtt-metering — Aforo MQTT Metering SDK
+ * @aforoai/mqtt-metering — Aforo MQTT Metering SDK
  *
  * Two integration modes:
  *
@@ -14,7 +14,7 @@
  *
  * Usage (Aedes broker):
  *   import aedes from 'aedes';
- *   import { AforoMqttBilling } from '@aforo/mqtt-metering';
+ *   import { AforoMqttBilling } from '@aforoai/mqtt-metering';
  *
  *   const billing = new AforoMqttBilling({
  *     tenantId: 'tenant_acme',

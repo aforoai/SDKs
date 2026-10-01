@@ -15,12 +15,12 @@ body:
       label: Artifact
       description: Which package or plugin?
       options:
-        - "node (@aforo/metering)"
+        - "node (@aforoai/metering)"
         - "node-agent / node-mcp / mcp-proxy"
         - "node-graphql / -grpc / -ws / -mqtt"
         - "python (aforo-metering)"
         - "python-mcp / -graphql / -grpc / -ws / -mqtt"
-        - "java (com.aforo:metering) + protocol variants"
+        - "java (ai.aforo:metering) + protocol variants"
         - "go (metering-go) + protocol variants"
         - "Kong plugin"
         - "Apigee shared flow"

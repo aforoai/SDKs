@@ -1,5 +1,5 @@
 /**
- * @file Shared types for @aforo/mcp-proxy
+ * @file Shared types for @aforoai/mcp-proxy
  */
 
 // ─── Configuration ──────────────────────────────────────────────────────────

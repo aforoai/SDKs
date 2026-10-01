@@ -1,4 +1,4 @@
-# @aforo/mcp-proxy — User Guide
+# @aforoai/mcp-proxy — User Guide
 
 **Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** operators metering an MCP server they don't own the source of — stdio (Claude Desktop / Cursor), SSE, or Streamable HTTP.
 
@@ -17,7 +17,7 @@ A transparent proxy in front of an MCP server so each `tools/call` is billed to 
 Public install (once published):
 
 ```bash
-npm i -g @aforo/mcp-proxy
+npm i -g @aforoai/mcp-proxy
 ```
 
 Not on npm yet, so install from source for now:

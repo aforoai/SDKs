@@ -1,4 +1,4 @@
-// Public API for @aforo/metering
+// Public API for @aforoai/metering
 
 export { AforoClient } from './client';
 export { expressMiddleware, middleware } from './middleware/express';

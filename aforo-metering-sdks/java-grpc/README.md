@@ -1,4 +1,4 @@
-# com.aforo:grpc-metering
+# ai.aforo:grpc-metering
 
 Meter every RPC on a `grpc-java` server without editing your service implementations. Add one `ServerInterceptor` and each call — unary or streaming — emits a billing event with timing, status code, and call type.
 
@@ -10,7 +10,7 @@ Intended (once published to Maven Central):
 
 ```xml
 <dependency>
-  <groupId>com.aforo</groupId>
+  <groupId>ai.aforo</groupId>
   <artifactId>grpc-metering</artifactId>
   <version>1.0.0</version>
 </dependency>

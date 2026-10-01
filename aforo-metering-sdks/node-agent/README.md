@@ -1,6 +1,6 @@
 # @aforoai/agent-metering
 
-Instrument an AI agent's runtime lifecycle — start session, record reasoning steps and tool calls, end session — and have Aforo bill and analyze the run. Sits one layer above the generic `@aforo/metering` client: events are POSTed directly with no peer dependency, buffered, batched, and flushed on a size/time threshold.
+Instrument an AI agent's runtime lifecycle — start session, record reasoning steps and tool calls, end session — and have Aforo bill and analyze the run. Sits one layer above the generic `@aforoai/metering` client: events are POSTed directly with no peer dependency, buffered, batched, and flushed on a size/time threshold.
 
 **Version:** 1.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 

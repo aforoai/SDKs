@@ -1,4 +1,4 @@
-# com.aforo:ws-metering
+# ai.aforo:ws-metering
 
 Meter WebSocket connections, frames, and bytes from any Java WebSocket stack. Call three methods from your open/message/close handlers — Jakarta WebSocket, Spring WebSocket, Netty, Undertow — and Aforo handles aggregation, batching, and retry.
 
@@ -10,7 +10,7 @@ Intended (once published to Maven Central):
 
 ```xml
 <dependency>
-  <groupId>com.aforo</groupId>
+  <groupId>ai.aforo</groupId>
   <artifactId>ws-metering</artifactId>
   <version>1.0.0</version>
 </dependency>

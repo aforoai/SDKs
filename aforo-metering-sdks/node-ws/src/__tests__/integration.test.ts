@@ -1,5 +1,5 @@
 /**
- * Real-broker integration test for @aforo/ws-metering.
+ * Real-broker integration test for @aforoai/ws-metering.
  *
  * Where the unit tests use a fake EventEmitter to stand in for the
  * WebSocket, this file:

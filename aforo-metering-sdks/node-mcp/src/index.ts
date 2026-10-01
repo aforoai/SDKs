@@ -1,11 +1,11 @@
 /**
- * @aforo/mcp-metering — Aforo MCP Server Metering SDK
+ * @aforoai/mcp-metering — Aforo MCP Server Metering SDK
  *
  * Wraps MCP tool handlers to automatically meter tool invocations,
  * track sessions, and enforce entitlements via Aforo's billing platform.
  *
  * Usage:
- *   import { AforoMcpBilling } from '@aforo/mcp-metering';
+ *   import { AforoMcpBilling } from '@aforoai/mcp-metering';
  *
  *   const billing = new AforoMcpBilling({
  *     tenantId: 'tenant_smartai',

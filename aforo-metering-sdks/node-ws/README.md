@@ -1,4 +1,4 @@
-# @aforo/ws-metering
+# @aforoai/ws-metering
 
 Meter WebSocket connections into Aforo — open, close, bytes, frame counts, and duration — by wrapping a `ws` server, or by tracking any connection that exposes the standard WebSocket event surface (Fastify-WebSocket, Socket.io, Deno, Bun).
 
@@ -9,7 +9,7 @@ Meter WebSocket connections into Aforo — open, close, bytes, frame counts, and
 Intended public install (once published):
 
 ```bash
-npm i @aforo/ws-metering ws
+npm i @aforoai/ws-metering ws
 ```
 
 > **Not yet on the public npm registry — install from source for now.** `ws` (`^8`) is an **optional** peer dependency — needed only if you use `wrapServer`. `trackConnection` works with any compatible socket.
@@ -29,7 +29,7 @@ npm install ws         # only if you use wrapServer
 
 ```ts
 import { WebSocketServer } from 'ws';
-import { AforoWsBilling } from '@aforo/ws-metering';
+import { AforoWsBilling } from '@aforoai/ws-metering';
 
 const billing = new AforoWsBilling({
   tenantId: 'tenant_acme',

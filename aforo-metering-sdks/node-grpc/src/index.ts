@@ -1,12 +1,12 @@
 /**
- * @aforo/grpc-metering — Aforo gRPC Metering SDK
+ * @aforoai/grpc-metering — Aforo gRPC Metering SDK
  *
  * Wraps gRPC server handlers (unary, server-stream, client-stream, bidi-stream)
  * to automatically meter per-method invocations and forward billing events to
  * Aforo's usage ingestor. Works with @grpc/grpc-js.
  *
  * Usage (unary handler):
- *   import { AforoGrpcBilling } from '@aforo/grpc-metering';
+ *   import { AforoGrpcBilling } from '@aforoai/grpc-metering';
  *
  *   const billing = new AforoGrpcBilling({
  *     tenantId: 'tenant_acme',

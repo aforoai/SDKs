@@ -1,4 +1,4 @@
-# @aforo/metering — User Guide
+# @aforoai/metering — User Guide
 
 **Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** Node/TypeScript engineers wiring usage metering into an API or service.
 
@@ -31,7 +31,7 @@ npm i /path/to/SDKs/aforo-metering-sdks/node/aforo-metering-1.0.0.tgz
 Create one `AforoClient` for the process lifetime — it owns the buffer and the background flush timer. Don't create one per request.
 
 ```ts
-import { AforoClient } from '@aforo/metering';
+import { AforoClient } from '@aforoai/metering';
 
 export const aforo = new AforoClient({
   apiKey: process.env.AFORO_API_KEY!,
@@ -52,7 +52,7 @@ await aforo.track({ customerId: 'cust_123', metricName: 'api_calls', quantity: 1
 Skip per-route `track()` calls entirely:
 
 ```ts
-import { expressMiddleware } from '@aforo/metering/middleware/express';
+import { expressMiddleware } from '@aforoai/metering/middleware/express';
 
 app.use(expressMiddleware({
   apiKey: process.env.AFORO_API_KEY!,
@@ -67,7 +67,7 @@ app.use(expressMiddleware({
 >
 > ⚠ The ingestor rejects any `metricName` not in your catalog, and one rejected event fails the whole batch. Earlier versions defaulted to `"<METHOD> <normalized-path>"` (e.g. `GET /users/:id`), which no catalog contains; the default is now `api_calls`.
 
-Fastify (`fastifyPlugin`) and Koa (`koaMiddleware`) imports follow the same shape under `@aforo/metering/middleware/fastify` and `/middleware/koa`.
+Fastify (`fastifyPlugin`) and Koa (`koaMiddleware`) imports follow the same shape under `@aforoai/metering/middleware/fastify` and `/middleware/koa`.
 
 ## Step 5 — Flush on shutdown
 

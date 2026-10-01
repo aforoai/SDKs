@@ -1,5 +1,5 @@
 /**
- * @aforo/graphql-metering — Aforo GraphQL Metering SDK
+ * @aforoai/graphql-metering — Aforo GraphQL Metering SDK
  *
  * Computes per-operation complexity using the GraphQL AST, captures the
  * operation type/name, and forwards billing events to Aforo's usage
@@ -10,7 +10,7 @@
  *
  * Usage (Apollo Server 4):
  *   import { ApolloServer } from '@apollo/server';
- *   import { AforoGraphQlBilling, aforoApolloPlugin } from '@aforo/graphql-metering';
+ *   import { AforoGraphQlBilling, aforoApolloPlugin } from '@aforoai/graphql-metering';
  *
  *   const billing = new AforoGraphQlBilling({
  *     tenantId: 'tenant_acme',

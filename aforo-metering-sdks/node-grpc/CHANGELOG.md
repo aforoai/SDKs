@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `@aforo/grpc-metering` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com); this package adheres to [SemVer](https://semver.org).
+All notable changes to `@aforoai/grpc-metering` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com); this package adheres to [SemVer](https://semver.org).
 
 ## [Unreleased]
 

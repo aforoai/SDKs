@@ -1,4 +1,4 @@
-# com.aforo:mqtt-metering
+# ai.aforo:mqtt-metering
 
 Meter MQTT client traffic — PUBLISH, SUBSCRIBE, CONNECT, DISCONNECT — from any Java MQTT client. Call one method per primitive from your Eclipse Paho (or other client) callbacks and Aforo handles batching and retry. For broker-side metering on EMQ X 5.x, use the companion Erlang plugin instead.
 
@@ -10,7 +10,7 @@ Intended (once published to Maven Central):
 
 ```xml
 <dependency>
-  <groupId>com.aforo</groupId>
+  <groupId>ai.aforo</groupId>
   <artifactId>mqtt-metering</artifactId>
   <version>1.0.0</version>
 </dependency>

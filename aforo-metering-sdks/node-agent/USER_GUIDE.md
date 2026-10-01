@@ -181,5 +181,5 @@ If you see that batch, the SDK is wired correctly. Then point `ingestorUrl` back
 ## What this guide does NOT cover
 
 - **Guaranteed delivery.** After its in-flush retries, a failed batch is dropped with a console warning — no on-disk queue, no retry-later. If a lost event is unacceptable, meter through an Aforo gateway plugin.
-- **Quota enforcement.** This SDK records usage; it does not block the agent when a limit is hit. Pre-flight quota gating lives in the MCP proxy (`@aforo/mcp-proxy --quota-enforcement`), not here.
+- **Quota enforcement.** This SDK records usage; it does not block the agent when a limit is hit. Pre-flight quota gating lives in the MCP proxy (`@aforoai/mcp-proxy --quota-enforcement`), not here.
 - **Rate-plan / metric setup.** Creating the AI_AGENT product, its metrics, and its rate plan is done in the Aforo console, not in this SDK.

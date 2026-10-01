@@ -1,4 +1,4 @@
-# com.aforo:mqtt-metering — User Guide
+# ai.aforo:mqtt-metering — User Guide
 
 **Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** Java engineers running an MQTT client (Eclipse Paho or other) who need per-message usage metering. For broker-side metering, see the EMQ X plugin instead.
 
@@ -25,7 +25,7 @@ Add to your service's `pom.xml`:
 
 ```xml
 <dependency>
-  <groupId>com.aforo</groupId>
+  <groupId>ai.aforo</groupId>
   <artifactId>mqtt-metering</artifactId>
   <version>1.0.0</version>
 </dependency>

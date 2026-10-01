@@ -1,5 +1,5 @@
 /**
- * @file Main exports for @aforo/mcp-proxy
+ * @file Main exports for @aforoai/mcp-proxy
  */
 
 export { StdioProxy } from './proxy/StdioProxy.js';

@@ -10,7 +10,7 @@ const DEFAULT_EXCLUDE_PATHS = ['/health', '/ready', '/metrics', '/favicon.ico'];
  * Uses the `onResponse` hook — runs AFTER the response is sent.
  *
  * ```typescript
- * import { fastifyPlugin } from '@aforo/metering/middleware/fastify';
+ * import { fastifyPlugin } from '@aforoai/metering/middleware/fastify';
  * fastify.register(fastifyPlugin, { apiKey: process.env.AFORO_API_KEY, productType: 'API' });
  * ```
  */

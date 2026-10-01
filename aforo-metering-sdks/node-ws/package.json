@@ -1,5 +1,5 @@
 {
-  "name": "@aforo/ws-metering",
+  "name": "@aforoai/ws-metering",
   "version": "1.0.0",
   "description": "Aforo WebSocket Metering SDK — wraps ws/Fastify-WebSocket/Socket.io connections to meter frames, bytes, and connection duration.",
   "main": "dist/index.js",

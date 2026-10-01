@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `@aforo/mcp-metering` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
+All notable changes to `@aforoai/mcp-metering` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 

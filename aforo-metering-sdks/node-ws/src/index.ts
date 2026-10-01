@@ -1,5 +1,5 @@
 /**
- * @aforo/ws-metering — Aforo WebSocket Metering SDK
+ * @aforoai/ws-metering — Aforo WebSocket Metering SDK
  *
  * Wraps WebSocket server connections to emit three classes of billing events:
  *   - CONNECTION_OPENED  — once on upgrade completion
@@ -12,7 +12,7 @@
  *
  * Usage:
  *   import { WebSocketServer } from 'ws';
- *   import { AforoWsBilling } from '@aforo/ws-metering';
+ *   import { AforoWsBilling } from '@aforoai/ws-metering';
  *
  *   const billing = new AforoWsBilling({
  *     tenantId: 'tenant_acme',

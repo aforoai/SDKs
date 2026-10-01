@@ -1,4 +1,4 @@
-# @aforo/grpc-metering
+# @aforoai/grpc-metering
 
 Wrap your `@grpc/grpc-js` server handlers and get one Aforo usage event per RPC — unary, server-stream, client-stream, or bidi — with status code, call type, message count, and duration attached. Your handler logic stays untouched.
 
@@ -9,7 +9,7 @@ Wrap your `@grpc/grpc-js` server handlers and get one Aforo usage event per RPC 
 Intended public install (once published):
 
 ```bash
-npm i @aforo/grpc-metering @grpc/grpc-js
+npm i @aforoai/grpc-metering @grpc/grpc-js
 ```
 
 > **Not yet on the public npm registry — install from source for now.** `@grpc/grpc-js` (`^1.9`) is a peer dependency; install it in your app.
@@ -29,7 +29,7 @@ npm install @grpc/grpc-js   # peer dependency, in your app
 
 ```ts
 import * as grpc from '@grpc/grpc-js';
-import { AforoGrpcBilling } from '@aforo/grpc-metering';
+import { AforoGrpcBilling } from '@aforoai/grpc-metering';
 import { UserServiceService } from './generated/user_grpc_pb';
 
 const billing = new AforoGrpcBilling({
