@@ -4,6 +4,8 @@ This monorepo ships five gateway metering plugins (Kong, Apigee, AWS Lambda, Azu
 
 ## Unreleased
 
+## v2.1.0 — 2026-10-01
+
 - Every event now carries `productType` (required by the ingestor in production): new per-plugin setting, default `API` — Kong `product_type`, Apigee KVM `product_type`, AWS Lambda `PRODUCT_TYPE` / `ProductType`, Azure Named Value `aforo-product-type`, MuleSoft `product-type`. MCP `tools/call` is sent as `MCP_SERVER` only when both `toolName` and `agentId` are present; events missing their type's required fields are skipped rather than failing the batch.
 - Kong and AWS Lambda honour `Retry-After` on 429 (up to 30 s). MuleSoft `occurredAt` is UTC.
 

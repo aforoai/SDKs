@@ -1,6 +1,6 @@
 # aforo-metering-lambda — User Guide
 
-**Version:** 2.0.0 · **Updated:** 2026-09-21 · **Audience:** engineers running AWS API Gateway who want API usage metered into Aforo from CloudWatch access logs.
+**Version:** 2.1.0 · **Updated:** 2026-10-01 · **Audience:** engineers running AWS API Gateway who want API usage metered into Aforo from CloudWatch access logs.
 
 ## What you'll build
 

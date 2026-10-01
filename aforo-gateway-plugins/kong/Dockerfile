@@ -36,7 +36,7 @@ USER root
 # rockspec passed as a path.
 COPY . /tmp/aforo-plugin/
 RUN cd /tmp/aforo-plugin \
-    && luarocks make kong-plugin-aforo-metering-2.0.0-1.rockspec \
+    && luarocks make kong-plugin-aforo-metering-2.1.0-1.rockspec \
     && rm -rf /tmp/aforo-plugin
 
 USER kong

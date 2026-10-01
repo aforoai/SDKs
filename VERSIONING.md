@@ -34,11 +34,11 @@ Each artifact versions independently. A Kong-plugin patch does not bump the Node
 | Artifact | Version |
 |---|---|
 | `aforo-metering-sdks/` — all Node, Python, Java, Go SDKs + `mcp-proxy` | `1.0.0` |
-| `aforo-gateway-plugins/` — `kong`, `aws-lambda`, `apigee`, `azure-apim`, `mulesoft` | `2.0.0` |
+| `aforo-gateway-plugins/` — `kong`, `aws-lambda`, `apigee`, `azure-apim`, `mulesoft` | `2.1.0` |
 | `aforo-emqx-plugin/` | `0.1.0` (experimental) |
 | `aforo-gateway-plugins/aws-cloudformation`, `aforo-gateway-plugins/azure-arm-templates` | `1.0.0` |
 
-The gateway plugins sit at `2.0.0` from their security-hardened release; the SDKs are on their own `1.x` line; the EMQX broker plugin is pre-1.0 (experimental). These are independent lines, not a single repo-wide version.
+The gateway plugins sit at `2.1.0` (`2.0.0` was their security-hardened release); the SDKs are on their own `1.x` line; the EMQX broker plugin is pre-1.0 (experimental). These are independent lines, not a single repo-wide version.
 
 ## Releasing
 

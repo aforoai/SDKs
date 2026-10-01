@@ -2,7 +2,7 @@
 
 A Kong Gateway plugin that captures API usage events in Kong's `log` phase and batch-forwards them to Aforo for billing and analytics. Metering runs after the response is sent, so it adds no latency to the request path.
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -27,7 +27,7 @@ cd SDKs/aforo-gateway-plugins/kong
 luarocks install lua-resty-http
 
 # 3. Build + install the plugin from the rockspec in this folder
-luarocks make kong-plugin-aforo-metering-2.0.0-1.rockspec
+luarocks make kong-plugin-aforo-metering-2.1.0-1.rockspec
 ```
 
 Then tell Kong to load it and reserve the shared-memory buffer the log phase writes to. In `kong.conf`:

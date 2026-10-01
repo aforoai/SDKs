@@ -2,7 +2,7 @@
 
 Anypoint custom policies that meter Standard API requests and MCP Server tool invocations via a DataWeave transformation in the response phase, with JWT validation, margin-guard, pre-flight quota, and compound metering. Bill API traffic from the gateway, with identity taken only from a verified JWT.
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 > ## ⛔ NOT PRODUCTION-READY — requires rebuild as a Mule 4 custom policy (mule-policy Maven project) or Flex Gateway PDK policy
 >

@@ -2,7 +2,7 @@
 
 Azure APIM policy fragments that meter Standard API requests and MCP Server tool invocations from the gateway's outbound phase, plus optional inbound JWT validation, margin-guard, pre-flight quota, and compound metering. Bill API traffic without changing your backend.
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## When to reach for this
 

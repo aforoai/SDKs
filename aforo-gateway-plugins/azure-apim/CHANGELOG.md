@@ -4,6 +4,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-10-01
+
 ### Added
 - Named Value `aforo-product-type` (default `API`; `none` = `API`), resolved once by `aforo-context` into the variable `aforo-product-type` (a per-API `set-variable` before `aforo-context` overrides it). Every metering and compound event now carries the `productType` the ingestor requires in production. **Breaking**: the Named Value must exist.
 

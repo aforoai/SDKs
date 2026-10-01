@@ -1,9 +1,9 @@
 package = "kong-plugin-aforo-metering"
-version = "2.0.0-1"
+version = "2.1.0-1"
 
 source = {
     url = "git+https://github.com/aforoai/kong-plugin-aforo-metering.git",
-    tag = "v2.0.0",
+    tag = "kong-v2.1.0",
 }
 
 description = {

@@ -1,6 +1,6 @@
 # aforo-metering (Apigee shared flow) — User Guide
 
-**Version:** 2.0.0 · **Updated:** 2026-09-21 · **Audience:** engineers running Apigee X / hybrid who want API usage metered into Aforo without changing their proxies' business logic.
+**Version:** 2.1.0 · **Updated:** 2026-10-01 · **Audience:** engineers running Apigee X / hybrid who want API usage metered into Aforo without changing their proxies' business logic.
 
 ## What you'll build
 
