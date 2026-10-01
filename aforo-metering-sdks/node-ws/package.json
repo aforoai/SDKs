@@ -47,5 +47,14 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aforoai/SDKs.git",
+    "directory": "aforo-metering-sdks/node-ws"
+  },
+  "homepage": "https://github.com/aforoai/SDKs/tree/main/aforo-metering-sdks/node-ws#readme",
+  "bugs": {
+    "url": "https://github.com/aforoai/SDKs/issues"
   }
 }
