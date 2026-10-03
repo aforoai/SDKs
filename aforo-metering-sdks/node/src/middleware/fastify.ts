@@ -1,6 +1,6 @@
-import { AforoClient } from '../client';
-import { MiddlewareOptions } from '../types';
-import { isPreflight, resolveMetricName, firstNonEmpty, endpointPathOf } from './common';
+import { AforoClient } from '../client.js';
+import { MiddlewareOptions } from '../types.js';
+import { isPreflight, resolveMetricName, firstNonEmpty, endpointPathOf, httpMethodOf } from './common.js';
 
 const DEFAULT_EXCLUDE_PATHS = ['/health', '/ready', '/metrics', '/favicon.ico'];
 
@@ -72,7 +72,7 @@ export async function fastifyPlugin(fastify: any, options: MiddlewareOptions) {
         metadata,
         productType: options.productType,
         endpointPath: endpointPathOf(path),
-        httpMethod: method,
+        httpMethod: httpMethodOf(method),
         statusCode,
         ...(typeof elapsed === 'number' ? { responseTimeMs: Math.round(elapsed) } : {}),
       }).catch(() => {});

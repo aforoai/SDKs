@@ -1,8 +1,8 @@
 # @aforoai/agent-metering
 
-Instrument an AI agent's runtime lifecycle — start session, record reasoning steps and tool calls, end session — and have Aforo bill and analyze the run. Sits one layer above the generic `@aforoai/metering` client: events are POSTed directly with no peer dependency, buffered, batched, and flushed on a size/time threshold.
+Instrument an AI agent's runtime lifecycle — start session, record reasoning steps and tool calls, end session — and have Aforo bill and analyze the run. Events are POSTed directly (no peer dependency on `@aforoai/metering`), buffered, and flushed on a size/time threshold.
 
-**Version:** 1.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 1.2.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -10,13 +10,13 @@ Instrument an AI agent's runtime lifecycle — start session, record reasoning s
 npm i @aforoai/agent-metering
 ```
 
-> **Not yet on the public npm registry.** Until it's published, install from source:
+> **Install `1.2.0` or later. `1.0.0` on npm was built from an older copy of this code and lacks the fixes listed in the changelog.** If `1.2.0` is not on npm yet, install from source:
 > ```bash
 > git clone https://github.com/aforoai/SDKs.git
 > cd SDKs/aforo-metering-sdks/node-agent
 > npm install && npm run build
-> npm pack        # produces aforoai-agent-metering-1.0.0.tgz
-> # then in your agent project: npm i /path/to/aforoai-agent-metering-1.0.0.tgz
+> npm pack        # produces aforoai-agent-metering-1.2.0.tgz
+> # then in your agent project: npm i /path/to/aforoai-agent-metering-1.2.0.tgz
 > ```
 
 Requires Node >= 18 (uses the built-in `fetch`). On Node < 18, pass your own `fetchImpl` in the config.
@@ -33,7 +33,7 @@ const agent = new AforoAgent({
   productId: 'prod_agent_001',
   apiKey: process.env.AFORO_API_KEY!,
   customerId: 'cust_acme_001', // the customer this agent's usage is billed to
-  productType: 'AI_AGENT',      // default; sent as top-level productType on every event
+  productType: 'AI_AGENT',      // default
 });
 
 const session = await agent.startSession({
@@ -68,22 +68,39 @@ Pass these to `new AforoAgent({...})`:
 | `tenantId` | `string` | — (required) | Aforo tenant scope. Stamped on every event and sent as `X-Tenant-Id`. Never read from a client header. |
 | `productId` | `string` | — (required) | The AI_AGENT product these events bill against. |
 | `apiKey` | `string` | — (required) | Sent as `X-API-Key: <apiKey>`. Use `process.env.AFORO_API_KEY`. |
-| `customerId` | `string` | — | Aforo customer the usage is billed to. Required here or per session via `startSession({ customerId })`; `startSession` throws if neither is set. |
-| `productType` | `string` | `AI_AGENT` | Top-level `productType` on every event (required by the ingestor). Override per session with `startSession({ productType })` or per event with `emitEvent({ productType })`. Trimmed and uppercased. |
-| `ingestorUrl` | `string` | `https://api.aforo.ai/v1/ingest/batch` | Full batch-ingest URL. Override for local dev or air-gapped deployments. A URL ending in `/v1/ingest` is rewritten to `/v1/ingest/batch`. |
-| `flushBatchSize` | `number` | `50` | Buffer this many events before forcing a flush. Lower it for low-volume agents to surface metrics sooner; raise it to amortize per-batch HTTP cost. |
+| `customerId` | `string` | — | Aforo customer the usage is billed to, sent top-level on every event. Set it here, per session via `startSession({ customerId })`, or per event. Events without one are dropped as `invalid`. |
+| `productType` | `string` | `AI_AGENT` | `productType` on every event. Override per session with `startSession({ productType })` or per event with `emitEvent({ productType })`. Trimmed and uppercased. The `/v1/ingest/events` endpoint derives the product type from the event type (`agent_*` and `token_usage` are AI_AGENT). |
+| `ingestorUrl` | `string` | `https://api.aforo.ai/v1/ingest` | Ingest base URL. Each event is POSTed to `<ingestorUrl>/events`. A bare host gets `/v1/ingest` added; a URL ending in `/events` or `/batch` is accepted. |
+| `flushBatchSize` | `number` | `50` | Buffer this many events before forcing a flush. Lower it for low-volume agents to surface metrics sooner. |
 | `flushIntervalMs` | `number` | `5000` | Max time an event sits in the buffer before a timed flush. `session.end()` flushes regardless. |
-| `maxRetries` | `number` | `3` | Attempts per batch for 408/429/5xx/network failures. Other 4xx are not retried. |
+| `maxRetries` | `number` | `3` | Attempts per event for 408/429/5xx/network failures. Other 4xx are not retried. |
 | `retryBaseDelayMs` | `number` | `1000` | Base backoff between attempts (doubles each time); a 429's `Retry-After` wins. |
+| `onDrop` | `(events, reason) => void` | unset | Called with events the SDK is about to lose. `reason` is `retry_exhausted`, `rejected` or `invalid`. See [Dropped events](#dropped-events). |
 | `fetchImpl` | `typeof fetch` | global `fetch` | Pluggable transport. Required on Node < 18 where there's no global `fetch`; also the seam used in tests. |
 
 ### Per-session and per-step options
 
-`startSession({...})` — `agentId` (required, at most 36 characters), optional `customerId` (overrides the client's), `productType` (overrides the client's), `sessionId` (a UUID is generated if omitted), `traceId` (defaults to the sessionId), `framework` (`CLAUDE` \| `GPT` \| `LANGCHAIN` \| `CREWAI` \| `AUTOGEN` \| `CUSTOM`), `modelProvider` (`ANTHROPIC` \| `OPENAI` \| `GOOGLE` \| `COHERE` \| `CUSTOM`), `modelName`, and free-form `metadata`.
+`startSession({...})` — `agentId` (required, at most 36 characters), optional `customerId` (overrides the client's), `productType` (overrides the client's), `sessionId` (generated if omitted, at most 64 characters), `traceId`, `framework` (`CLAUDE` \| `GPT` \| `LANGCHAIN` \| `CREWAI` \| `AUTOGEN` \| `CUSTOM`), `modelProvider` (`ANTHROPIC` \| `OPENAI` \| `GOOGLE` \| `COHERE` \| `CUSTOM`), `modelName`, and free-form `metadata`.
 
-`recordStep({...})` — `stepKind` (`TOOL_CALL` \| `THOUGHT` \| `OBSERVATION` \| `FINAL_ANSWER`, required), optional `capabilityName`, `inputTokens`, `outputTokens`, `durationMs`, `executionStatus` (`SUCCESS` \| `ERROR` \| `TIMEOUT` \| `CANCELLED` \| `HITL_REQUIRED`, defaults `SUCCESS`), `parentStepId`, and `metadata`. The ingestor only accepts `SUCCESS`/`ERROR`/`TIMEOUT` as `executionStatus`, so `CANCELLED` and `HITL_REQUIRED` are sent as `metadata.agentExecutionStatus` instead. `session.recordToolCall(toolName, opts)` is the shortcut for the common `TOOL_CALL` case.
+`recordStep({...})` — `stepKind` (`TOOL_CALL` \| `THOUGHT` \| `OBSERVATION` \| `FINAL_ANSWER`, required), optional `capabilityName`, `inputTokens`, `outputTokens`, `durationMs`, `executionStatus` (defaults `SUCCESS`; see below), `parentStepId`, and `metadata`. `session.recordToolCall(toolName, opts)` is the shortcut for the common `TOOL_CALL` case.
 
 `end({...})` — `taskCompleted` (required), optional `errorMessage` and `metadata`.
+
+### Execution status
+
+`executionStatus` feeds outcome-based pricing: an OUTCOME_BASED rate plan bills each step at the weight set for its status. Accepted values (exported as `EXECUTION_STATUSES`, type `ExecutionStatus`): `SUCCESS`, `PARTIAL`, `TIMEOUT`, `ERROR`, `VALIDATION_FAILED`, `FAILED`, `FAILURE`, `CANCELLED`, `PENDING`, `BLOCKED`, `HITL_REQUIRED`. The value is trimmed and upper-cased; missing or blank is `SUCCESS`. Any other value is WARN-logged and left off the event, which is still sent and bills at full weight. A `metadata.executionStatus` cannot override the step's status.
+
+### Dropped events
+
+Every event the SDK loses is counted in `agent.droppedCount`, WARN-logged, and passed to the opt-in `onDrop(events, reason)` hook. Events keep their idempotency keys (stamped once, when the event is created), so re-submitting them is dedup-safe.
+
+| `reason` | When |
+|---|---|
+| `retry_exhausted` | Every send attempt failed (network error, 5xx, 408, 429). |
+| `rejected` | The ingestor returned a non-retryable 4xx. The WARN carries the server's message. |
+| `invalid` | The event failed a client-side check and was never sent. |
+
+`invalid` covers: no `customerId`; blank `metricKey`, `agentId` or `sessionId`; `value` not > 0; `customerId` over 64 characters, `agentId` over 36, `sessionId` over 64, `capabilityName` over 64, `metricKey` over 255, `productType` over 20. `startSession()` and `emitEvent()` do not throw for these, and nothing is truncated. The WARN is logged for the first invalid event and then every 1000th.
 
 ## Walk me through it
 
@@ -91,4 +108,4 @@ Step-by-step from install to a verified event in Aforo: [USER_GUIDE.md](USER_GUI
 
 ## What this doesn't cover
 
-Delivery is **best-effort**. 408/429/5xx/network failures are retried (`maxRetries`, default 3; `Retry-After` honoured); after that, or on any other 4xx, `flush()` logs a warning and **drops** the batch — there's no on-disk queue or dead-letter. That's the same posture as the generic and MCP SDKs: direct SDK emit is for first-party customers running their own agents. For billing where a dropped event is unacceptable, meter through a gateway plugin instead. This SDK also does not enforce quotas — it records usage, it doesn't gate the agent on a limit.
+Delivery is **best-effort**. 408/429/5xx/network failures are retried (`maxRetries`, default 3; `Retry-After` honoured); after that, or on any other 4xx, the event is dropped and reported (see [Dropped events](#dropped-events)) — there is no on-disk queue. For billing where a dropped event is unacceptable, persist events from `onDrop`, or meter through a gateway plugin instead. This SDK also does not enforce quotas — it records usage, it doesn't gate the agent on a limit.

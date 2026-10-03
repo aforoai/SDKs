@@ -16,6 +16,26 @@ export interface IngestorClientConfig {
   maxRetries?: number;
 }
 
+/** Outcome of {@link IngestorClient.sendBatchDetailed}. */
+export interface BatchSendOutcome {
+  result: BatchIngestResponse | null;
+  reason?: 'rejected' | 'retry_exhausted';
+  message?: string;
+}
+
+/** Best-effort server explanation for a rejected request. */
+async function readErrorMessage(response: { json?: () => Promise<unknown> }): Promise<string | undefined> {
+  try {
+    const body = (await response.json?.()) as Record<string, any> | undefined;
+    if (!body || typeof body !== 'object') return undefined;
+    const first = Array.isArray(body.errors) ? body.errors[0] : undefined;
+    const text = first?.message ?? body.detail ?? body.message ?? body.error ?? body.title;
+    return typeof text === 'string' && text ? text.slice(0, 500) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export class IngestorClient {
   private readonly baseUrl: string;
   private readonly apiKey: string;
@@ -31,8 +51,20 @@ export class IngestorClient {
     this.maxRetries = config.maxRetries ?? 3;
   }
 
+  /** Send a batch. Resolves to the parsed response, or null when the batch was not delivered. */
   async sendBatch(events: ProxyUsageEvent[]): Promise<BatchIngestResponse | null> {
-    if (events.length === 0) return { accepted: 0, duplicates: 0, failed: 0 };
+    return (await this.sendBatchDetailed(events)).result;
+  }
+
+  /**
+   * Send a batch and say why it failed. `result` is null when the batch was
+   * not delivered; `reason` is then 'rejected' (non-retryable 4xx) or
+   * 'retry_exhausted', and `message` carries the server's explanation when it
+   * gave one. The body is serialized once, so every retry re-sends the same
+   * idempotency keys.
+   */
+  async sendBatchDetailed(events: ProxyUsageEvent[]): Promise<BatchSendOutcome> {
+    if (events.length === 0) return { result: { accepted: 0, duplicates: 0, failed: 0 } };
 
     const url = `${this.baseUrl}/v1/ingest/batch`;
     const body = JSON.stringify({ events });
@@ -52,25 +84,26 @@ export class IngestorClient {
 
         if (response.ok) {
           try {
-            const result = await response.json() as BatchIngestResponse;
+            const result = unwrapEnvelope(await response.json()) as BatchIngestResponse;
             if (result && result.failed > 0) {
               logger.warn('Ingestor rejected some events', {
                 failed: result.failed,
                 errors: (result.errors ?? []).slice(0, 5).map(e => `#${e.index}: ${e.message}`),
               });
             }
-            return result;
+            return { result };
           } catch {
             // Old ingestor may return empty 202
-            return { accepted: events.length, duplicates: 0, failed: 0 };
+            return { result: { accepted: events.length, duplicates: 0, failed: 0 } };
           }
         }
 
         // 4xx (except 408, 429) — bad input, don't retry
         if (response.status >= 400 && response.status < 500
             && response.status !== 408 && response.status !== 429) {
-          logger.error('Ingestor returned non-retryable error', { status: response.status, attempt });
-          return null;
+          const message = await readErrorMessage(response);
+          logger.error('Ingestor returned non-retryable error', { status: response.status, attempt, ...(message ? { message } : {}) });
+          return { result: null, reason: 'rejected', message: `HTTP ${response.status}${message ? `: ${message}` : ''}` };
         }
 
         // 429 — respect Retry-After
@@ -92,7 +125,7 @@ export class IngestorClient {
         }
 
         logger.error('Ingestor exhausted retries', { status: response.status, attempts: this.maxRetries });
-        return null;
+        return { result: null, reason: 'retry_exhausted', message: `HTTP ${response.status}` };
 
       } catch (err) {
         if (attempt < this.maxRetries) {
@@ -101,11 +134,11 @@ export class IngestorClient {
           continue;
         }
         logger.error('Ingestor request failed after all retries', { error: (err as Error).message });
-        return null;
+        return { result: null, reason: 'retry_exhausted', message: (err as Error).message };
       }
     }
 
-    return null;
+    return { result: null, reason: 'retry_exhausted' };
   }
 
   /**
@@ -134,7 +167,7 @@ export class IngestorClient {
         return null;
       }
       try {
-        return await response.json() as BatchIngestResponse;
+        return unwrapEnvelope(await response.json()) as BatchIngestResponse;
       } catch {
         return { accepted: 1, duplicates: 0, failed: 0 };
       }
@@ -147,4 +180,13 @@ export class IngestorClient {
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
+}
+
+/**
+ * The ingestor wraps every 2xx JSON body in `{success, data, meta}`. Returns
+ * the inner `data` object when present, else the body unchanged (bare shape).
+ */
+export function unwrapEnvelope(body: any): any {
+  const data = body && typeof body === 'object' && !Array.isArray(body) ? body.data : undefined;
+  return data && typeof data === 'object' && !Array.isArray(data) ? data : body;
 }

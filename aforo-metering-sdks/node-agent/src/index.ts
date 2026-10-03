@@ -53,12 +53,46 @@ export type StepKind =
   | 'OBSERVATION'
   | 'FINAL_ANSWER';
 
-export type ExecutionStatus =
-  | 'SUCCESS'
-  | 'ERROR'
-  | 'TIMEOUT'
-  | 'CANCELLED'
-  | 'HITL_REQUIRED';
+/**
+ * The 11 canonical execution statuses the usage ingestor accepts (the same
+ * set as contract/ingest-contract.json and the core SDKs). OUTCOME_BASED rate
+ * plans bill each step at the weight set for its status; the SDK drops an
+ * unknown value (with a warning) and the step bills at full weight.
+ */
+export const EXECUTION_STATUSES = [
+  'SUCCESS',
+  'PARTIAL',
+  'TIMEOUT',
+  'ERROR',
+  'VALIDATION_FAILED',
+  'FAILED',
+  'FAILURE',
+  'CANCELLED',
+  'PENDING',
+  'BLOCKED',
+  'HITL_REQUIRED',
+] as const;
+
+export type ExecutionStatus = (typeof EXECUTION_STATUSES)[number];
+
+/**
+ * Trims and upper-cases a caller's status; missing or blank → SUCCESS (the
+ * step ran). A value outside {@link EXECUTION_STATUSES} is logged and left
+ * off the event, so the step bills at full weight — what the server would do
+ * with it anyway.
+ */
+function normalizeExecutionStatus(value: unknown): ExecutionStatus | undefined {
+  if (value === undefined || value === null) return 'SUCCESS';
+  if (typeof value !== 'string') {
+    console.warn('[aforo-agent] executionStatus must be a string; dropping it', value);
+    return undefined;
+  }
+  const status = value.trim().toUpperCase();
+  if (!status) return 'SUCCESS';
+  if ((EXECUTION_STATUSES as readonly string[]).includes(status)) return status as ExecutionStatus;
+  console.warn(`[aforo-agent] "${value}" is not an execution status; dropping it (the step bills at full weight)`);
+  return undefined;
+}
 
 export interface AforoAgentConfig {
   tenantId: string;
@@ -71,18 +105,21 @@ export interface AforoAgentConfig {
    */
   customerId?: string;
   /**
-   * Top-level {@code productType} stamped on every event (required by the
-   * ingestor in production). Defaults to {@code AI_AGENT}; trimmed and
-   * uppercased, unknown values are passed through. Overridable per session
+   * {@code productType} stamped on every event. Defaults to {@code AI_AGENT};
+   * trimmed and uppercased, unknown values are passed through. (The
+   * {@code /v1/ingest/events} endpoint itself derives the product type from
+   * the event type — {@code agent_*} and {@code token_usage} are AI_AGENT.)
+   * Overridable per session
    * ({@link StartSessionOptions.productType}) and per event
    * ({@link AgentEventInput.productType}).
    */
   productType?: string;
   /**
-   * Aforo usage-ingestor batch URL. Defaults to
-   * {@code https://api.aforo.ai/v1/ingest/batch} — override for
-   * local dev or air-gapped deployments. A URL ending in {@code /v1/ingest}
-   * (the old default) is rewritten to {@code /v1/ingest/batch}.
+   * Aforo usage-ingestor URL. Defaults to
+   * {@code https://api.aforo.ai/v1/ingest} — override for local dev or
+   * air-gapped deployments. Events are POSTed one per request to
+   * {@code <ingestorUrl>/events}; a URL already ending in {@code /events}
+   * or {@code /batch} is accepted.
    */
   ingestorUrl?: string;
   /**
@@ -97,7 +134,7 @@ export interface AforoAgentConfig {
    */
   flushIntervalMs?: number;
   /**
-   * Attempts per batch for 408/429/5xx/network failures (other 4xx are never
+   * Attempts per event for 408/429/5xx/network failures (other 4xx are never
    * retried). Defaults to 3.
    */
   maxRetries?: number;
@@ -105,7 +142,20 @@ export interface AforoAgentConfig {
   retryBaseDelayMs?: number;
   /** Pluggable transport for tests. Defaults to global {@code fetch}. */
   fetchImpl?: typeof fetch;
+  /**
+   * Opt-in hook receiving events that were permanently dropped:
+   * 'retry_exhausted' — every send attempt failed (network error, 5xx, 408,
+   * 429); 'rejected' — the ingestor returned a non-retryable 4xx; 'invalid' —
+   * the event failed a client-side check and was never sent. Events carry their idempotency keys (stamped
+   * at creation), so persisting and re-submitting them after recovery is
+   * dedup-safe. Exceptions thrown by the hook are swallowed. Default:
+   * none (drops are still counted in droppedCount and WARN-logged).
+   */
+  onDrop?: (events: UsageEvent[], reason: DropReason) => void;
 }
+
+/** Why an event was permanently dropped. */
+export type DropReason = 'retry_exhausted' | 'rejected' | 'invalid';
 
 export interface StartSessionOptions {
   agentId: string;
@@ -142,56 +192,56 @@ export interface EndSessionOptions {
   metadata?: Record<string, unknown>;
 }
 
-/**
- * Input to {@link AforoAgent.emitEvent}. {@code properties} keys that have a
- * first-class ingest field (capabilityName, executionStatus, durationMs,
- * stepIndex, parentStepId) are promoted to it; everything else lands in the
- * event's {@code metadata}.
- */
-export interface AgentEventInput {
+export interface UsageEvent {
+  tenantId: string;
+  productId: string;
+  /** Aforo customer billed for the event (top-level `customerId` on the wire). */
+  customerId: string;
+  /** Product type of the event (default AI_AGENT). */
+  productType: string;
   eventType: string;
   metricKey: string;
   value: number;
   agentId: string;
   sessionId: string;
-  properties: Record<string, unknown>;
-  /** Defaults to the client's {@code customerId}. */
-  customerId?: string;
-  /** Defaults to the sessionId. */
-  traceId?: string;
-  /** Defaults to the client's {@code productType} ({@code AI_AGENT}). */
-  productType?: string;
-}
-
-/** One event in a {@code POST /v1/ingest/batch} body (usage-ingestor IngestUsageEventRequest). */
-interface IngestEvent {
-  customerId: string;
-  metricName: string;
-  quantity: number;
-  occurredAt: string;
-  idempotencyKey: string;
-  productType: string;
-  agentId: string;
-  sessionId: string;
-  traceId: string;
-  stepNumber?: number;
-  parentStepId?: string;
+  /**
+   * Top-level capability name — parity with MCP's toolName. When present, the
+   * usage-ingestor extractor prefers this over metadata.capability_name /
+   * metadata.capabilityName (see ApigeeEventRequest.capabilityName + G11
+   * precedence chain, 2026-07-11). Omitted for non-capability events like
+   * agent_session_start / agent_session_end.
+   */
   capabilityName?: string;
-  executionStatus?: 'SUCCESS' | 'ERROR' | 'TIMEOUT';
-  executionDurationMs?: number;
-  metadata: Record<string, unknown>;
+  properties: Record<string, unknown>;
+  /** Distributed-trace id, when the caller supplied one. */
+  traceId?: string;
+  timestamp: string;
+  /** Stamped at event creation — dedup-safe replay of dropped events. */
+  idempotencyKey: string;
 }
 
-const DEFAULT_INGESTOR = 'https://api.aforo.ai/v1/ingest/batch';
-const DEFAULT_PRODUCT_TYPE = 'AI_AGENT';
-/** Ingestor limit on agentId (IngestUsageEventRequest @Size(max = 36)). */
-const MAX_AGENT_ID = 36;
-/** The ingestor rejects batches over 1000 events. */
-const MAX_BATCH_EVENTS = 1000;
-/** executionStatus values the ingestor accepts; others ride in metadata.agentExecutionStatus. */
-const INGEST_EXECUTION_STATUSES = new Set(['SUCCESS', 'ERROR', 'TIMEOUT']);
+/**
+ * Input to {@link AforoAgent.emitEvent}: a {@link UsageEvent} without the
+ * fields the client stamps. `customerId` and `productType` default to the
+ * client's values.
+ */
+export type AgentEventInput =
+  Omit<UsageEvent, 'tenantId' | 'productId' | 'timestamp' | 'idempotencyKey' | 'customerId' | 'productType'> & {
+    /** Defaults to the client's {@code customerId}. */
+    customerId?: string;
+    /** Defaults to the client's {@code productType} ({@code AI_AGENT}). */
+    productType?: string;
+  };
 
-let eventSeq = 0;
+const DEFAULT_INGESTOR = 'https://api.aforo.ai/v1/ingest';
+const DEFAULT_PRODUCT_TYPE = 'AI_AGENT';
+/** Ingestor field limits (IngestUsageEventRequest / ApigeeEventRequest @Size). */
+const MAX_AGENT_ID = 36;
+const MAX_CUSTOMER_ID = 64;
+const MAX_SESSION_ID = 64;
+const MAX_CAPABILITY_NAME = 64;
+const MAX_METRIC_NAME = 255;
+const MAX_PRODUCT_TYPE = 20;
 
 function normalizeProductType(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
@@ -199,8 +249,61 @@ function normalizeProductType(value: unknown): string | undefined {
   return trimmed ? trimmed.toUpperCase() : undefined;
 }
 
+/** Shorten an offending value for a log line. */
+function clip(value: unknown): string {
+  return String(value).slice(0, 80);
+}
+
+/**
+ * `<base>/events`. Accepts the base (`…/v1/ingest`), a bare host
+ * (`https://api.aforo.ai` → `/v1/ingest` is added) and, for callers who pass
+ * a full endpoint, `…/v1/ingest/events` or `…/v1/ingest/batch`.
+ */
+function eventsUrl(ingestorUrl: string | undefined): string {
+  let base = (ingestorUrl || DEFAULT_INGESTOR).replace(/\/+$/, '').replace(/\/(events|batch)$/, '');
+  if (/^[a-z][a-z0-9+.-]*:\/\/[^/]+$/i.test(base)) base += '/v1/ingest';
+  return base + '/events';
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** First reason the ingestor would reject this event, or null. */
+function describeInvalidEvent(ev: UsageEvent): string | null {
+  const blank = (v: unknown) => typeof v !== 'string' || !v.trim();
+  if (blank(ev.customerId)) {
+    return 'customerId is required (config.customerId, startSession({ customerId }) or emitEvent({ customerId }))';
+  }
+  if (ev.customerId.length > MAX_CUSTOMER_ID) return `customerId "${clip(ev.customerId)}" exceeds ${MAX_CUSTOMER_ID} chars`;
+  if (blank(ev.metricKey)) return `metricKey is required (got "${clip(ev.metricKey)}")`;
+  if (ev.metricKey.length > MAX_METRIC_NAME) return `metricKey "${clip(ev.metricKey)}" exceeds ${MAX_METRIC_NAME} chars`;
+  if (blank(ev.agentId)) return `agentId is required (got "${clip(ev.agentId)}")`;
+  if (ev.agentId.length > MAX_AGENT_ID) return `agentId "${clip(ev.agentId)}" exceeds ${MAX_AGENT_ID} chars`;
+  if (blank(ev.sessionId)) return `sessionId is required (got "${clip(ev.sessionId)}")`;
+  if (ev.sessionId.length > MAX_SESSION_ID) return `sessionId "${clip(ev.sessionId)}" exceeds ${MAX_SESSION_ID} chars`;
+  if (typeof ev.value !== 'number' || !Number.isFinite(ev.value) || ev.value <= 0) {
+    return `value must be a number > 0 (got "${clip(ev.value)}")`;
+  }
+  if (typeof ev.capabilityName === 'string' && ev.capabilityName.length > MAX_CAPABILITY_NAME) {
+    return `capabilityName "${clip(ev.capabilityName)}" exceeds ${MAX_CAPABILITY_NAME} chars`;
+  }
+  if (ev.productType.length > MAX_PRODUCT_TYPE) return `productType "${clip(ev.productType)}" exceeds ${MAX_PRODUCT_TYPE} chars`;
+  return null;
+}
+
+/** Best-effort server explanation for a rejected request. */
+async function readErrorMessage(res: { json?: () => Promise<unknown> }): Promise<string | undefined> {
+  try {
+    if (typeof res.json !== 'function') return undefined;
+    const body = (await res.json()) as Record<string, any> | undefined;
+    if (!body || typeof body !== 'object') return undefined;
+    const first = Array.isArray(body.errors) ? body.errors[0] : undefined;
+    const text = first?.message ?? body.detail ?? body.message ?? body.error ?? body.title;
+    return typeof text === 'string' && text ? text.slice(0, 500) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -211,6 +314,55 @@ function sleep(ms: number): Promise<void> {
 function genId(): string {
   return 'sess_' + Math.random().toString(36).substring(2, 10)
       + Date.now().toString(36);
+}
+
+/** Random idempotency key stamped at event creation (dedup opt-out). */
+function genKey(): string {
+  const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+  if (c && typeof c.randomUUID === 'function') return 'agent:' + c.randomUUID();
+  // Fallback for Node <18 with an injected fetchImpl: two random draws +
+  // time — collision-safe enough for a dedup-opt-out key.
+  return 'agent:' + Math.random().toString(36).slice(2, 12)
+      + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+/**
+ * Map an internal event to the Apigee-format shape `/v1/ingest/events`
+ * accepts. customerId is top-level (the endpoint requires it). The endpoint
+ * derives the product type from eventType (`agent_*` / `token_usage` →
+ * AI_AGENT); productType is still sent, top-level and in properties, so it is
+ * on record. agentId/sessionId/productId ride in properties (the server maps
+ * properties → metadata).
+ *
+ * G11 (2026-07-11): capabilityName is emitted BOTH as a top-level field
+ * (matches the server's ApigeeEventRequest.capabilityName so it survives the
+ * mapper into IngestUsageEventRequest.capabilityName) AND left inside
+ * properties for backward compat with older servers that only read metadata.
+ * The server's extractor precedence chain (top-level wins) resolves any
+ * conflict deterministically.
+ */
+function toApigeeEvent(ev: UsageEvent): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    eventType: ev.eventType,
+    metricKey: ev.metricKey,
+    value: ev.value,
+    customerId: ev.customerId,
+    productType: ev.productType,
+    timestamp: ev.timestamp,
+    idempotencyKey: ev.idempotencyKey,
+    properties: {
+      ...ev.properties,
+      agentId: ev.agentId,
+      sessionId: ev.sessionId,
+      productId: ev.productId,
+      productType: ev.productType,
+      ...(ev.traceId ? { traceId: ev.traceId } : {}),
+    },
+  };
+  if (ev.capabilityName && ev.capabilityName.trim().length > 0) {
+    payload.capabilityName = ev.capabilityName;
+  }
+  return payload;
 }
 
 /**
@@ -244,6 +396,10 @@ export class AgentSession {
       value: 1,
       agentId: this.agentId,
       sessionId: this.sessionId,
+      // G11 (2026-07-11): top-level capabilityName for per-capability billing parity
+      // with MCP's toolName. Kept in properties too for backward-compat with servers
+      // that only read the metadata path.
+      capabilityName: options.capabilityName,
       customerId: this.customerId,
       traceId: this.traceId,
       productType: this.productType,
@@ -251,13 +407,14 @@ export class AgentSession {
         stepKind: options.stepKind,
         stepIndex: this.stepCount,
         capabilityName: options.capabilityName,
-        executionStatus: options.executionStatus || 'SUCCESS',
         inputTokens: options.inputTokens || 0,
         outputTokens: options.outputTokens || 0,
         durationMs: options.durationMs,
         parentStepId: options.parentStepId,
         ...this.meta,
         ...(options.metadata || {}),
+        // Last, so a metadata key of the same name can't override it.
+        executionStatus: normalizeExecutionStatus(options.executionStatus),
       },
     });
     if (options.inputTokens || options.outputTokens) {
@@ -324,9 +481,11 @@ export class AgentSession {
  * One instance per process is enough — sessions share the same flush queue.
  */
 export class AforoAgent {
-  private readonly buffer: IngestEvent[] = [];
+  private readonly buffer: UsageEvent[] = [];
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly fetchImpl: typeof fetch;
+  private dropped = 0;
+  private invalidDrops = 0;
   private readonly productType: string;
 
   constructor(private readonly config: AforoAgentConfig) {
@@ -344,19 +503,12 @@ export class AforoAgent {
   /** Open a new session. Returns a session handle for emitting per-step events. */
   async startSession(options: StartSessionOptions): Promise<AgentSession> {
     const sessionId = options.sessionId || genId();
+    // Missing / invalid ids do not throw here: every event of the session is
+    // then dropped with reason 'invalid' (counted, WARN-logged, onDrop).
     const customerId = options.customerId || this.config.customerId;
-    if (!customerId || !customerId.trim()) {
-      throw new Error('AforoAgent: customerId is required (config.customerId or startSession({ customerId }))');
-    }
-    if (!options.agentId || !options.agentId.trim()) {
-      throw new Error('AforoAgent: agentId is required');
-    }
-    if (options.agentId.trim().length > MAX_AGENT_ID) {
-      throw new Error(`AforoAgent: agentId must be at most ${MAX_AGENT_ID} characters`);
-    }
-    const agentId = options.agentId.trim();
+    const agentId = typeof options.agentId === 'string' ? options.agentId.trim() : options.agentId;
     const productType = normalizeProductType(options.productType);
-    const traceId = options.traceId || sessionId;
+    const traceId = options.traceId;
     const meta: Record<string, unknown> = {
       framework: options.framework || 'CUSTOM',
       modelProvider: options.modelProvider,
@@ -382,61 +534,36 @@ export class AforoAgent {
    * but stable enough to be used directly when an agent framework already
    * has its own lifecycle hooks and just wants to plug in a metering tap.
    *
-   * An event the ingestor would reject -- blank metricKey, agentId (or one
-   * over 36 chars) or sessionId, or a value that is not > 0 -- is logged and
-   * dropped instead of buffered, because one invalid event fails its whole
-   * batch.
+   * Never throws for event content. An event the ingestor would reject --
+   * no customerId (config or per session / event), blank metricKey, blank
+   * agentId or sessionId, a value that is not > 0, or customerId over 64
+   * chars, agentId over 36, sessionId over 64, capabilityName over 64,
+   * metricKey over 255, productType over 20 -- is not buffered or sent. It is
+   * counted in {@code droppedCount}, WARN-logged and passed to {@code onDrop}
+   * with reason {@code 'invalid'}. Nothing is truncated.
    */
   async emitEvent(partial: AgentEventInput): Promise<void> {
     const customerId = partial.customerId || this.config.customerId;
-    if (!customerId || !customerId.trim()) {
-      throw new Error('AforoAgent: customerId is required (config.customerId or emitEvent({ customerId }))');
-    }
-    const agentId = typeof partial.agentId === 'string' ? partial.agentId.trim() : '';
-    const sessionId = typeof partial.sessionId === 'string' ? partial.sessionId.trim() : '';
-    const invalid: string[] = [];
-    if (typeof partial.metricKey !== 'string' || !partial.metricKey.trim()) invalid.push('metricKey');
-    if (!agentId || agentId.length > MAX_AGENT_ID) invalid.push(`agentId (1-${MAX_AGENT_ID} chars)`);
-    if (!sessionId) invalid.push('sessionId');
-    if (typeof partial.value !== 'number' || !Number.isFinite(partial.value) || partial.value <= 0) {
-      invalid.push('value > 0');
-    }
-    if (invalid.length > 0) {
-      // eslint-disable-next-line no-console
-      console.warn(`[aforo-agent] event ${partial.eventType} dropped; missing/invalid ${invalid.join(', ')}`);
+    const event: UsageEvent = {
+      tenantId: this.config.tenantId,
+      productId: this.config.productId,
+      timestamp: new Date().toISOString(),
+      // Random key stamped at creation (dedup opt-out semantics): the
+      // ingestor requires one, and dropped events handed to onDrop stay
+      // replayable without double-billing a successfully-sent sibling.
+      // Never regenerated: every retry of this event re-sends this key.
+      idempotencyKey: genKey(),
+      ...partial,
+      customerId: typeof customerId === 'string' ? customerId.trim() : (customerId as unknown as string),
+      productType: normalizeProductType(partial.productType) ?? this.productType,
+    };
+
+    const violation = describeInvalidEvent(event);
+    if (violation) {
+      this.recordDrop([event], 'invalid', `event ${clip(event.eventType)} is invalid: ${violation}`);
       return;
     }
-    // Promote properties that have a first-class ingest field; the rest is metadata.
-    const {
-      capabilityName, executionStatus, durationMs, stepIndex, parentStepId, ...rest
-    } = partial.properties || {};
-    const status = typeof executionStatus === 'string' ? executionStatus.toUpperCase() : undefined;
-    const now = new Date();
-    const event: IngestEvent = {
-      customerId,
-      metricName: partial.metricKey,
-      quantity: partial.value,
-      occurredAt: now.toISOString(),
-      // Minted once here and never regenerated, so a replayed event dedupes.
-      idempotencyKey: `agent:${sessionId}:${partial.eventType}:${now.getTime().toString(36)}:${(eventSeq++).toString(36)}:${Math.random().toString(36).substring(2, 10)}`.slice(-255),
-      productType: normalizeProductType(partial.productType) ?? this.productType,
-      agentId,
-      sessionId,
-      traceId: partial.traceId || sessionId,
-      stepNumber: typeof stepIndex === 'number' ? stepIndex : undefined,
-      parentStepId: typeof parentStepId === 'string' ? parentStepId.slice(0, 64) : undefined,
-      capabilityName: typeof capabilityName === 'string' ? capabilityName.slice(0, 64) : undefined,
-      executionStatus: status && INGEST_EXECUTION_STATUSES.has(status)
-        ? status as IngestEvent['executionStatus'] : undefined,
-      executionDurationMs: typeof durationMs === 'number' ? Math.round(durationMs) : undefined,
-      metadata: {
-        ...rest,
-        eventType: partial.eventType,
-        productId: this.config.productId,
-        // CANCELLED / HITL_REQUIRED have no ingest enum value — keep them visible here.
-        ...(status && !INGEST_EXECUTION_STATUSES.has(status) ? { agentExecutionStatus: status } : {}),
-      },
-    };
+
     this.buffer.push(event);
     if (this.buffer.length >= (this.config.flushBatchSize || 50)) {
       await this.flush();
@@ -450,11 +577,17 @@ export class AforoAgent {
    * {@link AgentSession.end}; call manually if your agent process is about
    * to exit and you want to guarantee delivery.
    *
-   * Retries 408/429/5xx/network failures (honouring a 429's Retry-After),
-   * then logs to console and DROPS the events (best-effort delivery — same
-   * posture as the MCP and generic SDKs). Other 4xx are never retried. For
-   * mission-critical billing, prefer the gateway-plugin path; SDK direct-emit
-   * is for first-party customers running their own infrastructure.
+   * Events are sent to {@code <ingestorUrl>/events} — the Apigee-format
+   * endpoint that takes ONE event per request — so the batch fans out
+   * concurrently. Each event is retried on 408/429/5xx/network failure
+   * (honouring a 429's Retry-After) up to {@code maxRetries} attempts, always
+   * with the same body and idempotency key; other 4xx are never retried.
+   *
+   * An event that still fails is counted, logged and handed to the opt-in
+   * onDrop hook: 'rejected' for a non-retryable 4xx, 'retry_exhausted'
+   * otherwise. For mission-critical billing, prefer the gateway-plugin path;
+   * SDK direct-emit is for first-party customers running their own
+   * infrastructure.
    */
   async flush(): Promise<void> {
     if (this.flushTimer) {
@@ -462,18 +595,38 @@ export class AforoAgent {
       this.flushTimer = null;
     }
     if (this.buffer.length === 0) return;
-    const pending = this.buffer.splice(0, this.buffer.length);
-    const url = (this.config.ingestorUrl || DEFAULT_INGESTOR).replace(/\/v1\/ingest\/?$/, '/v1/ingest/batch');
-    for (let i = 0; i < pending.length; i += MAX_BATCH_EVENTS) {
-      await this.send(url, pending.slice(i, i + MAX_BATCH_EVENTS));
-    }
+    const batch = this.buffer.splice(0, this.buffer.length);
+    const url = eventsUrl(this.config.ingestorUrl);
+
+    const results = await Promise.all(batch.map((ev) => this.send(url, ev)));
+
+    // Partition failures by drop reason: terminal 4xx → rejected,
+    // network error / 5xx / 408 / 429 after all attempts → retry_exhausted.
+    const rejected: UsageEvent[] = [];
+    const failed: UsageEvent[] = [];
+    let rejectedDetail = '';
+    let failedDetail = '';
+    results.forEach((r, i) => {
+      if (r.ok) return;
+      if (r.reason === 'rejected') {
+        rejected.push(batch[i]);
+        rejectedDetail = r.detail;
+      } else {
+        failed.push(batch[i]);
+        failedDetail = r.detail;
+      }
+    });
+    if (rejected.length > 0) this.recordDrop(rejected, 'rejected', rejectedDetail);
+    if (failed.length > 0) this.recordDrop(failed, 'retry_exhausted', failedDetail);
   }
 
-  private async send(url: string, batch: IngestEvent[]): Promise<void> {
-    // Serialised once, so every retry re-sends the same idempotency keys.
-    const body = JSON.stringify({ events: batch });
+  /** POST one event, retrying transient failures. Never throws. */
+  private async send(url: string, ev: UsageEvent): Promise<{ ok: true } | { ok: false; reason: DropReason; detail: string }> {
+    // Serialised once, so every retry re-sends the same idempotency key.
+    const body = JSON.stringify(toApigeeEvent(ev));
     const maxAttempts = Math.max(1, this.config.maxRetries ?? 3);
     const baseDelay = this.config.retryBaseDelayMs ?? 1000;
+    let detail = 'flush failed';
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       let delayMs = baseDelay * Math.pow(2, attempt - 1);
       try {
@@ -486,43 +639,54 @@ export class AforoAgent {
           },
           body,
         });
-        if (res.ok) {
-          await this.reportRejected(res);
-          return;
-        }
+        if (res.ok) return { ok: true };
+        const message = await readErrorMessage(res);
+        detail = `ingestor returned ${res.status}${message ? ` (${message})` : ''}`;
         const retryable = res.status === 408 || res.status === 429 || res.status >= 500;
-        if (!retryable || attempt === maxAttempts) {
-          // eslint-disable-next-line no-console
-          console.warn(`[aforo-agent] ingestor returned ${res.status}; dropped ${batch.length} events`);
-          return;
-        }
+        if (!retryable) return { ok: false, reason: 'rejected', detail };
         if (res.status === 429) {
           const retryAfter = res.headers && typeof res.headers.get === 'function' ? res.headers.get('Retry-After') : null;
           const seconds = retryAfter ? parseInt(retryAfter, 10) : NaN;
           if (!isNaN(seconds) && seconds >= 0) delayMs = seconds * 1000;
         }
       } catch (e) {
-        if (attempt === maxAttempts) {
-          // eslint-disable-next-line no-console
-          console.warn(`[aforo-agent] flush failed; dropped ${batch.length} events:`, e);
-          return;
-        }
+        detail = `flush failed: ${e}`;
       }
-      await sleep(delayMs);
+      if (attempt < maxAttempts) await sleep(delayMs);
     }
+    return { ok: false, reason: 'retry_exhausted', detail };
   }
 
-  /** Logs per-event rejections from a 2xx batch response ({@code errors[].message}). */
-  private async reportRejected(res: Response): Promise<void> {
-    try {
-      const result = await res.json() as { failed?: number; errors?: Array<{ index: number; message: string }> };
-      if (result && typeof result.failed === 'number' && result.failed > 0) {
-        const detail = (result.errors || []).slice(0, 5).map((e) => `#${e.index}: ${e.message}`).join('; ');
-        // eslint-disable-next-line no-console
-        console.warn(`[aforo-agent] ingestor rejected ${result.failed} event(s)${detail ? `: ${detail}` : ''}`);
+  /** Number of events permanently dropped since this instance was created. */
+  get droppedCount(): number {
+    return this.dropped;
+  }
+
+  /**
+   * Account for permanently lost events: bump the counter, WARN-log, and
+   * invoke the opt-in onDrop hook. The buffer is drained at flush start, so
+   * send drops are bounded by flush cadence; 'invalid' WARNs are throttled
+   * (first, then every 1000th) so a tight loop of bad events can't storm the log.
+   */
+  private recordDrop(events: UsageEvent[], reason: DropReason, detail: string): void {
+    this.dropped += events.length;
+    let log = true;
+    if (reason === 'invalid') {
+      this.invalidDrops += events.length;
+      log = this.invalidDrops === 1 || this.invalidDrops % 1000 === 0;
+    }
+    if (log) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[aforo-agent] ${detail}; dropped ${events.length} events — ${reason} (${this.dropped} total dropped)`,
+      );
+    }
+    if (this.config.onDrop) {
+      try {
+        this.config.onDrop(events, reason);
+      } catch {
+        // A hook bug must never break flushing.
       }
-    } catch {
-      // Empty or non-JSON 2xx body: nothing to report.
     }
   }
 

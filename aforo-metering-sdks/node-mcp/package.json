@@ -1,6 +1,6 @@
 {
   "name": "@aforoai/mcp-metering",
-  "version": "1.0.0",
+  "version": "1.3.2",
   "description": "Aforo MCP Server Metering SDK — wraps MCP tool handlers with usage billing",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -8,7 +8,13 @@
     "build": "tsc",
     "test": "jest"
   },
-  "keywords": ["mcp", "metering", "billing", "aforo", "model-context-protocol"],
+  "keywords": [
+    "mcp",
+    "metering",
+    "billing",
+    "aforo",
+    "model-context-protocol"
+  ],
   "license": "Apache-2.0",
   "dependencies": {},
   "devDependencies": {

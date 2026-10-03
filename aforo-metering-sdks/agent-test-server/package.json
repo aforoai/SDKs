@@ -1,0 +1,42 @@
+{
+  "name": "@aforoai/agent-test-server",
+  "version": "0.1.0",
+  "description": "Runnable toy AI_AGENT test server (HTTP + stdio + SSE) for testing Aforo agent metering — SDK integrations, gateway plugins, and end-to-end loadgen paths",
+  "license": "Apache-2.0",
+  "bin": {
+    "aforo-agent-test-server": "./dist/bin/aforo-agent-test-server.js"
+  },
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/src/index.js",
+      "require": "./dist/src/index.js",
+      "types": "./dist/src/index.d.ts"
+    }
+  },
+  "files": [
+    "dist/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/bin/aforo-agent-test-server.js",
+    "start:http": "node dist/bin/aforo-agent-test-server.js --transport http --port 8090",
+    "start:sse": "node dist/bin/aforo-agent-test-server.js --transport sse --port 8091",
+    "start:stdio": "node dist/bin/aforo-agent-test-server.js --transport stdio",
+    "test": "node --test dist/test/*.test.js",
+    "clean": "rm -rf dist/"
+  },
+  "dependencies": {
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

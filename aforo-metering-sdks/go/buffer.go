@@ -25,11 +25,20 @@ func newRingBuffer(capacity int) *ringBuffer {
 
 // push adds an event. Returns true if added without overflow.
 func (b *ringBuffer) push(event resolvedEvent) bool {
+	_, evicted := b.pushEvict(event)
+	return !evicted
+}
+
+// pushEvict adds an event. On overflow, returns the evicted OLDEST event and
+// true so the caller can surface the drop.
+func (b *ringBuffer) pushEvict(event resolvedEvent) (resolvedEvent, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	var evicted resolvedEvent
 	overflow := false
 	if b.count == b.capacity {
+		evicted = b.items[b.head]
 		b.head = (b.head + 1) % b.capacity
 		b.count--
 		overflow = true
@@ -39,7 +48,7 @@ func (b *ringBuffer) push(event resolvedEvent) bool {
 	b.tail = (b.tail + 1) % b.capacity
 	b.count++
 
-	return !overflow
+	return evicted, overflow
 }
 
 // drain removes and returns all events.

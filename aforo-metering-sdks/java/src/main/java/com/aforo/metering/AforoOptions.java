@@ -1,5 +1,8 @@
 package com.aforo.metering;
 
+import java.util.List;
+import java.util.function.BiConsumer;
+
 /**
  * Configuration options for the Aforo metering client.
  */
@@ -22,6 +25,7 @@ public class AforoOptions {
     private long retryBaseMs = 1_000;
     private long timeoutMs = 10_000;
     private long shutdownTimeoutMs = 5_000;
+    private BiConsumer<List<ResolvedEvent>, DropReason> onDrop;
 
     public AforoOptions(String apiKey) {
         if (apiKey == null || apiKey.isBlank()) {
@@ -40,6 +44,7 @@ public class AforoOptions {
     public long getRetryBaseMs() { return retryBaseMs; }
     public long getTimeoutMs() { return timeoutMs; }
     public long getShutdownTimeoutMs() { return shutdownTimeoutMs; }
+    public BiConsumer<List<ResolvedEvent>, DropReason> getOnDrop() { return onDrop; }
 
     public AforoOptions baseUrl(String baseUrl) { this.baseUrl = baseUrl; return this; }
     /**
@@ -60,6 +65,17 @@ public class AforoOptions {
     public AforoOptions retryBaseMs(long retryBaseMs) { this.retryBaseMs = retryBaseMs; return this; }
     public AforoOptions timeoutMs(long timeoutMs) { this.timeoutMs = timeoutMs; return this; }
     public AforoOptions shutdownTimeoutMs(long shutdownTimeoutMs) { this.shutdownTimeoutMs = shutdownTimeoutMs; return this; }
+
+    /**
+     * OPT-IN hook invoked with events the SDK is about to lose permanently
+     * (buffer overflow, retry exhaustion, non-retryable rejection, or an event
+     * that breaks an ingestor field limit — {@link DropReason#INVALID}), so the
+     * app can persist / alert / replay them. Dropped events keep their
+     * idempotency keys — re-submitting them via track() after recovery is
+     * dedup-safe. Default: none (drops are still counted in droppedCount()
+     * and WARN-logged). Exceptions thrown by the hook are swallowed.
+     */
+    public AforoOptions onDrop(BiConsumer<List<ResolvedEvent>, DropReason> onDrop) { this.onDrop = onDrop; return this; }
 
     /** Trim + uppercase; {@code null} for null/blank. Unknown values pass through. */
     public static String normalizeProductType(String productType) {

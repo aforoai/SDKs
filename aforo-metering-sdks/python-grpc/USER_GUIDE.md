@@ -1,6 +1,6 @@
 # aforo-grpc-metering — User Guide
 
-**Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** Python engineers running a gRPC server who need per-RPC billing.
+**Version:** 1.2.2 · **Updated:** 2026-10-01 · **Audience:** Python engineers running a gRPC server who need per-RPC billing.
 
 ## What you'll build
 
@@ -16,7 +16,7 @@ A gRPC server that reports one Aforo event per RPC — unary calls metered autom
 ## Step 1 — Install
 
 ```bash
-pip install -e .                  # from python-grpc/ (not yet on PyPI)
+pip install -e .                  # from python-grpc/ (or: pip install "aforo-grpc-metering>=1.2.2")
 pip install -e ".[httpx]"         # or [aiohttp]
 ```
 
@@ -126,10 +126,13 @@ billing.shutdown()   # flushes the final batch before process exit
 | `flush_interval_sec` | `float` | `5.0` | Background flush cadence. |
 | `flush_count` | `int` | `50` | Buffer size that forces a flush. |
 | `on_error` | `Callable?` | logs | Called on permanent batch failure, and with the ingestor's `errors[].message` when it rejects events. |
+| `on_drop` | `Callable[[list[dict], str], None]?` | `None` | Called with events that will not be delivered and the reason (`invalid`, `rejected`, `retry_exhausted`). Pass by keyword. |
 | `product_type` | `str` | `"GRPC_API"` | Top-level `productType` sent on every event (trimmed and upper-cased; values the SDK does not know are passed through). Override per event with `record(..., product_type=...)`. |
 | `customer_id_extractor` | `Callable?` | reads `x-customer-id` metadata | Resolve the billed customer. |
 
 `record()` arguments: `method`, `call_type`, `customer_id`, `status`, `message_count`, `duration_ms`, `data_bytes=0`. Exports: `AforoGrpcBilling`, `AforoGrpcInterceptor`, `GRPC_STATUS_LABELS`.
+
+Execution status (`executionStatus`, used by OUTCOME_BASED pricing) is described in the [README](README.md#execution-status-executionstatus).
 
 ## Troubleshooting
 
@@ -137,7 +140,8 @@ billing.shutdown()   # flushes the final batch before process exit
 |---|---|---|
 | Unary calls metered, streaming calls aren't | The interceptor auto-wraps unary only. | Call `billing.record(...)` in the streaming handler's `finally`. |
 | Some calls never metered | No `x-customer-id` in metadata, so the extractor returned nothing. | Send the metadata client-side or supply a `customer_id_extractor`. |
-| `on_error` fires with "Aforo returned 401/403" | Bad/unscoped API key — 4xx is dropped, not retried. | Fix `api_key`; confirm it matches `tenant_id`. |
+| `on_error` fires with "flush rejected with HTTP 401" (or 403) | Bad or unscoped API key. A 4xx other than 408 / 429 is not retried; the batch is dropped with reason `rejected`. | Fix `api_key`; confirm it matches `tenant_id`. Replay the batch from an `on_drop` hook if you keep one. |
+| `billing.dropped_count` is above 0 | Events were dropped: `invalid` (failed a client-side check), `rejected` (ingestor refused them) or `retry_exhausted`. | Read the WARNING log line for the reason; see [Dropped events](README.md#dropped-events). |
 | Events sent, none in console | Wrong `ingestor_url` host, or `grpc_api.rpc_calls` isn't mapped to a rate plan. | Use `https://api.aforo.ai`; map the metric in Aforo. |
 | `grpcStatusCode` shows `UNKNOWN` for errors | The numeric code wasn't in `GRPC_STATUS_LABELS` (defaults to `UNKNOWN`, code 2). | Expected for unusual codes; pass an explicit `status` label via `record()` if you need precision. |
 | Final batch lost on shutdown | `shutdown()` not called before exit. | Call `billing.shutdown()` in your server-stop path. |

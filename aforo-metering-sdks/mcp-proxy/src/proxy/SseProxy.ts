@@ -106,7 +106,9 @@ export class SseProxy extends BaseProxy {
               const dataLine = part.split('\n').find(l => l.startsWith('data: '));
               if (dataLine) {
                 const raw = dataLine.substring(6);
-                this.handleServerMessage(raw, connSessionId);
+                // Requests are tracked under the proxy's POST session
+                // (this.sessionId), so responses must be matched there too.
+                this.handleServerMessage(raw, this.sessionId);
               }
             }
 

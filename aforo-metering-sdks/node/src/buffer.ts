@@ -1,4 +1,4 @@
-import { ResolvedEvent } from './types';
+import { ResolvedEvent } from './types.js';
 
 /**
  * Bounded ring buffer for usage events.
@@ -20,20 +20,29 @@ export class RingBuffer {
 
   /** Add an event to the buffer. Returns true if added, false if overflow (oldest dropped). */
   push(event: ResolvedEvent): boolean {
-    let overflow = false;
+    return this.pushEvict(event) === null;
+  }
+
+  /**
+   * Add an event to the buffer. On overflow, returns the evicted OLDEST
+   * event so the caller can surface the drop; returns null when no
+   * eviction occurred.
+   */
+  pushEvict(event: ResolvedEvent): ResolvedEvent | null {
+    let evicted: ResolvedEvent | null = null;
 
     if (this.count === this.capacity) {
       // Buffer full — drop oldest (advance head)
+      evicted = this.items[this.head];
       this.head = (this.head + 1) % this.capacity;
       this.count--;
-      overflow = true;
     }
 
     this.items[this.tail] = event;
     this.tail = (this.tail + 1) % this.capacity;
     this.count++;
 
-    return !overflow;
+    return evicted;
   }
 
   /** Drain all events from the buffer. Returns a new array and clears the buffer. */

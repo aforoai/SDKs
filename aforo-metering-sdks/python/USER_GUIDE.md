@@ -1,6 +1,6 @@
 # aforo-metering — User Guide
 
-**Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** Python backend engineers wiring usage metering into an existing service.
+**Version:** 1.1.2 · **Updated:** 2026-10-01 · **Audience:** Python backend engineers wiring usage metering into an existing service.
 
 ## What you'll build
 
@@ -16,7 +16,7 @@ A Python service that reports billable usage to Aforo — either by calling `cli
 ## Step 1 — Install the package
 
 ```bash
-pip install -e .                  # from the cloned SDK source (not yet on PyPI)
+pip install -e .                  # from the cloned SDK source (or: pip install "aforo-metering>=1.1.2")
 # or, once published:  pip install aforo-metering
 ```
 
@@ -58,7 +58,7 @@ client.track(
 
 Every event carries a top-level `productType` — the client's `product_type` (default `"API"`) unless you pass `track(product_type="AI_AGENT")` for that event. The production ingestor requires it.
 
-> ⚠ `customer_id` and `metric_name` are both required and must not be blank, and `quantity` must be `> 0`. Otherwise `track()` raises `ValueError` — there's no silent no-op (the ingestor would reject the event and fail its whole batch). Calling `track()` after `shutdown()` raises `RuntimeError`.
+> ⚠ `customer_id` and `metric_name` are both required and must not be blank, and `quantity` must be `> 0`. An event that breaks these rules, or exceeds one of the ingestor's field limits, is not sent: `track()` does not raise, it counts the event in `client.dropped_count`, logs a WARN naming the field, and passes it to `on_drop` with reason `"invalid"`. Calling `track()` after `shutdown()` raises `RuntimeError`.
 
 ## Step 4 — Make delivery happen (and confirm it)
 
@@ -125,7 +125,7 @@ AFORO_API_KEY = os.environ["AFORO_API_KEY"]
 AFORO_PRODUCT_TYPE = "API"  # optional; default "API"
 ```
 
-Each request event carries top-level `productType`, `endpointPath` (path without query string, max 512 chars), `httpMethod`, `statusCode` and `responseTimeMs`.
+Each request event carries top-level `productType`, `endpointPath` (path without query string), `httpMethod`, `statusCode` and `responseTimeMs`. `endpointPath` and `httpMethod` come from the incoming request: a value over the ingestor's limit (512 / 16 characters) is truncated to the limit and the event is still sent, with one WARNING per field per process. Fields you set yourself are never truncated; an over-long one drops the event with reason `invalid`.
 
 > ⚠ The middleware only meters requests it can attribute to a customer. Configure `customer_id` (keyword, or `AFORO_CUSTOMER_ID` in Flask config / Django settings); by default it reads `X-Customer-Id` (Django tries `request.user.id` first). The caller's `X-Api-Key` is never used — it is the end user's secret, not a customer id. **No customer ID → the request is silently not metered.** `OPTIONS` (CORS preflight) requests are never metered. Set that header at your gateway/auth layer; do not trust a value the end client can spoof for a customer it doesn't own.
 
@@ -148,6 +148,7 @@ Each request event carries top-level `productType`, `endpointPath` (path without
 | `timeout` | `float` | `10.0` | Per-request timeout (seconds). |
 | `shutdown_timeout` | `float` | `5.0` | Drain budget on shutdown. |
 | `heartbeat_interval` | `float` | `30.0` | Seconds between session heartbeats. |
+| `on_drop` | `callable?` | `None` | `on_drop(events, reason)` for events the SDK loses; `reason` is `overflow`, `retry_exhausted`, `rejected` or `invalid`. `client.dropped_count` is the running total. |
 
 `track(...)` arguments:
 
@@ -159,6 +160,7 @@ Each request event carries top-level `productType`, `endpointPath` (path without
 | `idempotency_key` | `str?` | random UUID v4 | Dedupe key. Omit it and each event gets its own unique key; pass one to opt into dedup. |
 | `occurred_at` | `str?` | now | ISO-8601 event time (UTC). |
 | `metadata` | `dict?` | `None` | Arbitrary key/values stored with the event. |
+| `execution_status` | `str?` | `None` | Request outcome for OUTCOME_BASED pricing (`SUCCESS`, `TIMEOUT`, `ERROR`, …). Trimmed + upper-cased; an unknown value is logged and left off. |
 | `product_type` | `str?` | client's | Per-event `productType` override. |
 | `extra_fields` | `dict?` | `None` | Optional top-level ingest fields by their camelCase wire name (`agentId`, `sessionId`, `endpointPath`, …). |
 | `event` | `TrackEvent?` | `None` | Pass a `TrackEvent` instead of keyword args. |
@@ -169,7 +171,7 @@ Each request event carries top-level `productType`, `endpointPath` (path without
 
 `start_session(session_id, product_type="AI_AGENT", customer_id=None)` sends a `system.session.heartbeat` event immediately and then every `heartbeat_interval` seconds (default 30) from a daemon thread; `end_session()` stops it, flushes buffered usage, and sends a final `SESSION_END` heartbeat. `shutdown()` also stops it.
 
-Each heartbeat has `quantity: 1` (never billed — the ingestor intercepts heartbeats before billing), top-level `sessionId`, `productType` (the session's) and `sessionBoundary` (`HEARTBEAT` / `SESSION_END`), and `customerId` = the session's `customer_id` (default `"system"`). It is POSTed **on its own** as `{"events": [heartbeat]}` — never mixed into a usage batch, so it always takes the ingestor's synchronous path where heartbeats are intercepted. Heartbeats are best-effort: one attempt, no retry, failures are logged at debug level and never affect usage delivery.
+Each heartbeat has `quantity: 1` (never billed — the ingestor intercepts heartbeats before billing), top-level `sessionId`, `productType` (the session's) and `sessionBoundary` (`HEARTBEAT` / `SESSION_END`), and `customerId` = the session's `customer_id` (default `"system"`). It is POSTed **on its own** as `{"events": [heartbeat]}` — never mixed into a usage batch, so it always takes the ingestor's synchronous path where heartbeats are intercepted. Heartbeats are best-effort: one attempt, no retry, failures are logged at debug level, never affect usage delivery, and are not counted in `dropped_count`.
 
 ## Troubleshooting
 
@@ -181,6 +183,8 @@ Each heartbeat has `quantity: 1` (never billed — the ingestor intercepts heart
 | Middleware never emits events | No `X-Customer-Id` on requests (and no `customer_id` resolver), or the path is excluded. | Set the customer header upstream; check your route isn't in `exclude_paths`. |
 | Events lost on process restart | `SIGKILL`/crash skips `atexit`; buffered events never flushed. | Call `client.shutdown()` in your shutdown hook; lower `flush_interval`/`flush_count` for tighter delivery. |
 | `RuntimeError: AforoClient is shut down` | `track()` called after `shutdown()`. | Build a fresh client, or don't shut down until you're done emitting. |
+| `client.dropped_count` rises, WARN "Invalid event not sent" | `track()` got a blank `customer_id` / `metric_name`, `quantity <= 0`, or a field over the ingestor's limit. | Read the WARN (it names the field and limit) or log the events your `on_drop` hook receives with reason `"invalid"`; fix the call site. |
+| `FlushResult.failed > 0` on a `202` | The ingestor rejected individual events (unknown metric, …); each `errors[].message` is logged. | Fix the event source. Those events are passed to `on_drop` with reason `"rejected"`. |
 | Sudden gaps under burst load | Ring buffer hit `max_queue_size`; oldest events dropped to make room. | Raise `max_queue_size`, or lower `flush_interval` so the buffer drains faster. |
 
 ## What this guide does NOT cover

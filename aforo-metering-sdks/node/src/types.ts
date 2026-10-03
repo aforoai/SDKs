@@ -1,3 +1,15 @@
+/**
+ * Why a buffered event was permanently dropped by the SDK.
+ * - 'overflow': the ring buffer was full — the OLDEST event was evicted to make room.
+ * - 'retry_exhausted': a batch failed after all transport retries (ingest outage).
+ * - 'rejected': the ingestor rejected the batch with a non-retryable 4xx, or
+ *   rejected this event individually in a partially accepted batch.
+ * - 'invalid': the event failed a client-side check at track() (blank
+ *   customerId/metricName, quantity <= 0, a field over the ingestor's size
+ *   limit, a malformed occurredAt) and was never buffered or sent.
+ */
+export type DropReason = 'overflow' | 'retry_exhausted' | 'rejected' | 'invalid';
+
 /** Options for creating an AforoClient instance. */
 export interface AforoOptions {
   /** Aforo API key for authentication. */
@@ -35,6 +47,18 @@ export interface AforoOptions {
 
   /** Graceful shutdown timeout in milliseconds. Default: 5000 */
   shutdownTimeoutMs?: number;
+
+  /**
+   * OPT-IN hook invoked with events the SDK is about to lose permanently
+   * (buffer overflow, retry exhaustion, non-retryable rejection, or an event
+   * that failed client-side validation — reason 'invalid'), so the
+   * app can persist / alert / replay them. Dropped events keep their
+   * idempotency keys — re-submitting them via track() after recovery is
+   * dedup-safe. Default: none (drops are still counted in droppedCount and
+   * WARN-logged). Exceptions thrown by the hook are swallowed — a hook bug
+   * can never break flushing.
+   */
+  onDrop?: (events: ResolvedEvent[], reason: DropReason) => void;
 }
 
 /** A usage event to track. */
@@ -54,7 +78,12 @@ export interface TrackEvent {
    */
   productType?: string;
 
-  /** Optional override for idempotency key. Auto-generated if omitted. */
+  /**
+   * Optional idempotency key — supply a STABLE value to dedup retries of the
+   * same logical event. Omitted = dedup opt-out: the SDK stamps a unique
+   * random key per track() call (still stable across the SDK's own flush
+   * retries of the buffered event).
+   */
   idempotencyKey?: string;
 
   /** When the event occurred. Defaults to now. ISO 8601 string or epoch ms. */
@@ -62,6 +91,17 @@ export interface TrackEvent {
 
   /** Arbitrary key-value metadata attached to the event. */
   metadata?: Record<string, string | number | boolean>;
+
+  /**
+   * Optional outcome of the request (used by OUTCOME_BASED pricing, which bills
+   * each event at the weight set for its status). Events without a status bill
+   * at full price. Trimmed and upper-cased by the SDK; blank is treated as absent.
+   * Accepted values: SUCCESS, PARTIAL, TIMEOUT, ERROR, VALIDATION_FAILED, FAILED,
+   * FAILURE, CANCELLED, PENDING, BLOCKED, HITL_REQUIRED (max 20 chars). Any other
+   * value is logged with a warning and omitted (the event is still sent, without
+   * a status), because the server would reject the event.
+   */
+  executionStatus?: string;
 
   /** Optional HTTP context, sent as top-level fields. */
   endpointPath?: string;
@@ -79,6 +119,8 @@ export interface ResolvedEvent {
   occurredAt: string;
   productType: string;
   metadata?: Record<string, string | number | boolean>;
+  /** Normalized (trimmed, upper-cased) execution status; omitted when not set. */
+  executionStatus?: string;
   endpointPath?: string;
   httpMethod?: string;
   statusCode?: number;
@@ -152,4 +194,14 @@ export interface MiddlewareOptions {
 export interface FlushResult {
   sent: number;
   failed: number;
+  /** Why the batch failed, when failed > 0. Absent on success. */
+  reason?: DropReason;
+  /**
+   * Events the ingestor rejected individually inside a batch it otherwise
+   * accepted (per-event `errors[]` in the response). `index` is the position
+   * in the sent batch. Present only when the response identified them.
+   */
+  rejected?: Array<{ index: number; message: string }>;
+  /** Server-provided explanation for a failed batch, when one was returned. */
+  message?: string;
 }

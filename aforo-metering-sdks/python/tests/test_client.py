@@ -141,26 +141,101 @@ class TestAforoClient:
             {"customer_id": "  ", "metric_name": "m"},
             {"customer_id": "c", "metric_name": " "},
             {"customer_id": None, "metric_name": "m"},
+            {"customer_id": "c", "metric_name": "m", "quantity": 0},
+            {"customer_id": "c", "metric_name": "m", "quantity": -1},
+            {"customer_id": "c", "metric_name": "m", "quantity": None},
+            {"customer_id": "c", "metric_name": "m", "quantity": "lots"},
         ],
     )
-    def test_rejects_blank_customer_or_metric(self, kwargs):
-        patcher, _ = self._mock_transport()
+    def test_invalid_event_is_dropped_not_raised(self, kwargs, caplog):
+        """Rule: track() never raises for event content. An invalid event is not
+        buffered or sent; it is counted, WARN-logged and handed to on_drop
+        with reason "invalid" (keeping its idempotency key)."""
+        patcher, mock_transport = self._mock_transport()
+        drops = []
         try:
-            client = AforoClient(api_key="key", flush_interval=999)
-            with pytest.raises(ValueError, match="customer_id and metric_name"):
-                client.track(**kwargs)
+            client = AforoClient(
+                api_key="key", flush_interval=999,
+                on_drop=lambda events, reason: drops.append((events, reason)),
+            )
+            with caplog.at_level("WARNING", logger="aforo.client"):
+                client.track(**kwargs)  # must not raise
             assert client.buffered_count == 0
+            assert client.dropped_count == 1
+            assert len(drops) == 1 and drops[0][1] == "invalid"
+            assert len(drops[0][0]) == 1 and drops[0][0][0].idempotency_key
+            assert "Invalid event not sent" in caplog.text
+            client.flush()
+            assert not mock_transport.send_sync.called
         finally:
             client.shutdown()
             patcher.stop()
 
-    @pytest.mark.parametrize("quantity", [0, -1, None])
-    def test_rejects_non_positive_quantity(self, quantity):
+    def test_invalid_event_warning_is_throttled(self, caplog):
         patcher, _ = self._mock_transport()
         try:
             client = AforoClient(api_key="key", flush_interval=999)
-            with pytest.raises(ValueError, match="quantity must be > 0"):
-                client.track(customer_id="c", metric_name="m", quantity=quantity)
+            with caplog.at_level("WARNING", logger="aforo.client"):
+                for _ in range(1000):
+                    client.track(customer_id="", metric_name="m")
+            assert client.dropped_count == 1000
+            # first occurrence, then every 1000th
+            assert caplog.text.count("Invalid event not sent") == 2
+        finally:
+            client.shutdown()
+            patcher.stop()
+
+    def test_partial_rejection_drops_only_the_rejected_events(self):
+        patcher, mock_transport = self._mock_transport()
+        mock_transport.send_sync.return_value = FlushResult(
+            sent=2, failed=1, reason="rejected", failed_indices=[1],
+        )
+        drops = []
+        try:
+            client = AforoClient(
+                api_key="key", flush_interval=999,
+                on_drop=lambda events, reason: drops.append((events, reason)),
+            )
+            for key in ("k0", "k1", "k2"):
+                client.track(customer_id="c", metric_name="m", idempotency_key=key)
+            result = client.flush()
+            assert (result.sent, result.failed) == (2, 1)
+            assert client.dropped_count == 1
+            assert [(e.idempotency_key, r) for evs, r in drops for e in evs] == [("k1", "rejected")]
+        finally:
+            client.shutdown()
+            patcher.stop()
+
+    def test_partial_rejection_without_indices_counts_but_names_no_event(self):
+        patcher, mock_transport = self._mock_transport()
+        mock_transport.send_sync.return_value = FlushResult(sent=2, failed=1, reason="rejected")
+        drops = []
+        try:
+            client = AforoClient(
+                api_key="key", flush_interval=999,
+                on_drop=lambda events, reason: drops.append((events, reason)),
+            )
+            for _ in range(3):
+                client.track(customer_id="c", metric_name="m")
+            client.flush()
+            assert client.dropped_count == 1
+            assert drops == []
+        finally:
+            client.shutdown()
+            patcher.stop()
+
+    def test_failed_heartbeat_is_not_a_usage_drop(self):
+        patcher, mock_transport = self._mock_transport()
+        mock_transport.send_heartbeat.return_value = None
+        drops = []
+        try:
+            client = AforoClient(
+                api_key="key", flush_interval=999,
+                on_drop=lambda events, reason: drops.append(reason),
+            )
+            client.start_session("sess_1")
+            client.end_session()
+            assert client.dropped_count == 0 and drops == []
             assert client.buffered_count == 0
         finally:
             client.shutdown()
@@ -245,17 +320,24 @@ class TestAforoClient:
             patcher.stop()
 
     def test_auto_idempotency_key(self):
+        # No caller key = dedup opt-out. Two same-instant identical events
+        # must get DISTINCT random keys (the old content-hash fallback
+        # collapsed them - the H4 bug Aforo ingest fixed in April 2026).
+        import uuid as _uuid
+
         patcher, mock_transport = self._mock_transport()
         try:
             client = AforoClient(api_key="key", flush_interval=999)
             client.track(customer_id="cust_1", metric_name="api_calls", quantity=1)
+            client.track(customer_id="cust_1", metric_name="api_calls", quantity=1)
             client.flush()
 
             call_args = mock_transport.send_sync.call_args[0][0]
-            assert re.match(
-                r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-                call_args[0].idempotency_key,
-            )
+            key_a = call_args[0].idempotency_key
+            key_b = call_args[1].idempotency_key
+            _uuid.UUID(key_a)  # parses as a UUID
+            _uuid.UUID(key_b)
+            assert key_a != key_b
         finally:
             client.shutdown()
             patcher.stop()
@@ -345,12 +427,54 @@ class TestAforoClient:
             client.shutdown()
             patcher.stop()
 
-    def test_requires_customer_id_and_metric(self):
-        patcher, _ = self._mock_transport()
+    def test_execution_status_normalized_and_serialized(self):
+        patcher, mock_transport = self._mock_transport()
         try:
             client = AforoClient(api_key="key", flush_interval=999)
-            with pytest.raises(ValueError, match="customer_id and metric_name"):
-                client.track(customer_id="", metric_name="api_calls")
+            client.track(customer_id="cust_1", metric_name="api_calls", execution_status=" timeout ")
+            client.track(event=TrackEvent(customer_id="cust_1", metric_name="api_calls", execution_status="partial"))
+            client.flush()
+
+            events = mock_transport.send_sync.call_args[0][0]
+            assert events[0].execution_status == "TIMEOUT"
+            assert events[0].to_dict()["executionStatus"] == "TIMEOUT"
+            assert events[1].to_dict()["executionStatus"] == "PARTIAL"
+        finally:
+            client.shutdown()
+            patcher.stop()
+
+    def test_execution_status_omitted_when_absent_or_blank(self):
+        patcher, mock_transport = self._mock_transport()
+        try:
+            client = AforoClient(api_key="key", flush_interval=999)
+            client.track(customer_id="cust_1", metric_name="api_calls")
+            client.track(customer_id="cust_1", metric_name="api_calls", execution_status="   ")
+            client.flush()
+
+            events = mock_transport.send_sync.call_args[0][0]
+            assert all(e.execution_status is None for e in events)
+            assert all("executionStatus" not in e.to_dict() for e in events)
+        finally:
+            client.shutdown()
+            patcher.stop()
+
+    def test_unknown_execution_status_is_omitted_with_warning(self, caplog):
+        patcher, mock_transport = self._mock_transport()
+        try:
+            client = AforoClient(api_key="key", flush_interval=999)
+            with caplog.at_level("WARNING", logger="aforo.client"):
+                client.track(customer_id="cust_1", metric_name="api_calls", execution_status="bogus")
+                client.track(event=TrackEvent(
+                    customer_id="cust_1", metric_name="api_calls", execution_status="X" * 25,
+                ))
+            client.flush()
+
+            events = mock_transport.send_sync.call_args[0][0]
+            assert len(events) == 2
+            assert all(e.execution_status is None for e in events)
+            assert all("executionStatus" not in e.to_dict() for e in events)
+            assert events[0].to_dict()["metricName"] == "api_calls"
+            assert "Ignoring unknown executionStatus" in caplog.text
         finally:
             client.shutdown()
             patcher.stop()

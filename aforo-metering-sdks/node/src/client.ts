@@ -1,8 +1,8 @@
-import { AforoOptions, TrackEvent, ResolvedEvent, FlushResult } from './types';
-import { RingBuffer } from './buffer';
-import { Transport } from './transport';
-import { generateRandomKey } from './idempotency';
-import { describeLimitViolation } from './limits';
+import { AforoOptions, TrackEvent, ResolvedEvent, FlushResult, DropReason } from './types.js';
+import { RingBuffer } from './buffer.js';
+import { Transport } from './transport.js';
+import { generateRandomKey } from './idempotency.js';
+import { describeLimitViolation } from './limits.js';
 
 const DEFAULT_BASE_URL = 'https://api.aforo.ai';
 const DEFAULT_PRODUCT_TYPE = 'API';
@@ -42,6 +42,13 @@ export class AforoClient {
   private readonly flushInterval: number;
   private readonly shutdownTimeoutMs: number;
   private readonly productType: string;
+  private readonly onDrop?: (events: ResolvedEvent[], reason: DropReason) => void;
+
+  // Drop accounting — events permanently lost (overflow eviction, failed
+  // batch, or an event that failed client-side validation)
+  private dropped = 0;
+  private overflowDrops = 0;
+  private invalidDrops = 0;
 
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private flushing = false;
@@ -54,6 +61,10 @@ export class AforoClient {
   private sessionStartedAt: number | null = null;
   private sessionProductType: string = DEFAULT_SESSION_PRODUCT_TYPE;
 
+  // Kept so shutdown() can deregister — otherwise every client leaks a
+  // SIGTERM/SIGINT once-listener for the life of the process.
+  private readonly signalHandler: () => void;
+
   constructor(options: AforoOptions) {
     if (!options.apiKey) throw new Error('apiKey is required');
 
@@ -61,6 +72,7 @@ export class AforoClient {
     this.productType = normalizeProductType(options.productType) ?? DEFAULT_PRODUCT_TYPE;
     this.flushInterval = options.flushInterval ?? DEFAULT_FLUSH_INTERVAL;
     this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT;
+    this.onDrop = options.onDrop;
 
     this.buffer = new RingBuffer(options.maxQueueSize ?? DEFAULT_MAX_QUEUE_SIZE);
 
@@ -82,12 +94,12 @@ export class AforoClient {
       this.flushTimer.unref();
     }
 
-    // Register graceful shutdown handlers
-    const shutdownHandler = () => {
+    // Register graceful shutdown handlers (deregistered in shutdown())
+    this.signalHandler = () => {
       this.shutdown().catch(() => {});
     };
-    process.once('SIGTERM', shutdownHandler);
-    process.once('SIGINT', shutdownHandler);
+    process.once('SIGTERM', this.signalHandler);
+    process.once('SIGINT', this.signalHandler);
   }
 
   // ─── Session lifecycle with heartbeat ─────────────────────────────
@@ -166,6 +178,8 @@ export class AforoClient {
       },
     };
 
+    // Sent alone and outside the usage buffer; a failed heartbeat is not a
+    // usage drop, so it is never counted in droppedCount or handed to onDrop.
     return this.transport.sendSingleBestEffort(heartbeat).then(() => undefined, () => undefined);
   }
 
@@ -176,57 +190,37 @@ export class AforoClient {
    * Returns immediately — does not await HTTP.
    * Triggers a flush if the buffer reaches flushCount.
    *
-   * Throws if the event breaks any constraint the ingestor enforces — a blank
-   * or over-long `customerId` / `metricName` / `idempotencyKey`, a `quantity`
-   * that is not positive or carries more than 14 integer digits / 6 decimal
-   * places, an `occurredAt` that is not an ISO-8601 instant, or any other
-   * capped field that is too long. Limits the server makes configurable (event
-   * age, clock skew, metadata size) are left to the server, so the SDK can
-   * never refuse usage a given deployment would accept. Such an event is rejected by the ingestor and never billed,
-   * and because flushing happens in the background nobody would see that
-   * rejection — so it is reported here instead, and never enters the buffer.
-   * See `limits.ts` for the limits and where each one comes from.
+   * Throws only when the client is shut down. An event the ingestor would
+   * reject — a blank or over-long `customerId` / `metricName` /
+   * `idempotencyKey`, a `quantity` that is not positive or carries more than
+   * 14 integer digits / 6 decimal places, an `occurredAt` that is not an
+   * ISO-8601 instant, or any other capped field that is too long — is NOT
+   * buffered and NOT sent. It is counted in `droppedCount`, WARN-logged with
+   * the field, the limit and the offending value, and passed to the opt-in
+   * `onDrop` hook with reason `'invalid'`. Limits the server makes
+   * configurable (event age, clock skew, metadata size) are left to the
+   * server. See `limits.ts` for the limits and where each one comes from.
    */
   async track(event: TrackEvent): Promise<void> {
     if (this.closed) {
       throw new Error('AforoClient is shut down — cannot track new events');
     }
 
-    if (event.customerId === undefined || event.customerId === null || !String(event.customerId).trim()) {
-      throw new Error('customerId is required');
-    }
-    if (event.metricName === undefined || event.metricName === null || !String(event.metricName).trim()) {
-      throw new Error('metricName is required');
-    }
+    // A missing event object is reported as an invalid event, not a TypeError.
+    event = (event ?? {}) as TrackEvent;
 
     const occurredAt = resolveOccurredAt(event.occurredAt);
     const quantity = event.quantity ?? 1;
-    if (typeof quantity !== 'number' || !Number.isFinite(quantity) || quantity <= 0) {
-      throw new Error('quantity must be a positive number (> 0)');
-    }
-
     const productType = normalizeProductType(event.productType) ?? this.productType;
     // Minted once, here, when the event is enqueued — never at flush/retry
     // time, so a retried batch carries the same keys and the ingestor
     // deduplicates it. A caller-supplied key is passed through verbatim;
-    // otherwise each event gets its own random UUID. A deterministic hash of
-    // the event fields would make two genuinely distinct events in the same
-    // millisecond collide, and the ingestor would silently drop the second.
-    // Minted before the limit check so an over-long caller-supplied key is
-    // reported here rather than silently dropped by the server later.
+    // otherwise each event gets its own random UUID (no caller key = dedup
+    // opt-out). A deterministic hash of the event fields would make two
+    // genuinely distinct events in the same millisecond collide, and the
+    // ingestor would silently drop the second. Minted before the validity
+    // check so a dropped event reaches onDrop with its key.
     const idempotencyKey = event.idempotencyKey ?? generateRandomKey();
-
-    const violation = describeLimitViolation({
-      customerId: event.customerId,
-      metricName: event.metricName,
-      quantity,
-      idempotencyKey,
-      occurredAt,
-      productType,
-      endpointPath: event.endpointPath,
-      httpMethod: event.httpMethod,
-    });
-    if (violation) throw new Error(violation);
 
     const resolved: ResolvedEvent = {
       customerId: event.customerId,
@@ -241,12 +235,82 @@ export class AforoClient {
       ...(event.statusCode !== undefined ? { statusCode: event.statusCode } : {}),
       ...(event.responseTimeMs !== undefined ? { responseTimeMs: event.responseTimeMs } : {}),
     };
+    const executionStatus = normalizeExecutionStatus(event.executionStatus);
+    if (executionStatus) {
+      if (CANONICAL_EXECUTION_STATUSES.has(executionStatus)) {
+        resolved.executionStatus = executionStatus;
+      } else {
+        // The ingestor rejects an event carrying an unknown status, so an
+        // unknown value is reported and the field omitted (the event still
+        // bills, at full weight) instead of losing the event.
+        warnUnknownExecutionStatus(executionStatus);
+      }
+    }
 
-    this.buffer.push(resolved);
+    const violation = describeInvalidEvent(event, resolved);
+    if (violation) {
+      // Not buffered, not sent, never thrown: an un-awaited rejected track()
+      // would crash the process on the hot path. Same shape as every other drop.
+      this.recordDrop([resolved], 'invalid', violation);
+      return;
+    }
+
+    this.enqueue(resolved);
 
     // Trigger flush if buffer threshold reached
     if (this.buffer.size >= this.flushCount) {
       this.flush().catch(() => {});
+    }
+  }
+
+  /** Buffer an event; surface the evicted-oldest event if the push overflowed. */
+  private enqueue(resolved: ResolvedEvent): void {
+    const evicted = this.buffer.pushEvict(resolved);
+    if (evicted) {
+      this.recordDrop([evicted], 'overflow');
+    }
+  }
+
+  /**
+   * Account for permanently lost events: bump the counter, WARN-log, and
+   * invoke the opt-in onDrop hook. Overflow logs are throttled (first, then
+   * every 1000th eviction) so sustained overflow can't storm the log;
+   * failed-batch drops log every time (bounded by flush cadence).
+   */
+  private recordDrop(events: ResolvedEvent[], reason: DropReason, detail?: string): void {
+    if (events.length === 0) return;
+    this.dropped += events.length;
+
+    if (reason === 'invalid') {
+      // Throttled like overflow: a tight loop of bad events can't storm the log.
+      this.invalidDrops += events.length;
+      if (this.invalidDrops === 1 || this.invalidDrops % 1000 === 0) {
+        console.warn(
+          `[aforo] Invalid event dropped — ${detail ?? 'failed validation'} ` +
+          `(${this.invalidDrops} invalid, ${this.dropped} total dropped). It was not sent.`,
+        );
+      }
+    } else if (reason === 'overflow') {
+      this.overflowDrops += events.length;
+      if (this.overflowDrops === 1 || this.overflowDrops % 1000 === 0) {
+        console.warn(
+          `[aforo] Buffer overflow: oldest event dropped (${this.dropped} total dropped). ` +
+          `Consider raising maxQueueSize or checking ingest connectivity.`,
+        );
+      }
+    } else {
+      console.warn(
+        `[aforo] Dropped ${events.length} event(s) — ${reason}` +
+        `${detail ? `: ${detail}` : ''} (${this.dropped} total dropped).`,
+      );
+    }
+
+    if (this.onDrop) {
+      try {
+        this.onDrop(events, reason);
+      } catch {
+        // A hook bug must never break tracking/flushing.
+      }
     }
   }
 
@@ -281,6 +345,28 @@ export class AforoClient {
       const result = await this.transport.send(batch);
       totalSent += result.sent;
       totalFailed += result.failed;
+
+      if (result.failed > 0) {
+        // The batch was already drained from the buffer — without this it
+        // vanishes silently. Surface it (counter + WARN + opt-in hook).
+        // A partially accepted batch drops only the events the server
+        // rejected: by index when the response names them; otherwise they are
+        // counted and logged but not handed to onDrop (which ones is unknown).
+        if (result.sent > 0 || result.rejected) {
+          if (result.rejected) {
+            const lost = result.rejected.map((r) => batch[r.index]).filter(Boolean);
+            this.recordDrop(lost, 'rejected', result.message);
+          } else {
+            this.dropped += result.failed;
+            console.warn(
+              `[aforo] Ingestor rejected ${result.failed} of ${batch.length} event(s) in a batch` +
+              `${result.message ? `: ${result.message}` : ''} (${this.dropped} total dropped).`,
+            );
+          }
+        } else {
+          this.recordDrop(batch, result.reason ?? 'retry_exhausted', result.message);
+        }
+      }
     }
 
     return { sent: totalSent, failed: totalFailed };
@@ -294,6 +380,11 @@ export class AforoClient {
     if (this.closed) return;
     this.closed = true;
 
+    // Deregister signal handlers so repeated create/shutdown cycles don't
+    // accumulate process listeners (safe if already fired — once() removed it).
+    process.removeListener('SIGTERM', this.signalHandler);
+    process.removeListener('SIGINT', this.signalHandler);
+
     // Stop session heartbeats
     this.stopHeartbeatTimer();
 
@@ -303,16 +394,31 @@ export class AforoClient {
       this.flushTimer = null;
     }
 
-    // Flush with timeout
-    await Promise.race([
-      this.flush(),
-      new Promise<void>((resolve) => setTimeout(resolve, this.shutdownTimeoutMs)),
-    ]);
+    // Flush with timeout. The escape-hatch timer MUST be cleared once the
+    // race settles — left dangling it holds the event loop open for up to
+    // shutdownTimeoutMs after a clean shutdown, delaying process exit in
+    // short-lived producers (CLIs, jobs, serverless handlers).
+    let escapeTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        this.flush(),
+        new Promise<void>((resolve) => {
+          escapeTimer = setTimeout(resolve, this.shutdownTimeoutMs);
+        }),
+      ]);
+    } finally {
+      if (escapeTimer) clearTimeout(escapeTimer);
+    }
   }
 
   /** Number of events currently buffered. */
   get bufferedCount(): number {
     return this.buffer.size;
+  }
+
+  /** Total events permanently dropped (overflow, failed batches, server-rejected and invalid events) since creation. */
+  get droppedCount(): number {
+    return this.dropped;
   }
 
   /** Whether the client has been shut down. */
@@ -327,12 +433,81 @@ function normalizeProductType(value?: string | null): string | undefined {
   return trimmed ? trimmed.toUpperCase() : undefined;
 }
 
+/** Shorten an offending value for a log line. */
+function clip(value: unknown): string {
+  return String(value).slice(0, 80);
+}
+
+/**
+ * First reason the ingestor would reject this event, or null when it is
+ * acceptable. Required fields and quantity sign first, then the size limits.
+ */
+function describeInvalidEvent(event: TrackEvent, resolved: ResolvedEvent): string | null {
+  for (const field of ['customerId', 'metricName'] as const) {
+    const value = (event as any)?.[field];
+    if (value === undefined || value === null || !String(value).trim()) {
+      return `${field} is required (got "${clip(value)}")`;
+    }
+  }
+  const quantity = resolved.quantity;
+  if (typeof quantity !== 'number' || !Number.isFinite(quantity) || quantity <= 0) {
+    return `quantity must be a positive number (> 0), got "${clip(quantity)}"`;
+  }
+  if (typeof resolved.occurredAt !== 'string') {
+    return `occurredAt must be an ISO-8601 string or epoch milliseconds, got "${clip(resolved.occurredAt)}"`;
+  }
+  return describeLimitViolation({
+    customerId: resolved.customerId,
+    metricName: resolved.metricName,
+    quantity,
+    idempotencyKey: resolved.idempotencyKey,
+    occurredAt: resolved.occurredAt,
+    productType: resolved.productType,
+    endpointPath: resolved.endpointPath,
+    httpMethod: resolved.httpMethod,
+  });
+}
+
 function randomSuffix(): string {
   return Math.random().toString(36).slice(2, 10);
 }
 
 function resolveOccurredAt(value?: string | number): string {
   if (!value) return new Date().toISOString();
-  if (typeof value === 'number') return new Date(value).toISOString();
+  if (typeof value === 'number') {
+    const date = new Date(value);
+    // An out-of-range epoch must not throw from track(); it is reported as invalid.
+    return Number.isNaN(date.getTime()) ? String(value) : date.toISOString();
+  }
   return value;
+}
+
+/**
+ * Statuses the ingestor accepts (contract/ingest-contract.json, max 20 chars).
+ * Anything else would make it reject the event.
+ */
+const CANONICAL_EXECUTION_STATUSES: ReadonlySet<string> = new Set([
+  'SUCCESS', 'PARTIAL', 'TIMEOUT', 'ERROR', 'VALIDATION_FAILED', 'FAILED',
+  'FAILURE', 'CANCELLED', 'PENDING', 'BLOCKED', 'HITL_REQUIRED',
+]);
+
+// Warn once per distinct bad value (bounded) so a misconfigured static status
+// can't storm the log on every request.
+const MAX_WARNED_STATUSES = 100;
+const warnedStatuses = new Set<string>();
+
+function warnUnknownExecutionStatus(value: string): void {
+  if (warnedStatuses.has(value)) return;
+  if (warnedStatuses.size < MAX_WARNED_STATUSES) warnedStatuses.add(value);
+  console.warn(
+    `[aforo] Unknown executionStatus "${value.slice(0, 40)}" — field omitted from the event. ` +
+    `Expected one of: ${[...CANONICAL_EXECUTION_STATUSES].join(', ')}.`,
+  );
+}
+
+/** Trim + upper-case; blank/absent → undefined (key omitted from the wire body). */
+function normalizeExecutionStatus(value?: string): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed.toUpperCase() : undefined;
 }

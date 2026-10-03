@@ -13,6 +13,7 @@ import java.net.InetSocketAddress;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -33,6 +34,8 @@ class IngestBatchContractTest {
     private final List<Captured> captured = new CopyOnWriteArrayList<>();
     private final AtomicInteger failuresBeforeSuccess = new AtomicInteger();
     private final AtomicInteger failureStatus = new AtomicInteger(500);
+    /** When set, the body of a 202 response (to simulate a partial result). */
+    private final java.util.concurrent.atomic.AtomicReference<String> acceptedBody = new java.util.concurrent.atomic.AtomicReference<>();
     private HttpServer server;
     private int port;
 
@@ -51,6 +54,14 @@ class IngestBatchContractTest {
                         .getBytes(java.nio.charset.StandardCharsets.UTF_8);
                 exchange.sendResponseHeaders(status, err.length);
                 exchange.getResponseBody().write(err);
+                exchange.close();
+                return;
+            }
+            String accepted = acceptedBody.get();
+            if (status == 202 && accepted != null) {
+                byte[] ok = accepted.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(status, ok.length);
+                exchange.getResponseBody().write(ok);
                 exchange.close();
                 return;
             }
@@ -146,11 +157,54 @@ class IngestBatchContractTest {
     @Test
     @DisplayName("customerId longer than 64 chars is not sent")
     void overlongCustomerDropped() throws Exception {
-        try (AforoMqttBilling b = builder().flushCount(1).build()) {
+        List<Map<String, Object>> droppedEvents = new CopyOnWriteArrayList<>();
+        List<AforoMqttBilling.DropReason> reasons = new CopyOnWriteArrayList<>();
+        try (AforoMqttBilling b = builder().flushCount(1)
+                .onDrop((events, reason) -> { droppedEvents.addAll(events); reasons.add(reason); }).build()) {
             b.recordPublish("c".repeat(65), "sensor-1", "t", 0, false, 1L);
+            // Not thrown, not buffered: counted and handed to onDrop as INVALID, key intact.
+            assertThat(b.droppedCount()).isEqualTo(1);
             Thread.sleep(100);
         }
         assertThat(captured).isEmpty();
+        assertThat(reasons).containsExactly(AforoMqttBilling.DropReason.INVALID);
+        assertThat(droppedEvents).hasSize(1);
+        assertThat(String.valueOf(droppedEvents.get(0).get("idempotencyKey"))).isNotBlank();
+    }
+
+    @Test
+    @DisplayName("a 202 that rejects one event by index drops only that event, as REJECTED")
+    void partialFailureDropsOnlyRejectedEvent() throws Exception {
+        acceptedBody.set("{\"success\":true,\"data\":{\"accepted\":1,\"duplicates\":0,\"failed\":1,\"errors\":[{\"index\":1,\"message\":\"Unknown metric\"}]}}");
+        List<Map<String, Object>> droppedEvents = new CopyOnWriteArrayList<>();
+        List<AforoMqttBilling.DropReason> reasons = new CopyOnWriteArrayList<>();
+        AforoMqttBilling b = builder().flushCount(1000)
+                .onDrop((events, reason) -> { droppedEvents.addAll(events); reasons.add(reason); }).build();
+        try {
+            b.recordPublish("cust_001", "sensor-1", "t/a", 0, false, 1L);
+            b.recordPublish("cust_001", "sensor-1", "t/b", 0, false, 1L);
+        } finally {
+            b.close();
+        }
+        assertThat(captured).hasSize(1);
+        assertThat(captured.get(0).body().get("events").size()).isEqualTo(2);
+        assertThat(b.droppedCount()).isEqualTo(1);
+        assertThat(reasons).containsExactly(AforoMqttBilling.DropReason.REJECTED);
+        assertThat(droppedEvents).hasSize(1);
+        assertThat(droppedEvents.get(0).get("mqttTopic")).isEqualTo("t/b");
+    }
+
+    @Test
+    @DisplayName("a whitespace topic or a blank customerId is dropped as INVALID")
+    void blankTopicOrCustomerDroppedAsInvalid() throws Exception {
+        List<AforoMqttBilling.DropReason> reasons = new CopyOnWriteArrayList<>();
+        try (AforoMqttBilling b = builder().flushCount(1).onDrop((events, reason) -> reasons.add(reason)).build()) {
+            b.recordPublish("cust_001", "sensor-1", "   ", 0, false, 1L);
+            b.recordPublish(" ", "sensor-1", "t", 0, false, 1L);
+            assertThat(b.droppedCount()).isEqualTo(2);
+        }
+        assertThat(captured).isEmpty();
+        assertThat(reasons).hasSize(2).containsOnly(AforoMqttBilling.DropReason.INVALID);
     }
 
     @Test

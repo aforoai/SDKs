@@ -1,6 +1,6 @@
 # aforo-mcp-metering — User Guide
 
-**Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** Python engineers running an MCP server who need per-tool-call billing.
+**Version:** 1.3.2 · **Updated:** 2026-10-01 · **Audience:** Python engineers running an MCP server who need per-tool-call billing.
 
 ## What you'll build
 
@@ -15,7 +15,7 @@ An MCP server whose tool handlers are metered automatically: every call records 
 ## Step 1 — Install
 
 ```bash
-pip install -e .                 # from python-mcp/ (not yet on PyPI)
+pip install -e .                 # from python-mcp/ (or: pip install "aforo-mcp-metering>=1.3.2")
 pip install -e ".[httpx]"        # or [aiohttp] for an async client
 ```
 
@@ -53,7 +53,7 @@ async def handle_tool(name: str, arguments: dict, **kwargs):
     return [TextContent(type="text", text=result)]
 ```
 
-The wrapper times the call, records the invocation in a `finally` block (so failures are still billed), and re-raises any exception with `executionStatus="ERROR"`.
+The wrapper times the call and records the invocation in a `finally` block, so failures are still metered. The call's `executionStatus` is derived for you: a returned result → `SUCCESS`; a returned result with `isError: true` (the normal way an MCP tool reports failure) → `ERROR`; a raised `TimeoutError` or an MCP error with JSON-RPC code `-32001` → `TIMEOUT`; any other raised exception → `ERROR`; `asyncio.CancelledError`, `KeyboardInterrupt` or `SystemExit` → `CANCELLED`. Exceptions are always re-raised. To override, pass a synchronous resolver: `@billing.wrap_tool_handler(status_resolver=lambda result, error: ...)` — it returns one of the 11 canonical statuses, or `None` to keep the default; a resolver that raises, is async, or returns an unknown value is logged and the default is used. Handlers may be `async def` or plain `def`.
 
 > ⚠ The wrapped handler **must** keep the `(name, arguments, **kwargs)` shape. `agent_id` and `session_id` are read from `kwargs`; if your server passes them positionally or under different names, they won't be attributed (`agent_id` falls back to `"unknown"`). The `customerId` on each event is the `agent_id` — so a missing `agent_id` bills everything to `"unknown"`.
 
@@ -106,14 +106,15 @@ A hard crash skips this — buffered events that never flushed are lost.
 | `api_key` | `str` | required | Aforo API key, sent as `X-API-Key`. |
 | `ingestor_url` | `str` | required | Host; `/v1/ingest/batch` appended. |
 | `flush_interval_sec` | `float` | `5.0` | Periodic flush cadence (needs `start()`). |
-| `flush_count` | `int` | `50` | Buffer size that triggers an async flush. |
+| `flush_count` | `int` | `50` | Buffer size that triggers an async flush (clamped to 1..1000). |
 | `on_error` | `Callable?` | logs | Called on permanent batch failure. |
+| `on_drop` | `Callable[[list[dict], str], None]?` | `None` | Called with events the SDK loses; `reason` is `retry_exhausted`, `rejected` or `invalid`. `dropped_count` is the running total. |
 | `heartbeat_interval_sec` | `float` | `30.0` | Seconds between session heartbeats. |
 | `heartbeat_enabled` | `bool` | `True` | Turn periodic session heartbeats off. |
 | `on_session_killed` | `Callable[[str, str], None]?` | `None` | Called on a server kill signal `(session_id, "SERVER_KILL")`. |
 | `product_type` | `str` | `"MCP_SERVER"` | Top-level `productType` on every event; per-call override via the `product_type` handler kwarg or `record_tool_invocation(product_type=...)`. |
 
-Methods: `wrap_tool_handler(handler)`, `record_tool_invocation(tool_name, agent_id, session_id=None, execution_status="SUCCESS", execution_duration_ms=0, *, product_type=None)`, `start()`, `flush()`, `start_session(session_id, product_type=None, customer_id=None)`, `end_session()`, `shutdown()`.
+Methods: `wrap_tool_handler(handler, *, status_resolver=None)`, `record_tool_invocation(tool_name, agent_id, session_id=None, execution_status="SUCCESS", execution_duration_ms=0, *, product_type=None)`, `start()`, `flush()`, `start_session(session_id, product_type=None, customer_id=None)`, `end_session()`, `shutdown()`.
 
 ## Troubleshooting
 
@@ -122,6 +123,8 @@ Methods: `wrap_tool_handler(handler)`, `record_tool_invocation(tool_name, agent_
 | No events at all | `await start()` was never called and the buffer hasn't hit `flush_count`. | Call `await billing.start()` once, or `await billing.flush()` to force it. |
 | Every event has `agentId = "unknown"` | The handler didn't receive `agent_id` in `kwargs`. | Pass `agent_id` (and `session_id`) through from your MCP server to the tool handler. |
 | `on_error` fires with "Aforo returned 401/403" | Bad/unscoped API key — 4xx is dropped, not retried. | Fix `api_key`; confirm it belongs to `tenant_id`. |
+| `dropped_count` rises, WARN "Invalid tool invocation not sent" | Blank tool name, `agent_id` over 36 chars or `session_id` over 64 chars. The invocation is not sent and those ids are not truncated. (A tool name over 64 chars does not drop the event: it is truncated to 64 and the call is still sent.) | Shorten the id at the source; inspect the events your `on_drop` hook receives with reason `"invalid"`. |
+| A failed tool bills as `SUCCESS` | The tool returns an error payload without `isError: true` and without raising. | Return `isError: true`, raise, or pass a `status_resolver`. |
 | Events sent, none in console | Wrong `ingestor_url` host, or `mcp_server.tool_invocations` isn't mapped to a rate plan. | Use `https://api.aforo.ai`; map the metric in the Aforo console. |
 | Session keeps billing after you expected it killed | Kill only clears the SDK's session; it does not abort the in-flight tool call. | Handle the stop in `on_session_killed` and close the session yourself. |
 | Events lost on restart | Buffered events weren't flushed before exit. | `await billing.shutdown()` in your shutdown path. |

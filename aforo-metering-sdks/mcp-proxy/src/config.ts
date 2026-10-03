@@ -44,6 +44,7 @@ export function loadConfig(cliArgs: Partial<ProxyConfig & { config?: string }>):
     quotaEnforcement: envBool('AFORO_QUOTA_ENFORCEMENT')  ?? cliArgs.aforo?.quotaEnforcement ?? fileConfig.aforo?.quotaEnforcement ?? DEFAULTS.quotaEnforcement,
     flushIntervalMs:  envInt('AFORO_FLUSH_INTERVAL_MS')   ?? cliArgs.aforo?.flushIntervalMs  ?? fileConfig.aforo?.flushIntervalMs  ?? DEFAULTS.flushIntervalMs,
     flushCount:       envInt('AFORO_FLUSH_COUNT')          ?? cliArgs.aforo?.flushCount        ?? fileConfig.aforo?.flushCount        ?? DEFAULTS.flushCount,
+    responseTimeoutMs: envInt('AFORO_RESPONSE_TIMEOUT_MS') ?? cliArgs.aforo?.responseTimeoutMs ?? fileConfig.aforo?.responseTimeoutMs,
     heartbeatIntervalMs: envInt('AFORO_HEARTBEAT_INTERVAL_MS') ?? cliArgs.aforo?.heartbeatIntervalMs ?? fileConfig.aforo?.heartbeatIntervalMs ?? DEFAULTS.heartbeatIntervalMs,
     debug:           envBool('AFORO_DEBUG')                ?? cliArgs.aforo?.debug             ?? fileConfig.aforo?.debug             ?? DEFAULTS.debug,
   };

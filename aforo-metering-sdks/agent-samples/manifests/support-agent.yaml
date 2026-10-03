@@ -1,0 +1,53 @@
+# Aforo AI_AGENT reference manifest — Support Agent (minimal shape)
+# Only required fields + capability names + one description per capability.
+# Useful for exercising the fresh-product / sparse-manifest path.
+
+name: Aforo Support Agent
+description: Triages inbound support tickets — classify intent, draft a first response, and escalate when SLA risk is high.
+
+version: 1.0.0
+
+tags:
+  - support
+  - triage
+
+capabilities:
+  - name: classify_intent
+    description: Classify a support ticket into one of billing_question, technical_issue, feature_request, refund_request, or other.
+    costTier: STANDARD
+    input_schema:
+      type: object
+      required: [ticket_body]
+      properties:
+        ticket_body:
+          type: string
+          maxLength: 10000
+
+  - name: draft_response
+    description: Draft a first-touch response to a ticket in the tenant's brand voice.
+    costTier: STANDARD
+    input_schema:
+      type: object
+      required: [ticket_body, intent]
+      properties:
+        ticket_body:
+          type: string
+        intent:
+          type: string
+        brand_voice:
+          type: string
+          enum: [formal, friendly, technical]
+          default: friendly
+
+  - name: escalate_ticket
+    description: Decide whether to escalate to a human based on sentiment plus SLA time remaining.
+    costTier: STANDARD
+    input_schema:
+      type: object
+      required: [ticket_body, sla_remaining_minutes]
+      properties:
+        ticket_body:
+          type: string
+        sla_remaining_minutes:
+          type: integer
+          minimum: 0

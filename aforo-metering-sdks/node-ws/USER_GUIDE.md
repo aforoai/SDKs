@@ -1,6 +1,6 @@
 # @aforoai/ws-metering — User Guide
 
-**Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** Node.js engineers running a WebSocket server (`ws`, Fastify-WebSocket, Socket.io, Deno, Bun) who need per-connection usage metered into Aforo.
+**Version:** 1.2.1 · **Updated:** 2026-10-01 · **Audience:** Node.js engineers running a WebSocket server (`ws`, Fastify-WebSocket, Socket.io, Deno, Bun) who need per-connection usage metered into Aforo.
 
 ## What you'll build
 
@@ -21,7 +21,7 @@ Once published:
 npm i @aforoai/ws-metering ws
 ```
 
-It isn't on npm yet. Build from source and link it:
+Install `1.2.1` or later. `1.0.0` on npm was built from an older copy of this code and lacks the fixes listed in the changelog. If `1.2.1` is not on npm yet, install from source:
 
 ```bash
 cd SDKs/aforo-metering-sdks/node-ws
@@ -121,6 +121,11 @@ The batch is POSTed to `https://api.aforo.ai/v1/ingest/batch` with `X-API-Key: <
 new AforoWsBilling({ /* … */, onError: (err) => myLogger.error('aforo ws flush failed', err) });
 ```
 
+## Outcomes and dropped events
+
+- **`executionStatus`** — the outcome used by outcome-based pricing. How this SDK sets it, the accepted values and how to override it: [README → Execution status](README.md#execution-status).
+- **Dropped events** — the SDK does not throw into your socket handlers for event content. Events it cannot deliver are counted in `billing.droppedCount`, logged with `console.warn`, and passed to `onDrop(events, reason)`. The three reasons (`invalid`, `rejected`, `retry_exhausted`) and what triggers each: [README → Dropped events](README.md#dropped-events).
+
 ## Configuration reference
 
 | Option | Type | Default | What it does |
@@ -133,7 +138,8 @@ new AforoWsBilling({ /* … */, onError: (err) => myLogger.error('aforo ws flush
 | `perFrameEvents` | `boolean` | `false` | One event per frame vs. aggregate-on-close only. |
 | `flushCount` | `number` | `100` | Buffered events that trigger an immediate flush. |
 | `flushIntervalMs` | `number` | `3000` | Max ms before a partial batch is flushed. |
-| `onError` | `(error: Error) => void` | `console.error` | Terminal flush-failure callback. |
+| `onError` | `(error: Error) => void` | `console.error` | Called once per delivery problem: dropped or refused batch, per-event failures in a 2xx response, unusable `executionStatus`. |
+| `onDrop` | `(events, reason) => void` | none | Receives permanently dropped events with reason `invalid`, `rejected` or `retry_exhausted`. |
 | `extractCustomerId` | `(req) => string \| undefined` | — (`wrapServer`) | Resolve the customer from the upgrade request. |
 | `extractMetadata` | `(req) => Record<string, unknown> \| undefined` | `undefined` (`wrapServer`) | Optional per-connection tags. |
 
@@ -148,6 +154,8 @@ new AforoWsBilling({ /* … */, onError: (err) => myLogger.error('aforo ws flush
 | `wsCloseReason` is `NORMAL_CLOSURE` for an abnormal drop | Close code `1005`/`1006` maps that way, or no code arrived | Inspect `metadata.closeCode`; abnormal drops show `1006 → ABNORMAL_CLOSURE`. |
 | Byte counts look low | `estimateBytes` only sizes strings/Buffers/typed arrays | Send standard frame payloads; exotic payload types size to 0. |
 | `onError` firing repeatedly | Wrong `apiKey`/`tenantId`, or ingestor unreachable | Verify credentials and that the host accepts `POST /v1/ingest/batch`. |
+| `droppedCount` rises and the warning says `invalid` | An event failed a client-side check (`customerId` longer than 64 characters or `productType` longer than 20) | Fix the value named in the warning; over-limit values are not truncated. `onDrop` receives the event. |
+| `droppedCount` rises and the warning says `rejected` | The ingestor refused the batch (4xx) or specific events | Read the `onError` message — it carries the ingestor's `errors[].message`. |
 
 ## What this guide does NOT cover
 

@@ -11,3 +11,14 @@ target/
 *.log
 .idea/
 *.iml
+
+# Test coverage artifacts — never commit generated reports, any language
+# (jest --coverage, pytest-cov, go -coverprofile, jacoco)
+coverage/
+.coverage
+.coverage.*
+htmlcov/
+.nyc_output/
+*.lcov
+coverage.out
+cover.out

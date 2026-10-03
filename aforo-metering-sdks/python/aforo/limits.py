@@ -3,8 +3,10 @@
 An event that breaks one of these is rejected by the ingestor and never billed.
 The server reports it per event (indexed ``errors[]`` in the batch response), but
 the SDK flushes in the background, so that report reaches nobody: the usage is
-simply gone. Checking the same limits in ``track()`` surfaces the problem to the
-caller, at the call site that produced it, while the event can still be fixed.
+simply gone. ``track()`` checks the same limits before buffering: an event that
+breaks one is not sent; it is counted in ``dropped_count``, WARN-logged with the
+field, the limit and the offending value, and passed to the ``on_drop`` hook with
+reason ``"invalid"``. ``track()`` does not raise for it.
 
 Source: ``dto/IngestUsageEventRequest`` in aforo-nextgen-usage-ingestor-service —
 the ``@Size`` and ``@Digits`` bean constraints, which are compiled into the server
@@ -17,13 +19,25 @@ may raise ``max-age-days`` to 365 for backfills — so enforcing the default her
 would make the SDK refuse usage its own server would accept and bill. Refusing
 real usage is a worse failure than the rejection it prevents.
 
-Nothing here truncates or rounds: that would change what is billed. The offending
-event is rejected instead, naming the field, the limit and the offending value.
+``describe_limit_violation`` never truncates or rounds: that would change what is
+billed. The offending event is dropped instead, naming the field, the limit and
+the offending value. That holds for every field the SDK caller sets.
+
+The one exception is a label the SDK itself copies from the incoming request
+(the middlewares' ``endpointPath`` and ``httpMethod``): those go through
+``truncate_label`` where they are derived, so an API consumer cannot avoid being
+metered by sending an over-long path. The event is still sent, with the label cut
+to the server limit.
+
+``executionStatus`` is not checked here: an unknown or over-length status is left
+off the event and the event is still sent (see ``normalize_execution_status``).
 """
 
 from __future__ import annotations
 
+import logging
 import re
+import threading
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Optional
 
@@ -38,9 +52,70 @@ MAX_LENGTHS = {
     "sessionId": 64,
     "agentId": 36,
     "toolName": 64,
+    "capabilityName": 64,
+    "subscriptionId": 64,
     "endpointPath": 512,
     "httpMethod": 16,
+    "grpcService": 255,
+    "grpcMethod": 128,
+    "gqlOperationName": 255,
+    "wsConnectionId": 64,
+    "mqttTopic": 500,
+    "mqttClientId": 128,
 }
+
+logger = logging.getLogger("aforo.limits")
+
+_truncation_warned: set = set()
+_truncation_lock = threading.Lock()
+
+
+def utf16_length(text: str) -> int:
+    """Length as the ingestor counts it (Java ``String.length()``): UTF-16 code
+    units, so a character outside the Basic Multilingual Plane counts as 2."""
+    return sum(2 if ord(ch) > 0xFFFF else 1 for ch in text)
+
+
+def truncate_utf16(text: str, limit: int) -> str:
+    """Longest prefix of ``text`` that is at most ``limit`` UTF-16 code units.
+
+    Cuts between characters, so a surrogate pair is never split: a character
+    that needs 2 units and has only 1 left is left out entirely.
+    """
+    if len(text) * 2 <= limit:
+        return text
+    units = 0
+    for index, ch in enumerate(text):
+        units += 2 if ord(ch) > 0xFFFF else 1
+        if units > limit:
+            return text[:index]
+    return text
+
+
+def truncate_label(field: str, value: Any) -> Any:
+    """Cut a request-derived label to the ingestor's limit for ``field``.
+
+    For labels the SDK copies from the incoming request only -- never for a
+    field the caller sets (those are dropped as ``"invalid"`` when over-long).
+    Logs one WARNING per field name per process. Non-strings pass through.
+    """
+    if not isinstance(value, str):
+        return value
+    limit = MAX_LENGTHS[field]
+    cut = truncate_utf16(value, limit)
+    if len(cut) == len(value):
+        return value
+    with _truncation_lock:
+        first = field not in _truncation_warned
+        _truncation_warned.add(field)
+    if first:
+        logger.warning(
+            "[aforo] %s taken from the request was longer than the ingestor's limit and "
+            "was truncated to %d characters; the event is still sent. Logged once per field.",
+            field, limit,
+        )
+    return cut
+
 
 #: ``@Digits(integer=14, fraction=6)`` — usage_events.quantity is NUMERIC(20,6).
 MAX_QUANTITY_INTEGER_DIGITS = 14
@@ -63,7 +138,7 @@ def _length_error(field: str, value: Any) -> Optional[str]:
         return None
     return (
         f"{field} is {len(text)} characters, exceeding the ingestor's {limit}-character "
-        f'limit (value starts "{text[:32]}"). Shorten it — the SDK will not truncate it, '
+        f'limit (value starts "{text[:80]}"). Shorten it — the SDK will not truncate it, '
         "because a truncated id bills the wrong thing."
     )
 

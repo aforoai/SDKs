@@ -6,10 +6,10 @@ import java.math.BigDecimal;
  * Client-side mirror of the ingestor's per-event field constraints.
  *
  * <p>An event that breaks one of these is rejected by the ingestor and never
- * billed. The server reports it per event (indexed {@code errors[]} in the batch
- * response), but the SDK flushes in the background, so that report reaches
- * nobody: the usage is simply gone. Checking the same limits at {@code track()}
- * surfaces the problem where it can still be acted on.</p>
+ * billed. Checking the same limits at {@code track()} reports the problem at the
+ * call that caused it: the event is not buffered, it is counted in
+ * {@code droppedCount()}, logged, and handed to the {@code onDrop} hook with
+ * {@link DropReason#INVALID}. {@code track()} does not throw for it.</p>
  *
  * <p>Source: {@code dto/IngestUsageEventRequest} in
  * aforo-nextgen-usage-ingestor-service — the {@code @Size} and {@code @Digits}
@@ -56,8 +56,14 @@ final class EventLimits {
     private static String length(String field, String value, int max) {
         if (value == null || value.length() <= max) return null;
         return field + " is " + value.length() + " characters, exceeding the ingestor's " + max
-                + "-character limit. Shorten it — the SDK will not truncate it, because a truncated"
+                + "-character limit (value: \"" + abbreviate(value) + "\"). Shorten it — the SDK will not truncate it, because a truncated"
                 + " id bills the wrong thing.";
+    }
+
+    /** At most ~80 characters of a value, for log messages. */
+    static String abbreviate(String value) {
+        if (value == null) return "null";
+        return value.length() <= 80 ? value : value.substring(0, 80) + "...";
     }
 
     private static String quantity(double quantity) {

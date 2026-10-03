@@ -74,6 +74,59 @@ class AforoWsBillingTest {
         return allEvents().stream().filter(p).toList();
     }
 
+    // ── executionStatus (explicit only) ────────────────────────────────
+
+    @Test
+    @DisplayName("executionStatus: explicit values are normalized and sent; never derived from the close code")
+    void executionStatusExplicitOnly() throws Exception {
+        try (AforoWsBilling b = baseBuilder().perFrameEvents(true).build()) {
+            String c1 = b.openConnection("cust_001", null, " pending ");
+            b.recordFrame(c1, "CLIENT_TO_SERVER", "TEXT", 3, "success");
+            b.recordFrame(c1, "CLIENT_TO_SERVER", "TEXT", 3);
+            b.closeConnection(c1, 1011, "  timeout ");
+            String c2 = b.openConnection("cust_001", null);
+            b.recordFrame(c2, "CLIENT_TO_SERVER", "TEXT", 3, "   ");
+            b.closeConnection(c2, 1011);                    // error close code, but nothing derived
+        }
+        waitFor(() -> allEvents().size() == 7, 2000);
+        List<JsonNode> ev = allEvents();
+        java.util.Map<String, List<JsonNode>> byConn = new java.util.HashMap<>();
+        for (JsonNode e : ev) byConn.computeIfAbsent(e.get("wsConnectionId").asText(), k -> new java.util.ArrayList<>()).add(e);
+        assertThat(byConn).hasSize(2);
+        for (List<JsonNode> events : byConn.values()) {
+            boolean first = events.size() == 4;
+            if (first) {
+                assertThat(events.get(0).get("executionStatus").asText()).isEqualTo("PENDING");
+                assertThat(events.get(1).get("executionStatus").asText()).isEqualTo("SUCCESS");
+                assertThat(events.get(2).has("executionStatus")).isFalse();
+                assertThat(events.get(3).get("wsFrameType").asText()).isEqualTo("CLOSE");
+                assertThat(events.get(3).get("executionStatus").asText()).isEqualTo("TIMEOUT");
+            } else {
+                assertThat(events).hasSize(3);
+                events.forEach(e -> assertThat(e.has("executionStatus")).isFalse());
+                assertThat(events.get(2).get("wsCloseReason").asText()).isEqualTo("INTERNAL_ERROR");
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("executionStatus: unknown explicit values are omitted; the rest of each event is sent")
+    void executionStatusUnknownOmitted() throws Exception {
+        try (AforoWsBilling b = baseBuilder().perFrameEvents(true).build()) {
+            String c1 = b.openConnection("cust_001", null, "opened");
+            b.recordFrame(c1, "CLIENT_TO_SERVER", "TEXT", 3, "TIMEOUT_BUT_WAY_TOO_LONG_FOR_IT");
+            b.closeConnection(c1, 1000, " cancelled ");
+        }
+        waitFor(() -> allEvents().size() == 3, 2000);
+        List<JsonNode> ev = allEvents();
+        assertThat(ev).hasSize(3);
+        assertThat(ev.get(0).has("executionStatus")).isFalse();
+        assertThat(ev.get(0).get("customerId").asText()).isEqualTo("cust_001");
+        assertThat(ev.get(1).has("executionStatus")).isFalse();
+        assertThat(ev.get(1).get("dataBytes").asLong()).isEqualTo(3L);
+        assertThat(ev.get(2).get("executionStatus").asText()).isEqualTo("CANCELLED");
+    }
+
     // ── Lifecycle: open → close ────────────────────────────────────────
 
     @Test

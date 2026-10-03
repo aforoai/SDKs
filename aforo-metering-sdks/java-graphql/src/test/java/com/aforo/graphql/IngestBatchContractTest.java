@@ -13,6 +13,7 @@ import java.net.InetSocketAddress;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -33,6 +34,8 @@ class IngestBatchContractTest {
     private final List<Captured> captured = new CopyOnWriteArrayList<>();
     private final AtomicInteger failuresBeforeSuccess = new AtomicInteger();
     private final AtomicInteger failureStatus = new AtomicInteger(500);
+    /** When set, the body of a 202 response (to simulate a partial result). */
+    private final java.util.concurrent.atomic.AtomicReference<String> acceptedBody = new java.util.concurrent.atomic.AtomicReference<>();
     private HttpServer server;
     private int port;
 
@@ -51,6 +54,14 @@ class IngestBatchContractTest {
                         .getBytes(java.nio.charset.StandardCharsets.UTF_8);
                 exchange.sendResponseHeaders(status, err.length);
                 exchange.getResponseBody().write(err);
+                exchange.close();
+                return;
+            }
+            String accepted = acceptedBody.get();
+            if (status == 202 && accepted != null) {
+                byte[] ok = accepted.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(status, ok.length);
+                exchange.getResponseBody().write(ok);
                 exchange.close();
                 return;
             }
@@ -130,11 +141,41 @@ class IngestBatchContractTest {
     @Test
     @DisplayName("customerId longer than 64 chars is not sent")
     void overlongCustomerDropped() throws Exception {
-        try (AforoGraphQlBilling b = builder().flushCount(1).build()) {
+        List<Map<String, Object>> droppedEvents = new CopyOnWriteArrayList<>();
+        List<AforoGraphQlBilling.DropReason> reasons = new CopyOnWriteArrayList<>();
+        try (AforoGraphQlBilling b = builder().flushCount(1)
+                .onDrop((events, reason) -> { droppedEvents.addAll(events); reasons.add(reason); }).build()) {
             b.record("c".repeat(65), "{ a }", null, 1L, false);
+            // Not thrown, not buffered: counted and handed to onDrop as INVALID, key intact.
+            assertThat(b.droppedCount()).isEqualTo(1);
             Thread.sleep(100);
         }
         assertThat(captured).isEmpty();
+        assertThat(reasons).containsExactly(AforoGraphQlBilling.DropReason.INVALID);
+        assertThat(droppedEvents).hasSize(1);
+        assertThat(String.valueOf(droppedEvents.get(0).get("idempotencyKey"))).isNotBlank();
+    }
+
+    @Test
+    @DisplayName("a 202 that rejects one event by index drops only that event, as REJECTED")
+    void partialFailureDropsOnlyRejectedEvent() throws Exception {
+        acceptedBody.set("{\"success\":true,\"data\":{\"accepted\":1,\"duplicates\":0,\"failed\":1,\"errors\":[{\"index\":1,\"message\":\"Unknown metric\"}]}}");
+        List<Map<String, Object>> droppedEvents = new CopyOnWriteArrayList<>();
+        List<AforoGraphQlBilling.DropReason> reasons = new CopyOnWriteArrayList<>();
+        AforoGraphQlBilling b = builder().flushCount(1000)
+                .onDrop((events, reason) -> { droppedEvents.addAll(events); reasons.add(reason); }).build();
+        try {
+            b.record("cust_001", "query A { a }", "A", 1L, false);
+            b.record("cust_001", "query B { b }", "B", 1L, false);
+        } finally {
+            b.close();
+        }
+        assertThat(captured).hasSize(1);
+        assertThat(captured.get(0).body().get("events").size()).isEqualTo(2);
+        assertThat(b.droppedCount()).isEqualTo(1);
+        assertThat(reasons).containsExactly(AforoGraphQlBilling.DropReason.REJECTED);
+        assertThat(droppedEvents).hasSize(1);
+        assertThat(droppedEvents.get(0).get("gqlOperationName")).isEqualTo("B");
     }
 
     @Test
@@ -156,7 +197,7 @@ class IngestBatchContractTest {
     void perCallProductTypeOverride() throws Exception {
         try (AforoGraphQlBilling b = builder().flushCount(2).build()) {
             b.record("cust_001", "query A { a }", "A", 1L, false);
-            b.record("cust_001", "query B { b }", "B", 1L, false, " agentic_api ");
+            b.record("cust_001", "query B { b }", "B", 1L, false, null, " agentic_api ");
             waitFor(() -> !captured.isEmpty(), 3000);
         }
         JsonNode events = captured.get(0).body().get("events");

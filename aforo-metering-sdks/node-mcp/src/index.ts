@@ -24,6 +24,20 @@
  *   );
  */
 
+import { createHash, randomUUID } from 'node:crypto';
+
+/**
+ * Why buffered events were permanently dropped by the SDK.
+ * - 'retry_exhausted': the batch failed after all 3 flush attempts (ingest outage).
+ * - 'rejected': the ingestor rejected the batch with a non-retryable 4xx, or
+ *   rejected these events individually inside a batch it otherwise accepted.
+ * - 'invalid': the event failed a client-side check (blank toolName, or
+ *   agentId / customerId / sessionId over the ingestor's size limit) and was
+ *   never buffered or sent. An over-long toolName is truncated, not dropped.
+ * (No 'overflow' reason here — the MCP buffer is unbounded between flushes.)
+ */
+export type McpDropReason = 'retry_exhausted' | 'rejected' | 'invalid';
+
 /** The ingestor's per-request cap on POST /v1/ingest/batch (IngestBatchRequest). */
 export const MAX_BATCH_EVENTS = 1000;
 export const DEFAULT_PRODUCT_TYPE = 'MCP_SERVER';
@@ -34,6 +48,9 @@ export const HEARTBEAT_FALLBACK_CUSTOMER_ID = 'system';
 const MAX_CUSTOMER_ID = 64;
 const MAX_AGENT_ID = 36;
 const MAX_TOOL_NAME = 64;
+const MAX_SESSION_ID = 64;
+const MAX_PRODUCT_TYPE = 20;
+const MAX_IDEMPOTENCY_KEY = 255;
 
 export interface AforoMcpConfig {
   tenantId: string;
@@ -65,6 +82,16 @@ export interface AforoMcpConfig {
   flushIntervalMs?: number;
   flushCount?: number;
   onError?: (error: Error) => void;
+  /**
+   * OPT-IN hook invoked with events the SDK is about to lose permanently
+   * (retry exhaustion, non-retryable rejection, or an event that failed
+   * client-side validation — reason 'invalid'), so the app can persist /
+   * alert / replay them. Dropped events keep their idempotency keys —
+   * re-sending them after recovery is dedup-safe. Default: none (drops are
+   * still counted in droppedCount and WARN-logged). Exceptions thrown by the
+   * hook are swallowed.
+   */
+  onDrop?: (events: UsageEvent[], reason: McpDropReason) => void;
   /** Interval between session heartbeats in ms (default 30000). */
   heartbeatIntervalMs?: number;
   /** Whether to send session heartbeats while a session is active (default true). */
@@ -89,7 +116,7 @@ export interface StartSessionOptions {
   productType?: string;
 }
 
-const SDK_VERSION = '1.1.0';
+const SDK_VERSION = '1.3.2';
 
 function normalizeProductType(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
@@ -103,11 +130,114 @@ function nonBlank(value: unknown): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
+/** Shorten an offending value for a log line. */
+function clip(value: unknown): string {
+  return String(value).slice(0, 80);
+}
+
+/** Best-effort server explanation for a rejected request. */
+async function readErrorMessage(response: { json?: () => Promise<unknown> }): Promise<string | undefined> {
+  try {
+    const body = (await response.json?.()) as Record<string, any> | undefined;
+    if (!body || typeof body !== 'object') return undefined;
+    const first = Array.isArray(body.errors) ? body.errors[0] : undefined;
+    const text = first?.message ?? body.detail ?? body.message ?? body.error ?? body.title;
+    return typeof text === 'string' && text ? text.slice(0, 500) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Cut `value` to at most `max` UTF-16 code units — how the ingestor counts
+ * (`String.length()` in Java) — without leaving half a surrogate pair.
+ */
+export function truncateToLimit(value: string, max: number): string {
+  if (value.length <= max) return value;
+  let end = Math.max(0, max);
+  const last = end > 0 ? value.charCodeAt(end - 1) : 0;
+  // A high surrogate at the cut means its low half was cut off: drop it too.
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return value.slice(0, end);
+}
+
+/**
+ * `head + component + tail`, unchanged when it fits the ingestor's
+ * idempotencyKey limit. Otherwise `component` is replaced by the SHA-256 hex
+ * digest of its full value (and, if the fixed parts alone are too long,
+ * `head + component` is). Never cut, so the unique tail always survives.
+ */
+function boundedIdempotencyKey(head: string, component: string, tail: string): string {
+  const key = `${head}${component}${tail}`;
+  if (key.length <= MAX_IDEMPOTENCY_KEY) return key;
+  const hashed = `${head}${sha256Hex(component)}${tail}`;
+  if (hashed.length <= MAX_IDEMPOTENCY_KEY) return hashed;
+  return `${sha256Hex(head + component)}${tail}`;
+}
+
+function sha256Hex(text: string): string {
+  return createHash('sha256').update(text, 'utf8').digest('hex');
+}
+
 function randomSuffix(): string {
   return Math.random().toString(36).slice(2, 10);
 }
 
-interface UsageEvent {
+/**
+ * Decides the executionStatus for one tool call. Receives the handler's
+ * result (undefined when it threw) and the thrown error (undefined when it
+ * returned). Return one of the canonical statuses (SUCCESS, PARTIAL, TIMEOUT,
+ * ERROR, VALIDATION_FAILED, FAILED, FAILURE, CANCELLED, PENDING, BLOCKED,
+ * HITL_REQUIRED), or undefined to use {@link defaultToolStatus}.
+ */
+export type ToolStatusResolver<TRes = unknown> = (
+  result: TRes | undefined,
+  error: unknown,
+) => string | undefined;
+
+export interface WrapToolHandlerOptions<TRes = unknown> {
+  /** Overrides the default status decision. Must be synchronous. If it
+   * throws, returns a Promise, or returns a status outside
+   * {@link EXECUTION_STATUSES}, the problem is reported to onError and the
+   * default decision is used instead. */
+  statusResolver?: ToolStatusResolver<TRes>;
+}
+
+/** The 11 statuses the ingestor accepts; anything else rejects the event. */
+export const EXECUTION_STATUSES: readonly string[] = [
+  'SUCCESS', 'PARTIAL', 'TIMEOUT', 'ERROR', 'VALIDATION_FAILED', 'FAILED',
+  'FAILURE', 'CANCELLED', 'PENDING', 'BLOCKED', 'HITL_REQUIRED',
+];
+
+/** JSON-RPC error code the MCP SDKs use for a request timeout (ErrorCode.RequestTimeout). */
+const MCP_REQUEST_TIMEOUT = -32001;
+
+/**
+ * Default executionStatus for a wrapped tool call:
+ * - the handler threw a timeout (a `TimeoutError`, e.g. from
+ *   `AbortSignal.timeout`, or an MCP error with code -32001) → TIMEOUT
+ * - the handler threw anything else, including a JSON-RPC error → ERROR
+ * - the handler returned `{ isError: true, ... }`, the normal way an MCP
+ *   tool reports failure → ERROR
+ * - otherwise → SUCCESS
+ *
+ * ERROR rather than FAILURE for returned failures: a tool author's choice
+ * between throwing and returning `isError` should not change the bill, and
+ * ERROR is what every gateway and SDK sends for a call that ran and failed.
+ */
+export function defaultToolStatus(result: unknown, error: unknown): string {
+  if (error !== undefined) {
+    const e = error as { name?: unknown; code?: unknown } | null;
+    if (e && (e.name === 'TimeoutError' || e.code === MCP_REQUEST_TIMEOUT)) return 'TIMEOUT';
+    return 'ERROR';
+  }
+  if (result && typeof result === 'object' && (result as { isError?: unknown }).isError === true) {
+    return 'ERROR';
+  }
+  return 'SUCCESS';
+}
+
+export interface UsageEvent {
   customerId: string;
   metricName: string;
   quantity: number;
@@ -138,6 +268,13 @@ export class AforoMcpBilling {
   private flushIntervalMs: number;
   private flushCount: number;
   private onError: (error: Error) => void;
+  private onDrop: ((events: UsageEvent[], reason: McpDropReason) => void) | null;
+
+  // Drop accounting — events permanently lost after flush failure
+  private dropped = 0;
+  private invalidDrops = 0;
+  /** Request-derived labels already reported as truncated (one WARN per label). */
+  private truncationWarned = new Set<string>();
   private productType: string;
   private defaultCustomerId: string | undefined;
   private defaultAgentId: string;
@@ -169,6 +306,7 @@ export class AforoMcpBilling {
     this.productType = normalizeProductType(config.productType) ?? DEFAULT_PRODUCT_TYPE;
     this.defaultCustomerId = nonBlank(config.customerId);
     this.defaultAgentId = nonBlank(config.agentId) ?? 'unknown';
+    this.onDrop = config.onDrop ?? null;
     this.heartbeatIntervalMs = config.heartbeatIntervalMs ?? 30_000;
     this.heartbeatEnabled = config.heartbeatEnabled ?? true;
     this.onError = config.onError ?? ((err) => console.error('[aforo-mcp] Error:', err.message));
@@ -298,7 +436,7 @@ export class AforoMcpBilling {
         return;
       }
       try {
-        this.handleKilledSessions((await response.json()) as BatchIngestResponse);
+        this.handleKilledSessions(unwrapEnvelope(await response.json()) as BatchIngestResponse);
       } catch {
         // Empty / non-JSON body — nothing to act on.
       }
@@ -335,7 +473,8 @@ export class AforoMcpBilling {
    * Reads `agent_id`, `session_id` and `customer_id` from `request.params._meta`.
    */
   wrapToolHandler<TReq extends { params: { name: string; arguments?: unknown; _meta?: Record<string, unknown> } }, TRes>(
-    handler: (request: TReq) => Promise<TRes>
+    handler: (request: TReq) => Promise<TRes>,
+    options: WrapToolHandlerOptions<TRes> = {},
   ): (request: TReq) => Promise<TRes> {
     return async (request: TReq): Promise<TRes> => {
       const toolName = request.params.name;
@@ -350,29 +489,65 @@ export class AforoMcpBilling {
         this.startSession(sessionId, { customerId: customerId ?? this.defaultCustomerId ?? agentId });
       }
 
-      let status = 'SUCCESS';
+      let result: TRes | undefined;
+      let error: unknown;
       try {
-        const result = await handler(request);
+        result = await handler(request);
         return result;
-      } catch (error) {
-        status = 'ERROR';
-        throw error;
+      } catch (err) {
+        error = err === undefined ? new Error('tool handler threw undefined') : err;
+        throw err;
       } finally {
         const durationMs = Date.now() - startTime;
+        const status = this.resolveToolStatus(result, error, options.statusResolver);
         this.recordToolInvocation(toolName, agentId, sessionId, status, durationMs,
           customerId ? { customerId } : undefined);
       }
     };
   }
 
+  private resolveToolStatus<TRes>(
+    result: TRes | undefined,
+    error: unknown,
+    resolver: ToolStatusResolver<TRes> | undefined,
+  ): string {
+    if (resolver) {
+      try {
+        const custom: unknown = resolver(result, error);
+        if (custom && typeof (custom as { then?: unknown }).then === 'function') {
+          // An async resolver can't be awaited here without delaying the
+          // tool's response. Swallow its eventual rejection (an unhandled
+          // rejection would crash the host process) and use the default.
+          (custom as Promise<unknown>).then(undefined, () => undefined);
+          this.onError(new Error('statusResolver returned a Promise; it must be synchronous. Using the default status.'));
+        } else if (typeof custom === 'string' && custom.trim()) {
+          const status = custom.trim().toUpperCase();
+          if (EXECUTION_STATUSES.includes(status)) return status;
+          this.onError(new Error(`statusResolver returned "${custom}", which is not an execution status. Using the default status.`));
+        }
+      } catch (err) {
+        this.onError(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+    return defaultToolStatus(result, error);
+  }
+
   /**
    * Record a tool invocation manually (if not using wrapToolHandler).
    *
    * The customer is `options.customerId`, else the `customerId` config, else
-   * the agentId. An event the ingestor would reject -- blank toolName,
-   * toolName over 64 chars, agentId over 36 chars or customerId over 64 chars --
-   * is dropped and reported via `onError`, because one invalid event fails its
-   * whole batch.
+   * the agentId. `executionStatus` is sent as given: pass one of
+   * {@link EXECUTION_STATUSES} (`wrapToolHandler` always does).
+   *
+   * Never throws. An event the ingestor would reject -- blank toolName,
+   * agentId over 36, customerId over 64, sessionId
+   * over 64, productType over 20 -- is not buffered or sent: it is counted in
+   * `droppedCount`, WARN-logged and passed to `onDrop` with reason `'invalid'`.
+   *
+   * The tool name is the name the client asked for, so an over-long one is
+   * not a reason to lose the call: it is cut to 64 chars on the event (one
+   * WARN per client) and the event is sent. The idempotency key is built from
+   * the full name.
    */
   recordToolInvocation(
     toolName: string,
@@ -382,38 +557,83 @@ export class AforoMcpBilling {
     executionDurationMs: number,
     options: RecordToolInvocationOptions = {}
   ): void {
-    const resolvedAgentId = nonBlank(agentId) ?? this.defaultAgentId;
-    const customerId = nonBlank(options.customerId) ?? this.defaultCustomerId ?? resolvedAgentId;
-    const problems: string[] = [];
-    if (!nonBlank(toolName)) problems.push('toolName is blank');
-    else if (toolName.length > MAX_TOOL_NAME) problems.push(`toolName exceeds ${MAX_TOOL_NAME} chars`);
-    if (resolvedAgentId.length > MAX_AGENT_ID) problems.push(`agentId exceeds ${MAX_AGENT_ID} chars`);
-    if (customerId.length > MAX_CUSTOMER_ID) problems.push(`customerId exceeds ${MAX_CUSTOMER_ID} chars`);
-    if (problems.length > 0) {
-      this.onError(new Error(`tool invocation not metered: ${problems.join(', ')}`));
-      return;
+    const label = this.requestLabel('toolName', toolName, MAX_TOOL_NAME);
+    this.recordInvocation(label, agentId, sessionId, executionStatus, executionDurationMs, options, toolName);
+  }
+
+  /**
+   * Bound a label that originates from the client's request (the tool name)
+   * to the ingestor's limit. The event is still sent; one WARN per label name
+   * per client. Identity fields never go through here.
+   */
+  private requestLabel(field: string, value: string, max: number): string {
+    if (typeof value !== 'string' || value.length <= max) return value;
+    if (!this.truncationWarned.has(field)) {
+      this.truncationWarned.add(field);
+      console.warn(
+        `[aforo-mcp] ${field} was longer than the ingestor's limit and was ` +
+        `truncated to ${max} characters; the event is still sent. Logged once per label.`,
+      );
     }
+    return truncateToLimit(value, max);
+  }
+
+  /** `keyToolName` is the untruncated tool name the idempotency key is built from. */
+  private recordInvocation(
+    toolName: string,
+    agentId: string | undefined,
+    sessionId: string | undefined,
+    executionStatus: string,
+    executionDurationMs: number,
+    options: RecordToolInvocationOptions,
+    keyToolName: string,
+  ): void {
+    const resolvedAgentId = nonBlank(agentId) ?? this.defaultAgentId;
+    const resolvedSessionId = nonBlank(sessionId);
+    const customerId = nonBlank(options.customerId) ?? this.defaultCustomerId ?? resolvedAgentId;
+    const productType = normalizeProductType(options.productType) ?? this.productType;
+    const problems: string[] = [];
+    if (!nonBlank(toolName)) problems.push(`toolName is blank (got "${clip(toolName)}")`);
+    if (resolvedAgentId.length > MAX_AGENT_ID) problems.push(`agentId "${clip(resolvedAgentId)}" exceeds ${MAX_AGENT_ID} chars`);
+    if (customerId.length > MAX_CUSTOMER_ID) problems.push(`customerId "${clip(customerId)}" exceeds ${MAX_CUSTOMER_ID} chars`);
+    if (resolvedSessionId && resolvedSessionId.length > MAX_SESSION_ID) problems.push(`sessionId "${clip(resolvedSessionId)}" exceeds ${MAX_SESSION_ID} chars`);
+    if (productType.length > MAX_PRODUCT_TYPE) problems.push(`productType "${clip(productType)}" exceeds ${MAX_PRODUCT_TYPE} chars`);
 
     const event: UsageEvent = {
       customerId,
       metricName: 'mcp_server.tool_invocations',
       quantity: 1,
       occurredAt: new Date().toISOString(),
-      // Unique per event: Date.now() alone collides for two calls of the same
-      // tool in the same ms, and the ingestor dedupes the second as a replay.
-      idempotencyKey: `mcp:sdk:${resolvedAgentId}:${sessionId ?? 'no-session'}:${toolName}:${Date.now()}:${randomSuffix()}`.slice(0, 255),
-      productType: normalizeProductType(options.productType) ?? this.productType,
+      // Random suffix de-collides identical tool calls landing in the same
+      // millisecond (same agent+session+tool) — without it they shared a key
+      // and the second dedup'd away (silent under-billing; 2026-07-05 fix).
+      // Stamped once at event creation, so flush retries stay dedup-safe.
+      // Built from the untruncated tool name; a name that makes the key longer
+      // than the ingestor allows is replaced by its SHA-256 digest. The key is
+      // never cut — cutting it would remove the suffix that keeps calls apart.
+      idempotencyKey: boundedIdempotencyKey(
+        `mcp:sdk:${resolvedAgentId}:${resolvedSessionId ?? 'no-session'}:`,
+        String(keyToolName),
+        `:${Date.now()}:${randomUUID().slice(0, 8)}`,
+      ),
+      productType,
       toolName,
       agentId: resolvedAgentId,
-      sessionId,
+      sessionId: resolvedSessionId,
       executionStatus,
       executionDurationMs,
       metadata: {
         productId: this.config.productId,
         sdk: 'nodejs',
-        sdkVersion: '1.0.0',
+        sdkVersion: SDK_VERSION,
       },
     };
+
+    if (problems.length > 0) {
+      // Not buffered, not sent, not thrown — same shape as every other drop.
+      this.recordDrop([event], 'invalid', problems.join(', '));
+      return;
+    }
 
     this.buffer.push(event);
 
@@ -442,6 +662,7 @@ export class AforoMcpBilling {
 
   private async sendBatch(events: UsageEvent[]): Promise<void> {
     const url = `${this.config.ingestorUrl}/v1/ingest/batch`;
+    // Serialized once: every retry re-sends the same body, same idempotency keys.
     const body = JSON.stringify({ events });
 
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -456,11 +677,8 @@ export class AforoMcpBilling {
 
         if (response.ok) {
           try {
-            const result = (await response.json()) as BatchIngestResponse;
-            if (result && result.failed > 0) {
-              const detail = (result.errors ?? []).slice(0, 5).map((e) => `#${e.index}: ${e.message}`).join('; ');
-              this.onError(new Error(`Aforo ingestor rejected ${result.failed} event(s)${detail ? `: ${detail}` : ''}`));
-            }
+            const result = unwrapEnvelope(await response.json()) as BatchIngestResponse;
+            this.handlePartialFailure(events, result);
             // Check for kill signals from server
             this.handleKilledSessions(result);
           } catch {
@@ -471,12 +689,14 @@ export class AforoMcpBilling {
 
         const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
         if (!retryable) {
-          this.onError(new Error(`Aforo ingestor returned ${response.status} — not retrying`));
+          const detail = await readErrorMessage(response);
+          this.onError(new Error(`Aforo ingestor returned ${response.status}${detail ? ` (${detail})` : ''} — not retrying`));
+          this.recordDrop(events, 'rejected', detail);
           return;
         }
         if (attempt === 3) {
           this.onError(new Error(`Aforo ingestor returned ${response.status} — retries exhausted, ${events.length} event(s) dropped`));
-          return;
+          break;
         }
         if (response.status === 429) {
           const retryAfter = response.headers?.get?.('Retry-After');
@@ -486,12 +706,84 @@ export class AforoMcpBilling {
       } catch (err) {
         if (attempt === 3) {
           this.onError(err instanceof Error ? err : new Error(String(err)));
-          return;
+          break;
         }
       }
 
       await new Promise(resolve => setTimeout(resolve, delayMs));
     }
+
+    // All 3 attempts failed (5xx / 408 / 429 or network error) — the batch was
+    // already removed from the buffer, so without this it vanishes silently.
+    this.recordDrop(events, 'retry_exhausted');
+  }
+
+  /**
+   * A 2xx can still report per-event rejections. Those events are dropped with
+   * reason 'rejected': by index when the response names them; otherwise they
+   * are counted and reported, but not handed to onDrop (which ones is unknown).
+   */
+  private handlePartialFailure(events: UsageEvent[], result: BatchIngestResponse | null | undefined): void {
+    if (!result || typeof result !== 'object') return;
+    const seen = new Set<number>();
+    const errors = (Array.isArray(result.errors) ? result.errors : []).filter((e) => {
+      const index = Number(e?.index);
+      if (!Number.isInteger(index) || index < 0 || index >= events.length || seen.has(index)) return false;
+      seen.add(index);
+      return true;
+    });
+    const reported = typeof result.failed === 'number' && result.failed > 0 ? Math.floor(result.failed) : 0;
+    const count = Math.min(events.length, Math.max(reported, errors.length));
+    if (count === 0) return;
+
+    const detail = errors.slice(0, 5).map((e) => `#${e.index}: ${e.message}`).join('; ');
+    this.onError(new Error(`Aforo ingestor rejected ${count} event(s)${detail ? `: ${detail}` : ''}`));
+    if (errors.length === count) {
+      this.recordDrop(errors.map((e) => events[Number(e.index)]), 'rejected', detail);
+    } else {
+      this.dropped += count;
+      console.warn(
+        `[aforo-mcp] Ingestor rejected ${count} of ${events.length} event(s) in a batch` +
+        `${detail ? `: ${detail}` : ''} (${this.dropped} total dropped).`,
+      );
+    }
+  }
+
+  /**
+   * Account for permanently lost events: bump the counter, WARN-log, and
+   * invoke the opt-in onDrop hook (exceptions swallowed — a hook bug must
+   * never break flushing). 'invalid' WARNs are throttled (first, then every
+   * 1000th) so a tight loop of bad events can't storm the log.
+   */
+  private recordDrop(events: UsageEvent[], reason: McpDropReason, detail?: string): void {
+    if (events.length === 0) return;
+    this.dropped += events.length;
+    if (reason === 'invalid') {
+      this.invalidDrops += events.length;
+      if (this.invalidDrops === 1 || this.invalidDrops % 1000 === 0) {
+        console.warn(
+          `[aforo-mcp] Invalid tool invocation dropped — ${detail ?? 'failed validation'} ` +
+          `(${this.invalidDrops} invalid, ${this.dropped} total dropped). It was not sent.`,
+        );
+      }
+    } else {
+      console.warn(
+        `[aforo-mcp] Dropped ${events.length} event(s) — ${reason}` +
+        `${detail ? `: ${detail}` : ''} (${this.dropped} total dropped).`,
+      );
+    }
+    if (this.onDrop) {
+      try {
+        this.onDrop(events, reason);
+      } catch {
+        // swallowed
+      }
+    }
+  }
+
+  /** Total events permanently dropped (failed batches, server-rejected and invalid events) since creation. */
+  get droppedCount(): number {
+    return this.dropped;
   }
 
   /**
@@ -505,4 +797,13 @@ export class AforoMcpBilling {
     }
     await this.flush();
   }
+}
+
+/**
+ * The ingestor wraps every 2xx JSON body in `{success, data, meta}`. Returns
+ * the inner `data` object when present, else the body unchanged (bare shape).
+ */
+function unwrapEnvelope(body: any): any {
+  const data = body && typeof body === 'object' && !Array.isArray(body) ? body.data : undefined;
+  return data && typeof data === 'object' && !Array.isArray(data) ? data : body;
 }

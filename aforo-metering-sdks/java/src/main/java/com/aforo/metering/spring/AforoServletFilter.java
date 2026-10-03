@@ -3,6 +3,7 @@ package com.aforo.metering.spring;
 import com.aforo.metering.AforoClient;
 import com.aforo.metering.AforoOptions;
 import com.aforo.metering.PathNormalizer;
+import com.aforo.metering.RequestLabels;
 import com.aforo.metering.TrackEvent;
 import jakarta.servlet.Filter;
 import jakarta.servlet.FilterChain;
@@ -17,6 +18,9 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.logging.Logger;
 
 /**
  * Servlet filter that captures API usage events after each request.
@@ -47,6 +51,11 @@ import java.util.Objects;
  * route pattern, else the normalized request path, without query string),
  * {@code httpMethod}, {@code statusCode}, {@code responseTimeMs}, and
  * {@code productType} ({@link #productType(String)}, else the client default).</p>
+ *
+ * <p>{@code endpointPath} and {@code httpMethod} come from the request. A value
+ * over the ingestor's limit (512 / 16 characters) is truncated and the event is
+ * still sent; one warning is logged per label per filter. The customer id and
+ * the metric name are never truncated — an over-long one drops the event.</p>
  */
 public class AforoServletFilter implements Filter {
 
@@ -58,6 +67,14 @@ public class AforoServletFilter implements Filter {
 
     /** Ingestor limit on {@code endpointPath}. */
     static final int MAX_ENDPOINT_PATH_LENGTH = 512;
+
+    /** Ingestor limit on {@code httpMethod}. */
+    static final int MAX_HTTP_METHOD_LENGTH = 16;
+
+    private static final Logger LOG = Logger.getLogger(AforoServletFilter.class.getName());
+
+    /** Labels already reported as truncated — one warning per label per filter. */
+    private final Set<String> truncationWarned = ConcurrentHashMap.newKeySet();
 
     private static final String BEST_MATCHING_PATTERN_ATTRIBUTE =
             "org.springframework.web.servlet.HandlerMapping.bestMatchingPattern";
@@ -169,7 +186,7 @@ public class AforoServletFilter implements Filter {
                     .quantity(1)
                     .productType(productType)
                     .endpointPath(endpointPath(req, path))
-                    .httpMethod(req.getMethod())
+                    .httpMethod(bounded("httpMethod", req.getMethod(), MAX_HTTP_METHOD_LENGTH))
                     .statusCode(res.getStatus())
                     .responseTimeMs(responseTimeMs)
                     .metadata(Map.of("gateway", "java-servlet", "status", res.getStatus()))
@@ -183,13 +200,23 @@ public class AforoServletFilter implements Filter {
     }
 
     /** Route pattern when Spring MVC matched one, else the normalized path; no query, capped. */
-    private static String endpointPath(HttpServletRequest req, String path) {
+    private String endpointPath(HttpServletRequest req, String path) {
         Object pattern = req.getAttribute(BEST_MATCHING_PATTERN_ATTRIBUTE);
         String normalized = PathNormalizer.normalize(path, pattern instanceof String s ? s : null);
         int q = normalized.indexOf('?');
         if (q >= 0) normalized = normalized.substring(0, q);
-        return normalized.length() > MAX_ENDPOINT_PATH_LENGTH
-                ? normalized.substring(0, MAX_ENDPOINT_PATH_LENGTH) : normalized;
+        return bounded("endpointPath", normalized, MAX_ENDPOINT_PATH_LENGTH);
+    }
+
+    /** A request-derived label cut to the ingestor's limit; warns once per label. */
+    private String bounded(String label, String value, int max) {
+        if (value == null || value.length() <= max) return value;
+        if (truncationWarned.add(label)) {
+            LOG.warning("[aforo] " + label + " from the request was longer than " + max
+                    + " characters and was truncated to " + max + "; the event is still sent."
+                    + " Later truncations of " + label + " are not logged.");
+        }
+        return RequestLabels.truncate(value, max);
     }
 
     private String resolveMetricName(HttpServletRequest req, HttpServletResponse res) {

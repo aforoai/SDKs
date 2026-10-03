@@ -2,7 +2,7 @@
 
 Meter WebSocket connections, frames, and bytes from any Java WebSocket stack. Call three methods from your open/message/close handlers — Jakarta WebSocket, Spring WebSocket, Netty, Undertow — and Aforo handles aggregation, batching, and retry.
 
-**Version:** 1.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 1.2.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -12,7 +12,7 @@ Intended (once published to Maven Central):
 <dependency>
   <groupId>ai.aforo</groupId>
   <artifactId>ws-metering</artifactId>
-  <version>1.0.0</version>
+  <version>1.2.1</version>
 </dependency>
 ```
 
@@ -86,6 +86,39 @@ Builder options on `AforoWsBilling.newBuilder()`:
 | `flushIntervalMs` | `long` | `3000` | Background flush cadence (ms). |
 
 Every required field is validated at build time — a blank value throws `IllegalArgumentException`.
+
+## Execution status (outcome-based pricing)
+
+OUTCOME_BASED rate plans bill each event at the weight set for its `executionStatus`. This SDK never derives one — a close code alone doesn't say whether the session succeeded — so only the value you pass is sent. Each entry point takes it as an optional last argument:
+
+```java
+String connId = billing.openConnection(customerId, metadata, null);
+billing.recordFrame(connId, "SERVER_TO_CLIENT", "TEXT", bytes, "SUCCESS");  // per-frame mode only
+billing.closeConnection(connId, closeCode, "TIMEOUT");
+```
+
+The value is trimmed and upper-cased; `null` or blank means "not set" and the field is left off the event. Accepted values: `SUCCESS`, `PARTIAL`, `TIMEOUT`, `ERROR`, `VALIDATION_FAILED`, `FAILED`, `FAILURE`, `CANCELLED`, `PENDING`, `BLOCKED`, `HITL_REQUIRED`. Any other value is logged and left off the event (the event is still sent) — the ingestor would reject an event carrying an unknown status.
+
+## Dropped events
+
+Events the SDK cannot deliver are counted, logged at `WARNING`, and passed to an optional hook. Nothing is thrown from the `record*` / `openConnection` calls for event content.
+
+```java
+AforoWsBilling billing = AforoWsBilling.newBuilder()
+        // ...
+        .onDrop((events, reason) -> deadLetter.save(events, reason))
+        .build();
+
+long lost = billing.droppedCount();
+```
+
+| `DropReason` | When |
+|---|---|
+| `RETRY_EXHAUSTED` | The batch failed all 3 attempts (network error, 5xx, 408, 429). |
+| `REJECTED` | The ingestor answered a non-retryable 4xx for the batch, or accepted the batch (2xx) but refused individual events in `errors[]`. Only the events the response identifies by index are passed to the hook. |
+| `INVALID` | The event breaks an ingestor field limit and was never sent: `customerId` over 64 characters, `productType` over 20. Values are never truncated. |
+
+Dropped events keep their `idempotencyKey`, so storing them and re-sending later is dedup-safe. An exception thrown by the hook is swallowed.
 
 ## Billing model
 

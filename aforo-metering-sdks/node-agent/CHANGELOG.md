@@ -2,23 +2,43 @@
 
 All notable changes to `@aforoai/agent-metering` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
-## [Unreleased]
+## [1.2.0] - 2026-10-01
 
-### Fixed
-- **Breaking (fix):** the tenant API key is sent as `X-API-Key` instead of `Authorization: Bearer`. The ingestor parses Bearer values as JWTs and rejected every request 401 (sending both headers is also 401), so no usage was being delivered.
-- **Breaking (fix):** events go to `POST /v1/ingest/batch` as `{"events":[...]}` in the ingestor's event shape. The old default, `/v1/ingest`, takes a single event, so no batch was ever accepted. An `ingestorUrl` ending in `/v1/ingest` is rewritten to `/v1/ingest/batch`.
-- **Breaking (fix):** a `customerId` is now required, either on the client or per session through `startSession({ customerId })`. The ingestor rejects events without one.
-- Each event now carries `customerId`, `metricName`, `quantity`, `occurredAt`, `idempotencyKey`, `productType: AI_AGENT`, `agentId`, `sessionId` and `traceId`. `traceId` defaults to the session id. `stepNumber`, `capabilityName`, `executionStatus`, `executionDurationMs` and `parentStepId` are sent when present. All other properties, including `eventType` and `productId`, go into `metadata`.
-- The API key is no longer copied into every event body. It is sent only in the `X-API-Key` header.
-- The ingestor has no `CANCELLED` or `HITL_REQUIRED` execution status, so these are sent as `metadata.agentExecutionStatus`.
-- Flushes are split into requests of at most 1000 events.
-- New optional fields: `StartSessionOptions.customerId`, `StartSessionOptions.traceId` and `RecordStepOptions.parentStepId`.
-- `agentId` over 36 characters (the ingestor's limit) makes `startSession()` throw. `emitEvent()` logs and drops an event with a blank `metricKey`, `sessionId` or `agentId` (or one over 36 chars) or a `value` that is not > 0, instead of buffering it — one invalid event fails its whole batch.
-- Failed batches are retried: 408, 429 (honouring `Retry-After`), 5xx and network errors, up to `maxRetries` attempts (default 3) with exponential backoff from `retryBaseDelayMs` (default 1000). Other 4xx are not retried. Each retry re-sends the same idempotency keys. Per-event rejections in a 2xx response are logged from `errors[].message`.
+Merge of the public-repo fixes with the working repo's wire contract. The wire shape is unchanged: one Apigee-format event per `POST <ingestorUrl>/events` (`/v1/ingest/events` in `contract/ingest-contract.json`). The public repo's switch to `/v1/ingest/batch` was not taken.
+
+### Changed
+- **Auth header.** The API key is sent as `X-API-Key`; `Authorization` is no longer sent.
+- **Default `ingestorUrl`** is `https://api.aforo.ai/v1/ingest`. A bare host (`https://api.aforo.ai`, `http://localhost:8084`) gets `/v1/ingest` added; a URL already ending in `/events` or `/batch` is accepted. Events always go to `…/v1/ingest/events`.
+- **`customerId` is sent top-level on every event.** The `/v1/ingest/events` endpoint requires it. Set it on the client, per session (`startSession({ customerId })`) or per event (`emitEvent({ customerId })`).
+- **Retries.** Each event is retried on 408, 429 (`Retry-After` honoured), 5xx and network errors, up to `maxRetries` attempts (default 3) with exponential backoff from `retryBaseDelayMs` (default 1000), always with the same body and idempotency key. Other 4xx are not retried. Before, each event was sent once.
 
 ### Added
-- `productType` option (default `AI_AGENT`) on the client, overridable per session (`startSession({ productType })`) and per event (`emitEvent({ productType })`). It was hard-coded to `AI_AGENT`. Values are trimmed and uppercased; unknown values pass through.
-- `maxRetries` and `retryBaseDelayMs` options.
+- `productType` option (default `AI_AGENT`) on the client, per session and per event; trimmed and upper-cased. It is sent top-level and in `properties`. The `/v1/ingest/events` endpoint derives the product type from the event type (`agent_*` and `token_usage` are AI_AGENT).
+- `StartSessionOptions.traceId` (sent as `properties.traceId` when set) and `RecordStepOptions.parentStepId`.
+- `maxRetries` and `retryBaseDelayMs` options; `AgentEventInput` type.
+- **Client-side validation, reported as a drop.** An event the ingestor would reject — no `customerId`, blank `metricKey` / `agentId` / `sessionId`, `value` not > 0, `customerId` over 64 characters, `agentId` over 36, `sessionId` over 64, `capabilityName` over 64, `metricKey` over 255, `productType` over 20 — is not buffered and not sent. `startSession()` and `emitEvent()` do not throw for it. The event is counted in `droppedCount`, WARN-logged (first occurrence, then every 1000th) and passed to `onDrop` with the new reason `'invalid'`. Nothing is truncated.
+- The server's error message is included in the WARN for a rejected event.
+
+### Unchanged
+- `executionStatus`: the 11 canonical statuses, trimmed and upper-cased, sent in `properties`; an unknown value is logged and left off.
+- Idempotency keys: one random key per event, stamped when the event is created, reused by every retry and by `onDrop` replays.
+- Top-level `capabilityName`; `onDrop` reasons `retry_exhausted` / `rejected`.
+
+## [1.1.1] - 2026-09-30
+
+### Fixed
+- A `metadata.executionStatus` can no longer override the step's status.
+- An unknown `executionStatus` is logged and left off the event; the event is still sent.
+
+## [1.1.0] - 2026-09-30
+
+### Added
+- `ExecutionStatus` lists all 11 canonical statuses (`PARTIAL`, `FAILED`, `VALIDATION_FAILED`, `FAILURE`, `PENDING` and `BLOCKED` used to fail to compile). `EXECUTION_STATUSES` is exported and checked against `contract/ingest-contract.json`.
+- Drop observability: `droppedCount`, WARN log, opt-in `onDrop(events, reason)`.
+- Top-level `capabilityName` on step events.
+
+### Fixed
+- Events are posted one per request to `/v1/ingest/events`; the earlier `{events:[...]}` body to `/v1/ingest` was rejected on every flush.
 
 ## [1.0.0] — 2026-06-29
 

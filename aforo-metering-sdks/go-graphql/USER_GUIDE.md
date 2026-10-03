@@ -1,6 +1,6 @@
 # graphql-metering-go — User Guide
 
-**Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** Go engineers metering a GraphQL-over-HTTP server (gqlgen, graphql-go, or a custom handler).
+**Version:** 1.2.2 · **Updated:** 2026-10-01 · **Audience:** Go engineers metering a GraphQL-over-HTTP server (gqlgen, graphql-go, or a custom handler).
 
 ## What you'll build
 
@@ -14,9 +14,9 @@ A GraphQL server that emits one Aforo billing event per operation — type, name
 - A way to identify the customer per request — by default the `X-Customer-Id` header your gateway/auth sets.
 - Ingestor base URL — `https://api.aforo.ai`.
 
-## Step 1 — Add the module from source
+## Step 1 — Add the module
 
-`go get github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql` does not resolve yet (proxy not live). Clone and `replace`:
+Releases are git tags of the form `aforo-metering-sdks/go-graphql/vX.Y.Z` on github.com/aforoai/SDKs. Use `v1.2.2` or later: `v1.0.0` was tagged from an older copy of this code and lacks the fixes listed in the changelog. Until the `v1.2.2` tag exists, `go get github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql@main` resolves to a pseudo-version of the default branch. To build against a local checkout, clone and `replace`:
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
@@ -24,7 +24,7 @@ git clone https://github.com/aforoai/SDKs.git
 
 ```go
 // go.mod (your service)
-require github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql v1.0.0
+require github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql v1.2.2
 
 replace github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql => ../SDKs/aforo-metering-sdks/go-graphql
 ```
@@ -128,7 +128,7 @@ Content-Type: application/json
 {"events":[{"customerId":"…","metricName":"graphql_api.operations","quantity":1,"occurredAt":"…","idempotencyKey":"gql:…","productType":"GRAPHQL_API","gqlOperationType":"QUERY","gqlOperationName":"…","gqlComplexity":12,"gqlFieldCount":7,"gqlHasErrors":false,"executionDurationMs":3,"metadata":{"sdkVersion":"1.0.0","productId":"prod_graphql_unified_gateway"}}]}
 ```
 
-> ⚠ Flush failures are silent unless you set `OnError`. If nothing lands, set `OnError: func(err error){ log.Println("aforo:", err) }` to surface marshal failures, retry-exhausted drops and ingestor rejections (including `errors[].message`).
+> ⚠ Drops are WARN-logged through the standard `log` package and counted in `DroppedCount()`; the reason for a failed flush is only reported to `OnError`. If nothing lands, set `OnError: func(err error){ log.Println("aforo:", err) }` to surface marshal failures, retry-exhausted drops and ingestor rejections (including `errors[].message`).
 
 ## Configuration reference
 
@@ -145,6 +145,31 @@ Content-Type: application/json
 | `HTTPClient` | `*http.Client` | `&http.Client{Timeout: 10s}` | HTTP client override. |
 | `CustomerExtractor` | `func(*http.Request) string` | reads `X-Customer-Id` | Per-request customer-id resolver. |
 | `OnError` | `func(error)` | no-op | Marshal failures, retry-exhausted drops, non-retryable `4xx` rejections, and partial failures (with the ingestor's `errors[].message`). |
+| `OnDrop` | `func([]map[string]any, DropReason)` | `nil` | Opt-in hook called with events the SDK drops (`retry_exhausted`, `rejected`, `invalid`). See [Dropped events](#dropped-events). |
+
+## Dropped events
+
+An event the SDK cannot deliver is never lost silently. `billing.DroppedCount()` returns the running total, each drop is WARN-logged, and the opt-in `Config.OnDrop(events, reason)` hook receives the events (with their idempotency keys, so re-submitting them later is dedup-safe).
+
+| `DropReason` | When |
+|---|---|
+| `graphqlmetering.DropRetryExhausted` (`retry_exhausted`) | A batch failed all 3 attempts (transport error, `408`, `429`, `5xx`). |
+| `graphqlmetering.DropRejected` (`rejected`) | The ingestor answered a non-retryable `4xx`, or refused individual events in a `2xx` partial-failure response. In the partial case only the events named by `errors[].index` are passed to `OnDrop`; failures the ingestor does not identify are counted but not attributed to an event. |
+| `graphqlmetering.DropInvalid` (`invalid`) | The event failed client-side validation and was never buffered: `customerId` over 64 characters, or `productType` over 20. An operation name over 255 is not dropped — it comes from the client's request, so it is truncated to 255 characters without splitting a character, the event is sent, and a WARN is logged once (`Middleware` and `Record` alike). The invalid-drop WARN log names the field, the limit and the value (throttled: first occurrence, then every 1000th); `OnError` is called too. |
+
+A call with no customer id is not metered and is not a drop. An unknown `executionStatus` is not a drop either: the status is left off (or replaced by the derived one) and the event is sent.
+
+```go
+OnDrop: func(events []map[string]any, reason graphqlmetering.DropReason) {
+	log.Printf("aforo: %d event(s) dropped: %s", len(events), reason)
+},
+```
+
+Idempotency keys are minted once, when the event is recorded. Every retry re-sends the same body, so a retried batch is deduplicated by the ingestor.
+
+## Execution status
+
+See [Execution status (outcome-based pricing)](README.md#execution-status-outcome-based-pricing) in the README for the values, how the status is derived and how to set your own.
 
 ## Troubleshooting
 
@@ -154,7 +179,7 @@ Content-Type: application/json
 | No events for some requests | Empty `query`, non-POST request, or no resolvable customer id | Confirm the request is a GraphQL POST with a `query`, and that `X-Customer-Id` (or your extractor) returns a value. |
 | Resolvers receive an empty body | A body-draining middleware sits ahead of `Middleware` | Order so this wrapper reads/restores the body before others consume it. |
 | Complexity scores look off | Built-in scorer is a brace-balance approximation | Compute an exact score and pass it via `Record()`; the middleware path always uses the approximation. |
-| Events drop with no log | Flush exhausted 3 retries and `OnError` is unset | Set `OnError` to log; verify `APIKey`, `IngestorURL`, and that the tenant owns the metric. |
+| `DroppedCount()` rises with reason `retry_exhausted` | Flush exhausted its 3 attempts | Set `OnError` to log; verify `APIKey`, `IngestorURL`, and that the tenant owns the metric. |
 | All operations record as `anonymous` | No `operationName` in the body and no named operation in the document | Send `operationName`, or name your operations (`query Foo {...}`). |
 
 ## What this guide does NOT cover

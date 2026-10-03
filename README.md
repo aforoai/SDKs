@@ -4,7 +4,7 @@
 
 Meter your product's usage and send it to Aforo for billing — in code with a language SDK, or with zero code at your API gateway. Everything in this repo is what you install to get usage events flowing into Aforo.
 
-> **Distribution status:** these packages are being prepared for public registries (npm · PyPI · Maven Central · Go modules) and the gateway plugins for tagged GitHub Releases. Until a package is published, install it from source — each package directory has its own README with the steps. The integration model below is stable.
+> **Distribution status:** the Node SDKs are on npm under `@aforoai/*`, the Python SDKs on PyPI as `aforo-*`, and the Go modules are tagged in this repo; the Java SDKs (`ai.aforo`) are not on Maven Central yet, and the gateway plugins ship as tagged GitHub Releases. Do not install `1.0.0` of any SDK — it predates `executionStatus` and the response-envelope fix. Each package README names the minimum version and the from-source steps. The integration model below is stable.
 
 ---
 
@@ -25,12 +25,12 @@ Most teams start with a gateway plugin (no code) or the base SDK for their langu
 
 ## What's here
 
-### `aforo-metering-sdks/` — language SDKs (24 packages)
+### `aforo-metering-sdks/` — language SDKs (25 packages)
 
 | Language | Base | GraphQL | gRPC | WebSocket | MQTT | MCP | Agent | Proxy (CLI) |
 |---|---|---|---|---|---|---|---|---|
 | **Node** | `node` | `node-graphql` | `node-grpc` | `node-ws` | `node-mqtt` | `node-mcp` | `node-agent` | `mcp-proxy` |
-| **Python** | `python` | `python-graphql` | `python-grpc` | `python-ws` | `python-mqtt` | `python-mcp` | — | — |
+| **Python** | `python` | `python-graphql` | `python-grpc` | `python-ws` | `python-mqtt` | `python-mcp` | `python-agent` | — |
 | **Java** | `java` | `java-graphql` | `java-grpc` | `java-ws` | `java-mqtt` | — | — | — |
 | **Go** | `go` | `go-graphql` | `go-grpc` | `go-ws` | `go-mqtt` | — | — | — |
 

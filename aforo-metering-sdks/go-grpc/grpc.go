@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -34,9 +35,33 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const sdkVersion = "1.0.0"
+const sdkVersion = "1.2.2"
+
+// Ingestor limits for the gRPC fields (IngestUsageEventRequest @Size).
+const (
+	maxGrpcServiceLen = 255
+	maxGrpcMethodLen  = 128
+)
 
 // Config captures all SDK options.
+// DropReason describes why a buffered batch was permanently dropped.
+// The buffer is unbounded (drained at flush start), so unlike the core SDK
+// there is no overflow reason here.
+type DropReason string
+
+const (
+	// DropRetryExhausted — the batch failed after all transport retries.
+	DropRetryExhausted DropReason = "retry_exhausted"
+	// DropRejected — the ingestor answered a non-retryable 4xx, refused the
+	// event individually in a 2xx partial-failure response, or the batch
+	// could not be serialized.
+	DropRejected DropReason = "rejected"
+	// DropInvalid — the event failed client-side validation (a required field
+	// was blank or a field exceeded the ingestor's limit) and was never
+	// buffered.
+	DropInvalid DropReason = "invalid"
+)
+
 type Config struct {
 	TenantID          string
 	ProductID         string
@@ -49,6 +74,13 @@ type Config struct {
 	HTTPClient        *http.Client                     // optional override
 	CustomerExtractor func(ctx context.Context) string // default reads "x-customer-id" md
 	OnError           func(error)
+	// OnDrop is an OPT-IN hook invoked with events the SDK is about to lose
+	// permanently (retry exhaustion, a rejection by the ingestor, or
+	// client-side validation — see DropReason). Events keep
+	// their idempotency keys, so re-submitting them after recovery is
+	// dedup-safe. Default: nil (drops are still counted in DroppedCount()
+	// and WARN-logged). Panics in the hook are recovered.
+	OnDrop func(events []map[string]any, reason DropReason)
 }
 
 type Billing struct {
@@ -56,10 +88,19 @@ type Billing struct {
 	url    string
 	client *http.Client
 
-	mu     sync.Mutex
-	buffer []map[string]any
-	stop   chan struct{}
-	wg     sync.WaitGroup
+	mu       sync.Mutex
+	buffer   []map[string]any
+	stop     chan struct{}
+	stopOnce sync.Once
+	dropped  atomic.Int64
+	// invalidDrops throttles the DropInvalid WARN log.
+	invalidDrops atomic.Int64
+	// truncWarned holds the label names already WARN-logged as truncated.
+	truncWarned sync.Map
+	// retryBackoffBase is the exponential-backoff base (default 1s) —
+	// package-private so tests can skip real sleeps.
+	retryBackoffBase time.Duration
+	wg               sync.WaitGroup
 }
 
 // New constructs a Billing instance and starts the background flush loop.
@@ -88,10 +129,11 @@ func New(cfg Config) (*Billing, error) {
 	}
 
 	b := &Billing{
-		cfg:    cfg,
-		url:    strings.TrimRight(cfg.IngestorURL, "/") + "/v1/ingest/batch",
-		client: cfg.HTTPClient,
-		stop:   make(chan struct{}),
+		cfg:              cfg,
+		url:              strings.TrimRight(cfg.IngestorURL, "/") + "/v1/ingest/batch",
+		client:           cfg.HTTPClient,
+		stop:             make(chan struct{}),
+		retryBackoffBase: time.Second,
 	}
 	b.wg.Add(1)
 	go b.flushLoop()
@@ -102,6 +144,7 @@ func New(cfg Config) (*Billing, error) {
 func (b *Billing) UnaryInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		start := time.Now()
+		ctx = withStatusHolder(ctx)
 		resp, err := handler(ctx, req)
 		b.recordRPC(ctx, info.FullMethod, "UNARY", err, 1, start)
 		return resp, err
@@ -115,7 +158,8 @@ func (b *Billing) UnaryInterceptor() grpc.UnaryServerInterceptor {
 func (b *Billing) StreamInterceptor() grpc.StreamServerInterceptor {
 	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 		start := time.Now()
-		err := handler(srv, ss)
+		ms := &meteredStream{ServerStream: ss, ctx: withStatusHolder(ss.Context())}
+		err := handler(srv, ms)
 		callType := "BIDI_STREAM"
 		switch {
 		case info.IsClientStream && !info.IsServerStream:
@@ -123,41 +167,77 @@ func (b *Billing) StreamInterceptor() grpc.StreamServerInterceptor {
 		case !info.IsClientStream && info.IsServerStream:
 			callType = "SERVER_STREAM"
 		}
-		b.recordRPC(ss.Context(), info.FullMethod, callType, err, 1, start)
+		b.recordRPC(ms.ctx, info.FullMethod, callType, err, 1, start)
 		return err
 	}
 }
 
 // Record manually emits a billing event. Use for streaming RPCs where you want exact
-// message counts. The grpcStatusCode is auto-derived from err. An optional
-// EventOptions overrides the event's productType.
+// message counts. The grpcStatusCode and executionStatus are auto-derived from err
+// (see OutcomeFromGrpcCode); a status set with SetExecutionStatus on ctx wins.
+// Optional EventOptions override the event's productType and executionStatus.
+//
+// A call with no customer id is not metered. An event the ingestor would
+// refuse (blank method, a field over its limit) is not buffered: it is counted
+// in DroppedCount(), WARN-logged and handed to OnDrop with DropInvalid. The
+// method name is the exception: it originates from the incoming RPC, so one
+// over 128 characters is truncated and the event is still sent.
 func (b *Billing) Record(ctx context.Context, method, callType string, messageCount int, err error, durationMs int64, opts ...EventOptions) {
+	b.record(ctx, method, callType, messageCount, err, durationMs, opts)
+}
+
+// RecordWithOptions is Record with optional per-event fields. A non-blank
+// opts.ExecutionStatus wins over a status set with SetExecutionStatus, which
+// wins over the status derived from err.
+func (b *Billing) RecordWithOptions(ctx context.Context, method, callType string, messageCount int, err error, durationMs int64, opts EventOptions) {
+	b.record(ctx, method, callType, messageCount, err, durationMs, []EventOptions{opts})
+}
+
+func (b *Billing) record(ctx context.Context, method, callType string, messageCount int, err error, durationMs int64, opts []EventOptions) {
 	customerID := strings.TrimSpace(b.cfg.CustomerExtractor(ctx))
-	if customerID == "" || method == "" {
-		return
-	}
-	if len(customerID) > 64 {
-		b.cfg.OnError(fmt.Errorf("grpcmetering: customerId longer than 64 chars, event dropped"))
+	if customerID == "" {
 		return
 	}
 	statusLabel := "OK"
+	executionStatus := OutcomeFromGrpcCode(codes.OK)
 	if err != nil {
-		st, _ := status.FromError(err)
+		st, ok := status.FromError(err)
+		if !ok {
+			// A handler returning a plain context error (e.g. ctx.Err()) is
+			// sent to the client as CANCELLED / DEADLINE_EXCEEDED by grpc-go;
+			// record the same code rather than UNKNOWN.
+			st = status.FromContextError(err)
+		}
+		// The ingestor's grpcStatusCode enum uses UPPER_SNAKE names.
 		statusLabel = statusCodeName(st.Code())
+		executionStatus = OutcomeFromGrpcCode(st.Code())
+	}
+	if explicit := statusFromContext(ctx); explicit != "" {
+		executionStatus = explicit
+	}
+	if explicit := normalizeExecutionStatus(executionStatusFor(opts)); explicit != "" {
+		executionStatus = explicit
 	}
 	now := time.Now().UTC()
+	// The key is built from the full method name, before truncation.
+	key := idempotencyKeyFor(b.cfg.TenantID, b.cfg.ServiceName, method, now.UnixMilli(), randomSuffix())
+	// The method name always originates from the incoming RPC (also when
+	// integration code hands it to Record), so it is truncated to the
+	// ingestor's limit instead of dropping the event.
+	method = b.truncateLabel("grpcMethod", method, maxGrpcMethodLen)
 	event := map[string]any{
 		"customerId":          customerID,
 		"metricName":          "grpc_api.rpc_calls",
 		"quantity":            1,
 		"occurredAt":          now.Format(time.RFC3339Nano),
-		"idempotencyKey":      capKey(fmt.Sprintf("grpc:%s:%s:%s:%d:%s", b.cfg.TenantID, b.cfg.ServiceName, method, now.UnixMilli(), randomSuffix())),
+		"idempotencyKey":      key,
 		"productType":         b.productTypeFor(opts),
 		"grpcService":         b.cfg.ServiceName,
 		"grpcMethod":          method,
 		"grpcStatusCode":      statusLabel,
 		"messageCount":        messageCount,
 		"executionDurationMs": durationMs,
+		"executionStatus":     executionStatus,
 		"metadata": map[string]any{
 			"sdkVersion": sdkVersion,
 			"productId":  b.cfg.ProductID,
@@ -168,6 +248,32 @@ func (b *Billing) Record(ctx context.Context, method, callType string, messageCo
 	switch ct := strings.ToUpper(callType); ct {
 	case "UNARY", "CLIENT_STREAM", "SERVER_STREAM", "BIDI_STREAM":
 		event["grpcCallType"] = ct
+	}
+	// Required-field and limit guards: an event the ingestor would refuse is
+	// dropped here (DropInvalid) instead of failing server-side unseen.
+	msg := ""
+	switch {
+	case strings.TrimSpace(method) == "":
+		msg = "grpcMethod is required for a GRPC_API event"
+	case strings.TrimSpace(b.cfg.ServiceName) == "":
+		msg = "grpcService is required for a GRPC_API event"
+	default:
+		for _, c := range []struct {
+			field, value string
+			max          int
+		}{
+			{"customerId", customerID, maxCustomerIDLen},
+			{"grpcService", b.cfg.ServiceName, maxGrpcServiceLen},
+			{"productType", event["productType"].(string), maxProductTypeLen},
+		} {
+			if msg = tooLong(c.field, c.value, c.max); msg != "" {
+				break
+			}
+		}
+	}
+	if msg != "" {
+		b.dropInvalid(event, msg)
+		return
 	}
 	b.mu.Lock()
 	b.buffer = append(b.buffer, event)
@@ -183,7 +289,7 @@ func (b *Billing) recordRPC(ctx context.Context, fullMethod, callType string, er
 	if i := strings.LastIndex(fullMethod, "/"); i >= 0 {
 		method = fullMethod[i+1:]
 	}
-	b.Record(ctx, method, callType, messageCount, err, time.Since(start).Milliseconds())
+	b.record(ctx, method, callType, messageCount, err, time.Since(start).Milliseconds(), nil)
 }
 
 func (b *Billing) flushLoop() {
@@ -201,31 +307,9 @@ func (b *Billing) flushLoop() {
 	}
 }
 
-// maxBatchSize is the ingestor's per-request cap on POST /v1/ingest/batch.
-const maxBatchSize = 1000
-
-func (b *Billing) flush() {
-	b.mu.Lock()
-	if len(b.buffer) == 0 {
-		b.mu.Unlock()
-		return
-	}
-	batch := b.buffer
-	b.buffer = nil
-	b.mu.Unlock()
-
-	for start := 0; start < len(batch); start += maxBatchSize {
-		end := start + maxBatchSize
-		if end > len(batch) {
-			end = len(batch)
-		}
-		b.send(batch[start:end])
-	}
-}
-
 // Shutdown flushes pending events and stops the background goroutine.
 func (b *Billing) Shutdown(ctx context.Context) error {
-	close(b.stop)
+	b.stopOnce.Do(func() { close(b.stop) })
 	done := make(chan struct{})
 	go func() { b.wg.Wait(); close(done) }()
 	select {
@@ -289,13 +373,11 @@ func statusCodeName(c codes.Code) string {
 	}
 }
 
-// capKey keeps idempotency keys within the ingestor's 255-char limit. The
-// unique tail (millis + random suffix) is preserved.
-func capKey(k string) string {
-	if len(k) > 255 {
-		return k[len(k)-255:]
-	}
-	return k
+// idempotencyKeyFor returns "grpc:<tenant>:<service>:<method>:<millis>:<suffix>".
+// method must be the full, untruncated method name; see boundedKey for what
+// happens when the key would exceed 255 characters.
+func idempotencyKeyFor(tenantID, serviceName, method string, millis int64, suffix string) string {
+	return boundedKey(fmt.Sprintf("grpc:%s:%s:", tenantID, serviceName), method, fmt.Sprintf(":%d:%s", millis, suffix))
 }
 
 var alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"

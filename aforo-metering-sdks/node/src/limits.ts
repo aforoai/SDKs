@@ -5,8 +5,10 @@
  * billed. The server reports it per event (`errors[]` in the batch response,
  * indexed), so the rest of the batch survives — but the SDK sends in the
  * background, so that report reaches nobody: the usage is simply gone. Checking
- * the same limits at `track()` surfaces the problem to the caller, at the call
- * site that produced it, while the event can still be corrected.
+ * the same limits at `track()` reports the problem where it happens: the event
+ * is not buffered or sent, it is counted in `droppedCount`, WARN-logged with
+ * the field, the limit and the offending value, and handed to the opt-in
+ * `onDrop` hook with reason `'invalid'`. `track()` does not throw for it.
  *
  * Source: `dto/IngestUsageEventRequest` (aforo-nextgen-usage-ingestor-service) —
  * the `@Size` and `@Digits` bean constraints, which are compiled into the
@@ -21,9 +23,15 @@
  * Only `occurredAt`'s shape is checked, since a malformed timestamp is invalid
  * under every configuration.
  *
- * Nothing here truncates or rounds — that would change what is billed. The
- * offending event is rejected instead, naming the field, the limit, and the
- * offending value.
+ * The limit check never truncates or rounds a value the caller set — that would
+ * change what is billed. The offending event is dropped instead (reason
+ * `'invalid'`), naming the field, the limit, and the offending value.
+ *
+ * The one exception is a label the SDK itself reads off an incoming request
+ * (the middlewares' `endpointPath` and `httpMethod`): dropping there would let
+ * an API consumer avoid metering by sending an over-long path. Those are cut to
+ * the limit where they are derived (`truncateRequestLabel`) and the event is
+ * still sent.
  */
 
 /** Maximum characters the ingestor accepts per string field (`@Size(max = ...)`). */
@@ -37,8 +45,16 @@ export const MAX_LENGTHS = {
   sessionId: 64,
   agentId: 36,
   toolName: 64,
+  capabilityName: 64,
   endpointPath: 512,
   httpMethod: 16,
+  subscriptionId: 64,
+  grpcService: 255,
+  grpcMethod: 128,
+  gqlOperationName: 255,
+  wsConnectionId: 64,
+  mqttTopic: 500,
+  mqttClientId: 128,
 } as const;
 
 /** `@Digits(integer = 14, fraction = 6)` — `usage_events.quantity` is NUMERIC(20,6). */
@@ -68,6 +84,45 @@ function lengthOf(value: string): number {
   return value.length;
 }
 
+/**
+ * Cut `value` to at most `max` UTF-16 code units — how the ingestor counts —
+ * without leaving half a surrogate pair at the end.
+ */
+export function truncateToLimit(value: string, max: number): string {
+  if (value.length <= max) return value;
+  let end = Math.max(0, max);
+  const last = end > 0 ? value.charCodeAt(end - 1) : 0;
+  // A high surrogate at the cut means its low half was cut off: drop it too.
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return value.slice(0, end);
+}
+
+/** Labels already reported as truncated — one WARN per label name per process. */
+const truncationWarned = new Set<string>();
+
+/**
+ * Bound a label the SDK derived from an incoming request to the ingestor's
+ * limit for `field`. Logs one WARN per field per process. Not for values the
+ * SDK caller sets: those are never altered (an over-long one drops the event).
+ */
+export function truncateRequestLabel(field: LengthCheckedField, value: string): string {
+  const max = MAX_LENGTHS[field];
+  if (typeof value !== 'string' || value.length <= max) return value;
+  if (!truncationWarned.has(field)) {
+    truncationWarned.add(field);
+    console.warn(
+      `[aforo] ${field} taken from the request was longer than the ingestor's limit and was `
+      + `truncated to ${max} characters; the event is still sent. Logged once per label.`,
+    );
+  }
+  return truncateToLimit(value, max);
+}
+
+/** Test hook: forget which labels were already reported as truncated. */
+export function resetTruncationWarnings(): void {
+  truncationWarned.clear();
+}
+
 function lengthError(field: LengthCheckedField, value: unknown): string | null {
   if (value === undefined || value === null) return null;
   const text = String(value);
@@ -75,7 +130,7 @@ function lengthError(field: LengthCheckedField, value: unknown): string | null {
   const len = lengthOf(text);
   if (len <= max) return null;
   return `${field} is ${len} characters, exceeding the ingestor's ${max}-character limit `
-    + `(value starts "${text.slice(0, 32)}"). Shorten it — the SDK will not truncate it, `
+    + `(value starts "${text.slice(0, 80)}"). Shorten it — the SDK will not truncate it, `
     + 'because a truncated id bills the wrong thing.';
 }
 
@@ -122,11 +177,11 @@ function quantityError(quantity: number): string | null {
 
 function occurredAtError(occurredAt: string): string | null {
   if (!ISO_DATE_TIME.test(occurredAt)) {
-    return `occurredAt "${occurredAt}" is not an ISO-8601 timestamp `
+    return `occurredAt "${String(occurredAt).slice(0, 80)}" is not an ISO-8601 timestamp `
       + '(expected e.g. "2026-03-01T14:30:00Z").';
   }
   if (Number.isNaN(Date.parse(occurredAt))) {
-    return `occurredAt "${occurredAt}" is not a valid date.`;
+    return `occurredAt "${String(occurredAt).slice(0, 80)}" is not a valid date.`;
   }
   return null;
 }
@@ -146,12 +201,20 @@ export interface LimitCheckedEvent {
   sessionId?: unknown;
   agentId?: unknown;
   toolName?: unknown;
+  capabilityName?: unknown;
+  subscriptionId?: unknown;
+  grpcService?: unknown;
+  grpcMethod?: unknown;
+  gqlOperationName?: unknown;
+  wsConnectionId?: unknown;
+  mqttTopic?: unknown;
+  mqttClientId?: unknown;
 }
 
 /**
  * Describe the first ingestor constraint this event breaks, or `null` when it
- * would be accepted. Callers that must not throw (the framework middlewares)
- * can use this to skip an event instead.
+ * would be accepted. `AforoClient.track()` uses it to drop an invalid event
+ * (reason `'invalid'`) before it is buffered.
  */
 export function describeLimitViolation(event: LimitCheckedEvent): string | null {
   if (event.idempotencyKey !== undefined && event.idempotencyKey !== null

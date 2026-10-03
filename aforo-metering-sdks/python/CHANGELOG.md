@@ -2,27 +2,52 @@
 
 All notable changes to `aforo-metering` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
-## [Unreleased]
-
-### Fixed
-- **Fix:** `track()` now raises `ValueError` for events the ingestor's compiled-in field constraints would refuse — `customer_id` over 64 chars, `metric_name` over 255, `idempotency_key` over 255, `product_type` over 20, a `quantity` with more than 14 integer digits or 6 decimal places, and a malformed `occurred_at`. Such an event is rejected server-side and never billed, and because flushing happens in the background nobody ever saw that rejection; now it is reported at the call site, before the event is buffered. Nothing is truncated or rounded. Limits the server makes configurable (`max-age-days`, `future-tolerance-minutes`, `max-metadata-bytes`) are left to the server, so the SDK can never refuse usage your deployment would accept.
-- **Breaking (fix):** an event with no caller-supplied `idempotency_key` now gets a fresh random UUID v4 (`generate_random_key()`) instead of `generate_idempotency_key()`'s `SHA256(customer_id:metric_name:quantity:occurred_at)`. `occurred_at` only carries millisecond precision, so two genuinely distinct events for the same customer, metric and quantity inside one millisecond produced the SAME key; the ingestor answered DUPLICATE and silently dropped the second one, under-billing high-throughput callers (bulk SMS, per-request middleware). The key is still minted once, when `track()` enqueues the event, so retries re-send the same keys and a replayed batch is still deduplicated. **Callers who relied on the deterministic key for dedup must now pass their own `idempotency_key`** — an explicit key is still sent verbatim. `generate_idempotency_key()` remains public for that purpose but is no longer the default.
-- **Breaking (fix):** the tenant API key is sent as `X-API-Key` instead of `Authorization: Bearer`. The ingestor parses Bearer values as JWTs and rejected every request 401 (sending both headers is also 401), so no usage was being delivered.
-- **Breaking (fix):** default ingestor base URL is now `https://api.aforo.ai`, Aforo's public API gateway in front of the ingestor. `ingest.aforo.ai` / `ingestor.aforo.ai` resolve to a static CloudFront/S3 site that answers POSTs with a 301, not the ingestor. Set the base URL explicitly if you relied on the old default.
-- **Breaking (fix):** Flask/Django/FastAPI middleware default metric is `api_calls` instead of `"METHOD /path"`; new `metric_name` / `customer_id` options for Flask (kwargs or `AFORO_METRIC_NAME` / `AFORO_CUSTOMER_ID` config) and Django (`AFORO_METRIC_NAME` / `AFORO_CUSTOMER_ID` settings). The caller's `X-Api-Key` header is no longer used as the customer id. `OPTIONS` (CORS preflight) requests are no longer metered.
-- **Fix:** session heartbeats are no longer mixed into the usage batch (they were `system.session.heartbeat` events with quantity 0, which the ingestor rejects, failing the whole batch with 400). See "Changed" for how they are sent now.
-
-### Added
-- `product_type` client option (default `"API"`) and per-event `track(product_type=...)` override: every event now carries the top-level `productType` the production ingestor requires. Values are trimmed and upper-cased; unknown values are passed through. `TrackEvent` gains `product_type` and `extra_fields` (optional top-level ingest fields by camelCase wire name).
-- Middleware `product_type` option (FastAPI kwarg / `MiddlewareOptions`, Flask kwarg or `AFORO_PRODUCT_TYPE` config, Django `AFORO_PRODUCT_TYPE` setting). Request events now carry top-level `endpointPath` (path without query, max 512), `httpMethod`, `statusCode` and `responseTimeMs`; a FastAPI `quantity` resolving to `<= 0` is not metered.
-- `heartbeat_interval` option (default 30 s).
+## [1.1.2] - 2026-10-01
 
 ### Changed
-- Session heartbeats are restored: `start_session()` sends a heartbeat immediately and every `heartbeat_interval` seconds from a daemon thread; `end_session()` stops it, flushes, and sends `SESSION_END`; `shutdown()` stops it. Each heartbeat has quantity 1, metric `system.session.heartbeat`, top-level `sessionId` / `productType` / `sessionBoundary`, a unique idempotency key, `customerId` from the new `start_session(customer_id=...)` (default `"system"`), and is POSTed alone as `{"events": [hb]}` so the ingestor always intercepts it on the synchronous path. Best-effort: one attempt, failures logged and swallowed.
-- `track()` raises `ValueError` for a blank `customer_id` / `metric_name` and for `quantity <= 0` (the ingestor would fail the whole batch).
-- `flush_count` is clamped to 1..1000 (the ingestor's per-request limit).
+- **Middlewares (Flask, Django, FastAPI/ASGI): request-derived labels are truncated, not dropped.** `endpointPath` and `httpMethod` are read from the incoming request. A value over the ingestor's limit (`endpointPath` 512, `httpMethod` 16) is cut to the limit and the event is still sent. The length is counted in UTF-16 code units, as the ingestor counts it, and a surrogate pair is never split. Before, the path was cut at 512 code points, which a path containing characters outside the Basic Multilingual Plane could still exceed, and the event was then rejected. One WARNING is logged per field name per process.
+- New helpers in `aforo.limits`: `truncate_label`, `truncate_utf16`, `utf16_length`.
+
+### Unchanged
+- Fields the caller sets (`customer_id`, `metric_name`, `idempotency_key`, `product_type`, and anything passed in `extra_fields` to `track()`) are never truncated. An over-long one still drops the event with reason `invalid`.
+- The idempotency key is the caller's key or a random UUID per event; it does not depend on the request path.
+
+## [1.1.1] - 2026-10-01
+
+### Fixed
+- **2xx responses are read from the `{success, data}` envelope.** The ingestor wraps every 2xx JSON body, so `failed`, `errors[]` and `killedSessionIds` arrive under `data`. They were read at the top level, where they are never present, so events the ingestor rejected inside a 2xx response were counted as sent and the heartbeat response returned to the caller did not carry `killedSessionIds`. A bare (unwrapped) body is still accepted.
+
+## [1.1.0] - 2026-10-01
+
+Merge of the public repository's fixes with the working repository's 1.0.1.
+
+### Changed
+- **Auth:** the API key is sent as `X-API-Key`; no `Authorization` header is sent. The ingestor accepts `X-API-Key` for every key.
+- **Default host** is `https://api.aforo.ai` (was `ingest.aforo.ai`, which is not the ingestor).
+- **Session heartbeats** have quantity 1, top-level `sessionId` / `productType` / `sessionBoundary`, and are each POSTed alone as `{"events": [hb]}` — never through the usage buffer. One attempt, best-effort; a failed heartbeat is not counted in `dropped_count`. `start_session(customer_id=...)` and the `heartbeat_interval` option are new.
+- **Transport:** 408 and 429 are retried (429 honours `Retry-After`); other 4xx are not, and their `errors[].message` is logged. A `202` with `failed` > 0 is read: the rejected events are dropped with reason `rejected` (only the ones the response names by index are passed to `on_drop`). `FlushResult` gains `failed_indices`.
+- `flush_count` is clamped to 1..1000, the ingestor's batch limit.
 - `occurredAt` defaults to a millisecond ISO-8601 instant with a `Z` suffix.
-- A 2xx batch response's `failed` / `errors[].message` are now read: `FlushResult.failed` counts per-event rejections and each message is logged. Non-retried 4xx responses log their `errors[].message`. A non-numeric `Retry-After` falls back to exponential backoff instead of raising.
+- **Middleware (FastAPI / Flask / Django):** default metric is `api_calls` (was `"METHOD /path"`); `metric_name`, `customer_id` and `product_type` options; the caller's `X-Api-Key` is never used as the customer id; `OPTIONS` requests are not metered; events carry top-level `endpointPath`, `httpMethod`, `statusCode`, `responseTimeMs`.
+
+### Added
+- `product_type` client option (default `API`) and per-event `track(product_type=...)`; every event carries top-level `productType`. `extra_fields` adds optional top-level ingest fields by wire name.
+- Field-limit checks mirroring the ingestor (`aforo/limits.py`): `customerId` 64, `metricName` 255, `idempotencyKey` 255, `productType` 20, `quantity` 14 integer / 6 decimal digits, ISO-8601 `occurred_at`, and the `extra_fields` limits.
+- Drop reason **`invalid`**: an event with a blank `customer_id` / `metric_name`, `quantity <= 0` or a field over a limit is not buffered or sent. `track()` does **not** raise for it (in 1.0.x a blank `customer_id` / `metric_name` raised `ValueError`); the event is counted in `dropped_count`, WARN-logged (first occurrence, then every 1000th) and passed to `on_drop(events, "invalid")`.
+
+### Unchanged from 1.0.1
+- `execution_status`, `on_drop` / `dropped_count`, random per-event idempotency keys minted once at `track()`, the `atexit` flush.
+
+## [1.0.1] - 2026-09-30
+
+- An `execution_status` outside the 11 canonical values (or over 20 characters) is WARN-logged and left off the event; it used to be sent as-is and the ingestor rejected that event.
+
+## 1.0.0 (working repository, 2026-07 – 2026-09)
+
+- `execution_status` on `track()` / `TrackEvent`: optional, trimmed, upper-cased.
+- Drop observability: `dropped_count`, WARN log, opt-in `on_drop(events, reason)` with reasons `overflow`, `retry_exhausted`, `rejected`. A hook that calls `flush()` no longer deadlocks.
+- An event without a caller `idempotency_key` gets a random UUID (was a content hash that collided for same-instant events). The key is minted once at `track()` and reused by every retry.
+- Events are POSTed to `/v1/ingest/batch` as `{"events": [...]}`; a contract test loads `contract/ingest-contract.json`.
 
 ## [1.0.0] — 2026-06-29
 
@@ -33,5 +58,4 @@ Initial public distribution packaging — README, user guide, and versioning.
 - Full configuration reference for `AforoOptions`, `track()` arguments, and `MiddlewareOptions`.
 - Events deliver to `POST https://ingest.aforo.ai/v1/ingest/batch` with Bearer auth.
 
-[Unreleased]: https://github.com/aforoai/SDKs/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/aforoai/SDKs/releases/tag/v1.0.0

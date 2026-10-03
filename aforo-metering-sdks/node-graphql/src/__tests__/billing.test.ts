@@ -275,7 +275,7 @@ describe('ingest batch contract', () => {
     durationMs: 5.6, hasErrors: false, responseBytes: 10,
   });
   const FIELDS = ['customerId', 'metricName', 'quantity', 'occurredAt', 'idempotencyKey', 'productType', 'metadata', 'gqlOperationType', 'gqlOperationName',
-    'gqlComplexity', 'gqlFieldCount', 'gqlHasErrors', 'dataBytes', 'executionDurationMs'];
+    'gqlComplexity', 'gqlFieldCount', 'gqlHasErrors', 'dataBytes', 'executionDurationMs', 'executionStatus'];
 
   test('events carry only IngestUsageEventRequest fields', async () => {
     const billing = new AforoGraphQlBilling({ ...config(), flushCount: 100 });
@@ -293,15 +293,39 @@ describe('ingest batch contract', () => {
     assertBatchContract(capturedRequests, 'sk_gql_abc', FIELDS);
   });
 
-  test('long operation name is trimmed to 255 and idempotencyKey to 255', async () => {
-    const billing = new AforoGraphQlBilling({ ...config(), flushCount: 100 });
-    const name = 'Op' + 'x'.repeat(400);
-    billing.record({ customerId: 'cust_001', query: `query ${name} { a }`, operationName: name, durationMs: 1, hasErrors: false });
+  test('over-limit customerId: dropped as invalid — not truncated, not thrown, not sent', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const onError = jest.fn();
+    const drops: Array<{ events: any[]; reason: string }> = [];
+    const billing = new AforoGraphQlBilling({
+      ...config(), flushCount: 100, onError,
+      onDrop: (events, reason) => drops.push({ events, reason }),
+    });
+    expect(() => {
+      billing.record({ customerId: 'c'.repeat(65), query: '{ a }', durationMs: 1, hasErrors: false });
+      billing.record({ customerId: '   ', query: '{ a }', durationMs: 1, hasErrors: false }); // not billable, not a drop
+    }).not.toThrow();
     await billing.shutdown();
-    const ev = capturedRequests[0].body.events[0];
-    expect(ev.gqlOperationName.length).toBe(255);
-    expect(ev.idempotencyKey.length).toBeLessThanOrEqual(255);
-    expect(ev.idempotencyKey).toMatch(/:\d+:[a-z0-9]{8}$/);
+    expect(capturedRequests).toHaveLength(0);
+    expect(billing.droppedCount).toBe(1);
+    expect(drops.map((d) => d.reason)).toEqual(['invalid']);
+    expect(drops[0].events[0].customerId).toBe('c'.repeat(65));
+    expect(drops[0].events[0].idempotencyKey).toMatch(/:\d+:[a-z0-9]{8}$/);
+    expect(onError).not.toHaveBeenCalled();
+    expect(warn.mock.calls.map((c) => c[0]).join('\n')).toMatch(/invalid: customerId is 65 chars, limit 64/);
+    warn.mockRestore();
+  });
+
+  test('invalid-event WARN is throttled per field: first, then every 1000th', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const billing = new AforoGraphQlBilling({ ...config(), flushCount: 5000 });
+    for (let i = 0; i < 1001; i++) {
+      billing.record({ customerId: 'c'.repeat(65), query: '{ a }', durationMs: 1, hasErrors: false });
+    }
+    await billing.shutdown();
+    expect(billing.droppedCount).toBe(1001);
+    expect(warn).toHaveBeenCalledTimes(2);
+    warn.mockRestore();
   });
 });
 
@@ -337,8 +361,12 @@ describe('productType', () => {
 });
 
 describe('batch response handling', () => {
-  const rec = (b: AforoGraphQlBilling) => b.record({
-    customerId: 'cust_001', query: `{ a }`, operationName: undefined, durationMs: 1, hasErrors: false,
+  let warn: jest.SpyInstance;
+  beforeEach(() => { warn = jest.spyOn(console, 'warn').mockImplementation(() => {}); });
+  afterEach(() => { warn.mockRestore(); });
+
+  const rec = (b: AforoGraphQlBilling, i = 0) => b.record({
+    customerId: 'cust_001', query: `query Op${i} { a }`, operationName: `Op${i}`, durationMs: 1, hasErrors: false,
   });
   const resp = (status: number, body: any = {}, headers: Record<string, string> = {}) => ({
     ok: status >= 200 && status < 300, status, statusText: String(status),
@@ -346,15 +374,19 @@ describe('batch response handling', () => {
     json: async () => body,
   } as unknown as Response);
 
-  test('4xx (not 408/429) is not retried and reports errors[].message', async () => {
+  test('4xx (not 408/429) is not retried, reports errors[].message, and drops the batch as rejected', async () => {
     const onError = jest.fn();
-    const b = new AforoGraphQlBilling({ ...config(), flushCount: 100, onError });
+    const onDrop = jest.fn();
+    const b = new AforoGraphQlBilling({ ...config(), flushCount: 100, onError, onDrop });
     nextFetchResponse = () => resp(400, { errors: [{ index: 0, message: 'productType is required' }] });
     rec(b);
     await b.shutdown();
     expect(capturedRequests).toHaveLength(1);
     expect(onError).toHaveBeenCalledTimes(1);
     expect(onError.mock.calls[0][0].message).toMatch(/HTTP 400.*productType is required.*not retried/);
+    expect(b.droppedCount).toBe(1);
+    expect(onDrop).toHaveBeenCalledTimes(1);
+    expect(onDrop.mock.calls[0][1]).toBe('rejected');
   });
 
   test('429 honours Retry-After and 408 is retried; same idempotencyKeys re-sent', async () => {
@@ -367,15 +399,39 @@ describe('batch response handling', () => {
     expect(capturedRequests).toHaveLength(3);
     expect(new Set(capturedRequests.map((r) => r.body.events[0].idempotencyKey)).size).toBe(1);
     expect(onError).not.toHaveBeenCalled();
+    expect(b.droppedCount).toBe(0);
   });
 
-  test('202 with failed > 0 reports per-event errors[].message via onError', async () => {
+  test('202 with failed > 0 reports errors[].message and drops only the events named by index', async () => {
     const onError = jest.fn();
-    const b = new AforoGraphQlBilling({ ...config(), flushCount: 100, onError });
-    nextFetchResponse = () => resp(202, { accepted: 0, duplicates: 0, failed: 1, errors: [{ index: 0, message: 'bad event' }] });
+    const onDrop = jest.fn();
+    const b = new AforoGraphQlBilling({ ...config(), flushCount: 100, onError, onDrop });
+    nextFetchResponse = () => resp(202, { success: true, data: { accepted: 2, duplicates: 0, failed: 1, errors: [{ index: 1, message: 'bad event' }] } });
+    rec(b, 0); rec(b, 1); rec(b, 2);
+    await b.shutdown();
+    expect(capturedRequests).toHaveLength(1);
+    expect(onError.mock.calls[0][0].message).toMatch(/rejected 1 event\(s\).*#1: bad event/);
+    expect(b.droppedCount).toBe(1);
+    expect(onDrop).toHaveBeenCalledTimes(1);
+    expect(onDrop.mock.calls[0][1]).toBe('rejected');
+    expect(onDrop.mock.calls[0][0].map((e: any) => e.gqlOperationName)).toEqual(['Op1']);
+  });
+
+  test('202 with failed > 0 but no usable index counts the drops without naming events', async () => {
+    const onDrop = jest.fn();
+    const b = new AforoGraphQlBilling({ ...config(), flushCount: 100, onError: () => {}, onDrop });
+    nextFetchResponse = () => resp(202, { accepted: 1, failed: 2 });
+    rec(b, 0); rec(b, 1); rec(b, 2);
+    await b.shutdown();
+    expect(b.droppedCount).toBe(2);
+    expect(onDrop).not.toHaveBeenCalled();
+  });
+
+  test('a throwing onError never turns a delivered batch into a retry', async () => {
+    const b = new AforoGraphQlBilling({ ...config(), flushCount: 100, onError: () => { throw new Error('hook bug'); } });
+    nextFetchResponse = () => resp(202, { accepted: 0, failed: 1, errors: [{ index: 0, message: 'bad' }] });
     rec(b);
     await b.shutdown();
     expect(capturedRequests).toHaveLength(1);
-    expect(onError.mock.calls[0][0].message).toMatch(/rejected 1 event\(s\).*#0: bad event/);
   });
 });

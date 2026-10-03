@@ -2,11 +2,14 @@ package com.aforo.metering;
 
 import java.time.Instant;
 import java.util.Map;
+import java.util.logging.Logger;
 
 /**
  * A usage event to track. Use the builder pattern for construction.
  */
 public class TrackEvent {
+
+    private static final Logger LOG = Logger.getLogger(TrackEvent.class.getName());
 
     private final String customerId;
     private final String metricName;
@@ -14,6 +17,7 @@ public class TrackEvent {
     private final String idempotencyKey;
     private final String occurredAt;
     private final Map<String, Object> metadata;
+    private final String executionStatus;
     private final String productType;
     private final String endpointPath;
     private final String httpMethod;
@@ -27,11 +31,40 @@ public class TrackEvent {
         this.idempotencyKey = builder.idempotencyKey;
         this.occurredAt = builder.occurredAt;
         this.metadata = builder.metadata;
+        this.executionStatus = canonicalExecutionStatus(builder.executionStatus);
         this.productType = builder.productType;
         this.endpointPath = builder.endpointPath;
         this.httpMethod = builder.httpMethod;
         this.statusCode = builder.statusCode;
         this.responseTimeMs = builder.responseTimeMs;
+    }
+
+    /**
+     * Canonical outcome statuses the ingestor accepts (contract/ingest-contract.json,
+     * max 20 chars). Anything else would make it reject the event.
+     */
+    static final java.util.Set<String> ALLOWED_EXECUTION_STATUSES = java.util.Set.of(
+            "SUCCESS", "PARTIAL", "TIMEOUT", "ERROR", "VALIDATION_FAILED", "FAILED",
+            "FAILURE", "CANCELLED", "PENDING", "BLOCKED", "HITL_REQUIRED");
+
+    /** Trim + upper-case; blank or {@code null} becomes {@code null} (omitted from the wire body). */
+    static String normalizeExecutionStatus(String value) {
+        if (value == null) return null;
+        String trimmed = value.trim();
+        return trimmed.isEmpty() ? null : trimmed.toUpperCase(java.util.Locale.ROOT);
+    }
+
+    /**
+     * {@link #normalizeExecutionStatus} plus an allowlist check. An unknown value is
+     * logged and returned as {@code null} so the field is left off the event — sending
+     * it would make the ingestor reject the event, losing its usage.
+     */
+    static String canonicalExecutionStatus(String value) {
+        String normalized = normalizeExecutionStatus(value);
+        if (normalized == null || ALLOWED_EXECUTION_STATUSES.contains(normalized)) return normalized;
+        LOG.warning("[aforo] Ignoring unknown executionStatus \"" + normalized + "\" — expected one of "
+                + new java.util.TreeSet<>(ALLOWED_EXECUTION_STATUSES) + "; the event is sent without it.");
+        return null;
     }
 
     public String getCustomerId() { return customerId; }
@@ -40,6 +73,8 @@ public class TrackEvent {
     public String getIdempotencyKey() { return idempotencyKey; }
     public String getOccurredAt() { return occurredAt; }
     public Map<String, Object> getMetadata() { return metadata; }
+    /** Normalized (trimmed, upper-cased) execution status, or {@code null} when not set. */
+    public String getExecutionStatus() { return executionStatus; }
     /** Per-event product type override, or {@code null} to use the client default. */
     public String getProductType() { return productType; }
     public String getEndpointPath() { return endpointPath; }
@@ -58,6 +93,7 @@ public class TrackEvent {
         private String idempotencyKey;
         private String occurredAt;
         private Map<String, Object> metadata;
+        private String executionStatus;
         private String productType;
         private String endpointPath;
         private String httpMethod;
@@ -86,6 +122,16 @@ public class TrackEvent {
         public Builder httpMethod(String httpMethod) { this.httpMethod = httpMethod; return this; }
         public Builder statusCode(Integer statusCode) { this.statusCode = statusCode; return this; }
         public Builder responseTimeMs(Long responseTimeMs) { this.responseTimeMs = responseTimeMs; return this; }
+
+        /**
+         * Optional outcome of the request, used by OUTCOME_BASED pricing (each event bills
+         * at the weight set for its status; events without a status bill at full price).
+         * Trimmed and upper-cased; blank is treated as absent. Accepted values: SUCCESS,
+         * PARTIAL, TIMEOUT, ERROR, VALIDATION_FAILED, FAILED, FAILURE, CANCELLED, PENDING,
+         * BLOCKED, HITL_REQUIRED (max 20 chars). Any other value is logged and left off
+         * the event (the ingestor would otherwise reject the event).
+         */
+        public Builder executionStatus(String executionStatus) { this.executionStatus = executionStatus; return this; }
 
         public TrackEvent build() { return new TrackEvent(this); }
     }
