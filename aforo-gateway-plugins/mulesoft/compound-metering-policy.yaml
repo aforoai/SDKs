@@ -89,3 +89,38 @@ configuration:
 #   paths mapObject ((metricName, jsonPath) ->
 #     (metricName): body[jsonPath] default 0
 #   ) filterObject ((value) -> value > 0)
+#
+# ── correlationId (FROZEN — A+ compound-key freeze, 2026-07-05) ──
+#
+# MANDATORY: the compound event's `correlationId` MUST be derived
+# deterministically from Mule's stable per-event `correlationId`
+# attribute — the SAME identity the standard metering policy's
+# idempotencyKey was frozen to (see template.xml: "idempotencyKey":
+# correlationId, stable across <until-successful> retries — no clock).
+#
+# Dedup-safety basis: the Aforo ingestor types `correlationId` as a UUID
+# and derives EVERY per-metric dedup key from it
+# (correlationId:metricName[:dimensionKey]:index — CompoundEventDecomposer),
+# so the correlationId is the dedup ROOT for the whole compound event.
+# A redelivery (until-successful retry re-driving the flow, ObjectStore
+# replay after restart) MUST re-send the identical correlationId so the
+# ingest dedups instead of double-billing.
+#
+# NEVER use uuid(), now(), randomBytes(), or any per-evaluation value —
+# a fresh id per attempt makes every replay look like a new event, which
+# is exactly the double-billing the A+ program exists to prevent.
+#
+# Because Mule's correlationId is not guaranteed UUID-shaped (it may be
+# taken from a client X-Correlation-ID header), hash it into a v3-style
+# UUID the ingestor's UUID-typed field can parse. Build the event ONCE
+# per Mule event and buffer THAT object; the derivation below is also
+# safe to re-evaluate (it is a pure function of the stable identity):
+#
+#   %dw 2.0
+#   import dw::Crypto
+#   var h = lower(Crypto::MD5(("aforo-compound:" ++ correlationId)
+#             as Binary {encoding: "UTF-8"}))
+#   var variantNibble = ['8', '9', 'a', 'b'][(dw::core::Numbers::fromHex(h[16]) mod 4)]
+#   ---
+#   h[0 to 7] ++ "-" ++ h[8 to 11] ++ "-3" ++ h[13 to 15] ++ "-"
+#     ++ variantNibble ++ h[17 to 19] ++ "-" ++ h[20 to 31]

@@ -6,6 +6,49 @@ This function ships on the Aforo gateway-plugins line; the whole repo is version
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-10-02
+
+Merges the two lines of this function: the public 2.1.0 release (mirror work by Gowtham and Eswar) and the working repository's delivery, outcome and detection work. Every setting either line read still works.
+
+### From the 2.1.0 line
+- Customer identity from `$context.authorizer.customerId`; the API key value and the client IP are never a `customerId`; no identity or an id over 64 characters → no event.
+- `METRIC_MAPPINGS` (EXACT / PREFIX / CONTAINS, first match wins), `DEFAULT_METRIC` (`api_calls`), `PRODUCT_TYPE` on every event.
+- `OPTIONS` and quantity ≤ 0 not metered; `FLUSH_COUNT` capped at 1000.
+- 408 / 429 retried, `Retry-After` honoured (30 s cap), other 4xx dropped with the body logged; batches sent concurrently under a deadline from `getRemainingTimeInMillis()`.
+- `X-API-Key` only; default endpoint `https://api.aforo.ai/v1/ingest/batch`; `index.handler` exported.
+
+### From the working repository
+- `executionStatus` on every event from the HTTP status (2xx/3xx SUCCESS, 408/504 TIMEOUT, 499 CANCELLED, 400/422 VALIDATION_FAILED, 401/403/429 BLOCKED, other 4xx/5xx ERROR), with `STATUS_OUTCOMES` overrides. This replaces 2.1.0's MCP-only SUCCESS/ERROR.
+- `EXCLUDE_STATUS_CODES` (default `401,403,429`; a list replaces the default; `none` or empty meters everything) — 2.1.0 had the list hardcoded.
+- AGENTIC_API detection: with `PRODUCT_TYPE=API`, a valid W3C `traceparent` (or `x-trace-id`) sends `productType: AGENTIC_API` and a top-level `traceId`.
+- Delivery: EMF metric `EventsFailedToSend` before each throw; SQS OnFailure queue (14 days) and `MaximumEventAgeInSeconds: 21600` in `template.yaml`; replay procedure in the README.
+- Compound events: `correlationId` is a UUID derived from the request's stable seed, not random per call.
+
+### Added
+- EMF metrics `EventsRejected` (permanent 4xx, and events rejected individually inside an accepted batch — read from `data.errors` of the `{success, data, meta}` response) and `EventsDroppedInvalidMetric`.
+- A resolved metric name that is empty or longer than 255 characters is dropped with a WARN instead of sent.
+- `CUSTOMER_ID_SOURCE=authorizer` to disable the IAM-caller fallback.
+- `buildCompoundEvent(customerId, measurements, metadata, correlationSeed, productType)`; an options object `{ correlationSeed, productType }` is accepted as the 4th argument.
+- `npm test` runs two suites: `tests/handler.test.js` and `tests/contract.test.js`.
+
+### Changed — what a 2.1.0 user will notice
+- A request carrying `traceparent` is now sent as `AGENTIC_API` when `PRODUCT_TYPE` is `API`. Set `PRODUCT_TYPE` to anything else to keep one type for every event.
+- MCP events get `executionStatus` from the shared table (504 is `TIMEOUT`, not `ERROR`), and the MCP idempotency key is back to `mcp:<AFORO_TENANT_ID>:<requestId>:<toolName>:<log timestamp>` (2.1.0 used `mcp:<requestId>:<toolName>`). Both shapes are stable across retries; an MCP event in flight across the upgrade from 2.1.0 can be counted twice.
+- SAM parameters `AforoTenantId` and `CustomerIdSource` are accepted again (both optional), so parameter overrides written for either line deploy. The template gains `ExcludeStatusCodes`, `StatusOutcomes` and the failure queue.
+- `buildCompoundEvent`'s 4th argument is the correlation seed. A 4th argument that is exactly a known productType, with no 5th argument, is still read as the productType.
+- An IAM `caller` in the access log is used as the customer when the authorizer set none.
+
+### Changed — what a user of the working repository's build will notice
+- **`$context.identity.apiKey` is no longer the customer.** It is the key value, a secret. Stages metered through an API Gateway API key alone produce no events until the route has the Aforo authorizer (or IAM authorization) and the access-log format logs `customerId`. Remove `apiKey` from the log format. `principalId` and the CLF client IP are no longer used either.
+- No `X-Tenant-Id` header is sent (index.js, `compound-metering.js`, `preflight-quota.js`).
+- The default metric is `api_calls`, not `{method} {path}`. `METRIC_NAME_PATTERN` still applies when set.
+- A permanent 4xx no longer throws: the batch is dropped and counted in `EventsRejected` instead of being redelivered twice and parked in the failure queue.
+- Every event carries `productType` (default `API`); an MCP `tools/call` without an `agentId` keeps the configured type instead of `MCP_SERVER`.
+- An MCP entry with no `requestId` now keys on the CloudWatch log-event id instead of the literal `undefined`.
+
+### Deprecated aliases
+None — the two lines used the same names. `AFORO_TENANT_ID` / `AforoTenantId` and `CUSTOMER_ID_SOURCE` / `CustomerIdSource`, removed in 2.1.0, are read again; `CUSTOMER_ID_SOURCE=header` stays unsupported and behaves as `authorizer`.
+
 ## [2.1.0] — 2026-10-01
 
 ### Added

@@ -15,28 +15,55 @@
  *                          "metricName":"sms_sent"}]. matchType is EXACT,
  *                          PREFIX or CONTAINS (plain string comparison, the
  *                          same semantics as catalog's gateway-mappings).
- *   DEFAULT_METRIC       — Metric for requests no mapping matches
- *                          (default "api_calls"). MUST be a metric registered
- *                          in the Aforo catalog: an unknown metric fails the
- *                          whole batch with 400.
- *   METRIC_NAME_PATTERN  — Legacy route-shaped template ({method} {path}
- *                          {service} {route}). Used ONLY when explicitly set;
- *                          every resulting name must be a catalog metric.
+ *   METRIC_NAME_PATTERN  — Route-shaped template ({method} {path} {service}
+ *                          {route}). Used ONLY when explicitly set, for
+ *                          requests no mapping matches; every resulting name
+ *                          must be a catalog metric.
+ *   DEFAULT_METRIC       — Metric for requests neither of the above names
+ *                          (default "api_calls"). The ingestor rejects an
+ *                          event whose metric is not in the Aforo catalog;
+ *                          the Lambda cannot know the catalog.
  *   QUANTITY_SOURCE      — "1" (count) or "response_size"
  *   FLUSH_COUNT          — Max events per batch (default 50, capped at 1000 —
  *                          the ingestor rejects larger batches with 400)
  *   INCLUDE_METADATA     — "false" to omit request metadata
  *   MCP_ENABLED          — "true" to enable MCP JSON-RPC detection
- *   MCP_PRODUCT_ID       — Aforo product ID for MCP metering
  *   PRODUCT_TYPE         — productType sent on every event (default "API";
  *                          trimmed + upper-cased, unknown values passed
  *                          through). MCP tools/call with both toolName and
- *                          agentId is sent as MCP_SERVER instead.
+ *                          agentId is sent as MCP_SERVER; with PRODUCT_TYPE
+ *                          = API, a request carrying a valid W3C traceparent
+ *                          (or x-trace-id) is sent as AGENTIC_API.
+ *   EXCLUDE_STATUS_CODES — Status codes that are NOT metered (default
+ *                          "401,403,429"). A configured list replaces the
+ *                          default; "" or "none" meters every status.
+ *   STATUS_OUTCOMES      — Optional executionStatus overrides, e.g.
+ *                          "404=VALIDATION_FAILED,429=ERROR". Exact HTTP codes
+ *                          200-599 -> canonical outcome; invalid entries are
+ *                          skipped with a warning; last duplicate wins. See
+ *                          README "Execution status mapping".
+ *   CUSTOMER_ID_SOURCE   — "consumer" (default): the authorizer's customerId,
+ *                          then the IAM caller ($context.identity.caller).
+ *                          "authorizer": the authorizer's customerId only.
+ *   AFORO_TENANT_ID      — Optional. Never sent to the ingestor. Part of the
+ *                          MCP idempotency key (kept so keys do not change
+ *                          shape across an upgrade) and a property on the
+ *                          EMF metrics.
  *
  * Customer identity: the access-log entry's `customerId` field, which the
- * stage's access-log format must populate from `$context.authorizer.customerId`
- * (set by authorizer.js from the verified JWT's customer_id claim). Entries
- * without one are skipped — see README "Access-log format".
+ * stage's access-log format populates from `$context.authorizer.customerId`
+ * (set by authorizer.js from the verified JWT's customer_id claim), or — for
+ * IAM-authorized routes — `caller` from `$context.identity.caller`. Both are
+ * set by API Gateway from a verified credential. The API key VALUE
+ * ($context.identity.apiKey) is a secret and the client IP is not an
+ * identity: neither is ever used. Entries without an identity are skipped —
+ * see README "Access-log format".
+ *
+ * Delivery: a transient failure (network, 5xx, 408, 429) that outlives the
+ * in-handler retries makes the handler THROW, so Lambda's async retry
+ * redelivers the same log payload; idempotency keys are derived from log
+ * data only, so the ingestor deduplicates. A permanent 4xx is dropped (logged
+ * + EMF metric) without throwing — a redelivery would be rejected again.
  *
  * Note: Margin guard enforcement is not possible here. This Lambda processes
  * CloudWatch Logs asynchronously and CANNOT block live requests. For
@@ -51,9 +78,14 @@ const zlib = require('zlib');
 
 const AFORO_ENDPOINT = process.env.AFORO_ENDPOINT || '';
 const AFORO_API_KEY = process.env.AFORO_API_KEY || '';
+// Never sent to the ingestor (the tenant comes from the API key). Kept only
+// because it is part of the frozen MCP idempotency-key shape and an EMF
+// property; unset is fine.
+const AFORO_TENANT_ID = process.env.AFORO_TENANT_ID || '';
 const DEFAULT_METRIC = process.env.DEFAULT_METRIC || 'api_calls';
 // Route-shaped names ("GET /v1/users/42") are not catalog metrics, so the old
-// '{method} {path}' default failed every batch. Only honoured when set.
+// '{method} {path}' default produced events the ingestor rejects. Only
+// honoured when set.
 const METRIC_NAME_PATTERN = process.env.METRIC_NAME_PATTERN || '';
 const QUANTITY_SOURCE = process.env.QUANTITY_SOURCE || '1';
 // The ingestor rejects a batch of more than 1000 events with 400 (the whole
@@ -64,13 +96,13 @@ const FLUSH_COUNT = Math.min(MAX_BATCH_EVENTS,
 const INCLUDE_METADATA = process.env.INCLUDE_METADATA !== 'false';
 const MCP_ENABLED = process.env.MCP_ENABLED === 'true';
 const PRODUCT_TYPE = normalizeProductType(process.env.PRODUCT_TYPE);
+const CUSTOMER_ID_SOURCE = normalizeCustomerIdSource(process.env.CUSTOMER_ID_SOURCE);
 
-// Fields each productType must carry. The ingestor validates a batch as a
-// whole, so one event missing them fails every event it travels with; such
-// events are skipped instead. An AI_AGENT agentId (X-Agent-Id is client-
-// settable, never trusted) and gRPC / GraphQL / WebSocket / MQTT fields are not
-// in an API Gateway access log, so those types are listed only so the check
-// refuses them rather than poisoning batches. Unknown types pass unchecked.
+// Fields each productType must carry. An event missing them is rejected by
+// the ingestor, so it is skipped here instead. An AI_AGENT agentId
+// (X-Agent-Id is client-settable, never trusted) and gRPC / GraphQL /
+// WebSocket / MQTT fields are not in an API Gateway access log, so those types
+// are listed only so the check refuses them. Unknown types pass unchecked.
 const PRODUCT_TYPE_REQUIRED_FIELDS = {
     API: [],
     AGENTIC_API: [],
@@ -85,9 +117,27 @@ const PRODUCT_TYPE_REQUIRED_FIELDS = {
 const MAX_RETRY_AFTER_MS = 30000;
 
 const METRIC_MAPPINGS = parseMetricMappings(process.env.METRIC_MAPPINGS);
+const MAX_METRIC_NAME_LENGTH = 255;
 
 const EXCLUDE_PATHS = ['/health', '/ready', '/metrics', '/favicon.ico'];
-const EXCLUDE_STATUS_CODES = [401, 403, 429];
+
+/**
+ * Parse a comma-separated list of HTTP status codes ("401,403,429").
+ * Unset -> the default. A configured list REPLACES the default; an empty
+ * value ("") or "none" meters everything. Non-numeric entries are skipped.
+ */
+function parseStatusCodeList(raw, fallback) {
+    if (raw === undefined || raw === null) return fallback;
+    return String(raw).split(',')
+        .map((v) => Number(v.trim()))
+        .filter((n) => Number.isInteger(n) && n >= 100 && n <= 599);
+}
+
+// Not metered by default (same default as Kong's exclude_status_codes).
+// Remove a code here (EXCLUDE_STATUS_CODES env) to meter it; its
+// executionStatus then follows the outcome table below (401/403/429 ->
+// BLOCKED unless STATUS_OUTCOMES says otherwise).
+const EXCLUDE_STATUS_CODES = parseStatusCodeList(process.env.EXCLUDE_STATUS_CODES, [401, 403, 429]);
 const MAX_CUSTOMER_ID_LENGTH = 64;
 
 // Per-attempt HTTP timeout, and how much of the Lambda's remaining time is
@@ -104,8 +154,35 @@ function normalizeProductType(raw) {
 }
 
 /**
+ * "consumer" (default) or "authorizer". Anything else — including the
+ * long-removed "header" — is treated as "authorizer", the narrower source,
+ * with a warning: a client-settable header is never an identity.
+ */
+function normalizeCustomerIdSource(raw) {
+    const v = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+    if (v === '' || v === 'consumer') return 'consumer';
+    if (v !== 'authorizer') {
+        console.warn(`[aforo-metering] CUSTOMER_ID_SOURCE="${raw}" is not supported — using "authorizer"`);
+    }
+    return 'authorizer';
+}
+
+/**
+ * Resolve the customer from VERIFIED identity only: the Aforo authorizer's
+ * customerId, then (source "consumer") the IAM caller. Never the API key
+ * value, a request header, or the client IP. Returns '' when there is none.
+ */
+function resolveCustomerId(parsed, source = CUSTOMER_ID_SOURCE) {
+    const fromAuthorizer = (parsed.customerId || '').trim();
+    if (fromAuthorizer) return fromAuthorizer;
+    if (source === 'consumer') return (parsed.caller || '').trim();
+    return '';
+}
+
+/**
  * Parse METRIC_MAPPINGS. Invalid config is logged loudly and ignored rather
- * than crashing every invocation: events then resolve to DEFAULT_METRIC.
+ * than crashing every invocation: events then fall through to
+ * METRIC_NAME_PATTERN / DEFAULT_METRIC.
  */
 function parseMetricMappings(raw) {
     if (!raw || !raw.trim()) return [];
@@ -114,13 +191,13 @@ function parseMetricMappings(raw) {
         if (!Array.isArray(rules)) throw new Error('not a JSON array');
         return rules.filter((r) => {
             const ok = r && typeof r.value === 'string' && r.value !== ''
-                && typeof r.metricName === 'string' && r.metricName !== ''
+                && typeof r.metricName === 'string' && r.metricName.trim() !== ''
                 && ['EXACT', 'PREFIX', 'CONTAINS'].includes(r.matchType || 'EXACT');
             if (!ok) console.error(`METRIC_MAPPINGS: ignoring invalid rule ${JSON.stringify(r)}`);
             return ok;
         });
     } catch (err) {
-        console.error(`METRIC_MAPPINGS is not valid JSON (${err.message}) — all events will use DEFAULT_METRIC`);
+        console.error(`METRIC_MAPPINGS is not valid JSON (${err.message}) — no mapping applies`);
         return [];
     }
 }
@@ -153,9 +230,118 @@ function resolveMetricName(parsed, mappings = METRIC_MAPPINGS,
     return defaultMetric;
 }
 
+const OUTCOME_STATUSES = new Set([
+    'SUCCESS', 'PARTIAL', 'TIMEOUT', 'ERROR', 'VALIDATION_FAILED', 'FAILED',
+    'FAILURE', 'CANCELLED', 'PENDING', 'BLOCKED', 'HITL_REQUIRED',
+]);
+
+/**
+ * Parse a status→outcome override list: "404=VALIDATION_FAILED,429=ERROR".
+ * Keys are exact HTTP codes 200-599; values are canonical statuses
+ * (case-insensitive). Invalid entries are skipped with a warning so one
+ * typo never disables metering.
+ */
+function parseStatusOutcomes(raw) {
+    const map = {};
+    if (!raw || typeof raw !== 'string') return map;
+    for (const part of raw.split(',')) {
+        const entry = part.trim();
+        if (!entry) continue;
+        const eq = entry.indexOf('=');
+        const code = eq > 0 ? entry.slice(0, eq).trim() : '';
+        const outcome = eq > 0 ? entry.slice(eq + 1).trim().toUpperCase() : '';
+        if (!/^[2-5]\d\d$/.test(code) || !OUTCOME_STATUSES.has(outcome)) {
+            console.warn(`[aforo-metering] STATUS_OUTCOMES: ignoring invalid entry "${entry}"`);
+            continue;
+        }
+        map[code] = outcome;
+    }
+    return map;
+}
+
+const STATUS_OUTCOMES = parseStatusOutcomes(process.env.STATUS_OUTCOMES);
+
+/**
+ * Map the upstream HTTP status to the server's executionStatus value
+ * space for OUTCOME_BASED pricing (each event billed at a per-status
+ * weight; every other pricing model ignores the field). Shared rule —
+ * identical in all five gateway plugins (README "Execution status mapping").
+ * Default table (policy locked 2026-09-30):
+ *   2xx/3xx -> SUCCESS, 408/504 -> TIMEOUT, 499 -> CANCELLED,
+ *   400/422 -> VALIDATION_FAILED, 401/403/429 -> BLOCKED,
+ *   every other 4xx and 5xx (404 included) -> ERROR,
+ *   unknown / 0 / missing / non-numeric / 1xx / out of range -> undefined.
+ * `overrides` (STATUS_OUTCOMES env) wins over the default for exact codes.
+ * Callers MUST only set the field when the result is defined — never
+ * send null or an empty string.
+ */
+function outcomeFromStatus(status, overrides = STATUS_OUTCOMES) {
+    const s = Number(status);
+    if (!Number.isFinite(s) || s < 200 || s > 599) return undefined;
+    const code = Math.floor(s);
+    if (overrides && typeof overrides === 'object') {
+        const o = overrides[String(code)];
+        if (typeof o === 'string' && OUTCOME_STATUSES.has(o.toUpperCase())) {
+            return o.toUpperCase();
+        }
+    }
+    if (code < 400) return 'SUCCESS';
+    if (code === 408 || code === 504) return 'TIMEOUT';
+    if (code === 499) return 'CANCELLED';
+    if (code === 400 || code === 422) return 'VALIDATION_FAILED';
+    if (code === 401 || code === 403 || code === 429) return 'BLOCKED';
+    return 'ERROR';
+}
+
+/**
+ * Detect AGENTIC_API from W3C trace context.
+ *
+ * Per descriptor eventSchema.inferenceRule = HAS_TRACE (agentic_api.json),
+ * a request with a resolvable trace id classifies as AGENTIC_API.
+ * Preferred source is the W3C traceparent header (parsed for its 32-hex
+ * trace_id field); fallback is x-trace-id per descriptor
+ * tracing.allowFallback = true (non-OTel callers). MCP JSON-RPC still
+ * wins the productType when both signals are present — the handler
+ * checks MCP first and only consults this helper afterwards when
+ * productType is still unset. Malformed traceparent falls through
+ * cleanly; never invent a productType from an unparseable header.
+ *
+ * @param {Object|null} trace Trace-context object with .traceparent + .xTraceId.
+ * @returns {string|null} 32-hex trace_id (lowercased) or trimmed x-trace-id,
+ *                        or null when no signal is present or valid.
+ */
+function extractAgenticTraceId(trace) {
+    if (!trace) return null;
+
+    if (trace.traceparent) {
+        // W3C format: version-trace_id-parent_id-flags (hex widths 2-32-16-2).
+        // Invalid per spec: version=="ff", trace_id all zeros, parent_id all zeros.
+        const parts = String(trace.traceparent).split('-');
+        if (parts.length === 4 &&
+            /^[0-9a-f]{2}$/i.test(parts[0]) && parts[0].toLowerCase() !== 'ff' &&
+            /^[0-9a-f]{32}$/i.test(parts[1]) && !/^0+$/.test(parts[1]) &&
+            /^[0-9a-f]{16}$/i.test(parts[2]) && !/^0+$/.test(parts[2]) &&
+            /^[0-9a-f]{2}$/i.test(parts[3])) {
+            return parts[1].toLowerCase();
+        }
+    }
+
+    if (trace.xTraceId) {
+        // Non-OTel fallback. Descriptor types trace_id as String, not UUID —
+        // no shape check beyond non-empty after trim.
+        const trimmed = String(trace.xTraceId).trim();
+        if (trimmed.length > 0) {
+            return trimmed;
+        }
+    }
+
+    return null;
+}
+
 /**
  * Build a usage event from a parsed log entry, or return { skip: reason }.
- * Exported for tests.
+ * Everything in the event — idempotencyKey included — is derived from the
+ * log entry alone, so a redelivered log payload rebuilds identical events.
  */
 function buildUsageEvent(parsed, logEvent) {
     if (EXCLUDE_PATHS.some(p => parsed.path && parsed.path.startsWith(p))) return { skip: 'excluded path' };
@@ -165,13 +351,11 @@ function buildUsageEvent(parsed, logEvent) {
     // carry no Authorization header — so they can never have a customer.
     if ((parsed.method || '').toUpperCase() === 'OPTIONS') return { skip: 'OPTIONS' };
 
-    // Customer identity comes only from the authorizer context
-    // ($context.authorizer.customerId), which authorizer.js sets from the
-    // verified JWT. Never the API key value (a secret) or the client IP.
-    const customerId = (parsed.customerId || '').trim();
+    const customerId = resolveCustomerId(parsed);
     if (!customerId) return { skip: 'no customerId' };
     if (customerId.length > MAX_CUSTOMER_ID_LENGTH) return { skip: 'customerId longer than 64 chars' };
 
+    // W3C Trace Context (null when absent — fidelity, not synthetic)
     const headers = parsed.headers || {};
     const trace = {
         traceparent: headers['traceparent'] ?? null,
@@ -219,9 +403,11 @@ function buildUsageEvent(parsed, logEvent) {
         usageEvent.metadata.keyId = parsed.keyId;
     }
 
+    let isMcp = false;
     if (MCP_ENABLED && parsed.method === 'POST' && parsed.requestBody) {
         const mcpInfo = detectMcpToolCall(parsed.requestBody);
         if (mcpInfo) {
+            isMcp = true;
             usageEvent.metricName = 'mcp_server.tool_invocations';
             usageEvent.quantity = 1;
             usageEvent.toolName = mcpInfo.toolName;
@@ -230,15 +416,49 @@ function buildUsageEvent(parsed, logEvent) {
             // only when both are known, otherwise keep PRODUCT_TYPE rather
             // than send an event the ingestor must reject.
             if (usageEvent.toolName && usageEvent.agentId) usageEvent.productType = 'MCP_SERVER';
-            usageEvent.executionStatus = parsed.status >= 200 && parsed.status < 300 ? 'SUCCESS' : 'ERROR';
             usageEvent.executionDurationMs = parsed.latency || 0;
-            usageEvent.idempotencyKey = `mcp:${parsed.requestId || logEvent.id}:${mcpInfo.toolName}`;
+            // FROZEN key shape (log data + the static tenant setting only).
+            // Changing it would double-bill retries in flight across an
+            // upgrade. The CloudWatch event id stands in when the log format
+            // has no requestId, so two such entries never share a key.
+            usageEvent.idempotencyKey =
+                `mcp:${AFORO_TENANT_ID}:${parsed.requestId || logEvent.id}:${mcpInfo.toolName}:${logEvent.timestamp}`;
         }
     }
 
-    // The ingestor requires quantity > 0 and validates a batch as a whole, so
-    // one zero-byte response (e.g. 204 with QUANTITY_SOURCE=response_size)
-    // would fail every event batched with it.
+    // AGENTIC_API classification — only when a trace id is resolvable
+    // (descriptor eventSchema.inferenceRule = HAS_TRACE), MCP has not claimed
+    // the event, and the configured type is the baseline API: an operator who
+    // set PRODUCT_TYPE to anything else has already said what these calls
+    // are. traceId goes top-level (the ingestor reads descriptor
+    // requiredFields from the top level, not from metadata).
+    if (!isMcp && usageEvent.productType === 'API') {
+        const agenticTraceId = extractAgenticTraceId(trace);
+        if (agenticTraceId) {
+            usageEvent.productType = 'AGENTIC_API';
+            usageEvent.traceId = agenticTraceId;
+        }
+    }
+
+    // Outcome for OUTCOME_BASED pricing — every event path (standard API,
+    // AGENTIC_API, MCP). Omitted when the status is not determinable.
+    // CloudWatch access logs carry no response body, so a JSON-RPC `error`
+    // inside a 2xx cannot be detected here.
+    const executionStatus = outcomeFromStatus(parsed.status);
+    if (executionStatus) usageEvent.executionStatus = executionStatus;
+
+    // The Lambda cannot know the catalog, but a blank or oversized name can
+    // never be a metric: drop it here rather than have the ingestor reject it.
+    const metricName = typeof usageEvent.metricName === 'string' ? usageEvent.metricName.trim() : '';
+    if (!metricName || metricName.length > MAX_METRIC_NAME_LENGTH) {
+        console.warn(`[aforo-metering] dropping event for ${parsed.method} ${parsed.path}: ` +
+            `metric name is ${metricName ? 'longer than 255 chars' : 'empty'}`);
+        return { skip: 'invalid metricName' };
+    }
+    usageEvent.metricName = metricName;
+
+    // The ingestor requires quantity > 0 (e.g. a 204 with
+    // QUANTITY_SOURCE=response_size has none).
     if (!(Number.isFinite(usageEvent.quantity) && usageEvent.quantity > 0)) return { skip: 'quantity <= 0' };
 
     const required = PRODUCT_TYPE_REQUIRED_FIELDS[usageEvent.productType] || [];
@@ -283,7 +503,11 @@ async function handler(event, context) {
 
     if (skipped['no customerId']) {
         console.warn(`Skipped ${skipped['no customerId']} entries with no customerId. The stage's access-log format ` +
-            'must include "customerId":"$context.authorizer.customerId" and the route must use the Aforo authorizer.');
+            'must include "customerId":"$context.authorizer.customerId" and the route must use the Aforo authorizer ' +
+            '(or, for IAM-authorized routes, "caller":"$context.identity.caller").');
+    }
+    if (skipped['invalid metricName']) {
+        emitMetric('EventsDroppedInvalidMetric', skipped['invalid metricName'], logEvents.length);
     }
     if (Object.keys(skipped).length > 0) console.log(`Skipped: ${JSON.stringify(skipped)}`);
 
@@ -309,20 +533,90 @@ async function handler(event, context) {
     let dropped = 0;
     let transient = 0;
     results.forEach((r, i) => {
-        if (r === 'sent') totalSent += batches[i].length;
-        else if (r === 'rejected') dropped += batches[i].length;
-        else transient += batches[i].length;
+        const size = batches[i].length;
+        if (r.outcome === 'sent') {
+            const rejected = Math.min(size, r.rejectedEvents || 0);
+            totalSent += size - rejected;
+            dropped += rejected;
+        } else if (r.outcome === 'rejected') {
+            dropped += size;
+        } else {
+            transient += size;
+        }
     });
 
     console.log(`Sent ${totalSent}/${usageEvents.length} events to Aforo`);
 
-    if (transient > 0) {
-        // Throw so Lambda's async-invocation retry (2 retries by default)
-        // re-delivers this log batch. Every event carries a stable
-        // idempotencyKey, so batches that already landed deduplicate.
-        throw new Error(`${transient} event(s) not delivered after retries (transient failure) — failing the invocation so Lambda retries it`);
+    if (dropped > 0) {
+        // Permanent rejection: the ingestor judged these bytes and said no, so
+        // a redelivery would be rejected again. Counted, never retried.
+        emitMetric('EventsRejected', dropped, usageEvents.length);
     }
+
+    if (transient > 0) {
+        // Emit the failure metric BEFORE throwing so every failed invocation
+        // is alarmable, not just the terminal one.
+        emitMetric('EventsFailedToSend', transient, usageEvents.length);
+
+        // SAFETY BASIS for throwing: every idempotencyKey is derived purely
+        // from CloudWatch log DATA — `parsed.requestId || logEvent.id` for
+        // standard events, plus toolName + logEvent.timestamp (and the static
+        // tenant setting) for MCP events. NOTHING time-of-execution feeds a
+        // key. Lambda's async retry re-invokes this handler with the
+        // IDENTICAL awslogs payload, so the rebuilt events carry
+        // byte-identical keys and the ingest layer dedups them — a redelivery
+        // (including batches that already landed in this invocation) CANNOT
+        // double-bill.
+        //
+        // Returning 200 here would tell Lambda "success" and turn a
+        // recoverable ingest blip into permanent silent loss. Throwing hands
+        // the events back to the async retry (and, when retries exhaust, to
+        // the OnFailure destination configured in template.yaml).
+        throw new Error(
+            `Aforo ingest failed for ${transient}/${usageEvents.length} events after in-handler retries ` +
+            '(transient failure) — throwing so Lambda redelivers (dedup-safe: idempotency keys are stable across redelivery)'
+        );
+    }
+
     return { statusCode: 200, body: `Processed ${totalSent} events, dropped ${dropped} rejected` };
+}
+
+/**
+ * Emit a CloudWatch custom metric via Embedded Metric Format (EMF).
+ *
+ * EMF is a structured console.log — CloudWatch extracts the metric from
+ * the log stream automatically, so this needs no SDK dependency and no
+ * extra IAM permission. Namespace Aforo/Metering, dimension Gateway:
+ *   EventsFailedToSend         — transient failure; fires before each throw.
+ *                                The TERMINAL signal (async retries also
+ *                                exhausted) is the OnFailure SQS queue depth.
+ *   EventsRejected             — dropped after a permanent 4xx, or rejected
+ *                                per event inside an accepted batch.
+ *   EventsDroppedInvalidMetric — metric name empty or longer than 255 chars.
+ *
+ * Never throws: a metrics failure must not mask or replace the real
+ * delivery failure being reported.
+ */
+function emitMetric(name, count, totalCount) {
+    try {
+        const record = {
+            _aws: {
+                Timestamp: Date.now(),
+                CloudWatchMetrics: [{
+                    Namespace: 'Aforo/Metering',
+                    Dimensions: [['Gateway']],
+                    Metrics: [{ Name: name, Unit: 'Count' }],
+                }],
+            },
+            Gateway: 'aws-api-gateway',
+            TotalEventsInInvocation: totalCount,
+        };
+        if (AFORO_TENANT_ID) record.TenantId = AFORO_TENANT_ID;
+        record[name] = count;
+        console.log(JSON.stringify(record));
+    } catch (err) {
+        console.error(`Failed to emit EMF metric ${name}: ${err.message}`);
+    }
 }
 
 /**
@@ -346,6 +640,11 @@ function parseAccessLog(message) {
             // "-" is what API Gateway logs for an unset $context variable.
             customerId: cleanContextValue(json.customerId ?? json['authorizer.customerId']),
             keyId: cleanContextValue(json.keyId ?? json['authorizer.keyId']),
+            // $context.identity.caller — the IAM principal API Gateway
+            // verified (SigV4). $context.identity.apiKey (the key VALUE, a
+            // secret) and $context.authorizer.principalId (a placeholder
+            // when the token has no customer) are deliberately not read.
+            caller: cleanContextValue(json.caller ?? json['identity.caller']),
             headers: json.requestHeaders || {},
             requestBody: json.requestBody || null,
         };
@@ -369,6 +668,7 @@ function parseAccessLog(message) {
             // CLF's first field is the client IP — never a customer id.
             customerId: '',
             keyId: '',
+            caller: '',
             headers: {},
             requestBody: null,
         };
@@ -402,14 +702,47 @@ function detectMcpToolCall(requestBody) {
     }
 }
 
+
 /** 4xx except 408/429 is a permanent rejection: retrying sends the same bytes to the same judgement. */
 function isPermanentRejection(status) {
     return status >= 400 && status < 500 && status !== 408 && status !== 429;
 }
 
 /**
- * Send one batch. Returns 'sent', 'rejected' (permanent 4xx — dropped and
- * logged) or 'failed' (transient failure that outlived retries/deadline).
+ * Per-event rejections inside an accepted batch. The ingestor wraps every 2xx
+ * as { success, data, meta }; data carries { accepted, duplicates, failed,
+ * errors: [{ index, message }] }. Returns the failed count (0 when the body
+ * is absent or not that shape) and logs the reasons.
+ */
+function countRejectedEvents(resBody, events) {
+    if (!resBody) return 0;
+    let data;
+    try {
+        const json = JSON.parse(resBody);
+        data = json && typeof json === 'object' && json.data && typeof json.data === 'object' ? json.data : json;
+    } catch {
+        return 0;
+    }
+    if (!data || typeof data !== 'object') return 0;
+    const errors = Array.isArray(data.errors) ? data.errors : [];
+    const failed = Number.isInteger(data.failed) && data.failed > 0 ? data.failed : errors.length;
+    if (failed > 0) {
+        const detail = errors.slice(0, 10).map((e) => {
+            const ev = events[e && e.index];
+            return `#${e && e.index}${ev ? ` (${ev.metricName})` : ''}: ${e && e.message}`;
+        }).join('; ');
+        console.error(`Aforo accepted the batch but rejected ${failed} event(s) — dropped. ${detail}`);
+    }
+    return failed;
+}
+
+/**
+ * Send one batch. Resolves to { outcome, rejectedEvents }:
+ *   'sent'     — 2xx (rejectedEvents = events the ingestor refused individually)
+ *   'rejected' — permanent 4xx; dropped and logged, never retried
+ *   'failed'   — transient failure that outlived the retries or the deadline
+ * The body is serialized ONCE, so every attempt carries the same idempotency
+ * keys.
  */
 async function sendToAforo(events, deadline) {
     const body = JSON.stringify({ events });
@@ -421,12 +754,12 @@ async function sendToAforo(events, deadline) {
         try {
             const res = await doPost(AFORO_ENDPOINT, body, Math.min(REQUEST_TIMEOUT_MS, timeLeft));
             if (res.status >= 200 && res.status < 300) {
-                return 'sent';
+                return { outcome: 'sent', rejectedEvents: countRejectedEvents(res.body, events) };
             }
             if (isPermanentRejection(res.status)) {
                 console.error(`Aforo rejected the batch with ${res.status} — dropping ${events.length} event(s). ` +
                     `Response: ${String(res.body || '').slice(0, 500)}`);
-                return 'rejected';
+                return { outcome: 'rejected' };
             }
             console.warn(`Aforo returned ${res.status} — attempt ${attempt}/${MAX_ATTEMPTS}`);
             retryAfterMs = res.status === 429 ? parseRetryAfter(res.headers && res.headers['retry-after']) : null;
@@ -446,8 +779,12 @@ async function sendToAforo(events, deadline) {
         }
     }
 
-    console.error(`Batch of ${events.length} event(s) not delivered (transient failure or Lambda deadline)`);
-    return 'failed';
+    // Not "dropped" — the handler throws when any batch fails transiently, so
+    // Lambda redelivers the whole invocation (dedup-safe; see the safety-basis
+    // comment in the handler).
+    console.error(`Batch of ${events.length} event(s) not delivered (transient failure or Lambda deadline) — ` +
+        'the invocation will be redelivered');
+    return { outcome: 'failed' };
 }
 
 /** Retry-After in delta-seconds or HTTP-date form → ms, or null. */
@@ -458,6 +795,10 @@ function parseRetryAfter(value) {
     const at = Date.parse(value);
     return Number.isNaN(at) ? null : Math.max(0, at - Date.now());
 }
+
+// Enough of a response to read the per-event errors of a 1000-event batch
+// without buffering an unbounded body.
+const MAX_RESPONSE_BYTES = 262144;
 
 function doPost(url, body, timeoutMs) {
     return new Promise((resolve, reject) => {
@@ -482,7 +823,7 @@ function doPost(url, body, timeoutMs) {
         const transport = parsedUrl.protocol === 'https:' ? https : http;
         const req = transport.request(options, (res) => {
             let resBody = '';
-            res.on('data', (chunk) => { if (resBody.length < 2000) resBody += chunk; });
+            res.on('data', (chunk) => { if (resBody.length < MAX_RESPONSE_BYTES) resBody += chunk; });
             res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: resBody }));
         });
 
@@ -497,17 +838,26 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// NOTE: a previous version assigned exports.handler and then replaced
-// module.exports wholesale, so `index.handler` was undefined at runtime.
+// `Handler: index.handler` (template.yaml) resolves against module.exports,
+// so `handler` MUST be a property of whatever is assigned here. An earlier
+// version set exports.handler and then replaced module.exports wholesale,
+// which left index.handler undefined at runtime.
 module.exports = {
     handler,
     parseAccessLog,
     detectMcpToolCall,
     buildUsageEvent,
     resolveMetricName,
+    resolveCustomerId,
     parseMetricMappings,
     isPermanentRejection,
     parseRetryAfter,
+    countRejectedEvents,
     normalizeProductType,
+    normalizeCustomerIdSource,
+    extractAgenticTraceId,
+    outcomeFromStatus,
+    parseStatusOutcomes,
+    parseStatusCodeList,
     FLUSH_COUNT,
 };

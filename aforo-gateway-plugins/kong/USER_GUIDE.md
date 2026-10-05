@@ -1,6 +1,6 @@
 # kong-plugin-aforo-metering — User Guide
 
-**Version:** 2.1.0 · **Updated:** 2026-10-01 · **Audience:** engineers running Kong Gateway (OSS or Enterprise) who want API usage metered into Aforo.
+**Version:** 2.2.0 · **Updated:** 2026-10-02 · **Audience:** engineers running Kong Gateway (OSS or Enterprise) who want API usage metered into Aforo.
 
 ## What you'll build
 
@@ -21,10 +21,10 @@ Not yet on LuaRocks, so build it from the rockspec in this folder:
 git clone https://github.com/aforoai/SDKs.git
 cd SDKs/aforo-gateway-plugins/kong
 luarocks install lua-resty-http
-luarocks make kong-plugin-aforo-metering-2.1.0-1.rockspec
+luarocks make kong-plugin-aforo-metering-2.2.0-1.rockspec
 ```
 
-`luarocks make` reads `kong-plugin-aforo-metering-2.1.0-1.rockspec` and installs the `handler`, `schema`, `rate-limit-enforce`, `margin-guard`, `preflight-quota` and `compound-metering` modules under `kong.plugins.aforo-metering.*`.
+`luarocks make` reads `kong-plugin-aforo-metering-2.2.0-1.rockspec` and installs the `handler`, `schema`, `rate-limit-enforce`, `margin-guard`, `preflight-quota` and `compound-metering` modules under `kong.plugins.aforo-metering.*`.
 
 Two things that will bite you if you skip them:
 
@@ -67,13 +67,15 @@ docker run -d --name kong --network=kong-net \
   -p 8000:8000 -p 8001:8001 kong-aforo:3.4
 ```
 
-Still based on `kong-aforo:3.4`, because the mount only replaces the plugin — `lua-resty-jwt` still has to come from the image.
+Still based on `kong-aforo:3.4`, because the mount only replaces the plugin; `lua-resty-http` still has to come from the image.
 
 ## Choosing what each endpoint bills as
 
-The plugin's legacy default, `metric_name_pattern = "{method} {path}"`, produces one
-metric per endpoint — `GET /api/products`, `POST /api/sms/v2/send`. Aforo rejects any
-metric not registered in the catalog, so out of the box every event fails.
+Out of the box every event is sent as `default_metric` (`api_calls`), which must exist in
+your catalog. The old default template, `metric_name_pattern = "{method} {path}"`, produced
+one metric per endpoint (`GET /api/products`, `POST /api/sms/v2/send`); the ingestor refuses
+any metric that is not in the catalog, so the template is now used only when you set it to
+something else.
 
 Registering one metric per endpoint is not the fix. It makes the catalog track URL
 structure instead of business meaning, puts a line item per endpoint on the invoice, and
@@ -127,11 +129,22 @@ Configurable via `metric_header` / `quantity_header`; set either to empty to dis
 ### Resolution order
 
 1. `metric_header` from the upstream response
-2. first matching `metric_mappings` rule
-3. `metric_name_pattern`, only if explicitly set to something other than the default
-4. `default_metric`
+2. first matching rule fetched from `mappings_url` (EXACT / PREFIX / CONTAINS on the path)
+3. first matching `metric_mappings` rule
+4. `metric_name_pattern`, only if set to something other than `{method} {path}` (a fixed name such as `platform_api_calls`, or a template)
+5. `default_metric`
 
 Existing deployments that set a custom `metric_name_pattern` keep working unchanged.
+
+MCP, gRPC, GraphQL and WebSocket events use fixed metric names (`mcp_server.tool_invocations`, `grpc_api.rpc_calls`, `graphql_api.operations`, `websocket_api.connection_opened`); the mappings apply to plain HTTP events.
+
+### Fetching the rules from Aforo
+
+Set `mappings_url` to your catalog's gateway-mappings endpoint and the plugin reads the rules you declared on each metric, so a new metric needs no gateway change. The fetch runs in a background timer with `mappings_timeout_ms` (3 s); requests only read the cached table. One worker fetches at a time, a failed fetch is retried after `mappings_refresh_seconds`, and the last good table keeps being used.
+
+### What happens to a metric name Aforo does not know
+
+The plugin cannot see your catalog. A name that is blank or longer than 255 characters is dropped at the gateway (`invalid_metric`). A well-formed name that is not a catalog metric is sent, refused by the ingestor for that event only, and counted as `ingestor_rejected` with the ingestor's message in the Kong log. Neither is retried. Watch `aforo_dropped:ingestor_rejected` after changing mappings.
 
 ## Step 2 — Register the plugin and the shared buffer
 
@@ -182,22 +195,53 @@ plugins:
 
 ## Step 4 — Attach a customer identity
 
-`customer_id_source` is `consumer` and accepts only that. To attribute usage to a customer, bind a Kong consumer to the request credential (key-auth, JWT, etc.) so `kong.client.get_consumer()` resolves. Example with key-auth:
+A request with no verified customer produces no event. Pick the model that matches how the route authenticates.
+
+### A. Kong consumers (key-auth, basic-auth, …)
+
+Nothing to configure. Bind a consumer to the credential:
 
 ```bash
-# Create a consumer and a key
 curl -X POST http://localhost:8001/consumers --data "username=acme-corp" --data "custom_id=cust_acme"
 curl -X POST http://localhost:8001/consumers/acme-corp/key-auth --data "key=acme-secret-key"
-
-# Enable key-auth on the same service
 curl -X POST http://localhost:8001/services/my-service/plugins --data "name=key-auth"
 ```
 
-The event's `customerId` becomes the consumer's `custom_id` (`cust_acme`), falling back to `username`, then `id`.
+`customerId` is the consumer's `custom_id` (`cust_acme`), else `username`, else `id`.
 
-> ⚠ If neither a JWT claim nor a Kong consumer resolves, `customerId` is `nil`. The event still buffers, but Aforo's ingestor rejects events without a `customerId` at schema validation. Bind a consumer (or enable JWT validation) before relying on the data.
+### B. Kong's `jwt` plugin verifies the token (`customer_id_jwt_claim`)
 
-To use a validated JWT claim instead, set `config.jwt_validation_enabled=true` and `config.jwt_issuer`; when present, the JWT's `customer_id` claim wins over the consumer identity. See the Configuration reference for the JWT options.
+Use this when the route already carries Kong's `jwt` plugin and one issuer signs tokens for every caller. On such a route the Kong consumer is the issuer, so billing by consumer would bill all callers as one customer.
+
+```yaml
+config:
+  customer_id_jwt_claim: tenant_id
+  customer_id_jwt_exclude_claims: [impersonated_by]   # optional: tokens not to meter
+```
+
+The claim is read from the token Kong's `jwt` plugin stored after verifying the signature. The `Authorization` header is never parsed. In this mode the claim is the only source: no verified token, or no such claim, means no event.
+
+### C. This plugin verifies an Aforo JWT (`jwt_validation_enabled`)
+
+Use this when no Kong auth plugin is on the route and callers present an Aforo-issued RS256 token.
+
+```yaml
+config:
+  jwt_validation_enabled: true
+  jwt_issuer: https://auth.aforo.ai
+  jwt_public_key: |
+    -----BEGIN PUBLIC KEY-----
+    ...
+    -----END PUBLIC KEY-----
+```
+
+In the access phase the plugin checks, in order: the token is RS256, the signature verifies against `jwt_public_key`, `exp` (required) and `nbf`, `iss`, then revocation. A failure answers 401. `customerId` is the token's `customer_id` claim (else `sub`); if the token names neither, the Kong consumer is used.
+
+> ⚠ `jwt_jwks_uri` is accepted and not used: there is no JWKS fetch. Without `jwt_public_key` every token is rejected. For rotating keys use model B.
+
+> ⚠ `jwt_allow_unverified_signature: true` lets a token through when the plugin has no key to verify it with. Since 2.2.0 that token grants access only. Its claims are not used for `customerId` or `keyId` unless Kong's `jwt` plugin verified the same token. If you relied on this flag for identity, move to model B.
+
+If you configure both B and C, B decides the customer.
 
 ## Step 5 — Send a request and trigger a flush
 
@@ -229,14 +273,16 @@ A successful flush logs:
 [aforo-metering] Flushed 1 events to Aforo (status=200)
 ```
 
-A failure logs the attempt count and dropped-event count:
+A refused batch logs the status and the ingestor's answer, and is not retried:
 
 ```
 [aforo-metering] Flush attempt 1/3 failed (status=401, err=none)
-[aforo-metering] All 3 flush attempts failed. 1 events dropped.
+[aforo-metering] Ingestor rejected the batch with 401 -- dropping 1 event(s) rather than retrying them forever.
 ```
 
-Then confirm the event under the matching customer + metric in your Aforo usage view. The metric name follows `metric_name_pattern` — by default `GET /my-service/anything`.
+A transient failure (network, 5xx, 408, 429) is retried up to three times, honouring `Retry-After` on 429 up to 30 seconds, then the batch goes back into the buffer for the next flush with the same idempotency keys.
+
+Then confirm the event under the matching customer + metric in your Aforo usage view. The metric is `api_calls` unless a mapping or `metric_name_pattern` says otherwise.
 
 ## Step 7 (optional) — Turn on MCP tool-invocation metering
 
@@ -250,7 +296,7 @@ curl -X PATCH http://localhost:8001/services/my-service/plugins/<plugin-id> \
 
 The log phase parses POST bodies, and any JSON-RPC `2.0` request with `method: "tools/call"` emits a `mcp_server.tool_invocations` event carrying `toolName`, `sessionId` (from `Mcp-Session-Id`), and `executionStatus`.
 
-> ⚠ `agentId` is taken from the JSON-RPC payload at `params._meta.agent_id` only. The plugin will not read an `X-Agent-Id` request header for the agent — that path was removed in 2.0.0 because the header is client-settable.
+`agentId` is read from the JSON-RPC payload at `params._meta.agent_id`, else from the `X-Agent-Id` request header. Both are supplied by the caller. A tool call with no agent id is sent with the configured `product_type` instead of `MCP_SERVER`, which requires one.
 
 ## Configuration reference
 
@@ -262,14 +308,17 @@ See the full option table in [README.md](README.md#configuration). The three you
 |---------|-------|-----|
 | `Shared dict 'aforo_buffer' not available` in logs, no events sent | The `aforo_buffer` shared dict was never declared | Add `nginx_http_lua_shared_dict = aforo_buffer 10m` to `kong.conf` and `kong reload`. |
 | Events buffer but never flush | `flush_count` not reached and `flush_interval_ms` not yet elapsed | Wait for the interval, lower `flush_count` to 1 for testing, or send more traffic. |
-| Flush logs `status=401` | Wrong `api_key` or `tenant_id` | Re-check the Aforo API key and tenant; both are sent on the flush (`X-API-Key` + `X-Tenant-Id`). |
-| Events land in Aforo with empty/missing customer | No Kong consumer bound and no JWT claim | Add an auth plugin (key-auth/JWT) with a consumer, or enable `jwt_validation_enabled`. |
-| `lua-resty-jwt not found; RS256 signature NOT verified` warning | `jwt_validation_enabled=true` but the lib isn't installed | `luarocks install lua-resty-jwt`, or use Kong Enterprise's native JWT plugin and leave validation off here. Claims checks (exp/iss/jti/revocation) still run regardless. |
-| `All 3 flush attempts failed. N events dropped.` | Ingestor unreachable or returning 5xx for the full retry window | Check `aforo_endpoint` reachability and Aforo status; these events are not re-queued after the third attempt. |
-| Health-check requests show up as billed usage | Path not excluded | They shouldn't — `/health`, `/ready`, `/metrics` are excluded by default. Add yours to `exclude_paths`. |
+| Flush logs `status=401` or `403` | Wrong `api_key`, or the key lacks `usage:ingest` | Re-check the Aforo API key. It is sent as `X-API-Key`. |
+| No events for a route, log says `no verified customer identity` (debug level) | No identity model resolved | See Step 4. With `customer_id_jwt_claim`, confirm Kong's `jwt` plugin runs on the route and the token carries the claim. |
+| 401 `INVALID_SIGNATURE` with `jwt_validation_enabled` | `jwt_public_key` missing, not the issuer's key, or a private key | Set the issuer's PEM public key. `jwt_jwks_uri` alone verifies nothing. |
+| 401 `UNSUPPORTED_ALGORITHM` | Token is not RS256 | Issue RS256 tokens, or verify with Kong's `jwt` plugin and use `customer_id_jwt_claim`. |
+| `Ingestor refused N of M event(s) in an accepted batch` | Usually a metric name that is not in the catalog | Fix `metric_mappings` / `default_metric` / `metric_name_pattern`; add the metric in Aforo. |
+| `All flush attempts failed. N events re-buffered` | Ingestor unreachable or returning 5xx | Check `aforo_endpoint` reachability. Events stay buffered (up to 10,000) and are retried. |
+| Health-check requests show up as billed usage | Path not excluded | `/health`, `/ready`, `/metrics` are excluded by default; a configured `exclude_paths` replaces that list, so include them again. |
 
 ## What this guide does NOT cover
 
 - **The rate-limit and margin-guard access-phase modules** (`rate-limit-enforce.lua`, `margin-guard.lua`, `preflight-quota.lua`) ship in this folder and are wired into the handler, but their Redis policy schema and pricing-service contract are documented with the Aforo platform, not here. This guide covers metering.
-- **Full RS256 verification setup** with a JWKS fetcher — the handler supports a `jwt_public_key` PEM and a `jwt_jwks_uri`, but production key rotation/fetching is an integration you wire with `lua-resty-jwt` or Kong Enterprise. See the inline notes in `handler.lua`.
-- **Guaranteed delivery.** This is fire-and-forget metering. For exactly-once accounting, reconcile against your upstream's own logs.
+- **JWKS and key rotation.** In-plugin verification takes one PEM key. Rotating keys belong to Kong's `jwt` plugin (model B).
+- **A real Kong run of this release.** The unit suite runs against mocks of the Kong PDK; the Docker image in this folder has not been exercised against a live ingestor for 2.2.0.
+- **Guaranteed delivery.** Events are buffered in shared memory and lost on a Kong restart. For exactly-once accounting, reconcile against your upstream's own logs.

@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<!-- Sends the usage event payload to the Aforo ingestor service.
-     Uses ServiceCallout with continueOnError=true so API response
-     is never impacted by metering failures. Runs only when
-     aforo-metering.js set aforo.sendEvent = "true" (see sharedflows/default.xml). -->
+<!-- Sends the usage event to the Aforo ingestor.
+     This runs before the client gets its response, so the wait is bounded:
+     1 s to connect, 2 s for the response. Apigee accepts only literal
+     values here (no flow variables), so the timeouts cannot be read from
+     the KVM. continueOnError=true: a failed send never fails the API call. -->
 <ServiceCallout name="AforoMeteringSendEvent" continueOnError="true">
     <DisplayName>Aforo Metering - Send Event to Ingestor</DisplayName>
     <Request variable="aforo.calloutRequest">
@@ -11,19 +12,23 @@
             <Payload contentType="application/json">{aforo.eventPayload}</Payload>
             <Headers>
                 <Header name="Content-Type">application/json</Header>
-                <!-- X-API-Key ALONE: the ingestor's ApiKeyAuthFilter reads only this
-                     header; Authorization: Bearer is parsed as a JWT and rejected
-                     401. The tenant comes from the key, so no X-Tenant-Id. -->
+                <!-- X-API-Key alone. The ingestor takes the tenant from the
+                     key: no Authorization header, no X-Tenant-Id. -->
                 <Header name="X-API-Key">{private.aforo.apiKey}</Header>
             </Headers>
         </Set>
     </Request>
     <Response>aforo.calloutResponse</Response>
     <HTTPTargetConnection>
-        <URL>{aforo.endpoint}</URL>
+        <URL>{private.aforo.endpoint}</URL>
         <Properties>
-            <Property name="connect.timeout.millis">5000</Property>
-            <Property name="io.timeout.millis">10000</Property>
+            <Property name="connect.timeout.millis">1000</Property>
+            <Property name="io.timeout.millis">2000</Property>
+            <!-- 4xx counts as policy SUCCESS, so servicecallout.<name>.failed
+                 is true only for a transport error or a 5xx. The retry gate
+                 (aforo-metering-retry-gate.js) retries only those; a 4xx is
+                 never re-sent. -->
+            <Property name="success.codes">1xx,2xx,3xx,4xx</Property>
         </Properties>
     </HTTPTargetConnection>
 </ServiceCallout>

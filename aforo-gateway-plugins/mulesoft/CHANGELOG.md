@@ -4,6 +4,57 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-10-02
+
+Merge of the two lines of work on this policy: the installable Mule 4 package from the working repository and the 2.1.0 ingestor-contract fixes from the public mirror (mirror work by Gowtham and Eswar).
+
+### From the working repository
+- The policy is an installable Mule 4 package, `aforo-metering/` (`pom.xml` with packaging `mule-policy`, `aforo-metering.yaml`, `src/main/mule/template.xml`, `mule-artifact.json`). It replaces the root `mule-policy.yaml` and `template.xml`, which 2.1.0 marked as not deployable. Both files are gone.
+- Customer id from `authentication.properties.claims` (MuleSoft's JWT Validation policy), with `customer-id-claim` and `tenant-id-claim`.
+- `executionStatus` on every event from the shared outcome table, with `status-outcomes` overrides (last entry for a code wins).
+- `exclude-status-codes` (default `401,403,429`) and `exclude-paths` (default `/health,/ready,/metrics`); a value replaces the default, `none` meters everything.
+- Idempotency key minted once per request, before the flow; up to three delivery attempts send the same bytes. The MCP key has no clock in it.
+- AGENTIC_API classification from `traceparent` / `x-trace-id`.
+- `tests/policy.test.cjs` (178 structural checks) and the `mulesoft-policy` CI workflow that builds the jar.
+
+### From the mirror (2.1.0), ported into the package
+- `product-type`: `productType` on every event, trimmed and upper-cased, default `API`. An MCP `tools/call` is `MCP_SERVER` only when the body names an agent; otherwise it keeps the configured type.
+- `occurredAt` is shifted to UTC before it is formatted with a literal `Z`.
+- No event for `OPTIONS`, for a customer id over 64 characters, or for quantity 0.
+- `metricName` defaults to `api_calls` instead of `{method} {path}` (`default-metric`).
+- `X-API-Key` is the only credential header. The package no longer sends `X-Tenant-Id` to the ingestor.
+
+### Added in this release
+- `metric-mappings`: `KIND|value|metricName` rules separated by `;` (`EXACT`, `PREFIX`, `CONTAINS`), first match wins, then `default-metric`. Same rule format as the Azure APIM Named Value.
+- `default-metric` accepts `{method}` and `{path}`.
+- `quantity-source` (`request_count` / `response_size`) and `include-metadata` are policy properties. `response_size` reads the response `Content-Length`; the body is not read.
+- A 408 from the ingestor is retried, like a 429 and a 5xx. Any other 4xx is logged at WARN with the response body and not retried.
+- A metric name that is empty or longer than 255 characters is not sent (WARN). Other skipped requests log `not metered: <reason>` at DEBUG.
+- `vars.aforo.customerId` / `vars.aforo.tenantId` (the 2.1.0 identity source) are read when the verified claims name no customer.
+
+### Deprecated aliases
+Read only when the canonical property is empty.
+
+| Canonical | Alias (2.1.0 `template.xml` placeholder) |
+|---|---|
+| `product-type` | `product_type` |
+| `default-metric` | `default_metric` |
+| `quantity-source` | `quantity_source` |
+| `include-metadata` | `include_metadata` |
+
+`${api_key}` and `${aforo_endpoint}` have no alias: `aforo-api-key` and `aforo-endpoint` are required, so an alias could never be read.
+
+### What a 2.1.0 or package-1.0.0 user will notice
+- Package 1.0.0 sent `metricName: "GET /v1/accounts/123"`. 2.2.0 sends `api_calls`. Set `default-metric` to `{method} {path}` to keep the old name.
+- Package 1.0.0 sent no `productType` on standard events. 2.2.0 sends `API` (or `product-type`).
+- An MCP `tools/call` without `params._meta.agent_id` is no longer sent as `MCP_SERVER`.
+- `OPTIONS` requests are no longer metered.
+- The Maven version is 2.2.0 (was 1.0.0), so the jar is `aforo-metering-2.2.0-mule-policy.jar`. An Exchange that holds 1.0.0 accepts 2.2.0 as a new version.
+- `Retry-After` is not read: the wait between attempts stays at one second.
+
+### Not run
+- Nothing here has been applied on a Mule runtime. `mvn clean package` assembles the jar and `tests/policy.test.cjs` checks structure; neither evaluates DataWeave. Run `tests/policy-contract.md` on a test API first.
+
 ## [2.1.0] — 2026-10-01
 
 ### Added

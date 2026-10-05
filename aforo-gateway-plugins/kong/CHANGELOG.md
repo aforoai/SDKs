@@ -2,9 +2,52 @@
 
 Format: [Keep a Changelog](https://keepachangelog.com). Versioning: [SemVer](https://semver.org).
 
-This plugin ships on the Aforo gateway-plugins line; the whole repo is versioned and tagged together. Entries below are the Kong-specific slice of each repo release (see the parent `aforo-gateway-plugins/CHANGELOG.md` for the cross-plugin picture).
+The Kong plugin has one version: the rockspec's. `handler.lua`'s `VERSION` constant carries the same number. Releases are tagged `kong-vX.Y.Z`.
 
 ## [Unreleased]
+
+## [2.2.0] — 2026-10-02
+
+Merges two lines that had diverged since 2026-06-29: the public 2.1.0 release (Gowtham and Eswar) and the internal handler line 1.4.0–1.4.4. Every config key of either line is still accepted.
+
+### Version
+- One version from here on. The internal `handler.lua` `VERSION` 1.4.4 is retired; the constant is now `2.2.0`, equal to the rockspec.
+- One rockspec, `kong-plugin-aforo-metering-2.2.0-1.rockspec`, listing all six modules. `2.0.4-1` and `2.1.0-1` are removed.
+
+### From the internal line (new to 2.1.0 users)
+- `customer_id_jwt_claim` + `customer_id_jwt_exclude_claims`: customer from a claim of the JWT Kong's `jwt` plugin verified.
+- `executionStatus` on every event from the shared status table, `status_outcomes` overrides, gRPC `grpc-status` mapping.
+- `grpc_enabled`, `graphql_enabled`, `websocket_enabled` detection (off by default).
+- AGENTIC_API classification when a trace id is present.
+- Drop counters (`aforo_dropped:<reason>`, optional Prometheus counter).
+- Idempotency keys never contain a clock. The 2.1.0 MCP key ended in `ngx.now()`.
+
+### From 2.1.0 (new to internal-line users)
+- In-plugin RS256 verification through `resty.openssl`, fail-closed. The internal line returned "valid" when `lua-resty-jwt` or `jwt_public_key` was missing.
+- `metric_mappings`, `mappings_url`, `default_metric`, `metric_header`, `quantity_header`.
+- Atomic shared-dict list buffer; batches of at most 1000; transient failures re-buffered; permanent 4xx dropped; `Retry-After` honoured on 429 (30 s cap, in the flush timer).
+- CORS preflights not metered; quantity ≤ 0 skipped; per-product-type required fields.
+- `preflight_quota_*` wired into the access phase; sibling modules resolve under `kong.plugins.aforo-metering.*`.
+
+### Changed
+- **Identity selection.** `customer_id_jwt_claim`, when set, is the only source. Otherwise the claim of the token this plugin verified, then the Kong consumer. 2.1.0 behaviour is unchanged for configs without `customer_id_jwt_claim`.
+- **`jwt_allow_unverified_signature` no longer supplies identity.** A token let through without verification grants access only; its claims are not used for `customerId` or `keyId` unless Kong's `jwt` plugin verified the same token. A throttled warning is logged. Move to `customer_id_jwt_claim`.
+- **Default metric.** Internal-line configs that left `metric_name_pattern` at `{method} {path}` now send `default_metric` (`api_calls`). Set `metric_name_pattern` to any other value to keep a pattern.
+- Buffer key is `aforo:events` (a list). Events buffered under the old key at upgrade time are not sent.
+- Flush timers are single-flight per kind, and a flush that leaves events behind schedules the next one.
+
+### Security
+- JWT verifier: `alg` must be `RS256` (rejects `none` and HS256 by name); `exp` must be numeric; `nbf` checked; signature checked before any claim; 8 KB token cap; a private key in `jwt_public_key` is refused; an unparseable key never falls back to the opt-out.
+- Central mappings: cached per tenant, response capped at 1 MB / 5000 rules, failed fetches not repeated per request.
+- Customer id longer than 64 characters is not used, from any source.
+
+### Fixed
+- A metric name that is blank or longer than 255 characters is dropped and counted (`invalid_metric`) instead of failing at the ingestor.
+- Events the ingestor refuses inside an accepted batch are counted (`ingestor_rejected`) and logged with its message.
+- `{path}` in `metric_name_pattern` containing `%` no longer raises.
+
+### Deprecated
+- `metric_name_pattern` default `{method} {path}` (ignored). `jwt_jwks_uri` (accepted, unused). `jwt_allow_unverified_signature` for identity.
 
 ## [2.1.0] — 2026-10-01
 
