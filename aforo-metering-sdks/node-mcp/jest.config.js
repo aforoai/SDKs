@@ -1,7 +1,6 @@
-/** @type {import('jest').Config} */
+/** Jest config for @aforoai/mcp-metering (ts-jest). */
 module.exports = {
   preset: 'ts-jest',
   testEnvironment: 'node',
-  roots: ['<rootDir>/tests'],
-  testMatch: ['**/*.test.ts'],
+  testMatch: ['**/tests/**/*.test.ts'],
 };

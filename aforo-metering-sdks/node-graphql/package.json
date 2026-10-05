@@ -1,6 +1,6 @@
 {
   "name": "@aforoai/graphql-metering",
-  "version": "1.0.0",
+  "version": "1.2.2",
   "description": "Aforo GraphQL Metering SDK — plugin + middleware that meters every GraphQL operation (query/mutation/subscription) with accurate complexity scoring and ships usage events to Aforo.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

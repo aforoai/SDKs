@@ -20,6 +20,7 @@ func testClient(t *testing.T) *AforoClient {
 		BaseURL:       "http://127.0.0.1:1",
 		FlushCount:    1000000,
 		FlushInterval: time.Hour,
+		RetryBase:     time.Millisecond,
 	})
 	t.Cleanup(func() { c.Close() })
 	return c
@@ -91,5 +92,43 @@ func TestServerConfigurableLimitsAreLeftToTheServer(t *testing.T) {
 	big.Metadata = map[string]interface{}{"blob": strings.Repeat("x", 20000)}
 	if err := c.Track(big); err != nil {
 		t.Fatalf("large metadata is the server's call, got %v", err)
+	}
+}
+
+// The server's @Size counts characters, not bytes: a 64-character multi-byte
+// customer id is 128 bytes and must still be accepted.
+func TestLengthLimitsCountCharactersNotBytes(t *testing.T) {
+	c := testClient(t)
+	ev := validEvent()
+	ev.CustomerID = strings.Repeat("é", 64)
+	if err := c.Track(ev); err != nil {
+		t.Fatalf("64 multi-byte characters should be accepted, got %v", err)
+	}
+	ev.CustomerID = strings.Repeat("é", 65)
+	if err := c.Track(ev); !errors.Is(err, ErrInvalidEvent) {
+		t.Fatalf("65 characters should be rejected, got %v", err)
+	}
+}
+
+// An over-limit event follows the drop-observability shape as well as
+// returning ErrInvalidEvent.
+func TestOverLimitEventIsCountedAndHandedToOnDrop(t *testing.T) {
+	var got []DropReason
+	c := NewClient(Options{
+		APIKey: "sk_test_limits", BaseURL: "http://127.0.0.1:1",
+		FlushInterval: time.Hour, RetryBase: time.Millisecond,
+		OnDrop: func(_ []TrackEvent, r DropReason) { got = append(got, r) },
+	})
+	t.Cleanup(func() { c.Close() })
+	over := validEvent()
+	over.MetricName = strings.Repeat("m", 256)
+	if err := c.Track(over); !errors.Is(err, ErrInvalidEvent) {
+		t.Fatalf("want ErrInvalidEvent, got %v", err)
+	}
+	if c.DroppedCount() != 1 || c.BufferedCount() != 0 {
+		t.Errorf("DroppedCount=%d BufferedCount=%d, want 1 and 0", c.DroppedCount(), c.BufferedCount())
+	}
+	if len(got) != 1 || got[0] != DropInvalid {
+		t.Errorf("OnDrop reasons = %v, want [invalid]", got)
 	}
 }

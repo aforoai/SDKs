@@ -2,7 +2,7 @@
 
 Meter MQTT client traffic — PUBLISH, SUBSCRIBE, CONNECT, DISCONNECT — from any Java MQTT client. Call one method per primitive from your Eclipse Paho (or other client) callbacks and Aforo handles batching and retry. For broker-side metering on EMQ X 5.x, use the companion Erlang plugin instead.
 
-**Version:** 1.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 1.2.2 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -12,7 +12,7 @@ Intended (once published to Maven Central):
 <dependency>
   <groupId>ai.aforo</groupId>
   <artifactId>mqtt-metering</artifactId>
-  <version>1.0.0</version>
+  <version>1.2.2</version>
 </dependency>
 ```
 
@@ -105,6 +105,40 @@ Every event carries `mqttQos` (0/1/2) and `mqttRetained`. Use them in descriptor
 ## Walk me through it
 
 Step-by-step from zero to a verified event in Aforo: see [USER_GUIDE.md](USER_GUIDE.md).
+
+## Execution status (outcome-based pricing)
+
+OUTCOME_BASED rate plans bill each event at the weight set for its `executionStatus`. This SDK never derives one — only the value you pass is sent. Every `record*` method has an overload with a trailing `executionStatus` argument:
+
+```java
+billing.recordPublish(customerId, clientId, topic, qos, retained, bytes, "SUCCESS");
+billing.recordConnect(customerId, clientId, "BLOCKED");   // e.g. broker refused the CONNECT
+```
+
+The value is trimmed and upper-cased; `null` or blank means "not set" and the field is left off the event. Accepted values: `SUCCESS`, `PARTIAL`, `TIMEOUT`, `ERROR`, `VALIDATION_FAILED`, `FAILED`, `FAILURE`, `CANCELLED`, `PENDING`, `BLOCKED`, `HITL_REQUIRED`. Any other value is logged and left off the event (the event is still sent) — the ingestor would reject an event carrying an unknown status.
+
+## Dropped events
+
+Events the SDK cannot deliver are counted, logged at `WARNING`, and passed to an optional hook. Nothing is thrown from the `record*` / `openConnection` calls for event content.
+
+```java
+AforoMqttBilling billing = AforoMqttBilling.newBuilder()
+        // ...
+        .onDrop((events, reason) -> deadLetter.save(events, reason))
+        .build();
+
+long lost = billing.droppedCount();
+```
+
+| `DropReason` | When |
+|---|---|
+| `RETRY_EXHAUSTED` | The batch failed all 3 attempts (network error, 5xx, 408, 429). |
+| `REJECTED` | The ingestor answered a non-retryable 4xx for the batch, or accepted the batch (2xx) but refused individual events in `errors[]`. Only the events the response identifies by index are passed to the hook. |
+| `INVALID` | The event breaks an ingestor field limit and was never sent: a blank `customerId`, a blank or whitespace-only topic, `customerId` over 64 characters, `productType` over 20. These values are never truncated. |
+
+The topic and client id originate from the MQTT packet: a topic over 500 characters or a `clientId` over 128 is cut to the limit on `mqttTopic` / `mqttClientId` and the event is still sent, with one `WARNING` per label per instance.
+
+Dropped events keep their `idempotencyKey`, so storing them and re-sending later is dedup-safe. An exception thrown by the hook is swallowed.
 
 ## What this doesn't cover
 

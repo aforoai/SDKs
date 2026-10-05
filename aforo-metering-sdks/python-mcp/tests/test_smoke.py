@@ -113,7 +113,7 @@ def test_killed_session_from_heartbeat_response_stops_session_and_calls_back():
         billing = AforoMcpBilling(**dict(CFG, on_session_killed=lambda sid, why: killed.append((sid, why))))
 
         async def fake_post(url, headers, body):
-            return 202, json.dumps({"accepted": 0, "killedSessionIds": ["sess_1"]})
+            return 202, json.dumps({"success": True, "data": {"accepted": 0, "killedSessionIds": ["sess_1"]}})
 
         billing._do_post_with_body = fake_post
         await billing.start_session("sess_1")
@@ -151,18 +151,66 @@ def test_product_type_option_and_per_call_override():
     asyncio.run(scenario())
 
 
-def test_invalid_invocations_dropped_via_on_error_and_fields_capped():
-    errors = []
-    billing = AforoMcpBilling(**dict(CFG, on_error=errors.append))
-    billing.record_tool_invocation("", "agent_1")
-    billing.record_tool_invocation("t", "x" * 65)
-    assert len(billing._buffer) == 0 and len(errors) == 2
-    billing.record_tool_invocation("t" * 80, "a" * 50)
+def test_invalid_invocations_are_dropped_as_invalid_never_truncated(caplog):
+    drops = []
+    billing = AforoMcpBilling(**dict(CFG, on_drop=lambda evs, reason: drops.append((evs, reason))))
+    with caplog.at_level("WARNING", logger="aforo_mcp_metering"):
+        billing.record_tool_invocation("", "agent_1")          # blank tool name
+        billing.record_tool_invocation("t", "a" * 37)          # agentId > 36
+        billing.record_tool_invocation("t", "agent_1", session_id="s" * 65)
+    assert len(billing._buffer) == 0
+    assert billing.dropped_count == 3
+    assert [reason for _, reason in drops] == ["invalid"] * 3
+    assert all(len(evs) == 1 and evs[0]["idempotencyKey"] for evs, _ in drops)
+    assert "toolName is required" in caplog.text  # first occurrence logged, rest throttled
+
+    billing.record_tool_invocation("t" * 64, "a" * 36, session_id="s" * 64)
     billing.record_tool_invocation("t", None)
     ev, ev2 = billing._buffer
     assert len(ev["toolName"]) == 64 and len(ev["agentId"]) == 36
-    assert ev["customerId"] == "a" * 50
+    assert ev["metadata"]["sdkVersion"] == "1.3.2"
     assert ev2["agentId"] == "unknown"
+    assert billing.dropped_count == 3
+
+
+def test_unknown_execution_status_is_left_off_and_event_still_buffered():
+    billing = AforoMcpBilling(**CFG)
+    billing.record_tool_invocation("t", "agent_1", execution_status="bogus")
+    billing.record_tool_invocation("t", "agent_1", execution_status=" timeout ")
+    assert "executionStatus" not in billing._buffer[0]
+    assert billing._buffer[1]["executionStatus"] == "TIMEOUT"
+    assert billing.dropped_count == 0
+
+
+def test_partial_rejection_drops_only_the_named_events_and_failed_heartbeat_is_no_drop():
+    async def scenario():
+        drops = []
+        billing = AforoMcpBilling(**dict(CFG, on_drop=lambda evs, reason: drops.append((evs, reason))))
+        responses = [
+            (202, json.dumps({"success": True, "data": {"accepted": 2, "failed": 1, "errors": [{"index": 1, "message": "unknown metric"}]}})),
+            (202, json.dumps({"accepted": 1, "failed": 1})),
+            (500, ""),
+        ]
+
+        async def fake_post(url, headers, body):
+            return responses.pop(0)
+
+        billing._do_post_with_body = fake_post
+        for tool in ("a", "b", "c"):
+            billing.record_tool_invocation(tool, "agent_1")
+        await billing.flush()
+        assert billing.dropped_count == 1
+        assert [(e["toolName"], r) for evs, r in drops for e in evs] == [("b", "rejected")]
+
+        billing.record_tool_invocation("d", "agent_1")
+        billing.record_tool_invocation("e", "agent_1")
+        await billing.flush()
+        assert billing.dropped_count == 2 and len(drops) == 1  # counted, no event named
+
+        await billing._send_heartbeat("sess_1", "HEARTBEAT")  # 500: not a usage drop
+        assert billing.dropped_count == 2 and len(drops) == 1
+
+    asyncio.run(scenario())
 
 
 def test_retry_rules_408_429_retry_after_and_errors_message():
@@ -187,6 +235,7 @@ def test_retry_rules_408_429_retry_after_and_errors_message():
         await billing.flush()
         assert len(calls) == 1
         assert "unknown metric" in str(errors[0])
+        assert billing.dropped_count == 1  # non-retryable 4xx -> "rejected"
 
     asyncio.run(scenario())
 

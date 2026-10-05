@@ -1,6 +1,6 @@
 # @aforoai/graphql-metering — User Guide
 
-**Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** Node.js engineers running a GraphQL server (Apollo Server 4, `graphql-http`, or `express-graphql`) who need per-operation usage metered into Aforo.
+**Version:** 1.2.2 · **Updated:** 2026-10-01 · **Audience:** Node.js engineers running a GraphQL server (Apollo Server 4, `graphql-http`, or `express-graphql`) who need per-operation usage metered into Aforo.
 
 ## What you'll build
 
@@ -21,7 +21,7 @@ Once published, this is one line:
 npm i @aforoai/graphql-metering graphql
 ```
 
-It isn't on npm yet. Build from source and link it:
+Install `1.2.2` or later. `1.0.0` on npm was built from an older copy of this code and lacks the fixes listed in the changelog. If `1.2.2` is not on npm yet, install from source:
 
 ```bash
 cd SDKs/aforo-metering-sdks/node-graphql
@@ -138,6 +138,11 @@ const billing = new AforoGraphQlBilling({
 });
 ```
 
+## Outcomes and dropped events
+
+- **`executionStatus`** — the outcome used by outcome-based pricing. How this SDK sets it, the accepted values and how to override it: [README → Execution status](README.md#execution-status).
+- **Dropped events** — the SDK does not throw into your resolvers or the response path for event content. Events it cannot deliver are counted in `billing.droppedCount`, logged with `console.warn`, and passed to `onDrop(events, reason)`. The three reasons (`invalid`, `rejected`, `retry_exhausted`) and what triggers each: [README → Dropped events](README.md#dropped-events).
+
 ## Configuration reference
 
 | Option | Type | Default | What it does |
@@ -152,7 +157,8 @@ const billing = new AforoGraphQlBilling({
 | `complexityScorer` | `(doc, operationName?) => { complexity, fieldCount }` | `fieldCount + 5 × maxDepth` | Replace the complexity formula. |
 | `flushCount` | `number` | `50` | Buffered events that trigger an immediate flush. |
 | `flushIntervalMs` | `number` | `5000` | Max ms before a partial batch is flushed. |
-| `onError` | `(error: Error) => void` | `console.error` | Terminal flush-failure callback. |
+| `onError` | `(error: Error) => void` | `console.error` | Called once per delivery problem: dropped or refused batch, per-event failures in a 2xx response, unusable `executionStatus`. |
+| `onDrop` | `(events, reason) => void` | none | Receives permanently dropped events with reason `invalid`, `rejected` or `retry_exhausted`. |
 
 ## Troubleshooting
 
@@ -164,6 +170,8 @@ const billing = new AforoGraphQlBilling({
 | Middleware records nothing | `express.json()` runs after `billing.middleware()`, so `req.body.query` is empty | Register `express.json()` first. |
 | Complexity is always low/0 | Custom scorer returns wrong shape, or operation has few fields | Confirm your `complexityScorer` returns `{ complexity, fieldCount }`; the default counts AST fields + 5×depth. |
 | `onError` firing repeatedly | Wrong `apiKey`/`tenantId`, or ingestor unreachable | Verify the API key and tenant id; confirm the host resolves and accepts `POST /v1/ingest/batch`. |
+| `droppedCount` rises and the warning says `invalid` | An event failed a client-side check (`customerId` longer than 64 characters or `productType` longer than 20) | Fix the value named in the warning; values you set are not truncated. (An operation name over 255 characters is cut to 255 and the event is still sent.) `onDrop` receives the event. |
+| `droppedCount` rises and the warning says `rejected` | The ingestor refused the batch (4xx) or specific events | Read the `onError` message — it carries the ingestor's `errors[].message`. |
 
 ## What this guide does NOT cover
 

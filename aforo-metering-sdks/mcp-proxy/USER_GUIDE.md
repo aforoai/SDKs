@@ -1,6 +1,6 @@
 # @aforoai/mcp-proxy — User Guide
 
-**Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** operators metering an MCP server they don't own the source of — stdio (Claude Desktop / Cursor), SSE, or Streamable HTTP.
+**Version:** 1.2.2 · **Updated:** 2026-10-01 · **Audience:** operators metering an MCP server they don't own the source of — stdio (Claude Desktop / Cursor), SSE, or Streamable HTTP.
 
 ## What you'll build
 
@@ -20,7 +20,7 @@ Public install (once published):
 npm i -g @aforoai/mcp-proxy
 ```
 
-Not on npm yet, so install from source for now:
+Install `1.2.2` or later. `1.0.0` on npm was built from an older copy of this code and lacks the fixes listed in the changelog. If `1.2.2` is not on npm yet, install from source:
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
@@ -145,7 +145,7 @@ If you see that hit `/v1/ingest/batch`, the proxy is metering. Point `--ingestor
 
 ## Step 6 — (Optional) turn on quota enforcement
 
-`--quota-enforcement` adds a pre-flight `POST /api/v1/quota/check` before each `tools/call`. On `DENY` the proxy returns a JSON-RPC error (`code -32000`, "Quota exceeded") to the client and never forwards the call to the server:
+`--quota-enforcement` adds a pre-flight `POST /api/v1/quota/check` before each `tools/call`. On `DENY` the proxy returns a JSON-RPC error (`code -32000`; the message is the server's reason, and `error.data` carries `reason`, `currentUsage`, `limit`, `retryAfterMs` and `resetsAt`) to the client and never forwards the call to the server:
 
 ```bash
 aforo-mcp-proxy --transport stdio \
@@ -190,13 +190,16 @@ Precedence: **env var > CLI flag > config file > default.**
 | `upstream URL is required for SSE/HTTP transport` | sse/http mode with no `--upstream` | Add `--upstream`. |
 | Events POST to `…/v1/ingest/batch/v1/ingest/batch` (404) | `--ingestor-url` included the batch path | Pass only the base URL. |
 | Usage rolls up under `"unknown"` | Traffic carries no `_meta.agent_id` | Set `--agent-id` / `AFORO_AGENT_ID`, and `AFORO_CUSTOMER_ID` (or `_meta.customer_id`) to bill a real customer. |
-| `Flush failed — events dropped` in logs | Auth/tenant error (4xx) or retries exhausted (5xx) | Check `apiKey` + `tenantId`; non-408/429 4xx is not retried. |
+| `Events dropped` in logs, `reason: rejected` | The ingestor refused the batch (non-retryable 4xx) or some of its events; the log carries the server's message | Check `apiKey` + `tenantId`, and fix what the message names (unknown metric, bad field). |
+| `Events dropped` in logs, `reason: retry_exhausted` | The ingestor was unreachable or kept returning 5xx/408/429 for all 3 attempts | Check connectivity to `ingestorUrl`. |
+| `Tool call not metered — invalid event dropped` in logs | The call's `agentId` (> 36 chars), `customerId` (> 64) or `sessionId` (> 64) exceeds the ingestor's limit | Shorten the value at its source. The call itself is still forwarded. |
+| A failed tool call is billed as `ERROR`, a slow one as `TIMEOUT` | That is the default status mapping (see the README's "What each tool call is billed as") | Raise `AFORO_RESPONSE_TIMEOUT_MS` for long-running tools, or set `aforo.statusResolver` when embedding the proxy as a library. |
 | Quota enforcement never denies under load | The 50ms check failed open on timeout | Expected on a slow path; quota is a soft gate. Raise the limit upstream, don't rely on it for hard blocking. |
 | stdio metering misses calls | Server uses non-newline JSON-RPC framing | Confirm metering on a known tool; report the framing your server uses. |
 
 ## What this guide does NOT cover
 
 - **Hard quota blocking.** `--quota-enforcement` is a 50ms fail-open pre-flight gate, not a security wall. A timeout lets the call through.
-- **Guaranteed delivery.** A 3-attempt backoff then the batch is dropped (logged). No on-disk queue.
+- **Guaranteed delivery.** A 3-attempt backoff then the batch is dropped: counted, logged, and passed to `aforo.onDrop` when the proxy is embedded as a library. No on-disk queue.
 - **Transforming payloads or adding upstream auth.** The proxy observes and meters; it doesn't rewrite tool inputs/outputs or authenticate to the upstream server for you.
 - **Product / metric / rate-plan setup.** Done in the Aforo console.

@@ -1,18 +1,155 @@
-"""Ingest contract tests: batches go to POST /v1/ingest/batch as
-{"events": [...]} with the key only in X-API-Key, at most 1000 events per
-request, using IngestUsageEventRequest field names."""
+"""Ingest-contract guard (A+ delivery-guarantee prompt 7).
+
+Validates the OBSERVED wire request (endpoint path + body shape) against the
+shared, checked-in contract fixture at contract/ingest-contract.json — which
+is derived from the REAL usage-ingestor controllers/DTOs, never from this
+SDK's own constants. The 2026-07-05 D1 incident shipped this very SDK posting
+a batch body to a single-event endpoint; its own green suite hid 100% event
+loss because it asserted the SDK's own (wrong) constant.
+
+Also covers the transport rules shared by every variant: the key travels only
+in X-API-Key, a flush is split into requests of at most 1000 events,
+idempotency keys are reused verbatim on retry, and an event with an unusable
+customerId is dropped with reason "invalid" instead of being sent.
+"""
 
 from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import List
+from urllib.parse import urlparse
+
 from unittest import mock
 
 import pytest
 
 from aforo_ws_metering import client as mod
 from aforo_ws_metering.client import AforoWsBilling
+
+MODULE_KEY = "python-ws"
+
+FIXTURE = json.loads(
+    (Path(__file__).resolve().parents[2] / "contract" / "ingest-contract.json").read_text()
+)
+
+
+def _assert_required(obj: dict, field: str) -> None:
+    assert field in obj, f"required field '{field}' missing from wire body"
+    v = obj[field]
+    assert v is not None, f"required field '{field}' is null"
+    if isinstance(v, str):
+        assert v.strip() != "", f"required field '{field}' is blank"
+
+
+def assert_body_matches_contract(spec: dict, body) -> None:
+    """Same assertion shape in every SDK suite (all languages)."""
+    assert body is not None
+    if spec["cardinality"] == "batch-wrapped":
+        # A bare array here is the /v1/ingest/async-batch shape — wrong for this endpoint.
+        assert isinstance(body, dict), "batch body must be an object, not a bare array"
+        events = body.get(spec["batchKey"])
+        assert isinstance(events, list) and events, f"batch body must carry non-empty '{spec['batchKey']}'"
+        assert len(events) <= spec["maxEvents"]
+        for ev in events:
+            for field in spec["eventRequiredFields"]:
+                _assert_required(ev, field)
+    elif spec["cardinality"] == "single":
+        assert isinstance(body, dict)
+        for key in spec.get("forbiddenTopLevelKeys", []):
+            assert key not in body, f"single-event body must not carry '{key}'"
+        for field in spec["requiredFields"]:
+            _assert_required(body, field)
+    else:
+        raise AssertionError(f"unhandled cardinality in fixture: {spec['cardinality']}")
+
+
+class _CapturingClient:
+    """Stand-in for httpx.Client that records the POST and returns 202."""
+
+    captured: list = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def post(self, url, json=None, headers=None):
+        _CapturingClient.captured.append((url, json, headers))
+        resp = mock.MagicMock()
+        resp.status_code = 202
+        return resp
+
+
+def test_posts_to_contracted_endpoint_with_contracted_body_shape(monkeypatch):
+    sdk_entry = FIXTURE["sdks"].get(MODULE_KEY)
+    assert sdk_entry is not None, "module must be registered in the fixture"
+    endpoint = sdk_entry["endpoint"]
+    spec = FIXTURE["endpoints"][endpoint]
+
+    _CapturingClient.captured = []
+    monkeypatch.setattr(mod, "HAS_HTTPX", True, raising=False)
+    monkeypatch.setattr(mod.httpx, "Client", _CapturingClient)
+
+    billing = AforoWsBilling(
+        tenant_id="tenant-001",
+        product_id="prod-ws-001",
+        api_key="sk_test_abc",
+        ingestor_url="https://ingest.test.aforo.ai",
+    )
+    billing.push(
+        {
+            "customerId": "cust_contract",
+            "wsConnectionId": "ws_contract_1",
+            "wsDirection": "SERVER_TO_CLIENT",
+            "wsFrameType": "TEXT",
+            "messageCount": 1,
+            "dataBytes": 42,
+        }
+    )
+    billing.shutdown()
+
+    assert _CapturingClient.captured, "no wire request observed"
+    url, body, _headers = _CapturingClient.captured[0]
+    assert urlparse(str(url)).path == endpoint
+    assert_body_matches_contract(spec, body)
+
+
+def test_execution_status_is_contracted_optional_field_sent_only_when_set(monkeypatch):
+    spec = FIXTURE["endpoints"][FIXTURE["sdks"][MODULE_KEY]["endpoint"]]
+    status_spec = spec["eventOptionalFields"]["executionStatus"]
+
+    _CapturingClient.captured = []
+    monkeypatch.setattr(mod, "HAS_HTTPX", True, raising=False)
+    monkeypatch.setattr(mod.httpx, "Client", _CapturingClient)
+
+    billing = AforoWsBilling(
+        tenant_id="tenant-001",
+        product_id="prod-ws-001",
+        api_key="sk_test_abc",
+        ingestor_url="https://ingest.test.aforo.ai",
+    )
+    frame = {"customerId": "cust_contract", "wsConnectionId": "ws_contract_1", "wsFrameType": "TEXT"}
+    billing.push(frame, execution_status="timeout")
+    billing.push(frame)
+    billing.shutdown()
+
+    assert _CapturingClient.captured, "no wire request observed"
+    _url, body, _headers = _CapturingClient.captured[0]
+    assert_body_matches_contract(spec, body)
+    with_status, without_status = body[spec["batchKey"]]
+    assert with_status["executionStatus"] == "TIMEOUT"
+    assert with_status["executionStatus"] in status_spec["values"]
+    assert len(with_status["executionStatus"]) <= status_spec["maxLength"]
+    assert "executionStatus" not in without_status
+
+
+# ── Transport rules (X-API-Key, 1000-event requests, stable keys) ──
 
 ALLOWED_TOP_LEVEL = {
     "customerId", "metricName", "quantity", "occurredAt", "idempotencyKey",
@@ -144,12 +281,19 @@ def test_idempotency_keys_are_stable_across_retries(monkeypatch):
 
 
 @pytest.mark.parametrize("bad", ["", "   ", "c" * 65])
-def test_invalid_customer_id_is_not_sent(monkeypatch, bad):
+def test_invalid_customer_id_is_dropped_as_invalid_and_not_sent(monkeypatch, bad):
     h, patcher = _install(monkeypatch)
+    drops = []
     try:
         b = _make()
-        _emit_customer(b, bad)
+        b.on_drop = lambda events, reason: drops.append((events, reason))
+        _emit_customer(b, bad)  # must not raise
+        assert b.dropped_count == 1
         b.shutdown()
     finally:
         patcher.stop()
     assert h.requests == []
+    assert len(drops) == 1
+    events, reason = drops[0]
+    assert reason == "invalid"
+    assert len(events) == 1 and events[0]["idempotencyKey"]

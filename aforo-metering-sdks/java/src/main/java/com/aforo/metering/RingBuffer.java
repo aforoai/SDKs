@@ -27,15 +27,23 @@ public class RingBuffer {
      * Add an event. Returns true if added without overflow, false if oldest was dropped.
      */
     public boolean push(ResolvedEvent event) {
+        return pushEvict(event) == null;
+    }
+
+    /**
+     * Add an event. On overflow, returns the evicted OLDEST event so the
+     * caller can surface the drop; returns null when no eviction occurred.
+     */
+    public ResolvedEvent pushEvict(ResolvedEvent event) {
         queue.add(event);
         int newSize = size.incrementAndGet();
 
         if (newSize > capacity) {
-            queue.poll(); // Drop oldest
+            ResolvedEvent evicted = queue.poll(); // Drop oldest
             size.decrementAndGet();
-            return false;
+            return evicted;
         }
-        return true;
+        return null;
     }
 
     /**

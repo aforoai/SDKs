@@ -51,7 +51,7 @@ describe('IngestorClient', () => {
   });
 
   it('sendSingle returns the parsed response (e.g. killedSessionIds)', async () => {
-    stubFetch([{ status: 202, body: { accepted: 0, duplicates: 0, failed: 0, killedSessionIds: ['s1'] } }]);
+    stubFetch([{ status: 202, body: { success: true, data: { accepted: 0, duplicates: 0, failed: 0, killedSessionIds: ['s1'] } } }]);
     const client = new IngestorClient({ baseUrl: 'https://x.test', apiKey: 'k', tenantId: 't' });
     const res = await client.sendSingle(event());
     assert.deepEqual(res?.killedSessionIds, ['s1']);
@@ -63,9 +63,24 @@ describe('IngestorClient', () => {
     assert.equal(await client.sendBatch([event()]), null);
     assert.equal(calls.length, 1);
 
-    stubFetch([{ status: 202, body: { accepted: 0, duplicates: 0, failed: 1, errors: [{ index: 0, message: 'unknown metric' }] } }]);
+    stubFetch([{ status: 202, body: { success: true, data: { accepted: 0, duplicates: 0, failed: 1, errors: [{ index: 0, message: 'unknown metric' }] } } }]);
     const res = await client.sendBatch([event()]);
     assert.equal(res?.errors?.[0].message, 'unknown metric');
+  });
+
+  it('sendBatchDetailed says why a batch failed: rejected with the server message, or retry_exhausted', async () => {
+    stubFetch([{ status: 400, body: { errors: [{ index: 0, message: 'productType is required' }] } }]);
+    const client = new IngestorClient({ baseUrl: 'https://x.test', apiKey: 'k', tenantId: 't', maxRetries: 1 });
+    const rejected = await client.sendBatchDetailed([event()]);
+    assert.equal(rejected.result, null);
+    assert.equal(rejected.reason, 'rejected');
+    assert.match(rejected.message ?? '', /HTTP 400: productType is required/);
+
+    const calls = stubFetch([{ status: 503 }]);
+    const exhausted = await client.sendBatchDetailed([event()]);
+    assert.equal(exhausted.result, null);
+    assert.equal(exhausted.reason, 'retry_exhausted');
+    assert.equal(calls.length, 1);
   });
 });
 

@@ -1,6 +1,11 @@
-// Contract tests: top-level productType (config default + per-event
-// override), errors[].message surfacing, no retry on non-retryable 4xx, and
-// Retry-After on 429.
+// Ingest-contract guard (A+ delivery-guarantee prompt 7).
+//
+// Validates the OBSERVED wire request (endpoint path + body shape) against
+// the shared, checked-in contract fixture at contract/ingest-contract.json —
+// derived from the REAL usage-ingestor controllers/DTOs, never from this
+// SDK's own constants. The 2026-07-05 D1 incident shipped this very SDK
+// posting a batch body to a single-event endpoint; its own green suite hid
+// 100% event loss because it asserted the SDK's own (wrong) constant.
 package grpcmetering
 
 import (
@@ -9,13 +14,264 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
+
+const contractModuleKey = "go-grpc"
+
+type contractSpec struct {
+	Cardinality           string   `json:"cardinality"`
+	BatchKey              string   `json:"batchKey"`
+	MaxEvents             int      `json:"maxEvents"`
+	RequiredFields        []string `json:"requiredFields"`
+	EventRequiredFields   []string `json:"eventRequiredFields"`
+	ForbiddenTopLevelKeys []string `json:"forbiddenTopLevelKeys"`
+	EventOptionalFields   map[string]struct {
+		MaxLength int      `json:"maxLength"`
+		Values    []string `json:"values"`
+	} `json:"eventOptionalFields"`
+}
+
+type contractFixture struct {
+	Endpoints map[string]contractSpec `json:"endpoints"`
+	SDKs      map[string]struct {
+		Endpoint string `json:"endpoint"`
+	} `json:"sdks"`
+}
+
+func loadContractFixture(t *testing.T) contractFixture {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "contract", "ingest-contract.json"))
+	if err != nil {
+		t.Fatalf("cannot read shared contract fixture: %v", err)
+	}
+	var f contractFixture
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatalf("cannot parse shared contract fixture: %v", err)
+	}
+	return f
+}
+
+func assertContractRequired(t *testing.T, obj map[string]any, field string) {
+	t.Helper()
+	v, ok := obj[field]
+	if !ok || v == nil {
+		t.Fatalf("required field %q missing/null in wire body", field)
+	}
+	if s, isStr := v.(string); isStr && strings.TrimSpace(s) == "" {
+		t.Fatalf("required field %q is blank in wire body", field)
+	}
+}
+
+// Same assertion shape in every SDK suite (all languages).
+func assertBodyMatchesContract(t *testing.T, spec contractSpec, raw []byte) {
+	t.Helper()
+	switch spec.Cardinality {
+	case "batch-wrapped":
+		var body map[string]any
+		if err := json.Unmarshal(raw, &body); err != nil {
+			// A bare array here is the /v1/ingest/async-batch shape — wrong for this endpoint.
+			t.Fatalf("batch body must be a JSON object (not a bare array): %v", err)
+		}
+		eventsAny, ok := body[spec.BatchKey].([]any)
+		if !ok || len(eventsAny) == 0 {
+			t.Fatalf("batch body must carry non-empty %q array", spec.BatchKey)
+		}
+		if len(eventsAny) > spec.MaxEvents {
+			t.Fatalf("batch exceeds contract max of %d events", spec.MaxEvents)
+		}
+		for _, evAny := range eventsAny {
+			ev, ok := evAny.(map[string]any)
+			if !ok {
+				t.Fatalf("batch element is not an object")
+			}
+			for _, field := range spec.EventRequiredFields {
+				assertContractRequired(t, ev, field)
+			}
+		}
+	case "single":
+		var body map[string]any
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatalf("single-event body must be a JSON object: %v", err)
+		}
+		for _, key := range spec.ForbiddenTopLevelKeys {
+			if _, present := body[key]; present {
+				t.Fatalf("single-event body must not carry %q", key)
+			}
+		}
+		for _, field := range spec.RequiredFields {
+			assertContractRequired(t, body, field)
+		}
+	default:
+		t.Fatalf("unhandled cardinality in fixture: %q", spec.Cardinality)
+	}
+}
+
+func TestIngestContract(t *testing.T) {
+	fixture := loadContractFixture(t)
+	entry, ok := fixture.SDKs[contractModuleKey]
+	if !ok {
+		t.Fatal("module must be registered in the fixture")
+	}
+	spec, ok := fixture.Endpoints[entry.Endpoint]
+	if !ok {
+		t.Fatalf("fixture has no endpoint spec for %q", entry.Endpoint)
+	}
+
+	var mu sync.Mutex
+	var paths []string
+	var bodies [][]byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		bodies = append(bodies, b)
+		mu.Unlock()
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	b, err := New(Config{
+		TenantID:      "tenant-001",
+		ProductID:     "prod-grpc-001",
+		APIKey:        "sk_grpc_abc",
+		IngestorURL:   srv.URL,
+		ServiceName:   "acme.v1.UserService",
+		FlushCount:    100, // buffer only — Shutdown's final drain does the synchronous flush (no async race)
+		FlushInterval: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-customer-id", "cust_contract"))
+	b.Record(ctx, "GetUser", "UNARY", 1, nil, 42)
+	_ = b.Shutdown(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(paths) == 0 {
+		t.Fatal("no wire request observed")
+	}
+	if paths[0] != entry.Endpoint {
+		t.Fatalf("SDK posted to %q but the contract endpoint is %q", paths[0], entry.Endpoint)
+	}
+	assertBodyMatchesContract(t, spec, bodies[0])
+}
+
+// Every executionStatus value this SDK can derive or send must be one the
+// ingestor accepts — asserted against the shared fixture, not our own table.
+func TestIngestContract_ExecutionStatusValues(t *testing.T) {
+	fixture := loadContractFixture(t)
+	entry := fixture.SDKs[contractModuleKey]
+	spec := fixture.Endpoints[entry.Endpoint]
+	statusSpec, ok := spec.EventOptionalFields["executionStatus"]
+	if !ok {
+		t.Fatal("fixture must declare executionStatus under eventOptionalFields")
+	}
+	allowed := map[string]bool{}
+	for _, v := range statusSpec.Values {
+		allowed[v] = true
+	}
+	inContract := func(v string) bool { return allowed[v] && len(v) <= statusSpec.MaxLength }
+
+	// Every derivable value (all 17 gRPC codes plus an out-of-range code).
+	for c := codes.OK; c <= codes.Unauthenticated+1; c++ {
+		if got := OutcomeFromGrpcCode(c); !inContract(got) {
+			t.Errorf("OutcomeFromGrpcCode(%s) = %q, not in contract %v", c, got, statusSpec.Values)
+		}
+	}
+
+	var mu sync.Mutex
+	var bodies [][]byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, b)
+		mu.Unlock()
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	b, err := New(Config{
+		TenantID:      "tenant-001",
+		ProductID:     "prod-grpc-001",
+		APIKey:        "sk_grpc_abc",
+		IngestorURL:   srv.URL,
+		ServiceName:   "acme.v1.UserService",
+		FlushCount:    100,
+		FlushInterval: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-customer-id", "cust_contract"))
+	b.Record(ctx, "GetUser", "UNARY", 1, nil, 1)
+	b.Record(ctx, "GetUser", "UNARY", 1, status.Error(codes.DeadlineExceeded, "slow"), 1)
+	b.Record(ctx, "GetUser", "UNARY", 1, status.Error(codes.Internal, "boom"), 1)
+	b.RecordWithOptions(ctx, "GetUser", "UNARY", 1, nil, 1, EventOptions{ExecutionStatus: " partial "})
+	_ = b.Shutdown(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) == 0 {
+		t.Fatal("no wire request observed")
+	}
+	assertBodyMatchesContract(t, spec, bodies[0])
+	var body struct {
+		Events []map[string]any `json:"events"`
+	}
+	if err := json.Unmarshal(bodies[0], &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	want := []string{"SUCCESS", "TIMEOUT", "ERROR", "PARTIAL"}
+	if len(body.Events) != len(want) {
+		t.Fatalf("expected %d events, got %d", len(want), len(body.Events))
+	}
+	for i, w := range want {
+		got, _ := body.Events[i]["executionStatus"].(string)
+		if got != w || !inContract(got) {
+			t.Errorf("event %d executionStatus = %q, want %q (in contract)", i, got, w)
+		}
+	}
+}
+
+// The SDK's executionStatus allow-list must match the contract exactly: a
+// value the SDK accepts but the ingestor does not would reject the event.
+func TestIngestContract_ExecutionStatusAllowListParity(t *testing.T) {
+	fixture := loadContractFixture(t)
+	spec := fixture.Endpoints[fixture.SDKs[contractModuleKey].Endpoint]
+	statusSpec, ok := spec.EventOptionalFields["executionStatus"]
+	if !ok || len(statusSpec.Values) == 0 {
+		t.Fatal("fixture must declare executionStatus values under eventOptionalFields")
+	}
+	if statusSpec.MaxLength != maxExecutionStatusLength {
+		t.Errorf("maxExecutionStatusLength = %d, contract maxLength = %d", maxExecutionStatusLength, statusSpec.MaxLength)
+	}
+	if len(canonicalExecutionStatuses) != len(statusSpec.Values) {
+		t.Errorf("SDK allows %d statuses, contract lists %d (%v)", len(canonicalExecutionStatuses), len(statusSpec.Values), statusSpec.Values)
+	}
+	for _, v := range statusSpec.Values {
+		if _, ok := canonicalExecutionStatuses[v]; !ok {
+			t.Errorf("contract status %q missing from SDK allow-list", v)
+		}
+		if got := normalizeExecutionStatus(strings.ToLower(v)); got != v {
+			t.Errorf("normalizeExecutionStatus(%q) = %q, want %q", strings.ToLower(v), got, v)
+		}
+	}
+}
+
+// ── Wire assertions carried over from the public repo: top-level productType
+// (config default + per-event override), X-API-Key, errors[].message
+// surfacing, no retry on non-retryable 4xx, Retry-After on 429. ──
 
 type scriptedReply struct {
 	status  int
@@ -171,7 +427,7 @@ func TestContractProductTypeConfigAndPerEventOverride(t *testing.T) {
 func TestContractNonRetryable4xxReportsErrorsMessage(t *testing.T) {
 	srv := &scriptedServer{replies: []scriptedReply{{
 		status: 400,
-		body:   `{"accepted":0,"duplicates":0,"failed":1,"errors":[{"index":0,"message":"unknown metric"}]}`,
+		body:   `{"success":true,"data":{"accepted":0,"duplicates":0,"failed":1,"errors":[{"index":0,"message":"unknown metric"}]}}`,
 	}}}
 	ts := httptest.NewServer(srv)
 	defer ts.Close()

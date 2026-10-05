@@ -56,6 +56,24 @@ class AforoClientTest {
     }
 
     @Test
+    void autoKeysAreUniquePerTrackCall() {
+        // No caller key = dedup opt-out. Two same-instant identical events must
+        // get DISTINCT random keys (the old content-hash fallback collapsed
+        // them — the H4 bug Aforo ingest fixed server-side in April 2026).
+        String occurredAt = "2026-07-05T00:00:00Z";
+        TrackEvent same1 = TrackEvent.builder("cust_1", "api_calls").occurredAt(occurredAt).build();
+        TrackEvent same2 = TrackEvent.builder("cust_1", "api_calls").occurredAt(occurredAt).build();
+        try (var client = new AforoClient(options())) {
+            client.track(same1);
+            client.track(same2);
+            assertThat(client.bufferedCount()).isEqualTo(2);
+        }
+        // Random UUID fallback: unique even for identical fields + timestamps.
+        assertThat(IdempotencyKeyGenerator.generateRandom())
+                .isNotEqualTo(IdempotencyKeyGenerator.generateRandom());
+    }
+
+    @Test
     void throwsAfterClose() {
         var client = new AforoClient(options());
         client.close();
@@ -100,5 +118,32 @@ class AforoClientTest {
                 Map.of("region", "us-east-1"));
         Map<String, Object> map = event.toMap();
         assertThat(map).containsKey("metadata");
+    }
+
+    @Test
+    void executionStatusNormalizedAndSerializedWhenSet() {
+        TrackEvent event = TrackEvent.builder("cust_1", "api_calls").executionStatus("  timeout ").build();
+        assertThat(event.getExecutionStatus()).isEqualTo("TIMEOUT");
+        var resolved = new ResolvedEvent("cust_1", "api_calls", 1, "key_1", "2026-03-21", null,
+                event.getExecutionStatus());
+        assertThat(resolved.toMap()).containsEntry("executionStatus", "TIMEOUT");
+    }
+
+    @Test
+    void executionStatusOmittedWhenAbsentOrBlank() {
+        assertThat(TrackEvent.builder("cust_1", "api_calls").build().getExecutionStatus()).isNull();
+        assertThat(TrackEvent.builder("cust_1", "api_calls").executionStatus("   ").build().getExecutionStatus()).isNull();
+        var resolved = new ResolvedEvent("cust_1", "api_calls", 1, "key_1", "2026-03-21", null, null);
+        assertThat(resolved.toMap()).doesNotContainKey("executionStatus");
+    }
+
+    @Test
+    void executionStatusUnknownOrOverLengthOmitted() {
+        assertThat(TrackEvent.builder("cust_1", "api_calls").executionStatus("delivered").build()
+                .getExecutionStatus()).isNull();
+        assertThat(TrackEvent.builder("cust_1", "api_calls").executionStatus("SUCCESS_BUT_WAY_TOO_LONG_FOR_IT").build()
+                .getExecutionStatus()).isNull();
+        assertThat(TrackEvent.builder("cust_1", "api_calls").executionStatus(" hitl_required ").build()
+                .getExecutionStatus()).isEqualTo("HITL_REQUIRED");
     }
 }

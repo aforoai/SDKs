@@ -1,6 +1,6 @@
 # ws-metering-go — User Guide
 
-**Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** Go engineers metering a WebSocket server, with any WebSocket library.
+**Version:** 1.2.1 · **Updated:** 2026-10-01 · **Audience:** Go engineers metering a WebSocket server, with any WebSocket library.
 
 ## What you'll build
 
@@ -14,9 +14,9 @@ A WebSocket server that emits one Aforo `CONNECTION_OPENED` event when a connect
 - A customer id per connection — you pass it to `Open`. Decode it from your auth (header, token, query).
 - Ingestor base URL — `https://api.aforo.ai`.
 
-## Step 1 — Add the module from source
+## Step 1 — Add the module
 
-`go get github.com/aforoai/SDKs/aforo-metering-sdks/go-ws` does not resolve yet (proxy not live). Clone and `replace`:
+Releases are git tags of the form `aforo-metering-sdks/go-ws/vX.Y.Z` on github.com/aforoai/SDKs. Use `v1.2.1` or later: `v1.0.0` was tagged from an older copy of this code and lacks the fixes listed in the changelog. Until the `v1.2.1` tag exists, `go get github.com/aforoai/SDKs/aforo-metering-sdks/go-ws@main` resolves to a pseudo-version of the default branch. To build against a local checkout, clone and `replace`:
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
@@ -24,7 +24,7 @@ git clone https://github.com/aforoai/SDKs.git
 
 ```go
 // go.mod (your service)
-require github.com/aforoai/SDKs/aforo-metering-sdks/go-ws v1.0.0
+require github.com/aforoai/SDKs/aforo-metering-sdks/go-ws v1.2.1
 
 replace github.com/aforoai/SDKs/aforo-metering-sdks/go-ws => ../SDKs/aforo-metering-sdks/go-ws
 ```
@@ -114,7 +114,7 @@ Content-Type: application/json
 {"events":[{"customerId":"…","metricName":"websocket_api.connection_closed","quantity":1,"occurredAt":"…","idempotencyKey":"ws:…","productType":"WEBSOCKET_API","wsConnectionId":"ws_…","wsDirection":"SERVER_TO_CLIENT","wsFrameType":"CLOSE","messageCount":42,"dataBytes":8192,"executionDurationMs":15300,"wsCloseReason":"NORMAL_CLOSURE","metadata":{"path":"/ws","event":"CONNECTION_CLOSED","frames":42,"bytes":8192,"closeCode":1000,"sdkVersion":"1.0.0","productId":"prod_ws_market_feed"}}]}
 ```
 
-> ⚠ Flush failures are silent unless you set `OnError`. If nothing lands, set `OnError: func(err error){ log.Println("aforo:", err) }` to surface marshal failures, retry-exhausted drops and ingestor rejections (including `errors[].message`).
+> ⚠ Drops are WARN-logged through the standard `log` package and counted in `DroppedCount()`; the reason for a failed flush is only reported to `OnError`. If nothing lands, set `OnError: func(err error){ log.Println("aforo:", err) }` to surface marshal failures, retry-exhausted drops and ingestor rejections (including `errors[].message`).
 
 ## Configuration reference
 
@@ -130,6 +130,31 @@ Content-Type: application/json
 | `FlushInterval` | `time.Duration` | `3s` | Background flush cadence. |
 | `HTTPClient` | `*http.Client` | `&http.Client{Timeout: 10s}` | HTTP client override. |
 | `OnError` | `func(error)` | no-op | Marshal failures, retry-exhausted drops, non-retryable `4xx` rejections, and partial failures (with the ingestor's `errors[].message`). |
+| `OnDrop` | `func([]map[string]any, DropReason)` | `nil` | Opt-in hook called with events the SDK drops (`retry_exhausted`, `rejected`, `invalid`). See [Dropped events](#dropped-events). |
+
+## Dropped events
+
+An event the SDK cannot deliver is never lost silently. `billing.DroppedCount()` returns the running total, each drop is WARN-logged, and the opt-in `Config.OnDrop(events, reason)` hook receives the events (with their idempotency keys, so re-submitting them later is dedup-safe).
+
+| `DropReason` | When |
+|---|---|
+| `wsmetering.DropRetryExhausted` (`retry_exhausted`) | A batch failed all 3 attempts (transport error, `408`, `429`, `5xx`). |
+| `wsmetering.DropRejected` (`rejected`) | The ingestor answered a non-retryable `4xx`, or refused individual events in a `2xx` partial-failure response. In the partial case only the events named by `errors[].index` are passed to `OnDrop`; failures the ingestor does not identify are counted but not attributed to an event. |
+| `wsmetering.DropInvalid` (`invalid`) | The event failed client-side validation and was never buffered: `customerId` over 64 characters or `productType` over 20 — `Open` returns `""` and the connection is not metered. The WARN log names the field, the limit and the value (throttled: first occurrence, then every 1000th); `OnError` is called too. |
+
+A call with no customer id is not metered and is not a drop. An unknown `executionStatus` is not a drop either: the status is left off (or replaced by the derived one) and the event is sent.
+
+```go
+OnDrop: func(events []map[string]any, reason wsmetering.DropReason) {
+	log.Printf("aforo: %d event(s) dropped: %s", len(events), reason)
+},
+```
+
+Idempotency keys are minted once, when the event is recorded. Every retry re-sends the same body, so a retried batch is deduplicated by the ingestor.
+
+## Execution status
+
+See [Execution status (outcome-based pricing)](README.md#execution-status-outcome-based-pricing) in the README for the values, how the status is derived and how to set your own.
 
 ## Troubleshooting
 
@@ -140,7 +165,7 @@ Content-Type: application/json
 | No `CONNECTION_CLOSED` event | `Close` never ran for that `connID` | `defer billing.Close(connID, code)` right after `Open`; the close event carries the totals. |
 | Frame/byte totals are zero | `RecordFrame` calls used a stale or wrong `connID` | Pass the exact `connID` `Open` returned; an unknown id is a silent no-op. |
 | Event volume too high | `PerFrameEvents: true` on a chatty feed | Turn it off (default) to emit only open + close with aggregated counters. |
-| Events drop with no log | Flush exhausted 3 retries and `OnError` is unset | Set `OnError`; verify `APIKey`, `IngestorURL`, and that the tenant owns the metric. |
+| `DroppedCount()` rises with reason `retry_exhausted` | Flush exhausted its 3 attempts | Set `OnError`; verify `APIKey`, `IngestorURL`, and that the tenant owns the metric. |
 
 ## What this guide does NOT cover
 

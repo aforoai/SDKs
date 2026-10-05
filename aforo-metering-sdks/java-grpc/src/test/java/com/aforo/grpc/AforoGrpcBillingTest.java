@@ -252,6 +252,72 @@ class AforoGrpcBillingTest {
         assertThat(requests).hasSizeGreaterThanOrEqualTo(3);
     }
 
+    // ── executionStatus ────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("outcomeFromGrpcStatus maps every Status.Code per the gateway table")
+    void outcomeMappingTable() {
+        java.util.Map<io.grpc.Status.Code, String> expected = new java.util.EnumMap<>(io.grpc.Status.Code.class);
+        expected.put(io.grpc.Status.Code.OK, "SUCCESS");
+        expected.put(io.grpc.Status.Code.CANCELLED, "CANCELLED");
+        expected.put(io.grpc.Status.Code.INVALID_ARGUMENT, "VALIDATION_FAILED");
+        expected.put(io.grpc.Status.Code.FAILED_PRECONDITION, "VALIDATION_FAILED");
+        expected.put(io.grpc.Status.Code.OUT_OF_RANGE, "VALIDATION_FAILED");
+        expected.put(io.grpc.Status.Code.DEADLINE_EXCEEDED, "TIMEOUT");
+        expected.put(io.grpc.Status.Code.PERMISSION_DENIED, "BLOCKED");
+        expected.put(io.grpc.Status.Code.RESOURCE_EXHAUSTED, "BLOCKED");
+        expected.put(io.grpc.Status.Code.UNAUTHENTICATED, "BLOCKED");
+        for (io.grpc.Status.Code code : io.grpc.Status.Code.values()) {
+            assertThat(AforoGrpcBilling.outcomeFromGrpcStatus(code))
+                    .as(code.name()).isEqualTo(expected.getOrDefault(code, "ERROR"));
+        }
+        assertThat(AforoGrpcBilling.outcomeFromGrpcStatus((io.grpc.Status.Code) null)).isNull();
+        assertThat(AforoGrpcBilling.outcomeFromGrpcStatus(" deadline_exceeded ")).isEqualTo("TIMEOUT");
+        assertThat(AforoGrpcBilling.outcomeFromGrpcStatus("NOT_A_CODE")).isNull();
+        assertThat(AforoGrpcBilling.outcomeFromGrpcStatus("  ")).isNull();
+    }
+
+    @Test
+    @DisplayName("record() sends executionStatus: derived, explicit (wins, normalized), blank→derived, unknown label→omitted")
+    void recordSendsExecutionStatus() throws Exception {
+        try (AforoGrpcBilling b = baseBuilder().flushCount(5).build()) {
+            b.record("M", "UNARY", "cust_001", "DEADLINE_EXCEEDED", 1L);          // derived
+            b.record("M", "UNARY", "cust_001", "OK", 1L, "  partial ");           // explicit wins
+            b.record("M", "UNARY", "cust_001", "UNAVAILABLE", 1L, "   ");         // blank → derived
+            b.record("M", "UNARY", "cust_001", "custom-label", 1L);               // no derivation
+            b.record("M", "UNARY", "cust_001", "custom-label", 1L, null);         // nothing set
+            waitFor(() -> requests.size() == 1, 2000);
+        }
+        JsonNode events = requests.get(0).body().get("events");
+        assertThat(events.size()).isEqualTo(5);
+        assertThat(events.get(0).get("executionStatus").asText()).isEqualTo("TIMEOUT");
+        assertThat(events.get(1).get("executionStatus").asText()).isEqualTo("PARTIAL");
+        assertThat(events.get(1).get("grpcStatusCode").asText()).isEqualTo("OK");
+        assertThat(events.get(2).get("executionStatus").asText()).isEqualTo("ERROR");
+        assertThat(events.get(3).has("executionStatus")).isFalse();
+        assertThat(events.get(4).has("executionStatus")).isFalse();
+    }
+
+    @Test
+    @DisplayName("record(): unknown explicit executionStatus is dropped (derived status used); rest of the event is sent")
+    void recordIgnoresUnknownExplicitExecutionStatus() throws Exception {
+        try (AforoGrpcBilling b = baseBuilder().flushCount(3).build()) {
+            b.record("M", "UNARY", "cust_001", "DEADLINE_EXCEEDED", 1L, "not_a_status");
+            b.record("M", "UNARY", "cust_001", "custom-label", 1L, "SUCCESS_BUT_WAY_TOO_LONG_FOR_IT");
+            b.record("M", "UNARY", "cust_001", "OK", 1L, " hitl_required ");
+            waitFor(() -> requests.size() == 1, 2000);
+        }
+        JsonNode events = requests.get(0).body().get("events");
+        assertThat(events.size()).isEqualTo(3);
+        assertThat(events.get(0).get("executionStatus").asText()).isEqualTo("TIMEOUT");
+        assertThat(events.get(0).get("grpcMethod").asText()).isEqualTo("M");
+        assertThat(events.get(1).has("executionStatus")).isFalse();
+        assertThat(events.get(1).get("customerId").asText()).isEqualTo("cust_001");
+        assertThat(events.get(2).get("executionStatus").asText()).isEqualTo("HITL_REQUIRED");
+        assertThat(AforoGrpcBilling.canonicalExecutionStatus("bogus")).isNull();
+        assertThat(AforoGrpcBilling.canonicalExecutionStatus(" validation_failed ")).isEqualTo("VALIDATION_FAILED");
+    }
+
     // ── Helpers ────────────────────────────────────────────────────────
 
     private static void waitFor(java.util.function.BooleanSupplier cond, long timeoutMs) throws InterruptedException {

@@ -9,6 +9,7 @@ package graphqlmetering
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,10 +19,37 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-const sdkVersion = "1.0.0"
+const sdkVersion = "1.2.2"
+
+// maxGqlOperationNameLen is the ingestor's limit for gqlOperationName.
+const maxGqlOperationNameLen = 255
+
+// maxCapturedResponseBytes caps how much of a GraphQL response the
+// Middleware keeps to derive executionStatus. Larger responses fall back to
+// the HTTP status.
+const maxCapturedResponseBytes = 1 << 20
+
+// DropReason describes why a buffered batch was permanently dropped.
+// The buffer is unbounded (drained at flush start), so unlike the core SDK
+// there is no overflow reason here.
+type DropReason string
+
+const (
+	// DropRetryExhausted — the batch failed after all transport retries.
+	DropRetryExhausted DropReason = "retry_exhausted"
+	// DropRejected — the ingestor answered a non-retryable 4xx, refused the
+	// event individually in a 2xx partial-failure response, or the batch
+	// could not be serialized.
+	DropRejected DropReason = "rejected"
+	// DropInvalid — the event failed client-side validation (a required field
+	// was blank or a field exceeded the ingestor's limit) and was never
+	// buffered.
+	DropInvalid DropReason = "invalid"
+)
 
 type Config struct {
 	TenantID          string
@@ -35,6 +63,13 @@ type Config struct {
 	HTTPClient        *http.Client
 	CustomerExtractor func(r *http.Request) string
 	OnError           func(error)
+	// OnDrop is an OPT-IN hook invoked with events the SDK is about to lose
+	// permanently (retry exhaustion, a rejection by the ingestor, or
+	// client-side validation — see DropReason). Events keep
+	// their idempotency keys, so re-submitting them after recovery is
+	// dedup-safe. Default: nil (drops are still counted in DroppedCount()
+	// and WARN-logged). Panics in the hook are recovered.
+	OnDrop func(events []map[string]any, reason DropReason)
 }
 
 type Billing struct {
@@ -42,10 +77,19 @@ type Billing struct {
 	url    string
 	client *http.Client
 
-	mu     sync.Mutex
-	buffer []map[string]any
-	stop   chan struct{}
-	wg     sync.WaitGroup
+	mu       sync.Mutex
+	buffer   []map[string]any
+	stop     chan struct{}
+	stopOnce sync.Once
+	dropped  atomic.Int64
+	// invalidDrops throttles the DropInvalid WARN log.
+	invalidDrops atomic.Int64
+	// truncWarned holds the label names already WARN-logged as truncated.
+	truncWarned sync.Map
+	// retryBackoffBase is the exponential-backoff base (default 1s) —
+	// package-private so tests can skip real sleeps.
+	retryBackoffBase time.Duration
+	wg               sync.WaitGroup
 }
 
 func New(cfg Config) (*Billing, error) {
@@ -72,10 +116,11 @@ func New(cfg Config) (*Billing, error) {
 		cfg.OnError = func(err error) {}
 	}
 	b := &Billing{
-		cfg:    cfg,
-		url:    strings.TrimRight(cfg.IngestorURL, "/") + "/v1/ingest/batch",
-		client: cfg.HTTPClient,
-		stop:   make(chan struct{}),
+		cfg:              cfg,
+		url:              strings.TrimRight(cfg.IngestorURL, "/") + "/v1/ingest/batch",
+		client:           cfg.HTTPClient,
+		stop:             make(chan struct{}),
+		retryBackoffBase: time.Second,
 	}
 	b.wg.Add(1)
 	go b.flushLoop()
@@ -85,6 +130,15 @@ func New(cfg Config) (*Billing, error) {
 // Middleware wraps an http.Handler that serves GraphQL POST requests.
 // Captures the request body, extracts operation type/name, and emits one
 // billing event per response.
+//
+// The operation name comes from the client's request. One longer than the
+// ingestor's 255 characters is truncated (never splitting a character) and the
+// event is still sent; a WARN is logged once.
+//
+// executionStatus is derived from the response body (see
+// OutcomeFromGraphQLResponse), falling back to the HTTP status (see
+// OutcomeFromHTTPStatus) when the body is not a GraphQL response or is larger
+// than 1 MiB. A handler can override it with SetExecutionStatus(r.Context(), …).
 func (b *Billing) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -93,6 +147,9 @@ func (b *Billing) Middleware(next http.Handler) http.Handler {
 		}
 		bodyBytes, _ := io.ReadAll(r.Body)
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+		holder := &statusHolder{}
+		r = r.WithContext(context.WithValue(r.Context(), statusHolderKey{}, holder))
 
 		start := time.Now()
 		recw := &responseRecorder{ResponseWriter: w, status: 200}
@@ -109,35 +166,59 @@ func (b *Billing) Middleware(next http.Handler) http.Handler {
 		if customerID == "" {
 			return
 		}
-		b.Record(customerID, req.Query, req.OperationName, time.Since(start).Milliseconds(), recw.status >= 400)
+		executionStatus := holder.get()
+		if executionStatus == "" && !recw.overflow {
+			executionStatus = OutcomeFromGraphQLResponse(recw.body.Bytes())
+		}
+		if executionStatus == "" {
+			executionStatus = OutcomeFromHTTPStatus(recw.status)
+		}
+		b.record(customerID, req.Query, req.OperationName, time.Since(start).Milliseconds(), recw.status >= 400, executionStatus, b.cfg.ProductType)
 	})
 }
 
 // Record emits one billing event manually. Use from custom executors.
-// An optional EventOptions overrides the event's productType.
+// No executionStatus is sent unless EventOptions.ExecutionStatus is set (for
+// example OutcomeFromGraphQLResponse of the response you returned). Optional
+// EventOptions also override the event's productType.
+//
+// A call with a blank customerID or query is not metered. An event the
+// ingestor would refuse (a field over its limit) is not buffered: it is
+// counted in DroppedCount(), WARN-logged and handed to OnDrop with DropInvalid.
+// The operation name (the operationName argument, or the name read from the
+// query text when it is "") originates from the client's request, so one over
+// 255 characters is truncated and the event is still sent.
 func (b *Billing) Record(customerID, query, operationName string, durationMs int64, hasErrors bool, opts ...EventOptions) {
+	b.record(customerID, query, operationName, durationMs, hasErrors, executionStatusFor(opts), b.productTypeFor(opts))
+}
+
+// RecordWithOptions is Record with optional per-event fields.
+func (b *Billing) RecordWithOptions(customerID, query, operationName string, durationMs int64, hasErrors bool, opts EventOptions) {
+	b.Record(customerID, query, operationName, durationMs, hasErrors, opts)
+}
+
+func (b *Billing) record(customerID, query, operationName string, durationMs int64, hasErrors bool, executionStatus, productType string) {
 	customerID = strings.TrimSpace(customerID)
 	if customerID == "" || query == "" {
 		return
 	}
-	if len(customerID) > 64 {
-		b.cfg.OnError(fmt.Errorf("graphqlmetering: customerId longer than 64 chars, event dropped"))
-		return
-	}
 	opType, opName := detectOperation(query, operationName)
-	if len(opName) > 255 {
-		opName = opName[:255]
-	}
 	complexity, fieldCount := scoreComplexity(query)
 
 	now := time.Now().UTC()
+	// The key is built from the full operation name, before truncation.
+	key := idempotencyKeyFor(b.cfg.TenantID, b.cfg.ProductID, opName, now.UnixMilli(), randomSuffix())
+	// The operation name always originates from the client's request (also
+	// when integration code hands it to Record), so it is truncated to the
+	// ingestor's limit instead of dropping the event.
+	opName = b.truncateLabel("gqlOperationName", opName, maxGqlOperationNameLen)
 	event := map[string]any{
 		"customerId":          customerID,
 		"metricName":          "graphql_api.operations",
 		"quantity":            1,
 		"occurredAt":          now.Format(time.RFC3339Nano),
-		"idempotencyKey":      capKey(fmt.Sprintf("gql:%s:%s:%s:%d:%s", b.cfg.TenantID, b.cfg.ProductID, opName, now.UnixMilli(), randomSuffix())),
-		"productType":         b.productTypeFor(opts),
+		"idempotencyKey":      key,
+		"productType":         productType,
 		"gqlOperationType":    opType,
 		"gqlOperationName":    opName,
 		"gqlComplexity":       complexity,
@@ -148,6 +229,21 @@ func (b *Billing) Record(customerID, query, operationName string, durationMs int
 			"sdkVersion": sdkVersion,
 			"productId":  b.cfg.ProductID,
 		}, b.cfg.SchemaVersion),
+	}
+	if s := normalizeExecutionStatus(executionStatus); s != "" {
+		event["executionStatus"] = s
+	}
+	for _, c := range []struct {
+		field, value string
+		max          int
+	}{
+		{"customerId", customerID, maxCustomerIDLen},
+		{"productType", productType, maxProductTypeLen},
+	} {
+		if msg := tooLong(c.field, c.value, c.max); msg != "" {
+			b.dropInvalid(event, msg)
+			return
+		}
 	}
 	b.mu.Lock()
 	b.buffer = append(b.buffer, event)
@@ -173,30 +269,8 @@ func (b *Billing) flushLoop() {
 	}
 }
 
-// maxBatchSize is the ingestor's per-request cap on POST /v1/ingest/batch.
-const maxBatchSize = 1000
-
-func (b *Billing) flush() {
-	b.mu.Lock()
-	if len(b.buffer) == 0 {
-		b.mu.Unlock()
-		return
-	}
-	batch := b.buffer
-	b.buffer = nil
-	b.mu.Unlock()
-
-	for start := 0; start < len(batch); start += maxBatchSize {
-		end := start + maxBatchSize
-		if end > len(batch) {
-			end = len(batch)
-		}
-		b.send(batch[start:end])
-	}
-}
-
 func (b *Billing) Shutdown() error {
-	close(b.stop)
+	b.stopOnce.Do(func() { close(b.stop) })
 	b.wg.Wait()
 	return nil
 }
@@ -205,10 +279,26 @@ func (b *Billing) Shutdown() error {
 
 type responseRecorder struct {
 	http.ResponseWriter
-	status int
+	status   int
+	body     bytes.Buffer
+	overflow bool
 }
 
 func (r *responseRecorder) WriteHeader(code int) { r.status = code; r.ResponseWriter.WriteHeader(code) }
+
+// Write keeps a copy of the first maxCapturedResponseBytes of the response so
+// the Middleware can derive executionStatus from it.
+func (r *responseRecorder) Write(p []byte) (int, error) {
+	if !r.overflow {
+		if r.body.Len()+len(p) > maxCapturedResponseBytes {
+			r.overflow = true
+			r.body = bytes.Buffer{}
+		} else {
+			r.body.Write(p)
+		}
+	}
+	return r.ResponseWriter.Write(p)
+}
 
 var firstKeywordRegex = regexp.MustCompile(`^\s*(query|mutation|subscription)\b\s*([A-Za-z_][A-Za-z0-9_]*)?`)
 
@@ -258,13 +348,11 @@ func withSchemaVersion(m map[string]any, sv string) map[string]any {
 	return m
 }
 
-// capKey keeps idempotency keys within the ingestor's 255-char limit. The
-// unique tail (millis + random suffix) is preserved.
-func capKey(k string) string {
-	if len(k) > 255 {
-		return k[len(k)-255:]
-	}
-	return k
+// idempotencyKeyFor returns "gql:<tenant>:<product>:<operation>:<millis>:<suffix>".
+// opName must be the full, untruncated operation name; see boundedKey for what
+// happens when the key would exceed 255 characters.
+func idempotencyKeyFor(tenantID, productID, opName string, millis int64, suffix string) string {
+	return boundedKey(fmt.Sprintf("gql:%s:%s:", tenantID, productID), opName, fmt.Sprintf(":%d:%s", millis, suffix))
 }
 
 var alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"

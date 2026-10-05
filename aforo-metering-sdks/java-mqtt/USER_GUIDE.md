@@ -1,6 +1,6 @@
 # ai.aforo:mqtt-metering — User Guide
 
-**Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** Java engineers running an MQTT client (Eclipse Paho or other) who need per-message usage metering. For broker-side metering, see the EMQ X plugin instead.
+**Version:** 1.2.2 · **Updated:** 2026-10-01 · **Audience:** Java engineers running an MQTT client (Eclipse Paho or other) who need per-message usage metering. For broker-side metering, see the EMQ X plugin instead.
 
 ## What you'll build
 
@@ -27,7 +27,7 @@ Add to your service's `pom.xml`:
 <dependency>
   <groupId>ai.aforo</groupId>
   <artifactId>mqtt-metering</artifactId>
-  <version>1.0.0</version>
+  <version>1.2.2</version>
 </dependency>
 ```
 
@@ -121,7 +121,9 @@ Runtime.getRuntime().addShutdownHook(new Thread(billing::close));
 | Inbound messages not metered | `DELIVER` is off by default | Build with `.emitDeliverEvents(true)` if you bill on receipt. |
 | `metricName` is `mqtt_broker.<x>` not what you expected | The metric name is derived as `mqtt_broker.<eventType-lowercased>` | Define metrics in Aforo matching `mqtt_broker.publish`, `mqtt_broker.subscribe`, etc. |
 | Events POST to a 404 | `ingestorUrl` already includes the path | Pass the host only; the SDK appends `/v1/ingest/batch`. |
-| `flush exhausted retries — dropped N events` in logs | Ingestor returned non-2xx on all 3 attempts | Verify the key + `X-Tenant-Id`; ensure the `mqtt_broker.*` metrics exist in Aforo. |
+| `flush exhausted retries — dropped N events` in logs | Network error, 5xx, 408 or 429 on all 3 attempts | Check connectivity to `ingestorUrl`; the batch is reported to `onDrop` with `RETRY_EXHAUSTED`. |
+| `ingestor returned 4xx — not retrying` or `Dropped N event(s) — REJECTED` in logs | Bad key, unknown metric, or an event the ingestor refused; a 4xx other than 408/429 is sent once | Verify the key + `X-Tenant-Id`; ensure the `mqtt_broker.*` metric exists in Aforo. The log line carries the ingestor's `errors[].message`. |
+| `Dropping invalid event: ...` in logs, `droppedCount()` grows | The event breaks an ingestor field limit (`DropReason.INVALID`) and was not sent | The message names the field, the limit and the value. See [Dropped events](README.md#dropped-events). |
 | Want to bill differently by QoS / retain | Filtering happens in the Aforo rate plan, not the SDK | Use descriptor `filterCondition` on `mqtt_qos` / `mqtt_retained` (every event carries both). |
 
 ## What this guide does NOT cover

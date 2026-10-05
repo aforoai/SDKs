@@ -18,9 +18,11 @@ from .types import (
     DEFAULT_PRODUCT_TYPE,
     MAX_BATCH_SIZE,
     AforoOptions,
+    DropReason,
     FlushResult,
     ResolvedEvent,
     TrackEvent,
+    normalize_execution_status,
 )
 
 logger = logging.getLogger("aforo.client")
@@ -32,6 +34,30 @@ HEARTBEAT_METRIC = "system.session.heartbeat"
 def _utc_now_iso() -> str:
     """Current time as an ISO-8601 instant, e.g. ``2026-09-22T10:00:00.000Z``."""
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _describe_invalid(event: ResolvedEvent) -> Optional[str]:
+    """Why the ingestor would reject this event, or ``None`` if it would not."""
+    if event.customer_id is None or not str(event.customer_id).strip():
+        return "customer_id is required (got blank)"
+    if event.metric_name is None or not str(event.metric_name).strip():
+        return "metric_name is required (got blank)"
+    quantity = event.quantity
+    try:
+        positive = quantity is not None and not isinstance(quantity, bool) and quantity > 0
+    except TypeError:
+        positive = False
+    if not positive:
+        return f"quantity must be > 0 (got {str(quantity)[:80]})"
+    return describe_limit_violation({
+        **(event.extra_fields or {}),
+        "customerId": event.customer_id,
+        "metricName": event.metric_name,
+        "quantity": quantity,
+        "idempotencyKey": event.idempotency_key,
+        "occurredAt": event.occurred_at,
+        "productType": event.product_type,
+    })
 
 
 def _normalize_product_type(product_type: Optional[str]) -> Optional[str]:
@@ -84,7 +110,18 @@ class AforoClient:
         self._flush_interval = opts.flush_interval
         self._shutdown_timeout = opts.shutdown_timeout
         self._closed = False
-        self._flush_lock = threading.Lock()
+        # RLock (not Lock): _record_drop fires the customer's on_drop hook
+        # while _do_flush holds this lock — a hook that synchronously calls
+        # client.flush() would deadlock on a plain Lock. Reentry just drains
+        # the (already-empty) buffer and returns.
+        self._flush_lock = threading.RLock()
+
+        # Drop accounting — events permanently lost (overflow eviction or failed batch)
+        self._on_drop = opts.on_drop
+        self._dropped = 0
+        self._overflow_drops = 0
+        self._invalid_drops = 0
+        self._drop_lock = threading.Lock()
 
         # Session heartbeat state
         self._heartbeat_interval = opts.heartbeat_interval
@@ -100,7 +137,9 @@ class AforoClient:
         self._timer: Optional[threading.Timer] = None
         self._schedule_flush()
 
-        # Register atexit handler for graceful shutdown
+        # Register atexit handler for graceful shutdown (unregistered in
+        # shutdown() so repeated create/shutdown cycles don't accumulate
+        # handlers for the life of the interpreter).
         atexit.register(self._atexit_flush)
 
     # ─── Session lifecycle with heartbeats ─────────────────────────────
@@ -216,6 +255,7 @@ class AforoClient:
         occurred_at: Optional[str] = None,
         metadata: Optional[dict] = None,
         *,
+        execution_status: Optional[str] = None,
         product_type: Optional[str] = None,
         extra_fields: Optional[dict] = None,
         event: Optional[TrackEvent] = None,
@@ -224,14 +264,20 @@ class AforoClient:
 
         Can be called with keyword args or a ``TrackEvent`` dataclass.
 
+        ``execution_status`` (keyword-only) is the optional outcome used by
+        OUTCOME_BASED pricing -- see ``TrackEvent.execution_status``.
+
         ``product_type`` overrides the client's default ``product_type`` for this
         event only. ``extra_fields`` adds optional top-level ingest fields using
         their exact camelCase wire names (e.g. ``agentId``, ``sessionId``,
         ``endpointPath``).
 
-        Raises ``ValueError`` for a blank ``customer_id`` / ``metric_name`` or a
-        ``quantity`` <= 0: the ingestor rejects such an event, and one invalid
-        event fails the whole batch.
+        Never raises for event content. An event the ingestor would reject --
+        blank ``customer_id`` / ``metric_name``, ``quantity`` <= 0, or a field
+        over one of the ingestor's limits -- is not buffered and not sent: it is
+        counted in ``dropped_count``, WARN-logged with the field and limit, and
+        passed to the opt-in ``on_drop`` hook with reason ``"invalid"``.
+        Raises ``RuntimeError`` only when the client is already shut down.
         """
         if self._closed:
             raise RuntimeError("AforoClient is shut down — cannot track new events")
@@ -243,46 +289,24 @@ class AforoClient:
             idempotency_key = event.idempotency_key
             occurred_at = event.occurred_at
             metadata = event.metadata
+            execution_status = event.execution_status
             product_type = event.product_type
             extra_fields = event.extra_fields
-
-        if (
-            customer_id is None or not str(customer_id).strip()
-            or metric_name is None or not str(metric_name).strip()
-        ):
-            raise ValueError("customer_id and metric_name are required")
-
-        if quantity is None or isinstance(quantity, bool) or not quantity > 0:
-            raise ValueError("quantity must be > 0")
 
         if occurred_at is None:
             occurred_at = _utc_now_iso()
 
-        # Minted once, here, when the event is enqueued — never at flush/retry
-        # time, so a retried batch carries the same keys and the ingestor
-        # deduplicates it. A caller-supplied key is passed through verbatim;
-        # otherwise each event gets its own random UUID. A deterministic hash of
-        # the event fields would make two genuinely distinct events in the same
-        # millisecond collide, and the ingestor would silently drop the second.
+        # Minted once, here, when the event is created -- never at flush/retry
+        # time, so a retried batch (or an on_drop replay) carries the same key
+        # and the ingestor deduplicates it. A caller-supplied key is passed
+        # through verbatim; otherwise each event gets its own random UUID. The
+        # previous content-hash fallback silently COLLAPSED legitimately
+        # distinct events recorded in the same instant -- the same bug Aforo's
+        # ingest fixed server-side in April 2026 (H4 fix).
         if idempotency_key is None:
             idempotency_key = generate_random_key()
 
-        # Checked before the event enters the buffer: an event that breaks one of
-        # the ingestor's compiled-in field constraints is rejected server-side and
-        # never billed, and because flushing happens in the background nobody
-        # would ever see that rejection.
         resolved_product_type = _normalize_product_type(product_type) or self._product_type
-        violation = describe_limit_violation({
-            "customerId": customer_id,
-            "metricName": metric_name,
-            "quantity": quantity,
-            "idempotencyKey": idempotency_key,
-            "occurredAt": occurred_at,
-            "productType": resolved_product_type,
-            **(extra_fields or {}),
-        })
-        if violation:
-            raise ValueError(violation)
 
         resolved = ResolvedEvent(
             customer_id=customer_id,
@@ -291,15 +315,90 @@ class AforoClient:
             idempotency_key=idempotency_key,
             occurred_at=occurred_at,
             metadata=metadata,
+            execution_status=normalize_execution_status(execution_status),
             product_type=resolved_product_type,
             extra_fields=dict(extra_fields) if extra_fields else None,
         )
 
-        self._buffer.push(resolved)
+        # Checked before the event enters the buffer: an event that breaks one of
+        # the ingestor's compiled-in constraints is rejected server-side and
+        # never billed. It is dropped here (counter + WARN + on_drop "invalid")
+        # rather than raised: track() sits on request hot paths, and an
+        # exception there turns a metering problem into a failed request.
+        problem = _describe_invalid(resolved)
+        if problem:
+            self._record_drop([resolved], "invalid", detail=problem)
+            return
+
+        self._enqueue(resolved)
 
         # Flush if buffer threshold reached
         if self._buffer.size >= self._flush_count:
             self._do_flush_async()
+
+    def _enqueue(self, resolved: ResolvedEvent) -> None:
+        """Buffer an event; surface the evicted-oldest event on overflow."""
+        evicted = self._buffer.push_evict(resolved)
+        if evicted is not None:
+            self._record_drop([evicted], "overflow")
+
+    def _record_drop(
+        self,
+        events: list[ResolvedEvent],
+        reason: DropReason,
+        *,
+        count: Optional[int] = None,
+        detail: Optional[str] = None,
+    ) -> None:
+        """Account for permanently lost events: bump the counter, WARN-log,
+        and invoke the opt-in on_drop hook. Overflow and invalid-event logs are
+        throttled (first, then every 1000th) so a tight loop can't storm the
+        log; failed-batch drops log every time (bounded by flush cadence).
+
+        ``count`` overrides ``len(events)`` when the ingestor reported rejected
+        events without saying which ones: they are counted, but no event is
+        handed to the hook as dropped that may in fact have been accepted.
+        """
+        n = len(events) if count is None else count
+        if n <= 0:
+            return
+        with self._drop_lock:
+            self._dropped += n
+            dropped_total = self._dropped
+            if reason == "overflow":
+                self._overflow_drops += n
+                should_log = self._overflow_drops == 1 or self._overflow_drops % 1000 == 0
+            elif reason == "invalid":
+                self._invalid_drops += n
+                should_log = self._invalid_drops == 1 or self._invalid_drops % 1000 == 0
+            else:
+                should_log = True
+
+        if reason == "overflow":
+            if should_log:
+                logger.warning(
+                    "[aforo] Buffer overflow: oldest event dropped (%d total dropped). "
+                    "Consider raising max_queue_size or checking ingest connectivity.",
+                    dropped_total,
+                )
+        elif reason == "invalid":
+            if should_log:
+                logger.warning(
+                    "[aforo] Invalid event not sent — %s (%d total dropped).",
+                    detail or "rejected by client-side validation", dropped_total,
+                )
+        else:
+            logger.warning(
+                "[aforo] Dropped %d event(s) — %s (%d total dropped).",
+                n, reason, dropped_total,
+            )
+
+        if self._on_drop is not None and events:
+            try:
+                self._on_drop(events, reason)
+            except Exception:
+                # A hook bug must never break tracking/flushing.
+                logger.debug("on_drop hook raised", exc_info=True)
 
     def flush(self) -> FlushResult:
         """Force-flush all buffered events synchronously."""
@@ -310,6 +409,10 @@ class AforoClient:
         if self._closed:
             return
         self._closed = True
+
+        # Safe no-op if not registered (e.g. called FROM the atexit handler).
+        atexit.unregister(self._atexit_flush)
+
         self._stop_heartbeat()
 
         if self._timer:
@@ -321,6 +424,13 @@ class AforoClient:
     @property
     def buffered_count(self) -> int:
         return self._buffer.size
+
+    @property
+    def dropped_count(self) -> int:
+        """Total events permanently dropped (overflow, failed batches, events the
+        ingestor rejected, and events track() refused as invalid)."""
+        with self._drop_lock:
+            return self._dropped
 
     @property
     def product_type(self) -> str:
@@ -344,6 +454,20 @@ class AforoClient:
                 result = self._transport.send_sync(batch)
                 total_sent += result.sent
                 total_failed += result.failed
+
+                if result.failed > 0:
+                    # The batch was already drained from the buffer — without
+                    # this it vanishes silently. Surface it (counter + WARN +
+                    # opt-in hook).
+                    reason = result.reason or "retry_exhausted"
+                    if result.failed >= len(batch):
+                        self._record_drop(batch, reason)
+                    elif result.failed_indices:
+                        # Partial response naming the rejected events.
+                        self._record_drop([batch[i] for i in result.failed_indices], reason)
+                    else:
+                        # Partial response that does not say which events failed.
+                        self._record_drop([], reason, count=result.failed)
 
             return FlushResult(sent=total_sent, failed=total_failed)
 

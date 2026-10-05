@@ -186,6 +186,47 @@ class AforoMqttBillingTest {
         assertThat(allEvents()).hasSize(4);
     }
 
+    // ── executionStatus (explicit only) ────────────────────────────────
+
+    @Test
+    @DisplayName("executionStatus: every record* overload sends the normalized value; unset/blank omit it")
+    void executionStatusExplicitOnly() throws Exception {
+        try (AforoMqttBilling b = baseBuilder().flushCount(100).emitDeliverEvents(true).build()) {
+            b.recordConnect("cust_001", "c1", " success ");
+            b.recordPublish("cust_001", "c1", "t", 1, false, 4L, "timeout");
+            b.recordDeliver("cust_001", "c1", "t", 1, false, 4L, "PARTIAL");
+            b.recordSubscribe("cust_001", "c1", "t/#", 1, "blocked");
+            b.recordUnsubscribe("cust_001", "c1", "t/#", "Cancelled");
+            b.recordDisconnect("cust_001", "c1", "error");
+            b.recordPublish("cust_001", "c1", "t", 1, false, 4L);          // unset
+            b.recordPublish("cust_001", "c1", "t", 1, false, 4L, "   ");   // blank
+        }
+        waitFor(() -> allEvents().size() == 8, 2000);
+        List<JsonNode> ev = allEvents();
+        String[] expected = {"SUCCESS", "TIMEOUT", "PARTIAL", "BLOCKED", "CANCELLED", "ERROR"};
+        for (int i = 0; i < expected.length; i++) {
+            assertThat(ev.get(i).get("executionStatus").asText()).isEqualTo(expected[i]);
+        }
+        assertThat(ev.get(6).has("executionStatus")).isFalse();
+        assertThat(ev.get(7).has("executionStatus")).isFalse();
+    }
+
+    @Test
+    @DisplayName("executionStatus: unknown explicit values are omitted; the rest of the event is sent")
+    void executionStatusUnknownOmitted() throws Exception {
+        try (AforoMqttBilling b = baseBuilder().flushCount(100).build()) {
+            b.recordPublish("cust_001", "c1", "t", 1, false, 4L, "delivered");
+            b.recordPublish("cust_001", "c1", "t", 1, false, 4L, "SUCCESS_BUT_WAY_TOO_LONG_FOR_IT");
+            b.recordPublish("cust_001", "c1", "t", 1, false, 4L, " pending ");
+        }
+        waitFor(() -> allEvents().size() == 3, 2000);
+        List<JsonNode> ev = allEvents();
+        assertThat(ev.get(0).has("executionStatus")).isFalse();
+        assertThat(ev.get(0).get("customerId").asText()).isEqualTo("cust_001");
+        assertThat(ev.get(1).has("executionStatus")).isFalse();
+        assertThat(ev.get(2).get("executionStatus").asText()).isEqualTo("PENDING");
+    }
+
     private static void waitFor(java.util.function.BooleanSupplier cond, long timeoutMs) throws InterruptedException {
         long deadline = System.currentTimeMillis() + timeoutMs;
         while (System.currentTimeMillis() < deadline) {

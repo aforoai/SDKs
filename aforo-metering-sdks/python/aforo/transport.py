@@ -60,7 +60,7 @@ class Transport:
                         "Ingestor returned %d — not retrying%s",
                         resp.status_code, _error_summary(resp),
                     )
-                    return FlushResult(failed=len(events))
+                    return FlushResult(failed=len(events), reason="rejected")
 
                 # 429 — respect Retry-After
                 if resp.status_code == 429:
@@ -76,7 +76,7 @@ class Transport:
                     time.sleep(delay)
                     continue
 
-                return FlushResult(failed=len(events))
+                return FlushResult(failed=len(events), reason="retry_exhausted")
 
             except (httpx.HTTPError, OSError) as exc:
                 logger.debug("Request failed: %s (attempt %d/%d)", exc, attempt + 1, self._max_retries)
@@ -84,9 +84,9 @@ class Transport:
                     import time
                     time.sleep(self._retry_base_s * (2 ** attempt))
                     continue
-                return FlushResult(failed=len(events))
+                return FlushResult(failed=len(events), reason="retry_exhausted")
 
-        return FlushResult(failed=len(events))
+        return FlushResult(failed=len(events), reason="retry_exhausted")
 
     def send_heartbeat(self, event: ResolvedEvent) -> Optional[dict]:
         """POST one session heartbeat in its own ``{"events": [hb]}`` request.
@@ -105,7 +105,7 @@ class Transport:
                 resp = client.post(self._url, json={"events": [event.to_dict()]}, headers=headers)
             if 200 <= resp.status_code < 300:
                 try:
-                    payload = resp.json()
+                    payload = _unwrap_envelope(resp.json())
                 except Exception:
                     return {}
                 return payload if isinstance(payload, dict) else {}
@@ -113,6 +113,17 @@ class Transport:
         except Exception as exc:  # best-effort: never affects usage delivery
             logger.debug("Heartbeat failed: %s", exc)
         return None
+
+
+def _unwrap_envelope(payload):
+    """The ingestor wraps every 2xx JSON body in ``{success, data, meta}``.
+
+    Returns the inner ``data`` object when present, else the payload unchanged
+    (bare shape).
+    """
+    if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+        return payload["data"]
+    return payload
 
 
 def _retry_after_s(value: Optional[str]) -> Optional[float]:
@@ -128,7 +139,7 @@ def _retry_after_s(value: Optional[str]) -> Optional[float]:
 def _error_summary(resp) -> str:
     """First few ``errors[].message`` values from an ingestor response, for logs."""
     try:
-        payload = resp.json()
+        payload = _unwrap_envelope(resp.json())
     except Exception:
         return ""
     if not isinstance(payload, dict):
@@ -148,23 +159,43 @@ def _result_from_response(resp, count: int) -> FlushResult:
     """Build a FlushResult from a 2xx batch response.
 
     The ingestor answers ``202 {accepted, duplicates, failed, errors:[{index, message}]}``;
-    per-event rejections are reported in ``failed`` / ``errors[].message``.
+    per-event rejections are reported in ``failed`` / ``errors[].message``. Those
+    events are lost (the server will not accept them on a retry), so the result
+    carries ``reason="rejected"`` and, when the response names them by index,
+    ``failed_indices`` -- the client counts exactly those events as dropped.
     """
     failed = 0
+    indices: list[int] = []
     try:
-        payload = resp.json()
+        payload = _unwrap_envelope(resp.json())
         if isinstance(payload, dict):
             raw_failed = payload.get("failed")
             if isinstance(raw_failed, int) and not isinstance(raw_failed, bool) and raw_failed > 0:
                 failed = min(raw_failed, count)
                 errors = payload.get("errors")
                 if isinstance(errors, list):
-                    for err in errors[:10]:
-                        if isinstance(err, dict):
+                    for pos, err in enumerate(errors):
+                        if not isinstance(err, dict):
+                            continue
+                        if pos < 10:
                             logger.warning(
                                 "Ingestor rejected event %s: %s",
                                 err.get("index"), err.get("message"),
                             )
+                        idx = err.get("index")
+                        if (
+                            isinstance(idx, int) and not isinstance(idx, bool)
+                            and 0 <= idx < count and idx not in indices
+                        ):
+                            indices.append(idx)
     except Exception:
         pass  # empty / non-JSON body — treat the whole batch as accepted
-    return FlushResult(sent=count - failed, failed=failed)
+    if failed == 0:
+        return FlushResult(sent=count)
+    return FlushResult(
+        sent=count - failed,
+        failed=failed,
+        reason="rejected",
+        # Only trust the indices when they account for every failed event.
+        failed_indices=sorted(indices) if len(indices) == failed else None,
+    )

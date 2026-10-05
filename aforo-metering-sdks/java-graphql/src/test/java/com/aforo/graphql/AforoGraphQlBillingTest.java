@@ -175,6 +175,108 @@ class AforoGraphQlBillingTest {
         assertThat(requestBodies.get(0).get("events").size()).isEqualTo(3);
     }
 
+    // ── executionStatus ────────────────────────────────────────────────
+
+    private static graphql.ExecutionResult result(Object data, boolean withError) {
+        graphql.ExecutionResultImpl.Builder rb = graphql.ExecutionResultImpl.newExecutionResult().data(data);
+        if (withError) rb.addError(graphql.GraphqlErrorBuilder.newError().message("boom").build());
+        return rb.build();
+    }
+
+    /** Result with no {@code data} key at all (request failed before execution). */
+    private static graphql.ExecutionResult resultWithoutData(boolean withError) {
+        graphql.ExecutionResultImpl.Builder rb = graphql.ExecutionResultImpl.newExecutionResult();
+        if (withError) rb.addError(graphql.GraphqlErrorBuilder.newError().message("bad field").build());
+        return rb.build();
+    }
+
+    @Test
+    @DisplayName("outcomeFromGraphQlResult: errors + data key absent → VALIDATION_FAILED")
+    void outcomeFromResultWithAbsentData() {
+        graphql.ExecutionResult r = resultWithoutData(true);
+        assertThat(r.isDataPresent()).isFalse();
+        assertThat(AforoGraphQlBilling.outcomeFromGraphQlResult(r)).isEqualTo("VALIDATION_FAILED");
+        assertThat(result(null, true).isDataPresent()).isTrue();
+        assertThat(AforoGraphQlBilling.outcomeFromGraphQlResult(result(null, true))).isEqualTo("ERROR");
+        // No errors → SUCCESS regardless of whether data is present
+        assertThat(AforoGraphQlBilling.outcomeFromGraphQlResult(resultWithoutData(false))).isEqualTo("SUCCESS");
+    }
+
+    @Test
+    @DisplayName("outcomeFromGraphQlResult: no errors→SUCCESS, errors+data→PARTIAL, errors+null data→ERROR")
+    void outcomeFromResult() {
+        assertThat(AforoGraphQlBilling.outcomeFromGraphQlResult(result(java.util.Map.of("a", 1), false))).isEqualTo("SUCCESS");
+        assertThat(AforoGraphQlBilling.outcomeFromGraphQlResult(result(null, false))).isEqualTo("SUCCESS");
+        assertThat(AforoGraphQlBilling.outcomeFromGraphQlResult(result(java.util.Map.of("a", 1), true))).isEqualTo("PARTIAL");
+        assertThat(AforoGraphQlBilling.outcomeFromGraphQlResult(result(null, true))).isEqualTo("ERROR");
+        assertThat(AforoGraphQlBilling.outcomeFromGraphQlResult(null)).isNull();
+    }
+
+    @Test
+    @DisplayName("outcomeFromHttpStatus maps per the gateway table")
+    void outcomeFromHttp() {
+        assertThat(AforoGraphQlBilling.outcomeFromHttpStatus(200)).isEqualTo("SUCCESS");
+        assertThat(AforoGraphQlBilling.outcomeFromHttpStatus(304)).isEqualTo("SUCCESS");
+        assertThat(AforoGraphQlBilling.outcomeFromHttpStatus(408)).isEqualTo("TIMEOUT");
+        assertThat(AforoGraphQlBilling.outcomeFromHttpStatus(504)).isEqualTo("TIMEOUT");
+        assertThat(AforoGraphQlBilling.outcomeFromHttpStatus(499)).isEqualTo("CANCELLED");
+        assertThat(AforoGraphQlBilling.outcomeFromHttpStatus(400)).isEqualTo("VALIDATION_FAILED");
+        assertThat(AforoGraphQlBilling.outcomeFromHttpStatus(422)).isEqualTo("VALIDATION_FAILED");
+        assertThat(AforoGraphQlBilling.outcomeFromHttpStatus(401)).isEqualTo("BLOCKED");
+        assertThat(AforoGraphQlBilling.outcomeFromHttpStatus(403)).isEqualTo("BLOCKED");
+        assertThat(AforoGraphQlBilling.outcomeFromHttpStatus(429)).isEqualTo("BLOCKED");
+        assertThat(AforoGraphQlBilling.outcomeFromHttpStatus(404)).isEqualTo("ERROR");
+        assertThat(AforoGraphQlBilling.outcomeFromHttpStatus(500)).isEqualTo("ERROR");
+        assertThat(AforoGraphQlBilling.outcomeFromHttpStatus(100)).isNull();
+        assertThat(AforoGraphQlBilling.outcomeFromHttpStatus(0)).isNull();
+        assertThat(AforoGraphQlBilling.outcomeFromHttpStatus(600)).isNull();
+    }
+
+    @Test
+    @DisplayName("record(): explicit executionStatus is normalized and sent; blank/unset/5-arg omit it")
+    void recordExecutionStatusOnWire() throws Exception {
+        try (AforoGraphQlBilling b = baseBuilder().flushCount(4).build()) {
+            b.record("cust_001", "{ a }", null, 5L, true, "  partial ");
+            b.record("cust_001", "{ a }", null, 5L, false, "   ");
+            b.record("cust_001", "{ a }", null, 5L, false, null);
+            b.record("cust_001", "{ a }", null, 5L, false);
+            waitFor(() -> requestBodies.size() == 1, 2000);
+        }
+        JsonNode events = requestBodies.get(0).get("events");
+        assertThat(events.size()).isEqualTo(4);
+        assertThat(events.get(0).get("executionStatus").asText()).isEqualTo("PARTIAL");
+        for (int i = 1; i < 4; i++) assertThat(events.get(i).has("executionStatus")).isFalse();
+    }
+
+    @Test
+    @DisplayName("record(): unknown explicit executionStatus is omitted; the rest of the event (and batch) is sent")
+    void recordOmitsUnknownExecutionStatus() throws Exception {
+        try (AforoGraphQlBilling b = baseBuilder().flushCount(3).build()) {
+            b.record("cust_001", "query Q { a }", null, 5L, true, "kinda_ok");
+            b.record("cust_001", "{ a }", null, 5L, true, "PARTIAL_BUT_WAY_TOO_LONG_FOR_IT");
+            b.record("cust_001", "{ a }", null, 5L, false, " success ");
+            waitFor(() -> requestBodies.size() == 1, 2000);
+        }
+        JsonNode events = requestBodies.get(0).get("events");
+        assertThat(events.size()).isEqualTo(3);
+        assertThat(events.get(0).has("executionStatus")).isFalse();
+        assertThat(events.get(0).get("gqlOperationName").asText()).isEqualTo("Q");
+        assertThat(events.get(0).get("gqlHasErrors").asBoolean()).isTrue();
+        assertThat(events.get(1).has("executionStatus")).isFalse();
+        assertThat(events.get(2).get("executionStatus").asText()).isEqualTo("SUCCESS");
+    }
+
+    @Test
+    @DisplayName("outcomeFromGraphQlResult: an empty errors list counts as no errors")
+    void outcomeFromResultEmptyErrorsList() {
+        graphql.ExecutionResult r = graphql.ExecutionResultImpl.newExecutionResult()
+                .data(null).errors(java.util.List.of()).build();
+        assertThat(AforoGraphQlBilling.outcomeFromGraphQlResult(r)).isEqualTo("SUCCESS");
+        graphql.ExecutionResult noData = graphql.ExecutionResultImpl.newExecutionResult()
+                .errors(java.util.List.of()).build();
+        assertThat(AforoGraphQlBilling.outcomeFromGraphQlResult(noData)).isEqualTo("SUCCESS");
+    }
+
     private static void waitFor(java.util.function.BooleanSupplier cond, long timeoutMs) throws InterruptedException {
         long deadline = System.currentTimeMillis() + timeoutMs;
         while (System.currentTimeMillis() < deadline) {

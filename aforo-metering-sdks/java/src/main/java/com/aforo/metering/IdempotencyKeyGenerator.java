@@ -16,12 +16,13 @@ public final class IdempotencyKeyGenerator {
     /**
      * Generate a deterministic key from event fields via SHA-256 (32 hex chars).
      *
-     * <p><strong>No longer the client default.</strong> {@code occurredAt} only carries
-     * millisecond precision, so two genuinely distinct events for the same customer +
-     * metric + quantity inside one millisecond hash to the same key; the ingestor then
-     * answers DUPLICATE and drops the second one, which silently under-bills. Kept
-     * public for callers who deliberately want content-addressed dedup (e.g. replaying
-     * a fixed batch) and pass the result to {@code TrackEvent.Builder.idempotencyKey}.</p>
+     * <p>WARNING — collapse hazard: two legitimately DISTINCT events with
+     * identical fields in the same timestamp instant produce the SAME key, so
+     * the second dedups away (silent under-billing). The SDK therefore no
+     * longer uses this as the automatic fallback for keyless track() calls
+     * (2026-07-05 — mirrors Aforo ingest's April 2026 H4 fix). Use it only
+     * when your events are guaranteed unique per
+     * (customer, metric, quantity, occurredAt).</p>
      */
     public static String generate(String customerId, String metricName, double quantity, String occurredAt) {
         String input = customerId + ":" + metricName + ":" + quantity + ":" + occurredAt;
@@ -35,11 +36,9 @@ public final class IdempotencyKeyGenerator {
     }
 
     /**
-     * Generate a random UUID v4 key.
-     *
-     * <p>This is the default key for an event whose caller supplied none: every event
-     * gets its own key, so no two distinct events can collide. Dedup stays opt-in via an
-     * explicit {@code idempotencyKey}.</p>
+     * Random UUID key — the automatic fallback for keyless track() calls.
+     * No caller key = dedup opt-out: every call is a distinct event; the key
+     * is stamped once at enqueue so the SDK's own flush retries stay dedup-safe.
      */
     public static String generateRandom() {
         return UUID.randomUUID().toString();

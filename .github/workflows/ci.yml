@@ -29,7 +29,7 @@ jobs:
           set -e
           for d in go go-graphql go-grpc go-ws go-mqtt; do
             echo "::group::$d"
-            (cd "aforo-metering-sdks/$d" && go build ./... && go vet ./... && go test ./...)
+            (cd "aforo-metering-sdks/$d" && go build ./... && go vet ./... && go test -race ./...)
             echo "::endgroup::"
           done
 
@@ -39,7 +39,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pkg: [node, node-agent, node-mcp, mcp-proxy, node-graphql, node-grpc, node-ws, node-mqtt]
+        pkg: [node, node-agent, node-mcp, mcp-proxy, node-graphql, node-grpc, node-ws, node-mqtt, mcp-test-server, agent-test-server]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -58,7 +58,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pkg: [python, python-mcp, python-graphql, python-grpc, python-ws, python-mqtt]
+        pkg: [python, python-agent, python-mcp, python-graphql, python-grpc, python-ws, python-mqtt]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

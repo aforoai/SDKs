@@ -1,4 +1,5 @@
-import { MiddlewareOptions } from '../types';
+import { MiddlewareOptions } from '../types.js';
+import { truncateRequestLabel } from '../limits.js';
 
 /**
  * Metric recorded for each request when `metricName` is not configured.
@@ -26,12 +27,18 @@ export function resolveMetricName(options: MiddlewareOptions, req: any, res: any
   return options.metricName || DEFAULT_METRIC_NAME;
 }
 
-/** Longest endpointPath the ingestor accepts. */
-const MAX_ENDPOINT_PATH = 512;
-
-/** Request path without its query string, capped to what the ingestor accepts. */
+/**
+ * Request path without its query string. Read off the incoming request, so an
+ * over-long path is cut to the ingestor's limit (512) instead of dropping the
+ * event — otherwise a caller could avoid metering with a long URL.
+ */
 export function endpointPathOf(url: string): string {
-  return (url.split('?')[0] || '/').slice(0, MAX_ENDPOINT_PATH);
+  return truncateRequestLabel('endpointPath', String(url).split('?')[0] || '/');
+}
+
+/** HTTP method off the incoming request, cut to the ingestor's limit (16). */
+export function httpMethodOf(method: string): string {
+  return truncateRequestLabel('httpMethod', String(method));
 }
 
 /** First non-empty string among the candidates, or null. */

@@ -282,6 +282,7 @@ class AforoGrpcIntegrationTest {
         assertThat(ev).containsEntry("grpcService", "aforo.test.Greeter");
         assertThat(ev).containsEntry("grpcMethod", "SayHello");
         assertThat(ev).containsEntry("grpcStatusCode", "OK");
+        assertThat(ev).containsEntry("executionStatus", "SUCCESS");
         assertThat(ev).containsEntry("grpcCallType", "UNARY");
         assertThat(ev).containsEntry("customerId", "cust_grpc_001");
     }
@@ -297,6 +298,7 @@ class AforoGrpcIntegrationTest {
         Map<String, Object> ev = events.get(0);
         assertThat(ev).containsEntry("grpcMethod", "FailHard");
         assertThat(ev).containsEntry("grpcStatusCode", "INVALID_ARGUMENT");
+        assertThat(ev).containsEntry("executionStatus", "VALIDATION_FAILED");
         assertThat(ev).containsEntry("customerId", "cust_grpc_002");
     }
 

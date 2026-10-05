@@ -2,7 +2,7 @@
 
 Track API usage events from any Python service and let Aforo handle buffering, batching, and retry — plus drop-in middleware for FastAPI, Django, and Flask that meters every request without touching your handlers.
 
-**Version:** 1.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 1.1.2 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -16,7 +16,7 @@ pip install "aforo-metering[django]"
 pip install "aforo-metering[flask]"
 ```
 
-**Not yet on PyPI — install from source for now.** Straight from GitHub:
+**Install `1.1.2` or later. `1.0.0` on PyPI was built from an older copy of this code and lacks the fixes listed in the changelog.** If `1.1.2` is not on PyPI yet, install straight from GitHub:
 
 ```bash
 pip install "git+https://github.com/aforoai/SDKs.git#subdirectory=aforo-metering-sdks/python"
@@ -84,9 +84,26 @@ Pass these as keyword args to `AforoClient(...)`, or build an `AforoOptions` and
 | `shutdown_timeout` | `float` | `5.0` | Graceful-shutdown drain budget. |
 | `heartbeat_interval` | `float` | `30.0` | Seconds between session heartbeats (see `start_session`). |
 
-`track()` raises `ValueError` for a blank `customer_id` / `metric_name` or `quantity <= 0` — the ingestor rejects such an event, and one invalid event fails the whole batch.
+| `on_drop` | `callable?` | `None` | Opt-in hook `on_drop(events, reason)` for events the SDK loses. See [Dropped events](#dropped-events-dropped_count-on_drop). |
 
-Retry rules, fixed in the transport and not configurable beyond the values above: retry on **5xx, 408, 429**; honor `Retry-After` on 429; **never** retry other 4xx (the batch is dropped and counted as `failed`).
+Retry rules, fixed in the transport and not configurable beyond the values above: retry on **5xx, 408, 429**; honor `Retry-After` on 429; **never** retry other 4xx (the batch is dropped with reason `rejected`).
+
+### Reporting the request outcome (`execution_status`)
+
+`track(..., execution_status="TIMEOUT")` (keyword-only; also a `TrackEvent` field) sends the optional `executionStatus` used by OUTCOME_BASED pricing: each event bills at the weight configured for its status, and an event without a status bills at full weight. The value is trimmed and upper-cased. Accepted values: `SUCCESS`, `PARTIAL`, `TIMEOUT`, `ERROR`, `VALIDATION_FAILED`, `FAILED`, `FAILURE`, `CANCELLED`, `PENDING`, `BLOCKED`, `HITL_REQUIRED`. Any other value (or one over 20 characters) is WARN-logged and left off; the event is still sent. The full rules are in the [repository README](../README.md#reporting-the-request-outcome-executionstatus).
+
+### Dropped events (`dropped_count`, `on_drop`)
+
+`track()` never raises for event content — only `RuntimeError` after `shutdown()`. Every event the SDK cannot deliver is counted in `client.dropped_count`, WARN-logged, and passed to the opt-in `on_drop(events, reason)` hook. Dropped events keep their idempotency keys, so replaying them through `track()` is dedup-safe.
+
+| `reason` | When |
+|---|---|
+| `overflow` | The ring buffer was full; the oldest event was evicted. |
+| `retry_exhausted` | A batch still failed after all retries (5xx, 408, 429, network). |
+| `rejected` | The ingestor answered a non-retryable 4xx for the batch, or rejected individual events in a `202` (`failed` / `errors[]`). Only the events the response names by index are passed to the hook; if it names none, they are counted only. |
+| `invalid` | `track()` refused the event before buffering it: blank `customer_id` / `metric_name`, `quantity <= 0`, a malformed `occurred_at`, or a field over the ingestor's limit (`customerId` 64, `metricName` 255, `idempotencyKey` 255, `productType` 20, `quantity` 14 integer / 6 decimal digits, and the `extra_fields` limits in `aforo/limits.py`). Never truncated or rounded. The WARN names the field, the limit and the value; it is logged on the first occurrence and then every 1000th. |
+
+A failed session heartbeat is not a usage drop and is not counted.
 
 ### Framework middleware
 
@@ -95,7 +112,8 @@ Each adapter constructs its own `AforoClient` and emits one event per request.
 - **Metric:** `metric_name` — a fixed name or a callable; default `"api_calls"` (`aforo.DEFAULT_METRIC_NAME`). The metric must exist in your tenant's Aforo catalog: the ingestor rejects an unknown metric, and because it validates a batch as a whole, one rejected event fails every event in that batch.
 - **Customer:** `customer_id` — a fixed id or a callable; default is the `X-Customer-Id` header (Django tries `request.user.id` first). The caller's `X-Api-Key` is never used — it is a secret, not a customer id. A request with no resolvable customer ID is **not** metered.
 - **Product type:** `product_type` (Flask kwarg / `AFORO_PRODUCT_TYPE` config, Django `AFORO_PRODUCT_TYPE` setting, FastAPI kwarg) — default `"API"`.
-- Every event carries top-level `endpointPath` (path without query string, max 512 chars), `httpMethod`, `statusCode` and `responseTimeMs`. A `quantity` resolving to `<= 0` is not metered.
+- Every event carries top-level `endpointPath` (path without query string), `httpMethod`, `statusCode` and `responseTimeMs`. A `quantity` resolving to `<= 0` is not metered.
+- `endpointPath` and `httpMethod` are read from the incoming request. A value over the ingestor's limit (512 / 16 characters, counted in UTF-16 code units) is truncated to the limit and the event is still sent; a WARNING is logged once per field per process. Fields you set yourself (`customer_id`, `metric_name`, `idempotency_key`, anything in `extra_fields`) are never truncated: an over-long one drops the event with reason `invalid`.
 - **CORS preflights** (`OPTIONS`) are never metered.
 
 ```python

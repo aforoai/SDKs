@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="aforo-grpc-metering",
-    version="1.0.0",
+    version="1.2.2",
     description="Aforo gRPC Metering SDK — server interceptors and decorators that meter every RPC call to Aforo's usage ingestor.",
     long_description=open("README.md").read() if __import__("os").path.exists("README.md") else "",
     long_description_content_type="text/markdown",

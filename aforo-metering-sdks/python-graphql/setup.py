@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="aforo-graphql-metering",
-    version="1.0.0",
+    version="1.2.2",
     description="Aforo GraphQL Metering SDK — Strawberry/Graphene/Ariadne extensions + ASGI middleware that meter every GraphQL operation with AST-accurate complexity scoring.",
     long_description=open("README.md").read() if __import__("os").path.exists("README.md") else "",
     long_description_content_type="text/markdown",

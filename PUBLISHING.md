@@ -95,6 +95,22 @@ gh api -X PUT orgs/aforoai/teams/sdk-maintainers/memberships/<github-username>
 
 ---
 
+## Where SDK changes come from
+
+`aforo-metering-sdks/` is synced one-way from the working repo
+(`jayaforo/aforo-metering-sdks`) by pull request. Do not edit SDK code here: the
+next sync overwrites it. Root files (`.github/`, this file, `VERSIONING.md`,
+`README.md`) and the plugin directories are edited in this repo.
+
+## Already published (2026-10-01)
+
+`1.0.0` of the eight npm packages and of six PyPI packages, and Go `v1.0.0` of
+all five modules, were published before the first sync. They lack
+`executionStatus`, the `{success, data}` response-envelope fix and label
+truncation. A published version cannot be reused; the versions in
+[VERSIONING.md](VERSIONING.md) are higher and supersede them. Tag each module
+with the version in its own manifest, not the examples below.
+
 ## Step F — Launch sequence (laptop): tag → release → publish
 
 Make sure `main` holds the version you're shipping and CI is green. Tag formats
@@ -102,16 +118,16 @@ Make sure `main` holds the version you're shipping and CI is green. Tag formats
 
 | Artifact | Tag | Example |
 |---|---|---|
-| Node / Python / Java / gateway / EMQX | `<artifact>-v<version>` | `node-v1.0.0`, `kong-v2.0.0` |
-| Go modules | `aforo-metering-sdks/<pkg>/v<version>` *(required by the Go proxy)* | `aforo-metering-sdks/go/v1.0.0` |
+| Node / Python / Java / gateway / EMQX | `<artifact>-v<version>` | `node-v1.1.2`, `kong-v2.1.0` |
+| Go modules | `aforo-metering-sdks/<pkg>/v<version>` *(required by the Go proxy)* | `aforo-metering-sdks/go/v1.1.2` |
 
 ```bash
 # 1. Tag + push. release.yml cuts the GitHub Release automatically (no secrets).
-git tag node-v1.0.0
-git push origin node-v1.0.0
+git tag node-v1.1.2
+git push origin node-v1.1.2
 
 # 2. Publish FROM that exact tagged commit — --ref pins it so main drift can't leak in.
-gh workflow run "Publish — npm" --repo aforoai/SDKs --ref node-v1.0.0 \
+gh workflow run "Publish — npm" --repo aforoai/SDKs --ref node-v1.1.2 \
   -f package_dir=aforo-metering-sdks/node
 
 # 3. Watch the run.
@@ -122,15 +138,15 @@ Repeat per artifact, swapping the workflow + input:
 
 ```bash
 # Python  (input: package_dir; runs in the `pypi` environment, OIDC):
-gh workflow run "Publish — PyPI" --ref python-v1.0.0 \
+gh workflow run "Publish — PyPI" --ref python-v1.1.2 \
   -f package_dir=aforo-metering-sdks/python
 
 # Java / Maven  (input: module_dir):
-gh workflow run "Publish — Maven Central" --ref java-v1.0.0 \
+gh workflow run "Publish — Maven Central" --ref java-v1.1.2 \
   -f module_dir=aforo-metering-sdks/java
 
 # Go — NO publish workflow. The tag IS the release; the module proxy serves it:
-git tag aforo-metering-sdks/go/v1.0.0 && git push origin aforo-metering-sdks/go/v1.0.0
+git tag aforo-metering-sdks/go/v1.1.2 && git push origin aforo-metering-sdks/go/v1.1.2
 ```
 
 The `gh workflow run` calls are `workflow_dispatch`-only, so a publish happens
@@ -149,7 +165,7 @@ first Go module tag is pushed.
 ### Artifacts to loop through
 
 - **8 npm**: `node, node-agent, node-mcp, mcp-proxy, node-graphql, node-grpc, node-ws, node-mqtt`
-- **6 PyPI**: `python, python-mcp, python-graphql, python-grpc, python-ws, python-mqtt`
+- **7 PyPI**: `python, python-agent, python-mcp, python-graphql, python-grpc, python-ws, python-mqtt` (`aforo-agent-metering` needs its trusted publisher registered first — Step D)
 - **5 Maven**: `java, java-graphql, java-grpc, java-ws, java-mqtt`
 - **5 Go** (tag only): `go, go-graphql, go-grpc, go-ws, go-mqtt`
 - **Gateway plugins / EMQX** ship from source — tag them for versioning, but

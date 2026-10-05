@@ -1,0 +1,10 @@
+# Local link to the SDK in this repo. Install with:
+#   pip install -e ../..
+# The example doesn't hard-depend on aiohttp/httpx — the SDK falls back
+# to urllib. Add one of those extras yourself if you want async POST
+# performance ("pip install -e ../..[aiohttp]" or "[httpx]").
+-e ../..
+
+# Optional: dotenv for .env file support. Falls back to os.environ if
+# not installed.
+python-dotenv>=1.0

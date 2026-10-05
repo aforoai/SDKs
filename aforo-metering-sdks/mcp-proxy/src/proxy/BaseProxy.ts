@@ -46,6 +46,7 @@ export abstract class BaseProxy {
       flushCount: config.aforo.flushCount ?? 50,
       flushIntervalMs: config.aforo.flushIntervalMs ?? 5000,
       client,
+      onDrop: config.aforo.onDrop,
     });
 
     this.heartbeat = new HeartbeatEmitter({
@@ -67,6 +68,8 @@ export abstract class BaseProxy {
       productId: config.aforo.productId,
       transport: config.transport,
       agentIdOverride: config.aforo.agentId,
+      statusResolver: config.aforo.statusResolver,
+      staleCallTimeoutMs: config.aforo.responseTimeoutMs,
       customerId: config.aforo.customerId,
       productType: config.aforo.productType,
     });
@@ -109,7 +112,8 @@ export abstract class BaseProxy {
       if (toolCall) {
         // Quota check (if enabled)
         const denyResponse = await this.quota.check(
-          this.config.aforo.agentId ?? toolCall.agentId,
+          // Same customer the call is billed to (see ToolCallTracker.resolveCustomerId)
+          this.tracker.resolveCustomerId(toolCall),
           'mcp_server.tool_invocations',
           toolCall.requestId,
         );

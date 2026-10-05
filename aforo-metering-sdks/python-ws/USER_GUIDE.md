@@ -1,6 +1,6 @@
 # aforo-ws-metering — User Guide
 
-**Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** Python engineers serving WebSocket connections who need connection- or frame-level billing.
+**Version:** 1.2.2 · **Updated:** 2026-10-01 · **Audience:** Python engineers serving WebSocket connections who need connection- or frame-level billing.
 
 ## What you'll build
 
@@ -16,7 +16,7 @@ A WebSocket server that reports usage to Aforo — by default one connection-ope
 ## Step 1 — Install
 
 ```bash
-pip install -e .                  # from python-ws/ (not yet on PyPI)
+pip install -e .                  # from python-ws/ (or: pip install "aforo-ws-metering>=1.2.2")
 pip install -e ".[fastapi]"       # or [websockets] / [httpx]
 ```
 
@@ -111,9 +111,12 @@ billing.shutdown()   # flushes the final batch before process exit
 | `flush_count` | `int` | `100` | Buffer size that forces a flush. |
 | `per_frame_events` | `bool` | `False` | One event per frame vs. open + close. |
 | `on_error` | `Callable?` | logs | Called on permanent batch failure, and with the ingestor's `errors[].message` when it rejects events. |
+| `on_drop` | `Callable[[list[dict], str], None]?` | `None` | Called with events that will not be delivered and the reason (`invalid`, `rejected`, `retry_exhausted`). Pass by keyword. |
 | `product_type` | `str` | `"WEBSOCKET_API"` | Top-level `productType` sent on every event (trimmed and upper-cased; values the SDK does not know are passed through). Override per event with a `productType` key in `push({...})` or `product_type=` on `track_websockets_connection` / `track_starlette_websocket`. |
 
 Exports: `AforoWsBilling`, `track_websockets_connection(billing, ws, customer_id)`, `track_starlette_websocket(billing, ws, customer_id)`, `WS_CLOSE_REASONS`. Each tracker helper returns an async context manager.
+
+Execution status (`executionStatus`, used by OUTCOME_BASED pricing) is described in the [README](README.md#execution-status-executionstatus).
 
 ## Troubleshooting
 
@@ -121,7 +124,8 @@ Exports: `AforoWsBilling`, `track_websockets_connection(billing, ws, customer_id
 |---|---|---|
 | A route emits no events | The connection wasn't wrapped in `track_*`, or `customer_id` was falsy. | Wrap the connection in the `async with` block and resolve `customer_id` first. |
 | Close event missing / counts are zero | The `async with` block never exited cleanly, or the handler returned before entering it. | Ensure the block wraps the whole message loop; counts finalize on exit. |
-| `on_error` fires with "Aforo returned 401/403" | Bad/unscoped API key — 4xx is dropped, not retried. | Fix `api_key`; confirm it matches `tenant_id`. |
+| `on_error` fires with "flush rejected with HTTP 401" (or 403) | Bad or unscoped API key. A 4xx other than 408 / 429 is not retried; the batch is dropped with reason `rejected`. | Fix `api_key`; confirm it matches `tenant_id`. Replay the batch from an `on_drop` hook if you keep one. |
+| `billing.dropped_count` is above 0 | Events were dropped: `invalid` (failed a client-side check), `rejected` (ingestor refused them) or `retry_exhausted`. | Read the WARNING log line for the reason; see [Dropped events](README.md#dropped-events). |
 | Events sent, none in console | Wrong `ingestor_url` host, or the metric isn't mapped to a rate plan. | Use `https://api.aforo.ai`; map `websocket_api.connection_closed` (and `.message`) in Aforo. |
 | Event volume far higher than expected | `per_frame_events=True` emits one event per frame. | Switch back to default open+close unless you price per frame. |
 | `wsCloseReason` is `INTERNAL_ERROR` | An exception was raised inside the handler before a clean close. | Expected — fix the handler error; the close is still recorded. |

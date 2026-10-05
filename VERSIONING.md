@@ -29,16 +29,23 @@ When you change an artifact's behavior, in the **same commit**: bump its version
 
 Each artifact versions independently. A Kong-plugin patch does not bump the Node SDK.
 
-## Current baseline (2026-06-29)
+## Current versions (2026-10-02)
 
-| Artifact | Version |
-|---|---|
-| `aforo-metering-sdks/` — all Node, Python, Java, Go SDKs + `mcp-proxy` | `1.0.0` |
-| `aforo-gateway-plugins/` — `kong`, `aws-lambda`, `apigee`, `azure-apim`, `mulesoft` | `2.2.0` |
-| `aforo-emqx-plugin/` | `0.1.0` (experimental) |
-| `aforo-gateway-plugins/aws-cloudformation`, `aforo-gateway-plugins/azure-arm-templates` | `1.0.0` |
+| Artifact | In this repo | Already published |
+|---|---|---|
+| `node`, `python`, `java`, `go` | `1.1.2` | `1.0.0` (npm, PyPI, Go tag); Java: none |
+| `node-` / `python-` / `java-` / `go-` × `graphql`, `grpc`, `mqtt`; `python-ws` | `1.2.2` | `1.0.0`; Java: none |
+| `node-ws`, `java-ws`, `go-ws` | `1.2.1` | `1.0.0`; Java: none |
+| `node-mcp`, `python-mcp` | `1.3.2` | `1.0.0` |
+| `mcp-proxy` | `1.2.2` | `1.0.0` |
+| `node-agent` | `1.2.0` | `1.0.0` |
+| `python-agent` | `0.3.2` | none |
+| `mcp-test-server`, `agent-test-server` (internal, not published) | `0.1.0` | — |
+| `aforo-gateway-plugins/` — `kong`, `aws-lambda`, `apigee`, `azure-apim`, `mulesoft` | `2.2.0` | GitHub Releases `2.1.0` (`2.2.0` after the release tags are pushed) |
+| `aforo-emqx-plugin/` | `0.1.0` (experimental) | — |
+| `aforo-gateway-plugins/aws-cloudformation`, `aforo-gateway-plugins/azure-arm-templates` | `1.0.0` | — |
 
-The gateway plugins sit at `2.2.0` (`2.0.0` was their security-hardened release; `2.2.0` merged the internal line into `2.1.0`); the SDKs are on their own `1.x` line; the EMQX broker plugin is pre-1.0 (experimental). These are independent lines, not a single repo-wide version.
+The published `1.0.0` SDK artifacts predate the first sync from the working repo and must not be used; a published version can never be reused, so each module's next release is the version in the middle column. The gateway plugins sit at `2.2.0` here (`2.0.0` was their security-hardened release; `2.2.0` merges the internal line into `2.1.0`). The gateway plugins, the SDKs and the EMQX plugin are independent lines, not a single repo-wide version.
 
 ## Releasing
 

@@ -140,7 +140,7 @@ describe('AforoMcpBilling session heartbeats', () => {
   });
 
   it('fires onSessionKilled when a heartbeat response lists the session in killedSessionIds', async () => {
-    const fetchMock = okFetch({ accepted: 0, duplicates: 0, failed: 0, errors: [], killedSessionIds: ['sess_k'] });
+    const fetchMock = okFetch({ success: true, data: { accepted: 0, duplicates: 0, failed: 0, errors: [], killedSessionIds: ['sess_k'] } });
     (global as { fetch?: unknown }).fetch = fetchMock;
     const onSessionKilled = jest.fn();
     const billing = new AforoMcpBilling({ ...cfg, onSessionKilled });
@@ -183,18 +183,40 @@ describe('AforoMcpBilling productType, attribution and validation', () => {
     ]);
   });
 
-  it('drops events that would fail the batch (blank/long toolName, long agentId/customerId)', async () => {
+  it('drops invalid events (blank toolName, long agentId/customerId/sessionId) as "invalid" without throwing', async () => {
     const fetchMock = okFetch();
     (global as { fetch?: unknown }).fetch = fetchMock;
-    const onError = jest.fn();
-    const billing = new AforoMcpBilling({ ...cfg, onError });
-    billing.recordToolInvocation(' ', 'agent_1', undefined, 'SUCCESS', 1);
-    billing.recordToolInvocation('t'.repeat(65), 'agent_1', undefined, 'SUCCESS', 1);
-    billing.recordToolInvocation('search', 'a'.repeat(37), undefined, 'SUCCESS', 1);
-    billing.recordToolInvocation('search', 'agent_1', undefined, 'SUCCESS', 1, { customerId: 'c'.repeat(65) });
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const drops: Array<{ events: any[]; reason: string }> = [];
+    const billing = new AforoMcpBilling({ ...cfg, onDrop: (events, reason) => drops.push({ events, reason }) });
+    expect(() => {
+      billing.recordToolInvocation(' ', 'agent_1', undefined, 'SUCCESS', 1);
+      billing.recordToolInvocation('search', 'a'.repeat(37), undefined, 'SUCCESS', 1);
+      billing.recordToolInvocation('search', 'agent_1', undefined, 'SUCCESS', 1, { customerId: 'c'.repeat(65) });
+      billing.recordToolInvocation('search', 'agent_1', 's'.repeat(65), 'SUCCESS', 1);
+    }).not.toThrow();
     await billing.shutdown();
+
     expect(fetchMock).not.toHaveBeenCalled();
-    expect(onError).toHaveBeenCalledTimes(4);
+    expect(billing.droppedCount).toBe(4);
+    expect(drops.map((d) => d.reason)).toEqual(['invalid', 'invalid', 'invalid', 'invalid']);
+    for (const d of drops) {
+      expect(d.events).toHaveLength(1);
+      expect(d.events[0].idempotencyKey).toBeTruthy();
+    }
+    // Throttled: only the first invalid event is logged; it names the field and the value.
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('toolName is blank'));
+  });
+
+  it('accepts values exactly at the ingestor limits', async () => {
+    const fetchMock = okFetch();
+    (global as { fetch?: unknown }).fetch = fetchMock;
+    const billing = new AforoMcpBilling(cfg);
+    billing.recordToolInvocation('t'.repeat(64), 'a'.repeat(36), 's'.repeat(64), 'SUCCESS', 1, { customerId: 'c'.repeat(64) });
+    await billing.shutdown();
+    expect(billing.droppedCount).toBe(0);
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).events).toHaveLength(1);
   });
 });
 
@@ -232,6 +254,48 @@ describe('AforoMcpBilling transport', () => {
     billing.recordToolInvocation('search', 'agent_1', undefined, 'SUCCESS', 1);
     await billing.shutdown();
     expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('#0: unknown metric') }));
+  });
+
+  it('drops only the events the server rejected by index (reason "rejected")', async () => {
+    const fetchMock = okFetch({ success: true, data: { accepted: 1, duplicates: 0, failed: 1, errors: [{ index: 1, message: 'unknown metric' }] } });
+    (global as { fetch?: unknown }).fetch = fetchMock;
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const drops: Array<{ events: any[]; reason: string }> = [];
+    const billing = new AforoMcpBilling({ ...cfg, onError: jest.fn(), onDrop: (events, reason) => drops.push({ events, reason }) });
+    billing.recordToolInvocation('search', 'agent_1', undefined, 'SUCCESS', 1);
+    billing.recordToolInvocation('fetch', 'agent_1', undefined, 'SUCCESS', 1);
+    await billing.shutdown();
+    expect(billing.droppedCount).toBe(1);
+    expect(drops).toHaveLength(1);
+    expect(drops[0].reason).toBe('rejected');
+    expect(drops[0].events.map((e) => e.toolName)).toEqual(['fetch']);
+    warn.mockRestore();
+  });
+
+  it('counts unidentified per-event failures without guessing which events', async () => {
+    const fetchMock = okFetch({ accepted: 1, duplicates: 0, failed: 1 });
+    (global as { fetch?: unknown }).fetch = fetchMock;
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const onDrop = jest.fn();
+    const billing = new AforoMcpBilling({ ...cfg, onError: jest.fn(), onDrop });
+    billing.recordToolInvocation('search', 'agent_1', undefined, 'SUCCESS', 1);
+    billing.recordToolInvocation('fetch', 'agent_1', undefined, 'SUCCESS', 1);
+    await billing.shutdown();
+    expect(billing.droppedCount).toBe(1);
+    expect(onDrop).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it('a failed heartbeat is not a usage drop', async () => {
+    const fetchMock = jest.fn().mockRejectedValue(new Error('down'));
+    (global as { fetch?: unknown }).fetch = fetchMock;
+    const onDrop = jest.fn();
+    const billing = new AforoMcpBilling({ ...cfg, onError: jest.fn(), onDrop });
+    billing.startSession('sess_1');
+    await billing.endSession();
+    expect(fetchMock).toHaveBeenCalledTimes(2); // HEARTBEAT + SESSION_END, one attempt each
+    expect(billing.droppedCount).toBe(0);
+    expect(onDrop).not.toHaveBeenCalled();
   });
 });
 

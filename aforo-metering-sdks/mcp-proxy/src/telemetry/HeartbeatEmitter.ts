@@ -11,15 +11,16 @@
  * each heartbeat carries quantity 1 and is POSTed in its OWN request
  * (`{"events":[heartbeat]}`), never pushed into the usage buffer. Heartbeats are
  * best-effort: sent once, failures logged and ignored, never affecting usage
- * delivery. The timer is unref'd so it never keeps the process alive.
+ * delivery. A failed heartbeat is not a usage drop: it is never counted as
+ * dropped or passed to onDrop. The timer is unref'd so it never keeps the process alive.
  */
 
 import type { ProxyUsageEvent, BatchIngestResponse } from '../types.js';
 import type { EventBuffer } from './EventBuffer.js';
 import { generateHeartbeatKey } from '../util/idempotency.js';
 import { logger } from '../util/logger.js';
+import { PROXY_VERSION } from '../version.js';
 
-const PROXY_VERSION = '1.0.0';
 /** customerId on heartbeats when no customer is known; heartbeats are never billed. */
 export const HEARTBEAT_FALLBACK_CUSTOMER_ID = 'system';
 
