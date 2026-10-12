@@ -79,11 +79,12 @@ end
 -- JWT Validation helpers
 -- ────────────────────────────────────────────────────────────
 
--- Extract Bearer token from Authorization header
+-- Extract Bearer token from Authorization header. The scheme is matched
+-- case-insensitively (RFC 7235): "bearer" is as valid as "Bearer".
 local function extract_bearer_token()
     local auth_header = kong.request.get_header("Authorization")
-    if not auth_header then return nil end
-    local _, _, token = string.find(auth_header, "^[Bb]earer%s+(.+)$")
+    if type(auth_header) ~= "string" then return nil end
+    local _, _, token = string.find(auth_header, "^[Bb][Ee][Aa][Rr][Ee][Rr]%s+(.+)$")
     return token
 end
 
@@ -118,9 +119,30 @@ local function base64url_decode(str)
     return ngx.decode_base64(str)
 end
 
--- Parse a JWT into {header, claims, parts} without crypto verification.
--- Returns (claims_table, parts_array) on success, or (nil, err_string) on failure.
-local function parse_jwt_claims(token)
+-- v when it is a non-empty string, else nil. A type check rather than a
+-- truthiness one, so a null config value can never reach an event as a JSON
+-- null that the required-field check would wave through.
+local function non_empty_string(v)
+    if type(v) == "string" and v ~= "" then
+        return v
+    end
+    return nil
+end
+
+-- A claim as a non-empty string, or nil. Claims come from a token the caller
+-- built, and before the signature is checked that caller may be anyone, so
+-- nothing about their types can be assumed: a JSON null decodes to the
+-- cjson.null userdata, which is truthy, compares unequal to everything, and
+-- raises when concatenated or sent as a header -- a 500 on demand.
+local function claim_string(v)
+    if type(v) == "string" and v ~= "" then return v end
+    if type(v) == "number" then return tostring(v) end
+    return nil
+end
+
+-- Parse a JWT without crypto verification.
+-- Returns (claims, header) on success, or (nil, err_string) on failure.
+local function parse_jwt(token)
     local parts = {}
     for part in token:gmatch("([^.]+)") do
         table.insert(parts, part)
@@ -133,7 +155,16 @@ local function parse_jwt_claims(token)
     local ok, claims = pcall(cjson.decode, payload_json)
     if not ok or type(claims) ~= "table" then return nil, "invalid_jwt_payload" end
 
-    return claims, parts
+    -- The header only matters for its kid (JWKS key selection); a missing or
+    -- unreadable header is not an error here -- the signature check decides.
+    local header = {}
+    local header_json = base64url_decode(parts[1])
+    if header_json then
+        local hok, h = pcall(cjson.decode, header_json)
+        if hok and type(h) == "table" then header = h end
+    end
+
+    return claims, header
 end
 
 -- Shared dict backing the event buffer and the warning throttle below.
@@ -165,42 +196,251 @@ local function warn_throttled(key, ttl, ...)
     end
 end
 
--- Check jti blocklist in Redis.  Fail-open: returns false on any Redis error.
-local function is_jti_blocked(jti, redis_host, redis_port)
-    if not jti or jti == "" then return false end
-    local red = require("resty.redis"):new()
-    red:set_timeout(500)
-    local ok, err = red:connect(redis_host or "127.0.0.1", redis_port or 6379)
-    if not ok then
-        warn_throttled("redis_jti", 60,
-            "[aforo-metering] Redis unreachable for jti-blocklist check at ",
-            redis_host or "127.0.0.1", ":", redis_port or 6379, " (", err, "). ",
-            "Failing OPEN -- revoked tokens are NOT being rejected. ",
-            "Set jwt_redis_host/jwt_redis_port. Repeats suppressed for 60s.")
-        return false  -- fail-open: do not block legitimate requests on Redis failure
+-- Revocation lists in Redis, as org-service's JtiBlocklistService writes them:
+--   jti:blocked:{jti}          one token                   (value "1")
+--   jti:client:{client_id}     every token for that client (value "revoked")
+-- jti:client:{key_id} is checked too, as a secondary key.
+--
+-- Fail-OPEN, as documented, and only on evidence (2026-10-12 fix). The value
+-- used to be treated as "revoked" whenever it was anything but nil or
+-- ngx.null. lua-resty-redis answers a Redis ERROR reply -- NOAUTH on a
+-- password-protected Redis, LOADING while it restores, MOVED in a cluster --
+-- with false, so every one of those turned into 401 TOKEN_REVOKED for every
+-- token: fail-CLOSED, with nothing in the log. And no AUTH was ever sent, so
+-- a protected Redis produced exactly that. Now only a real string value means
+-- revoked; an error reply is logged (throttled) and treated as not revoked,
+-- the same as an unreachable Redis.
+--
+-- One connection per request for all the lookups, not one per lookup.
+-- Returns "TOKEN_REVOKED", "CLIENT_REVOKED" or nil.
+local function revocation_reason(conf, claims)
+    local lookups = {}
+    if claims.jti then
+        lookups[#lookups + 1] = { "jti:blocked:" .. claims.jti, "TOKEN_REVOKED" }
     end
-    local val = red:get("jti:blocked:" .. jti)
-    red:set_keepalive(10000, 10)
-    return val ~= nil and val ~= ngx.null
-end
+    if claims.client_id then
+        lookups[#lookups + 1] = { "jti:client:" .. claims.client_id, "CLIENT_REVOKED" }
+    end
+    if claims.key_id and claims.key_id ~= claims.client_id then
+        lookups[#lookups + 1] = { "jti:client:" .. claims.key_id, "CLIENT_REVOKED" }
+    end
+    if #lookups == 0 then return nil end
 
--- Check client-level revocation via key_id.  Fail-open.
-local function is_client_revoked(key_id, redis_host, redis_port)
-    if not key_id or key_id == "" then return false end
+    -- Prefer dedicated jwt_redis_* config; fall back to rate_limit_redis_*.
+    -- The password goes with the server: rate_limit_redis_password is only
+    -- borrowed when the blocklist lives on the rate-limit Redis, so a
+    -- password-less blocklist Redis is not sent a password it would refuse.
+    local rl_host = conf.rate_limit_redis_host or "127.0.0.1"
+    local rl_port = conf.rate_limit_redis_port or 6379
+    local host = non_empty_string(conf.jwt_redis_host) or rl_host
+    local port = conf.jwt_redis_port or rl_port
+    local password = non_empty_string(conf.jwt_redis_password)
+    if not password and host == rl_host and port == rl_port then
+        password = non_empty_string(conf.rate_limit_redis_password)
+    end
+
     local red = require("resty.redis"):new()
     red:set_timeout(500)
-    local ok, err = red:connect(redis_host or "127.0.0.1", redis_port or 6379)
+    local ok, err = red:connect(host, port)
+    if ok and password then
+        ok, err = red:auth(password)
+        if not ok then err = "AUTH failed: " .. tostring(err) end
+    end
     if not ok then
         warn_throttled("redis_revocation", 60,
-            "[aforo-metering] Redis unreachable for client-revocation check at ",
-            redis_host or "127.0.0.1", ":", redis_port or 6379, " (", err, "). ",
-            "Failing OPEN -- revoked API keys are NOT being rejected. ",
-            "Set jwt_redis_host/jwt_redis_port. Repeats suppressed for 60s.")
-        return false
+            "[aforo-metering] Redis unavailable for the JWT revocation check at ",
+            host, ":", port, " (", tostring(err), "). ",
+            "Failing OPEN -- revoked tokens and clients are NOT being rejected. ",
+            "Check jwt_redis_host / jwt_redis_port / jwt_redis_password. Repeats suppressed for 60s.")
+        red:close()
+        return nil
     end
-    local val = red:get("jti:client:" .. key_id)
+
+    local failed
+    for _, lookup in ipairs(lookups) do
+        local val, gerr = red:get(lookup[1])
+        if type(val) == "string" then
+            red:set_keepalive(10000, 10)
+            return lookup[2]
+        end
+        if val ~= ngx.null then
+            -- An error reply or a broken connection: no evidence either way.
+            failed = gerr or "no reply"
+        end
+    end
+
+    if failed then
+        warn_throttled("redis_revocation_reply", 60,
+            "[aforo-metering] Redis answered the JWT revocation lookup with an error (",
+            tostring(failed), ") at ", host, ":", port, ". Failing OPEN -- revoked tokens ",
+            "and clients are NOT being rejected. NOAUTH means jwt_redis_password is missing ",
+            "or wrong. Repeats suppressed for 60s.")
+        red:close()
+        return nil
+    end
     red:set_keepalive(10000, 10)
-    return val ~= nil and val ~= ngx.null
+    return nil
+end
+
+-- ── JWKS (jwt_jwks_uri) ─────────────────────────────────────
+--
+-- The issuer's public keys, fetched from its JWKS document and selected by the
+-- token header's kid. Never fetched per request:
+--   * cached in aforo_buffer for JWKS_HARD_TTL, refreshed in the background
+--     (a timer) once the copy is older than JWKS_SOFT_TTL -- requests keep
+--     using the cached keys meanwhile
+--   * fetched in the request only when nothing is cached yet, or the token's
+--     kid is not in the cached set (the issuer rotated its key) -- and then at
+--     most once per JWKS_REFETCH_INTERVAL across all workers, so a stream of
+--     tokens with invented kids cannot become a stream of fetches
+-- A set older than JWKS_HARD_TTL is dropped rather than trusted indefinitely:
+-- a key the issuer withdrew must stop verifying eventually even if the JWKS
+-- endpoint stays unreachable.
+local JWKS_CACHE_PREFIX = "aforo:jwks:"
+local JWKS_FETCH_LOCK_PREFIX = "aforo:jwks_fetch:"
+local JWKS_REFRESH_LOCK_PREFIX = "aforo:jwks_refresh:"
+local JWKS_SOFT_TTL = 3600
+local JWKS_HARD_TTL = 86400
+local JWKS_REFETCH_INTERVAL = 30
+local JWKS_FETCH_TIMEOUT_MS = 2000
+
+-- cjson.null -> nil, for optional JWK members.
+local function json_opt(v)
+    if v == cjson.null then return nil end
+    return v
+end
+
+-- GET and parse the JWKS document. Returns an entry
+-- { fetched_at, count, keys = { [kid] = jwk_json } } or (nil, reason).
+-- Only RSA signing keys usable for RS256 are kept; a key without a kid is
+-- stored under "" and can only match a kid-less token.
+local function fetch_jwks(uri)
+    local httpc = http.new()
+    httpc:set_timeout(JWKS_FETCH_TIMEOUT_MS)
+    local res, err = httpc:request_uri(uri, {
+        method = "GET",
+        headers = { ["Accept"] = "application/json" },
+    })
+    if not res then return nil, "fetch failed: " .. tostring(err) end
+    if res.status ~= 200 then return nil, "status " .. tostring(res.status) end
+
+    local doc = cjson.decode(res.body)
+    if type(doc) ~= "table" or type(doc.keys) ~= "table" then
+        return nil, "response is not a JWKS document"
+    end
+
+    local keys, count = {}, 0
+    for _, k in ipairs(doc.keys) do
+        if type(k) == "table" and k.kty == "RSA"
+            and (json_opt(k.use) == nil or k.use == "sig")
+            and (json_opt(k.alg) == nil or k.alg == "RS256") then
+            keys[claim_string(k.kid) or ""] = cjson.encode(k)
+            count = count + 1
+        end
+    end
+    if count == 0 then return nil, "no RS256 signing keys in the JWKS" end
+    return { fetched_at = ngx.now(), count = count, keys = keys }
+end
+
+local function cached_jwks(dict, uri)
+    local raw = dict:get(JWKS_CACHE_PREFIX .. uri)
+    local entry = raw and cjson.decode(raw)
+    return type(entry) == "table" and type(entry.keys) == "table" and entry or nil
+end
+
+local function store_jwks(dict, uri, entry)
+    dict:set(JWKS_CACHE_PREFIX .. uri, cjson.encode(entry), JWKS_HARD_TTL)
+end
+
+-- The key for kid. A token without a kid only matches a set of exactly one
+-- key: with several, picking one would be a guess.
+local function pick_jwk(entry, kid)
+    if not entry then return nil end
+    if kid then return entry.keys[kid] end
+    if entry.count == 1 then
+        local _, jwk = next(entry.keys)
+        return jwk
+    end
+    return nil
+end
+
+local function refresh_jwks(premature, uri)
+    if premature then return end
+    local dict = ngx.shared[BUFFER_DICT]
+    if not dict then return end
+    local entry, err = fetch_jwks(uri)
+    if entry then
+        store_jwks(dict, uri, entry)
+    else
+        warn_throttled("jwks_refresh", 300,
+            "[aforo-metering] Could not refresh the JWKS from ", uri, " (", err, "). ",
+            "Keeping the cached keys. Repeats suppressed for 300s.")
+    end
+end
+
+-- The JWK (JSON string) to verify a token with kid, or (nil, reason).
+local function jwks_key(uri, kid)
+    local dict = ngx.shared[BUFFER_DICT]
+    if not dict then
+        return nil, "shared dict '" .. BUFFER_DICT .. "' not available"
+    end
+
+    local entry = cached_jwks(dict, uri)
+    local jwk = pick_jwk(entry, kid)
+    if jwk then
+        if ngx.now() - (tonumber(entry.fetched_at) or 0) > JWKS_SOFT_TTL
+            and dict:add(JWKS_REFRESH_LOCK_PREFIX .. uri, 1, JWKS_REFETCH_INTERVAL) then
+            ngx.timer.at(0, refresh_jwks, uri)
+        end
+        return jwk
+    end
+
+    if not dict:add(JWKS_FETCH_LOCK_PREFIX .. uri, 1, JWKS_REFETCH_INTERVAL) then
+        if entry then
+            return nil, "kid '" .. tostring(kid) .. "' is not in the cached JWKS, and it was "
+                .. "refetched less than " .. JWKS_REFETCH_INTERVAL .. "s ago"
+        end
+        -- Cold cache, and another request is fetching it right now (just
+        -- after a restart, typically). Wait for that fetch rather than
+        -- refusing a valid token.
+        for _ = 1, JWKS_FETCH_TIMEOUT_MS / 50 do
+            ngx.sleep(0.05)
+            entry = cached_jwks(dict, uri)
+            if entry then
+                jwk = pick_jwk(entry, kid)
+                if jwk then return jwk end
+                return nil, "kid '" .. tostring(kid) .. "' is not in the JWKS"
+            end
+        end
+        return nil, "the JWKS has not been fetched yet"
+    end
+
+    local fresh, err = fetch_jwks(uri)
+    if not fresh then return nil, err end
+    store_jwks(dict, uri, fresh)
+    jwk = pick_jwk(fresh, kid)
+    if not jwk then
+        return nil, "kid '" .. tostring(kid) .. "' is not in the JWKS"
+    end
+    return jwk
+end
+
+-- Parsed public keys, per worker, keyed by the JWK's JSON: building an RSA key
+-- from a JWK on every request is wasted work for a key that changes yearly.
+-- Bounded so a rotation cannot grow it without limit.
+local jwk_pkeys, jwk_pkey_count = {}, 0
+local function jwk_to_pkey(pkey, jwk)
+    local pk = jwk_pkeys[jwk]
+    if pk then return pk end
+    local err
+    pk, err = pkey.new(jwk, { format = "JWK" })
+    if not pk then return nil, err end
+    if jwk_pkey_count >= 16 then
+        jwk_pkeys, jwk_pkey_count = {}, 0
+    end
+    jwk_pkeys[jwk] = pk
+    jwk_pkey_count = jwk_pkey_count + 1
+    return pk
 end
 
 -- RS256 signature verification, via Kong's bundled resty.openssl.
@@ -228,16 +468,22 @@ end
 -- Enterprise native JWT plugin, a service mesh, an external authorizer) opt out
 -- via jwt_allow_unverified_signature=true: explicit, defaulting to false, and
 -- logged at ERROR so the posture is never silent.
-local function verify_rs256_signature(token, conf)
+--
+-- Key source (2026-10-12): jwt_public_key (a static PEM) when set, else the
+-- issuer's JWKS from jwt_jwks_uri, selected by the token's kid. jwt_jwks_uri
+-- used to be accepted and ignored, so a JWKS-only configuration rejected every
+-- token. Neither set, or no usable key from the JWKS: the signature cannot be
+-- verified, which jwt_allow_unverified_signature decides. A key that IS found
+-- and does not verify the signature is always a rejection.
+local function verify_rs256_signature(token, conf, header)
     local allow_unverified = conf.jwt_allow_unverified_signature == true
+    local pem = non_empty_string(conf.jwt_public_key)
+    local jwks_uri = non_empty_string(conf.jwt_jwks_uri)
 
-    if not conf.jwt_public_key or conf.jwt_public_key == "" then
-        -- jwt_jwks_uri is declared in schema.lua but no JWKS fetcher is
-        -- implemented, so a JWKS-only configuration verifies nothing.
-        kong.log.err("[aforo-metering] No jwt_public_key configured -- RS256 signature CANNOT ",
-            "be verified (jwt_jwks_uri is declared but not yet implemented). Set jwt_public_key ",
-            "to the issuer's PEM public key, or jwt_allow_unverified_signature=true only if ",
-            "signatures are verified upstream.")
+    if not pem and not jwks_uri then
+        kong.log.err("[aforo-metering] Neither jwt_public_key nor jwt_jwks_uri is configured -- ",
+            "RS256 signature CANNOT be verified. Set one of them, or ",
+            "jwt_allow_unverified_signature=true only if signatures are verified upstream.")
         return allow_unverified
     end
 
@@ -263,14 +509,33 @@ local function verify_rs256_signature(token, conf)
         return false
     end
 
-    local pk, perr = pkey.new(conf.jwt_public_key)
-    if not pk then
-        -- A malformed configured key is an operator error, not an upstream
-        -- one. Never honour allow_unverified here: that would turn a typo in
-        -- the PEM into an open gate.
-        kong.log.err("[aforo-metering] jwt_public_key could not be parsed as a public key: ",
-            tostring(perr))
-        return false
+    local pk, perr
+    if pem then
+        pk, perr = pkey.new(pem)
+        if not pk then
+            -- A malformed configured key is an operator error, not an upstream
+            -- one. Never honour allow_unverified here: that would turn a typo in
+            -- the PEM into an open gate.
+            kong.log.err("[aforo-metering] jwt_public_key could not be parsed as a public key: ",
+                tostring(perr))
+            return false
+        end
+    else
+        local kid = claim_string(header and header.kid)
+        local jwk, why = jwks_key(jwks_uri, kid)
+        if not jwk then
+            warn_throttled("jwks_key", 60,
+                "[aforo-metering] No JWKS key to verify a token (kid=", tostring(kid), ") from ",
+                jwks_uri, ": ", tostring(why), ". RS256 signature CANNOT be verified. ",
+                "Repeats suppressed for 60s.")
+            return allow_unverified
+        end
+        pk, perr = jwk_to_pkey(pkey, jwk)
+        if not pk then
+            kong.log.err("[aforo-metering] JWKS key (kid=", tostring(kid), ") from ", jwks_uri,
+                " could not be loaded: ", tostring(perr))
+            return allow_unverified
+        end
     end
 
     local verified, verr = pk:verify(signature, signing_input, "sha256")
@@ -284,61 +549,91 @@ end
 
 -- Main JWT validation entry point.
 -- Returns {valid=bool, reason=string, customer_id, tenant_id, key_id, scopes, ...}
+--
+-- Ordering matters: nothing in the payload is trustworthy until the signature
+-- is checked, so before it only exp and iss are looked at -- each normalised
+-- first, because an unauthenticated caller chooses their types (see
+-- claim_string). A non-numeric exp used to reach `ngx.time() > exp` as a
+-- string or a null and raise: a 500 for anyone who asked.
 local function validate_jwt(token, conf)
     -- 1. Parse claims (structure + encoding check)
-    local claims, parts = parse_jwt_claims(token)
-    if not claims then
+    local raw, header = parse_jwt(token)
+    if not raw then
         return { valid = false, reason = "MALFORMED_TOKEN" }
     end
 
+    local claims = {
+        sub         = claim_string(raw.sub),
+        iss         = claim_string(raw.iss),
+        jti         = claim_string(raw.jti),
+        tenant_id   = claim_string(raw.tenant_id),
+        customer_id = claim_string(raw.customer_id),
+        key_id      = claim_string(raw.key_id),
+        client_id   = claim_string(raw.client_id),
+        environment = claim_string(raw.environment),
+    }
+
     -- 2. Expiry check
-    local exp = claims.exp
-    if not exp or ngx.time() > tonumber(exp) then
+    local exp = tonumber(raw.exp)
+    if not exp or ngx.time() > exp then
         return { valid = false, reason = "TOKEN_EXPIRED" }
     end
 
     -- 3. Issuer check
     if conf.jwt_issuer and conf.jwt_issuer ~= "" and claims.iss ~= conf.jwt_issuer then
-        kong.log.warn("[aforo-metering] JWT issuer mismatch: got '", claims.iss,
+        kong.log.warn("[aforo-metering] JWT issuer mismatch: got '", tostring(claims.iss),
             "', expected '", conf.jwt_issuer, "'")
         return { valid = false, reason = "INVALID_ISSUER" }
     end
 
     -- 4. RS256 signature verification (resty.openssl; fail-closed -- see above)
-    if not verify_rs256_signature(token, conf) then
+    if not verify_rs256_signature(token, conf, header) then
         return { valid = false, reason = "INVALID_SIGNATURE" }
     end
 
-    -- Resolve Redis coords for jti blocklist checks.
-    -- Prefer dedicated jwt_redis_* config; fall back to rate_limit_redis_*.
-    local redis_host = (conf.jwt_redis_host and conf.jwt_redis_host ~= "" and conf.jwt_redis_host)
-                       or conf.rate_limit_redis_host or "127.0.0.1"
-    local redis_port = conf.jwt_redis_port or conf.rate_limit_redis_port or 6379
-
-    -- 5. jti blocklist (revoked individual token)
-    local jti = claims.jti
-    if is_jti_blocked(jti, redis_host, redis_port) then
-        return { valid = false, reason = "TOKEN_REVOKED" }
+    -- 5. Tenant binding (2026-10-12 security fix). org-service signs every
+    -- tenant's tokens with the same key and issuer, so a valid signature says
+    -- nothing about WHICH tenant the token belongs to. Without this check a
+    -- token minted for tenant A was accepted by tenant B's gateway, metered as
+    -- B, and forwarded upstream with A's X-Tenant-Id.
+    if non_empty_string(conf.tenant_id) and claims.tenant_id ~= conf.tenant_id then
+        warn_throttled("jwt_tenant_mismatch", 60,
+            "[aforo-metering] JWT rejected: tenant_id '", tostring(claims.tenant_id),
+            "' does not match this plugin's tenant_id '", conf.tenant_id,
+            "'. Repeats suppressed for 60s.")
+        return { valid = false, reason = "TENANT_MISMATCH" }
     end
 
-    -- 6. Client-level revocation (all tokens for this key_id revoked)
-    local key_id = claims.key_id
-    if is_client_revoked(key_id, redis_host, redis_port) then
-        return { valid = false, reason = "CLIENT_REVOKED" }
+    -- 6. Revocation: this token (jti), or every token of its client
+    -- (client_id, then key_id). Fail-open on Redis trouble; see above.
+    local revoked = revocation_reason(conf, claims)
+    if revoked then
+        return { valid = false, reason = revoked }
     end
 
-    -- 7. Return validated claims
+    -- 7. Return validated claims. Only strings leave here: these become
+    -- upstream headers, and a non-string header value raises.
+    local scopes = raw.scopes
+    if type(scopes) == "table" then
+        local parts = {}
+        for _, sc in ipairs(scopes) do
+            if type(sc) == "string" then parts[#parts + 1] = sc end
+        end
+        scopes = table.concat(parts, " ")
+    else
+        scopes = claim_string(scopes) or ""
+    end
+
     return {
         valid        = true,
         customer_id  = claims.customer_id or claims.sub or "",
-        tenant_id    = claims.tenant_id   or "",
-        key_id       = claims.key_id      or "",
-        scopes       = type(claims.scopes) == "table"
-                           and table.concat(claims.scopes, " ")
-                           or (claims.scopes or ""),
+        tenant_id    = claims.tenant_id or "",
+        key_id       = claims.key_id or "",
+        client_id    = claims.client_id,
+        scopes       = scopes,
         environment  = claims.environment or "live",
-        offering_ids = claims.offering_ids,
-        jti          = jti,
+        offering_ids = type(raw.offering_ids) == "table" and raw.offering_ids or nil,
+        jti          = claims.jti,
     }
 end
 
@@ -676,16 +971,6 @@ local function resolve_quantity(conf, response_size, header_quantity)
     else
         return tonumber(source) or 1
     end
-end
-
--- v when it is a non-empty string, else nil. A type check rather than a
--- truthiness one, so a null config value can never reach an event as a JSON
--- null that the required-field check would wave through.
-local function non_empty_string(v)
-    if type(v) == "string" and v ~= "" then
-        return v
-    end
-    return nil
 end
 
 -- Resolve agentId and sessionId for an AI_AGENT event.
@@ -1087,7 +1372,9 @@ function AforoMeteringHandler:access(conf)
         -- Propagate verified claims as trusted downstream headers
         -- (overwrite any client-supplied headers — these come from the validated JWT)
         kong.service.request.set_header("X-Customer-Id", result.customer_id)
-        kong.service.request.set_header("X-Tenant-Id",   result.tenant_id)
+        -- conf.tenant_id, not the claim: the plugin instance decides the tenant
+        -- (the claim has been checked equal to it above).
+        kong.service.request.set_header("X-Tenant-Id",   conf.tenant_id)
         kong.service.request.set_header("X-Key-Id",      result.key_id)
         kong.service.request.set_header("X-Scopes",      result.scopes)
         if result.environment then

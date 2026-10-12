@@ -204,9 +204,11 @@ return {
                     },
                     -- ── JWT Validation ──
                     -- Enable to validate Aforo RS256 JWTs before metering.
-                    -- Checks: expiry, issuer, jti blocklist, client revocation.
-                    -- Signature verification requires lua-resty-jwt (Kong OSS) or
-                    -- the native JWT plugin with JWKS URI (Kong Enterprise).
+                    -- Checks: expiry, issuer, RS256 signature, tenant_id (must
+                    -- equal this plugin's tenant_id), jti blocklist, client
+                    -- revocation. The signature is verified with resty.openssl,
+                    -- which ships with Kong; no extra library is needed. The key
+                    -- comes from jwt_public_key, else from jwt_jwks_uri.
                     {
                         jwt_validation_enabled = {
                             type = "boolean",
@@ -224,27 +226,27 @@ return {
                     {
                         jwt_jwks_uri = {
                             type = "string",
-                            description = "Aforo JWKS URI for RS256 public key resolution (e.g. https://auth.smartai.com/.well-known/jwks.json). Used when lua-resty-jwt is installed.",
+                            description = "The token issuer's JWKS URL, e.g. https://<issuer>/.well-known/jwks.json. The key is chosen by the token's kid. Keys are cached for an hour and refreshed in the background; an unknown kid triggers a refetch at most every 30 s. Ignored when jwt_public_key is set.",
                         },
                     },
                     {
                         jwt_public_key = {
                             type = "string",
                             encrypted = true,
-                            description = "PEM-encoded RSA public key for offline RS256 verification. Alternative to jwt_jwks_uri for static key setups.",
+                            description = "PEM-encoded RSA public key for offline RS256 verification. Takes precedence over jwt_jwks_uri.",
                         },
                     },
                     {
                         jwt_allow_unverified_signature = {
                             type = "boolean",
                             default = false,
-                            description = "DANGEROUS. Accept JWTs whose RS256 signature could not be verified (lua-resty-jwt missing, or no jwt_public_key set). Defaults to false: unverifiable tokens are rejected. Enable ONLY when signatures are already verified upstream (Kong Enterprise native JWT plugin, service mesh, external authorizer). With this true and no verification upstream, any caller can mint a token naming any customer_id/tenant_id.",
+                            description = "DANGEROUS. Accept JWTs whose RS256 signature could not be verified (no jwt_public_key or jwt_jwks_uri, or no JWKS key for the token's kid). A signature that fails verification is always rejected. Enable ONLY when signatures are verified upstream (Kong Enterprise JWT plugin, service mesh). Otherwise any caller can mint a token naming any customer_id.",
                         },
                     },
-                    -- Redis host/port are shared with rate-limit enforcement above.
-                    -- jwt_validation uses rate_limit_redis_host / rate_limit_redis_port.
-                    -- Add dedicated jwt_redis_host/jwt_redis_port below only if the
-                    -- jti blocklist Redis is on a different host than rate-limit Redis.
+                    -- Redis host/port/password are shared with rate-limit enforcement
+                    -- below. jwt_validation uses rate_limit_redis_host / _port /
+                    -- _password unless the jwt_redis_* settings say otherwise. Set
+                    -- them only if the jti blocklist Redis is not the rate-limit one.
                     {
                         jwt_redis_host = {
                             type = "string",
@@ -255,6 +257,13 @@ return {
                         jwt_redis_port = {
                             type = "integer",
                             description = "Redis port for jti blocklist (defaults to rate_limit_redis_port if not set)",
+                        },
+                    },
+                    {
+                        jwt_redis_password = {
+                            type = "string",
+                            encrypted = true,
+                            description = "Redis password for the jti blocklist. Defaults to rate_limit_redis_password when the blocklist uses the same Redis host and port as rate limiting.",
                         },
                     },
                     -- Rate limit enforcement (reads policies from Redis)

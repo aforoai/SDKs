@@ -6,13 +6,21 @@ This plugin ships on the Aforo gateway-plugins line; the whole repo is versioned
 
 ## [Unreleased]
 
+### Security
+- **JWT tokens are now bound to the plugin's tenant.** Aforo signs every tenant's tokens with the same key, so a valid token issued for one tenant used to be accepted by another tenant's gateway, metered under the gateway's tenant, and forwarded upstream with the token's tenant in `X-Tenant-Id`. A token whose `tenant_id` is not this plugin's `tenant_id` is now rejected with 401 `TENANT_MISMATCH`, and `X-Tenant-Id` sent upstream is always this plugin's `tenant_id`.
+- **Revoking an OAuth client now blocks its tokens.** Aforo records client revocation under the token's `client_id`, but the plugin looked it up under `key_id` only, so tokens of a revoked client kept working at the gateway. Both are checked now.
+- **A Redis error no longer rejects every token.** If the revocation Redis answered with an error (for example `NOAUTH` from a password-protected Redis), every token was rejected as 401 `TOKEN_REVOKED`, with nothing in the log. Revocation lookups now fail open on any Redis problem, as documented, and log a warning. New setting `jwt_redis_password`; it defaults to `rate_limit_redis_password` when the blocklist is on the same Redis.
+- A token with a non-numeric or null `exp`, or with null claims, now gets 401 instead of a 500 error.
+
 ### Added
+- `jwt_jwks_uri` now works. The plugin fetches the issuer's JWKS, picks the key by the token's `kid`, caches the keys for an hour and refreshes them in the background. A token with an unknown `kid` triggers a refetch, at most once every 30 seconds. Before, the setting was accepted but ignored, and a configuration that set only `jwt_jwks_uri` rejected every token. `jwt_public_key` still works and takes precedence.
 - `AI_AGENT` metering. Three new settings: `agent_id` (the agent ID for the service or route), `agent_id_header` (default `X-Aforo-Agent-Id`) and `session_id_header` (default `X-Aforo-Session-Id`). The two headers are upstream response headers. With `product_type=AI_AGENT`, each event carries `agentId` (the response header, else `agent_id`) and `sessionId` (the response header, else Kong's ID for the request, so each request is its own session). Request headers are never read for either. Tokens are still reported with `X-Aforo-Quantity`. Events of other product types are unchanged.
 
 ### Fixed
 - Usage could go unbilled when a client repeated an `X-Request-Id`. The plugin used the client's `X-Request-Id` (or `X-Kong-Request-Id`) request header as each event's idempotency key, and Aforo keeps only the first event for a given key. A client that sent the same value on every call was billed once, and events from different customers that happened to send the same value were dropped as duplicates. The key is now Kong's own ID for the request, which a client cannot set. Retries of an event still carry its original key, so a retried flush is not double-counted. The client's `X-Request-Id` is still recorded in the event's trace context (`trace.xRequestId`) for correlating with your logs.
 - Kong 3.4 would not start with version 2.1.0 of this plugin installed. Kong limits each setting's description to 500 characters, and the `product_type` description was 635, so Kong stopped at startup with `schema violation ... length must be at most 500`. The description is shorter now.
 - When an `AI_AGENT` event is skipped for a missing agent ID, the warning says how to supply it.
+- The `Authorization` scheme is matched case-insensitively, so `bearer <token>` is validated like `Bearer <token>`.
 - The docs and setting descriptions said `metric_header` and `quantity_header` are turned off by setting them to an empty string. Kong rejects an empty string for these settings (`length must be at least 1`); set them to `null` instead.
 
 ## [2.1.0] — 2026-10-01

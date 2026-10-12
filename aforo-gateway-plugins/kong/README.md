@@ -88,12 +88,14 @@ Every option lives under `config.*`. `aforo_endpoint`, `api_key`, and `tenant_id
 | `include_metadata` | boolean | `true` | Include request metadata (method, path, status, latency, sizes) in the event. |
 | `mcp_enabled` | boolean | `false` | Detect MCP JSON-RPC `tools/call` POST bodies and emit `mcp_server.tool_invocations` events. |
 | `mcp_product_id` | string | — | Aforo product ID for MCP metering (set when `mcp_enabled=true`). |
-| `jwt_validation_enabled` | boolean | `false` | Validate an Aforo RS256 JWT in the access phase before metering (exp, iss, jti blocklist, client revocation). |
+| `jwt_validation_enabled` | boolean | `false` | Validate an Aforo RS256 JWT in the access phase before metering: `exp`, `iss`, the signature, `tenant_id`, the jti blocklist and client revocation. A token whose `tenant_id` is not this plugin's `tenant_id` is rejected with 401 `TENANT_MISMATCH`. |
 | `jwt_issuer` | string | `https://auth.aforo.ai` | Expected `iss` claim. Empty string skips the issuer check. |
-| `jwt_jwks_uri` | string | — | JWKS URI for RS256 key resolution (used when `lua-resty-jwt` is installed). |
-| `jwt_public_key` | string | — | PEM RSA public key for offline RS256 verification. Stored encrypted. |
+| `jwt_jwks_uri` | string | — | The issuer's JWKS URL, e.g. `https://<issuer>/.well-known/jwks.json`. The key is chosen by the token's `kid`. Keys are cached for an hour and refreshed in the background; a token with an unknown `kid` triggers a refetch, at most once every 30 s. Used when `jwt_public_key` is not set. |
+| `jwt_public_key` | string | — | PEM RSA public key for offline RS256 verification. Takes precedence over `jwt_jwks_uri`. Stored encrypted. |
+| `jwt_allow_unverified_signature` | boolean | `false` | Accept a JWT whose signature cannot be verified (no key configured, or no JWKS key for its `kid`). A signature that fails verification is always rejected. Enable only when signatures are verified before Kong reaches this plugin. |
 | `jwt_redis_host` | string | — | Redis host for the jti blocklist. Falls back to `rate_limit_redis_host`. |
 | `jwt_redis_port` | integer | — | Redis port for the jti blocklist. Falls back to `rate_limit_redis_port`. |
+| `jwt_redis_password` | string | — | Redis password for the jti blocklist. Falls back to `rate_limit_redis_password` when the blocklist is on the same Redis host and port as rate limiting. Stored encrypted. |
 | `rate_limit_enabled` | boolean | `false` | Enforce rate limits in the access phase (returns 429 on a HARD breach). |
 | `rate_limit_redis_host` | string | `127.0.0.1` | Redis host for rate-limit counters and policy cache. |
 | `rate_limit_redis_port` | integer | `6379` | Redis port for rate-limit counters. |
@@ -117,6 +119,6 @@ Step-by-step from install to a verified event in Aforo: see [USER_GUIDE.md](USER
 
 ## What this doesn't cover
 
-- **Crypto signature verification is opt-in.** With `jwt_validation_enabled=true`, the plugin always enforces `exp`, `iss`, the jti blocklist, and client revocation, but full RS256 signature verification requires `lua-resty-jwt` (Kong OSS) or Kong Enterprise's native JWT plugin with a JWKS URI. When `lua-resty-jwt` is absent the plugin logs a warning and skips the signature check (claims checks still run). On Kong Enterprise, prefer the native JWT plugin and leave `jwt_validation_enabled=false` here.
+- **JWT revocation checks fail open.** With `jwt_validation_enabled=true` the signature is always verified, with the key from `jwt_public_key` or `jwt_jwks_uri` (using `resty.openssl`, which ships with Kong; no extra library). A token that cannot be verified is rejected unless `jwt_allow_unverified_signature=true`. The jti blocklist and client revocation live in Redis: if Redis is unreachable, or answers with an error such as `NOAUTH`, tokens are let through without the revocation check and a warning is logged.
 - **No durable buffer.** Events live in the `aforo_buffer` shared dict until flush. A batch that fails transiently (5xx, timeout, 408, 429) is put back and retried on a later flush; a batch the ingestor rejects with any other 4xx is dropped with the reason logged. Past 10,000 buffered events the newest are dropped, and a Kong restart loses whatever is buffered — this is best-effort metering, not a guaranteed-delivery queue.
 - **Rate-limit, margin-guard and pre-flight quota enforcement need Redis / pricing-service / the ingestor reachable.** All fail open: a timeout or an unreachable dependency lets the request through rather than blocking it (the quota check can be made fail-closed with `preflight_quota_fail_open=false`).

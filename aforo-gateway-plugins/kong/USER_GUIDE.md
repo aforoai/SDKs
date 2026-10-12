@@ -67,7 +67,7 @@ docker run -d --name kong --network=kong-net \
   -p 8000:8000 -p 8001:8001 kong-aforo:3.4
 ```
 
-Still based on `kong-aforo:3.4`, because the mount only replaces the plugin — `lua-resty-jwt` still has to come from the image.
+Still based on `kong-aforo:3.4`, because the mount only replaces the plugin's code — `KONG_PLUGINS` and the `aforo_buffer` shared dict still come from the image.
 
 ## Choosing what each endpoint bills as
 
@@ -261,9 +261,9 @@ curl -X POST http://localhost:8001/services/my-service/plugins --data "name=key-
 
 The event's `customerId` becomes the consumer's `custom_id` (`cust_acme`), falling back to `username`, then `id`.
 
-> ⚠ If neither a JWT claim nor a Kong consumer resolves, `customerId` is `nil`. The event still buffers, but Aforo's ingestor rejects events without a `customerId` at schema validation. Bind a consumer (or enable JWT validation) before relying on the data.
+> ⚠ If neither a JWT claim nor a Kong consumer resolves, the request has no customer and is not metered: the plugin skips it and logs `no customer identity resolved`. Bind a consumer (or enable JWT validation) before relying on the data.
 
-To use a validated JWT claim instead, set `config.jwt_validation_enabled=true` and `config.jwt_issuer`; when present, the JWT's `customer_id` claim wins over the consumer identity. See the Configuration reference for the JWT options.
+To use a validated JWT claim instead, set `config.jwt_validation_enabled=true`, `config.jwt_issuer`, and the key that verifies the signature: `config.jwt_public_key` (a PEM) or `config.jwt_jwks_uri` (the issuer's JWKS URL, keys picked by `kid`). The JWT's `customer_id` claim then wins over the consumer identity. The token's `tenant_id` must equal `config.tenant_id`; a token issued for another tenant is rejected with 401 `TENANT_MISMATCH`. If the revocation Redis needs a password, set `config.jwt_redis_password`. See the Configuration reference for the JWT options.
 
 ## Step 5 — Send a request and trigger a flush
 
@@ -330,12 +330,13 @@ See the full option table in [README.md](README.md#configuration). The three you
 | Events buffer but never flush | `flush_count` not reached and `flush_interval_ms` not yet elapsed | Wait for the interval, lower `flush_count` to 1 for testing, or send more traffic. |
 | Flush logs `status=401` | Wrong `api_key` or `tenant_id` | Re-check the Aforo API key and tenant; both are sent on the flush (`X-API-Key` + `X-Tenant-Id`). |
 | Events land in Aforo with empty/missing customer | No Kong consumer bound and no JWT claim | Add an auth plugin (key-auth/JWT) with a consumer, or enable `jwt_validation_enabled`. |
-| `lua-resty-jwt not found; RS256 signature NOT verified` warning | `jwt_validation_enabled=true` but the lib isn't installed | `luarocks install lua-resty-jwt`, or use Kong Enterprise's native JWT plugin and leave validation off here. Claims checks (exp/iss/jti/revocation) still run regardless. |
+| 401 `TENANT_MISMATCH` | The token was issued for a different Aforo tenant than this plugin's `tenant_id` | Use a token for this tenant, or correct `tenant_id`. |
+| 401 `INVALID_SIGNATURE`, log says `No JWKS key to verify a token` | `jwt_jwks_uri` unreachable from Kong, or the token's `kid` is not in the JWKS | Check that Kong can reach `jwt_jwks_uri` and that it serves the issuer's current key. |
+| Log says `Redis answered the JWT revocation lookup with an error (NOAUTH ...)` | The blocklist Redis needs a password | Set `jwt_redis_password`. Until then, revoked tokens are not rejected. |
 | `All 3 flush attempts failed. N events dropped.` | Ingestor unreachable or returning 5xx for the full retry window | Check `aforo_endpoint` reachability and Aforo status; these events are not re-queued after the third attempt. |
 | Health-check requests show up as billed usage | Path not excluded | They shouldn't — `/health`, `/ready`, `/metrics` are excluded by default. Add yours to `exclude_paths`. |
 
 ## What this guide does NOT cover
 
 - **The rate-limit and margin-guard access-phase modules** (`rate-limit-enforce.lua`, `margin-guard.lua`, `preflight-quota.lua`) ship in this folder and are wired into the handler, but their Redis policy schema and pricing-service contract are documented with the Aforo platform, not here. This guide covers metering.
-- **Full RS256 verification setup** with a JWKS fetcher — the handler supports a `jwt_public_key` PEM and a `jwt_jwks_uri`, but production key rotation/fetching is an integration you wire with `lua-resty-jwt` or Kong Enterprise. See the inline notes in `handler.lua`.
 - **Guaranteed delivery.** This is fire-and-forget metering. For exactly-once accounting, reconcile against your upstream's own logs.
