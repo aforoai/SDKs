@@ -1176,6 +1176,15 @@ local function response_time_ms(latency)
 end
 
 -- ────────────────────────────────────────────────────────────
+-- init_worker: re-arm flushes for buffered events no timer is waiting on
+-- (after a kong reload, or a worker that crashed). See event-buffer.lua.
+-- ────────────────────────────────────────────────────────────
+
+function AforoMeteringHandler:init_worker()
+    event_buffer.init_worker()
+end
+
+-- ────────────────────────────────────────────────────────────
 -- Access phase handler (runs before proxying to upstream)
 -- Currently a no-op that stashes trace context for correlation.
 -- Session 5 will add rate-limit enforcement here.
@@ -1577,6 +1586,7 @@ end
 AforoMeteringHandler._resolve_customer_id = resolve_customer_id
 AforoMeteringHandler._flush_buffer = event_buffer.flush
 AforoMeteringHandler._buffer_key = event_buffer.key
+AforoMeteringHandler._rearm = event_buffer._rearm
 AforoMeteringHandler._mappings_key = mappings_key
 
 return AforoMeteringHandler

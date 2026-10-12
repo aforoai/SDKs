@@ -54,6 +54,12 @@ local function new_dict()
     function d:lpop(k) local l = self.store[k]; return l and table.remove(l, 1) end
     function d:rpop(k) local l = self.store[k]; return l and table.remove(l) end
     function d:llen(k) local l = self.store[k]; return l and #l or 0 end
+    function d:incr(k, v, init)
+        local cur = self.store[k]
+        if cur == nil then if init == nil then return nil, "not found" end; cur = init end
+        self.store[k] = cur + v; return self.store[k]
+    end
+    function d:capacity() return 10485760 end
     return d
 end
 

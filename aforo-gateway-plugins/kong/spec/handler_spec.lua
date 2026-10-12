@@ -50,17 +50,32 @@ local function new_shared_dict()
         if err then return nil, err end
         return l and #l or 0
     end
+    function d:incr(k, v, init)
+        local cur = self.store[k]
+        if cur == nil then
+            if init == nil then return nil, "not found" end
+            cur = init
+        end
+        self.store[k] = cur + v
+        return self.store[k]
+    end
+    d.cap = 10485760
+    function d:capacity() return self.cap end
     return d
 end
 
 _G.ngx = _G.ngx or {}
 ngx.shared = { aforo_buffer = new_shared_dict() }
 ngx.timers = {}
-ngx.timer = { at = function(delay, fn, ...) table.insert(ngx.timers, { delay = delay, fn = fn, args = { ... } }); return true end }
+ngx.timer = {
+    at = function(delay, fn, ...) table.insert(ngx.timers, { delay = delay, fn = fn, args = { ... } }); return true end,
+    every = function(delay, fn, ...) table.insert(ngx.timers, { every = true, delay = delay, fn = fn, args = { ... } }); return true end,
+}
 ngx.now = function() return 1788268682.221 end
 ngx.sleeps = {}
 ngx.sleep = function(s) table.insert(ngx.sleeps, s) end
 ngx.worker = ngx.worker or { pid = function() return 1 end }
+ngx.worker.id = ngx.worker.id or function() return 0 end
 ngx.escape_uri = ngx.escape_uri or function(s) return s end
 -- Stand-in for ngx.md5: distinct inputs give distinct keys, which is all the
 -- buffer and mappings keys need here.
@@ -709,6 +724,141 @@ describe("aforo-metering handler", function()
             local evs = buffered(c)
             assert.equals(1, #evs)
             assert.equals(0.333333, evs[1].quantity)
+        end)
+
+        -- ── review 2: delivery ──────────────────────────────────
+        it("delivers events kept on 401 with the rotated api_key, and stops using the old one", function()
+            local old = conf({ api_key = "sk_revoked" })
+            log(old, "c1"); log(old, "c2")
+            http_mock.responses = { { status = 401 } }
+            handler._flush_buffer(false, old)        -- 401: kept
+            -- The operator rotates the key; the old timer still holds the old conf.
+            local stale_timer = ngx.timers[#ngx.timers]
+            local new = conf({ api_key = "sk_rotated" })
+            log(new, "c3")
+            run(stale_timer)                         -- the stale timer flushes...
+            local keys = {}
+            for _, r in ipairs(http_mock.requests) do keys[#keys + 1] = r.params.headers["X-API-Key"] end
+            assert.same({ "sk_revoked", "sk_rotated" }, keys)  -- ...with the current key
+            assert.equals(3, #sent(2))
+            assert.equals(0, #buffered(new))
+        end)
+
+        it("re-arms a timed flush after a worker exit (reload)", function()
+            local c = conf()
+            log(c, "c1")
+            local t = table.remove(ngx.timers, 1)
+            http_mock.responses = { { status = 503 } }
+            t.fn(true, unpack(t.args))               -- premature: worker exiting; send fails, kept
+            assert.equals(1, #buffered(c))
+            ngx.timers = {}                          -- new worker: no timers survive
+            log(c, "c2")
+            assert.equals(1, #ngx.timers, "no timed flush armed")
+        end)
+
+        it("re-arms flushes on worker 0 with no traffic at all", function()
+            local c = conf()
+            log(c, "c1")
+            local k = handler._buffer_key(c)
+            ngx.timers = {}
+            dict:delete(k .. ":pending")             -- the timer died with its worker
+            handler:init_worker()
+            assert.equals(1, #ngx.timers)
+            assert.is_true(ngx.timers[1].every)
+            local every = table.remove(ngx.timers, 1)
+            every.fn(false)
+            assert.equals(1, #ngx.timers)            -- a timed flush for the stranded buffer
+            run(table.remove(ngx.timers, 1))
+            assert.equals(0, #buffered(c))
+        end)
+
+        it("keeps at most the newest 1,000 events for a destination the ingestor refuses", function()
+            local c = conf({ flush_count = 100000 })
+            for i = 1, 1200 do log(c, "c" .. i) end
+            http_mock.responses = { { status = 401 } }
+            handler._flush_buffer(false, c)
+            local left = buffered(c)
+            assert.equals(1000, #left)
+            assert.equals("c201", left[1].customerId)
+            assert.equals("c1200", left[1000].customerId)
+            log(c, "c1201")                           -- full for a refused destination
+            assert.equals(1000, #buffered(c))
+        end)
+
+        it("drops events older than 72 hours when the ingestor refuses the destination", function()
+            local c = conf()
+            local k = handler._buffer_key(c)
+            dict:rpush(k, cjson.encode({ customerId = "old", occurredAt = "2026-08-01T00:00:00.000Z" }))
+            log(c, "fresh")
+            http_mock.responses = { { status = 403 } }
+            handler._flush_buffer(false, c)
+            local left = buffered(c)
+            assert.equals(1, #left)
+            assert.equals("fresh", left[1].customerId)
+        end)
+
+        it("never lets a refused destination stop a healthy one from buffering", function()
+            dict.cap = 256 * 1024                     -- a small dict: events may use 192 KiB
+            local A = conf({ flush_count = 100000 })
+            local B = conf({ tenant_id = "tenantB", api_key = "sk_B", flush_count = 100000,
+                             aforo_endpoint = "http://ingestor-b.test/v1/ingest/batch" })
+            for i = 1, 600 do log(A, "a" .. i) end    -- fills the budget
+            local a_before = #buffered(A)
+            assert.is_true(a_before < 600)            -- A hit the budget itself
+            dict:set(handler._buffer_key(A) .. ":held", true)   -- A's key is refused (401)
+            for i = 1, 100 do log(B, "b" .. i) end
+            assert.equals(100, #buffered(B))          -- B lost nothing
+            assert.is_true(#buffered(A) < a_before)   -- A made the room
+            -- A refused destination gets no more room for itself.
+            local a_now = #buffered(A)
+            log(A, "a_new")
+            assert.equals(a_now, #buffered(A))
+        end)
+
+        it("treats a 400 for every part of the batch as a refused request, not 2n-1 POSTs", function()
+            local c = conf({ flush_count = 100000 })
+            for i = 1, 1000 do log(c, "c" .. i) end
+            respond_by_body(function() return 400 end)
+            handler._flush_buffer(false, c)
+            assert.equals(3, #http_mock.requests)     -- the batch and its two halves
+            assert.equals(1000, #buffered(c))         -- kept, as for a 404
+            assert.is_true(dict:get(handler._buffer_key(c) .. ":held"))
+        end)
+
+        it("checks the flush time budget before every POST", function()
+            local c = conf({ flush_count = 100000 })
+            for i = 1, 16 do log(c, "c" .. i) end
+            local clock = ngx.now()
+            local orig_now = ngx.now
+            ngx.now = function() return clock end
+            respond_by_body(function(body)
+                clock = clock + 61                      -- every POST takes "a minute"
+                return body:find('"c3"', 1, true) and 400 or 202
+            end)
+            handler._flush_buffer(false, c)
+            ngx.now = orig_now
+            assert.equals(1, #http_mock.requests)     -- no bisection past the budget
+            assert.equals(16, #buffered(c))
+        end)
+
+        it("only ever releases its own flush lock", function()
+            local c = conf()
+            log(c, "c1")
+            local k = handler._buffer_key(c)
+            http_mock.on_request = function()
+                dict:set(k .. ":lock", "another-flush")   -- the lock expired and was taken over
+            end
+            handler._flush_buffer(false, c)
+            assert.equals("another-flush", dict:get(k .. ":lock"))
+        end)
+
+        it("does not bisect on the way out", function()
+            local c = conf()
+            for i = 1, 8 do log(c, "c" .. i) end
+            http_mock.responses = { { status = 400 } }
+            handler._flush_buffer(true, c)
+            assert.equals(1, #http_mock.requests)
+            assert.equals(8, #buffered(c))
         end)
 
         it("skips an event whose identity is over the ingestor's limit, with the reason", function()
