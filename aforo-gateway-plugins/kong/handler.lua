@@ -1324,6 +1324,15 @@ end
 -- ────────────────────────────────────────────────────────────
 
 function AforoMeteringHandler:access(conf)
+    -- Requests this plugin refuses are not billable usage (2026-10-12 fix).
+    -- The flag is raised on entry and lowered only when the access phase
+    -- completes, so every refusal below (401 / 429 / 503) and any error that
+    -- aborts this handler (Kong answers 500) leaves it set, and the log phase
+    -- skips the request. A preflight fail-closed 503 used to be metered: the
+    -- customer was billed for a call the gateway itself turned away.
+    -- exclude_status_codes still applies on top, to every request.
+    kong.ctx.shared.aforo_refused = true
+
     kong.ctx.shared.aforo_trace = extract_trace_context()
 
     -- Only ever schedules a background refresh; never waits on one.
@@ -1382,8 +1391,14 @@ function AforoMeteringHandler:access(conf)
         end
     end
 
-    -- Rate limit enforcement (reads policy from Redis, returns 429 on HARD breach)
-    rate_limit.enforce(conf)
+    -- Rate limit enforcement (reads policy from Redis, returns 429 on HARD breach).
+    -- Each check below returns true when it has answered the request; stop
+    -- there. In the access phase kong.response.exit only records the
+    -- response, so carrying on would run the later checks -- and could answer
+    -- twice.
+    if rate_limit.enforce(conf) then
+        return
+    end
 
     -- resolve_customer_id() prefers the JWT-validated claim stashed above;
     -- falls back to Kong consumer identity (credential-bound). Never reads
@@ -1410,8 +1425,13 @@ function AforoMeteringHandler:access(conf)
         end
     end
 
-    -- Margin guard pre-flight check (calls pricing-service quick-check, returns 429 on L2/L3).
-    margin_guard.check(conf, conf.tenant_id, customer_id)
+    -- Margin guard pre-flight check (calls pricing-service quick-check, returns
+    -- 429 on THROTTLE / BLOCK).
+    if margin_guard.check(conf, conf.tenant_id, customer_id) then
+        return
+    end
+
+    kong.ctx.shared.aforo_refused = nil
 end
 
 -- ────────────────────────────────────────────────────────────
@@ -1419,6 +1439,13 @@ end
 -- ────────────────────────────────────────────────────────────
 
 function AforoMeteringHandler:log(conf)
+    -- Refused by this plugin's access phase, or that phase failed: never
+    -- billable. See the flag in access().
+    if kong.ctx.shared.aforo_refused then
+        kong.log.debug("[aforo-metering] Not metering a request this plugin refused.")
+        return
+    end
+
     local method = kong.request.get_method()
     local path = kong.request.get_path()
     local status = kong.response.get_status()

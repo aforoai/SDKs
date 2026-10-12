@@ -8,6 +8,7 @@ This monorepo ships five gateway metering plugins (Kong, Apigee, AWS Lambda, Azu
 - Kong (security): JWTs are bound to the plugin's `tenant_id` (a token for another tenant is rejected), client revocation is looked up by `client_id`, Redis errors no longer reject every token, and `jwt_jwks_uri` is implemented.
 - Kong: rate limiting no longer returns 500 on policies with null fields, can't be bypassed with a lower-case `bearer`, and now covers key-auth traffic. JWT-authenticated requests are not rate limited yet.
 - Kong: the margin guard now applies pricing's BLOCK/THROTTLE verdicts (it read the wrong fields and never blocked), checks the GLOBAL scope, and requires `margin_guard_url`.
+- Kong: requests the plugin itself refuses (401/429/503) are no longer metered.
 - Kong: the event idempotency key is now Kong's own request ID instead of the client's `X-Request-Id` header. A client that repeated one `X-Request-Id` was billed only once.
 
 ## v2.1.0 — 2026-10-01

@@ -111,7 +111,7 @@ Every option lives under `config.*`. `aforo_endpoint`, `api_key`, and `tenant_id
 | `preflight_quota_cache_ttl_ms` | integer | `1000` | How long an `ALLOW` is cached per tenant/customer/metric. `DENY` is never cached. `0` disables. |
 | `preflight_quota_fail_open` | boolean | `true` | On error, timeout or non-200: let the request through (`true`) or answer 503 (`false`). |
 | `exclude_paths` | array | `["/health","/ready","/metrics"]` | Paths skipped from metering (prefix match). |
-| `exclude_status_codes` | array | `[401,403,429]` | Status codes skipped from metering. |
+| `exclude_status_codes` | array | `[401,403,429]` | Status codes skipped from metering. Separately, a request this plugin refuses itself (JWT 401, rate-limit or margin-guard 429, pre-flight quota 429/503) is never metered, whatever this list says. |
 
 ## Walk me through it
 

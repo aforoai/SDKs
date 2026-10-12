@@ -611,4 +611,74 @@ describe("access phase", function()
             assert.equals("margin-low", K.service.request._h["X-Margin-Guard-Warning"])
         end)
     end)
+    -- ── Refused requests are not billed ─────────────────────────
+    describe("refused requests", function()
+        -- exclude_status_codes emptied: the point is that the plugin knows it
+        -- refused the request, whatever status it answered with.
+        local function buffered()
+            return ngx.shared.aforo_buffer:llen("aforo:events")
+        end
+        local function run(extra)
+            local c = conf(extra)
+            c.exclude_status_codes = {}
+            handler:access(c)
+            handler:log(c)
+            return c
+        end
+
+        it("does not meter a request refused 503 by preflight fail-closed", function()
+            K.client._consumer = { custom_id = "cust-1", username = "acme" }
+            http_responses = { { err = "connection refused" } }
+            run({ preflight_quota_enabled = true, preflight_quota_fail_open = false,
+                  preflight_quota_url = "http://ingest/api/v1/quota/check" })
+            assert.equals(503, K.response._exit.status)
+            assert.equals(0, buffered(), "the refused request was buffered as billable usage")
+        end)
+
+        it("does not meter a request refused 429 by the rate limiter, or run later checks", function()
+            K.client._consumer = { custom_id = "cust-1", username = "acme" }
+            redis_store["ratelimit:policy:tenant-B:hash(sk_live_9)"] = '{"enforcementMode":"HARD",'
+                .. '"tiers":[{"windowSeconds":60,"maxRequests":0}]}'
+            K.request._h["Authorization"] = "Bearer sk_live_9"
+            run({ rate_limit_enabled = true, margin_guard_enabled = true,
+                  margin_guard_url = "http://pricing" })
+            assert.equals(429, K.response._exit.status)
+            assert.equals(0, #http_requests)  -- margin guard was not asked
+            assert.equals(0, buffered())
+        end)
+
+        it("does not meter a request refused 429 by the margin guard", function()
+            K.client._consumer = { custom_id = "cust-1", username = "acme" }
+            http_responses = { { status = 200, body = '{"verdict":"BLOCK"}' } }
+            run({ margin_guard_enabled = true, margin_guard_url = "http://pricing" })
+            assert.equals(429, K.response._exit.status)
+            assert.equals(0, buffered())
+        end)
+
+        it("does not meter a request refused 401 by JWT validation", function()
+            K.request._h["Authorization"] = "Bearer " .. jwt(aforo_claims({ tenant_id = "tenant-A" }))
+            run(JWT_CONF)
+            assert.equals(401, K.response._exit.status)
+            assert.equals(0, buffered())
+        end)
+
+        it("does not meter a request whose access phase failed", function()
+            K.client.get_consumer = function() error("boom") end
+            local c = conf()
+            c.exclude_status_codes = {}
+            assert.has.errors(function() handler:access(c) end)
+            K.client.get_consumer = function() return K.client._consumer end
+            K.client._consumer = { custom_id = "cust-1", username = "acme" }
+            K.response._status = 500
+            handler:log(c)
+            assert.equals(0, buffered())
+        end)
+
+        it("still meters a request the access phase let through", function()
+            K.client._consumer = { custom_id = "cust-1", username = "acme" }
+            run()
+            assert.is_nil(K.response._exit)
+            assert.equals(1, buffered())
+        end)
+    end)
 end)
