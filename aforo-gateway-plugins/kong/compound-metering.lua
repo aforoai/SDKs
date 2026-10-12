@@ -4,8 +4,23 @@
 --
 -- Runs in the `log` phase (zero latency impact on client response).
 -- Requires: resty.http, cjson
+--
+-- Not called by handler.lua yet; it ships in the rockspec for integrations
+-- that build compound events themselves.
 
 local cjson = require("cjson.safe")
+
+-- Installed: kong.plugins.aforo-metering.event-util. From the source tree
+-- (busted): the bare filename. Same fallback as handler.lua.
+local function require_sibling(name)
+    local ok, mod = pcall(require, "kong.plugins.aforo-metering." .. name)
+    if ok then
+        return mod
+    end
+    return require(name)
+end
+
+local event_util = require_sibling("event-util")
 
 local M = {}
 
@@ -84,11 +99,14 @@ end
 function M.build_compound_event(customer_id, measurements, metadata, product_type)
     if not measurements or #measurements == 0 then return nil end
 
+    -- 2026-10-12: kong.tools.uuid() does not exist in Kong 3.x (it raised), and
+    -- occurredAt was epoch MILLIseconds, which the ingestor reads as seconds
+    -- -- the same two faults handler.lua had, fixed the same way.
     return {
-        correlationId = kong.tools.uuid(),
+        correlationId = event_util.uuid(),
         customerId    = customer_id,
         productType   = product_type or "API",
-        occurredAt    = ngx.now() * 1000, -- epoch millis
+        occurredAt    = event_util.iso8601_utc(ngx.now()),
         metadata      = metadata,
         measurements  = measurements,
     }
@@ -104,9 +122,13 @@ M.DEFAULT_LLM_PATHS = {
     ["$.usage.total_tokens"]      = "total-tokens",
 }
 
+-- Byte counts go to byte metrics. They used to be sent as bandwidth-in-gb /
+-- -out-gb with the raw byte count as the quantity: a 1 GB transfer billed as a
+-- billion GB. Renamed rather than converted, so no unit (GB or GiB?) and no
+-- rounding is guessed here; the catalog metric decides how bytes are priced.
 M.DEFAULT_CDN_PATHS = {
-    ["$.bandwidth.in_bytes"]  = "bandwidth-in-gb",
-    ["$.bandwidth.out_bytes"] = "bandwidth-out-gb",
+    ["$.bandwidth.in_bytes"]  = "bandwidth-in-bytes",
+    ["$.bandwidth.out_bytes"] = "bandwidth-out-bytes",
     ["$.compute.seconds"]     = "compute-seconds",
     ["$.request_count"]       = "request-count",
 }

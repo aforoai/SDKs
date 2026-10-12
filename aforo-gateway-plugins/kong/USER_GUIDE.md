@@ -24,7 +24,7 @@ luarocks install lua-resty-http
 luarocks make kong-plugin-aforo-metering-2.1.0-1.rockspec
 ```
 
-`luarocks make` reads `kong-plugin-aforo-metering-2.1.0-1.rockspec` and installs the `handler`, `schema`, `rate-limit-enforce`, `margin-guard`, `preflight-quota` and `compound-metering` modules under `kong.plugins.aforo-metering.*`.
+`luarocks make` reads `kong-plugin-aforo-metering-2.1.0-1.rockspec` and installs the `handler`, `schema`, `rate-limit-enforce`, `margin-guard`, `preflight-quota`, `compound-metering` and `event-util` modules under `kong.plugins.aforo-metering.*`.
 
 Two things that will bite you if you skip them:
 
