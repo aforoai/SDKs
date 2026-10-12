@@ -106,7 +106,11 @@ mock_kong = {
     },
     response = {
         get_status = function() return 200 end,
-        get_header = function(name) return nil end,
+        -- Upstream response headers (X-Aforo-*), set per test.
+        _headers = {},
+        get_header = function(name)
+            return mock_kong.response._headers[name]
+        end,
         -- Records instead of exiting, as Kong's access phase does: exit only
         -- stores the response and the handler keeps running unless it returns.
         _exit = nil,
@@ -143,6 +147,7 @@ describe("aforo-metering handler", function()
 
     before_each(function()
         mock_kong.request._headers = {}
+        mock_kong.response._headers = {}
         mock_kong.ctx.shared = {}
     end)
 
@@ -512,6 +517,157 @@ describe("aforo-metering handler", function()
             assert.equals("API", events[2].productType)
         end)
     end)
+    -- ── AI_AGENT identity ───────────────────────────────────────
+    -- agentId / sessionId come from operator config or the upstream RESPONSE
+    -- only. Request headers are client-settable and must never be a source.
+    describe("AI_AGENT identity", function()
+        local BUFFER_KEY = "aforo:events"
+        local dict, warnings, orig_get_consumer, orig_warn
+
+        -- Schema defaults spelled out: busted hands conf to the handler as-is,
+        -- without the defaults Kong would fill in.
+        local function conf(overrides)
+            local c = {
+                aforo_endpoint = "http://ingestor.test/v1/ingest/batch",
+                api_key = "sk_test_key",
+                tenant_id = "tenant_1",
+                default_metric = "api_calls",
+                product_type = "AI_AGENT",
+                quantity_header = "X-Aforo-Quantity",
+                agent_id_header = "X-Aforo-Agent-Id",
+                session_id_header = "X-Aforo-Session-Id",
+                exclude_paths = {},
+                exclude_status_codes = {},
+            }
+            for k, v in pairs(overrides or {}) do c[k] = v end
+            return c
+        end
+        local function buffered()
+            local l = dict.store[BUFFER_KEY]
+            local out = {}
+            for i = 1, (l and #l or 0) do out[i] = cjson.decode(l[i]) end
+            return out
+        end
+        -- One proxied request: request headers from the client, response
+        -- headers from the upstream. The customer is the Kong consumer.
+        local function log(c, request_headers, response_headers)
+            mock_kong.request._headers = request_headers or { ["X-Request-Id"] = "req-1" }
+            mock_kong.response._headers = response_headers or {}
+            handler:log(c)
+        end
+
+        before_each(function()
+            dict = new_shared_dict()
+            ngx.shared.aforo_buffer = dict
+            ngx.timers = {}
+            warnings = {}
+            orig_get_consumer = mock_kong.client.get_consumer
+            orig_warn = mock_kong.log.warn
+            mock_kong.client.get_consumer = function()
+                return { custom_id = "cust_acme", username = "acme-corp" }
+            end
+            mock_kong.log.warn = function(...)
+                local parts = {}
+                for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+                table.insert(warnings, table.concat(parts))
+            end
+        end)
+
+        after_each(function()
+            mock_kong.client.get_consumer = orig_get_consumer
+            mock_kong.log.warn = orig_warn
+        end)
+
+        it("meters with config agent_id, one session per request", function()
+            log(conf({ agent_id = "fraud-shield-agent" }))
+            local events = buffered()
+            assert.equals(1, #events)
+            local e = events[1]
+            assert.equals("AI_AGENT", e.productType)
+            assert.equals("cust_acme", e.customerId)
+            assert.equals("fraud-shield-agent", e.agentId)
+            assert.equals("req-1", e.sessionId)
+            assert.equals("req-1", e.idempotencyKey)
+            assert.equals(1, e.quantity)
+        end)
+
+        it("lets upstream response headers override config and report tokens", function()
+            log(conf({ agent_id = "fraud-shield-agent" }), nil, {
+                ["X-Aforo-Agent-Id"]   = "fraud-shield-v2",
+                ["X-Aforo-Session-Id"] = "sess-42",
+                ["X-Aforo-Quantity"]   = "2100",
+            })
+            local e = buffered()[1]
+            assert.equals("AI_AGENT", e.productType)
+            assert.equals("fraud-shield-v2", e.agentId)
+            assert.equals("sess-42", e.sessionId)
+            assert.equals(2100, e.quantity)
+            assert.equals("req-1", e.idempotencyKey)
+        end)
+
+        it("ignores a response header that is turned off (null)", function()
+            -- Kong hands the handler nil for a setting configured as null.
+            local c = conf({ agent_id = "fraud-shield-agent" })
+            c.agent_id_header, c.session_id_header = nil, nil
+            log(c, nil, {
+                ["X-Aforo-Agent-Id"]   = "fraud-shield-v2",
+                ["X-Aforo-Session-Id"] = "sess-42",
+            })
+            local e = buffered()[1]
+            assert.equals("fraud-shield-agent", e.agentId)
+            assert.equals("req-1", e.sessionId)
+        end)
+
+        it("never reads agent or session IDs from client request headers", function()
+            local forged = {
+                ["X-Request-Id"]       = "req-1",
+                ["X-Aforo-Agent-Id"]   = "agent_forged",
+                ["x-aforo-agent-id"]   = "agent_forged",
+                ["X-Agent-Id"]         = "agent_forged",
+                ["x-agent-id"]         = "agent_forged",
+                ["X-Aforo-Session-Id"] = "sess_forged",
+                ["x-aforo-session-id"] = "sess_forged",
+            }
+            -- Configured: config wins over every forged header.
+            log(conf({ agent_id = "fraud-shield-agent" }), forged)
+            -- Not configured: the forged headers do not fill the gap.
+            log(conf(), forged)
+            local events = buffered()
+            assert.equals(1, #events)
+            assert.equals("fraud-shield-agent", events[1].agentId)
+            assert.equals("req-1", events[1].sessionId)
+        end)
+
+        it("skips an event with no agent ID anywhere and names the fix", function()
+            log(conf())
+            log(conf({ agent_id = "" }), nil, { ["X-Aforo-Agent-Id"] = "" })
+            assert.equals(0, #buffered())
+            -- Throttled: one warning per window, not one per request.
+            assert.equals(1, #warnings)
+            assert.truthy(warnings[1]:find("requires agentId", 1, true))
+            assert.truthy(warnings[1]:find("config.agent_id", 1, true))
+            assert.truthy(warnings[1]:find("X-Aforo-Agent-Id response header", 1, true))
+        end)
+
+        it("adds nothing to API events", function()
+            -- As configured before these settings existed.
+            local plain = conf({ product_type = "API" })
+            plain.agent_id_header, plain.session_id_header = nil, nil
+            log(plain)
+            log(conf({ product_type = "API", agent_id = "fraud-shield-agent" }), nil, {
+                ["X-Aforo-Agent-Id"]   = "fraud-shield-v2",
+                ["X-Aforo-Session-Id"] = "sess-42",
+            })
+            local events = buffered()
+            assert.equals(2, #events)
+            assert.equals("API", events[2].productType)
+            assert.is_nil(events[2].agentId)
+            assert.is_nil(events[2].sessionId)
+            assert.equals(1, events[2].quantity)
+            -- Field for field the event an API service sent before these settings.
+            assert.same(events[1], events[2])
+        end)
+    end)
     -- ── Pre-flight quota check ──────────────────────────────────
     describe("preflight quota", function()
         local dict
@@ -627,6 +783,58 @@ describe("aforo-metering handler", function()
             mock_kong.request._headers = { ["x-customer-id"] = "cust_forged" }
             access(conf())
             assert.equals(0, #http_mock.requests)
+        end)
+    end)
+    -- ── Schema ──────────────────────────────────────────────────
+    -- Kong validates the schema itself at startup and refuses to load the
+    -- plugin on any violation, so these are checked without a running Kong.
+    describe("schema", function()
+        local config_fields, saved_typedefs
+
+        lazy_setup(function()
+            saved_typedefs = package.loaded["kong.db.schema.typedefs"]
+            package.loaded["kong.db.schema.typedefs"] = { no_consumer = {}, protocols_http = {} }
+            package.loaded["schema"] = nil
+            local schema = require("schema")
+            for _, f in ipairs(schema.fields) do
+                if f.config then config_fields = f.config.fields end
+            end
+        end)
+
+        lazy_teardown(function()
+            package.loaded["kong.db.schema.typedefs"] = saved_typedefs
+        end)
+
+        local function field(name)
+            for _, f in ipairs(config_fields) do
+                if f[name] then return f[name] end
+            end
+        end
+
+        it("keeps every description within Kong's 500-character limit", function()
+            local too_long = {}
+            local function walk(fields, prefix)
+                for _, f in ipairs(fields) do
+                    local name, def = next(f)
+                    if def.description and #def.description > 500 then
+                        too_long[#too_long + 1] = prefix .. name .. " (" .. #def.description .. ")"
+                    end
+                    if def.fields then walk(def.fields, prefix .. name .. ".") end
+                    if def.elements and def.elements.fields then
+                        walk(def.elements.fields, prefix .. name .. "[].")
+                    end
+                end
+            end
+            walk(config_fields, "config.")
+            -- Longer and Kong fails at boot: "length must be at most 500".
+            assert.same({}, too_long)
+        end)
+
+        it("declares the AI_AGENT identity settings", function()
+            assert.equals("string", field("agent_id").type)
+            assert.is_nil(field("agent_id").default)
+            assert.equals("X-Aforo-Agent-Id", field("agent_id_header").default)
+            assert.equals("X-Aforo-Session-Id", field("session_id_header").default)
         end)
     end)
 end)

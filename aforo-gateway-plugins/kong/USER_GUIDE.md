@@ -1,6 +1,6 @@
 # kong-plugin-aforo-metering — User Guide
 
-**Version:** 2.1.0 · **Updated:** 2026-10-01 · **Audience:** engineers running Kong Gateway (OSS or Enterprise) who want API usage metered into Aforo.
+**Version:** 2.1.0 · **Updated:** 2026-10-12 · **Audience:** engineers running Kong Gateway (OSS or Enterprise) who want API usage metered into Aforo.
 
 ## What you'll build
 
@@ -122,7 +122,7 @@ override the mapping for that request. A quantity that is not a positive number 
 with a warning, because the ingestor requires `quantity > 0` and a malformed value would
 otherwise fail the whole batch.
 
-Configurable via `metric_header` / `quantity_header`; set either to empty to disable.
+Configurable via `metric_header` / `quantity_header`; set either to `null` to disable.
 
 ### Resolution order
 
@@ -132,6 +132,72 @@ Configurable via `metric_header` / `quantity_header`; set either to empty to dis
 4. `default_metric`
 
 Existing deployments that set a custom `metric_name_pattern` keep working unchanged.
+
+### Metering an AI agent
+
+If the service behind Kong is an AI agent, bill it as `AI_AGENT`. Aforo needs two
+values on every AI agent event that Kong cannot see for itself: which agent did the
+work (`agentId`) and which session the request belongs to (`sessionId`). The plugin
+takes both from your plugin config or your upstream's response only. It never reads
+them from the client's request, because a client can set a request header to anything.
+
+1. Set `product_type: AI_AGENT` on the agent's service or route.
+2. Name the agent. Set `agent_id` in the plugin config (simplest when one service is
+   one agent), or have the upstream send `X-Aforo-Agent-Id: <agent id>` on its response.
+   If both are present, the response header wins.
+3. Report tokens. Have the upstream send `X-Aforo-Quantity: <tokens>` on its response,
+   as in [When only the backend knows](#when-only-the-backend-knows). Without it, each
+   request counts as 1.
+4. If a session spans several requests, have the upstream send
+   `X-Aforo-Session-Id: <session id>` on each of those responses. Without it, each
+   request is its own session.
+
+The customer is still the Kong consumer, or the validated JWT claim (see Step 4). The
+agent ID records which agent did the work, not who pays for it.
+
+```yaml
+services:
+  - name: fraud-shield
+    url: http://fraud-shield.internal:8080
+    routes:
+      - name: fraud-shield
+        paths: [/agents/fraud-shield]
+    plugins:
+      - name: key-auth
+      - name: aforo-metering
+        config:
+          aforo_endpoint: https://api.aforo.ai/v1/ingest/batch
+          api_key: ${AFORO_API_KEY}
+          tenant_id: ${AFORO_TENANT_ID}
+          product_type: AI_AGENT
+          agent_id: fraud-shield-agent
+```
+
+A response from the agent that used 2,100 tokens in session `sess-42`:
+
+```
+HTTP/1.1 200 OK
+X-Aforo-Quantity: 2100
+X-Aforo-Session-Id: sess-42
+```
+
+is metered as `agentId: fraud-shield-agent`, `sessionId: sess-42`, `quantity: 2100`.
+
+If neither `agent_id` nor the response header supplies an agent ID, the event is not
+metered, and the log says how to fix it:
+
+```
+[aforo-metering] Skipping events: product_type AI_AGENT requires agentId, which this request did not supply (e.g. POST /agents/fraud-shield). Fix: set config.agent_id to this service's agent ID, or have the upstream send it in the X-Aforo-Agent-Id response header.
+```
+
+The header names are configurable with `agent_id_header`, `session_id_header` and
+`quantity_header`. To turn one off, set it to `null` (Kong does not accept an empty
+string for these settings).
+
+> ⚠ The plugin reads these headers after the response has gone to the client, so the
+> client receives them too. Do not remove them with another plugin such as
+> `response-transformer`. If you do, the plugin never sees them: the agent ID falls back
+> to `agent_id`, each request becomes its own session, and the quantity falls back to 1.
 
 ## Step 2 — Register the plugin and the shared buffer
 

@@ -38,11 +38,16 @@ return {
                         },
                     },
                     -- Product type
+                    --
+                    -- Kong refuses a field description longer than 500
+                    -- characters, and the whole plugin then fails to load
+                    -- ("length must be at most 500"). Keep these short; the
+                    -- detail belongs in README.md.
                     {
                         product_type = {
                             type = "string",
                             default = "API",
-                            description = "Aforo productType sent on every event (trimmed, upper-cased): API, AGENTIC_API, AI_AGENT, MCP_SERVER, GRPC_API, GRAPHQL_API, WEBSOCKET_API or MQTT_BROKER. The ingestor requires it. MCP tools/call (mcp_enabled) is sent as MCP_SERVER when both toolName and agentId are known. Events missing the fields their type requires (MCP_SERVER: toolName + agentId) are skipped rather than sent, because one invalid event fails the whole batch. AI_AGENT / GRPC_API / GRAPHQL_API / WEBSOCKET_API / MQTT_BROKER need fields an HTTP gateway cannot observe or trust (agentId, gRPC/GraphQL/WebSocket/MQTT fields), so every non-MCP event would be skipped.",
+                            description = "Aforo productType sent on every event (trimmed, upper-cased): API, AGENTIC_API, AI_AGENT, MCP_SERVER, GRPC_API, GRAPHQL_API, WEBSOCKET_API or MQTT_BROKER. MCP tools/call is sent as MCP_SERVER when toolName and agentId are known. Events missing their type's required fields are skipped, as one invalid event fails the whole batch. AI_AGENT takes agentId from agent_id_header or agent_id. GRPC_API, GRAPHQL_API, WEBSOCKET_API and MQTT_BROKER need fields a gateway cannot observe.",
                         },
                     },
                     -- Metric configuration
@@ -99,14 +104,14 @@ return {
                         metric_header = {
                             type = "string",
                             default = "X-Aforo-Metric",
-                            description = "Upstream RESPONSE header that overrides the metric for a single request. For cases only the backend knows, e.g. one endpoint serving several billable actions. Read from the response, so clients cannot forge it. Set empty to disable.",
+                            description = "Upstream RESPONSE header that overrides the metric for a single request. For cases only the backend knows, e.g. one endpoint serving several billable actions. Read from the response, so clients cannot forge it. Set to null to disable.",
                         },
                     },
                     {
                         quantity_header = {
                             type = "string",
                             default = "X-Aforo-Quantity",
-                            description = "Upstream RESPONSE header supplying the quantity for a single request. Needed for metrics whose value only the backend knows -- call_minutes, tokens, bytes processed -- which a gateway cannot observe. Ignored unless it parses to a positive number. Set empty to disable.",
+                            description = "Upstream RESPONSE header supplying the quantity for a single request. Needed for metrics whose value only the backend knows -- call_minutes, tokens, bytes processed -- which a gateway cannot observe. Ignored unless it parses to a positive number. Set to null to disable.",
                         },
                     },
                     {
@@ -114,6 +119,32 @@ return {
                             type = "string",
                             default = "1",
                             description = "Quantity source: '1' (count), 'response_size' (bytes), or a number",
+                        },
+                    },
+                    -- AI_AGENT identity (product_type=AI_AGENT only).
+                    -- Aforo requires agentId and sessionId on every AI_AGENT
+                    -- event. Both come from operator config or the upstream
+                    -- RESPONSE, never from a request header: X-Agent-Id and
+                    -- friends are client-settable, so a caller could choose
+                    -- which agent its usage is attributed to.
+                    {
+                        agent_id = {
+                            type = "string",
+                            description = "Agent ID for AI_AGENT events on the service/route this plugin is attached to. Operator config, so trusted. Used when the upstream does not send agent_id_header.",
+                        },
+                    },
+                    {
+                        agent_id_header = {
+                            type = "string",
+                            default = "X-Aforo-Agent-Id",
+                            description = "Upstream RESPONSE header carrying the agent ID for a single AI_AGENT request; wins over agent_id. Read from the response, so clients cannot forge it. Set to null to disable.",
+                        },
+                    },
+                    {
+                        session_id_header = {
+                            type = "string",
+                            default = "X-Aforo-Session-Id",
+                            description = "Upstream RESPONSE header carrying the session ID for an AI_AGENT request, so several requests can share one session. Without it, each request is its own session (the request ID). Set to null to disable.",
                         },
                     },
                     {

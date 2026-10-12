@@ -4,6 +4,8 @@ This monorepo ships five gateway metering plugins (Kong, Apigee, AWS Lambda, Azu
 
 ## Unreleased
 
+- Kong: `AI_AGENT` metering, with `agent_id` / `agent_id_header` / `session_id_header` (operator config or upstream response headers, never request headers). Also fixes the Kong plugin failing to load at startup because a schema description exceeded Kong's 500-character limit.
+
 ## v2.1.0 — 2026-10-01
 
 - Every event now carries `productType` (required by the ingestor in production): new per-plugin setting, default `API` — Kong `product_type`, Apigee KVM `product_type`, AWS Lambda `PRODUCT_TYPE` / `ProductType`, Azure Named Value `aforo-product-type`, MuleSoft `product-type`. MCP `tools/call` is sent as `MCP_SERVER` only when both `toolName` and `agentId` are present; events missing their type's required fields are skipped rather than failing the batch.

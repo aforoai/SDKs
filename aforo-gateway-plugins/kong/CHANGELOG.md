@@ -6,6 +6,14 @@ This plugin ships on the Aforo gateway-plugins line; the whole repo is versioned
 
 ## [Unreleased]
 
+### Added
+- `AI_AGENT` metering. Three new settings: `agent_id` (the agent ID for the service or route), `agent_id_header` (default `X-Aforo-Agent-Id`) and `session_id_header` (default `X-Aforo-Session-Id`). The two headers are upstream response headers. With `product_type=AI_AGENT`, each event carries `agentId` (the response header, else `agent_id`) and `sessionId` (the response header, else the request ID, so each request is its own session). Request headers are never read for either. Tokens are still reported with `X-Aforo-Quantity`. Events of other product types are unchanged.
+
+### Fixed
+- The plugin failed to load in Kong (seen on 3.4): the `product_type` schema description was longer than Kong's 500-character limit, so Kong refused the plugin at startup with `length must be at most 500`. The description is shorter now, and a spec test checks the limit for every setting.
+- When an `AI_AGENT` event is skipped for a missing agent ID, the warning says how to supply it.
+- The docs and setting descriptions said `metric_header` and `quantity_header` are turned off by setting them to an empty string. Kong rejects an empty string for these settings (`length must be at least 1`); set them to `null` instead.
+
 ## [2.1.0] — 2026-10-01
 
 ### Added

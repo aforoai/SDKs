@@ -378,11 +378,12 @@ local MAX_RETRY_AFTER_SECONDS = 30
 -- productType is REQUIRED by the ingestor in production, and some types carry
 -- fields of their own. The ingestor validates a batch as a whole, so one event
 -- missing its type's fields fails every event it travels with; such events are
--- skipped at the log phase instead. An AI_AGENT agentId (no trusted source:
--- X-Agent-Id is client-settable), gRPC service/method, GraphQL operation,
--- WebSocket connection and MQTT topic are not observable at an HTTP gateway,
--- so those types are listed only so the check refuses them rather than
--- poisoning batches. Unknown types are passed through unchecked.
+-- skipped at the log phase instead. AI_AGENT gets agentId and sessionId from
+-- trusted sources only (see resolve_ai_agent_identity). gRPC service/method,
+-- GraphQL operation, WebSocket connection and MQTT topic are not observable
+-- at an HTTP gateway, so those types are listed only so the check refuses
+-- them rather than poisoning batches. Unknown types are passed through
+-- unchecked.
 local DEFAULT_PRODUCT_TYPE = "API"
 local PRODUCT_TYPE_REQUIRED_FIELDS = {
     API           = {},
@@ -675,6 +676,47 @@ local function resolve_quantity(conf, response_size, header_quantity)
     else
         return tonumber(source) or 1
     end
+end
+
+-- v when it is a non-empty string, else nil. A type check rather than a
+-- truthiness one, so a null config value can never reach an event as a JSON
+-- null that the required-field check would wave through.
+local function non_empty_string(v)
+    if type(v) == "string" and v ~= "" then
+        return v
+    end
+    return nil
+end
+
+-- Resolve agentId and sessionId for an AI_AGENT event.
+--
+-- Aforo requires both on every AI_AGENT event and a gateway observes neither.
+-- The obvious sources -- X-Agent-Id or X-Aforo-Session-Id on the REQUEST --
+-- are client-settable, so they are never read: a caller could choose which
+-- agent its usage is attributed to. Only sources the client cannot touch:
+--   agentId:   conf.agent_id_header from the upstream RESPONSE, then the
+--              operator's conf.agent_id for this service/route
+--   sessionId: conf.session_id_header from the upstream RESPONSE, then this
+--              request's idempotency key -- so without the header, one
+--              request is one session
+-- agentId may come back nil; the required-field check in the log phase
+-- refuses the event and says how to supply it.
+local function resolve_ai_agent_identity(conf, request_key)
+    local agent_id, session_id
+
+    local agent_header = non_empty_string(conf.agent_id_header)
+    if agent_header then
+        agent_id = non_empty_string(kong.response.get_header(agent_header))
+    end
+    agent_id = agent_id or non_empty_string(conf.agent_id)
+
+    local session_header = non_empty_string(conf.session_id_header)
+    if session_header then
+        session_id = non_empty_string(kong.response.get_header(session_header))
+    end
+    session_id = session_id or request_key
+
+    return agent_id, session_id
 end
 
 -- resolve_customer_id
@@ -1154,6 +1196,14 @@ function AforoMeteringHandler:log(conf)
         event.quantity       = resolve_quantity(conf, response_size, header_quantity)
         event.idempotencyKey = generate_idempotency_key(request_id)
         event.occurredAt     = iso8601_utc(ngx.now())
+        -- AI_AGENT only. Other types do not define these fields, so they are
+        -- left off rather than sent on every API call. The idempotency key is
+        -- the request ID when there is one, so it doubles as the per-request
+        -- session fallback.
+        if event.productType == "AI_AGENT" then
+            event.agentId, event.sessionId =
+                resolve_ai_agent_identity(conf, event.idempotencyKey)
+        end
     end
 
     -- quantity must be > 0 (e.g. quantity_source=response_size with an empty
@@ -1236,10 +1286,21 @@ function AforoMeteringHandler:log(conf)
     -- reason as the customerId skip above: one such event fails its batch.
     local missing = missing_required_fields(event)
     if missing then
+        -- Name the fix where there is one. Off the MCP path an AI_AGENT
+        -- agentId has exactly two sources, both in the operator's hands;
+        -- sessionId always has its request-ID fallback, so it is never the gap.
+        local fix = ""
+        if not mcp_info and event.productType == "AI_AGENT" and not event.agentId then
+            local agent_header = non_empty_string(conf.agent_id_header)
+            fix = " Fix: set config.agent_id to this service's agent ID, or have the upstream "
+                .. (agent_header
+                    and ("send it in the " .. agent_header .. " response header.")
+                    or "send it in a response header and set config.agent_id_header to its name.")
+        end
         warn_throttled("missing_fields_" .. event.productType, 300,
             "[aforo-metering] Skipping events: product_type ", event.productType,
             " requires ", table.concat(missing, ", "), ", which this request did not ",
-            "supply (e.g. ", method, " ", path, "). Repeats suppressed for 300s.")
+            "supply (e.g. ", method, " ", path, ").", fix, " Repeats suppressed for 300s.")
         return
     end
 
