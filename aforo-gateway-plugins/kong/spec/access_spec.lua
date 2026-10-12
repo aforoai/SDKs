@@ -67,6 +67,7 @@ _G.ngx = {
     timer = { at = function(delay, fn, ...) table.insert(timers, { delay = delay, fn = fn, args = { ... } }); return true end },
     sleep = function() end,
     decode_base64 = b64dec,
+    md5 = function(s) return (s:gsub("[^%w]", "_")) end,
     escape_uri = function(s) return (tostring(s):gsub("[^%w%-%._~]", function(c) return string.format("%%%02X", c:byte()) end)) end,
 }
 
@@ -616,7 +617,7 @@ describe("access phase", function()
         -- exclude_status_codes emptied: the point is that the plugin knows it
         -- refused the request, whatever status it answered with.
         local function buffered()
-            return ngx.shared.aforo_buffer:llen("aforo:events")
+            return ngx.shared.aforo_buffer:llen(handler._buffer_key(conf()))
         end
         local function run(extra)
             local c = conf(extra)

@@ -41,5 +41,6 @@ build = {
         ["kong.plugins.aforo-metering.preflight-quota"]    = "preflight-quota.lua",
         ["kong.plugins.aforo-metering.compound-metering"]  = "compound-metering.lua",
         ["kong.plugins.aforo-metering.event-util"]         = "event-util.lua",
+        ["kong.plugins.aforo-metering.event-buffer"]       = "event-buffer.lua",
     },
 }

@@ -62,6 +62,9 @@ ngx.sleeps = {}
 ngx.sleep = function(s) table.insert(ngx.sleeps, s) end
 ngx.worker = ngx.worker or { pid = function() return 1 end }
 ngx.escape_uri = ngx.escape_uri or function(s) return s end
+-- Stand-in for ngx.md5: distinct inputs give distinct keys, which is all the
+-- buffer and mappings keys need here.
+ngx.md5 = ngx.md5 or function(s) return (s:gsub("[^%w]", "_")) end
 
 -- resty.http mock: records every request and answers from a queue of
 -- scripted responses ({status=...} or {err="timeout"}); default 202.
@@ -134,6 +137,7 @@ mock_kong = {
         info = function(...) end,
         warn = function(...) end,
         err = function(...) end,
+        debug = function(...) end,
     },
     tools = {
         uuid = function() return "test-uuid" end,
@@ -255,7 +259,6 @@ describe("aforo-metering handler", function()
     -- concurrent workers lost events. It is now a list touched only by atomic
     -- rpush / lpop / lpush / rpop.
     describe("event buffer", function()
-        local BUFFER_KEY = "aforo:events"
         local dict
         local conf = {
             aforo_endpoint = "http://ingestor.test/v1/ingest/batch",
@@ -267,6 +270,7 @@ describe("aforo-metering handler", function()
             exclude_paths = {},
             exclude_status_codes = {},
         }
+        local BUFFER_KEY = handler._buffer_key(conf)
 
         local function log_request(customer_id)
             mock_kong.ctx.shared = { aforo_jwt_claims = { customer_id = customer_id } }
@@ -328,8 +332,10 @@ describe("aforo-metering handler", function()
         it("schedules an immediate flush once flush_count events are buffered", function()
             fill(49)
             log_request("cust_50")
-            assert.equals(1, #ngx.timers)
-            assert.equals(0, ngx.timers[1].delay)
+            -- The timed flush every non-empty buffer keeps pending, plus one immediate.
+            assert.equals(2, #ngx.timers)
+            assert.equals(5, ngx.timers[1].delay)
+            assert.equals(0, ngx.timers[2].delay)
         end)
 
         it("caps the buffer at MAX_BUFFER_SIZE, dropping the newest, and still schedules a flush", function()
@@ -339,10 +345,11 @@ describe("aforo-metering handler", function()
             assert.equals(10000, #events)
             assert.equals("c10000", events[10000].customerId)
             -- A full buffer must not stop flushing forever.
-            assert.equals(1, #ngx.timers)
+            assert.equals(2, #ngx.timers)
+            assert.equals(0, ngx.timers[2].delay)
             -- ...but not one flush per dropped request.
             log_request("cust_overflow_2")
-            assert.equals(1, #ngx.timers)
+            assert.equals(2, #ngx.timers)
         end)
 
         it("flushes with X-API-Key alone and empties the buffer", function()
@@ -370,9 +377,9 @@ describe("aforo-metering handler", function()
             assert.equals(0, #buffered())
         end)
 
-        it("drops a batch rejected with 4xx and keeps draining the rest", function()
+        it("drops a batch rejected with a permanent 4xx and keeps draining the rest", function()
             fill(1500)
-            http_mock.responses = { { status = 400, body = "bad event" } }
+            http_mock.responses = { { status = 422, body = "unprocessable" } }
             handler._flush_buffer(false, conf)
 
             -- One attempt for the rejected batch (no retry), one for the remainder.
@@ -446,9 +453,274 @@ describe("aforo-metering handler", function()
             assert.equals("new9990", events[10000].customerId)
         end)
     end)
+    -- ── Delivery (2026-10-12) ───────────────────────────────────
+    -- The metering-path review's findings, as tests of the fixed behaviour.
+    describe("delivery", function()
+        local dict
+        local function conf(o)
+            local c = {
+                aforo_endpoint = "http://ingestor.test/v1/ingest/batch",
+                api_key = "sk_A", tenant_id = "tenantA",
+                default_metric = "api_calls", flush_count = 50, flush_interval_ms = 5000,
+                quantity_header = "X-Aforo-Quantity", metric_header = "X-Aforo-Metric",
+                exclude_paths = {}, exclude_status_codes = { 401, 403, 429 },
+            }
+            for k, v in pairs(o or {}) do c[k] = v end
+            return c
+        end
+        local function log(c, cust, headers, response_headers)
+            mock_kong.request._headers = headers or {}
+            mock_kong.response._headers = response_headers or {}
+            mock_kong.ctx.shared = { aforo_jwt_claims = { customer_id = cust or "cust_a" } }
+            handler:log(c)
+        end
+        local function raw(c)
+            return dict.store[handler._buffer_key(c)] or {}
+        end
+        local function buffered(c)
+            local out = {}
+            for i, e in ipairs(raw(c)) do out[i] = cjson.decode(e) end
+            return out
+        end
+        local function sent(i) return cjson.decode(http_mock.requests[i].params.body).events end
+        local function run(t) t.fn(false, unpack(t.args)) end
+        local function timers_at(delay)
+            local n = 0
+            for _, t in ipairs(ngx.timers) do if t.delay == delay then n = n + 1 end end
+            return n
+        end
+        local function customers_delivered()
+            local out = {}
+            for i, r in ipairs(http_mock.requests) do
+                if r.status == 202 then
+                    for _, e in ipairs(sent(i)) do out[#out + 1] = e.customerId end
+                end
+            end
+            table.sort(out)
+            return out
+        end
+        -- Answer each POST by looking at what it carries.
+        local function respond_by_body(fn)
+            http_mock.on_request = function(n)
+                local status = fn(http_mock.requests[n].params.body)
+                http_mock.requests[n].status = status
+                table.insert(http_mock.responses, 1, { status = status })
+            end
+        end
+
+        before_each(function()
+            dict = new_shared_dict()
+            ngx.shared.aforo_buffer = dict
+            ngx.timers, ngx.sleeps = {}, {}
+            http_mock.requests, http_mock.responses, http_mock.on_request = {}, {}, nil
+        end)
+
+        it("keeps a timed flush pending after a failed flush, so low traffic still drains", function()
+            local c = conf()
+            log(c, "c1"); log(c, "c2"); log(c, "c3")
+            assert.equals(1, #ngx.timers)
+            http_mock.responses = { { status = 503 }, { status = 503 }, { status = 503 } }
+            run(table.remove(ngx.timers, 1))
+            assert.equals(3, #buffered(c))
+            -- Already rescheduled: no need to wait for flush_count more requests.
+            assert.equals(1, #ngx.timers)
+            assert.equals(5, ngx.timers[1].delay)
+            run(table.remove(ngx.timers, 1))      -- ingestor healthy again
+            assert.equals(0, #buffered(c))
+            assert.equals(3, #sent(4))
+        end)
+
+        it("runs at most one immediate flush per buffer, and none during backoff", function()
+            local c = conf({ flush_count = 5 })
+            local k = handler._buffer_key(c)
+            dict:set(k .. ":lock", true)          -- a flush is running in another worker
+            for i = 1, 200 do log(c, "c" .. i) end
+            assert.equals(1, #ngx.timers)         -- just the pending timed flush
+            assert.equals(0, timers_at(0))
+            dict:delete(k .. ":lock")
+            for i = 201, 400 do log(c, "c" .. i) end
+            assert.equals(1, timers_at(0))        -- one immediate flush, not one per request
+
+            ngx.timers = {}
+            dict:delete(k .. ":kick")
+            dict:set(k .. ":backoff", true)       -- the last flush failed
+            for i = 401, 450 do log(c, "c" .. i) end
+            assert.equals(0, timers_at(0))
+        end)
+
+        it("an immediate flush that finds a flush running leaves it alone", function()
+            local c = conf({ flush_count = 1 })
+            log(c, "c1")
+            local kick
+            for _, t in ipairs(ngx.timers) do if t.delay == 0 then kick = t end end
+            dict:set(handler._buffer_key(c) .. ":lock", true)
+            run(kick)
+            assert.equals(0, #http_mock.requests)
+            assert.equals(1, #buffered(c))
+        end)
+
+        it("makes one quick send when the worker is exiting, and keeps what fails", function()
+            local c = conf()
+            log(c, "c1"); log(c, "c2")
+            local t = table.remove(ngx.timers, 1)
+            t.fn(true, unpack(t.args))            -- premature: reload / shutdown
+            assert.equals(1, #http_mock.requests)
+            assert.equals(2, #sent(1))
+            assert.equals(0, #buffered(c))
+
+            log(c, "c3")
+            http_mock.responses = { { status = 503 } }
+            handler._flush_buffer(true, c)
+            assert.equals(2, #http_mock.requests) -- one attempt, no retries
+            assert.same({}, ngx.sleeps)
+            assert.equals(1, #buffered(c))
+        end)
+
+        it("flushes each plugin instance's events with its own key and endpoint", function()
+            local A = conf()
+            local B = conf({ api_key = "sk_B", tenant_id = "tenantB",
+                             aforo_endpoint = "http://ingestor-b.test/v1/ingest/batch" })
+            log(A, "cust_of_A"); log(B, "cust_of_B")
+            assert.equals(2, #ngx.timers)
+            run(table.remove(ngx.timers, 1)); run(table.remove(ngx.timers, 1))
+            assert.equals(2, #http_mock.requests)
+            local by_url = {}
+            for i, r in ipairs(http_mock.requests) do by_url[r.url] = { r = r, events = sent(i) } end
+            local a, b = by_url["http://ingestor.test/v1/ingest/batch"], by_url["http://ingestor-b.test/v1/ingest/batch"]
+            assert.equals("sk_A", a.r.params.headers["X-API-Key"])
+            assert.equals("tenantA", a.r.params.headers["X-Tenant-Id"])
+            assert.equals(1, #a.events)
+            assert.equals("cust_of_A", a.events[1].customerId)
+            assert.equals("sk_B", b.r.params.headers["X-API-Key"])
+            assert.equals("tenantB", b.r.params.headers["X-Tenant-Id"])
+            assert.equals(1, #b.events)
+            assert.equals("cust_of_B", b.events[1].customerId)
+        end)
+
+        it("keeps the batch on 401, 403 and 404, without a retry storm", function()
+            for _, status in ipairs({ 401, 403, 404 }) do
+                dict = new_shared_dict(); ngx.shared.aforo_buffer = dict
+                http_mock.requests = {}
+                local c = conf()
+                log(c, "c1"); log(c, "c2")
+                http_mock.responses = { { status = status, body = '{"title":"Unauthorized"}' } }
+                handler._flush_buffer(false, c)
+                assert.equals(1, #http_mock.requests)
+                assert.equals(2, #buffered(c))
+            end
+        end)
+
+        it("re-sends only the events a 202 says could not be stored", function()
+            local c = conf()
+            log(c, "c1"); log(c, "c2"); log(c, "c3")
+            http_mock.responses = { { status = 202, body = '{"accepted":1,"duplicates":0,"failed":2,"errors":['
+                .. '{"index":0,"message":"The event could not be stored: connection refused"},'
+                .. '{"index":2,"message":"metricName Metric name is required"}]}' } }
+            handler._flush_buffer(false, c)
+            local left = buffered(c)
+            assert.equals(1, #left)
+            assert.equals("c1", left[1].customerId)
+        end)
+
+        it("bisects a batch the ingestor answers 400, so one bad event costs only itself", function()
+            local c = conf()
+            for i = 1, 8 do log(c, "c" .. i) end
+            respond_by_body(function(body) return body:find('"c5"', 1, true) and 400 or 202 end)
+            handler._flush_buffer(false, c)
+            assert.same({ "c1", "c2", "c3", "c4", "c6", "c7", "c8" }, customers_delivered())
+            assert.equals(0, #buffered(c))
+            assert.is_true(#http_mock.requests <= 7)  -- log2(8) levels, not one POST per event
+        end)
+
+        it("splits a batch the ingestor answers 413", function()
+            local c = conf()
+            for i = 1, 4 do log(c, "c" .. i) end
+            respond_by_body(function(body)
+                local _, n = body:gsub('"customerId"', "")
+                return n > 2 and 413 or 202
+            end)
+            handler._flush_buffer(false, c)
+            assert.same({ "c1", "c2", "c3", "c4" }, customers_delivered())
+        end)
+
+        it("drops a single event the ingestor answers 400, with the reason", function()
+            local c = conf()
+            log(c, "c1")
+            http_mock.responses = { { status = 400, body = "Invalid UTF-8" } }
+            handler._flush_buffer(false, c)
+            assert.equals(1, #http_mock.requests)
+            assert.equals(0, #buffered(c))
+        end)
+
+        it("gives every AGENTIC_API event a traceId the client cannot withhold", function()
+            local c = conf({ product_type = "AGENTIC_API" })
+            ngx.var = { request_id = "kongreq1" }
+            log(c, "c1")
+            log(c, "c2", { traceparent = "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01" })
+            log(c, "c3", { ["x-trace-id"] = "legacy-1" })
+            log(c, "c4", { traceparent = "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+                           ["x-trace-id"] = "legacy-2" })
+            ngx.var = nil
+            local ids = {}
+            for i, e in ipairs(buffered(c)) do ids[i] = e.traceId end
+            assert.same({ "kongreq1", "4bf92f3577b34da6a3ce929d0e0e4736", "legacy-1", "legacy-2" }, ids)
+        end)
+
+        it("caches central mappings per tenant", function()
+            local url = "http://catalog/internal/v1/metrics/gateway-mappings"
+            local A = conf({ mappings_url = url })
+            local B = conf({ tenant_id = "tenantB", api_key = "sk_B", mappings_url = url })
+            dict:set(handler._mappings_key(A), cjson.encode({ { matchType = "PREFIX", value = "/v1/accounts",
+                                                                 metricName = "tenantA_metric" } }))
+            dict:set(handler._mappings_key(A) .. ":at", ngx.now())
+            log(A, "a"); log(B, "b")
+            assert.equals("tenantA_metric", buffered(A)[1].metricName)
+            assert.equals("api_calls", buffered(B)[1].metricName)
+        end)
+
+        it("drops unusable client values instead of poisoning the batch", function()
+            local c = conf()
+            local orig = mock_kong.request.get_path
+            mock_kong.request.get_path = function() return "/caf\233/\0x " .. string.rep("p", 600) end
+            log(c, "c1", {
+                traceparent = "00-\255\254-bad",
+                ["x-trace-id"] = { "first", "second" },     -- a repeated header
+                ["x-request-id"] = string.rep("x", 500),
+                tracestate = "vendor=1",
+            }, { ["X-Aforo-Metric"] = "sms\255sent" })
+            mock_kong.request.get_path = orig
+            local encoded = raw(c)[1]
+            assert.is_nil(encoded:find("[\128-\255]"), "non-ASCII bytes reached the batch body")
+            local e = cjson.decode(encoded)
+            assert.is_nil(e.trace.traceparent)
+            assert.equals("first", e.trace.xTraceId)
+            assert.is_nil(e.trace.xRequestId)
+            assert.equals("vendor=1", e.trace.tracestate)
+            assert.equals("api_calls", e.metricName)    -- the unusable header metric is ignored
+            assert.equals(512, #e.endpointPath)
+            assert.equals("/caf%E9/%00x%20ppp", e.endpointPath:sub(1, 18))
+        end)
+
+        it("rounds quantity to the ingestor's 6 decimals and skips what rounds to 0", function()
+            local c = conf()
+            log(c, "c1", nil, { ["X-Aforo-Quantity"] = "0.3333333" })
+            log(c, "c2", nil, { ["X-Aforo-Quantity"] = "0.0000001" })
+            log(c, "c3", nil, { ["X-Aforo-Quantity"] = "1e15" })
+            local evs = buffered(c)
+            assert.equals(1, #evs)
+            assert.equals(0.333333, evs[1].quantity)
+        end)
+
+        it("skips an event whose identity is over the ingestor's limit, with the reason", function()
+            local c = conf({ product_type = "AI_AGENT", agent_id = string.rep("a", 37) })
+            log(c, "c1")
+            assert.equals(0, #buffered(c))
+        end)
+    end)
     -- ── productType ─────────────────────────────────────────────
     describe("product_type", function()
-        local BUFFER_KEY = "aforo:events"
+        local BUFFER_KEY = handler._buffer_key({ aforo_endpoint = "http://ingestor.test/v1/ingest/batch",
+                                                 api_key = "sk_test_key" })
         local dict
         local function conf(pt)
             return {
@@ -521,7 +793,8 @@ describe("aforo-metering handler", function()
     -- agentId / sessionId come from operator config or the upstream RESPONSE
     -- only. Request headers are client-settable and must never be a source.
     describe("AI_AGENT identity", function()
-        local BUFFER_KEY = "aforo:events"
+        local BUFFER_KEY = handler._buffer_key({ aforo_endpoint = "http://ingestor.test/v1/ingest/batch",
+                                                 api_key = "sk_test_key", tenant_id = "tenant_1" })
         local dict, warnings, orig_get_consumer, orig_warn
 
         -- Schema defaults spelled out: busted hands conf to the handler as-is,
@@ -678,7 +951,8 @@ describe("aforo-metering handler", function()
     -- the ingestor silently drops a repeated (tenant, key), so a client that
     -- repeated one ID on every call was billed once. Only Kong may mint it.
     describe("idempotency key", function()
-        local BUFFER_KEY = "aforo:events"
+        local BUFFER_KEY = handler._buffer_key({ aforo_endpoint = "http://ingestor.test/v1/ingest/batch",
+                                                 api_key = "sk_test_key", tenant_id = "tenant_1" })
         local CLIENT_ID = "client-chosen-id"
         local TOOL_CALL = '{"jsonrpc":"2.0","method":"tools/call",'
             .. '"params":{"name":"search","_meta":{"agent_id":"agent_1"}}}'

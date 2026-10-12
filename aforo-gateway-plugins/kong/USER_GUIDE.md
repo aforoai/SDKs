@@ -295,12 +295,14 @@ A successful flush logs:
 [aforo-metering] Flushed 1 events to Aforo (status=200)
 ```
 
-A failure logs the attempt count and dropped-event count:
+A failure logs each attempt, then says what happened to the events. They are kept and retried every `flush_interval_ms`:
 
 ```
-[aforo-metering] Flush attempt 1/3 failed (status=401, err=none)
-[aforo-metering] All 3 flush attempts failed. 1 events dropped.
+[aforo-metering] Flush attempt 1/3 failed (status=503, err=none)
+[aforo-metering] Delivery failed. 1 event(s) re-buffered for retry on the next flush.
 ```
+
+A 401, 403 or 404 means the key, its permission or `aforo_endpoint` is wrong. The events are kept until you fix it, and the log says `The ingestor answered 401 ...`.
 
 Then confirm the event under the matching customer + metric in your Aforo usage view. The metric name follows `metric_name_pattern` — by default `GET /my-service/anything`.
 
@@ -333,7 +335,9 @@ See the full option table in [README.md](README.md#configuration). The three you
 | 401 `TENANT_MISMATCH` | The token was issued for a different Aforo tenant than this plugin's `tenant_id` | Use a token for this tenant, or correct `tenant_id`. |
 | 401 `INVALID_SIGNATURE`, log says `No JWKS key to verify a token` | `jwt_jwks_uri` unreachable from Kong, or the token's `kid` is not in the JWKS | Check that Kong can reach `jwt_jwks_uri` and that it serves the issuer's current key. |
 | Log says `Redis answered the JWT revocation lookup with an error (NOAUTH ...)` | The blocklist Redis needs a password | Set `jwt_redis_password`. Until then, revoked tokens are not rejected. |
-| `All 3 flush attempts failed. N events dropped.` | Ingestor unreachable or returning 5xx for the full retry window | Check `aforo_endpoint` reachability and Aforo status; these events are not re-queued after the third attempt. |
+| `Delivery failed. N event(s) re-buffered` | Ingestor unreachable or returning 5xx | Check `aforo_endpoint` reachability and Aforo status. The events are retried every `flush_interval_ms`, up to 10,000 per buffer. |
+| `The ingestor answered 401` (or 403 / 404) | Wrong or revoked `api_key`, a key without `usage-events:ingest`, or a wrong `aforo_endpoint` | Fix the setting. Events are kept meanwhile (up to 10,000 per buffer). |
+| `The ingestor rejected N of M event(s)` | Those events are invalid for Aforo (the log gives the reasons, e.g. an unknown metric) | Fix the metric mapping or the upstream header that produced them. They are not retried. |
 | Health-check requests show up as billed usage | Path not excluded | They shouldn't — `/health`, `/ready`, `/metrics` are excluded by default. Add yours to `exclude_paths`. |
 
 ## What this guide does NOT cover

@@ -38,6 +38,7 @@ local preflight_quota = require_sibling("preflight-quota")
 -- uuid() and iso8601_utc() live in event-util.lua, shared with
 -- compound-metering.lua; see there for why each is the way it is.
 local event_util = require_sibling("event-util")
+local event_buffer = require_sibling("event-buffer")
 local uuid = event_util.uuid
 local iso8601_utc = event_util.iso8601_utc
 
@@ -586,33 +587,7 @@ local AforoMeteringHandler = {
     VERSION  = "1.1.0",
 }
 
--- Shared memory buffer name (must be declared in kong.conf: lua_shared_dict aforo_buffer 10m)
---
--- The buffer is a shared-dict LIST, one JSON-encoded event per element
--- (2026-09-21). It used to be a single JSON array under one key, appended by
--- get -> decode -> insert -> set and drained by get -> delete. Neither sequence
--- is atomic, and every nginx worker runs them concurrently: two workers
--- appending at once each wrote back their own copy of the array and the other's
--- event vanished, and an append landing between a flush's get and its delete
--- was deleted unsent. Silent, proportional to traffic, and invisible in the
--- logs -- the worst kind of metering loss. rpush / lpop are single atomic
--- operations under the dict's own lock, so neither race exists any more.
---
--- A new key name on purpose: rpush against the old key, if it still held the
--- legacy string after a hot reload, fails with "value not a list".
-local BUFFER_KEY = "aforo:events"
-local MAX_BUFFER_SIZE = 10000
-
--- The ingestor rejects a batch of more than 1000 events with 400 -- which the
--- drop-on-4xx rule in flush_buffer would turn into silently discarding the
--- whole backlog. So a backlog (after an outage, say) is drained in slices no
--- larger than this, rather than as one oversized request.
-local MAX_BATCH_SIZE = 1000
-
--- Longest Retry-After (seconds) honoured on a 429 before the next attempt.
--- The flush runs in a timer, so a longer wait would only hold later slices;
--- past this the batch is re-buffered for a later flush instead.
-local MAX_RETRY_AFTER_SECONDS = 30
+-- The event buffer and its delivery to the ingestor live in event-buffer.lua.
 
 -- productType is REQUIRED by the ingestor in production, and some types carry
 -- fields of their own. The ingestor validates a batch as a whole, so one event
@@ -626,7 +601,7 @@ local MAX_RETRY_AFTER_SECONDS = 30
 local DEFAULT_PRODUCT_TYPE = "API"
 local PRODUCT_TYPE_REQUIRED_FIELDS = {
     API           = {},
-    AGENTIC_API   = {},
+    AGENTIC_API   = { "traceId" },
     AI_AGENT      = { "agentId", "sessionId" },
     MCP_SERVER    = { "toolName", "agentId" },
     GRPC_API      = { "grpcService", "grpcMethod" },
@@ -681,6 +656,73 @@ local function should_exclude_status(status, exclude_status_codes)
     return false
 end
 
+-- A header or body value forwarded into an event (2026-10-12 fix): kept only
+-- when it is a string of printable ASCII no longer than max, else dropped. A
+-- repeated header arrives as a table (the first value is used). This matters
+-- because one bad value used to cost the whole batch: a non-UTF-8 byte in a
+-- traceparent made the ingestor unable to read the request at all (Jackson
+-- answers 400), and every event batched with it went down too.
+local function clean_string(v, max)
+    if type(v) == "table" then v = v[1] end
+    if type(v) ~= "string" or v == "" or #v > max then return nil end
+    if string.find(v, "[^\32-\126]") then return nil end
+    return v
+end
+
+-- A value that must stay on the event whatever the client sent -- the request
+-- path, an MCP tool name: dropping it would let a client opt out of metering.
+-- Anything that is not printable ASCII is percent-encoded instead (Kong hands
+-- the path over decoded, so it can hold raw bytes), then it is cut to max.
+local function escaped_string(v, max)
+    if type(v) == "table" then v = v[1] end
+    if type(v) ~= "string" then return nil end
+    v = string.gsub(v, "[^\33-\126]", function(c) return string.format("%%%02X", string.byte(c)) end)
+    if #v > max then v = string.sub(v, 1, max) end
+    return v
+end
+
+-- quantity as the ingestor stores it: @Digits(integer = 14, fraction = 6).
+-- More decimals failed the event (0.3333333 from an upstream header was
+-- refused); rounded here instead. A value that rounds to 0 is not billable.
+local function round_quantity(q)
+    return math.floor(q * 1e6 + 0.5) / 1e6
+end
+
+-- Ingestor limits (IngestUsageEventRequest @Size) on fields that identify what
+-- is billed. These are not cut short -- a truncated agent or customer id would
+-- bill the wrong one -- and an event over a limit is refused by the ingestor
+-- anyway, so it is skipped here with the reason instead.
+local IDENTITY_LIMITS = {
+    customerId = 64, metricName = 255, idempotencyKey = 255,
+    agentId = 36, sessionId = 64, productType = 20, traceId = 128,
+}
+
+local function over_limit(event)
+    for field, max in pairs(IDENTITY_LIMITS) do
+        local v = event[field]
+        if type(v) == "string" and #v > max then
+            return field, max
+        end
+    end
+    return nil
+end
+
+-- The trace an AGENTIC_API call belongs to (2026-10-12): the trace-id of a
+-- valid W3C traceparent, else x-trace-id, else Kong's own request id. Never
+-- absent, so leaving the trace headers off cannot leave an event that the
+-- ingestor refuses -- which made the call free.
+local function agentic_trace_id(trace, request_id)
+    local tp = trace and trace.traceparent
+    if tp then
+        local version, trace_id, parent_id, flags = string.match(tp, "^(%x%x)%-(%x+)%-(%x+)%-(%x%x)$")
+        if version and version ~= "ff" and #trace_id == 32 and #parent_id == 16
+            and flags and not string.find(trace_id, "^0+$") then
+            return string.lower(trace_id)
+        end
+    end
+    return (trace and trace.xTraceId) or request_id
+end
+
 -- ────────────────────────────────────────────────────────────
 -- Central metric mappings, fetched from Aforo
 -- ────────────────────────────────────────────────────────────
@@ -702,9 +744,14 @@ end
 -- Cached in the existing aforo_buffer dict on purpose: requiring a second
 -- lua_shared_dict would add a deployment step operators forget, and a missing
 -- dict already costs this plugin all of its metering.
-local MAPPINGS_KEY = "aforo:gateway_mappings"
-local MAPPINGS_FETCHED_AT_KEY = "aforo:gateway_mappings_at"
-local MAPPINGS_INFLIGHT_KEY = "aforo:gateway_mappings_inflight"
+--
+-- Keyed by tenant_id + mappings_url (2026-10-12 fix). The cache used to be one
+-- global key, so with two plugin instances the second tenant's traffic was
+-- named by the first tenant's catalog rules -- metric names from somebody
+-- else's catalog, which the ingestor then rejected or, worse, accepted.
+local function mappings_key(conf)
+    return "aforo:gateway_mappings:" .. ngx.md5((conf.tenant_id or "") .. "\n" .. (conf.mappings_url or ""))
+end
 
 local function fetch_mappings(premature, conf)
     if premature then return end
@@ -721,7 +768,8 @@ local function fetch_mappings(premature, conf)
         headers = { ["Accept"] = "application/json" },
     })
 
-    dict:delete(MAPPINGS_INFLIGHT_KEY)
+    local key = mappings_key(conf)
+    dict:delete(key .. ":inflight")
 
     if not res or res.status < 200 or res.status >= 300 then
         -- Keep whatever is cached. Do not clear it.
@@ -738,10 +786,10 @@ local function fetch_mappings(premature, conf)
         return
     end
 
-    dict:set(MAPPINGS_KEY, cjson.encode(body.mappings))
-    dict:set(MAPPINGS_FETCHED_AT_KEY, ngx.now())
+    dict:set(key, cjson.encode(body.mappings))
+    dict:set(key .. ":at", ngx.now())
     if body.cacheTtlSeconds and tonumber(body.cacheTtlSeconds) then
-        dict:set("aforo:gateway_mappings_ttl", tonumber(body.cacheTtlSeconds))
+        dict:set(key .. ":ttl", tonumber(body.cacheTtlSeconds))
     end
     kong.log.info("[aforo-metering] Loaded ", #body.mappings, " metric mappings for tenant ",
         conf.tenant_id or "?")
@@ -755,18 +803,19 @@ local function maybe_refresh_mappings(conf)
     local dict = ngx.shared[BUFFER_DICT]
     if not dict then return end
 
-    local fetched_at = dict:get(MAPPINGS_FETCHED_AT_KEY)
-    local ttl = dict:get("aforo:gateway_mappings_ttl") or conf.mappings_refresh_seconds or 300
+    local key = mappings_key(conf)
+    local fetched_at = dict:get(key .. ":at")
+    local ttl = dict:get(key .. ":ttl") or conf.mappings_refresh_seconds or 300
     if fetched_at and (ngx.now() - fetched_at) < ttl then return end
 
     -- One worker fetches; the rest carry on with the cache. add() is atomic, so
     -- a burst of concurrent requests cannot stampede catalog.
-    local claimed = dict:add(MAPPINGS_INFLIGHT_KEY, 1, 30)
+    local claimed = dict:add(key .. ":inflight", 1, 30)
     if not claimed then return end
 
     local ok, err = ngx.timer.at(0, fetch_mappings, conf)
     if not ok then
-        dict:delete(MAPPINGS_INFLIGHT_KEY)
+        dict:delete(key .. ":inflight")
         kong.log.warn("[aforo-metering] Could not schedule mappings refresh: ", err)
     end
 end
@@ -788,10 +837,11 @@ local function mapping_matches(path, rule)
     return false
 end
 
-local function metric_from_cached_mappings(path)
+local function metric_from_cached_mappings(conf, path)
     local dict = ngx.shared[BUFFER_DICT]
     if not dict then return nil end
-    local raw = dict:get(MAPPINGS_KEY)
+    if not conf.mappings_url or conf.mappings_url == "" then return nil end
+    local raw = dict:get(mappings_key(conf))
     if not raw then return nil end
     local ok, rules = pcall(cjson.decode, raw)
     if not ok or type(rules) ~= "table" then return nil end
@@ -847,7 +897,7 @@ local function resolve_metric_name(conf, method, path, service_name, route_name,
     -- for a single request. Falls through when the cache is empty or has no rule
     -- for this path, so an unreachable catalog degrades to local config rather
     -- than to nothing.
-    local central = metric_from_cached_mappings(path)
+    local central = metric_from_cached_mappings(conf, path)
     if central and central ~= "" then
         return central
     end
@@ -935,13 +985,13 @@ local function resolve_ai_agent_identity(conf, request_key)
 
     local agent_header = non_empty_string(conf.agent_id_header)
     if agent_header then
-        agent_id = non_empty_string(kong.response.get_header(agent_header))
+        agent_id = clean_string(kong.response.get_header(agent_header), IDENTITY_LIMITS.agentId)
     end
     agent_id = agent_id or non_empty_string(conf.agent_id)
 
     local session_header = non_empty_string(conf.session_id_header)
     if session_header then
-        session_id = non_empty_string(kong.response.get_header(session_header))
+        session_id = clean_string(kong.response.get_header(session_header), IDENTITY_LIMITS.sessionId)
     end
     session_id = session_id or request_key
 
@@ -1010,227 +1060,13 @@ end
 -- ────────────────────────────────────────────────────────────
 
 local function extract_trace_context()
+    -- Client headers: see clean_string. Informational only, never identity.
     return {
-        traceparent = kong.request.get_header("traceparent"),
-        tracestate  = kong.request.get_header("tracestate"),
-        xTraceId    = kong.request.get_header("x-trace-id"),
-        xRequestId  = kong.request.get_header("x-request-id"),
+        traceparent = clean_string(kong.request.get_header("traceparent"), 128),
+        tracestate  = clean_string(kong.request.get_header("tracestate"), 512),
+        xTraceId    = clean_string(kong.request.get_header("x-trace-id"), 128),
+        xRequestId  = clean_string(kong.request.get_header("x-request-id"), 128),
     }
-end
-
--- ────────────────────────────────────────────────────────────
--- Flush buffered events to Aforo ingestor
--- ────────────────────────────────────────────────────────────
-
--- Take up to `max` events off the head of the buffer. Each lpop is atomic, so
--- concurrent flushes in different workers take disjoint events: nothing is sent
--- twice and nothing is lost between a read and a delete.
-local function pop_batch(dict, max)
-    local batch = {}
-    for i = 1, max do
-        local item, err = dict:lpop(BUFFER_KEY)
-        if not item then
-            if err then
-                kong.log.err("[aforo-metering] Could not read buffer: ", err)
-            end
-            break
-        end
-        batch[i] = item
-    end
-    return batch
-end
-
--- Put a failed batch back at the head of the buffer, oldest first, and trim
--- the tail back to MAX_BUFFER_SIZE. Returns how many events were dropped.
---
--- Ordering: failed events are older than anything buffered during the
--- attempt, so they go in front. On overflow we keep the OLDEST and drop the
--- newest, because the oldest are the ones closest to falling outside the
--- ingestor's 90-day occurredAt acceptance window -- and losing recent events
--- is recoverable from upstream logs far more often than losing old ones.
-local function rebuffer(dict, batch)
-    local dropped = 0
-    for i = #batch, 1, -1 do
-        local len, err = dict:lpush(BUFFER_KEY, batch[i])
-        if not len then
-            -- Only "no memory" in practice: the dict is full. The events
-            -- further down this loop are newer, so this is still "drop newest".
-            kong.log.err("[aforo-metering] Could not re-buffer event: ", err)
-            dropped = dropped + 1
-        end
-    end
-    local len = dict:llen(BUFFER_KEY) or 0
-    while len > MAX_BUFFER_SIZE do
-        if not dict:rpop(BUFFER_KEY) then break end
-        dropped = dropped + 1
-        len = len - 1
-    end
-    return dropped
-end
-
--- 4xx other than 408 / 429: the ingestor understood the batch and refused it.
--- See the drop-on-rejection comment in send_batch for why these are not retried.
-local function is_permanent_rejection(status)
-    return status ~= nil and status >= 400 and status < 500
-        and status ~= 408 and status ~= 429
-end
-
--- POST one batch. Returns "sent", "rejected" (permanent -- dropped, do not
--- retry) or "failed" (transient -- the caller keeps the events).
-local function send_batch(conf, batch)
-    local httpc = http.new()
-    httpc:set_timeout(10000)
-
-    -- Each element is already a JSON-encoded event, so the body is assembled
-    -- rather than decoded and re-encoded: cheaper, and the bytes sent are
-    -- exactly the bytes buffered.
-    local body = '{"events":[' .. table.concat(batch, ",") .. ']}'
-
-    local max_retries = 3
-    local last_status, last_body
-    for attempt = 1, max_retries do
-        local res, err = httpc:request_uri(conf.aforo_endpoint, {
-            method  = "POST",
-            body    = body,
-            -- X-API-Key, not Authorization: Bearer (2026-09-03).
-            --
-            -- The ingestor authenticates keys through aforo-common's
-            -- ApiKeyAuthFilter, which reads X-API-Key and nothing else. A key sent
-            -- as a Bearer token is simply not seen: the request stays anonymous and
-            -- /v1/ingest/batch answers 403 "You don't have permission to
-            -- usage-events:ingest", which reads like a permissions problem on the
-            -- key rather than a header the server never looked at.
-            --
-            -- Sent ALONE. Adding Authorization: Bearer alongside as a fallback was
-            -- tried and is actively harmful: an API key in that header is parsed as
-            -- a JWT, fails, and the request is rejected 401 before the API-key
-            -- filter ever runs. Verified against production -- X-API-Key alone
-            -- returns 202, the two together return 401.
-            headers = {
-                ["Content-Type"]  = "application/json",
-                ["X-API-Key"]     = conf.api_key or "",
-                ["X-Tenant-Id"]   = conf.tenant_id or "",
-            },
-        })
-
-        if res and res.status >= 200 and res.status < 300 then
-            kong.log.info("[aforo-metering] Flushed ", #batch, " events to Aforo (status=", res.status, ")")
-            return "sent"
-        end
-
-        local status = res and res.status or "no response"
-        last_status = res and res.status or nil
-        last_body = res and res.body or nil
-        kong.log.warn("[aforo-metering] Flush attempt ", attempt, "/", max_retries,
-            " failed (status=", status, ", err=", err or "none", ")")
-
-        -- Name the fix for the one failure that is reliably misdiagnosed.
-        -- OpenSSL error 20 against an https endpoint almost always means Kong's
-        -- lua_ssl_verify_depth (default 1) is too shallow for the chain, NOT a
-        -- missing CA bundle -- so operators go install certificates that are
-        -- already there. Only logged on the final attempt to avoid noise.
-        if attempt == max_retries and err and string.find(err, "unable to get local issuer certificate", 1, true) then
-            kong.log.err("[aforo-metering] TLS verification failed for ", conf.aforo_endpoint, ". ",
-                "This is usually lua_ssl_verify_depth, which Kong defaults to 1 -- too shallow for a ",
-                "leaf/intermediate/root chain. Set lua_ssl_verify_depth = 3 in kong.conf (or ",
-                "KONG_LUA_SSL_VERIFY_DEPTH=3). Adding CA certificates will not help: Kong already ",
-                "trusts the system bundle via lua_ssl_trusted_certificate.")
-        end
-
-        -- A permanent rejection (see below) gets the same answer on every
-        -- attempt, so stop here rather than sleeping through two more of them
-        -- -- which, with a backlog drained in slices, would hold every slice
-        -- behind it for 3s per rejected batch.
-        if is_permanent_rejection(last_status) then
-            break
-        end
-
-        if attempt < max_retries then
-            local wait = math.pow(2, attempt - 1)
-            -- Honour the ingestor's Retry-After on 429 (delta-seconds form).
-            -- Longer than MAX_RETRY_AFTER_SECONDS: stop here and let the
-            -- caller re-buffer, rather than sleep through the flush.
-            if last_status == 429 then
-                local ra = res.headers and tonumber(res.headers["Retry-After"]
-                    or res.headers["retry-after"])
-                if ra and ra >= 0 then
-                    if ra > MAX_RETRY_AFTER_SECONDS then
-                        break
-                    end
-                    wait = ra
-                end
-            end
-            ngx.sleep(wait)
-        end
-    end
-
-    -- Drop on a permanent rejection; only retry what retrying can fix
-    -- (2026-09-03 fix).
-    --
-    -- Re-buffering EVERY failure, added 2026-09-01, created a poison pill. The
-    -- ingestor validates the batch as a whole: one event the server considers
-    -- malformed fails the request with 400, so the whole batch came back and was
-    -- re-buffered -- including every well-formed event in it. The bad event was
-    -- then retried forever, failing the batch every time and dragging good
-    -- events down with it. Metering stops permanently and the log only says
-    -- "flush attempts failed", which reads like the ingestor being unwell rather
-    -- than one unacceptable event stuck at the head of the queue.
-    --
-    -- 4xx means the server understood us and refused; retrying sends the same
-    -- bytes to the same judgement. 408 and 429 are the exceptions -- both
-    -- explicitly invite a retry. Anything else (5xx, timeout, connection
-    -- refused) is transient and worth keeping, which is what the original fix
-    -- was for.
-    if is_permanent_rejection(last_status) then
-        kong.log.err("[aforo-metering] Ingestor rejected the batch with ", last_status,
-            " -- dropping ", #batch, " event(s) rather than retrying them forever. ",
-            "Response: ", string.sub(tostring(last_body or ""), 1, 500))
-        return "rejected"
-    end
-
-    return "failed"
-end
-
-local function flush_buffer(premature, conf)
-    if premature then return end
-
-    local dict = ngx.shared[BUFFER_DICT]
-    if not dict then
-        kong.log.err("[aforo-metering] Shared dict '", BUFFER_DICT, "' not found")
-        return
-    end
-
-    -- Drain in slices of MAX_BATCH_SIZE. Bounded so one flush cannot chase a
-    -- buffer that live traffic refills as fast as it drains; whatever is left
-    -- is picked up by the flush the next buffered event schedules.
-    for _ = 1, math.ceil(MAX_BUFFER_SIZE / MAX_BATCH_SIZE) do
-        local batch = pop_batch(dict, MAX_BATCH_SIZE)
-        if #batch == 0 then return end
-
-        local outcome = send_batch(conf, batch)
-
-        if outcome == "failed" then
-            -- Re-buffer transient failures (2026-09-01 fix).
-            -- The events were taken off the buffer before the first attempt, so
-            -- an ingestor outage outlasting 3 retries used to destroy the only
-            -- copy of them: unbilled usage, no dead-letter, nothing to
-            -- reconstruct from. Push them back so a later flush retries them,
-            -- and stop draining -- the next slice would only fail the same way.
-            local dropped = rebuffer(dict, batch)
-            if dropped > 0 then
-                kong.log.err("[aforo-metering] All flush attempts failed. ",
-                    #batch, " events re-buffered for retry; ", dropped,
-                    " dropped (buffer at MAX_BUFFER_SIZE=", MAX_BUFFER_SIZE,
-                    "). Raise lua_shared_dict aforo_buffer if this recurs.")
-            else
-                kong.log.err("[aforo-metering] All flush attempts failed. ",
-                    #batch, " events re-buffered for retry on the next flush.")
-            end
-            return
-        end
-
-        if #batch < MAX_BATCH_SIZE then return end
-    end
 end
 
 -- ────────────────────────────────────────────────────────────
@@ -1252,11 +1088,12 @@ local function detect_mcp_tool_call(raw_body)
 
     local agent_id = nil
     if params._meta and params._meta.agent_id then
-        agent_id = params._meta.agent_id
+        agent_id = clean_string(params._meta.agent_id, IDENTITY_LIMITS.agentId)
     end
 
     return {
-        tool_name = tool_name,
+        -- Kept, escaped and capped, whatever the client sent: see escaped_string.
+        tool_name = escaped_string(tool_name, 64),
         agent_id = agent_id,
     }
 end
@@ -1424,7 +1261,7 @@ function AforoMeteringHandler:log(conf)
     local response_size = tonumber(kong.response.get_header("Content-Length")) or 0
     -- Never a request header: see kong_request_id.
     local request_id = kong_request_id()
-    local session_id = kong.request.get_header("Mcp-Session-Id")
+    local session_id = clean_string(kong.request.get_header("Mcp-Session-Id"), IDENTITY_LIMITS.sessionId)
 
     local service_name = service and service.name or ""
     local route_name = route and route.name or ""
@@ -1472,7 +1309,8 @@ function AforoMeteringHandler:log(conf)
         -- Upstream-supplied overrides, read from the response so a client
         -- cannot forge them.
         local header_metric = conf.metric_header and conf.metric_header ~= ""
-            and kong.response.get_header(conf.metric_header) or nil
+            and clean_string(kong.response.get_header(conf.metric_header), IDENTITY_LIMITS.metricName)
+            or nil
         local header_quantity = conf.quantity_header and conf.quantity_header ~= ""
             and kong.response.get_header(conf.quantity_header) or nil
 
@@ -1492,16 +1330,27 @@ function AforoMeteringHandler:log(conf)
     end
 
     -- quantity must be > 0 (e.g. quantity_source=response_size with an empty
-    -- body); one such event would fail the whole batch.
-    if type(event.quantity) ~= "number" or event.quantity <= 0 then
+    -- body) after rounding to the ingestor's 6 decimals, and below its 14
+    -- integer digits; such an event would only be refused.
+    if type(event.quantity) == "number" then
+        event.quantity = round_quantity(event.quantity)
+    end
+    if type(event.quantity) ~= "number" or event.quantity <= 0 or event.quantity >= 1e14 then
         kong.log.debug("[aforo-metering] Skipping ", method, " ", path,
-            " -- quantity is not > 0.")
+            " -- quantity is not > 0 (after rounding to 6 decimals) or is too large.")
         return
     end
 
-    -- Top-level HTTP fields (hoisted from metadata for fast ClickHouse queries)
-    event.endpointPath    = path
-    event.httpMethod      = method
+    -- AGENTIC_API: always a traceId (see agentic_trace_id).
+    if event.productType == "AGENTIC_API" then
+        event.traceId = agentic_trace_id(trace, request_id)
+    end
+
+    -- Top-level HTTP fields (hoisted from metadata for fast ClickHouse queries).
+    -- The path is client-chosen: escaped and cut to the ingestor's 512 limit.
+    local event_path = escaped_string(path, 512) or "/"
+    event.endpointPath    = event_path
+    event.httpMethod      = string.sub(method or "", 1, 16)
     event.statusCode      = status
     event.responseTimeMs  = tonumber(latency) or 0
 
@@ -1513,10 +1362,10 @@ function AforoMeteringHandler:log(conf)
         event.metadata = {
             gateway       = "kong",
             method        = method,
-            path          = path,
+            path          = event_path,
             status        = status,
             latency       = tonumber(latency) or 0,
-            endpoint_path = path,
+            endpoint_path = event_path,
             http_method   = method,
             status_code   = status,
             response_time_ms = tonumber(latency) or 0,
@@ -1567,6 +1416,15 @@ function AforoMeteringHandler:log(conf)
         return
     end
 
+    local field, max = over_limit(event)
+    if field then
+        warn_throttled("over_limit_" .. field, 300,
+            "[aforo-metering] Skipping events: ", field, " is longer than the ingestor's ",
+            max, "-character limit (e.g. ", method, " ", event_path, "). Event not metered. ",
+            "Repeats suppressed for 300s.")
+        return
+    end
+
     -- Refuse to buffer an event its productType makes invalid, for the same
     -- reason as the customerId skip above: one such event fails its batch.
     local missing = missing_required_fields(event)
@@ -1590,14 +1448,6 @@ function AforoMeteringHandler:log(conf)
         return
     end
 
-    -- Buffer the event
-    local dict = ngx.shared[BUFFER_DICT]
-    if not dict then
-        kong.log.err("[aforo-metering] Shared dict '", BUFFER_DICT, "' not available. ",
-            "Add 'lua_shared_dict aforo_buffer 10m;' to kong.conf")
-        return
-    end
-
     local encoded, enc_err = cjson.encode(event)
     if not encoded then
         kong.log.err("[aforo-metering] Could not encode event for ", method, " ", path,
@@ -1605,54 +1455,14 @@ function AforoMeteringHandler:log(conf)
         return
     end
 
-    -- One atomic append; the returned length is this event's position, so it
-    -- doubles as the count that drives flush scheduling below without a
-    -- separate counter that could drift from the list.
-    local count, push_err = dict:rpush(BUFFER_KEY, encoded)
-    if not count then
-        kong.log.err("[aforo-metering] Could not buffer event (", push_err, "). ",
-            "Raise lua_shared_dict aforo_buffer if this recurs. Event not metered.")
-        return
-    end
-
-    if count > MAX_BUFFER_SIZE then
-        -- Over the cap: take one event back off the tail. That is this event or
-        -- one a concurrent worker appended a moment later -- either way the
-        -- newest, so the oldest (closest to the ingestor's acceptance window)
-        -- are the ones kept, matching the re-buffer rule in flush_buffer.
-        dict:rpop(BUFFER_KEY)
-        warn_throttled("buffer_overflow", 10,
-            "[aforo-metering] Buffer full (", MAX_BUFFER_SIZE, " events) -- dropping the ",
-            "newest event. The ingestor is failing or unreachable; see the flush errors. ",
-            "Repeats suppressed for 10s.")
-        -- Keep a flush coming. Previously an overflow returned without
-        -- scheduling one, so once the buffer was full and the last flush had
-        -- re-buffered, nothing ever flushed again even after the ingestor
-        -- recovered -- every new event was dropped at this line. add() limits
-        -- it to one attempt per second across workers rather than one per request.
-        if dict:add("aforo:overflow_flush", 1, 1) then
-            ngx.timer.at(0, flush_buffer, conf)
-        end
-        return
-    end
-
-    if count >= (conf.flush_count or 50) then
-        local ok, err = ngx.timer.at(0, flush_buffer, conf)
-        if not ok then
-            kong.log.warn("[aforo-metering] Failed to schedule immediate flush: ", err)
-        end
-    elseif count == 1 then
-        local interval = (conf.flush_interval_ms or 5000) / 1000
-        local ok, err = ngx.timer.at(interval, flush_buffer, conf)
-        if not ok then
-            kong.log.warn("[aforo-metering] Failed to schedule timed flush: ", err)
-        end
-    end
+    event_buffer.push(conf, encoded)
 end
 
 -- Exported for unit testing — not used by the Kong runtime.
 -- Keep the top-level handler contract (access/log) unchanged.
 AforoMeteringHandler._resolve_customer_id = resolve_customer_id
-AforoMeteringHandler._flush_buffer = flush_buffer
+AforoMeteringHandler._flush_buffer = event_buffer.flush
+AforoMeteringHandler._buffer_key = event_buffer.key
+AforoMeteringHandler._mappings_key = mappings_key
 
 return AforoMeteringHandler
