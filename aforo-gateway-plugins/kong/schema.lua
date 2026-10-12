@@ -307,20 +307,20 @@ return {
                         margin_guard_enabled = {
                             type = "boolean",
                             default = false,
-                            description = "Enable margin guard pre-flight check in the access phase",
+                            description = "Ask pricing-service before proxying whether the tenant (GLOBAL scope) or the customer is margin-blocked or throttled, and answer 429 if so. Fails open. Requires margin_guard_url.",
                         },
                     },
                     {
                         margin_guard_url = {
                             type = "string",
-                            description = "Pricing-service base URL for margin guard quick-check (e.g. http://pricing:8083)",
+                            description = "Pricing-service base URL for the margin guard quick-check, e.g. http://pricing:8083. Kong must reach pricing's internal API (/internal/v1/margin-guard/quick-check, no auth). Required when margin_guard_enabled is true.",
                         },
                     },
                     {
                         margin_guard_cache_ttl = {
                             type = "integer",
                             default = 30,
-                            description = "Cache TTL in seconds for margin guard decisions (default 30s)",
+                            description = "How long an ALLOW or BLOCK answer is cached per tenant and scope, in seconds. THROTTLE is never cached. 0 disables the cache.",
                         },
                     },
                     -- Pre-flight quota check (calls the ingestor's /api/v1/quota/check)
@@ -387,5 +387,13 @@ return {
                 },
             },
         },
+    },
+    entity_checks = {
+        -- Without a URL the margin guard has nothing to ask; this used to be
+        -- accepted and then raise on every request (a 500).
+        { conditional = {
+            if_field = "config.margin_guard_enabled", if_match = { eq = true },
+            then_field = "config.margin_guard_url", then_match = { required = true },
+        } },
     },
 }

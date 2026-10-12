@@ -191,6 +191,7 @@ _G.kong = K
 package.path = "./?.lua;" .. package.path
 local handler = require("handler")
 local rate_limit = require("rate-limit-enforce")
+local margin_guard = require("margin-guard")
 
 local function reset()
     K.request._h = {}
@@ -529,6 +530,85 @@ describe("access phase", function()
             package.loaded["resty.sha256"] = orig
             assert.is_false(refused)
             assert.is_nil(K.response._exit)
+        end)
+    end)
+    -- ── Margin guard ────────────────────────────────────────────
+    -- Bodies exactly as pricing's MarginGuardService.quickCheck builds them.
+    describe("margin guard", function()
+        local MG = { margin_guard_enabled = true, margin_guard_url = "http://pricing/" }
+        local BLOCK = { status = 200, body = '{"verdict":"BLOCK","currentLevel":"L3_BLOCK","marginPct":null,'
+            .. '"message":"Requests blocked due to critically low margin","configId":null,"throttleRatePct":null}' }
+        local THROTTLE = { status = 200, body = '{"verdict":"THROTTLE","currentLevel":"L2_THROTTLE",'
+            .. '"message":"Request throttled due to low margin"}' }
+        local ALLOW = { status = 200, body = '{"verdict":"ALLOW","currentLevel":"NONE"}' }
+
+        it("blocks on pricing's real BLOCK body, with Retry-After", function()
+            http_responses = { BLOCK }
+            assert.is_true(margin_guard.check(conf(MG), "tenant-B", "cust-1"))
+            assert.is_not_nil(K.response._exit, "BLOCK verdict let the request through")
+            assert.equals(429, K.response._exit.status)
+            assert.equals("30", K.response._exit.headers["Retry-After"])
+            assert.equals("Requests blocked due to critically low margin", K.response._exit.body.error.message)
+        end)
+
+        it("asks the GLOBAL scope, then the customer's, with escaped parameters", function()
+            http_responses = { ALLOW, ALLOW }
+            assert.is_false(margin_guard.check(conf(MG), "tenant B", "cust/1&x"))
+            assert.equals(2, #http_requests)
+            assert.equals("http://pricing/internal/v1/margin-guard/quick-check"
+                .. "?tenantId=tenant%20B&scopeType=GLOBAL&scopeId=global", http_requests[1].url)
+            assert.equals("http://pricing/internal/v1/margin-guard/quick-check"
+                .. "?tenantId=tenant%20B&scopeType=CUSTOMER&scopeId=cust%2F1%26x", http_requests[2].url)
+        end)
+
+        it("answers 429 on a THROTTLE of the customer's scope, and never caches it", function()
+            http_responses = { ALLOW, THROTTLE }
+            assert.is_true(margin_guard.check(conf(MG), "tenant-B", "cust-1"))
+            assert.equals(429, K.response._exit.status)
+            assert.equals("throttled", K.response._exit.headers["X-Margin-Guard"])
+            assert.equals("1", K.response._exit.headers["Retry-After"])
+            -- Next request: GLOBAL ALLOW is cached, the customer's THROTTLE was not.
+            K.response._exit = nil
+            http_responses = { ALLOW }
+            assert.is_false(margin_guard.check(conf(MG), "tenant-B", "cust-1"))
+            assert.equals(3, #http_requests)
+            assert.is_nil(K.response._exit)
+        end)
+
+        it("caches ALLOW and BLOCK for margin_guard_cache_ttl", function()
+            http_responses = { ALLOW, BLOCK }
+            margin_guard.check(conf(MG), "tenant-B", "cust-1")
+            K.response._exit = nil
+            assert.is_true(margin_guard.check(conf(MG), "tenant-B", "cust-1"))
+            assert.equals(2, #http_requests)  -- the second check came from the cache
+            assert.equals(429, K.response._exit.status)
+        end)
+
+        it("checks the GLOBAL scope even with no customer identity", function()
+            http_responses = { BLOCK }
+            assert.is_true(margin_guard.check(conf(MG), "tenant-B", nil))
+            assert.equals(1, #http_requests)
+        end)
+
+        it("fails open when pricing is down or answers non-200", function()
+            http_responses = { { err = "timeout" }, { status = 500 } }
+            assert.is_false(margin_guard.check(conf(MG), "tenant-B", "cust-1"))
+            assert.is_nil(K.response._exit)
+        end)
+
+        it("fails open, without a 500, when margin_guard_url is missing", function()
+            local refused
+            assert.has_no.errors(function()
+                refused = margin_guard.check(conf({ margin_guard_enabled = true }), "tenant-B", "cust-1")
+            end)
+            assert.is_false(refused)
+            assert.equals(0, #http_requests)
+        end)
+
+        it("passes WARN through with a header to the upstream", function()
+            http_responses = { { status = 200, body = '{"verdict":"WARN"}' }, ALLOW }
+            assert.is_false(margin_guard.check(conf(MG), "tenant-B", "cust-1"))
+            assert.equals("margin-low", K.service.request._h["X-Margin-Guard-Warning"])
         end)
     end)
 end)
