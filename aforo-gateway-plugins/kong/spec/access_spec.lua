@@ -190,6 +190,7 @@ _G.kong = K
 
 package.path = "./?.lua;" .. package.path
 local handler = require("handler")
+local rate_limit = require("rate-limit-enforce")
 
 local function reset()
     K.request._h = {}
@@ -444,6 +445,90 @@ describe("access phase", function()
             assert.is_nil(access_with(token("aforo-v1"), JWKS_CONF))
             assert.equals(1, #http_requests)   -- not fetched in the request
             assert.equals(1, #timers)          -- a refresh is scheduled instead
+        end)
+    end)
+    -- ── Rate limiting ───────────────────────────────────────────
+    describe("rate limiting", function()
+        local RL = { rate_limit_enabled = true }
+        local function policy(key, json)
+            redis_store["ratelimit:policy:tenant-B:hash(" .. key .. ")"] = json
+        end
+        local ONE_PER_MINUTE = '{"policyName":"P","enforcementMode":"HARD",'
+            .. '"tiers":[{"windowSeconds":60,"maxRequests":1,"burstCapacity":0}]}'
+
+        it("does not crash on a policy as pricing writes it (RATE_PLAN_OVERRIDE, nulls)", function()
+            policy("sk_live_1", '{"source":"RATE_PLAN_OVERRIDE","ratePlanId":"rp-1","policyId":null,'
+                .. '"policyName":null,"scope":null,"enforcementMode":"HARD","maxRpm":100,"maxRph":null,'
+                .. '"burstCapacity":null,"tiers":null}')
+            K.request._h["Authorization"] = "Bearer sk_live_1"
+            assert.has_no.errors(function() rate_limit.enforce(conf(RL)) end)
+            assert.is_nil(K.response._exit)
+            -- The flat maxRpm still applies once tiers is null.
+            for _ = 1, 100 do rate_limit.enforce(conf(RL)) end
+            assert.equals(429, K.response._exit.status)
+        end)
+
+        it("does not crash on a POLICY tier with burstCapacity null", function()
+            policy("sk_live_2", '{"source":"POLICY","policyId":5,"policyName":"Gold","scope":"PER_KEY",'
+                .. '"enforcementMode":"HARD","maxRpm":100,"maxRph":null,"burstCapacity":null,'
+                .. '"tiers":[{"windowSeconds":60,"maxRequests":100,"burstCapacity":null,"priority":1}]}')
+            K.request._h["Authorization"] = "Bearer sk_live_2"
+            assert.has_no.errors(function() rate_limit.enforce(conf(RL)) end)
+            assert.is_nil(K.response._exit)
+        end)
+
+        it("does not let a lower-case 'bearer' scheme bypass a HARD limit", function()
+            policy("sk_live_3", ONE_PER_MINUTE)
+            local c = conf(RL)
+            K.request._h["Authorization"] = "bearer sk_live_3"
+            assert.is_false(rate_limit.enforce(c))
+            assert.is_true(rate_limit.enforce(c))
+            assert.is_not_nil(K.response._exit, "2nd request over a limit of 1 was let through")
+            assert.equals(429, K.response._exit.status)
+        end)
+
+        it("looks up the policy of a key-auth credential by its raw key", function()
+            policy("sk_live_ka", ONE_PER_MINUTE)
+            K.client._credential = { id = "cred-1", key = "sk_live_ka" }
+            local c = conf(RL)
+            rate_limit.enforce(c)
+            assert.is_true(rate_limit.enforce(c))
+            assert.equals(429, K.response._exit.status)
+        end)
+
+        it("skips JWT traffic, saying so once", function()
+            K.request._h["Authorization"] = "Bearer " .. jwt(aforo_claims())
+            for _ = 1, 3 do assert.is_false(rate_limit.enforce(conf(RL))) end
+            local n = 0
+            for _, w in ipairs(warnings) do
+                if w:find("not applied to JWT-authenticated requests", 1, true) then n = n + 1 end
+            end
+            assert.equals(1, n)
+        end)
+
+        it("skips a tier without a numeric maxRequests instead of refusing everything", function()
+            policy("sk_live_4", '{"enforcementMode":"HARD","tiers":[{"windowSeconds":60,"maxRequests":null}]}')
+            K.request._h["Authorization"] = "Bearer sk_live_4"
+            assert.is_false(rate_limit.enforce(conf(RL)))
+            assert.is_nil(K.response._exit)
+        end)
+
+        it("fails open on a Redis error reply", function()
+            redis_error_reply = "NOAUTH Authentication required."
+            K.request._h["Authorization"] = "Bearer sk_live_5"
+            assert.is_false(rate_limit.enforce(conf(RL)))
+            assert.is_nil(K.response._exit)
+        end)
+
+        it("fails open, never 500, when anything in the check raises", function()
+            K.request._h["Authorization"] = "Bearer sk_live_6"
+            local orig = package.loaded["resty.sha256"]
+            package.loaded["resty.sha256"] = { new = function() error("boom") end }
+            local refused
+            assert.has_no.errors(function() refused = rate_limit.enforce(conf(RL)) end)
+            package.loaded["resty.sha256"] = orig
+            assert.is_false(refused)
+            assert.is_nil(K.response._exit)
         end)
     end)
 end)

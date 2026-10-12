@@ -96,7 +96,7 @@ Every option lives under `config.*`. `aforo_endpoint`, `api_key`, and `tenant_id
 | `jwt_redis_host` | string | — | Redis host for the jti blocklist. Falls back to `rate_limit_redis_host`. |
 | `jwt_redis_port` | integer | — | Redis port for the jti blocklist. Falls back to `rate_limit_redis_port`. |
 | `jwt_redis_password` | string | — | Redis password for the jti blocklist. Falls back to `rate_limit_redis_password` when the blocklist is on the same Redis host and port as rate limiting. Stored encrypted. |
-| `rate_limit_enabled` | boolean | `false` | Enforce rate limits in the access phase (returns 429 on a HARD breach). |
+| `rate_limit_enabled` | boolean | `false` | Enforce the Aforo rate-limit policy of the caller's API key in the access phase (429 on a HARD breach). The key is the Kong key-auth credential's key, or an API key sent as `Authorization: Bearer <key>`. Requests authenticated with a JWT are not rate limited yet. |
 | `rate_limit_redis_host` | string | `127.0.0.1` | Redis host for rate-limit counters and policy cache. |
 | `rate_limit_redis_port` | integer | `6379` | Redis port for rate-limit counters. |
 | `rate_limit_redis_password` | string | — | Redis password (optional, encrypted). |
@@ -121,4 +121,5 @@ Step-by-step from install to a verified event in Aforo: see [USER_GUIDE.md](USER
 
 - **JWT revocation checks fail open.** With `jwt_validation_enabled=true` the signature is always verified, with the key from `jwt_public_key` or `jwt_jwks_uri` (using `resty.openssl`, which ships with Kong; no extra library). A token that cannot be verified is rejected unless `jwt_allow_unverified_signature=true`. The jti blocklist and client revocation live in Redis: if Redis is unreachable, or answers with an error such as `NOAUTH`, tokens are let through without the revocation check and a warning is logged.
 - **No durable buffer.** Events live in the `aforo_buffer` shared dict until flush. A batch that fails transiently (5xx, timeout, 408, 429) is put back and retried on a later flush; a batch the ingestor rejects with any other 4xx is dropped with the reason logged. Past 10,000 buffered events the newest are dropped, and a Kong restart loses whatever is buffered — this is best-effort metering, not a guaranteed-delivery queue.
+- **Rate limiting does not apply to JWT-authenticated requests yet.** Aforo's rate-limit policies are keyed by API key, and a JWT carries only the key's id, so these requests pass without a rate-limit check. The plugin logs this once.
 - **Rate-limit, margin-guard and pre-flight quota enforcement need Redis / pricing-service / the ingestor reachable.** All fail open: a timeout or an unreachable dependency lets the request through rather than blocking it (the quota check can be made fail-closed with `preflight_quota_fail_open=false`).

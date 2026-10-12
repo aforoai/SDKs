@@ -11,6 +11,7 @@ This plugin ships on the Aforo gateway-plugins line; the whole repo is versioned
 - **Revoking an OAuth client now blocks its tokens.** Aforo records client revocation under the token's `client_id`, but the plugin looked it up under `key_id` only, so tokens of a revoked client kept working at the gateway. Both are checked now.
 - **A Redis error no longer rejects every token.** If the revocation Redis answered with an error (for example `NOAUTH` from a password-protected Redis), every token was rejected as 401 `TOKEN_REVOKED`, with nothing in the log. Revocation lookups now fail open on any Redis problem, as documented, and log a warning. New setting `jwt_redis_password`; it defaults to `rate_limit_redis_password` when the blocklist is on the same Redis.
 - A token with a non-numeric or null `exp`, or with null claims, now gets 401 instead of a 500 error.
+- **A lower-case `bearer` scheme no longer bypasses a HARD rate limit.** The rate limiter only recognised `Bearer`, so `Authorization: bearer <key>` was never rate limited.
 
 ### Added
 - `jwt_jwks_uri` now works. The plugin fetches the issuer's JWKS, picks the key by the token's `kid`, caches the keys for an hour and refreshes them in the background. A token with an unknown `kid` triggers a refetch, at most once every 30 seconds. Before, the setting was accepted but ignored, and a configuration that set only `jwt_jwks_uri` rejected every token. `jwt_public_key` still works and takes precedence.
@@ -21,6 +22,9 @@ This plugin ships on the Aforo gateway-plugins line; the whole repo is versioned
 - Kong 3.4 would not start with version 2.1.0 of this plugin installed. Kong limits each setting's description to 500 characters, and the `product_type` description was 635, so Kong stopped at startup with `schema violation ... length must be at most 500`. The description is shorter now.
 - When an `AI_AGENT` event is skipped for a missing agent ID, the warning says how to supply it.
 - The `Authorization` scheme is matched case-insensitively, so `bearer <token>` is validated like `Bearer <token>`.
+- **Rate limiting no longer turns into a 500 for every request.** Aforo writes rate-limit policies with null fields (rate-plan overrides have no tiers; burst capacity is often null), and the plugin crashed on them. Nulls are handled now, and any failure inside the rate-limit check lets the request through and is logged, instead of failing the request.
+- Rate limiting now applies to key-auth traffic: the policy is looked up by the authenticated key-auth credential's key. Before, only an API key sent as `Authorization: Bearer` was looked up. Requests authenticated with a JWT are still not rate limited (a known limitation, logged once).
+- A rate-limit tier without a numeric `maxRequests` is ignored. It used to count as a limit of 0, refusing every request under a HARD policy.
 - The docs and setting descriptions said `metric_header` and `quantity_header` are turned off by setting them to an empty string. Kong rejects an empty string for these settings (`length must be at least 1`); set them to `null` instead.
 
 ## [2.1.0] — 2026-10-01
