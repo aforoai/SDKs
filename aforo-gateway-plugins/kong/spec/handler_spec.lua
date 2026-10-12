@@ -549,10 +549,13 @@ describe("aforo-metering handler", function()
             return out
         end
         -- One proxied request: request headers from the client, response
-        -- headers from the upstream. The customer is the Kong consumer.
+        -- headers from the upstream, request ID from Kong (nginx $request_id).
+        -- The customer is the Kong consumer. The client's X-Request-Id is
+        -- there to prove it is ignored.
         local function log(c, request_headers, response_headers)
-            mock_kong.request._headers = request_headers or { ["X-Request-Id"] = "req-1" }
+            mock_kong.request._headers = request_headers or { ["X-Request-Id"] = "client-req-1" }
             mock_kong.response._headers = response_headers or {}
+            ngx.var = { request_id = "kong-req-1" }
             handler:log(c)
         end
 
@@ -576,6 +579,7 @@ describe("aforo-metering handler", function()
         after_each(function()
             mock_kong.client.get_consumer = orig_get_consumer
             mock_kong.log.warn = orig_warn
+            ngx.var = nil
         end)
 
         it("meters with config agent_id, one session per request", function()
@@ -586,8 +590,9 @@ describe("aforo-metering handler", function()
             assert.equals("AI_AGENT", e.productType)
             assert.equals("cust_acme", e.customerId)
             assert.equals("fraud-shield-agent", e.agentId)
-            assert.equals("req-1", e.sessionId)
-            assert.equals("req-1", e.idempotencyKey)
+            -- The session fallback is Kong's request ID, never the client's.
+            assert.equals("kong-req-1", e.sessionId)
+            assert.equals("kong-req-1", e.idempotencyKey)
             assert.equals(1, e.quantity)
         end)
 
@@ -602,7 +607,7 @@ describe("aforo-metering handler", function()
             assert.equals("fraud-shield-v2", e.agentId)
             assert.equals("sess-42", e.sessionId)
             assert.equals(2100, e.quantity)
-            assert.equals("req-1", e.idempotencyKey)
+            assert.equals("kong-req-1", e.idempotencyKey)
         end)
 
         it("ignores a response header that is turned off (null)", function()
@@ -615,12 +620,12 @@ describe("aforo-metering handler", function()
             })
             local e = buffered()[1]
             assert.equals("fraud-shield-agent", e.agentId)
-            assert.equals("req-1", e.sessionId)
+            assert.equals("kong-req-1", e.sessionId)
         end)
 
         it("never reads agent or session IDs from client request headers", function()
             local forged = {
-                ["X-Request-Id"]       = "req-1",
+                ["X-Request-Id"]       = "client-req-1",
                 ["X-Aforo-Agent-Id"]   = "agent_forged",
                 ["x-aforo-agent-id"]   = "agent_forged",
                 ["X-Agent-Id"]         = "agent_forged",
@@ -635,7 +640,7 @@ describe("aforo-metering handler", function()
             local events = buffered()
             assert.equals(1, #events)
             assert.equals("fraud-shield-agent", events[1].agentId)
-            assert.equals("req-1", events[1].sessionId)
+            assert.equals("kong-req-1", events[1].sessionId)
         end)
 
         it("skips an event with no agent ID anywhere and names the fix", function()
@@ -666,6 +671,126 @@ describe("aforo-metering handler", function()
             assert.equals(1, events[2].quantity)
             -- Field for field the event an API service sent before these settings.
             assert.same(events[1], events[2])
+        end)
+    end)
+    -- ── Idempotency key ─────────────────────────────────────────
+    -- Locks in the 2026-10-12 fix. The key was the client's X-Request-Id and
+    -- the ingestor silently drops a repeated (tenant, key), so a client that
+    -- repeated one ID on every call was billed once. Only Kong may mint it.
+    describe("idempotency key", function()
+        local BUFFER_KEY = "aforo:events"
+        local CLIENT_ID = "client-chosen-id"
+        local TOOL_CALL = '{"jsonrpc":"2.0","method":"tools/call",'
+            .. '"params":{"name":"search","_meta":{"agent_id":"agent_1"}}}'
+        local dict
+        local conf = {
+            aforo_endpoint = "http://ingestor.test/v1/ingest/batch",
+            api_key = "sk_test_key",
+            tenant_id = "tenant_1",
+            default_metric = "api_calls",
+            mcp_enabled = true,
+            flush_count = 50,
+            exclude_paths = {},
+            exclude_status_codes = {},
+        }
+        local function buffered()
+            local l = dict.store[BUFFER_KEY]
+            local out = {}
+            for i = 1, (l and #l or 0) do out[i] = cjson.decode(l[i]) end
+            return out
+        end
+        local function keys()
+            local out = {}
+            for i, e in ipairs(buffered()) do out[i] = e.idempotencyKey end
+            return out
+        end
+        -- One request with the client's chosen ID in every header the plugin
+        -- used to read, and kong_id as nginx's $request_id (nil: none).
+        local function log(kong_id, method, raw_body)
+            mock_kong.request._headers = {
+                ["X-Request-Id"]      = CLIENT_ID,
+                ["X-Kong-Request-Id"] = CLIENT_ID,
+            }
+            mock_kong.ctx.shared = {
+                aforo_jwt_claims = { customer_id = "cust_a" },
+                aforo_raw_body = raw_body,
+            }
+            ngx.var = kong_id and { request_id = kong_id } or nil
+            local orig = mock_kong.request.get_method
+            mock_kong.request.get_method = function() return method or "GET" end
+            handler:log(conf)
+            mock_kong.request.get_method = orig
+        end
+
+        before_each(function()
+            dict = new_shared_dict()
+            ngx.shared.aforo_buffer = dict
+            ngx.timers = {}
+            http_mock.requests = {}
+            http_mock.responses = {}
+            http_mock.on_request = nil
+        end)
+
+        after_each(function()
+            ngx.var = nil
+            mock_kong.request.get_id = nil
+        end)
+
+        it("uses Kong's request ID, never the client's X-Request-Id", function()
+            log("kong-id-1")
+            log("kong-id-2")
+            local k = keys()
+            assert.same({ "kong-id-1", "kong-id-2" }, k)
+            assert.not_equals(CLIENT_ID, k[1])
+            assert.not_equals(CLIENT_ID, k[2])
+        end)
+
+        it("does the same for MCP tool calls", function()
+            log("kong-id-1", "POST", TOOL_CALL)
+            log("kong-id-2", "POST", TOOL_CALL)
+            local events = buffered()
+            assert.equals(2, #events)
+            assert.equals("MCP_SERVER", events[1].productType)
+            assert.not_equals(events[1].idempotencyKey, events[2].idempotencyKey)
+            for i, e in ipairs(events) do
+                assert.is_nil(e.idempotencyKey:find(CLIENT_ID, 1, true))
+                assert.truthy(e.idempotencyKey:find(":kong-id-" .. i .. ":", 1, true))
+            end
+        end)
+
+        it("prefers kong.request.get_id where the PDK has it", function()
+            mock_kong.request.get_id = function() return "pdk-id-1" end
+            log("nginx-id-1")
+            assert.same({ "pdk-id-1" }, keys())
+        end)
+
+        it("falls back to a fresh UUID when Kong exposes no request ID", function()
+            log(nil)
+            log(nil)
+            local k = keys()
+            assert.equals(2, #k)
+            assert.not_equals(k[1], k[2])
+            assert.not_equals(CLIENT_ID, k[1])
+            assert.not_equals(CLIENT_ID, k[2])
+        end)
+
+        it("keeps the same key through a re-buffer and a later retry", function()
+            log("kong-id-1")
+            http_mock.responses = { { status = 503 }, { status = 503 }, { status = 503 } }
+            handler._flush_buffer(false, conf)
+            assert.equals(1, #buffered())
+            http_mock.responses = { { status = 202 } }
+            handler._flush_buffer(false, conf)
+            assert.equals(0, #buffered())
+            -- Three failed attempts, then the re-buffered event sent: every one
+            -- carried the key minted at log time, so the ingestor can still
+            -- collapse a retry whose earlier attempt did land.
+            assert.equals(4, #http_mock.requests)
+            for i = 1, 4 do
+                local sent = cjson.decode(http_mock.requests[i].params.body).events
+                assert.equals(1, #sent)
+                assert.equals("kong-id-1", sent[1].idempotencyKey)
+            end
         end)
     end)
     -- ── Pre-flight quota check ──────────────────────────────────

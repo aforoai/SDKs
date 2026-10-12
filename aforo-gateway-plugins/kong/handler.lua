@@ -697,8 +697,8 @@ end
 --   agentId:   conf.agent_id_header from the upstream RESPONSE, then the
 --              operator's conf.agent_id for this service/route
 --   sessionId: conf.session_id_header from the upstream RESPONSE, then this
---              request's idempotency key -- so without the header, one
---              request is one session
+--              request's idempotency key (Kong's request ID, never a client
+--              header) -- so without the header, one request is one session
 -- agentId may come back nil; the required-field check in the log phase
 -- refuses the event and says how to supply it.
 local function resolve_ai_agent_identity(conf, request_key)
@@ -743,8 +743,35 @@ local function resolve_customer_id(conf, consumer, headers)  -- luacheck: ignore
     return nil
 end
 
-local function generate_idempotency_key(request_id)
-    return request_id or uuid()
+-- Kong's own ID for the current request -- the idempotency key (2026-10-12).
+--
+-- The key used to be the client's X-Request-Id header, falling back to
+-- X-Kong-Request-Id, which is a request header too. The ingestor dedups on
+-- (tenant_id, idempotency_key) and silently drops a repeat, so a caller that
+-- sent the same X-Request-Id on every call was billed for the first one and
+-- never again -- and any other customer of the tenant who happened to send a
+-- colliding ID lost those events as well. A value the client chooses cannot
+-- decide whether usage counts. Only a server-generated ID is used now:
+--   1. kong.request.get_id(), where the PDK has it (not in Kong 3.4)
+--   2. nginx's $request_id: 32 random hex characters per request, generated
+--      by nginx and not influenced by any request header (verified on 3.4)
+--   3. a fresh UUID
+-- Resolved once per event in the log phase. The key is then part of the
+-- buffered JSON, so a re-buffered or retried event carries the same key and
+-- the ingestor still collapses a retry that did land.
+local function kong_request_id()
+    local get_id = kong.request.get_id
+    if type(get_id) == "function" then
+        local ok, id = pcall(get_id)
+        if ok and type(id) == "string" and id ~= "" then
+            return id
+        end
+    end
+    local ok, id = pcall(function() return ngx.var.request_id end)
+    if ok and type(id) == "string" and id ~= "" then
+        return id
+    end
+    return uuid()
 end
 
 -- ────────────────────────────────────────────────────────────
@@ -1137,8 +1164,8 @@ function AforoMeteringHandler:log(conf)
     local request_size = raw_body and #raw_body
         or tonumber(kong.request.get_header("Content-Length")) or 0
     local response_size = tonumber(kong.response.get_header("Content-Length")) or 0
-    local request_id = kong.request.get_header("X-Request-Id")
-        or kong.request.get_header("X-Kong-Request-Id")
+    -- Never a request header: see kong_request_id.
+    local request_id = kong_request_id()
     local session_id = kong.request.get_header("Mcp-Session-Id")
 
     local service_name = service and service.name or ""
@@ -1167,7 +1194,7 @@ function AforoMeteringHandler:log(conf)
         event.metricName     = "mcp_server.tool_invocations"
         event.quantity       = 1
         event.idempotencyKey = "mcp:" .. (conf.tenant_id or "") .. ":" ..
-                               (request_id or uuid()) .. ":" ..
+                               request_id .. ":" ..
                                mcp_info.tool_name .. ":" .. tostring(ngx.now())
         event.occurredAt     = iso8601_utc(ngx.now())
         event.toolName       = mcp_info.tool_name
@@ -1194,12 +1221,12 @@ function AforoMeteringHandler:log(conf)
         event.metricName     = resolve_metric_name(conf, method, path, service_name,
                                                    route_name, consumer_name, header_metric)
         event.quantity       = resolve_quantity(conf, response_size, header_quantity)
-        event.idempotencyKey = generate_idempotency_key(request_id)
+        event.idempotencyKey = request_id
         event.occurredAt     = iso8601_utc(ngx.now())
         -- AI_AGENT only. Other types do not define these fields, so they are
         -- left off rather than sent on every API call. The idempotency key is
-        -- the request ID when there is one, so it doubles as the per-request
-        -- session fallback.
+        -- Kong's own request ID, so it doubles as the per-request session
+        -- fallback.
         if event.productType == "AI_AGENT" then
             event.agentId, event.sessionId =
                 resolve_ai_agent_identity(conf, event.idempotencyKey)
@@ -1288,7 +1315,8 @@ function AforoMeteringHandler:log(conf)
     if missing then
         -- Name the fix where there is one. Off the MCP path an AI_AGENT
         -- agentId has exactly two sources, both in the operator's hands;
-        -- sessionId always has its request-ID fallback, so it is never the gap.
+        -- sessionId always has its Kong request-ID fallback, so it is never
+        -- the gap.
         local fix = ""
         if not mcp_info and event.productType == "AI_AGENT" and not event.agentId then
             local agent_header = non_empty_string(conf.agent_id_header)

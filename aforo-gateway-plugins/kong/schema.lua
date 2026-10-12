@@ -144,7 +144,7 @@ return {
                         session_id_header = {
                             type = "string",
                             default = "X-Aforo-Session-Id",
-                            description = "Upstream RESPONSE header carrying the session ID for an AI_AGENT request, so several requests can share one session. Without it, each request is its own session (the request ID). Set to null to disable.",
+                            description = "Upstream RESPONSE header carrying the session ID for an AI_AGENT request, so several requests can share one session. Without it, each request is its own session (Kong's request ID). Set to null to disable.",
                         },
                     },
                     {
