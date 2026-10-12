@@ -636,11 +636,20 @@ end
 -- Helpers
 -- ────────────────────────────────────────────────────────────
 
+-- An exclude_paths entry matches the path itself and anything below it: "/health"
+-- excludes "/health" and "/health/live", not "/healthcare/patients" (2026-10-12
+-- fix). It was a bare string prefix, so the defaults (/health, /ready,
+-- /metrics) quietly stopped billing any API whose path merely began with them.
 local function should_exclude_path(path, exclude_paths)
-    if not exclude_paths then return false end
+    if not exclude_paths or type(path) ~= "string" then return false end
     for _, excluded in ipairs(exclude_paths) do
-        if path == excluded or string.sub(path, 1, #excluded) == excluded then
-            return true
+        if type(excluded) == "string" and excluded ~= "" then
+            if path == excluded then return true end
+            if string.sub(path, 1, #excluded) == excluded
+                and (string.sub(excluded, -1) == "/"
+                     or string.sub(path, #excluded + 1, #excluded + 1) == "/") then
+                return true
+            end
         end
     end
     return false
@@ -884,7 +893,7 @@ local DEFAULT_METRIC_PATTERN = "{method} {path}"
 --   5. default_metric -- a single registered fallback, so an unmapped endpoint
 --      still bills as generic usage rather than being rejected
 local function resolve_metric_name(conf, method, path, service_name, route_name,
-                                   consumer_name, header_metric)
+                                   consumer_name, header_metric, mcp_fallback)
     -- 1. Upstream override. This reads the RESPONSE header, which the upstream
     -- sets and the client cannot -- so it is not a spoofable input the way a
     -- request header would be.
@@ -920,6 +929,12 @@ local function resolve_metric_name(conf, method, path, service_name, route_name,
                 end
             end
         end
+    end
+
+    -- An MCP tool call stops here: after the header and the mappings it is a
+    -- tool invocation, not generic API usage under default_metric.
+    if mcp_fallback then
+        return mcp_fallback
     end
 
     -- 4. Legacy template, honoured only if the operator actually chose one.
@@ -1073,29 +1088,91 @@ end
 -- MCP JSON-RPC Detection
 -- ────────────────────────────────────────────────────────────
 
-local function detect_mcp_tool_call(raw_body)
-    if not raw_body or raw_body == "" then return nil end
+local MCP_TOOL_METRIC = "mcp_server.tool_invocations"
 
-    local ok, parsed = pcall(cjson.decode, raw_body)
-    if not ok or not parsed then return nil end
+-- Largest request body read from client_body_buffer_size's spill file.
+local MCP_MAX_BODY_BYTES = 1048576
 
-    if parsed.jsonrpc ~= "2.0" then return nil end
-    if parsed.method ~= "tools/call" then return nil end
+-- Parse a request body as JSON-RPC (2026-10-12 rewrite). Returns nil when it
+-- is not JSON-RPC at all, else { calls = { {tool_name, agent_id}, ... } } --
+-- one entry per tools/call, also inside a JSON-RPC batch (an array), which
+-- used to be read as no tool call at all.
+--
+-- Every level is type-checked: the body is the client's. A body of `1`, or
+-- "params": null / "_meta": null, used to raise in the log phase (indexing a
+-- number or the cjson.null userdata) and lose the event. A tools/call whose
+-- name is missing or not a string is still a tool call -- billed as
+-- "unknown", so leaving the name out is not a way to skip billing.
+local function parse_jsonrpc(raw_body)
+    if type(raw_body) ~= "string" or raw_body == "" then return nil end
+    local parsed = cjson.decode(raw_body)
+    if type(parsed) ~= "table" then return nil end
 
-    local params = parsed.params or {}
-    local tool_name = params.name
-    if not tool_name then return nil end
-
-    local agent_id = nil
-    if params._meta and params._meta.agent_id then
-        agent_id = clean_string(params._meta.agent_id, IDENTITY_LIMITS.agentId)
+    local messages
+    if parsed.jsonrpc ~= nil then
+        messages = { parsed }
+    elseif #parsed > 0 then
+        messages = parsed
+    else
+        return nil
     end
 
-    return {
-        -- Kept, escaped and capped, whatever the client sent: see escaped_string.
-        tool_name = escaped_string(tool_name, 64),
-        agent_id = agent_id,
-    }
+    local calls, jsonrpc = {}, false
+    for _, msg in ipairs(messages) do
+        if type(msg) == "table" and msg.jsonrpc == "2.0" then
+            jsonrpc = true
+            if msg.method == "tools/call" then
+                local params = type(msg.params) == "table" and msg.params or {}
+                local meta = type(params._meta) == "table" and params._meta or {}
+                calls[#calls + 1] = {
+                    -- Kept, escaped and capped, whatever the client sent: see escaped_string.
+                    tool_name = escaped_string(params.name, 64) or "unknown",
+                    agent_id = clean_string(meta.agent_id, IDENTITY_LIMITS.agentId),
+                }
+            end
+        end
+    end
+    if not jsonrpc then return nil end
+    return { calls = calls }
+end
+
+-- A request body larger than client_body_buffer_size is spooled to a temp
+-- file, and kong.request.get_raw_body() returns nil for it, so a large
+-- tools/call was never seen. Read from the file instead, up to
+-- MCP_MAX_BODY_BYTES; past that it is not parsed (and is metered as a plain
+-- API call).
+local function read_body_file()
+    local ok, path = pcall(ngx.req.get_body_file)
+    if not ok or type(path) ~= "string" then return nil end
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local data = f:read(MCP_MAX_BODY_BYTES + 1)
+    f:close()
+    if not data or #data > MCP_MAX_BODY_BYTES then return nil end
+    return data
+end
+
+-- nginx variables, read defensively (absent outside a request).
+local function ngx_var(name)
+    local ok, v = pcall(function() return ngx.var[name] end)
+    return ok and v or nil
+end
+
+-- Bytes of response body sent to the client (2026-10-12 fix). Content-Length
+-- was used, which a chunked or streaming (SSE) response does not have -- so
+-- quantity_source=response_size billed it as nothing.
+local function response_bytes()
+    return tonumber(ngx_var("body_bytes_sent"))
+        or tonumber(kong.response.get_header("Content-Length")) or 0
+end
+
+-- The whole request as the client saw it, in ms (2026-10-12 fix).
+-- X-Kong-Proxy-Latency is only Kong's own overhead: an upstream that took
+-- 504 ms was reported as 2.
+local function response_time_ms(latency)
+    local t = tonumber(ngx_var("request_time"))
+    if t then return math.floor(t * 1000 + 0.5) end
+    return tonumber(latency) or 0
 end
 
 -- ────────────────────────────────────────────────────────────
@@ -1134,7 +1211,11 @@ function AforoMeteringHandler:access(conf)
     -- legitimately unavailable for streamed or oversized requests.
     if conf.mcp_enabled then
         local ok, body = pcall(kong.request.get_raw_body)
-        kong.ctx.shared.aforo_raw_body = ok and body or nil
+        body = ok and body or nil
+        if body == nil then
+            body = read_body_file()
+        end
+        kong.ctx.shared.aforo_raw_body = body
     end
 
     -- ── JWT Validation (runs first — all subsequent checks depend on validated identity) ──
@@ -1256,12 +1337,12 @@ function AforoMeteringHandler:log(conf)
     local raw_body = kong.ctx.shared.aforo_raw_body
     -- Content-Length when the body was not captured, so request_size stays
     -- populated for the common non-MCP path instead of reporting a flat 0.
-    local request_size = raw_body and #raw_body
+    local request_size = type(raw_body) == "string" and #raw_body
         or tonumber(kong.request.get_header("Content-Length")) or 0
-    local response_size = tonumber(kong.response.get_header("Content-Length")) or 0
+    local response_size = response_bytes()
+    local response_ms = response_time_ms(latency)
     -- Never a request header: see kong_request_id.
     local request_id = kong_request_id()
-    local session_id = clean_string(kong.request.get_header("Mcp-Session-Id"), IDENTITY_LIMITS.sessionId)
 
     local service_name = service and service.name or ""
     local route_name = route and route.name or ""
@@ -1271,49 +1352,72 @@ function AforoMeteringHandler:log(conf)
     -- W3C trace context (prefer access-phase stash, fallback to re-extraction)
     local trace = kong.ctx.shared.aforo_trace or extract_trace_context()
 
-    -- MCP Detection
-    local mcp_info = nil
-    if conf.mcp_enabled and method == "POST" then
-        mcp_info = detect_mcp_tool_call(raw_body)
-    end
-
     -- productType on every event (conf.product_type, default "API").
     local product_type = normalize_product_type(conf.product_type)
 
-    -- Build usage event
-    local event = {}
-    event.productType = product_type
+    -- Upstream-supplied overrides, read from the response so a client cannot
+    -- forge them.
+    local header_metric = conf.metric_header and conf.metric_header ~= ""
+        and clean_string(kong.response.get_header(conf.metric_header), IDENTITY_LIMITS.metricName)
+        or nil
 
-    if mcp_info then
-        event.customerId     = customer_id
-        event.metricName     = "mcp_server.tool_invocations"
-        event.quantity       = 1
-        event.idempotencyKey = "mcp:" .. (conf.tenant_id or "") .. ":" ..
-                               request_id .. ":" ..
-                               mcp_info.tool_name .. ":" .. tostring(ngx.now())
-        event.occurredAt     = iso8601_utc(ngx.now())
-        event.toolName       = mcp_info.tool_name
-        event.agentId        = mcp_info.agent_id or headers["x-agent-id"]
-        event.sessionId      = session_id
-        event.executionStatus = (status >= 200 and status < 300) and "SUCCESS" or "ERROR"
-        event.executionDurationMs = tonumber(latency) or 0
-        -- MCP_SERVER requires toolName AND agentId. Classify the tool call as
-        -- MCP_SERVER only when both are known; otherwise keep the configured
-        -- product_type rather than send an event the ingestor must reject.
-        if event.toolName and event.toolName ~= ""
-            and event.agentId and event.agentId ~= "" then
-            event.productType = "MCP_SERVER"
+    -- MCP: JSON-RPC on an mcp_enabled route.
+    local jsonrpc = nil
+    if conf.mcp_enabled and method == "POST" then
+        jsonrpc = parse_jsonrpc(raw_body)
+    end
+
+    -- MCP protocol messages that are not tool calls -- initialize, tools/list,
+    -- ping, notifications/* -- are plumbing, not usage (2026-10-12). They used
+    -- to fall through and bill as plain API calls under default_metric.
+    -- mcp_meter_non_tool_calls=true restores that. Requests on the route that
+    -- are not JSON-RPC at all are unaffected.
+    if jsonrpc and #jsonrpc.calls == 0 and not conf.mcp_meter_non_tool_calls then
+        kong.log.debug("[aforo-metering] Not metering an MCP protocol message (no tools/call).")
+        return
+    end
+
+    local events = {}
+    if jsonrpc and #jsonrpc.calls > 0 then
+        -- One event per tools/call: a JSON-RPC batch carries several.
+        local metric = resolve_metric_name(conf, method, path, service_name, route_name,
+                                           consumer_name, header_metric, MCP_TOOL_METRIC)
+        -- AI_AGENT: agent and session come from config or the upstream only,
+        -- as for every other AI_AGENT event. Otherwise the agent is the call's
+        -- _meta.agent_id, then the agent_id_header response header, then
+        -- conf.agent_id -- never the X-Agent-Id request header, which is the
+        -- client's to set (documented as unread since 2.0.0, and still read
+        -- here until 2026-10-12).
+        local trusted_agent, trusted_session = resolve_ai_agent_identity(conf, request_id)
+        local mcp_session = clean_string(kong.request.get_header("Mcp-Session-Id"), IDENTITY_LIMITS.sessionId)
+        for i, call in ipairs(jsonrpc.calls) do
+            local event = { productType = product_type, customerId = customer_id }
+            event.metricName     = metric
+            event.quantity       = 1
+            event.idempotencyKey = "mcp:" .. (conf.tenant_id or "") .. ":" .. request_id .. ":"
+                                   .. i .. ":" .. call.tool_name
+            event.occurredAt     = iso8601_utc(ngx.now())
+            event.toolName       = call.tool_name
+            if product_type == "AI_AGENT" then
+                event.agentId, event.sessionId = trusted_agent, trusted_session
+            else
+                event.agentId   = call.agent_id or trusted_agent
+                event.sessionId = mcp_session
+            end
+            event.executionStatus = (status >= 200 and status < 300) and "SUCCESS" or "ERROR"
+            event.executionDurationMs = response_ms
+            -- MCP_SERVER requires toolName AND agentId. Classify the tool call as
+            -- MCP_SERVER only when both are known; otherwise keep the configured
+            -- product_type rather than send an event the ingestor must reject.
+            if event.agentId then
+                event.productType = "MCP_SERVER"
+            end
+            events[i] = event
         end
     else
-        event.customerId     = customer_id
-        -- Upstream-supplied overrides, read from the response so a client
-        -- cannot forge them.
-        local header_metric = conf.metric_header and conf.metric_header ~= ""
-            and clean_string(kong.response.get_header(conf.metric_header), IDENTITY_LIMITS.metricName)
-            or nil
         local header_quantity = conf.quantity_header and conf.quantity_header ~= ""
             and kong.response.get_header(conf.quantity_header) or nil
-
+        local event = { productType = product_type, customerId = customer_id }
         event.metricName     = resolve_metric_name(conf, method, path, service_name,
                                                    route_name, consumer_name, header_metric)
         event.quantity       = resolve_quantity(conf, response_size, header_quantity)
@@ -1323,139 +1427,149 @@ function AforoMeteringHandler:log(conf)
         -- left off rather than sent on every API call. The idempotency key is
         -- Kong's own request ID, so it doubles as the per-request session
         -- fallback.
-        if event.productType == "AI_AGENT" then
-            event.agentId, event.sessionId =
-                resolve_ai_agent_identity(conf, event.idempotencyKey)
+        if product_type == "AI_AGENT" then
+            event.agentId, event.sessionId = resolve_ai_agent_identity(conf, request_id)
         end
+        events[1] = event
     end
 
-    -- quantity must be > 0 (e.g. quantity_source=response_size with an empty
-    -- body) after rounding to the ingestor's 6 decimals, and below its 14
-    -- integer digits; such an event would only be refused.
-    if type(event.quantity) == "number" then
-        event.quantity = round_quantity(event.quantity)
-    end
-    if type(event.quantity) ~= "number" or event.quantity <= 0 or event.quantity >= 1e14 then
-        kong.log.debug("[aforo-metering] Skipping ", method, " ", path,
-            " -- quantity is not > 0 (after rounding to 6 decimals) or is too large.")
-        return
-    end
-
-    -- AGENTIC_API: always a traceId (see agentic_trace_id).
-    if event.productType == "AGENTIC_API" then
-        event.traceId = agentic_trace_id(trace, request_id)
-    end
-
-    -- Top-level HTTP fields (hoisted from metadata for fast ClickHouse queries).
     -- The path is client-chosen: escaped and cut to the ingestor's 512 limit.
     local event_path = escaped_string(path, 512) or "/"
-    event.endpointPath    = event_path
-    event.httpMethod      = string.sub(method or "", 1, 16)
-    event.statusCode      = status
-    event.responseTimeMs  = tonumber(latency) or 0
 
-    -- W3C trace context (null when absent — fidelity, not synthetic)
-    event.trace = trace
-
-    -- Metadata (kept for backward compat — HTTP fields will be removed here in a follow-up)
-    if conf.include_metadata then
-        event.metadata = {
-            gateway       = "kong",
-            method        = method,
-            path          = event_path,
-            status        = status,
-            latency       = tonumber(latency) or 0,
-            endpoint_path = event_path,
-            http_method   = method,
-            status_code   = status,
-            response_time_ms = tonumber(latency) or 0,
-            requestSize   = request_size,
-            responseSize  = response_size,
-            service       = service_name,
-            route         = route_name,
-            consumer      = consumer_name,
-        }
-    end
-
-    -- Billing-hierarchy identity (2026-09-01 fix).
-    -- usage-ingestor's BillingHierarchyEnricher resolves team / member /
-    -- subscription for an event from an identity carried in metadata. Until now
-    -- this plugin emitted none, so every gateway-metered event reached the
-    -- ingestor unattributed: teamId stayed null, and because budget enforcement
-    -- is gated on a non-null teamId, team budgets were silently never enforced
-    -- for gateway traffic.
-    --
-    -- key_id is the JWT's Aforo API-key id (UUID). It is deliberately NOT the
-    -- same value as keyHash (SHA-256 hex of the raw key) which the enricher's
-    -- older :apikey: index is built on -- the gateway never sees the raw key, so
-    -- it cannot compute that hash. The ingestor therefore maintains a parallel
-    -- :keyid: index; see BillingHierarchySyncJob.
-    --
-    -- Set outside the include_metadata block on purpose: include_metadata=false
-    -- turns off *diagnostic* metadata, and must not silently disable billing
-    -- attribution.
-    local jwt_claims = kong.ctx.shared and kong.ctx.shared.aforo_jwt_claims
-    if jwt_claims and jwt_claims.key_id and jwt_claims.key_id ~= "" then
-        event.metadata = event.metadata or {}
-        event.metadata.keyId = jwt_claims.key_id
-    end
-
-    -- Refuse to buffer an event that can never be accepted (2026-09-03).
-    --
-    -- customerId is what usage attributes to; the ingestor rejects a blank one.
-    -- Because it validates a batch as a whole, a single such event fails the
-    -- request and every well-formed event batched with it is rejected too. Since
-    -- nothing downstream can supply the missing value later, buffering it only
-    -- damages the events around it -- so it is dropped here, at the one point
-    -- where the loss is limited to the event actually at fault.
-    if not event.customerId or event.customerId == "" then
-        kong.log.warn("[aforo-metering] Skipping ", method, " ", path,
-            " -- no customer identity resolved. With jwt_validation_enabled the ",
-            "customer_id claim supplies this; otherwise set customer_id_source to a ",
-            "Kong consumer. Event not metered.")
-        return
-    end
-
-    local field, max = over_limit(event)
-    if field then
-        warn_throttled("over_limit_" .. field, 300,
-            "[aforo-metering] Skipping events: ", field, " is longer than the ingestor's ",
-            max, "-character limit (e.g. ", method, " ", event_path, "). Event not metered. ",
-            "Repeats suppressed for 300s.")
-        return
-    end
-
-    -- Refuse to buffer an event its productType makes invalid, for the same
-    -- reason as the customerId skip above: one such event fails its batch.
-    local missing = missing_required_fields(event)
-    if missing then
-        -- Name the fix where there is one. Off the MCP path an AI_AGENT
-        -- agentId has exactly two sources, both in the operator's hands;
-        -- sessionId always has its Kong request-ID fallback, so it is never
-        -- the gap.
-        local fix = ""
-        if not mcp_info and event.productType == "AI_AGENT" and not event.agentId then
-            local agent_header = non_empty_string(conf.agent_id_header)
-            fix = " Fix: set config.agent_id to this service's agent ID, or have the upstream "
-                .. (agent_header
-                    and ("send it in the " .. agent_header .. " response header.")
-                    or "send it in a response header and set config.agent_id_header to its name.")
+    for _, event in ipairs(events) do
+        -- quantity must be > 0 (e.g. quantity_source=response_size with an empty
+        -- body) after rounding to the ingestor's 6 decimals, and below its 14
+        -- integer digits; such an event would only be refused.
+        if type(event.quantity) == "number" then
+            event.quantity = round_quantity(event.quantity)
         end
-        warn_throttled("missing_fields_" .. event.productType, 300,
-            "[aforo-metering] Skipping events: product_type ", event.productType,
-            " requires ", table.concat(missing, ", "), ", which this request did not ",
-            "supply (e.g. ", method, " ", path, ").", fix, " Repeats suppressed for 300s.")
-        return
-    end
+        if type(event.quantity) ~= "number" or event.quantity <= 0 or event.quantity >= 1e14 then
+            kong.log.debug("[aforo-metering] Skipping ", method, " ", path,
+                " -- quantity is not > 0 (after rounding to 6 decimals) or is too large.")
+            goto continue
+        end
 
-    local encoded, enc_err = cjson.encode(event)
-    if not encoded then
-        kong.log.err("[aforo-metering] Could not encode event for ", method, " ", path,
-            ": ", enc_err, ". Event not metered.")
-        return
-    end
+        -- AGENTIC_API: always a traceId (see agentic_trace_id).
+        if event.productType == "AGENTIC_API" then
+            event.traceId = agentic_trace_id(trace, request_id)
+        end
 
-    event_buffer.push(conf, encoded)
+        -- Top-level HTTP fields (hoisted from metadata for fast ClickHouse queries)
+        event.endpointPath    = event_path
+        event.httpMethod      = string.sub(method or "", 1, 16)
+        event.statusCode      = status
+        event.responseTimeMs  = response_ms
+
+        -- W3C trace context (null when absent — fidelity, not synthetic)
+        event.trace = trace
+
+        -- Metadata (kept for backward compat — HTTP fields will be removed here in a follow-up)
+        if conf.include_metadata then
+            event.metadata = {
+                gateway       = "kong",
+                method        = method,
+                path          = event_path,
+                status        = status,
+                latency       = tonumber(latency) or 0,
+                endpoint_path = event_path,
+                http_method   = method,
+                status_code   = status,
+                response_time_ms = response_ms,
+                requestSize   = request_size,
+                responseSize  = response_size,
+                service       = service_name,
+                route         = route_name,
+                consumer      = consumer_name,
+            }
+        else
+            -- endpoint_path stays whatever include_metadata says (2026-10-12):
+            -- central mappings and the ingestor's metric filters and
+            -- aggregation read this key, so without it include_metadata=false
+            -- silently changed what was billed.
+            event.metadata = { endpoint_path = event_path }
+        end
+
+        -- Billing-hierarchy identity (2026-09-01 fix).
+        -- usage-ingestor's BillingHierarchyEnricher resolves team / member /
+        -- subscription for an event from an identity carried in metadata. Until now
+        -- this plugin emitted none, so every gateway-metered event reached the
+        -- ingestor unattributed: teamId stayed null, and because budget enforcement
+        -- is gated on a non-null teamId, team budgets were silently never enforced
+        -- for gateway traffic.
+        --
+        -- key_id is the JWT's Aforo API-key id (UUID). It is deliberately NOT the
+        -- same value as keyHash (SHA-256 hex of the raw key) which the enricher's
+        -- older :apikey: index is built on -- the gateway never sees the raw key, so
+        -- it cannot compute that hash. The ingestor therefore maintains a parallel
+        -- :keyid: index; see BillingHierarchySyncJob.
+        --
+        -- Set outside the include_metadata block on purpose: include_metadata=false
+        -- turns off *diagnostic* metadata, and must not silently disable billing
+        -- attribution.
+        local jwt_claims = kong.ctx.shared and kong.ctx.shared.aforo_jwt_claims
+        if jwt_claims and jwt_claims.key_id and jwt_claims.key_id ~= "" then
+            event.metadata.keyId = jwt_claims.key_id
+        end
+
+        -- Refuse to buffer an event that can never be accepted (2026-09-03).
+        --
+        -- customerId is what usage attributes to; the ingestor rejects a blank one.
+        -- Nothing downstream can supply the missing value later, so buffering it
+        -- only costs a round trip -- it is dropped here, at the one point where the
+        -- loss is limited to the event actually at fault.
+        if not event.customerId or event.customerId == "" then
+            warn_throttled("no_customer", 60, "[aforo-metering] Skipping ", method, " ", path,
+                " -- no customer identity resolved. With jwt_validation_enabled the ",
+                "customer_id claim supplies this; otherwise set customer_id_source to a ",
+                "Kong consumer. Event not metered. Repeats suppressed for 60s.")
+            return
+        end
+
+        local field, max = over_limit(event)
+        if field then
+            warn_throttled("over_limit_" .. field, 300,
+                "[aforo-metering] Skipping events: ", field, " is longer than the ingestor's ",
+                max, "-character limit (e.g. ", method, " ", event_path, "). Event not metered. ",
+                "Repeats suppressed for 300s.")
+            goto continue
+        end
+
+        -- Refuse to buffer an event its productType makes invalid, for the same
+        -- reason as the customerId skip above.
+        do
+            local missing = missing_required_fields(event)
+            if missing then
+                -- Name the fix where there is one. An AI_AGENT agentId has exactly
+                -- two sources, both in the operator's hands; sessionId always has
+                -- its Kong request-ID fallback, so it is never the gap.
+                local fix = ""
+                if event.productType == "AI_AGENT" and not event.agentId then
+                    local agent_header = non_empty_string(conf.agent_id_header)
+                    fix = " Fix: set config.agent_id to this service's agent ID, or have the upstream "
+                        .. (agent_header
+                            and ("send it in the " .. agent_header .. " response header.")
+                            or "send it in a response header and set config.agent_id_header to its name.")
+                end
+                warn_throttled("missing_fields_" .. event.productType, 300,
+                    "[aforo-metering] Skipping events: product_type ", event.productType,
+                    " requires ", table.concat(missing, ", "), ", which this request did not ",
+                    "supply (e.g. ", method, " ", path, ").", fix, " Repeats suppressed for 300s.")
+                goto continue
+            end
+        end
+
+        do
+            local encoded, enc_err = cjson.encode(event)
+            if not encoded then
+                kong.log.err("[aforo-metering] Could not encode event for ", method, " ", path,
+                    ": ", enc_err, ". Event not metered.")
+                goto continue
+            end
+            event_buffer.push(conf, encoded)
+        end
+
+        ::continue::
+    end
 end
 
 -- Exported for unit testing — not used by the Kong runtime.

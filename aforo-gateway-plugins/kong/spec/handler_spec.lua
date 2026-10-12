@@ -717,6 +717,196 @@ describe("aforo-metering handler", function()
             assert.equals(0, #buffered(c))
         end)
     end)
+    -- ── Billing correctness (2026-10-12) ────────────────────────
+    describe("billing correctness", function()
+        local dict
+        local function conf(o)
+            local c = {
+                aforo_endpoint = "http://ingestor.test/v1/ingest/batch",
+                api_key = "sk_A", tenant_id = "tenantA", default_metric = "api_calls",
+                metric_header = "X-Aforo-Metric", quantity_header = "X-Aforo-Quantity",
+                agent_id_header = "X-Aforo-Agent-Id", session_id_header = "X-Aforo-Session-Id",
+                exclude_paths = { "/health", "/ready", "/metrics" }, exclude_status_codes = {},
+            }
+            for k, v in pairs(o or {}) do c[k] = v end
+            return c
+        end
+        local MCP = { mcp_enabled = true }
+        -- One request. opts: method, path, body (the access-phase stash),
+        -- headers (request), response (headers), var (ngx.var).
+        local function log(c, opts)
+            opts = opts or {}
+            mock_kong.request._headers = opts.headers or {}
+            mock_kong.response._headers = opts.response or {}
+            mock_kong.ctx.shared = { aforo_jwt_claims = { customer_id = "cust_a" }, aforo_raw_body = opts.body }
+            ngx.var = opts.var or { request_id = "kongreq" }
+            local m, p = mock_kong.request.get_method, mock_kong.request.get_path
+            mock_kong.request.get_method = function() return opts.method or "GET" end
+            mock_kong.request.get_path = function() return opts.path or "/v1/accounts/123" end
+            handler:log(c)
+            mock_kong.request.get_method, mock_kong.request.get_path = m, p
+            ngx.var = nil
+        end
+        local function buffered(c)
+            local l = dict.store[handler._buffer_key(c)] or {}
+            local out = {}
+            for i, e in ipairs(l) do out[i] = cjson.decode(e) end
+            return out
+        end
+        local function tool_call(name, meta)
+            return cjson.encode({ jsonrpc = "2.0", id = 1, method = "tools/call",
+                                  params = { name = name, _meta = meta } })
+        end
+
+        before_each(function()
+            dict = new_shared_dict()
+            ngx.shared.aforo_buffer = dict
+            ngx.timers = {}
+        end)
+
+        it("excludes a path and what is below it, not every path sharing its prefix", function()
+            local c = conf()
+            for _, p in ipairs({ "/healthcare/patients/42", "/metrics-api/v1/series", "/ready-meals/orders",
+                                 "/health", "/health/live", "/metrics" }) do
+                log(c, { path = p })
+            end
+            local paths = {}
+            for i, e in ipairs(buffered(c)) do paths[i] = e.endpointPath end
+            assert.same({ "/healthcare/patients/42", "/metrics-api/v1/series", "/ready-meals/orders" }, paths)
+        end)
+
+        it("bills response_size from the bytes actually sent, also without Content-Length", function()
+            local c = conf({ quantity_source = "response_size" })
+            log(c, { var = { request_id = "r1", body_bytes_sent = "5000" } })  -- chunked: no Content-Length
+            assert.equals(5000, buffered(c)[1].quantity)
+        end)
+
+        it("reports the whole request time, not Kong's own latency", function()
+            local c = conf(MCP)
+            log(c, { response = { ["X-Kong-Proxy-Latency"] = "2" }, var = { request_id = "r1", request_time = "0.504" } })
+            log(c, { method = "POST", body = tool_call("search", { agent_id = "a1" }),
+                     response = { ["X-Kong-Proxy-Latency"] = "2" }, var = { request_id = "r2", request_time = "0.504" } })
+            local evs = buffered(c)
+            assert.equals(504, evs[1].responseTimeMs)
+            assert.equals(504, evs[2].responseTimeMs)
+            assert.equals(504, evs[2].executionDurationMs)
+        end)
+
+        it("keeps metadata.endpoint_path with include_metadata=false", function()
+            local c = conf({ include_metadata = false })
+            log(c, { path = "/v1/sms" })
+            local e = buffered(c)[1]
+            assert.same({ endpoint_path = "/v1/sms" }, e.metadata)
+        end)
+
+        it("survives any MCP body, and still bills a tools/call without a usable name", function()
+            local c = conf(MCP)
+            local bodies = { "1", '"text"', "null", "[]", "[1,2]", "{}",
+                '{"jsonrpc":"2.0","method":"tools/call","params":null}',
+                '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"search","_meta":null}}',
+                '{"jsonrpc":"2.0","method":"tools/call","params":{"name":42}}' }
+            for i, body in ipairs(bodies) do
+                assert.has_no.errors(function()
+                    log(c, { method = "POST", body = body, var = { request_id = "r" .. i } })
+                end, body)
+            end
+            local tools = {}
+            for _, e in ipairs(buffered(c)) do
+                if e.toolName then tools[#tools + 1] = e.toolName end
+            end
+            assert.same({ "unknown", "search", "unknown" }, tools)
+        end)
+
+        it("bills each tools/call in a JSON-RPC batch, and none of the protocol messages", function()
+            local c = conf(MCP)
+            local batch = '[' .. tool_call("search", { agent_id = "a1" }) .. ','
+                .. '{"jsonrpc":"2.0","id":2,"method":"ping"},'
+                .. tool_call("fetch", { agent_id = "a1" }) .. ']'
+            log(c, { method = "POST", body = batch })
+            local evs = buffered(c)
+            assert.equals(2, #evs)
+            assert.equals("search", evs[1].toolName)
+            assert.equals("fetch", evs[2].toolName)
+            assert.not_equals(evs[1].idempotencyKey, evs[2].idempotencyKey)
+        end)
+
+        it("does not bill MCP protocol messages unless mcp_meter_non_tool_calls is set", function()
+            local msgs = {
+                '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
+                '{"jsonrpc":"2.0","id":2,"method":"tools/list"}',
+                '{"jsonrpc":"2.0","id":3,"method":"ping"}',
+                '{"jsonrpc":"2.0","method":"notifications/initialized"}',
+            }
+            local c = conf(MCP)
+            for _, m in ipairs(msgs) do log(c, { method = "POST", body = m }) end
+            assert.equals(0, #buffered(c))
+            -- Not JSON-RPC at all: unaffected.
+            log(c, { method = "POST", body = '{"hello":"world"}' })
+            log(c, { method = "GET" })
+            assert.equals(2, #buffered(c))
+
+            dict = new_shared_dict(); ngx.shared.aforo_buffer = dict
+            local on = conf({ mcp_enabled = true, mcp_meter_non_tool_calls = true })
+            for _, m in ipairs(msgs) do log(on, { method = "POST", body = m }) end
+            local evs = buffered(on)
+            assert.equals(4, #evs)
+            assert.equals("api_calls", evs[1].metricName)
+        end)
+
+        it("takes the MCP agent from _meta, then the agent response header, then config -- never X-Agent-Id", function()
+            local c = conf({ mcp_enabled = true, agent_id = "agent_cfg" })
+            local forged = { ["x-agent-id"] = "forged", ["X-Agent-Id"] = "forged" }
+            log(c, { method = "POST", body = tool_call("t", { agent_id = "agent_meta" }), headers = forged,
+                     response = { ["X-Aforo-Agent-Id"] = "agent_hdr" } })
+            log(c, { method = "POST", body = tool_call("t"), headers = forged,
+                     response = { ["X-Aforo-Agent-Id"] = "agent_hdr" } })
+            log(c, { method = "POST", body = tool_call("t"), headers = forged })
+            local ids = {}
+            for i, e in ipairs(buffered(c)) do ids[i] = e.agentId end
+            assert.same({ "agent_meta", "agent_hdr", "agent_cfg" }, ids)
+        end)
+
+        it("on an AI_AGENT route, takes MCP agent and session from config and the upstream only", function()
+            local c = conf({ mcp_enabled = true, product_type = "AI_AGENT", agent_id = "agent_cfg" })
+            log(c, { method = "POST", body = tool_call("t", { agent_id = "agent_meta" }),
+                     headers = { ["Mcp-Session-Id"] = "client-session" }, var = { request_id = "kongreq1" } })
+            log(c, { method = "POST", body = tool_call("t", { agent_id = "agent_meta" }),
+                     response = { ["X-Aforo-Session-Id"] = "sess-42" }, var = { request_id = "kongreq2" } })
+            local evs = buffered(c)
+            assert.equals("agent_cfg", evs[1].agentId)
+            assert.equals("kongreq1", evs[1].sessionId)
+            assert.equals("sess-42", evs[2].sessionId)
+        end)
+
+        it("names an MCP tool call by the metric header, then the mappings, then mcp_server.tool_invocations", function()
+            local c = conf({ mcp_enabled = true, default_metric = "api_calls",
+                             metric_mappings = { { path_pattern = "^/mcp/premium", metric_name = "premium_tools" } } })
+            local body = tool_call("t", { agent_id = "a1" })
+            log(c, { method = "POST", path = "/mcp", body = body, response = { ["X-Aforo-Metric"] = "tool_x" } })
+            log(c, { method = "POST", path = "/mcp/premium", body = body })
+            log(c, { method = "POST", path = "/mcp", body = body })
+            local names = {}
+            for i, e in ipairs(buffered(c)) do names[i] = e.metricName end
+            assert.same({ "tool_x", "premium_tools", "mcp_server.tool_invocations" }, names)
+        end)
+
+        it("reads a tools/call body that Kong spooled to a file", function()
+            local path = os.tmpname()
+            local f = io.open(path, "wb"); f:write(tool_call("big_tool", { agent_id = "a1" })); f:close()
+            local orig_raw = mock_kong.request.get_raw_body
+            mock_kong.request.get_raw_body = function() return nil, "request body did not fit into client body buffer" end
+            ngx.req = { get_body_file = function() return path end }
+            local c = conf(MCP)
+            mock_kong.ctx.shared = {}
+            handler:access(c)
+            local stash = mock_kong.ctx.shared.aforo_raw_body
+            mock_kong.request.get_raw_body = orig_raw
+            ngx.req = nil
+            os.remove(path)
+            log(c, { method = "POST", body = stash })
+            assert.equals("big_tool", buffered(c)[1].toolName)
+        end)
+    end)
     -- ── productType ─────────────────────────────────────────────
     describe("product_type", function()
         local BUFFER_KEY = handler._buffer_key({ aforo_endpoint = "http://ingestor.test/v1/ingest/batch",
@@ -780,13 +970,24 @@ describe("aforo-metering handler", function()
         end)
 
         it("sends an MCP tool call as MCP_SERVER only when agentId is known", function()
-            log(conf("API"), "POST", TOOL_CALL, { ["x-agent-id"] = "agent_1" })
+            local with_meta = '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"search",'
+                .. '"_meta":{"agent_id":"agent_1"}}}'
+            log(conf("API"), "POST", with_meta, {})
+            local configured = conf("API"); configured.agent_id = "agent_cfg"
+            log(configured, "POST", TOOL_CALL, {})
             log(conf("API"), "POST", TOOL_CALL, {})
+            -- X-Agent-Id is the client's to set: never a source for agentId.
+            log(conf("API"), "POST", TOOL_CALL, { ["x-agent-id"] = "agent_forged", ["X-Agent-Id"] = "agent_forged" })
             local events = buffered()
-            assert.equals(2, #events)
+            assert.equals(4, #events)
             assert.equals("MCP_SERVER", events[1].productType)
             assert.equals("search", events[1].toolName)
-            assert.equals("API", events[2].productType)
+            assert.equals("agent_1", events[1].agentId)
+            assert.equals("MCP_SERVER", events[2].productType)
+            assert.equals("agent_cfg", events[2].agentId)
+            assert.equals("API", events[3].productType)
+            assert.equals("API", events[4].productType)
+            assert.is_nil(events[4].agentId)
         end)
     end)
     -- ── AI_AGENT identity ───────────────────────────────────────

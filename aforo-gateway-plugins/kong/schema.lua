@@ -118,7 +118,7 @@ return {
                         quantity_source = {
                             type = "string",
                             default = "1",
-                            description = "Quantity source: '1' (count), 'response_size' (bytes), or a number",
+                            description = "Quantity source: '1' (count), 'response_size' (response body bytes sent to the client, also for chunked and streamed responses), or a number",
                         },
                     },
                     -- AI_AGENT identity (product_type=AI_AGENT only).
@@ -193,7 +193,14 @@ return {
                         mcp_enabled = {
                             type = "boolean",
                             default = false,
-                            description = "Enable MCP JSON-RPC detection for tool call metering",
+                            description = "Meter MCP JSON-RPC tools/call requests as tool invocations (one event per call, also in a JSON-RPC batch). Bodies up to 1 MB are read.",
+                        },
+                    },
+                    {
+                        mcp_meter_non_tool_calls = {
+                            type = "boolean",
+                            default = false,
+                            description = "With mcp_enabled: also meter JSON-RPC messages that are not tools/call (initialize, tools/list, ping, notifications), as plain API calls. Off by default: they are protocol traffic, not usage. Requests that are not JSON-RPC are always metered.",
                         },
                     },
                     {
@@ -373,7 +380,7 @@ return {
                             type = "array",
                             elements = { type = "string" },
                             default = { "/health", "/ready", "/metrics" },
-                            description = "Paths to exclude from metering",
+                            description = "Paths to exclude from metering. An entry matches that path and anything below it: /health excludes /health and /health/live, not /healthcare.",
                         },
                     },
                     {

@@ -316,9 +316,12 @@ curl -X PATCH http://localhost:8001/services/my-service/plugins/<plugin-id> \
   --data "config.mcp_product_id=$AFORO_MCP_PRODUCT_ID"
 ```
 
-The log phase parses POST bodies, and any JSON-RPC `2.0` request with `method: "tools/call"` emits a `mcp_server.tool_invocations` event carrying `toolName`, `sessionId` (from `Mcp-Session-Id`), and `executionStatus`.
+The log phase parses POST bodies (up to 1 MB). Each JSON-RPC `2.0` message with `method: "tools/call"` becomes one event carrying `toolName`, `sessionId` (from the `Mcp-Session-Id` header), `executionStatus` and `executionDurationMs`. A JSON-RPC batch (an array) gives one event per `tools/call` in it.
 
-> ⚠ `agentId` is taken from the JSON-RPC payload at `params._meta.agent_id` only. The plugin will not read an `X-Agent-Id` request header for the agent — that path was removed in 2.0.0 because the header is client-settable.
+- **Agent.** `agentId` is taken from `params._meta.agent_id`, else the upstream's `X-Aforo-Agent-Id` response header, else `config.agent_id`. The `X-Agent-Id` request header is never read: the client can set it to anything. With an agent the event is sent as `MCP_SERVER`; without one it keeps `product_type`.
+- **Metric.** The upstream's `X-Aforo-Metric` response header, else a matching central mapping or `metric_mappings` rule, else `mcp_server.tool_invocations`.
+- **Protocol messages are not billed.** `initialize`, `tools/list`, `ping` and notifications are MCP plumbing, so they are not metered. Set `config.mcp_meter_non_tool_calls=true` to meter them as plain API calls. Requests on the route that are not JSON-RPC are metered as usual.
+- On a route with `product_type: AI_AGENT`, the agent and session come from config and the upstream only, as described in [Metering an AI agent](#metering-an-ai-agent).
 
 ## Configuration reference
 

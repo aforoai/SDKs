@@ -10,6 +10,7 @@ This monorepo ships five gateway metering plugins (Kong, Apigee, AWS Lambda, Azu
 - Kong: the margin guard now applies pricing's BLOCK/THROTTLE verdicts (it read the wrong fields and never blocked), checks the GLOBAL scope, and requires `margin_guard_url`.
 - Kong: requests the plugin itself refuses (401/429/503) are no longer metered.
 - Kong: one event buffer per destination (a second plugin instance's usage was sent with the first one's key), no retry storms or stranded events, 401/403/404 and per-event storage failures kept for retry, 400/413 batches split, and unusable client values kept out of batches.
+- Kong: `exclude_paths` no longer skips paths that only share a prefix (`/healthcare`), streamed responses bill their bytes, `responseTimeMs` is the real response time, MCP bodies can't crash metering, JSON-RPC batches bill each tool call, MCP protocol messages are not billed (new `mcp_meter_non_tool_calls`), and the MCP agent is never taken from `X-Agent-Id`.
 - Kong: the event idempotency key is now Kong's own request ID instead of the client's `X-Request-Id` header. A client that repeated one `X-Request-Id` was billed only once.
 
 ## v2.1.0 — 2026-10-01

@@ -78,15 +78,16 @@ Every option lives under `config.*`. `aforo_endpoint`, `api_key`, and `tenant_id
 | `tenant_id` | string | — (required) | Aforo tenant identifier. Sent as the `X-Tenant-Id` header on the flush. |
 | `product_type` | string | `API` | `productType` sent on every event (trimmed, upper-cased; unknown values passed through). MCP `tools/call` (with `mcp_enabled`) is sent as `MCP_SERVER` when both `toolName` and `agentId` are known, otherwise keeps this value. Events missing the fields their type requires are skipped, not sent (one invalid event fails the whole batch). `AI_AGENT` needs an agent ID and a session ID: set `agent_id`, or have the upstream send them as response headers (`agent_id_header`, `session_id_header`); see [Metering an AI agent](USER_GUIDE.md#metering-an-ai-agent). `GRPC_API`/`GRAPHQL_API`/`WEBSOCKET_API`/`MQTT_BROKER` need fields an HTTP gateway cannot observe, so their events are skipped. |
 | `metric_name_pattern` | string | `{method} {path}` | Metric-name template. Variables: `{method}`, `{path}`, `{service}`, `{route}`, `{consumer}`. |
-| `quantity_source` | string | `1` | `1` = one unit per request, `response_size` = response bytes, or a literal number. |
+| `quantity_source` | string | `1` | `1` = one unit per request, `response_size` = response body bytes sent to the client (also for chunked and streamed responses), or a literal number. |
 | `agent_id` | string | — | `AI_AGENT` only. The agent ID for the service or route this plugin is on. Used when the upstream does not send `agent_id_header`. |
 | `agent_id_header` | string | `X-Aforo-Agent-Id` | `AI_AGENT` only. Upstream **response** header carrying the agent ID for one request; wins over `agent_id`. A request header of the same name is never read. `null` disables it. |
 | `session_id_header` | string | `X-Aforo-Session-Id` | `AI_AGENT` only. Upstream **response** header carrying the session ID, so several requests can share one session. Without it, each request is its own session. A request header of the same name is never read. `null` disables it. |
 | `customer_id_source` | string | `consumer` | Only `consumer` is accepted. A validated JWT `customer_id` claim takes precedence when `jwt_validation_enabled=true`. Request headers / query params are never read. |
 | `flush_interval_ms` | integer | `5000` | Max time before a non-empty buffer flushes. Also the wait before retrying after a failed flush. |
 | `flush_count` | integer | `50` | Flush immediately once this many events are buffered. |
-| `include_metadata` | boolean | `true` | Include request metadata (method, path, status, latency, sizes) in the event. |
-| `mcp_enabled` | boolean | `false` | Detect MCP JSON-RPC `tools/call` POST bodies and emit `mcp_server.tool_invocations` events. |
+| `include_metadata` | boolean | `true` | Include request metadata (method, path, status, latency, sizes) in the event. `metadata.endpoint_path` is always sent, because metric mappings and filters use it. |
+| `mcp_enabled` | boolean | `false` | Meter MCP JSON-RPC `tools/call` POST bodies as tool invocations: one event per call, also inside a JSON-RPC batch. Bodies up to 1 MB are read. See [Step 7 of the user guide](USER_GUIDE.md#step-7-optional--turn-on-mcp-tool-invocation-metering). |
+| `mcp_meter_non_tool_calls` | boolean | `false` | With `mcp_enabled`, also meter JSON-RPC messages that are not `tools/call` (`initialize`, `tools/list`, `ping`, notifications) as plain API calls. Off by default: they are protocol traffic. Requests that are not JSON-RPC are metered either way. |
 | `mcp_product_id` | string | — | Aforo product ID for MCP metering (set when `mcp_enabled=true`). |
 | `jwt_validation_enabled` | boolean | `false` | Validate an Aforo RS256 JWT in the access phase before metering: `exp`, `iss`, the signature, `tenant_id`, the jti blocklist and client revocation. A token whose `tenant_id` is not this plugin's `tenant_id` is rejected with 401 `TENANT_MISMATCH`. |
 | `jwt_issuer` | string | `https://auth.aforo.ai` | Expected `iss` claim. Empty string skips the issuer check. |
@@ -110,7 +111,7 @@ Every option lives under `config.*`. `aforo_endpoint`, `api_key`, and `tenant_id
 | `preflight_quota_timeout_ms` | integer | `100` | Timeout for the check (it is on the request path). |
 | `preflight_quota_cache_ttl_ms` | integer | `1000` | How long an `ALLOW` is cached per tenant/customer/metric. `DENY` is never cached. `0` disables. |
 | `preflight_quota_fail_open` | boolean | `true` | On error, timeout or non-200: let the request through (`true`) or answer 503 (`false`). |
-| `exclude_paths` | array | `["/health","/ready","/metrics"]` | Paths skipped from metering (prefix match). |
+| `exclude_paths` | array | `["/health","/ready","/metrics"]` | Paths skipped from metering. An entry matches that path and anything below it: `/health` skips `/health` and `/health/live`, not `/healthcare`. |
 | `exclude_status_codes` | array | `[401,403,429]` | Status codes skipped from metering. Separately, a request this plugin refuses itself (JWT 401, rate-limit or margin-guard 429, pre-flight quota 429/503) is never metered, whatever this list says. |
 
 ## Walk me through it
