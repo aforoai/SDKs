@@ -442,6 +442,111 @@ describe("access phase", function()
             assert.equals("INVALID_SIGNATURE", access_with(jwt(aforo_claims()), JWKS_CONF).body.error_description)
         end)
 
+        -- org-service makes a new key pair on every start but keeps kid
+        -- "aforo-v1"; verify() here succeeds only with the issuer's current key.
+        local function with_issuer_key(current, fn)
+            local mod = package.loaded["resty.openssl.pkey"]
+            local orig = mod.new
+            mod.new = function(key)
+                local n = cjson.decode(key).n
+                return { verify = function() return n == current.n end }
+            end
+            local ok, err = pcall(fn)
+            mod.new = orig
+            assert(ok, err)
+        end
+
+        it("refetches once when the issuer replaced the key under the same kid", function()
+            local current = { n = "S1-OLD" }
+            with_issuer_key(current, function()
+                http_responses = { { status = 200, body = cjson.encode({ keys = {
+                    { kty = "RSA", use = "sig", kid = "aforo-v1", alg = "RS256", n = "S1-OLD", e = "AQAB" } } }) } }
+                assert.is_nil(access_with(token("aforo-v1"), JWKS_CONF))
+                -- The issuer restarts: new key, same kid. The fetch lock has long expired.
+                current.n = "S1-NEW"
+                ngx.shared.aforo_buffer.store["aforo:jwks_fetch:" .. URI] = nil
+                http_responses = { { status = 200, body = cjson.encode({ keys = {
+                    { kty = "RSA", use = "sig", kid = "aforo-v1", alg = "RS256", n = "S1-NEW", e = "AQAB" } } }) } }
+                for _ = 1, 5 do
+                    K.response._exit = nil
+                    assert.is_nil(access_with(token("aforo-v1"), JWKS_CONF))
+                end
+                assert.equals(2, #http_requests)   -- the first fetch and one refetch
+            end)
+        end)
+
+        it("rejects a bad signature after that one refetch, and never on a failed refetch", function()
+            local current = { n = "S1B-REAL" }
+            with_issuer_key(current, function()
+                http_responses = { { status = 200, body = cjson.encode({ keys = {
+                    { kty = "RSA", use = "sig", kid = "aforo-v1", alg = "RS256", n = "S1B-REAL", e = "AQAB" } } }) } }
+                access_with(token("aforo-v1"), JWKS_CONF)
+                current.n = "nobody"                  -- forged: verifies against no key
+                ngx.shared.aforo_buffer.store["aforo:jwks_fetch:" .. URI] = nil
+                http_responses = { { err = "connection refused" } }
+                K.response._exit = nil
+                assert.equals("INVALID_SIGNATURE", access_with(token("aforo-v1"), JWKS_CONF).body.error_description)
+                -- More forgeries within the interval cost no fetches.
+                for _ = 1, 5 do
+                    K.response._exit = nil
+                    assert.equals(401, access_with(token("aforo-v1"), JWKS_CONF).status)
+                end
+                assert.equals(2, #http_requests)
+            end)
+        end)
+
+        it("does not make requests wait after a failed cold fetch", function()
+            local slept = 0
+            local orig_sleep = ngx.sleep
+            ngx.sleep = function(sec) slept = slept + sec end
+            http_responses = { { err = "connection refused" } }
+            access_with(token("aforo-v1"), JWKS_CONF)   -- the fetch fails
+            for _ = 1, 3 do
+                K.response._exit = nil
+                assert.equals(401, access_with(token("aforo-v1"), JWKS_CONF).status)
+            end
+            ngx.sleep = orig_sleep
+            assert.equals(1, #http_requests)
+            assert.equals(0, slept)
+        end)
+
+        it("still waits for a cold fetch another request has in flight", function()
+            local key = "aforo:jwks:" .. URI
+            ngx.shared.aforo_buffer.store["aforo:jwks_fetch:" .. URI] = 1
+            ngx.shared.aforo_buffer.store["aforo:jwks_inflight:" .. URI] = true
+            local orig_sleep = ngx.sleep
+            ngx.sleep = function()             -- the other request's fetch lands meanwhile
+                ngx.shared.aforo_buffer.store["aforo:jwks_inflight:" .. URI] = nil
+                ngx.shared.aforo_buffer.store[key] = cjson.encode({ fetched_at = ngx.now(), count = 1,
+                    keys = { ["aforo-v1"] = cjson.encode({ kty = "RSA", kid = "aforo-v1", n = "n-aforo-v1", e = "AQAB" }) } })
+            end
+            local exit = access_with(token("aforo-v1"), JWKS_CONF)
+            ngx.sleep = orig_sleep
+            assert.is_nil(exit)
+            assert.equals(0, #http_requests)
+        end)
+
+        it("rejects a kid the JWKS does not have, even with jwt_allow_unverified_signature", function()
+            local OPEN = { jwt_validation_enabled = true, jwt_jwks_uri = URI, jwt_allow_unverified_signature = true }
+            http_responses = { jwks("aforo-v1", "aforo-v2") }
+            pkey_verify_result = false
+            assert.equals(401, access_with(token("aforo-v1"), OPEN).status)   -- forged, real kid
+            K.response._exit = nil
+            assert.equals(401, access_with(token("not-a-real-kid"), OPEN).status)
+            K.response._exit = nil
+            assert.equals(401, access_with(jwt(aforo_claims()), OPEN).status) -- no kid, two keys
+            -- JWKS unreachable: also a rejection, not "cannot verify".
+            reset()
+            http_responses = { { err = "connection refused" } }
+            assert.equals(401, access_with(token("aforo-v1"), OPEN).status)
+        end)
+
+        it("keeps jwt_allow_unverified_signature for a configuration with no key source", function()
+            assert.is_nil(access_with(token("any"), { jwt_validation_enabled = true,
+                jwt_allow_unverified_signature = true }))
+            assert.equals(0, #http_requests)
+        end)
+
         it("refreshes a stale set in the background, still verifying from the cache", function()
             http_responses = { jwks("aforo-v1") }
             access_with(token("aforo-v1"), JWKS_CONF)

@@ -244,6 +244,12 @@ end
 local JWKS_CACHE_PREFIX = "aforo:jwks:"
 local JWKS_FETCH_LOCK_PREFIX = "aforo:jwks_fetch:"
 local JWKS_REFRESH_LOCK_PREFIX = "aforo:jwks_refresh:"
+-- A fetch is running / the last fetch failed. Requests waiting on a cold
+-- cache wait only while one is running, and give up at once after a failure
+-- -- they used to sleep the full fetch timeout each, unable to tell the two
+-- apart (2026-10-13 fix).
+local JWKS_INFLIGHT_PREFIX = "aforo:jwks_inflight:"
+local JWKS_FAILED_PREFIX = "aforo:jwks_failed:"
 local JWKS_SOFT_TTL = 3600
 local JWKS_HARD_TTL = 86400
 local JWKS_REFETCH_INTERVAL = 30
@@ -323,6 +329,39 @@ local function refresh_jwks(premature, uri)
     end
 end
 
+-- Fetch the JWKS now and cache it, marking the fetch as running while it
+-- does and as failed (for JWKS_REFETCH_INTERVAL) when it does not work out.
+local function fetch_and_store(dict, uri)
+    dict:set(JWKS_INFLIGHT_PREFIX .. uri, true, JWKS_FETCH_TIMEOUT_MS / 1000 + 1)
+    local fresh, err = fetch_jwks(uri)
+    dict:delete(JWKS_INFLIGHT_PREFIX .. uri)
+    if not fresh then
+        dict:set(JWKS_FAILED_PREFIX .. uri, tostring(err), JWKS_REFETCH_INTERVAL)
+        return nil, err
+    end
+    dict:delete(JWKS_FAILED_PREFIX .. uri)
+    store_jwks(dict, uri, fresh)
+    return fresh
+end
+
+-- A token whose kid IS cached did not verify. The issuer may have replaced
+-- the key and kept the kid -- org-service generates a new key pair on every
+-- start and keeps kid "aforo-v1" -- in which case every new token failed
+-- until the cache's soft TTL ran out, an hour later (2026-10-13 fix). Refetch
+-- once, under the same lock as any other fetch (at most once per
+-- JWKS_REFETCH_INTERVAL, so bad signatures cannot drive fetches), and return
+-- the JWK for kid only if it changed. A failed refetch never accepts.
+local function jwks_refetch(uri, kid, old_jwk)
+    local dict = ngx.shared[BUFFER_DICT]
+    if not dict or not dict:add(JWKS_FETCH_LOCK_PREFIX .. uri, 1, JWKS_REFETCH_INTERVAL) then
+        return nil
+    end
+    local fresh = fetch_and_store(dict, uri)
+    local jwk = fresh and pick_jwk(fresh, kid)
+    if jwk and jwk ~= old_jwk then return jwk end
+    return nil
+end
+
 -- The JWK (JSON string) to verify a token with kid, or (nil, reason).
 local function jwks_key(uri, kid)
     local dict = ngx.shared[BUFFER_DICT]
@@ -345,24 +384,28 @@ local function jwks_key(uri, kid)
             return nil, "kid '" .. tostring(kid) .. "' is not in the cached JWKS, and it was "
                 .. "refetched less than " .. JWKS_REFETCH_INTERVAL .. "s ago"
         end
-        -- Cold cache, and another request is fetching it right now (just
-        -- after a restart, typically). Wait for that fetch rather than
-        -- refusing a valid token.
+        -- Cold cache. If a fetch is running (just after a restart, typically),
+        -- wait for it rather than refusing a valid token; if the last one
+        -- failed, answer now.
         for _ = 1, JWKS_FETCH_TIMEOUT_MS / 50 do
-            ngx.sleep(0.05)
-            entry = cached_jwks(dict, uri)
-            if entry then
-                jwk = pick_jwk(entry, kid)
-                if jwk then return jwk end
-                return nil, "kid '" .. tostring(kid) .. "' is not in the JWKS"
+            local failed = dict:get(JWKS_FAILED_PREFIX .. uri)
+            if failed then
+                return nil, "the last JWKS fetch failed (" .. tostring(failed) .. ")"
             end
+            if not dict:get(JWKS_INFLIGHT_PREFIX .. uri) then break end
+            ngx.sleep(0.05)
+        end
+        entry = cached_jwks(dict, uri)
+        if entry then
+            jwk = pick_jwk(entry, kid)
+            if jwk then return jwk end
+            return nil, "kid '" .. tostring(kid) .. "' is not in the JWKS"
         end
         return nil, "the JWKS has not been fetched yet"
     end
 
-    local fresh, err = fetch_jwks(uri)
+    local fresh, err = fetch_and_store(dict, uri)
     if not fresh then return nil, err end
-    store_jwks(dict, uri, fresh)
     jwk = pick_jwk(fresh, kid)
     if not jwk then
         return nil, "kid '" .. tostring(kid) .. "' is not in the JWKS"
@@ -417,9 +460,10 @@ end
 -- Key source (2026-10-12): jwt_public_key (a static PEM) when set, else the
 -- issuer's JWKS from jwt_jwks_uri, selected by the token's kid. jwt_jwks_uri
 -- used to be accepted and ignored, so a JWKS-only configuration rejected every
--- token. Neither set, or no usable key from the JWKS: the signature cannot be
--- verified, which jwt_allow_unverified_signature decides. A key that IS found
--- and does not verify the signature is always a rejection.
+-- token. jwt_allow_unverified_signature only decides when no key source is
+-- configured at all or resty.openssl cannot load; with a key source, a token
+-- that does not verify -- or that names a kid the JWKS does not have -- is
+-- always a rejection.
 local function verify_rs256_signature(token, conf, header)
     local allow_unverified = conf.jwt_allow_unverified_signature == true
     local pem = non_empty_string(conf.jwt_public_key)
@@ -466,21 +510,38 @@ local function verify_rs256_signature(token, conf, header)
             return false
         end
     else
+        -- With a JWKS configured, no key for the token is a rejection, never
+        -- jwt_allow_unverified_signature (2026-10-13 fix): the token picks
+        -- its own kid, so treating "no such key" as "cannot verify" let a
+        -- forged token choose to skip verification by naming a kid that does
+        -- not exist.
         local kid = claim_string(header and header.kid)
         local jwk, why = jwks_key(jwks_uri, kid)
         if not jwk then
             warn_throttled("jwks_key", 60,
-                "[aforo-metering] No JWKS key to verify a token (kid=", tostring(kid), ") from ",
-                jwks_uri, ": ", tostring(why), ". RS256 signature CANNOT be verified. ",
-                "Repeats suppressed for 60s.")
-            return allow_unverified
+                "[aforo-metering] JWT rejected: no JWKS key for it (kid=", tostring(kid), ") from ",
+                jwks_uri, ": ", tostring(why), ". Repeats suppressed for 60s.")
+            return false
         end
         pk, perr = jwk_to_pkey(pkey, jwk)
         if not pk then
             kong.log.err("[aforo-metering] JWKS key (kid=", tostring(kid), ") from ", jwks_uri,
                 " could not be loaded: ", tostring(perr))
-            return allow_unverified
+            return false
         end
+
+        local verified, verr = pk:verify(signature, signing_input, "sha256")
+        if verr then
+            kong.log.err("[aforo-metering] RS256 verification error: ", tostring(verr))
+            return false
+        end
+        if verified == true then return true end
+
+        -- Maybe the issuer replaced the key under the same kid: see jwks_refetch.
+        local fresh = jwks_refetch(jwks_uri, kid, jwk)
+        if not fresh then return false end
+        pk = jwk_to_pkey(pkey, fresh)
+        return pk ~= nil and pk:verify(signature, signing_input, "sha256") == true
     end
 
     local verified, verr = pk:verify(signature, signing_input, "sha256")

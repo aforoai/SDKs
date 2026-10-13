@@ -247,7 +247,7 @@ return {
                         jwt_allow_unverified_signature = {
                             type = "boolean",
                             default = false,
-                            description = "DANGEROUS. Accept JWTs whose RS256 signature could not be verified (no jwt_public_key or jwt_jwks_uri, or no JWKS key for the token's kid). A signature that fails verification is always rejected. Enable ONLY when signatures are verified upstream (Kong Enterprise JWT plugin, service mesh). Otherwise any caller can mint a token naming any customer_id.",
+                            description = "DANGEROUS. Accept JWTs without verifying the signature, only when no key is configured (neither jwt_public_key nor jwt_jwks_uri) or resty.openssl cannot load. With a key configured, a token that does not verify, or names a kid the JWKS lacks, is always rejected. Enable ONLY when signatures are verified upstream; otherwise any caller can mint a token naming any customer_id.",
                         },
                     },
                     -- Redis host/port/password are shared with rate-limit enforcement
