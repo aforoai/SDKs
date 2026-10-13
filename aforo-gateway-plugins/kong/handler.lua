@@ -1831,6 +1831,8 @@ AforoMeteringHandler._resolve_customer_id = resolve_customer_id
 AforoMeteringHandler._flush_buffer = event_buffer.flush
 AforoMeteringHandler._buffer_key = event_buffer.key
 AforoMeteringHandler._rearm = event_buffer._rearm
+AforoMeteringHandler._conf_ttl = event_buffer.CONF_TTL
+AforoMeteringHandler._max_event_age = event_buffer.MAX_EVENT_AGE_SECONDS
 AforoMeteringHandler._mappings_key = mappings_key
 
 return AforoMeteringHandler

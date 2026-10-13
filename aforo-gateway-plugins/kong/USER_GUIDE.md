@@ -304,7 +304,7 @@ A failure logs each attempt, then says what happened to the events. They are kep
 [aforo-metering] Delivery to https://api.aforo.ai/v1/ingest/batch failed. 1 event(s) re-buffered for retry on the next flush. Repeats suppressed for 60s.
 ```
 
-A 401, 403 or 404 means the key, its permission or `aforo_endpoint` is wrong, and the log says `The ingestor answered 401 ...`. The newest 500 events for that destination (none older than 72 hours) are kept; once you fix the key they go out with the new one.
+A 401, 403 or 404 means the key, its permission or `aforo_endpoint` is wrong, and the log says `The ingestor answered 401 ...`. The newest 500 events refused under that key are kept and retried with that same key, backing off to once every 5 minutes; they go out if the key works again, and are dropped after 72 hours. Events are never re-sent with a different key — see [Rotating the Aforo API key](#rotating-the-aforo-api-key).
 
 Then confirm the event under the matching customer + metric in your Aforo usage view. The metric name follows `metric_name_pattern` — by default `GET /my-service/anything`.
 
@@ -325,6 +325,16 @@ The log phase parses POST bodies (up to 1 MB). Each JSON-RPC `2.0` message with 
 - **Protocol messages are not billed.** `initialize`, `tools/list`, `ping` and notifications are MCP plumbing, so they are not metered. Set `config.mcp_meter_non_tool_calls=true` to meter them as plain API calls. Requests on the route that are not JSON-RPC are metered as usual.
 - On a route with `product_type: AI_AGENT`, the agent and session come from config and the upstream only, as described in [Metering an AI agent](#metering-an-ai-agent).
 
+## Rotating the Aforo API key
+
+Events are always delivered with the key they were buffered under; they never move to another key, tenant or endpoint. So rotate in this order:
+
+1. Create the new key in Aforo.
+2. Put it in the plugin's `config.api_key` in Kong. New events use it from then on; events already buffered under the old key are still sent with the old key, which still works.
+3. Wait a few `flush_interval_ms` (until the log shows no more flushes for the old key), then revoke the old key in Aforo.
+
+If the old key is revoked first, Aforo refuses the events still buffered under it. The plugin keeps the newest 500 of them under that key and retries them with it, backing off to once every 5 minutes. They are delivered if the old key works again, and dropped after 72 hours. Changing `tenant_id` or `aforo_endpoint` works the same way: events already buffered keep their original tenant and endpoint.
+
 ## Configuration reference
 
 See the full option table in [README.md](README.md#configuration). The three you must set: `aforo_endpoint`, `api_key`, `tenant_id`.
@@ -341,7 +351,7 @@ See the full option table in [README.md](README.md#configuration). The three you
 | 401 `INVALID_SIGNATURE`, log says `No JWKS key to verify a token` | `jwt_jwks_uri` unreachable from Kong, or the token's `kid` is not in the JWKS | Check that Kong can reach `jwt_jwks_uri` and that it serves the issuer's current key. |
 | Log says `Redis answered the JWT revocation lookup with an error (NOAUTH ...)` | The blocklist Redis needs a password | Set `jwt_redis_password`. Until then, revoked tokens are not rejected. |
 | `Delivery to … failed: N event(s) kept for retry` | Ingestor unreachable or returning 5xx | Check `aforo_endpoint` reachability and Aforo status. The events are retried every `flush_interval_ms`, up to 10,000 per buffer (fewer if the shared dict fills up first). A line that says `dropped` means events were lost: the buffer or the dict was full. |
-| `The ingestor answered 401` (or 403 / 404) | Wrong or revoked `api_key`, a key without `usage-events:ingest`, or a wrong `aforo_endpoint` | Fix the setting. Meanwhile the newest 500 events for that destination, none older than 72 hours, are kept; a new `api_key` on the same plugin takes them along. |
+| `The ingestor answered 401` (or 403 / 404) | Wrong or revoked `api_key`, a key without `usage-events:ingest`, or a wrong `aforo_endpoint` | Fix the setting. The newest 500 events refused under the old key stay with that key: they are delivered if it works again, and dropped after 72 hours. New events use the new setting. |
 | `Could not buffer an event: shared dict 'aforo_buffer' is full` | The ingestor has been failing for a while, or the dict is small for your traffic | Fix delivery first (see the other flush errors); raise `lua_shared_dict aforo_buffer` if it recurs with a healthy ingestor. |
 | `The ingestor rejected N of M event(s)` | Those events are invalid for Aforo (the log gives the reasons, e.g. an unknown metric) | Fix the metric mapping or the upstream header that produced them. They are not retried. |
 | Health-check requests show up as billed usage | Path not excluded | They shouldn't — `/health`, `/ready`, `/metrics` are excluded by default. Add yours to `exclude_paths`. |

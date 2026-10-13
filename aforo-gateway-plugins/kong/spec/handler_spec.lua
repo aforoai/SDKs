@@ -9,7 +9,7 @@ local function new_shared_dict()
     -- Memory is modelled for lists, as the real dict behaves: each element
     -- takes a slab slot, pushes fail with "no memory" when the dict is full
     -- (they evict nothing), and free_space() reports what is left.
-    local d = { store = {}, fail_push = false, cap = 10485760, used = 0 }
+    local d = { store = {}, exp = {}, fail_push = false, cap = 10485760, used = 0 }
     local function slot(v)
         local n = #v + 48
         if n > 2048 then return math.ceil(n / 4096) * 4096 end
@@ -17,20 +17,43 @@ local function new_shared_dict()
         while p < n do p = p * 2 end
         return p
     end
-    function d:get(k) return self.store[k] end
-    function d:set(k, v) self.store[k] = v; return true end
-    function d:add(k, v)
+    -- Expiry follows ngx.now(), so a test can move time forward.
+    local function expired(self, k)
+        local e = self.exp[k]
+        if e and ngx.now() >= e then self.store[k] = nil; self.exp[k] = nil; return true end
+        return false
+    end
+    function d:get(k) expired(self, k); return self.store[k] end
+    function d:set(k, v, ttl)
+        self.store[k] = v
+        self.exp[k] = (ttl and ttl > 0) and (ngx.now() + ttl) or nil
+        return true
+    end
+    function d:add(k, v, ttl)
+        expired(self, k)
         if self.store[k] ~= nil then return false, "exists" end
-        self.store[k] = v; return true
+        return self:set(k, v, ttl)
     end
     d.safe_set = d.set
     d.safe_add = d.add
+    function d:ttl(k)
+        expired(self, k)
+        if self.store[k] == nil then return nil, "not found" end
+        return self.exp[k] and (self.exp[k] - ngx.now()) or 0
+    end
+    function d:expire(k, ttl)
+        expired(self, k)
+        if self.store[k] == nil then return nil, "not found" end
+        self.exp[k] = (ttl and ttl > 0) and (ngx.now() + ttl) or nil
+        return true
+    end
     function d:delete(k)
         local v = self.store[k]
         if type(v) == "table" and v.__list then
             for _, e in ipairs(v) do self.used = self.used - slot(e) end
         end
         self.store[k] = nil
+        self.exp[k] = nil
     end
     local function list(self, k, create)
         local v = self.store[k]
@@ -812,44 +835,178 @@ describe("aforo-metering handler", function()
         end)
 
         -- ── review 2: delivery ──────────────────────────────────
-        it("moves an instance's events kept on 401 to its rotated api_key, and stops using the old one", function()
-            local old = conf({ api_key = "sk_revoked", __plugin_id = "plugin-1" })
-            log(old, "c1"); log(old, "c2")
-            http_mock.responses = { { status = 401 } }
-            handler._flush_buffer(false, old)        -- 401: kept
-            -- The operator rotates the key of the same plugin instance.
-            local new = conf({ api_key = "sk_rotated", __plugin_id = "plugin-1" })
-            log(new, "c3")
-            for _, t in ipairs(ngx.timers) do run(t) end   -- every pending timer, stale ones included
-            local keys = {}
-            for _, r in ipairs(http_mock.requests) do keys[#keys + 1] = r.params.headers["X-API-Key"] end
-            assert.same({ "sk_revoked", "sk_rotated" }, keys)
-            local ids = {}
-            for _, e in ipairs(sent(2)) do ids[#ids + 1] = e.customerId end
-            assert.same({ "c1", "c2", "c3" }, ids)   -- the old events first, in order
-            assert.equals(0, #buffered(old))
-            assert.equals(0, #buffered(new))
-            assert.is_nil(dict:get(handler._buffer_key(old) .. ":conf"))  -- the old buffer is retired
+        -- ── review 4: buffers never move; one key, one buffer ─────
+        local function keys_used()
+            local out = {}
+            for i, r in ipairs(http_mock.requests) do
+                local ids = {}
+                for _, e in ipairs(sent(i)) do ids[#ids + 1] = e.customerId end
+                out[#out + 1] = r.params.headers["X-API-Key"] .. ":" .. table.concat(ids, ",")
+            end
+            return out
+        end
+
+        it("delivers two instances with different keys each with its own key", function()
+            local A = conf({ api_key = "sk_a", __plugin_id = "plugin-A" })
+            local B = conf({ api_key = "sk_b", __plugin_id = "plugin-B" })
+            log(A, "a1"); log(B, "b1"); log(A, "a2")
+            for _, t in ipairs(ngx.timers) do run(t) end
+            table.sort(http_mock.requests, function(x, y) return x.params.headers["X-API-Key"] < y.params.headers["X-API-Key"] end)
+            assert.same({ "sk_a:a1,a2", "sk_b:b1" }, keys_used())
         end)
 
-        it("never moves another instance's events on a rotation", function()
-            local A = conf({ api_key = "sk_shared", __plugin_id = "plugin-A" })
-            local B = conf({ api_key = "sk_shared", __plugin_id = "plugin-B" })
-            log(A, "a1"); log(B, "b1")
-            log(conf({ api_key = "sk_new", __plugin_id = "plugin-A" }), "a2")   -- A rotates
-            assert.equals(1, #buffered(B))
-            assert.equals("b1", buffered(B)[1].customerId)
-            local moved = buffered(conf({ api_key = "sk_new", __plugin_id = "plugin-A" }))
-            assert.equals(2, #moved)
-        end)
-
-        it("sends a push from a worker still on the old settings to the new buffer", function()
+        it("keeps events refused under the old key with that key after a rotation; new ones use the new key", function()
             local old = conf({ api_key = "sk_old", __plugin_id = "plugin-1" })
             local new = conf({ api_key = "sk_new", __plugin_id = "plugin-1" })
-            log(old, "c1"); log(new, "c2")
-            log(old, "c3")                           -- a worker that has not reloaded yet
+            log(old, "o1"); log(old, "o2")
+            http_mock.responses = { { status = 401 } }
+            handler._flush_buffer(false, old)                -- refused: held under sk_old
+            log(new, "n1")                                    -- the rotated config
+            http_mock.requests = {}
+            http_mock.responses = { { status = 202 }, { status = 401 } }
+            handler._flush_buffer(false, new)
+            handler._flush_buffer(false, old)
+            assert.same({ "sk_new:n1", "sk_old:o1,o2" }, keys_used())   -- never crossed
+            assert.equals(2, #buffered(old))                  -- still waiting for sk_old
+            -- If the old key works again, they go out with it.
+            http_mock.responses = { { status = 202 } }
+            handler._flush_buffer(false, old)
             assert.equals(0, #buffered(old))
-            assert.equals(3, #buffered(new))
+            assert.equals("sk_old", http_mock.requests[#http_mock.requests].params.headers["X-API-Key"])
+        end)
+
+        it("never moves buffered events when tenant_id or aforo_endpoint changes", function()
+            local stg = conf({ api_key = "sk_stg", tenant_id = "tenant-staging",
+                               aforo_endpoint = "http://staging/v1/ingest/batch", __plugin_id = "plugin-1" })
+            local prd = conf({ api_key = "sk_prd", tenant_id = "tenant-prod",
+                               aforo_endpoint = "http://prod/v1/ingest/batch", __plugin_id = "plugin-1" })
+            log(stg, "s1"); log(prd, "p1")
+            handler._flush_buffer(false, prd)
+            assert.equals(1, #http_mock.requests)
+            assert.equals("http://prod/v1/ingest/batch", http_mock.requests[1].url)
+            assert.same({ "sk_prd:p1" }, keys_used())
+            assert.equals(1, #buffered(stg))
+        end)
+
+        it("does not grow the registry across reloads that give the plugin a new id", function()
+            for i = 1, 11 do
+                log(conf({ api_key = "sk_a", __plugin_id = "random-id-" .. i }), "c" .. i)
+            end
+            assert.equals(1, #cjson.decode(dict:get("aforo:destinations")))
+            assert.equals(11, #buffered(conf({ api_key = "sk_a" })))
+        end)
+
+        it("prunes empty buffers whose settings expired from the registry", function()
+            local A = conf({ api_key = "sk_a" })
+            local B = conf({ api_key = "sk_b" })
+            log(A, "a1"); log(B, "b1")
+            handler._flush_buffer(false, A)                  -- A is empty now
+            dict:delete(handler._buffer_key(A) .. ":conf")   -- and its settings expired
+            handler._rearm(false)
+            local reg = cjson.decode(dict:get("aforo:destinations"))
+            assert.same({ handler._buffer_key(B) }, reg)
+        end)
+
+        it("backs off a refused destination exponentially, at most 5 minutes, and resets on a 2xx", function()
+            local c = conf({ flush_interval_ms = 5000 })
+            local k = handler._buffer_key(c)
+            log(c, "c1")
+            local delays = {}
+            for _ = 1, 8 do
+                ngx.timers = {}
+                http_mock.responses = { { status = 401 } }
+                dict:delete(k .. ":pending")
+                handler._flush_buffer(false, c)
+                delays[#delays + 1] = ngx.timers[#ngx.timers].delay
+            end
+            assert.same({ 10, 20, 40, 80, 160, 300, 300, 300 }, delays)
+            ngx.timers = {}
+            http_mock.responses = { { status = 202 } }
+            log(c, "c2"); dict:delete(k .. ":pending")
+            handler._flush_buffer(false, c)
+            assert.is_nil(dict:get(k .. ":held_n"))
+            log(c, "c3")
+            assert.equals(5, ngx.timers[#ngx.timers].delay)
+        end)
+
+        it("marks a destination failing at its first failed attempt, until a 2xx", function()
+            local c = conf()
+            local k = handler._buffer_key(c)
+            log(c, "c1")
+            local seen
+            http_mock.responses = { { status = 503 }, { status = 503 }, { status = 503 } }
+            http_mock.on_request = function(n) if n == 2 then seen = dict:get(k .. ":failing") end end
+            handler._flush_buffer(false, c)
+            assert.is_true(seen, "not marked failing before the retries were over")
+            assert.is_true(dict:ttl(k .. ":failing") >= 480)
+            http_mock.on_request = nil
+            http_mock.responses = { { status = 202 } }
+            handler._flush_buffer(false, c)
+            assert.is_nil(dict:get(k .. ":failing"))
+        end)
+
+        it("never refuses a healthy destination while a failing one has events to give up", function()
+            dict.cap = 128 * 1024
+            local Y = conf({ api_key = "sk_y", flush_count = 100000 })
+            local X = conf({ api_key = "sk_x", flush_count = 100000 })
+            while dict:free_space() > 600 do log(Y, "y") end
+            dict:set(handler._buffer_key(Y) .. ":failing", true)
+            local refused, pushed = 0, 0
+            local i = 0
+            while #buffered(Y) > 0 do                       -- while Y has anything to give up
+                i = i + 1
+                local before = #buffered(X)
+                log(X, "x" .. i)
+                pushed = pushed + 1
+                if #buffered(X) == before then refused = refused + 1 end
+            end
+            assert.is_true(pushed > 100)
+            assert.equals(0, refused)
+        end)
+
+        it("reports exactly how many events a re-buffer kept and dropped", function()
+            dict.cap = 96 * 1024
+            local c = conf({ flush_count = 100000 })
+            for i = 1, 40 do log(c, "old" .. i) end
+            local errs = {}
+            local orig = mock_kong.log.err
+            mock_kong.log.err = function(...) errs[#errs + 1] = table.concat({ ... }) end
+            http_mock.responses = { { status = 503 }, { status = 503 }, { status = 503 } }
+            http_mock.on_request = function(n)
+                if n == 1 then while dict:free_space() > 300 do log(c, "new") end end
+            end
+            local before_new
+            handler._flush_buffer(false, c)
+            mock_kong.log.err = orig
+            local left = buffered(c)
+            local old_left, new_left = 0, 0
+            for _, e in ipairs(left) do if e.customerId:find("^old") then old_left = old_left + 1 else new_left = new_left + 1 end end
+            local line
+            for _, l in ipairs(errs) do if l:find("put back", 1, true) then line = l end end
+            assert.is_not_nil(line)
+            local kept = tonumber(line:match("(%d+) of 40 event%(s%) put back"))
+            assert.equals(old_left, kept)
+        end)
+
+        it("never strands events: settings outlive every event, and expired events are dropped with a log", function()
+            assert.is_true(handler._conf_ttl > handler._max_event_age + 3600)
+            local now0 = ngx.now()
+            local orig_now = ngx.now
+            local c = conf()
+            log(c, "c1")
+            local errs = {}
+            local orig_err = mock_kong.log.err
+            mock_kong.log.err = function(...) errs[#errs + 1] = table.concat({ ... }) end
+            -- 72 h and a minute later, with no traffic in between:
+            ngx.now = function() return now0 + handler._max_event_age + 60 end
+            assert.is_not_nil(dict:get(handler._buffer_key(c) .. ":conf"))   -- settings still there
+            run(table.remove(ngx.timers, 1))
+            ngx.now, mock_kong.log.err = orig_now, orig_err
+            assert.equals(0, #http_mock.requests)                  -- nothing the ingestor would refuse
+            assert.equals(0, #buffered(c))
+            local said = false
+            for _, l in ipairs(errs) do if l:find("older than 72 hours", 1, true) then said = true end end
+            assert.is_true(said)
         end)
 
         it("re-arms a timed flush after a worker exit (reload)", function()

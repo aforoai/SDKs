@@ -63,6 +63,8 @@ local function new_dict()
     function d:free_space() return 10485760 end
     d.safe_set = d.set
     d.safe_add = d.add
+    function d:ttl(k) if self.store[k] == nil then return nil, "not found" end return 0 end
+    function d:expire(k) return self.store[k] ~= nil end
     return d
 end
 
