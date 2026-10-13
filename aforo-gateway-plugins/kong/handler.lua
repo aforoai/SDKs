@@ -1185,28 +1185,33 @@ local function upstream_identity(header, max)
     return v
 end
 
--- Returns agent_id, session_id -- or nil, nil, <header name> when the
--- upstream sent that header with a value that cannot be used.
+-- Returns agent_id, session_id, bad_agent_header, bad_session_header.
+-- A bad_* is the name of a header the upstream sent with a value that cannot
+-- be used; the matching value is then nil -- never a fallback -- and the
+-- other one is still resolved, so a caller that does not need the bad one
+-- can go on (2026-10-13 fix: one bad header used to void both).
 local function resolve_ai_agent_identity(conf, request_key)
-    local agent_id, session_id
+    local agent_id, session_id, bad_agent, bad_session
 
     local agent_header = non_empty_string(conf.agent_id_header)
     if agent_header then
         local v, bad = upstream_identity(agent_header, IDENTITY_LIMITS.agentId)
-        if bad then return nil, nil, agent_header end
-        agent_id = v
+        if bad then bad_agent = agent_header else agent_id = v end
     end
-    agent_id = agent_id or non_empty_string(conf.agent_id)
+    if not bad_agent then
+        agent_id = agent_id or non_empty_string(conf.agent_id)
+    end
 
     local session_header = non_empty_string(conf.session_id_header)
     if session_header then
         local v, bad = upstream_identity(session_header, IDENTITY_LIMITS.sessionId)
-        if bad then return nil, nil, session_header end
-        session_id = v
+        if bad then bad_session = session_header else session_id = v end
     end
-    session_id = session_id or request_key
+    if not bad_session then
+        session_id = session_id or request_key
+    end
 
-    return agent_id, session_id
+    return agent_id, session_id, bad_agent, bad_session
 end
 
 -- resolve_customer_id
@@ -1611,9 +1616,9 @@ function AforoMeteringHandler:log(conf)
         -- Kong's own request ID, so it doubles as the per-request session
         -- fallback.
         if product_type == "AI_AGENT" then
-            local bad
-            event.agentId, event.sessionId, bad = resolve_ai_agent_identity(conf, request_id)
-            if bad then return nil, bad end
+            local bad_agent, bad_session
+            event.agentId, event.sessionId, bad_agent, bad_session = resolve_ai_agent_identity(conf, request_id)
+            if bad_agent or bad_session then return nil, bad_agent or bad_session end
         end
         return event
     end
@@ -1629,16 +1634,21 @@ function AforoMeteringHandler:log(conf)
         -- conf.agent_id -- never the X-Agent-Id request header, which is the
         -- client's to set (documented as unread since 2.0.0, and still read
         -- here until 2026-10-12).
-        local trusted_agent, trusted_session, bad = resolve_ai_agent_identity(conf, request_id)
-        -- An unusable agent/session header matters wherever it would be used:
-        -- always on an AI_AGENT route; elsewhere only the agent header, and
-        -- only for a call without _meta.agent_id.
-        if bad and product_type == "AI_AGENT" then return skip_unusable(bad) end
+        local trusted_agent, trusted_session, bad_agent, bad_session =
+            resolve_ai_agent_identity(conf, request_id)
+        -- An unusable header matters only where its value would be used: on
+        -- an AI_AGENT route both are, for every call; elsewhere the session
+        -- header is not used at all, and the agent header only by a call
+        -- without its own _meta.agent_id -- only those calls are skipped.
+        if product_type == "AI_AGENT" and (bad_agent or bad_session) then
+            return skip_unusable(bad_agent or bad_session)
+        end
         local mcp_session = clean_string(kong.request.get_header("Mcp-Session-Id"), IDENTITY_LIMITS.sessionId)
-        for i, call in ipairs(jsonrpc.calls) do
-            if bad and bad == conf.agent_id_header and not call.agent_id then
-                return skip_unusable(bad)
-            end
+        for _, call in ipairs(jsonrpc.calls) do
+          if bad_agent and not call.agent_id then
+            skip_unusable(bad_agent)
+          else
+            local i = #events + 1
             local event = { productType = product_type, customerId = customer_id }
             event.metricName     = metric
             event.quantity       = 1
@@ -1661,6 +1671,7 @@ function AforoMeteringHandler:log(conf)
                 event.productType = "MCP_SERVER"
             end
             events[i] = event
+          end
         end
         -- A mixed JSON-RPC batch with mcp_meter_non_tool_calls: its other
         -- messages are metered too, as one plain API call -- as they would be

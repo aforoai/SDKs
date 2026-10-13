@@ -1291,6 +1291,27 @@ describe("aforo-metering handler", function()
             log(c, { method = "POST", body = stash })
             assert.equals("big_tool", buffered(c)[1].toolName)
         end)
+        it("R5a: an unusable session header (unused off AI_AGENT) does not strip the MCP agent", function()
+            local c = conf({ mcp_enabled = true, agent_id = "agent-x" })      -- product_type API
+            log(c, { method = "POST", body = tool_call("search"),
+                     response = { ["X-Aforo-Session-Id"] = string.rep("s", 65) } })
+            local e = buffered(c)[1]
+            assert.is_not_nil(e)
+            assert.equals("agent-x", e.agentId)
+            assert.equals("MCP_SERVER", e.productType)
+        end)
+
+        it("R5b: an unusable agent header skips only the tool calls that would use it", function()
+            local c = conf({ mcp_enabled = true })
+            local body = cjson.encode({
+                { jsonrpc = "2.0", id = 1, method = "tools/call", params = { name = "own", _meta = { agent_id = "a1" } } },
+                { jsonrpc = "2.0", id = 2, method = "tools/call", params = { name = "needs_header" } },
+            })
+            log(c, { method = "POST", body = body, response = { ["X-Aforo-Agent-Id"] = string.rep("a", 37) } })
+            local evs = buffered(c)
+            assert.equals(1, #evs)
+            assert.equals("own", evs[1].toolName)
+        end)
     end)
     -- ── productType ─────────────────────────────────────────────
     describe("product_type", function()
