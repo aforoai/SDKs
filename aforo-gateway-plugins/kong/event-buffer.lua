@@ -583,16 +583,21 @@ local function drain(dict, bkey, settings)
             -- taken off the buffer before the first attempt, so an ingestor
             -- outage outlasting the retries used to destroy the only copy of
             -- them: unbilled usage, no dead-letter, nothing to reconstruct from.
+            -- Once a minute per destination: a refused or failing destination
+            -- is retried every flush_interval_ms, and one line per retry
+            -- buried everything else in the log.
             local dropped = rebuffer(dict, bkey, keep, ctx.held)
             if ctx.held then
-                kong.log.err("[aforo-metering] Delivery refused; ", #keep - dropped,
-                    " event(s) kept for this destination", dropped > 0 and (", " .. dropped ..
-                    " dropped (over " .. HELD_MAX_EVENTS .. " events or older than 72 h)") or "", ".")
+                log_throttled("err", "held_" .. bkey, 60, "[aforo-metering] Delivery refused for ",
+                    settings.aforo_endpoint, "; ", #keep - dropped, " event(s) kept", dropped > 0
+                    and (", " .. dropped .. " dropped (over " .. HELD_MAX_EVENTS .. " events or older than 72 h)")
+                    or "", ". Repeats suppressed for 60s.")
             elseif ctx.failed then
-                kong.log.err("[aforo-metering] Delivery failed. ", #keep - dropped,
+                log_throttled("err", "failed_" .. bkey, 60, "[aforo-metering] Delivery to ",
+                    settings.aforo_endpoint, " failed. ", #keep - dropped,
                     " event(s) re-buffered for retry on the next flush",
                     dropped > 0 and (", " .. dropped .. " dropped: the buffer or the shared dict is full") or "",
-                    ".")
+                    ". Repeats suppressed for 60s.")
             end
         end
 
