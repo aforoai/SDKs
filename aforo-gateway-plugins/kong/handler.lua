@@ -665,29 +665,109 @@ local function should_exclude_status(status, exclude_status_codes)
     return false
 end
 
--- A header or body value forwarded into an event (2026-10-12 fix): kept only
--- when it is a string of printable ASCII no longer than max, else dropped. A
--- repeated header arrives as a table (the first value is used). This matters
--- because one bad value used to cost the whole batch: a non-UTF-8 byte in a
--- traceparent made the ingestor unable to read the request at all (Jackson
--- answers 400), and every event batched with it went down too.
+-- ── Text hygiene ────────────────────────────────────────────
+--
+-- What keeps a batch readable is valid JSON, and cjson emits a Lua string's
+-- bytes as they are: one malformed UTF-8 sequence in any event (a client's
+-- header, a path) made the ingestor unable to read the whole request
+-- (Jackson answers 400), and every event batched with it went down too. So
+-- every string an event carries must be well-formed UTF-8. Valid Unicode is
+-- legitimate and passes through unchanged -- a path, a tool name or a
+-- customer id may well be "café".
+--
+-- Lengths are counted the way the ingestor counts them: Java's
+-- String.length(), i.e. UTF-16 code units (@Size, and the Postgres VARCHAR
+-- behind it, count characters, not bytes). A 4-byte UTF-8 character is 2.
+
+-- The character at byte i of s, if it is well-formed UTF-8: its length in
+-- bytes, and in UTF-16 code units. nil for a malformed, overlong or
+-- surrogate sequence.
+local function utf8_char(s, i)
+    local c = string.byte(s, i)
+    if c < 0x80 then return 1, 1 end
+    if c >= 0xC2 and c <= 0xDF then
+        local c2 = string.byte(s, i + 1)
+        if c2 and c2 >= 0x80 and c2 <= 0xBF then return 2, 1 end
+        return nil
+    end
+    if c >= 0xE0 and c <= 0xEF then
+        local c2, c3 = string.byte(s, i + 1, i + 2)
+        if not c3 or c2 < 0x80 or c2 > 0xBF or c3 < 0x80 or c3 > 0xBF then return nil end
+        if (c == 0xE0 and c2 < 0xA0) or (c == 0xED and c2 > 0x9F) then return nil end
+        return 3, 1
+    end
+    if c >= 0xF0 and c <= 0xF4 then
+        local c2, c3, c4 = string.byte(s, i + 1, i + 3)
+        if not c4 or c2 < 0x80 or c2 > 0xBF or c3 < 0x80 or c3 > 0xBF
+            or c4 < 0x80 or c4 > 0xBF then return nil end
+        if (c == 0xF0 and c2 < 0x90) or (c == 0xF4 and c2 > 0x8F) then return nil end
+        return 4, 2
+    end
+    return nil
+end
+
+local function is_control(c)
+    return c < 0x20 or c == 0x7F
+end
+
+-- s's length in UTF-16 code units when it is well-formed UTF-8 -- and, unless
+-- allow_control, free of control characters -- else nil.
+local function text_length(s, allow_control)
+    local i, n, len = 1, #s, 0
+    while i <= n do
+        if not allow_control and is_control(string.byte(s, i)) then return nil end
+        local bytes, units = utf8_char(s, i)
+        if not bytes then return nil end
+        i = i + bytes
+        len = len + units
+    end
+    return len
+end
+
+-- A header or body value copied into an event: kept only when it is
+-- well-formed UTF-8 text without control characters and at most max
+-- characters, else dropped. A repeated header arrives as a table (the first
+-- value is used).
 local function clean_string(v, max)
     if type(v) == "table" then v = v[1] end
-    if type(v) ~= "string" or v == "" or #v > max then return nil end
-    if string.find(v, "[^\32-\126]") then return nil end
+    if type(v) ~= "string" or v == "" then return nil end
+    local len = text_length(v)
+    if not len or len > max then return nil end
     return v
 end
 
 -- A value that must stay on the event whatever the client sent -- the request
 -- path, an MCP tool name: dropping it would let a client opt out of metering.
--- Anything that is not printable ASCII is percent-encoded instead (Kong hands
--- the path over decoded, so it can hold raw bytes), then it is cut to max.
+-- Valid UTF-8 is kept as it is; only malformed bytes and control characters
+-- are percent-encoded (Kong hands the path over decoded, so it can hold raw
+-- bytes). Then it is cut to max characters, at a character boundary.
 local function escaped_string(v, max)
     if type(v) == "table" then v = v[1] end
     if type(v) ~= "string" then return nil end
-    v = string.gsub(v, "[^\33-\126]", function(c) return string.format("%%%02X", string.byte(c)) end)
-    if #v > max then v = string.sub(v, 1, max) end
-    return v
+    local out, len, i, n = {}, 0, 1, #v
+    while i <= n do
+        local c = string.byte(v, i)
+        local bytes, units
+        if not is_control(c) then bytes, units = utf8_char(v, i) end
+        local piece
+        if bytes then
+            piece = string.sub(v, i, i + bytes - 1)
+        else
+            piece, bytes, units = string.format("%%%02X", c), 1, 3
+        end
+        if len + units > max then break end
+        out[#out + 1] = piece
+        len = len + units
+        i = i + bytes
+    end
+    return table.concat(out)
+end
+
+-- A value for event metadata (names Kong holds: service, route, consumer):
+-- kept when it is valid text, else left out.
+local function text_or_nil(v)
+    if type(v) == "string" and text_length(v, true) then return v end
+    return nil
 end
 
 -- quantity as the ingestor stores it: @Digits(integer = 14, fraction = 6).
@@ -706,11 +786,20 @@ local IDENTITY_LIMITS = {
     agentId = 36, sessionId = 64, productType = 20, traceId = 128,
 }
 
-local function over_limit(event)
+-- The first identity field the ingestor would refuse, and why -- or nil.
+-- Counted in characters (see text_length); control characters are allowed
+-- here, since cjson escapes them and they are someone's actual identifier.
+local function identity_problem(event)
     for field, max in pairs(IDENTITY_LIMITS) do
         local v = event[field]
-        if type(v) == "string" and #v > max then
-            return field, max
+        if type(v) == "string" then
+            local len = text_length(v, true)
+            if not len then
+                return field, "is not valid UTF-8 text"
+            end
+            if len > max then
+                return field, "is longer than the ingestor's " .. max .. "-character limit"
+            end
         end
     end
     return nil
@@ -995,18 +1084,40 @@ end
 --              header) -- so without the header, one request is one session
 -- agentId may come back nil; the required-field check in the log phase
 -- refuses the event and says how to supply it.
+-- An upstream response header that names who or what is billed. Returns
+-- (value) when usable, (nil) when absent, and (nil, true) when it is present
+-- but unusable -- malformed text, a control character, or longer than the
+-- ingestor allows. The caller must then skip the event, not fall back
+-- (2026-10-12 fix): falling back used to bill an agent's usage to
+-- config.agent_id, a multi-request session as one-off requests, and a
+-- metric the backend named to default_metric -- quietly, to the wrong thing.
+local function upstream_identity(header, max)
+    local raw = kong.response.get_header(header)
+    if type(raw) == "table" then raw = raw[1] end
+    if raw == nil or raw == "" then return nil end
+    local v = clean_string(raw, max)
+    if not v then return nil, true end
+    return v
+end
+
+-- Returns agent_id, session_id -- or nil, nil, <header name> when the
+-- upstream sent that header with a value that cannot be used.
 local function resolve_ai_agent_identity(conf, request_key)
     local agent_id, session_id
 
     local agent_header = non_empty_string(conf.agent_id_header)
     if agent_header then
-        agent_id = clean_string(kong.response.get_header(agent_header), IDENTITY_LIMITS.agentId)
+        local v, bad = upstream_identity(agent_header, IDENTITY_LIMITS.agentId)
+        if bad then return nil, nil, agent_header end
+        agent_id = v
     end
     agent_id = agent_id or non_empty_string(conf.agent_id)
 
     local session_header = non_empty_string(conf.session_id_header)
     if session_header then
-        session_id = clean_string(kong.response.get_header(session_header), IDENTITY_LIMITS.sessionId)
+        local v, bad = upstream_identity(session_header, IDENTITY_LIMITS.sessionId)
+        if bad then return nil, nil, session_header end
+        session_id = v
     end
     session_id = session_id or request_key
 
@@ -1094,7 +1205,8 @@ local MCP_TOOL_METRIC = "mcp_server.tool_invocations"
 local MCP_MAX_BODY_BYTES = 1048576
 
 -- Parse a request body as JSON-RPC (2026-10-12 rewrite). Returns nil when it
--- is not JSON-RPC at all, else { calls = { {tool_name, agent_id}, ... } } --
+-- is not JSON-RPC at all, else { calls = { {tool_name, agent_id}, ... },
+-- other = <number of messages that are not tools/call> } --
 -- one entry per tools/call, also inside a JSON-RPC batch (an array), which
 -- used to be read as no tool call at all.
 --
@@ -1117,11 +1229,13 @@ local function parse_jsonrpc(raw_body)
         return nil
     end
 
-    local calls, jsonrpc = {}, false
+    local calls, other, jsonrpc = {}, 0, false
     for _, msg in ipairs(messages) do
         if type(msg) == "table" and msg.jsonrpc == "2.0" then
             jsonrpc = true
-            if msg.method == "tools/call" then
+            if msg.method ~= "tools/call" then
+                other = other + 1
+            else
                 local params = type(msg.params) == "table" and msg.params or {}
                 local meta = type(params._meta) == "table" and params._meta or {}
                 calls[#calls + 1] = {
@@ -1133,7 +1247,7 @@ local function parse_jsonrpc(raw_body)
         end
     end
     if not jsonrpc then return nil end
-    return { calls = calls }
+    return { calls = calls, other = other }
 end
 
 -- A request body larger than client_body_buffer_size is spooled to a temp
@@ -1364,11 +1478,23 @@ function AforoMeteringHandler:log(conf)
     -- productType on every event (conf.product_type, default "API").
     local product_type = normalize_product_type(conf.product_type)
 
+    -- An upstream identity header that is present but unusable: the event is
+    -- not metered, rather than billed under a different identity.
+    local function skip_unusable(header)
+        warn_throttled("unusable_" .. header, 60, "[aforo-metering] Skipping events: the upstream ",
+            "sent ", header, " with a value that cannot be used (not valid UTF-8 text, a control ",
+            "character, or longer than the ingestor allows), e.g. ", method, " ", path, ". Not ",
+            "metered, rather than billed to a different ", header, ". Repeats suppressed for 60s.")
+    end
+
     -- Upstream-supplied overrides, read from the response so a client cannot
     -- forge them.
-    local header_metric = conf.metric_header and conf.metric_header ~= ""
-        and clean_string(kong.response.get_header(conf.metric_header), IDENTITY_LIMITS.metricName)
-        or nil
+    local header_metric
+    if conf.metric_header and conf.metric_header ~= "" then
+        local bad
+        header_metric, bad = upstream_identity(conf.metric_header, IDENTITY_LIMITS.metricName)
+        if bad then return skip_unusable(conf.metric_header) end
+    end
 
     -- MCP: JSON-RPC on an mcp_enabled route.
     local jsonrpc = nil
@@ -1386,6 +1512,27 @@ function AforoMeteringHandler:log(conf)
         return
     end
 
+    local function api_event()
+        local header_quantity = conf.quantity_header and conf.quantity_header ~= ""
+            and kong.response.get_header(conf.quantity_header) or nil
+        local event = { productType = product_type, customerId = customer_id }
+        event.metricName     = resolve_metric_name(conf, method, path, service_name,
+                                                   route_name, consumer_name, header_metric)
+        event.quantity       = resolve_quantity(conf, response_size, header_quantity)
+        event.idempotencyKey = request_id
+        event.occurredAt     = iso8601_utc(ngx.now())
+        -- AI_AGENT only. Other types do not define these fields, so they are
+        -- left off rather than sent on every API call. The idempotency key is
+        -- Kong's own request ID, so it doubles as the per-request session
+        -- fallback.
+        if product_type == "AI_AGENT" then
+            local bad
+            event.agentId, event.sessionId, bad = resolve_ai_agent_identity(conf, request_id)
+            if bad then return nil, bad end
+        end
+        return event
+    end
+
     local events = {}
     if jsonrpc and #jsonrpc.calls > 0 then
         -- One event per tools/call: a JSON-RPC batch carries several.
@@ -1397,9 +1544,16 @@ function AforoMeteringHandler:log(conf)
         -- conf.agent_id -- never the X-Agent-Id request header, which is the
         -- client's to set (documented as unread since 2.0.0, and still read
         -- here until 2026-10-12).
-        local trusted_agent, trusted_session = resolve_ai_agent_identity(conf, request_id)
+        local trusted_agent, trusted_session, bad = resolve_ai_agent_identity(conf, request_id)
+        -- An unusable agent/session header matters wherever it would be used:
+        -- always on an AI_AGENT route; elsewhere only the agent header, and
+        -- only for a call without _meta.agent_id.
+        if bad and product_type == "AI_AGENT" then return skip_unusable(bad) end
         local mcp_session = clean_string(kong.request.get_header("Mcp-Session-Id"), IDENTITY_LIMITS.sessionId)
         for i, call in ipairs(jsonrpc.calls) do
+            if bad and bad == conf.agent_id_header and not call.agent_id then
+                return skip_unusable(bad)
+            end
             local event = { productType = product_type, customerId = customer_id }
             event.metricName     = metric
             event.quantity       = 1
@@ -1423,22 +1577,17 @@ function AforoMeteringHandler:log(conf)
             end
             events[i] = event
         end
-    else
-        local header_quantity = conf.quantity_header and conf.quantity_header ~= ""
-            and kong.response.get_header(conf.quantity_header) or nil
-        local event = { productType = product_type, customerId = customer_id }
-        event.metricName     = resolve_metric_name(conf, method, path, service_name,
-                                                   route_name, consumer_name, header_metric)
-        event.quantity       = resolve_quantity(conf, response_size, header_quantity)
-        event.idempotencyKey = request_id
-        event.occurredAt     = iso8601_utc(ngx.now())
-        -- AI_AGENT only. Other types do not define these fields, so they are
-        -- left off rather than sent on every API call. The idempotency key is
-        -- Kong's own request ID, so it doubles as the per-request session
-        -- fallback.
-        if product_type == "AI_AGENT" then
-            event.agentId, event.sessionId = resolve_ai_agent_identity(conf, request_id)
+        -- A mixed JSON-RPC batch with mcp_meter_non_tool_calls: its other
+        -- messages are metered too, as one plain API call -- as they would be
+        -- on their own.
+        if jsonrpc.other > 0 and conf.mcp_meter_non_tool_calls then
+            local event, unusable = api_event()
+            if not event then return skip_unusable(unusable) end
+            events[#events + 1] = event
         end
+    else
+        local event, unusable = api_event()
+        if not event then return skip_unusable(unusable) end
         events[1] = event
     end
 
@@ -1486,9 +1635,9 @@ function AforoMeteringHandler:log(conf)
                 response_time_ms = response_ms,
                 requestSize   = request_size,
                 responseSize  = response_size,
-                service       = service_name,
-                route         = route_name,
-                consumer      = consumer_name,
+                service       = text_or_nil(service_name),
+                route         = text_or_nil(route_name),
+                consumer      = text_or_nil(consumer_name),
             }
         else
             -- endpoint_path stays whatever include_metadata says (2026-10-12):
@@ -1534,12 +1683,11 @@ function AforoMeteringHandler:log(conf)
             return
         end
 
-        local field, max = over_limit(event)
+        local field, why = identity_problem(event)
         if field then
-            warn_throttled("over_limit_" .. field, 300,
-                "[aforo-metering] Skipping events: ", field, " is longer than the ingestor's ",
-                max, "-character limit (e.g. ", method, " ", event_path, "). Event not metered. ",
-                "Repeats suppressed for 300s.")
+            warn_throttled("identity_" .. field, 300,
+                "[aforo-metering] Skipping events: ", field, " ", why, " (e.g. ", method, " ",
+                event_path, "). Event not metered. Repeats suppressed for 300s.")
             goto continue
         end
 

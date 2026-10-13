@@ -702,18 +702,79 @@ describe("aforo-metering handler", function()
                 ["x-trace-id"] = { "first", "second" },     -- a repeated header
                 ["x-request-id"] = string.rep("x", 500),
                 tracestate = "vendor=1",
-            }, { ["X-Aforo-Metric"] = "sms\255sent" })
+            })
             mock_kong.request.get_path = orig
             local encoded = raw(c)[1]
-            assert.is_nil(encoded:find("[\128-\255]"), "non-ASCII bytes reached the batch body")
+            assert.is_nil(encoded:find("[\128-\255]"), "malformed bytes reached the batch body")
             local e = cjson.decode(encoded)
             assert.is_nil(e.trace.traceparent)
             assert.equals("first", e.trace.xTraceId)
             assert.is_nil(e.trace.xRequestId)
             assert.equals("vendor=1", e.trace.tracestate)
-            assert.equals("api_calls", e.metricName)    -- the unusable header metric is ignored
+            -- Only the malformed byte and the control character are escaped.
             assert.equals(512, #e.endpointPath)
-            assert.equals("/caf%E9/%00x%20ppp", e.endpointPath:sub(1, 18))
+            assert.equals("/caf%E9/%00x ppp", e.endpointPath:sub(1, 16))
+        end)
+
+        it("keeps valid Unicode unchanged: paths, tool names, metric names, customer ids", function()
+            local c = conf({ mcp_enabled = true })
+            local orig_path, orig_method = mock_kong.request.get_path, mock_kong.request.get_method
+            mock_kong.request.get_path = function() return "/café/ü" end
+            log(c, "kündin", nil, { ["X-Aforo-Metric"] = "nachrichten_gesendet_ü" })
+            mock_kong.request.get_method = function() return "POST" end
+            mock_kong.ctx.shared = { aforo_jwt_claims = { customer_id = "cust_a" },
+                aforo_raw_body = '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"t b é","_meta":{"agent_id":"a1"}}}' }
+            mock_kong.request._headers, mock_kong.response._headers = {}, {}
+            handler:log(c)
+            mock_kong.request.get_path, mock_kong.request.get_method = orig_path, orig_method
+            local evs = buffered(c)
+            assert.equals("/café/ü", evs[1].endpointPath)
+            assert.equals("nachrichten_gesendet_ü", evs[1].metricName)
+            assert.equals("kündin", evs[1].customerId)
+            assert.equals("t b é", evs[2].toolName)
+        end)
+
+        it("counts identity limits in characters as the ingestor does, not bytes", function()
+            local c = conf()
+            log(c, string.rep("\195\169", 40))            -- 'é' x 40: 40 characters, 80 bytes
+            log(c, string.rep("\240\159\152\128", 32))    -- 32 emoji: 64 UTF-16 units -- at the limit
+            log(c, string.rep("\240\159\152\128", 33))    -- 66 units: over customerId's 64
+            log(c, "bad\255id")                           -- not text: would poison the batch
+            local ids = {}
+            for i, e in ipairs(buffered(c)) do ids[i] = #e.customerId end
+            assert.same({ 80, 128 }, ids)
+        end)
+
+        it("skips the event when an upstream identity header is present but unusable", function()
+            local c = conf({ product_type = "AI_AGENT", agent_id = "default-agent",
+                             agent_id_header = "X-Aforo-Agent-Id", session_id_header = "X-Aforo-Session-Id" })
+            local long_agent = "support-agent-production-eu-west-1-v2"   -- 37 characters
+            log(c, "c1", nil, { ["X-Aforo-Agent-Id"] = long_agent })
+            log(c, "c2", nil, { ["X-Aforo-Session-Id"] = "sess\1ion" })
+            log(conf(), "c3", nil, { ["X-Aforo-Metric"] = "sms\255sent" })
+            assert.equals(0, #buffered(c))
+            assert.equals(0, #buffered(conf()))
+            -- Absent headers still fall back as designed.
+            log(c, "c4")
+            assert.equals("default-agent", buffered(c)[1].agentId)
+        end)
+
+        it("with mcp_meter_non_tool_calls, also meters the other messages of a mixed batch", function()
+            local c = conf({ mcp_enabled = true, mcp_meter_non_tool_calls = true })
+            local orig_method = mock_kong.request.get_method
+            mock_kong.request.get_method = function() return "POST" end
+            mock_kong.request._headers, mock_kong.response._headers = {}, {}
+            mock_kong.ctx.shared = { aforo_jwt_claims = { customer_id = "cust_a" }, aforo_raw_body = cjson.encode({
+                { jsonrpc = "2.0", id = 1, method = "tools/list" },
+                { jsonrpc = "2.0", id = 2, method = "tools/call", params = { name = "search" } },
+            }) }
+            handler:log(c)
+            mock_kong.request.get_method = orig_method
+            local evs = buffered(c)
+            assert.equals(2, #evs)
+            assert.equals("search", evs[1].toolName)
+            assert.equals("api_calls", evs[2].metricName)
+            assert.is_nil(evs[2].toolName)
         end)
 
         it("rounds quantity to the ingestor's 6 decimals and skips what rounds to 0", function()

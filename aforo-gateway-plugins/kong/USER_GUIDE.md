@@ -120,7 +120,9 @@ X-Aforo-Quantity: 7.5
 These are **response** headers, set by your upstream, so a client cannot forge them. Both
 override the mapping for that request. A quantity that is not a positive number is ignored
 with a warning, because the ingestor requires `quantity > 0` and a malformed value would
-otherwise fail the whole batch.
+otherwise fail the whole batch. A metric name the plugin cannot use (not valid UTF-8 text,
+or longer than 255 characters) skips the event with a warning, rather than billing it under
+the default metric. The same applies to `X-Aforo-Agent-Id` and `X-Aforo-Session-Id`.
 
 Configurable via `metric_header` / `quantity_header`; set either to `null` to disable.
 
