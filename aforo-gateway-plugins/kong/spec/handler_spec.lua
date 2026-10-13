@@ -928,6 +928,19 @@ describe("aforo-metering handler", function()
             assert.equals(b_now, #buffered(B))
         end)
 
+        it("keeps the oldest when its own newer events filled the dict during a failed flush", function()
+            dict.cap = 64 * 1024
+            local A = conf({ flush_count = 100000 })
+            for i = 1, 20 do log(A, "old" .. i) end
+            http_mock.responses = { { status = 503 }, { status = 503 }, { status = 503 } }
+            http_mock.on_request = function(n)
+                if n == 1 then while dict:free_space() > 512 do log(A, "new") end end
+            end
+            handler._flush_buffer(false, A)
+            local left = buffered(A)
+            for i = 1, 20 do assert.equals("old" .. i, left[i].customerId) end
+        end)
+
         it("never refuses events while the dict has room, whatever happened before", function()
             dict.cap = 64 * 1024
             local A = conf({ flush_count = 100000 })

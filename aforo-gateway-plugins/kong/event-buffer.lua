@@ -339,16 +339,18 @@ local function evict_failing(dict, except_bkey, n)
 end
 
 -- Put events back at the head of the buffer, oldest first, under the same
--- rules as a push. Returns how many events were dropped.
+-- rules as a push. Returns how many of batch went back, and how many events
+-- were dropped in all (of batch, or newer ones that made room).
 --
 -- Normally the OLDEST are kept: they are the ones closest to falling outside
 -- the ingestor's acceptance window, and recent events are recoverable from
 -- upstream logs far more often than old ones. A held destination keeps its
 -- NEWEST instead, within HELD_MAX_AGE_SECONDS: its oldest are the ones about
--- to become undeliverable. Out of memory, a buffer that is not held may evict
--- refused or failing destinations' oldest events; a held one evicts nobody.
+-- to become undeliverable. Out of memory, a buffer that is not held makes room
+-- at its own newest end first (keep the oldest), then by evicting refused or
+-- failing destinations' oldest events; a held one evicts nobody.
 local function rebuffer(dict, bkey, batch, held)
-    local dropped = 0
+    local dropped, kept = 0, 0
     local oldest_ok = held and (ngx.now() - HELD_MAX_AGE_SECONDS) or nil
     local first = 1
     if held then
@@ -366,10 +368,17 @@ local function rebuffer(dict, bkey, batch, held)
             dropped = dropped + 1
         else
             local ok = dict:lpush(bkey, item)
-            if not ok and not held and evict_failing(dict, bkey, EVICT_BATCH) > 0 then
-                ok = dict:lpush(bkey, item)
+            if not ok and not held then
+                -- Events pushed while this batch was out are newer: they go first.
+                if drop(dict, bkey, 1, "tail") > 0 then
+                    dropped = dropped + 1
+                    ok = dict:lpush(bkey, item)
+                end
+                if not ok and evict_failing(dict, bkey, EVICT_BATCH) > 0 then
+                    ok = dict:lpush(bkey, item)
+                end
             end
-            if not ok then dropped = dropped + 1 end
+            if ok then kept = kept + 1 else dropped = dropped + 1 end
         end
     end
 
@@ -378,7 +387,7 @@ local function rebuffer(dict, bkey, batch, held)
     if len > limit then
         dropped = dropped + drop(dict, bkey, len - limit, held and "head" or "tail")
     end
-    return dropped
+    return kept, dropped
 end
 
 -- A 2xx can still carry per-event failures: /v1/ingest/batch answers 202
@@ -671,12 +680,12 @@ local function drain(dict, bkey, settings)
             -- taken off the buffer before the first attempt, so an ingestor
             -- outage outlasting the retries used to destroy the only copy of
             -- them: unbilled usage, no dead-letter, nothing to reconstruct from.
-            local dropped = rebuffer(dict, bkey, keep, ctx.held)
+            local kept, dropped = rebuffer(dict, bkey, keep, ctx.held)
             local what = ctx.held and "refused" or "failed"
             if dropped > 0 then
                 -- Never throttled: these events are gone.
                 kong.log.err("[aforo-metering] Delivery to ", settings.aforo_endpoint, " ", what,
-                    ": ", #keep - dropped, " event(s) kept, ", dropped, " dropped (",
+                    ": ", kept, " event(s) put back for retry, ", dropped, " dropped (",
                     ctx.held and ("over " .. HELD_MAX_EVENTS .. " events, older than 72 h, or no memory")
                         or "the buffer or the shared dict is full", ").")
             elseif ctx.held or ctx.failed then
@@ -716,7 +725,7 @@ local function shutdown_send(dict, bkey, settings)
                   timeout_ms = SHUTDOWN_SEND_TIMEOUT_MS, attempts = 1 }
     local keep = deliver(ctx, batch, 0)
     if #keep > 0 then
-        local dropped = rebuffer(dict, bkey, keep, ctx.held or dict:get(bkey .. ":held"))
+        local _, dropped = rebuffer(dict, bkey, keep, ctx.held or dict:get(bkey .. ":held"))
         if dropped > 0 then
             kong.log.err("[aforo-metering] Shutdown flush to ", settings.aforo_endpoint, ": ",
                 dropped, " event(s) dropped putting the rest back.")
