@@ -626,6 +626,20 @@ describe("access phase", function()
             assert.is_nil(K.response._exit)
         end)
 
+        it("applies a PER_CUSTOMER limit to the customer, not to each of its keys", function()
+            local P = '{"policyName":"Cust","scope":"PER_CUSTOMER","enforcementMode":"HARD",'
+                .. '"tiers":[{"windowSeconds":60,"maxRequests":1,"burstCapacity":0}]}'
+            policy("sk_live_a", P); policy("sk_live_b", P)
+            K.client._consumer = { id = "c-uuid", custom_id = "cust-1", username = "acme" }
+            local allowed = 0
+            for _, key in ipairs({ "sk_live_a", "sk_live_b" }) do
+                K.client._credential = { key = key }
+                K.response._exit = nil
+                if not rate_limit.enforce(conf(RL)) then allowed = allowed + 1 end
+            end
+            assert.equals(1, allowed)
+        end)
+
         it("fails open on a Redis error reply", function()
             redis_error_reply = "NOAUTH Authentication required."
             K.request._h["Authorization"] = "Bearer sk_live_5"
@@ -715,6 +729,29 @@ describe("access phase", function()
             end)
             assert.is_false(refused)
             assert.equals(0, #http_requests)
+        end)
+
+        it("never caches the ALLOW for a request a THROTTLE let through", function()
+            -- Pricing (with fix/margin-guard-throttle-pass-level): a throttle
+            -- pass is ALLOW with currentLevel L2_THROTTLE; half are refused.
+            local PASS = { status = 200, body = '{"verdict":"ALLOW","currentLevel":"L2_THROTTLE"}' }
+            local refused = 0
+            for i = 1, 20 do
+                K.response._exit = nil
+                -- GLOBAL is a plain ALLOW: cached after the first request.
+                http_responses = (i == 1) and { ALLOW } or {}
+                table.insert(http_responses, (i % 2 == 1) and THROTTLE or PASS)
+                if margin_guard.check(conf(MG), "tenant-B", "cust-1") then refused = refused + 1 end
+            end
+            assert.equals(10, refused)
+            assert.equals(21, #http_requests)   -- 1 GLOBAL + every customer check
+        end)
+
+        it("still caches a plain ALLOW, with currentLevel NONE or none at all", function()
+            http_responses = { ALLOW, { status = 200, body = '{"verdict":"ALLOW"}' } }
+            margin_guard.check(conf(MG), "tenant-B", "cust-1")
+            margin_guard.check(conf(MG), "tenant-B", "cust-1")
+            assert.equals(2, #http_requests)
         end)
 
         it("passes WARN through with a header to the upstream", function()

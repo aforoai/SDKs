@@ -209,17 +209,23 @@ local function enforce(conf)
     -- which previously allowed cross-customer rate-limit bypass (IDOR
     -- advisory finding #7). Closed 2026-04-23.
     --
-    -- When JWT validation is disabled or the JWT carries no customer_id
-    -- claim, PER_CUSTOMER falls back to key_hash (same behavior as
-    -- PER_KEY). This is safe — the key is already authenticated, and
-    -- the enforcement scope just becomes narrower (per-key instead of
-    -- per-customer). It does NOT fall back to an unauthenticated source.
+    -- Without a JWT claim, PER_CUSTOMER uses the Kong consumer -- the same
+    -- credential-bound identity the plugin bills (handler.lua's
+    -- resolve_customer_id: custom_id, then username, then id). It used to
+    -- fall back to the key hash straight away, so a customer with N key-auth
+    -- keys got N times its PER_CUSTOMER limit (2026-10-13 fix). Only with no
+    -- customer identity at all does it narrow to the key, which is
+    -- authenticated; it never falls back to an unauthenticated source.
     local scope_id
     if scope_key == "PER_CUSTOMER" then
         local jwt_claims = kong.ctx.shared and kong.ctx.shared.aforo_jwt_claims
         local jwt_customer = jwt_claims and jwt_claims.customer_id
+        local consumer = kong.client.get_consumer()
+        local consumer_id = consumer and (consumer.custom_id or consumer.username or consumer.id)
         if type(jwt_customer) == "string" and jwt_customer ~= "" then
             scope_id = jwt_customer
+        elseif type(consumer_id) == "string" and consumer_id ~= "" then
+            scope_id = consumer_id
         else
             scope_id = key_hash
         end

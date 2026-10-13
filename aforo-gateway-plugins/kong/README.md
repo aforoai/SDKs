@@ -104,7 +104,7 @@ Every option lives under `config.*`. `aforo_endpoint`, `api_key`, and `tenant_id
 | `rate_limit_redis_timeout_ms` | integer | `50` | Redis timeout; fail-open on timeout. |
 | `margin_guard_enabled` | boolean | `false` | Before proxying, ask pricing-service whether the tenant (GLOBAL scope) or the customer is margin-blocked or throttled, and answer 429 with `Retry-After` if so. Fails open. Requires `margin_guard_url`. |
 | `margin_guard_url` | string | — | Pricing-service base URL, e.g. `http://pricing:8083`. Kong must be able to reach pricing's internal `/internal/v1/margin-guard/quick-check`. Required when `margin_guard_enabled` is true. |
-| `margin_guard_cache_ttl` | integer | `30` | How long an ALLOW or BLOCK answer is cached, in seconds. THROTTLE is never cached. `0` disables the cache. |
+| `margin_guard_cache_ttl` | integer | `30` | How long a BLOCK, or an ALLOW while no throttle is active, is cached, in seconds. THROTTLE, and the ALLOW for a request a throttle let through, are never cached. `0` disables the cache. Throttling is exact only with a pricing-service version that marks a throttle pass (`currentLevel: L2_THROTTLE`); older versions answer it as a plain ALLOW, which is cached. |
 | `preflight_quota_enabled` | boolean | `false` | Ask the ingestor's `POST /api/v1/quota/check` before proxying (rate limit, prepaid wallet, cumulative quota); 429 on `DENY`. Off by default: it adds a synchronous call per cache miss. |
 | `preflight_quota_url` | string | origin of `aforo_endpoint` + `/api/v1/quota/check` | Quota-check endpoint. |
 | `preflight_quota_api_key` | string | `api_key` | Key sent as `X-API-Key` on the check. Set when `api_key` is ingest-only: with RBAC enforced the check needs `quotas:read`. Stored encrypted. |

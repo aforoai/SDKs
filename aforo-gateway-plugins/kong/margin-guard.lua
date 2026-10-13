@@ -48,9 +48,15 @@ local function log_throttled(dict, level, key, ...)
 end
 
 -- One scope's verdict: { verdict, message } or nil when there is no usable
--- answer (fail open). Only ALLOW and BLOCK are cached: THROTTLE is decided
--- per request by pricing, so a cached THROTTLE would refuse every request in
--- the window instead of pricing's share of them.
+-- answer (fail open). Only BLOCK and a plain ALLOW are cached. THROTTLE is
+-- decided per request by pricing (it counts requests and rejects its share),
+-- so neither a THROTTLE nor the ALLOW for a request the throttle let through
+-- may be cached: a cached pass would wave through every request in the TTL,
+-- and the throttle would almost never apply (2026-10-13 fix). Pricing marks
+-- such a pass ALLOW with currentLevel "L2_THROTTLE"; an ALLOW is cached only
+-- when currentLevel is "NONE" or absent. Older pricing versions answer a
+-- throttle pass with currentLevel "NONE", which cannot be told apart from a
+-- real ALLOW -- full throttle accuracy needs the updated pricing service.
 local function quick_check(conf, dict, base_url, tenant_id, scope_type, scope_id)
     local ttl = tonumber(conf.margin_guard_cache_ttl) or 30
     local cache_key = CACHE_PREFIX .. tenant_id .. ":" .. scope_type .. ":" .. scope_id
@@ -97,7 +103,9 @@ local function quick_check(conf, dict, base_url, tenant_id, scope_type, scope_id
         verdict = verdict,
         message = type(body.message) == "string" and body.message or nil,
     }
-    if dict and ttl > 0 and (verdict == "ALLOW" or verdict == "BLOCK") then
+    local level = body.currentLevel
+    local plain_allow = verdict == "ALLOW" and (level == nil or level == cjson.null or level == "NONE")
+    if dict and ttl > 0 and (verdict == "BLOCK" or plain_allow) then
         dict:set(cache_key, cjson.encode(entry), ttl)
     end
     return entry
