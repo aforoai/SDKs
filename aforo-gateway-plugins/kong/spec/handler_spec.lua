@@ -6,14 +6,32 @@
 -- implements the list operations the event buffer relies on with OpenResty's
 -- semantics (atomic per call; list ops on a non-list key fail).
 local function new_shared_dict()
-    local d = { store = {}, fail_push = false }
+    -- Memory is modelled for lists, as the real dict behaves: each element
+    -- takes a slab slot, pushes fail with "no memory" when the dict is full
+    -- (they evict nothing), and free_space() reports what is left.
+    local d = { store = {}, fail_push = false, cap = 10485760, used = 0 }
+    local function slot(v)
+        local n = #v + 48
+        if n > 2048 then return math.ceil(n / 4096) * 4096 end
+        local p = 16
+        while p < n do p = p * 2 end
+        return p
+    end
     function d:get(k) return self.store[k] end
     function d:set(k, v) self.store[k] = v; return true end
     function d:add(k, v)
         if self.store[k] ~= nil then return false, "exists" end
         self.store[k] = v; return true
     end
-    function d:delete(k) self.store[k] = nil end
+    d.safe_set = d.set
+    d.safe_add = d.add
+    function d:delete(k)
+        local v = self.store[k]
+        if type(v) == "table" and v.__list then
+            for _, e in ipairs(v) do self.used = self.used - slot(e) end
+        end
+        self.store[k] = nil
+    end
     local function list(self, k, create)
         local v = self.store[k]
         if v == nil then
@@ -23,25 +41,31 @@ local function new_shared_dict()
         if type(v) ~= "table" or not v.__list then return nil, "value not a list" end
         return v
     end
+    local function room(self, v)
+        if self.fail_push or self.used + slot(v) > self.cap then return false end
+        return true
+    end
     function d:rpush(k, v)
-        if self.fail_push then return nil, "no memory" end
+        if not room(self, v) then return nil, "no memory" end
         local l, err = list(self, k, true); if not l then return nil, err end
-        l[#l + 1] = v; return #l
+        l[#l + 1] = v; self.used = self.used + slot(v); return #l
     end
     function d:lpush(k, v)
-        if self.fail_push then return nil, "no memory" end
+        if not room(self, v) then return nil, "no memory" end
         local l, err = list(self, k, true); if not l then return nil, err end
-        table.insert(l, 1, v); return #l
+        table.insert(l, 1, v); self.used = self.used + slot(v); return #l
     end
     function d:lpop(k)
         local l, err = list(self, k, false); if not l then return nil, err end
         local v = table.remove(l, 1)
+        if v then self.used = self.used - slot(v) end
         if #l == 0 then self.store[k] = nil end
         return v
     end
     function d:rpop(k)
         local l, err = list(self, k, false); if not l then return nil, err end
         local v = table.remove(l)
+        if v then self.used = self.used - slot(v) end
         if #l == 0 then self.store[k] = nil end
         return v
     end
@@ -59,8 +83,8 @@ local function new_shared_dict()
         self.store[k] = cur + v
         return self.store[k]
     end
-    d.cap = 10485760
     function d:capacity() return self.cap end
+    function d:free_space() return math.max(0, self.cap - self.used) end
     return d
 end
 
@@ -788,21 +812,44 @@ describe("aforo-metering handler", function()
         end)
 
         -- ── review 2: delivery ──────────────────────────────────
-        it("delivers events kept on 401 with the rotated api_key, and stops using the old one", function()
-            local old = conf({ api_key = "sk_revoked" })
+        it("moves an instance's events kept on 401 to its rotated api_key, and stops using the old one", function()
+            local old = conf({ api_key = "sk_revoked", __plugin_id = "plugin-1" })
             log(old, "c1"); log(old, "c2")
             http_mock.responses = { { status = 401 } }
             handler._flush_buffer(false, old)        -- 401: kept
-            -- The operator rotates the key; the old timer still holds the old conf.
-            local stale_timer = ngx.timers[#ngx.timers]
-            local new = conf({ api_key = "sk_rotated" })
+            -- The operator rotates the key of the same plugin instance.
+            local new = conf({ api_key = "sk_rotated", __plugin_id = "plugin-1" })
             log(new, "c3")
-            run(stale_timer)                         -- the stale timer flushes...
+            for _, t in ipairs(ngx.timers) do run(t) end   -- every pending timer, stale ones included
             local keys = {}
             for _, r in ipairs(http_mock.requests) do keys[#keys + 1] = r.params.headers["X-API-Key"] end
-            assert.same({ "sk_revoked", "sk_rotated" }, keys)  -- ...with the current key
-            assert.equals(3, #sent(2))
+            assert.same({ "sk_revoked", "sk_rotated" }, keys)
+            local ids = {}
+            for _, e in ipairs(sent(2)) do ids[#ids + 1] = e.customerId end
+            assert.same({ "c1", "c2", "c3" }, ids)   -- the old events first, in order
+            assert.equals(0, #buffered(old))
             assert.equals(0, #buffered(new))
+            assert.is_nil(dict:get(handler._buffer_key(old) .. ":conf"))  -- the old buffer is retired
+        end)
+
+        it("never moves another instance's events on a rotation", function()
+            local A = conf({ api_key = "sk_shared", __plugin_id = "plugin-A" })
+            local B = conf({ api_key = "sk_shared", __plugin_id = "plugin-B" })
+            log(A, "a1"); log(B, "b1")
+            log(conf({ api_key = "sk_new", __plugin_id = "plugin-A" }), "a2")   -- A rotates
+            assert.equals(1, #buffered(B))
+            assert.equals("b1", buffered(B)[1].customerId)
+            local moved = buffered(conf({ api_key = "sk_new", __plugin_id = "plugin-A" }))
+            assert.equals(2, #moved)
+        end)
+
+        it("sends a push from a worker still on the old settings to the new buffer", function()
+            local old = conf({ api_key = "sk_old", __plugin_id = "plugin-1" })
+            local new = conf({ api_key = "sk_new", __plugin_id = "plugin-1" })
+            log(old, "c1"); log(new, "c2")
+            log(old, "c3")                           -- a worker that has not reloaded yet
+            assert.equals(0, #buffered(old))
+            assert.equals(3, #buffered(new))
         end)
 
         it("re-arms a timed flush after a worker exit (reload)", function()
@@ -833,17 +880,20 @@ describe("aforo-metering handler", function()
             assert.equals(0, #buffered(c))
         end)
 
-        it("keeps at most the newest 1,000 events for a destination the ingestor refuses", function()
+        it("keeps at most the newest 500 events for a destination the ingestor refuses", function()
             local c = conf({ flush_count = 100000 })
             for i = 1, 1200 do log(c, "c" .. i) end
             http_mock.responses = { { status = 401 } }
             handler._flush_buffer(false, c)
             local left = buffered(c)
-            assert.equals(1000, #left)
-            assert.equals("c201", left[1].customerId)
-            assert.equals("c1200", left[1000].customerId)
-            log(c, "c1201")                           -- full for a refused destination
-            assert.equals(1000, #buffered(c))
+            assert.equals(500, #left)
+            assert.equals("c701", left[1].customerId)
+            assert.equals("c1200", left[500].customerId)
+            log(c, "c1201")                           -- full: the oldest makes room
+            left = buffered(c)
+            assert.equals(500, #left)
+            assert.equals("c702", left[1].customerId)
+            assert.equals("c1201", left[500].customerId)
         end)
 
         it("drops events older than 72 hours when the ingestor refuses the destination", function()
@@ -859,21 +909,32 @@ describe("aforo-metering handler", function()
         end)
 
         it("never lets a refused destination stop a healthy one from buffering", function()
-            dict.cap = 256 * 1024                     -- a small dict: events may use 192 KiB
+            dict.cap = 256 * 1024                     -- a small dict
             local A = conf({ flush_count = 100000 })
             local B = conf({ tenant_id = "tenantB", api_key = "sk_B", flush_count = 100000,
                              aforo_endpoint = "http://ingestor-b.test/v1/ingest/batch" })
-            for i = 1, 600 do log(A, "a" .. i) end    -- fills the budget
+            for i = 1, 600 do log(A, "a" .. i) end    -- A fills the dict to the brim
             local a_before = #buffered(A)
-            assert.is_true(a_before < 600)            -- A hit the budget itself
+            assert.is_true(a_before < 600)
             dict:set(handler._buffer_key(A) .. ":held", true)   -- A's key is refused (401)
             for i = 1, 100 do log(B, "b" .. i) end
             assert.equals(100, #buffered(B))          -- B lost nothing
             assert.is_true(#buffered(A) < a_before)   -- A made the room
-            -- A refused destination gets no more room for itself.
-            local a_now = #buffered(A)
+            -- A refused destination gets no room at others' expense: with the
+            -- dict full of B's events, A's push evicts none of them.
+            while dict:free_space() > 1024 do log(B, "b_fill") end
+            local b_now = #buffered(B)
             log(A, "a_new")
-            assert.equals(a_now, #buffered(A))
+            assert.equals(b_now, #buffered(B))
+        end)
+
+        it("never refuses events while the dict has room, whatever happened before", function()
+            dict.cap = 64 * 1024
+            local A = conf({ flush_count = 100000 })
+            while dict:free_space() > 4096 do log(A, "a") end   -- full
+            dict:delete(handler._buffer_key(A))               -- drained (or evicted) by anyone
+            log(A, "after")
+            assert.equals(1, #buffered(A))
         end)
 
         it("treats a 400 for every part of the batch as a refused request, not 2n-1 POSTs", function()
@@ -882,7 +943,7 @@ describe("aforo-metering handler", function()
             respond_by_body(function() return 400 end)
             handler._flush_buffer(false, c)
             assert.equals(3, #http_mock.requests)     -- the batch and its two halves
-            assert.equals(1000, #buffered(c))         -- kept, as for a 404
+            assert.equals(500, #buffered(c))          -- kept, as for a 404 (the newest 500)
             assert.is_true(dict:get(handler._buffer_key(c) .. ":held"))
         end)
 
@@ -926,6 +987,119 @@ describe("aforo-metering handler", function()
             local c = conf({ product_type = "AI_AGENT", agent_id = string.rep("a", 37) })
             log(c, "c1")
             assert.equals(0, #buffered(c))
+        end)
+        -- ── review 3 ────────────────────────────────────────────
+        it("R1: a 413 batch whose halves are still too big is split further, not held", function()
+            -- A proxy in front of the ingestor takes at most ~250 events per body.
+            local c = conf({ flush_count = 100000 })
+            for i = 1, 1000 do log(c, "c" .. i) end
+            respond_by_body(function(body)
+                local _, n = body:gsub('"customerId"', "")
+                return n > 250 and 413 or 202
+            end)
+            handler._flush_buffer(false, c)
+            handler._flush_buffer(false, c)          -- and a second flush, for good measure
+            assert.is_nil(dict:get(handler._buffer_key(c) .. ":held"), "destination marked refused")
+            assert.equals(1000, #customers_delivered())
+        end)
+
+        it("R2: one instance's stale key does not hold another instance's events", function()
+            -- Two services of one tenant, same endpoint. Service A still has a
+            -- revoked key; service B was rotated to a good one.
+            local A = conf({ api_key = "sk_revoked", flush_count = 100000 })
+            local B = conf({ api_key = "sk_good", flush_count = 100000 })
+            http_mock.on_request = function(n)
+                local key = http_mock.requests[n].params.headers["X-API-Key"]
+                http_mock.requests[n].status = key == "sk_good" and 202 or 401
+                table.insert(http_mock.responses, 1, { status = http_mock.requests[n].status })
+            end
+            for i = 1, 5 do log(B, "b" .. i) end
+            log(A, "a1")                             -- A's request happens to be the last one
+            handler._flush_buffer(false, B)          -- B's own timer / flush
+            local b_sent = 0
+            for i, r in ipairs(http_mock.requests) do
+                if r.status == 202 then
+                    for _, e in ipairs(sent(i)) do if e.customerId:sub(1, 1) == "b" then b_sent = b_sent + 1 end end
+                end
+            end
+            assert.equals(5, b_sent)
+        end)
+
+        it("R3: UTF-8 validity matrix (customerId)", function()
+            local c = conf()
+            local cases = {
+                { "\224\160\128", true },  { "\224\159\191", false }, -- E0 A0 80 ok, E0 9F BF overlong
+                { "\237\159\191", true },  { "\237\160\128", false }, -- ED 9F BF ok, ED A0 80 surrogate
+                { "\238\128\128", true },  { "\239\191\191", true },  -- EE 80 80, EF BF BF
+                { "\240\144\128\128", true }, { "\240\143\191\191", false }, -- U+10000, overlong
+                { "\244\143\191\191", true }, { "\244\144\128\128", false }, -- U+10FFFF, > U+10FFFF
+                { "\245\128\128\128", false }, { "\192\128", false }, { "\193\191", false },
+                { "\194\128", true }, { "x\226\130", false }, { "x\240\159\152", false }, { "x\195", false },
+                { "\128", false }, { "a\237\190\128b", false },
+            }
+            local want = {}
+            for i, case in ipairs(cases) do
+                log(c, "id" .. i .. "-" .. case[1])
+                if case[2] then want[#want + 1] = "id" .. i .. "-" .. case[1] end
+            end
+            local got = {}
+            for i, e in ipairs(buffered(c)) do got[i] = e.customerId end
+            assert.same(want, got)
+        end)
+
+        it("R4: a refused destination keeps its NEWEST events, as the docs and the log say", function()
+            local c = conf({ flush_count = 100000 })
+            for i = 1, 1000 do log(c, "old" .. i) end
+            http_mock.responses = { { status = 401 } }
+            handler._flush_buffer(false, c)          -- refused: held, 1000 kept
+            for i = 1, 300 do log(c, "new" .. i) end -- the next flush interval's traffic
+            http_mock.responses = { { status = 401 } }
+            handler._flush_buffer(false, c)
+            local left = buffered(c)
+            assert.equals("new300", left[#left].customerId)
+        end)
+
+        it("R6: held is cleared once the key works, even if the 202 reports a transient per-event error", function()
+            local c = conf({ flush_count = 100000 })
+            log(c, "c1"); log(c, "c2")
+            http_mock.responses = { { status = 401 } }
+            handler._flush_buffer(false, c)
+            http_mock.responses = { { status = 202, body = '{"accepted":1,"failed":1,"errors":['
+                .. '{"index":0,"message":"The event could not be stored: deadlock"}]}' } }
+            handler._flush_buffer(false, c)
+            assert.is_nil(dict:get(handler._buffer_key(c) .. ":held"))
+        end)
+
+        it("R7: events a re-buffer drops are reported even inside the 60 s log throttle", function()
+            local c = conf({ flush_count = 100000 })
+            local errs = {}
+            local orig = mock_kong.log.err
+            mock_kong.log.err = function(...) errs[#errs + 1] = table.concat({ ... }) end
+            for i = 1, 10 do log(c, "c" .. i) end
+            http_mock.responses = { { status = 503 }, { status = 503 }, { status = 503 } }
+            handler._flush_buffer(false, c)          -- first failure: logged, nothing dropped
+            -- Second failure 5 s later: the buffer filled up meanwhile, so the re-buffer drops.
+            http_mock.responses = { { status = 503 }, { status = 503 }, { status = 503 } }
+            local k = handler._buffer_key(c)
+            http_mock.on_request = function(n)
+                if n == 4 then for i = 1, 10000 do dict:rpush(k, cjson.encode({ customerId = "n" .. i })) end end
+            end
+            handler._flush_buffer(false, c)
+            mock_kong.log.err = orig
+            local reported = false
+            for _, l in ipairs(errs) do if l:find("dropped", 1, true) then reported = true end end
+            assert.equals(10000, #buffered(c))       -- 10 events were dropped by the second flush...
+            assert.is_true(reported, "...and no log line says so")
+        end)
+
+        it("R2b: a timer flush (as in production) sends B's events with whichever key was pushed last", function()
+            local A = conf({ api_key = "sk_revoked", flush_count = 100000 })
+            local B = conf({ api_key = "sk_good", flush_count = 100000 })
+            for i = 1, 5 do log(B, "b" .. i) end
+            log(A, "a1")
+            http_mock.responses = { { status = 401 } }
+            run(table.remove(ngx.timers, 1))         -- the pending timed flush
+            assert.equals("sk_good", http_mock.requests[1].params.headers["X-API-Key"])
         end)
     end)
     -- ── Billing correctness (2026-10-12) ────────────────────────

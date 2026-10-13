@@ -136,7 +136,7 @@ local function warn_throttled(key, ttl, ...)
         kong.log.warn(...)
         return
     end
-    if dict:add("aforo:warn:" .. key, 1, ttl or 60) then
+    if dict:safe_add("aforo:warn:" .. key, 1, ttl or 60) then
         kong.log.warn(...)
     end
 end
@@ -293,14 +293,29 @@ local function fetch_jwks(uri)
     return { fetched_at = ngx.now(), count = count, keys = keys }
 end
 
+-- Shared across workers in the dict; also kept per worker, so a full dict
+-- (the write below is safe_set: it fails rather than evict buffered events)
+-- costs a refetch per worker, not every token for the next 30 s.
+local jwks_local = {}
+
 local function cached_jwks(dict, uri)
     local raw = dict:get(JWKS_CACHE_PREFIX .. uri)
     local entry = raw and cjson.decode(raw)
-    return type(entry) == "table" and type(entry.keys) == "table" and entry or nil
+    if type(entry) ~= "table" or type(entry.keys) ~= "table" then
+        entry = jwks_local[uri]
+    end
+    if entry and ngx.now() - (tonumber(entry.fetched_at) or 0) > JWKS_HARD_TTL then
+        return nil
+    end
+    return entry
 end
 
 local function store_jwks(dict, uri, entry)
-    dict:set(JWKS_CACHE_PREFIX .. uri, cjson.encode(entry), JWKS_HARD_TTL)
+    if dict:safe_set(JWKS_CACHE_PREFIX .. uri, cjson.encode(entry), JWKS_HARD_TTL) then
+        jwks_local[uri] = nil
+    else
+        jwks_local[uri] = entry
+    end
 end
 
 -- The key for kid. A token without a kid only matches a set of exactly one
@@ -332,11 +347,11 @@ end
 -- Fetch the JWKS now and cache it, marking the fetch as running while it
 -- does and as failed (for JWKS_REFETCH_INTERVAL) when it does not work out.
 local function fetch_and_store(dict, uri)
-    dict:set(JWKS_INFLIGHT_PREFIX .. uri, true, JWKS_FETCH_TIMEOUT_MS / 1000 + 1)
+    dict:safe_set(JWKS_INFLIGHT_PREFIX .. uri, true, JWKS_FETCH_TIMEOUT_MS / 1000 + 1)
     local fresh, err = fetch_jwks(uri)
     dict:delete(JWKS_INFLIGHT_PREFIX .. uri)
     if not fresh then
-        dict:set(JWKS_FAILED_PREFIX .. uri, tostring(err), JWKS_REFETCH_INTERVAL)
+        dict:safe_set(JWKS_FAILED_PREFIX .. uri, tostring(err), JWKS_REFETCH_INTERVAL)
         return nil, err
     end
     dict:delete(JWKS_FAILED_PREFIX .. uri)
@@ -353,7 +368,7 @@ end
 -- the JWK for kid only if it changed. A failed refetch never accepts.
 local function jwks_refetch(uri, kid, old_jwk)
     local dict = ngx.shared[BUFFER_DICT]
-    if not dict or not dict:add(JWKS_FETCH_LOCK_PREFIX .. uri, 1, JWKS_REFETCH_INTERVAL) then
+    if not dict or not dict:safe_add(JWKS_FETCH_LOCK_PREFIX .. uri, 1, JWKS_REFETCH_INTERVAL) then
         return nil
     end
     local fresh = fetch_and_store(dict, uri)
@@ -373,13 +388,13 @@ local function jwks_key(uri, kid)
     local jwk = pick_jwk(entry, kid)
     if jwk then
         if ngx.now() - (tonumber(entry.fetched_at) or 0) > JWKS_SOFT_TTL
-            and dict:add(JWKS_REFRESH_LOCK_PREFIX .. uri, 1, JWKS_REFETCH_INTERVAL) then
+            and dict:safe_add(JWKS_REFRESH_LOCK_PREFIX .. uri, 1, JWKS_REFETCH_INTERVAL) then
             ngx.timer.at(0, refresh_jwks, uri)
         end
         return jwk
     end
 
-    if not dict:add(JWKS_FETCH_LOCK_PREFIX .. uri, 1, JWKS_REFETCH_INTERVAL) then
+    if not dict:safe_add(JWKS_FETCH_LOCK_PREFIX .. uri, 1, JWKS_REFETCH_INTERVAL) then
         if entry then
             return nil, "kid '" .. tostring(kid) .. "' is not in the cached JWKS, and it was "
                 .. "refetched less than " .. JWKS_REFETCH_INTERVAL .. "s ago"
@@ -945,10 +960,19 @@ local function fetch_mappings(premature, conf)
         return
     end
 
-    dict:set(key, cjson.encode(body.mappings))
-    dict:set(key .. ":at", ngx.now())
+    -- safe_set: never evict buffered events to make room for a cache. If the
+    -- dict is full the table is not stored -- and then neither is its
+    -- timestamp, so the next request tries again instead of treating an
+    -- empty cache as fresh.
+    local stored, serr = dict:safe_set(key, cjson.encode(body.mappings))
+    if not stored then
+        kong.log.warn("[aforo-metering] Could not cache the metric mappings (", tostring(serr),
+            "); using the previous table or local metric_mappings until the next refresh.")
+        return
+    end
+    dict:safe_set(key .. ":at", ngx.now())
     if body.cacheTtlSeconds and tonumber(body.cacheTtlSeconds) then
-        dict:set(key .. ":ttl", tonumber(body.cacheTtlSeconds))
+        dict:safe_set(key .. ":ttl", tonumber(body.cacheTtlSeconds))
     end
     kong.log.info("[aforo-metering] Loaded ", #body.mappings, " metric mappings for tenant ",
         conf.tenant_id or "?")
@@ -969,7 +993,7 @@ local function maybe_refresh_mappings(conf)
 
     -- One worker fetches; the rest carry on with the cache. add() is atomic, so
     -- a burst of concurrent requests cannot stampede catalog.
-    local claimed = dict:add(key .. ":inflight", 1, 30)
+    local claimed = dict:safe_add(key .. ":inflight", 1, 30)
     if not claimed then return end
 
     local ok, err = ngx.timer.at(0, fetch_mappings, conf)

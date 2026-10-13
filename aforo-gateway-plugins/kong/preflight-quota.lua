@@ -42,7 +42,7 @@ local function warn_throttled(dict, key, ...)
         kong.log.warn(...)
         return
     end
-    if dict:add("aforo:warn:" .. key, 1, 60) then
+    if dict:safe_add("aforo:warn:" .. key, 1, 60) then
         kong.log.warn(...)
     end
 end
@@ -169,7 +169,8 @@ function M.check(conf, customer_id, metric_name)
     end
 
     if data.decision == "ALLOW" and dict and ttl_ms > 0 then
-        dict:set(cache_key, "ALLOW", ttl_ms / 1000)
+        -- safe_set: a cache never evicts buffered events; a full dict just misses.
+        dict:safe_set(cache_key, "ALLOW", ttl_ms / 1000)
     end
 
     if data.decision == "WARN" then

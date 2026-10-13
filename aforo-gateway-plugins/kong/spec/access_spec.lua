@@ -60,6 +60,9 @@ local function new_dict()
         self.store[k] = cur + v; return self.store[k]
     end
     function d:capacity() return 10485760 end
+    function d:free_space() return 10485760 end
+    d.safe_set = d.set
+    d.safe_add = d.add
     return d
 end
 

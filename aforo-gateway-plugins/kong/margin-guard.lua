@@ -43,7 +43,7 @@ local TIMEOUT_MS = 50 -- fail-fast: this is on the request path
 
 -- Same shape as preflight-quota.lua's throttle.
 local function log_throttled(dict, level, key, ...)
-    if dict and not dict:add("aforo:warn:" .. key, 1, 60) then return end
+    if dict and not dict:safe_add("aforo:warn:" .. key, 1, 60) then return end
     kong.log[level](...)
 end
 
@@ -106,7 +106,8 @@ local function quick_check(conf, dict, base_url, tenant_id, scope_type, scope_id
     local level = body.currentLevel
     local plain_allow = verdict == "ALLOW" and (level == nil or level == cjson.null or level == "NONE")
     if dict and ttl > 0 and (verdict == "BLOCK" or plain_allow) then
-        dict:set(cache_key, cjson.encode(entry), ttl)
+        -- safe_set: a cache never evicts buffered events; a full dict just misses.
+        dict:safe_set(cache_key, cjson.encode(entry), ttl)
     end
     return entry
 end

@@ -6,17 +6,33 @@
 -- checks next to it.
 --
 -- Shared memory: the aforo_buffer dict (lua_shared_dict aforo_buffer 10m).
--- Per destination -- one aforo_endpoint + tenant_id -- it holds:
+-- One buffer per plugin instance and destination -- aforo_endpoint +
+-- tenant_id + api_key (hashed) + the plugin's own id. Per buffer it holds:
 --   <key>            the events, a list, one encoded event per element
---   <key>:conf       the destination's current delivery settings (api_key...)
---   <key>:bytes      estimated shared memory the events occupy
+--   <key>:conf       the buffer's delivery settings (endpoint, key, tenant...)
 --   <key>:lock       a flush is running (at most one per buffer, all workers)
 --   <key>:pending    a timed flush is scheduled
 --   <key>:kick       an immediate (flush_count) flush is scheduled
 --   <key>:backoff    the last flush failed; no immediate flush until it expires
+--   <key>:failing    the last flush failed (transiently)
 --   <key>:held       the ingestor is refusing this destination (401/403/404,
 --                    or a 400 for the request as a whole); tighter limits apply
--- and, once: aforo:events_bytes (all destinations) and aforo:destinations.
+-- and: aforo:destinations (every buffer, for the re-arm timer),
+-- aforo:instance:<plugin id> (the buffer that plugin instance last used) and
+-- aforo:retired:<key> (a buffer whose instance moved on, for a minute).
+--
+-- Memory (2026-10-13 redesign). There is no byte accounting: counters of what
+-- the events occupy drifted -- an entry evicted by someone else's set() left
+-- a phantom total behind, and events were refused while the dict was empty.
+-- Only ground truth is used: a buffer's length (llen), the dict's free space,
+-- and whether a push succeeds. Two facts about the shared dict, checked on
+-- Kong 3.4's lua-nginx-module, shape the rules:
+--   * rpush / lpush on a full dict fail with "no memory"; they evict nothing.
+--   * set() / add() on a full dict evict the least recently used entries --
+--     a single 12 KB cache write evicted a whole list of 1,000 events. So no
+--     key of this plugin is ever written with set()/add(): every one uses
+--     safe_set()/safe_add(), which fail instead. A cache that cannot be
+--     written simply misses.
 
 local http = require("resty.http")
 local cjson = require("cjson.safe")
@@ -25,28 +41,37 @@ local M = {}
 
 local BUFFER_DICT = "aforo_buffer"
 local KEY_PREFIX = "aforo:events:"
-local BYTES_KEY = "aforo:events_bytes"
 local DESTINATIONS_KEY = "aforo:destinations"
+local INSTANCE_PREFIX = "aforo:instance:"
+local RETIRED_PREFIX = "aforo:retired:"
 
--- Per destination. Past it the newest events are dropped.
+-- Events per buffer. Past it the newest events are dropped.
 local MAX_BUFFER_SIZE = 10000
 
--- A destination the ingestor is refusing keeps far less (2026-10-12 fix).
--- Kept on 401/403/404 so a key rotation loses nothing, its events used to
--- pile up to MAX_BUFFER_SIZE -- which a 10 MiB dict cannot even hold at a
--- typical 1.2 KB per event (2 KiB slab slots: ~5,000 fit) -- and once the
--- dict was full every other tenant's events were refused too. Now: at most
--- HELD_MAX_EVENTS, none older than the ingestor will accept, a small share of
--- memory, and evicted first when a healthy destination needs the room.
-local HELD_MAX_EVENTS = 1000
+-- A destination the ingestor is refusing keeps far less, and its newest: at
+-- most HELD_MAX_EVENTS, none older than the ingestor accepts. A new event
+-- for it pushes out its oldest. Kept at all so a key fix loses nothing
+-- recent; kept small so a refused destination cannot crowd out the rest.
+local HELD_MAX_EVENTS = 500
 local HELD_MAX_AGE_SECONDS = 72 * 3600
-local HELD_TTL = 86400            -- refreshed on every refusal, cleared on success
+local HELD_TTL = 86400            -- refreshed on every refusal, cleared on any 2xx
 
--- Share of the dict's capacity events may use, all destinations together;
--- the rest stays free for the caches (JWKS, mappings, quota, warnings) that
--- live in the same dict. A held destination gets an eighth of it.
-local EVENTS_BUDGET_FRACTION = 0.75
-local HELD_BUDGET_FRACTION = 0.125
+-- The largest event this plugin builds. handler.lua caps every string an
+-- event carries (paths 512 characters, trace headers 128-512, identities at
+-- the ingestor's limits, names 255); the worst case, every field at its
+-- limit in 3-byte characters, is about 13 KiB. Typical events are well under
+-- 2 KiB. A larger value is refused, as a guard.
+local MAX_EVENT_BYTES = 16384
+
+-- Below this much free space (whole free pages), a push from a healthy
+-- destination first evicts the oldest events of refused, then failing,
+-- destinations.
+local RESERVE_FRACTION = 0.1
+local EVICT_BATCH = 16
+
+-- How long a retired buffer redirects pushes to its successor: a worker
+-- that has not loaded the new configuration yet still pushes with the old.
+local RETIRED_GRACE = 60
 
 -- The ingestor rejects a batch of more than 1000 events with 400, so a
 -- backlog (after an outage, say) is drained in slices no larger than this,
@@ -83,7 +108,7 @@ local TRANSIENT_EVENT_ERROR = "The event could not be stored"
 
 local function log_throttled(level, key, ttl, ...)
     local dict = ngx.shared[BUFFER_DICT]
-    if dict and not dict:add("aforo:warn:" .. key, 1, ttl) then return end
+    if dict and not dict:safe_add("aforo:warn:" .. key, 1, ttl) then return end
     kong.log[level](...)
 end
 
@@ -91,25 +116,32 @@ local function interval_seconds(settings)
     return math.max(0.05, (tonumber(settings.flush_interval_ms) or 5000) / 1000)
 end
 
--- One buffer per destination: aforo_endpoint + tenant_id. Before 2026-10-12
--- all instances shared one buffer and a flush sent it with whichever
--- instance's settings it ran under -- tenant B's usage under tenant A's key.
--- The api_key is deliberately NOT part of the key: after a rotation the old
--- key's buffer used to be orphaned, its timer posting with the old key
--- forever. The key is looked up at flush time instead (see settings below).
+-- The plugin instance this conf belongs to: Kong sets conf.__plugin_id to
+-- the plugin entity's id, which stays the same when the instance's settings
+-- change (DB-less included, verified on Kong 3.4). nil if absent.
+local function instance_id(conf)
+    local id = conf.__plugin_id
+    return type(id) == "string" and id ~= "" and id or nil
+end
+
+-- One buffer per plugin instance and destination (2026-10-13). It was
+-- endpoint + tenant only, so two instances with the same endpoint and tenant
+-- but different keys shared one buffer, and each flush sent everybody's
+-- events with whichever key was pushed last -- one service's usage under
+-- another's (possibly revoked, possibly another tenant's) key. Now nothing
+-- is ever mixed: the key and the instance are part of the buffer key.
 function M.key(conf)
-    return KEY_PREFIX .. ngx.md5((conf.aforo_endpoint or "") .. "\n" .. (conf.tenant_id or ""))
+    return KEY_PREFIX .. ngx.md5((conf.aforo_endpoint or "") .. "\n" .. (conf.tenant_id or "")
+        .. "\n" .. ngx.md5(conf.api_key or "") .. "\n" .. (instance_id(conf) or ""))
 end
 
 -- ── Delivery settings, shared across workers ─────────────────
 --
 -- A timer runs in whichever worker scheduled it, long after the request whose
--- settings it saw -- so it must not use the conf it captured: that conf may
--- hold a key the operator has since rotated. Each push records the
--- destination's current settings in the dict when they differ from what is
--- there (one shm read per push; a write only on change); every flush reads
--- them. Nothing is cached per worker, so a lost entry is rewritten by the
--- very next push.
+-- settings it saw, so each buffer's settings live in the dict and every
+-- flush reads them from there. With the key part of the buffer key, a
+-- buffer's settings never change; a new key means a new buffer (see
+-- follow_instance).
 
 local function settings_of(conf)
     return {
@@ -127,62 +159,113 @@ local function load_settings(dict, bkey)
     return type(s) == "table" and s or nil
 end
 
--- Destinations with a buffer, for the re-arm timer: a JSON list of buffer
--- keys. Read-modify-write under a short lock, and only when this destination
--- is missing; a push that does not get the lock leaves it to the next one.
+local function destinations(dict)
+    local list = cjson.decode(dict:get(DESTINATIONS_KEY) or "[]")
+    return type(list) == "table" and list or {}
+end
+
+-- Buffers, for the re-arm timer and eviction: a JSON list of buffer keys.
+-- Read-modify-write under a short lock, only when this buffer is missing; a
+-- push that does not get the lock leaves it to the next one.
 local function register(dict, bkey)
     local raw = dict:get(DESTINATIONS_KEY)
     if raw and string.find(raw, '"' .. bkey .. '"', 1, true) then return end
-    if not dict:add(DESTINATIONS_KEY .. ":lock", true, 1) then return end
-    local list = cjson.decode(dict:get(DESTINATIONS_KEY) or "[]")
-    if type(list) ~= "table" then list = {} end
+    if not dict:safe_add(DESTINATIONS_KEY .. ":lock", true, 1) then return end
+    local list = destinations(dict)
     local found = false
     for _, k in ipairs(list) do
         if k == bkey then found = true; break end
     end
     if not found then
         list[#list + 1] = bkey
-        dict:set(DESTINATIONS_KEY, cjson.encode(list))
+        dict:safe_set(DESTINATIONS_KEY, cjson.encode(list))
     end
+    dict:delete(DESTINATIONS_KEY .. ":lock")
+end
+
+local function unregister(dict, bkey)
+    if not dict:safe_add(DESTINATIONS_KEY .. ":lock", true, 1) then return end
+    local list, keep = destinations(dict), {}
+    for _, k in ipairs(list) do
+        if k ~= bkey then keep[#keep + 1] = k end
+    end
+    dict:safe_set(DESTINATIONS_KEY, cjson.encode(keep))
     dict:delete(DESTINATIONS_KEY .. ":lock")
 end
 
 local function save_settings(dict, bkey, conf)
     local json = cjson.encode(settings_of(conf))
     if dict:get(bkey .. ":conf") ~= json then
-        dict:set(bkey .. ":conf", json)
+        dict:safe_set(bkey .. ":conf", json)
     end
     register(dict, bkey)
 end
 
--- ── Memory accounting ───────────────────────────────────────
+-- ── Key rotation, by plugin instance ────────────────────────
 --
--- What one list element really costs in the dict's slab allocator: the value
--- plus the node header, rounded up to the slab size -- a power of two up to
--- half a page, whole 4 KiB pages beyond. Counting raw bytes would put a
--- 1.2 KB event at 1.2 KB when it occupies 2 KiB.
-local function slot_bytes(n)
-    local s = n + 48
-    if s > 2048 then
-        return math.ceil(s / 4096) * 4096
+-- When an instance's api_key (or endpoint / tenant) changes, its buffer key
+-- changes too. Its old buffer -- typically events held on 401 while the key
+-- was being replaced -- is moved into the new one, so those events go out
+-- with the new key, and the old buffer is retired. Only that instance's own
+-- buffer moves; no other instance's events are touched. For RETIRED_GRACE a
+-- push to the retired buffer (a worker still on the old configuration) is
+-- redirected to the new one, so the two cannot keep swapping events.
+--
+-- Without an instance id (not the case on Kong 3.x) nothing is moved: the
+-- old buffer keeps its old key, bounded like any refused destination.
+
+local function retire(dict, old, new)
+    local moved, lost = 0, 0
+    while true do
+        -- Newest of the old buffer first, each to the head of the new one:
+        -- the old events end up in front, in order.
+        local item = dict:rpop(old)
+        if not item then break end
+        if dict:lpush(new, item) then
+            moved = moved + 1
+        else
+            lost = lost + 1
+        end
     end
-    local p = 16
-    while p < s do p = p * 2 end
-    return p
+    dict:safe_set(RETIRED_PREFIX .. old, new, RETIRED_GRACE)
+    for _, suffix in ipairs({ ":conf", ":held", ":failing", ":backoff", ":pending", ":kick" }) do
+        dict:delete(old .. suffix)
+    end
+    unregister(dict, old)
+    return moved, lost
 end
 
-local function account(dict, bkey, delta)
-    if delta == 0 then return end
-    dict:incr(bkey .. ":bytes", delta, 0)
-    dict:incr(BYTES_KEY, delta, 0)
+-- The buffer this push goes to, and whether conf is its own (false: a
+-- redirect from a retired buffer, whose successor has its own settings).
+local function follow_instance(dict, conf)
+    local bkey = M.key(conf)
+    local inst = instance_id(conf)
+    if not inst then return bkey, true end
+
+    local successor = dict:get(RETIRED_PREFIX .. bkey)
+    if successor then return successor, false end
+
+    local ikey = INSTANCE_PREFIX .. inst
+    local prev = dict:get(ikey)
+    if prev ~= bkey then
+        if prev and dict:safe_add(prev .. ":migrating", true, 30) then
+            local moved, lost = retire(dict, prev, bkey)
+            dict:delete(prev .. ":migrating")
+            if moved > 0 or lost > 0 then
+                kong.log.warn("[aforo-metering] The settings of plugin ", inst, " changed (",
+                    "api_key, aforo_endpoint or tenant_id): ", moved, " buffered event(s) will go out ",
+                    "with the new settings", lost > 0 and (", " .. lost .. " lost: shared dict full") or "", ".")
+            end
+        end
+        dict:safe_set(ikey, bkey)
+    end
+    return bkey, true
 end
 
-local function used(dict, key)
-    return math.max(0, tonumber(dict:get(key)) or 0)
-end
+-- ── Memory ──────────────────────────────────────────────────
 
-local function events_budget(dict)
-    return math.floor(dict:capacity() * EVENTS_BUDGET_FRACTION)
+local function reserve(dict)
+    return math.max(dict:capacity() * RESERVE_FRACTION, 4 * MAX_EVENT_BYTES)
 end
 
 -- Days-from-civil: a UTC calendar time as epoch seconds, without os.time
@@ -208,7 +291,7 @@ end
 -- concurrent flushes in different workers take disjoint events: nothing is sent
 -- twice and nothing is lost between a read and a delete.
 local function pop_batch(dict, bkey, max)
-    local batch, bytes = {}, 0
+    local batch = {}
     for i = 1, max do
         local item, err = dict:lpop(bkey)
         if not item then
@@ -218,60 +301,77 @@ local function pop_batch(dict, bkey, max)
             break
         end
         batch[i] = item
-        bytes = bytes + slot_bytes(#item)
     end
-    account(dict, bkey, -bytes)
     return batch
 end
 
 -- Drop n events from one end of a buffer ("head" = oldest, "tail" = newest).
 local function drop(dict, bkey, n, from)
-    local dropped, bytes = 0, 0
+    local dropped = 0
     for _ = 1, n do
         local item = (from == "head") and dict:lpop(bkey) or dict:rpop(bkey)
         if not item then break end
         dropped = dropped + 1
-        bytes = bytes + slot_bytes(#item)
     end
-    account(dict, bkey, -bytes)
     return dropped
 end
 
--- Put events back at the head of the buffer, oldest first, and trim the
--- buffer to its limit. Returns how many events were dropped.
+-- Make room by evicting the oldest events of other buffers: refused (held)
+-- ones first, then ones whose last flush failed. Never except_bkey's own.
+-- Returns how many events went.
+local function evict_failing(dict, except_bkey, n)
+    local list = destinations(dict)
+    local evicted = 0
+    for _, marker in ipairs({ ":held", ":failing" }) do
+        for _, bkey in ipairs(list) do
+            if evicted >= n then break end
+            if bkey ~= except_bkey and dict:get(bkey .. marker) then
+                evicted = evicted + drop(dict, bkey, n - evicted, "head")
+            end
+        end
+    end
+    if evicted > 0 then
+        log_throttled("warn", "evict_failing", 10, "[aforo-metering] Shared dict '", BUFFER_DICT,
+            "' is nearly full: dropped the oldest ", evicted, " event(s) of destinations the ingestor ",
+            "is refusing or failing, to keep metering the others. Repeats suppressed for 10s.")
+    end
+    return evicted
+end
+
+-- Put events back at the head of the buffer, oldest first, under the same
+-- rules as a push. Returns how many events were dropped.
 --
--- Normally the OLDEST are kept and the newest dropped: they are the ones
--- closest to falling outside the ingestor's acceptance window, and recent
--- events are recoverable from upstream logs far more often than old ones. If
--- the dict runs out of memory mid-way, the newest event in the buffer makes
--- room -- that used to be the other way round: the push loop runs newest
--- to oldest, so a full dict silently dropped the oldest, and the log blamed
--- MAX_BUFFER_SIZE. A held destination keeps its NEWEST instead, within
--- HELD_MAX_AGE_SECONDS: its oldest are the ones about to become undeliverable.
+-- Normally the OLDEST are kept: they are the ones closest to falling outside
+-- the ingestor's acceptance window, and recent events are recoverable from
+-- upstream logs far more often than old ones. A held destination keeps its
+-- NEWEST instead, within HELD_MAX_AGE_SECONDS: its oldest are the ones about
+-- to become undeliverable. Out of memory, a buffer that is not held may evict
+-- refused or failing destinations' oldest events; a held one evicts nobody.
 local function rebuffer(dict, bkey, batch, held)
-    local dropped, bytes = 0, 0
+    local dropped = 0
     local oldest_ok = held and (ngx.now() - HELD_MAX_AGE_SECONDS) or nil
-    for i = #batch, 1, -1 do
+    local first = 1
+    if held then
+        -- Only as many as fit, and those the newest of the batch.
+        local room = math.max(0, HELD_MAX_EVENTS - (dict:llen(bkey) or 0))
+        if #batch > room then
+            first = #batch - room + 1
+            dropped = dropped + first - 1
+        end
+    end
+    for i = #batch, first, -1 do
         local item = batch[i]
         local t = oldest_ok and occurred_at(item)
         if t and t < oldest_ok then
             dropped = dropped + 1
         else
-            local len = dict:lpush(bkey, item)
-            while not len do
-                -- Out of memory: make room at the newest end, then retry.
-                if drop(dict, bkey, 1, "tail") == 0 then break end
-                dropped = dropped + 1
-                len = dict:lpush(bkey, item)
+            local ok = dict:lpush(bkey, item)
+            if not ok and not held and evict_failing(dict, bkey, EVICT_BATCH) > 0 then
+                ok = dict:lpush(bkey, item)
             end
-            if len then
-                bytes = bytes + slot_bytes(#item)
-            else
-                dropped = dropped + 1
-            end
+            if not ok then dropped = dropped + 1 end
         end
     end
-    account(dict, bkey, bytes)
 
     local limit = held and HELD_MAX_EVENTS or MAX_BUFFER_SIZE
     local len = dict:llen(bkey) or 0
@@ -279,34 +379,6 @@ local function rebuffer(dict, bkey, batch, held)
         dropped = dropped + drop(dict, bkey, len - limit, held and "head" or "tail")
     end
     return dropped
-end
-
--- Make room for need bytes by evicting the oldest events of destinations the
--- ingestor is refusing (never except_bkey's own). Returns true when enough
--- was freed.
-local function evict_held(dict, except_bkey, need)
-    local list = cjson.decode(dict:get(DESTINATIONS_KEY) or "[]")
-    if type(list) ~= "table" then return false end
-    local freed, evicted = 0, 0
-    for _, bkey in ipairs(list) do
-        if bkey ~= except_bkey and dict:get(bkey .. ":held") then
-            while freed < need do
-                local item = dict:lpop(bkey)
-                if not item then break end
-                local b = slot_bytes(#item)
-                account(dict, bkey, -b)
-                freed = freed + b
-                evicted = evicted + 1
-            end
-        end
-        if freed >= need then break end
-    end
-    if evicted > 0 then
-        log_throttled("warn", "evict_held", 10, "[aforo-metering] Shared dict '", BUFFER_DICT,
-            "' is nearly full: dropped ", evicted, " event(s) of a destination the ingestor is ",
-            "refusing (401/403/404), to keep metering the others. Repeats suppressed for 10s.")
-    end
-    return freed >= need
 end
 
 -- A 2xx can still carry per-event failures: /v1/ingest/batch answers 202
@@ -421,20 +493,22 @@ local function send_batch(settings, batch, timeout_ms, attempts)
                 "[aforo-metering] The ingestor answered ", status, " for ", settings.aforo_endpoint,
                 " -- check api_key, its usage-events:ingest permission, tenant_id and ",
                 "aforo_endpoint. The newest ", HELD_MAX_EVENTS, " events (none older than 72 h) are ",
-                "KEPT and retried every flush_interval_ms with the current settings. Response: ",
+                "KEPT and retried every flush_interval_ms. Response: ",
                 resp_body, ". Repeats suppressed for 60s.")
             return "held"
         end
 
         -- 400: the ingestor could not read the batch (one malformed event
         -- fails the whole request -- non-UTF-8 bytes are the classic). 413:
-        -- too big. Either way, halves may well pass: the caller bisects, so
-        -- one bad event costs only itself. A single event that still gets 400
-        -- is dropped, with the reason.
+        -- too big for the ingestor or a proxy in front of it. Either way,
+        -- halves may well pass: the caller bisects, so one bad event costs
+        -- only itself and an oversized batch goes out in smaller parts. A
+        -- single event that still gets 400 or 413 is dropped, with the reason.
         if status == 400 or status == 413 then
-            if #batch > 1 then return "split", resp_body end
-            log_throttled("err", "ingest_rejected_event", 60,
+            if #batch > 1 then return "split", resp_body, status end
+            log_throttled("err", "ingest_rejected_event_" .. status, 60,
                 "[aforo-metering] The ingestor rejected an event with ", status,
+                status == 413 and " (too large for the ingestor or a proxy in front of it)" or "",
                 " -- dropping it. Response: ", resp_body, ". Repeats suppressed for 60s.")
             return "rejected"
         end
@@ -493,16 +567,18 @@ end
 
 -- Send events, bisecting on 400 / 413. Returns the events to keep.
 -- ctx: settings, started, timeout_ms, attempts, no_split; set here: stop,
--- held, failed. A known (outcome, retry) for these events may be passed in.
+-- held, failed, got_2xx. A known (outcome, retry, status) for these events
+-- may be passed in.
 local deliver
-deliver = function(ctx, events, depth, outcome, retry)
+deliver = function(ctx, events, depth, outcome, retry, status)
     if ctx.stop then return events end
     if not outcome then
         if over_budget(ctx) then return events end
-        outcome, retry = send_batch(ctx.settings, events, ctx.timeout_ms, ctx.attempts)
+        outcome, retry, status = send_batch(ctx.settings, events, ctx.timeout_ms, ctx.attempts)
     end
 
     if outcome == "sent" then
+        ctx.got_2xx = true
         if #retry > 0 then ctx.stop, ctx.failed = true, true end
         return retry
     elseif outcome == "rejected" then
@@ -515,7 +591,7 @@ deliver = function(ctx, events, depth, outcome, retry)
         return events
     end
 
-    -- "split"
+    -- "split" (400 or 413 on several events)
     if ctx.no_split then
         ctx.stop, ctx.failed = true, true
         return events
@@ -523,17 +599,20 @@ deliver = function(ctx, events, depth, outcome, retry)
     local mid = math.floor(#events / 2)
     local left, right = slice(events, 1, mid), slice(events, mid + 1, #events)
 
-    if depth == 0 then
-        -- If both halves of the first split are refused too, it is not an
-        -- event: it is the request -- a wrong aforo_endpoint path, a WAF in
-        -- front of the ingestor. Bisecting further cost 2n-1 POSTs per flush
-        -- (1,997 for 1,000 events). Stop, and keep the events as for a 404.
+    if depth == 0 and status == 400 then
+        -- If both halves of the first split are refused with 400 too, it is
+        -- not an event: it is the request -- a wrong aforo_endpoint path, a
+        -- WAF in front of the ingestor. Bisecting further cost 2n-1 POSTs per
+        -- flush. Stop, and keep the events as for a 404. Only for 400: a 413
+        -- means "too big", and smaller parts are exactly the answer -- they
+        -- are bisected down to single events (2026-10-13 fix: a 413 that
+        -- also refused both halves used to hold the destination for good).
         if over_budget(ctx) then return events end
-        local lo, lr = send_batch(ctx.settings, left, ctx.timeout_ms, ctx.attempts)
-        if lo == "split" then
+        local lo, lr, ls = send_batch(ctx.settings, left, ctx.timeout_ms, ctx.attempts)
+        if lo == "split" and ls == 400 then
             if over_budget(ctx) then return events end
-            local ro, rr = send_batch(ctx.settings, right, ctx.timeout_ms, ctx.attempts)
-            if ro == "split" then
+            local ro, rr, rs = send_batch(ctx.settings, right, ctx.timeout_ms, ctx.attempts)
+            if ro == "split" and rs == 400 then
                 log_throttled("err", "ingest_request_400", 60,
                     "[aforo-metering] The ingestor answers 400 to every part of the batch, so the ",
                     "request itself is refused, not an event -- check aforo_endpoint and anything ",
@@ -542,10 +621,10 @@ deliver = function(ctx, events, depth, outcome, retry)
                 ctx.stop, ctx.held = true, true
                 return events
             end
-            local keep = deliver(ctx, left, depth + 1, lo, lr)
-            return append(keep, deliver(ctx, right, depth + 1, ro, rr))
+            local keep = deliver(ctx, left, depth + 1, lo, lr, ls)
+            return append(keep, deliver(ctx, right, depth + 1, ro, rr, rs))
         end
-        local keep = deliver(ctx, left, depth + 1, lo, lr)
+        local keep = deliver(ctx, left, depth + 1, lo, lr, ls)
         return append(keep, deliver(ctx, right, depth + 1))
     end
 
@@ -556,12 +635,12 @@ end
 local flush_timer
 
 -- A timed flush is always pending while this buffer holds events: one per
--- buffer across all workers, claimed with add(). The TTL is a safety net for
--- a timer lost with its worker; the re-arm timer (init_worker) and the next
--- push then schedule a new one.
+-- buffer across all workers, claimed with safe_add(). The TTL is a safety
+-- net for a timer lost with its worker; the re-arm timer (init_worker) and
+-- the next push then schedule a new one.
 local function ensure_pending(dict, bkey, settings)
     local interval = interval_seconds(settings)
-    if dict:add(bkey .. ":pending", true, interval + 10) then
+    if dict:safe_add(bkey .. ":pending", true, interval + 10) then
         local ok, err = ngx.timer.at(interval, flush_timer, bkey, false)
         if not ok then
             dict:delete(bkey .. ":pending")
@@ -578,42 +657,49 @@ local function drain(dict, bkey, settings)
         if #batch == 0 then break end
 
         local keep = deliver(ctx, batch, 0)
+
+        -- The destination works again as soon as anything got a 2xx -- also a
+        -- 202 that reports a transient per-event error (2026-10-13 fix).
+        if ctx.held then
+            dict:safe_set(bkey .. ":held", true, HELD_TTL)
+        elseif ctx.got_2xx then
+            dict:delete(bkey .. ":held")
+        end
+
         if #keep > 0 then
             -- Re-buffer what was not delivered (2026-09-01 fix). The events were
             -- taken off the buffer before the first attempt, so an ingestor
             -- outage outlasting the retries used to destroy the only copy of
             -- them: unbilled usage, no dead-letter, nothing to reconstruct from.
-            -- Once a minute per destination: a refused or failing destination
-            -- is retried every flush_interval_ms, and one line per retry
-            -- buried everything else in the log.
             local dropped = rebuffer(dict, bkey, keep, ctx.held)
-            if ctx.held then
-                log_throttled("err", "held_" .. bkey, 60, "[aforo-metering] Delivery refused for ",
-                    settings.aforo_endpoint, "; ", #keep - dropped, " event(s) kept", dropped > 0
-                    and (", " .. dropped .. " dropped (over " .. HELD_MAX_EVENTS .. " events or older than 72 h)")
-                    or "", ". Repeats suppressed for 60s.")
-            elseif ctx.failed then
-                log_throttled("err", "failed_" .. bkey, 60, "[aforo-metering] Delivery to ",
-                    settings.aforo_endpoint, " failed. ", #keep - dropped,
-                    " event(s) re-buffered for retry on the next flush",
-                    dropped > 0 and (", " .. dropped .. " dropped: the buffer or the shared dict is full") or "",
-                    ". Repeats suppressed for 60s.")
+            local what = ctx.held and "refused" or "failed"
+            if dropped > 0 then
+                -- Never throttled: these events are gone.
+                kong.log.err("[aforo-metering] Delivery to ", settings.aforo_endpoint, " ", what,
+                    ": ", #keep - dropped, " event(s) kept, ", dropped, " dropped (",
+                    ctx.held and ("over " .. HELD_MAX_EVENTS .. " events, older than 72 h, or no memory")
+                        or "the buffer or the shared dict is full", ").")
+            elseif ctx.held or ctx.failed then
+                -- Once a minute per destination: a refused or failing
+                -- destination is retried every flush_interval_ms, and one line
+                -- per retry buried everything else in the log.
+                log_throttled("err", what .. "_" .. bkey, 60, "[aforo-metering] Delivery to ",
+                    settings.aforo_endpoint, " ", what, ": ", #keep, " event(s) kept for retry. ",
+                    "Repeats suppressed for 60s.")
             end
         end
 
-        if ctx.held then
-            dict:set(bkey .. ":held", true, HELD_TTL)
-        end
         if ctx.stop then
             if ctx.held or ctx.failed then
                 -- Back off: no immediate flush until flush_interval_ms has
                 -- passed. Without it, every request past flush_count started
                 -- another flush against an ingestor that was already failing.
-                dict:set(bkey .. ":backoff", true, interval_seconds(settings))
+                dict:safe_set(bkey .. ":backoff", true, interval_seconds(settings))
+                dict:safe_set(bkey .. ":failing", true, interval_seconds(settings) * 3 + 10)
             end
             return
         end
-        dict:delete(bkey .. ":held")
+        dict:delete(bkey .. ":failing")
         if #batch < MAX_BATCH_SIZE then return end
     end
 end
@@ -629,7 +715,13 @@ local function shutdown_send(dict, bkey, settings)
     local ctx = { settings = settings, started = ngx.now(), no_split = true,
                   timeout_ms = SHUTDOWN_SEND_TIMEOUT_MS, attempts = 1 }
     local keep = deliver(ctx, batch, 0)
-    if #keep > 0 then rebuffer(dict, bkey, keep, ctx.held) end
+    if #keep > 0 then
+        local dropped = rebuffer(dict, bkey, keep, ctx.held or dict:get(bkey .. ":held"))
+        if dropped > 0 then
+            kong.log.err("[aforo-metering] Shutdown flush to ", settings.aforo_endpoint, ": ",
+                dropped, " event(s) dropped putting the rest back.")
+        end
+    end
 end
 
 flush_timer = function(premature, bkey, immediate)
@@ -652,8 +744,12 @@ flush_timer = function(premature, bkey, immediate)
 
     if not immediate then dict:delete(bkey .. ":pending") end
     if not settings then
-        log_throttled("err", "no_settings", 60, "[aforo-metering] No delivery settings for a buffer ",
-            "-- its events wait for the next request to that destination. Repeats suppressed for 60s.")
+        -- A retired buffer (its instance moved on) has none, and is empty.
+        if (dict:llen(bkey) or 0) > 0 then
+            log_throttled("err", "no_settings", 60, "[aforo-metering] No delivery settings for a ",
+                "buffer -- its events wait for the next request to that destination. Repeats ",
+                "suppressed for 60s.")
+        end
         if immediate then dict:delete(bkey .. ":kick") end
         return
     end
@@ -661,7 +757,7 @@ flush_timer = function(premature, bkey, immediate)
     -- At most one flush per buffer at a time, across workers. The token makes
     -- sure a flush only ever releases its own lock.
     local token = tostring(ngx.worker.pid()) .. ":" .. tostring(ngx.now()) .. ":" .. tostring(math.random(1e9))
-    if dict:add(bkey .. ":lock", token, FLUSH_LOCK_TTL) then
+    if dict:safe_add(bkey .. ":lock", token, FLUSH_LOCK_TTL) then
         local ok, err = pcall(drain, dict, bkey, settings)
         if dict:get(bkey .. ":lock") == token then dict:delete(bkey .. ":lock") end
         if not ok then kong.log.err("[aforo-metering] Flush failed: ", tostring(err)) end
@@ -681,7 +777,7 @@ local function schedule(dict, bkey, settings, count)
     if count >= (tonumber(settings.flush_count) or 50)
         and not dict:get(bkey .. ":lock")
         and not dict:get(bkey .. ":backoff")
-        and dict:add(bkey .. ":kick", true, FLUSH_LOCK_TTL) then
+        and dict:safe_add(bkey .. ":kick", true, FLUSH_LOCK_TTL) then
         local ok, err = ngx.timer.at(0, flush_timer, bkey, true)
         if not ok then
             dict:delete(bkey .. ":kick")
@@ -698,61 +794,61 @@ function M.push(conf, encoded)
             "Add 'lua_shared_dict aforo_buffer 10m;' to kong.conf")
         return false
     end
-    local bkey = M.key(conf)
-    save_settings(dict, bkey, conf)
-    local settings = settings_of(conf)
+    if #encoded > MAX_EVENT_BYTES then
+        log_throttled("err", "event_too_large", 60, "[aforo-metering] Not buffering an event of ",
+            #encoded, " bytes (the limit is ", MAX_EVENT_BYTES, "). Repeats suppressed for 60s.")
+        return false
+    end
+
+    local bkey, own = follow_instance(dict, conf)
+    local settings
+    if own then
+        save_settings(dict, bkey, conf)
+        settings = settings_of(conf)
+    else
+        settings = load_settings(dict, bkey) or settings_of(conf)
+    end
 
     local held = dict:get(bkey .. ":held")
-    local cost = slot_bytes(#encoded)
-    local budget = events_budget(dict)
     local count = dict:llen(bkey) or 0
-
-    -- This destination's own limit: fewer, and less memory, while the
-    -- ingestor is refusing it. Over it, the newest event is the one dropped.
-    local max_events = held and HELD_MAX_EVENTS or MAX_BUFFER_SIZE
-    local max_bytes = held and math.floor(budget * HELD_BUDGET_FRACTION) or budget
-    if count >= max_events or used(dict, bkey .. ":bytes") + cost > max_bytes then
-        if held then
-            log_throttled("warn", "buffer_full_held", 10, "[aforo-metering] Not buffering more events ",
-                "for ", settings.aforo_endpoint, ": the ingestor is refusing it (401/403/404) and it ",
-                "already holds ", count, " event(s) -- the most this plugin keeps for a refused ",
-                "destination. Fix api_key / aforo_endpoint; see the flush errors. Repeats suppressed for 10s.")
-        else
-            log_throttled("warn", "buffer_full", 10, "[aforo-metering] Buffer full for ",
-                settings.aforo_endpoint, " (", count, " events) -- dropping the newest event. The ",
-                "ingestor is failing or unreachable; see the flush errors. Repeats suppressed for 10s.")
+    if held then
+        -- Refused: keep the newest -- a new event pushes out the oldest.
+        if count >= HELD_MAX_EVENTS then
+            drop(dict, bkey, count - HELD_MAX_EVENTS + 1, "head")
+            log_throttled("warn", "buffer_full_held", 10, "[aforo-metering] ", settings.aforo_endpoint,
+                " is refusing this plugin's events (401/403/404, or 400 for every request), and it ",
+                "keeps only its newest ", HELD_MAX_EVENTS, ": dropping the oldest. Fix api_key / ",
+                "aforo_endpoint; see the flush errors. Repeats suppressed for 10s.")
         end
+    elseif count >= MAX_BUFFER_SIZE then
+        log_throttled("warn", "buffer_full", 10, "[aforo-metering] Buffer full for ",
+            settings.aforo_endpoint, " (", count, " events) -- dropping the newest event. The ",
+            "ingestor is failing or unreachable; see the flush errors. Repeats suppressed for 10s.")
         -- Keep a flush coming: a full buffer must still drain once the
         -- ingestor recovers.
         schedule(dict, bkey, settings, count)
         return false
     end
 
-    -- All destinations together. A failing destination must never cost a
-    -- healthy one its events: under pressure, the refused destinations' events
-    -- make room first; a refused destination itself gets no more room.
-    local total = used(dict, BYTES_KEY)
-    if total + cost > budget and (held or not evict_held(dict, bkey, total + cost - budget)) then
-        log_throttled("err", "dict_full", 10, "[aforo-metering] Shared dict '", BUFFER_DICT,
-            "' is full of buffered events (", math.floor(total / 1024), " KiB of the ",
-            math.floor(budget / 1024), " KiB events may use) -- dropping the newest event. The ",
-            "ingestor is failing or unreachable; see the flush errors. Raise lua_shared_dict ",
-            BUFFER_DICT, " if this recurs. Repeats suppressed for 10s.")
-        schedule(dict, bkey, settings, count)
-        return false
+    -- A refused or failing destination must never cost a healthy one its
+    -- events: when the dict runs low, a healthy push first evicts their
+    -- oldest events. A refused or failing destination evicts nobody.
+    local healthy = not held and not dict:get(bkey .. ":failing")
+    if healthy and dict:free_space() < reserve(dict) then
+        evict_failing(dict, bkey, EVICT_BATCH)
     end
-
     local n, push_err = dict:rpush(bkey, encoded)
-    if not n and not held and evict_held(dict, bkey, cost) then
+    if not n and healthy and evict_failing(dict, bkey, EVICT_BATCH * 4) > 0 then
         n, push_err = dict:rpush(bkey, encoded)
     end
     if not n then
-        log_throttled("err", "dict_no_memory", 10, "[aforo-metering] Could not buffer an event: ",
-            "shared dict '", BUFFER_DICT, "' is out of memory (", tostring(push_err), "). Raise ",
-            "lua_shared_dict ", BUFFER_DICT, ". Event not metered. Repeats suppressed for 10s.")
+        log_throttled("err", "dict_full", 10, "[aforo-metering] Could not buffer an event: ",
+            "shared dict '", BUFFER_DICT, "' is full (", tostring(push_err), "). The ingestor is ",
+            "failing or unreachable -- see the flush errors -- or the dict is small for this ",
+            "traffic: raise lua_shared_dict ", BUFFER_DICT, ". Event not metered. Repeats suppressed for 10s.")
+        schedule(dict, bkey, settings, count)
         return false
     end
-    account(dict, bkey, cost)
     schedule(dict, bkey, settings, n)
     return true
 end
@@ -764,9 +860,7 @@ local function rearm(premature)
     if premature then return end
     local dict = ngx.shared[BUFFER_DICT]
     if not dict then return end
-    local list = cjson.decode(dict:get(DESTINATIONS_KEY) or "[]")
-    if type(list) ~= "table" then return end
-    for _, bkey in ipairs(list) do
+    for _, bkey in ipairs(destinations(dict)) do
         if (dict:llen(bkey) or 0) > 0 then
             local settings = load_settings(dict, bkey)
             if settings then ensure_pending(dict, bkey, settings) end
@@ -786,13 +880,18 @@ end
 -- destination now, with conf as its current settings.
 function M.flush(premature, conf, immediate)
     local dict = ngx.shared[BUFFER_DICT]
-    if dict then save_settings(dict, M.key(conf), conf) end
-    return flush_timer(premature, M.key(conf), immediate)
+    local bkey = M.key(conf)
+    if dict then
+        local own
+        bkey, own = follow_instance(dict, conf)
+        if own then save_settings(dict, bkey, conf) end
+    end
+    return flush_timer(premature, bkey, immediate)
 end
 
 M.MAX_BUFFER_SIZE = MAX_BUFFER_SIZE
 M.HELD_MAX_EVENTS = HELD_MAX_EVENTS
+M.MAX_EVENT_BYTES = MAX_EVENT_BYTES
 M._rearm = rearm
-M._slot_bytes = slot_bytes
 
 return M

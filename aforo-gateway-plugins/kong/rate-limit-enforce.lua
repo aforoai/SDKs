@@ -55,7 +55,7 @@ end
 -- warning would log on every request.
 local function log_throttled(level, key, ttl, ...)
     local dict = ngx.shared[BUFFER_DICT]
-    if dict and not dict:add("aforo:warn:" .. key, 1, ttl) then return end
+    if dict and not dict:safe_add("aforo:warn:" .. key, 1, ttl) then return end
     kong.log[level](...)
 end
 
