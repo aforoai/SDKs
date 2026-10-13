@@ -22,7 +22,9 @@
 --   <key>:held       the ingestor is refusing this destination (401/403/404,
 --                    or a 400 for the request as a whole); tighter limits apply
 --   <key>:held_n     consecutive refused flushes, for the retry back-off
--- and aforo:destinations, every buffer, for the re-arm timer and eviction.
+--   <key>:reg        this buffer is in the registry (TTL follows :conf)
+-- and aforo:registry, a list of every buffer, for the re-arm timer and
+-- eviction.
 --
 -- Memory: there is no byte accounting -- counters of what the events occupy
 -- drift. Only ground truth is used: a buffer's length (llen), the dict's free
@@ -40,7 +42,14 @@ local M = {}
 
 local BUFFER_DICT = "aforo_buffer"
 local KEY_PREFIX = "aforo:events:"
-local DESTINATIONS_KEY = "aforo:destinations"
+-- A list, one buffer key per element (2026-10-13). It was one JSON string,
+-- rewritten whenever a destination was added. On a full dict, safe_set of an
+-- existing key whose new value falls into another slab size class frees the
+-- old value and then fails -- so growing the string past a size class (the
+-- 4th, 9th, 20th, 41st... destination) deleted the whole registry, and with
+-- it eviction and re-arm. A list grows one small element at a time and is
+-- never rewritten.
+local REGISTRY_KEY = "aforo:registry"
 
 -- Events per buffer. Past it the newest events are dropped.
 local MAX_BUFFER_SIZE = 10000
@@ -161,50 +170,89 @@ local function load_settings(dict, bkey)
     return type(s) == "table" and s or nil
 end
 
-local function destinations(dict)
-    local list = cjson.decode(dict:get(DESTINATIONS_KEY) or "[]")
-    return type(list) == "table" and list or {}
+-- Add this buffer to the registry, once: the :reg marker (safe_add)
+-- deduplicates, and one rpush adds it. A failed rpush loses at most this one
+-- entry; the marker goes with it, so the buffer's next push tries again.
+local function register(dict, bkey)
+    if dict:get(bkey .. ":reg") then return end
+    if (dict:llen(REGISTRY_KEY) or 0) >= MAX_DESTINATIONS then
+        log_throttled("err", "registry_full", 300, "[aforo-metering] More than ", MAX_DESTINATIONS,
+            " destinations (aforo_endpoint + tenant_id + api_key) are buffering at once; a new one ",
+            "is still delivered, but not re-armed after a reload. Repeats suppressed for 300s.")
+        return
+    end
+    if not dict:safe_add(bkey .. ":reg", true, CONF_TTL) then return end
+    local ok, err = dict:rpush(REGISTRY_KEY, bkey)
+    if not ok then
+        dict:delete(bkey .. ":reg")
+        log_throttled("warn", "registry_push", 60, "[aforo-metering] Could not add a destination to ",
+            "the registry (", tostring(err), "); retried on its next push. Repeats suppressed for 60s.")
+    end
 end
 
--- Buffers, for the re-arm timer and eviction: a JSON list of buffer keys.
--- Read-modify-write under a short lock, only when this buffer is missing; a
--- push that does not get the lock leaves it to the next one. rearm prunes
--- buffers that are empty and whose settings have expired.
-local function register(dict, bkey)
-    local raw = dict:get(DESTINATIONS_KEY)
-    if raw and string.find(raw, '"' .. bkey .. '"', 1, true) then return end
-    if not dict:safe_add(DESTINATIONS_KEY .. ":lock", true, 1) then return end
-    local list = destinations(dict)
-    local found = false
-    for _, k in ipairs(list) do
-        if k == bkey then found = true; break end
-    end
-    if not found then
-        if #list >= MAX_DESTINATIONS then
-            log_throttled("err", "registry_full", 300, "[aforo-metering] More than ", MAX_DESTINATIONS,
-                " destinations (aforo_endpoint + tenant_id + api_key) are buffering at once; a new one ",
-                "is still delivered, but not re-armed after a reload. Repeats suppressed for 300s.")
+-- Visit every registered buffer: a list cannot be read without taking from
+-- it, so each entry is popped and pushed back. visit(bkey) returning false
+-- removes the entry (and its markers); returning "stop" ends the walk. An
+-- entry added meanwhile by another worker is simply visited or not. A
+-- failed push-back loses that one entry: its :reg marker is deleted so the
+-- buffer's next push registers it again.
+local function each_destination(dict, visit)
+    local n = dict:llen(REGISTRY_KEY) or 0
+    for _ = 1, n do
+        local bkey = dict:lpop(REGISTRY_KEY)
+        if not bkey then break end
+        local verdict = visit(bkey)
+        if verdict == false then
+            for _, suffix in ipairs({ ":reg", ":held", ":held_n", ":failing", ":backoff" }) do
+                dict:delete(bkey .. suffix)
+            end
         else
-            list[#list + 1] = bkey
-            dict:safe_set(DESTINATIONS_KEY, cjson.encode(list))
+            if not dict:rpush(REGISTRY_KEY, bkey) then
+                dict:delete(bkey .. ":reg")
+                log_throttled("warn", "registry_push", 60, "[aforo-metering] Could not keep a ",
+                    "destination in the registry (no memory); retried on its next push. Repeats ",
+                    "suppressed for 60s.")
+            end
+            if verdict == "stop" then break end
         end
     end
-    dict:delete(DESTINATIONS_KEY .. ":lock")
 end
 
--- Record this buffer's settings, and keep them alive as long as its events.
+-- Record this buffer's settings and keep them alive as long as its events.
+-- Returns whether the buffer has settings now: a buffer without them must
+-- never take an event (it could never be delivered).
+--
+-- Rewritten only when needed: endpoint, tenant and key are the buffer's key,
+-- so two confs for one buffer can differ only in flush_interval_ms /
+-- flush_count -- two plugin instances sharing a destination. The rule: the
+-- settings in the dict stay; a push re-asserts its own flush settings only
+-- when the entry is due for its hourly TTL refresh. So two such instances
+-- take turns at most hourly, never per push, and a changed flush setting
+-- takes effect within the hour. A rewrite that fails (on a full dict a value
+-- of another size class frees the old one and then fails) restores the
+-- previous value, whose freed slot fits it.
 local function save_settings(dict, bkey, conf)
     local ckey = bkey .. ":conf"
-    local json = cjson.encode(settings_of(conf))
-    if dict:get(ckey) ~= json then
-        dict:safe_set(ckey, json, CONF_TTL)
+    local cur = dict:get(ckey)
+    if not cur then
+        dict:safe_set(ckey, cjson.encode(settings_of(conf)), CONF_TTL)
     else
         local ttl = dict:ttl(ckey)
         if ttl and ttl < CONF_TTL - CONF_REFRESH then
-            dict:expire(ckey, CONF_TTL)
+            local json = cjson.encode(settings_of(conf))
+            if json ~= cur then
+                if not dict:safe_set(ckey, json, CONF_TTL) then
+                    dict:safe_set(ckey, cur, CONF_TTL)
+                end
+            else
+                dict:expire(ckey, CONF_TTL)
+            end
+            dict:expire(bkey .. ":reg", CONF_TTL)
         end
     end
+    if dict:get(ckey) == nil then return false end
     register(dict, bkey)
+    return true
 end
 
 -- ── Memory ──────────────────────────────────────────────────
@@ -270,15 +318,15 @@ end
 -- ones first, then ones that are failing. Never except_bkey's own. Returns
 -- how many events went.
 local function evict_failing(dict, except_bkey, n)
-    local list = destinations(dict)
     local evicted = 0
     for _, marker in ipairs({ ":held", ":failing" }) do
-        for _, bkey in ipairs(list) do
-            if evicted >= n then break end
+        if evicted >= n then break end
+        each_destination(dict, function(bkey)
             if bkey ~= except_bkey and dict:get(bkey .. marker) then
                 evicted = evicted + drop(dict, bkey, n - evicted, "head")
             end
-        end
+            if evicted >= n then return "stop" end
+        end)
     end
     if evicted > 0 then
         log_throttled("warn", "evict_failing", 10, "[aforo-metering] Shared dict '", BUFFER_DICT,
@@ -812,7 +860,6 @@ function M.push(conf, encoded)
     end
 
     local bkey = M.key(conf)
-    save_settings(dict, bkey, conf)
     local settings = settings_of(conf)
 
     local held = dict:get(bkey .. ":held")
@@ -827,6 +874,7 @@ function M.push(conf, encoded)
                 "oldest. Fix api_key / aforo_endpoint; see the flush errors. Repeats suppressed for 60s.")
         end
     elseif count >= MAX_BUFFER_SIZE then
+        save_settings(dict, bkey, conf)
         log_throttled("warn", "buffer_full", 10, "[aforo-metering] Buffer full for ",
             settings.aforo_endpoint, " (", count, " events) -- dropping the newest event. The ",
             "ingestor is failing or unreachable; see the flush errors. Repeats suppressed for 10s.")
@@ -840,9 +888,27 @@ function M.push(conf, encoded)
     -- events: when the dict runs low, a healthy push evicts their oldest
     -- events -- as many as it takes, while there are any. A refused or
     -- failing destination evicts nobody.
+    --
+    -- Room first, then this buffer's settings: a buffer never takes an event
+    -- it has no settings to deliver with. (The settings used to be written
+    -- first; on a full dict that write failed, the eviction then made room,
+    -- and the event went into a buffer no flush could ever send.)
     local healthy = not held and not dict:get(bkey .. ":failing")
     if healthy and dict:free_space() < reserve(dict) then
         evict_failing(dict, bkey, EVICT_BATCH)
+    end
+    local has_settings = save_settings(dict, bkey, conf)
+    while not has_settings and healthy do
+        if evict_failing(dict, bkey, EVICT_BATCH) == 0 then break end
+        has_settings = save_settings(dict, bkey, conf)
+    end
+    if not has_settings then
+        log_throttled("err", "dict_full", 10, "[aforo-metering] Could not buffer an event: ",
+            "shared dict '", BUFFER_DICT, "' is full (no room for this destination's settings). The ",
+            "ingestor is failing or unreachable -- see the flush errors -- or the dict is small for ",
+            "this traffic: raise lua_shared_dict ", BUFFER_DICT, ". Event not metered. Repeats ",
+            "suppressed for 10s.")
+        return false
     end
     local n, push_err = dict:rpush(bkey, encoded)
     while not n and healthy do
@@ -869,39 +935,27 @@ local function rearm(premature)
     if premature then return end
     local dict = ngx.shared[BUFFER_DICT]
     if not dict then return end
-    local list = destinations(dict)
-    local stale = {}
-    for _, bkey in ipairs(list) do
+    local seen = {}
+    each_destination(dict, function(bkey)
+        if seen[bkey] then return false end            -- a duplicate entry
+        seen[bkey] = true
         local n = dict:llen(bkey) or 0
         local settings = load_settings(dict, bkey)
         if n > 0 then
             if settings then
                 ensure_pending(dict, bkey, settings)
             else
-                -- The invariant (CONF_TTL > MAX_EVENT_AGE_SECONDS, settings
-                -- refreshed by every push) makes this impossible; say so loudly
-                -- rather than strand events quietly.
+                -- push() never buffers without settings, and they outlive every
+                -- event (CONF_TTL > MAX_EVENT_AGE_SECONDS, refreshed by pushes);
+                -- say so loudly rather than strand events quietly.
                 log_throttled("err", "no_settings_" .. bkey, 60, "[aforo-metering] ", n, " buffered ",
                     "event(s) have no delivery settings and cannot be sent. Repeats suppressed for 60s.")
             end
-        elseif not settings then
-            stale[bkey] = true
+            return true
         end
-    end
-    if next(stale) and dict:safe_add(DESTINATIONS_KEY .. ":lock", true, 1) then
-        local keep = {}
-        for _, bkey in ipairs(destinations(dict)) do
-            if not stale[bkey] then
-                keep[#keep + 1] = bkey
-            else
-                for _, suffix in ipairs({ ":held", ":held_n", ":failing", ":backoff" }) do
-                    dict:delete(bkey .. suffix)
-                end
-            end
-        end
-        dict:safe_set(DESTINATIONS_KEY, cjson.encode(keep))
-        dict:delete(DESTINATIONS_KEY .. ":lock")
-    end
+        if not settings then return false end         -- empty, settings expired: prune
+        return true
+    end)
 end
 
 function M.init_worker()

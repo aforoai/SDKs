@@ -18,14 +18,51 @@ local function new_shared_dict()
         return p
     end
     -- Expiry follows ngx.now(), so a test can move time forward.
+    local free_scalar
     local function expired(self, k)
         local e = self.exp[k]
-        if e and ngx.now() >= e then self.store[k] = nil; self.exp[k] = nil; return true end
+        if e and ngx.now() >= e then free_scalar(self, k); self.store[k] = nil; self.exp[k] = nil; return true end
         return false
     end
+    -- Scalars take slab slots too. safe_set of an existing key into another
+    -- size class frees the old value first and, with no room, then fails:
+    -- the key is gone -- as the real shdict does.
+    local function scalar_slot(k, v)
+        return slot(tostring(k) .. tostring(v))
+    end
+    free_scalar = function(self, k)
+        local v = self.store[k]
+        if v ~= nil and not (type(v) == "table" and v.__list) then
+            self.used = self.used - scalar_slot(k, v)
+        end
+    end
     function d:get(k) expired(self, k); return self.store[k] end
+    function d:safe_set(k, v, ttl)
+        expired(self, k)
+        local old = self.store[k]
+        if old ~= nil and type(old) == "table" and old.__list then return nil, "value not a list" end
+        local new_slot = scalar_slot(k, v)
+        if old ~= nil and scalar_slot(k, old) == new_slot then
+            self.store[k] = v                                  -- same slot, in place
+        else
+            if old ~= nil then free_scalar(self, k); self.store[k] = nil; self.exp[k] = nil end
+            if self.fail_push or self.used + new_slot > self.cap then return false, "no memory" end
+            self.store[k] = v
+            self.used = self.used + new_slot
+        end
+        self.exp[k] = (ttl and ttl > 0) and (ngx.now() + ttl) or nil
+        return true
+    end
+    function d:safe_add(k, v, ttl)
+        expired(self, k)
+        if self.store[k] ~= nil then return false, "exists" end
+        return self:safe_set(k, v, ttl)
+    end
+    -- set/add are only used by tests to arrange state: never refused.
     function d:set(k, v, ttl)
+        free_scalar(self, k)
         self.store[k] = v
+        self.used = self.used + scalar_slot(k, v)
         self.exp[k] = (ttl and ttl > 0) and (ngx.now() + ttl) or nil
         return true
     end
@@ -34,8 +71,6 @@ local function new_shared_dict()
         if self.store[k] ~= nil then return false, "exists" end
         return self:set(k, v, ttl)
     end
-    d.safe_set = d.set
-    d.safe_add = d.add
     function d:ttl(k)
         expired(self, k)
         if self.store[k] == nil then return nil, "not found" end
@@ -51,6 +86,8 @@ local function new_shared_dict()
         local v = self.store[k]
         if type(v) == "table" and v.__list then
             for _, e in ipairs(v) do self.used = self.used - slot(e) end
+        else
+            free_scalar(self, k)
         end
         self.store[k] = nil
         self.exp[k] = nil
@@ -892,7 +929,7 @@ describe("aforo-metering handler", function()
             for i = 1, 11 do
                 log(conf({ api_key = "sk_a", __plugin_id = "random-id-" .. i }), "c" .. i)
             end
-            assert.equals(1, #cjson.decode(dict:get("aforo:destinations")))
+            assert.equals(1, dict:llen("aforo:registry"))
             assert.equals(11, #buffered(conf({ api_key = "sk_a" })))
         end)
 
@@ -903,7 +940,8 @@ describe("aforo-metering handler", function()
             handler._flush_buffer(false, A)                  -- A is empty now
             dict:delete(handler._buffer_key(A) .. ":conf")   -- and its settings expired
             handler._rearm(false)
-            local reg = cjson.decode(dict:get("aforo:destinations"))
+            local reg = {}
+            for i, k in ipairs(dict.store["aforo:registry"]) do reg[i] = k end
             assert.same({ handler._buffer_key(B) }, reg)
         end)
 
@@ -1083,6 +1121,96 @@ describe("aforo-metering handler", function()
             local b_now = #buffered(B)
             log(A, "a_new")
             assert.equals(b_now, #buffered(B))
+        end)
+
+        -- ── review 5 ────────────────────────────────────────────
+        local function slot(n)
+            n = n + 48
+            if n > 2048 then return math.ceil(n / 4096) * 4096 end
+            local p = 16
+            while p < n do p = p * 2 end
+            return p
+        end
+        -- Events of ~1.2 KB (2 KiB slots), as in the field: a long path, which
+        -- the event carries twice (endpointPath and metadata.endpoint_path).
+        local LONG_PATH = "/v1/" .. string.rep("p", 500)
+        local function big(fn)
+            local orig = mock_kong.request.get_path
+            mock_kong.request.get_path = function() return LONG_PATH end
+            local ok, err = pcall(fn)
+            mock_kong.request.get_path = orig
+            assert(ok, err)
+        end
+        local PAD = string.rep("p", 1300)
+
+        it("F1: never holds events for a buffer without its settings, even on a full dict", function()
+            dict.cap = 256 * 1024
+            local A = conf({ api_key = "sk_a", flush_count = 100000, flush_interval_ms = 10000000 })
+            local B = conf({ api_key = "sk_b", flush_count = 100000, flush_interval_ms = 200 })
+            local kA, kB = handler._buffer_key(A), handler._buffer_key(B)
+            big(function()
+                local n = 0
+                while dict:free_space() > 4096 and n < 2000 do log(A, "a"); n = n + 1 end
+            end)
+            http_mock.responses = { { status = 503 }, { status = 503 }, { status = 503 } }
+            handler._flush_buffer(false, A)                 -- A is failing now
+            while dict:rpush(kA, cjson.encode({ customerId = "a", pad = PAD })) do end   -- A refills the dict
+            local f = 0                                      -- other destinations' settings fill the small slots
+            while dict:safe_set("aforo:events:filler" .. f .. ":conf", string.rep("c", 280)) do f = f + 1 end
+            local function invariant(label)
+                if (dict:llen(kB) or 0) > 0 then
+                    assert.is_not_nil(dict:get(kB .. ":conf"), label .. ": B holds events without settings")
+                end
+            end
+            big(function()
+                log(B, "b1"); invariant("first push")
+                for round = 1, 30 do
+                    for _ = 1, 20 do log(A, "a") end
+                    log(B, "b" .. round); invariant("round " .. round)
+                end
+            end)
+        end)
+
+        it("F2: the registry survives a full dict, and refused/failing buffers stay evictable and re-armed", function()
+            dict.cap = 256 * 1024
+            local A = conf({ api_key = "sk_a", flush_count = 100000, flush_interval_ms = 10000000 })
+            local kA = handler._buffer_key(A)
+            log(A, "a0")
+            -- Enough other destinations that one more grows a registry *string*
+            -- into the next slab size class (how the old registry was lost).
+            local function entry(i) return handler._buffer_key(conf({ api_key = "sk_d" .. i })) end
+            local len, i = #('["' .. kA .. '"]'), 0
+            while true do
+                i = i + 1
+                local nxt = len + #entry(i) + 3
+                if slot(nxt + 20) > slot(len + 20) and i > 3 then break end
+                len = nxt
+                local c = conf({ api_key = "sk_d" .. i }); log(c, "d" .. i); handler._flush_buffer(false, c)
+            end
+            big(function()
+                local n = 0
+                while dict:free_space() > 4096 and n < 2000 do log(A, "a"); n = n + 1 end
+            end)
+            http_mock.responses = { { status = 503 }, { status = 503 }, { status = 503 } }
+            handler._flush_buffer(false, A)                 -- A failing
+            while dict:rpush(kA, cjson.encode({ customerId = "a", pad = PAD })) do end
+            local f = 0                                      -- other destinations' settings fill the small slots
+            while dict:safe_set("aforo:events:filler" .. f .. ":conf", string.rep("c", 280)) do f = f + 1 end
+            local C = conf({ api_key = "sk_c_new" })        -- a new destination: the registry grows
+            local okc = 0
+            big(function()
+                for n = 1, 50 do
+                    local before = #buffered(C)
+                    log(C, "c" .. n)
+                    if #buffered(C) > before then okc = okc + 1 end
+                end
+            end)
+            assert.equals(50, okc)                          -- C evicted the failing A to make room
+            -- A reload: A's timers die; rearm must still know A.
+            dict:delete(kA .. ":pending")
+            ngx.timers = {}
+            handler._rearm(false)
+            assert.is_not_nil(dict:get(kA .. ":pending"), "A was not re-armed: the registry lost it")
         end)
 
         it("keeps the oldest when its own newer events filled the dict during a failed flush", function()
