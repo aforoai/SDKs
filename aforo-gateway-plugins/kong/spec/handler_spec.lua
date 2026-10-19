@@ -1908,6 +1908,19 @@ describe("aforo-metering handler", function()
             assert.equals("kong-req-1", events[1].sessionId)
         end)
 
+        it("falls back to the Kong service's id as the agent, never to a request header", function()
+            local orig = mock_kong.router.get_service
+            mock_kong.router.get_service = function()
+                return { id = "5b1c9a52-7d8e-4c1a-9f3e-2a6b8c0d4e11", name = "fraud-shield" }
+            end
+            log(conf(), { ["X-Agent-Id"] = "agent_forged", ["X-Aforo-Agent-Id"] = "agent_forged" })
+            log(conf({ agent_id = "fraud-shield-agent" }))
+            mock_kong.router.get_service = orig
+            local evs = buffered()
+            assert.equals("5b1c9a52-7d8e-4c1a-9f3e-2a6b8c0d4e11", evs[1].agentId)
+            assert.equals("fraud-shield-agent", evs[2].agentId)
+        end)
+
         it("skips an event with no agent ID anywhere and names the fix", function()
             log(conf())
             log(conf({ agent_id = "" }), nil, { ["X-Aforo-Agent-Id"] = "" })

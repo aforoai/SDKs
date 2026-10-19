@@ -130,7 +130,7 @@ return {
                     {
                         agent_id = {
                             type = "string",
-                            description = "Agent ID for AI_AGENT events on the service/route this plugin is attached to. Operator config, so trusted. Used when the upstream does not send agent_id_header. Not used for MCP tool calls, whose agent is the caller.",
+                            description = "Agent ID for AI_AGENT events on the service/route this plugin is attached to. Operator config, so trusted. Used when the upstream does not send agent_id_header; without either, the Kong service's id is the agent. Not used for MCP tool calls, whose agent is the caller.",
                         },
                     },
                     {

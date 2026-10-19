@@ -1188,12 +1188,17 @@ end
 -- are client-settable, so they are never read: a caller could choose which
 -- agent its usage is attributed to. Only sources the client cannot touch:
 --   agentId:   conf.agent_id_header from the upstream RESPONSE, then the
---              operator's conf.agent_id for this service/route
+--              operator's conf.agent_id for this service/route, then the
+--              id of the Kong service the request was proxied to
+--              (2026-10-19): an AI_AGENT product with neither configured
+--              used to meter nothing at all. The service is the agent, and
+--              its id is the operator's, never the client's.
 --   sessionId: conf.session_id_header from the upstream RESPONSE, then this
 --              request's idempotency key (Kong's request ID, never a client
 --              header) -- so without the header, one request is one session
--- agentId may come back nil; the required-field check in the log phase
--- refuses the event and says how to supply it.
+-- agentId comes back nil only for a request routed to no service; the
+-- required-field check in the log phase then refuses the event and says how
+-- to supply it.
 -- An upstream response header that names who or what is billed. Returns
 -- (value) when usable, (nil) when absent, and (nil, true) when it is present
 -- but unusable -- malformed text, a control character, or longer than the
@@ -1239,7 +1244,7 @@ end
 -- be used; the matching value is then nil -- never a fallback -- and the
 -- other one is still resolved, so a caller that does not need the bad one
 -- can go on (2026-10-13 fix: one bad header used to void both).
-local function resolve_ai_agent_identity(conf, request_key)
+local function resolve_ai_agent_identity(conf, request_key, service)
     local agent_id, session_id, bad_agent, bad_session
 
     local agent_header = non_empty_string(conf.agent_id_header)
@@ -1249,6 +1254,7 @@ local function resolve_ai_agent_identity(conf, request_key)
     end
     if not bad_agent then
         agent_id = agent_id or non_empty_string(conf.agent_id)
+            or (type(service) == "table" and clean_string(service.id, IDENTITY_LIMITS.agentId))
     end
 
     local session_header = non_empty_string(conf.session_id_header)
