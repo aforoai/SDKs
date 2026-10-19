@@ -2306,6 +2306,230 @@ describe("aforo-metering handler", function()
             assert.same({ "mcp_server.tool_invocations", "api_calls" }, checked_metrics())
         end)
     end)
+    -- ── Each product type, end to end ───────────────────────────
+    -- A key-auth consumer calls the live-test upstream's endpoint for each
+    -- type (kong-gateway-test/upstream.py), through the access phase with
+    -- pre-flight on, the upstream response and the log phase; the buffer is
+    -- then flushed and every event in the POST to /v1/ingest/batch is checked
+    -- against what the ingestor validates for its productType.
+    describe("each product type end to end", function()
+        -- IngestUsageEventRequest bean validation, the descriptors'
+        -- eventSchema.requiredFields (as SchemaBasedEventValidator maps them
+        -- to top-level fields) and ExecutionStatuses.ALLOWED.
+        local REQUIRED = {
+            API         = {},
+            AGENTIC_API = { "endpointPath", "httpMethod", "statusCode", "traceId" },
+            AI_AGENT    = { "agentId", "sessionId" },
+            MCP_SERVER  = { "toolName", "agentId" },
+        }
+        local MAX = { customerId = 64, metricName = 255, idempotencyKey = 255, traceId = 128,
+                      sessionId = 64, productType = 20, agentId = 36, toolName = 64,
+                      executionStatus = 20, endpointPath = 512, httpMethod = 16 }
+        local STATUSES = { SUCCESS = 1, PARTIAL = 1, TIMEOUT = 1, ERROR = 1, VALIDATION_FAILED = 1,
+                           FAILED = 1, FAILURE = 1, CANCELLED = 1, PENDING = 1, BLOCKED = 1,
+                           HITL_REQUIRED = 1 }
+        local function ingestor_errors(e)
+            local errs = {}
+            local function blank(v) return v == nil or v == "" end
+            for _, f in ipairs({ "customerId", "metricName", "idempotencyKey", "occurredAt", "productType" }) do
+                if blank(e[f]) then errs[#errs + 1] = f .. " is required" end
+            end
+            if type(e.quantity) ~= "number" or e.quantity <= 0 then errs[#errs + 1] = "quantity must be positive" end
+            for f, max in pairs(MAX) do
+                if type(e[f]) == "string" and #e[f] > max then errs[#errs + 1] = f .. " over " .. max end
+            end
+            local required = REQUIRED[e.productType]
+            if not required then errs[#errs + 1] = "unexpected productType " .. tostring(e.productType) end
+            for _, f in ipairs(required or {}) do
+                if blank(e[f]) then errs[#errs + 1] = f .. " is required for " .. e.productType end
+            end
+            if e.executionStatus ~= nil and not STATUSES[e.executionStatus] then
+                errs[#errs + 1] = "executionStatus " .. tostring(e.executionStatus)
+            end
+            return errs
+        end
+
+        local dict, orig
+        local CONSUMER = { id = "6f0e1d2c-3b4a-4596-8877-665544332211", username = "acme",
+                           custom_id = "cust_acme", tags = { "aforo-managed" } }
+        local SERVICE = { id = "0a1b2c3d-4e5f-4061-8273-948596a7b8c9", name = "novapay" }
+
+        local function conf(product_type, o)
+            local c = {
+                aforo_endpoint = "https://api.aforo.test/v1/ingest/batch",
+                api_key = "sk_ingest", tenant_id = "fintech", product_type = product_type,
+                default_metric = "api_calls", metric_header = "X-Aforo-Metric",
+                quantity_header = "X-Aforo-Quantity", agent_id_header = "X-Aforo-Agent-Id",
+                session_id_header = "X-Aforo-Session-Id", trace_id_header = "X-Aforo-Trace-Id",
+                quantity_source = "1", include_metadata = true, flush_count = 50, flush_interval_ms = 5000,
+                exclude_paths = { "/health", "/ready", "/metrics" }, exclude_status_codes = { 401, 403, 429 },
+                preflight_quota_enabled = true, preflight_quota_cache_ttl_ms = 0,
+                preflight_quota_fail_open = true,
+            }
+            for k, v in pairs(o or {}) do c[k] = v end
+            return c
+        end
+
+        -- One call through Kong. req: method, path, headers (client), body.
+        -- res: status, headers (upstream). Pre-flight answers ALLOW.
+        local function call(c, req, res)
+            mock_kong.ctx.shared = {}
+            mock_kong.request._headers = req.headers or {}
+            mock_kong.response._headers = {}
+            mock_kong.response._exit = nil
+            mock_kong.request.get_method = function() return req.method or "POST" end
+            mock_kong.request.get_path = function() return req.path end
+            mock_kong.request.get_raw_body = function() return req.body end
+            ngx.req = { get_body_file = function() return nil end }
+            http_mock.responses = { { status = 200, body = '{"decision":"ALLOW"}' } }
+            handler:access(c)
+            ngx.req = nil
+            http_mock.responses = {}
+            -- The upstream answers; Kong sends it to the client; then the log phase.
+            mock_kong.response.get_status = function() return res and res.status or 200 end
+            mock_kong.response._headers = res and res.headers or {}
+            ngx.var = { request_id = req.id or "kreq" }
+            handler:log(c)
+            ngx.var = nil
+        end
+
+        local function checked()
+            local out = {}
+            for _, r in ipairs(http_mock.requests) do
+                if r.url:find("/quota/check", 1, true) then
+                    out[#out + 1] = cjson.decode(r.params.body).metricName
+                end
+            end
+            return out
+        end
+
+        -- Flush and return the events the ingestor received, each checked.
+        local function delivered(c)
+            handler._flush_buffer(false, c)
+            local events = {}
+            for _, r in ipairs(http_mock.requests) do
+                if r.url == c.aforo_endpoint then
+                    for _, e in ipairs(cjson.decode(r.params.body).events) do
+                        assert.same({}, ingestor_errors(e), cjson.encode(e))
+                        events[#events + 1] = e
+                    end
+                end
+            end
+            return events
+        end
+
+        before_each(function()
+            dict = new_shared_dict()
+            ngx.shared.aforo_buffer = dict
+            ngx.timers = {}
+            http_mock.requests, http_mock.responses, http_mock.on_request = {}, {}, nil
+            orig = {
+                get_consumer = mock_kong.client.get_consumer, get_service = mock_kong.router.get_service,
+                get_method = mock_kong.request.get_method, get_path = mock_kong.request.get_path,
+                get_raw_body = mock_kong.request.get_raw_body, get_status = mock_kong.response.get_status,
+            }
+            mock_kong.client.get_consumer = function() return CONSUMER end
+            mock_kong.router.get_service = function() return SERVICE end
+        end)
+
+        after_each(function()
+            mock_kong.client.get_consumer = orig.get_consumer
+            mock_kong.router.get_service = orig.get_service
+            mock_kong.request.get_method, mock_kong.request.get_path = orig.get_method, orig.get_path
+            mock_kong.request.get_raw_body = orig.get_raw_body
+            mock_kong.response.get_status = orig.get_status
+        end)
+
+        it("API: POST /v1/payments, an upstream with no Aforo code, one call one unit", function()
+            local c = conf("API", { metric_mappings = { { path_pattern = "^/v1/payments", metric_name = "payments" } } })
+            call(c, { path = "/v1/payments", id = "k1" })
+            call(c, { path = "/v1/payments", id = "k2" }, { status = 500 })
+            call(c, { path = "/v1/payments", id = "k3" }, { status = 401 })   -- excluded
+            call(c, { method = "GET", path = "/health", id = "k4" })           -- excluded, never checked
+            assert.same({ "payments", "payments", "payments" }, checked())
+            local evs = delivered(c)
+            assert.equals(2, #evs)
+            assert.equals("API", evs[1].productType)
+            assert.equals("cust_acme", evs[1].customerId)
+            assert.equals("payments", evs[1].metricName)
+            assert.equals(1, evs[1].quantity)
+            assert.equals("SUCCESS", evs[1].executionStatus)
+            assert.equals("ERROR", evs[2].executionStatus)
+            assert.is_nil(evs[1].agentId)
+            assert.is_nil(evs[1].traceId)
+        end)
+
+        it("AI_AGENT: POST /v1/fraud/assess, tokens and session from the upstream's response headers", function()
+            local c = conf("AI_AGENT", { default_metric = "fraud_tokens", agent_id = "fraud-shield" })
+            local forged = { ["X-Aforo-Agent-Id"] = "forged", ["X-Aforo-Session-Id"] = "forged",
+                             ["X-Aforo-Quantity"] = "1", traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" }
+            call(c, { path = "/v1/fraud/assess", headers = forged, id = "k1" },
+                 { headers = { ["X-Aforo-Quantity"] = "2100", ["X-Aforo-Session-Id"] = "fsa_1a2b3c" } })
+            -- Nothing configured, nothing sent: the Kong service is the agent,
+            -- the request its own session.
+            call(conf("AI_AGENT", { default_metric = "fraud_tokens" }), { path = "/v1/fraud/assess", id = "k2" })
+            assert.same({ "fraud_tokens", "fraud_tokens" }, checked())
+            local evs = delivered(c)
+            assert.equals(2, #evs)
+            assert.equals("AI_AGENT", evs[1].productType)
+            assert.equals("fraud-shield", evs[1].agentId)
+            assert.equals("fsa_1a2b3c", evs[1].sessionId)
+            assert.equals("fsa_1a2b3c", evs[1].traceId)
+            assert.equals(2100, evs[1].quantity)
+            assert.equals(SERVICE.id, evs[2].agentId)
+            assert.equals("k2", evs[2].sessionId)
+            assert.equals(1, evs[2].quantity)
+        end)
+
+        it("AGENTIC_API: POST /v1/kyc/verify, one goal per call unless the upstream names the trace", function()
+            local c = conf("AGENTIC_API", { default_metric = "kyc_verifications" })
+            local tp = { traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" }
+            call(c, { path = "/v1/kyc/verify", headers = tp, id = "k1" })
+            call(c, { path = "/v1/kyc/verify", headers = tp, id = "k2" })
+            call(c, { path = "/v1/kyc/verify", headers = tp, id = "k3" },
+                 { headers = { ["X-Aforo-Trace-Id"] = "goal-7" } })
+            assert.same({ "kyc_verifications", "kyc_verifications", "kyc_verifications" }, checked())
+            local evs = delivered(c)
+            local traces = {}
+            for i, e in ipairs(evs) do traces[i] = e.traceId end
+            -- The repeated client traceparent does not fold calls into one goal.
+            assert.same({ "k1", "k2", "goal-7" }, traces)
+            assert.equals("/v1/kyc/verify", evs[1].endpointPath)
+            assert.equals("POST", evs[1].httpMethod)
+            assert.equals(200, evs[1].statusCode)
+        end)
+
+        it("MCP_SERVER: POST /mcp, an upstream with no Aforo code, one event per tools/call", function()
+            local c = conf("MCP_SERVER", { default_metric = "ledger_tool_calls" })
+            local session = { ["Mcp-Session-Id"] = "mcp_5f3a" }
+            call(c, { path = "/mcp", id = "k1", body = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' },
+                 { headers = session })
+            call(c, { path = "/mcp", id = "k2", headers = session,
+                      body = '{"jsonrpc":"2.0","method":"notifications/initialized"}' }, { status = 202, headers = session })
+            call(c, { path = "/mcp", id = "k3", headers = session, body = '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' },
+                 { headers = session })
+            call(c, { path = "/mcp", id = "k4", headers = session, body = cjson.encode({
+                { jsonrpc = "2.0", id = 3, method = "tools/call",
+                  params = { name = "query_ledger", _meta = { agent_id = "forged" } } },
+                { jsonrpc = "2.0", id = 4, method = "tools/call", params = { name = "get_balance" } },
+                { jsonrpc = "2.0", id = 5, method = "ping" },
+            }) }, { headers = session })
+            -- Only the request that bills was checked.
+            assert.same({ "ledger_tool_calls" }, checked())
+            local evs = delivered(c)
+            assert.equals(2, #evs)
+            for i, tool in ipairs({ "query_ledger", "get_balance" }) do
+                assert.equals("MCP_SERVER", evs[i].productType)
+                assert.equals(tool, evs[i].toolName)
+                assert.equals("ledger_tool_calls", evs[i].metricName)
+                assert.equals("cust_acme", evs[i].agentId)
+                assert.equals("mcp_5f3a", evs[i].sessionId)
+                assert.equals("SUCCESS", evs[i].executionStatus)
+                assert.equals(1, evs[i].quantity)
+            end
+            assert.not_equals(evs[1].idempotencyKey, evs[2].idempotencyKey)
+        end)
+    end)
     -- ── Schema ──────────────────────────────────────────────────
     -- Kong validates the schema itself at startup and refuses to load the
     -- plugin on any violation, so these are checked without a running Kong.
