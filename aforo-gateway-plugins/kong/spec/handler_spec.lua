@@ -171,7 +171,7 @@ local http_mock = { requests = {}, responses = {} }
 package.loaded["resty.http"] = {
     new = function()
         return {
-            set_timeout = function() end,
+            set_timeout = function(_, ms) http_mock.timeout = ms end,
             request_uri = function(_, url, params)
                 table.insert(http_mock.requests, { url = url, params = params })
                 if http_mock.on_request then http_mock.on_request(#http_mock.requests) end
@@ -2187,6 +2187,123 @@ describe("aforo-metering handler", function()
             mock_kong.request._headers = { ["x-customer-id"] = "cust_forged" }
             access(conf())
             assert.equals(0, #http_mock.requests)
+        end)
+
+        -- One request through the access phase: method, path and the raw
+        -- body Kong would hand get_raw_body.
+        local function request(c, opts)
+            local m, p, b = mock_kong.request.get_method, mock_kong.request.get_path,
+                            mock_kong.request.get_raw_body
+            mock_kong.request.get_method = function() return opts.method or "GET" end
+            mock_kong.request.get_path = function() return opts.path or "/v1/accounts/123" end
+            mock_kong.request.get_raw_body = function() return opts.body end
+            local req = ngx.req
+            ngx.req = { get_body_file = function() return nil end }   -- nothing spooled
+            handler:access(c)
+            ngx.req = req
+            if opts.log then
+                ngx.var = { request_id = opts.request_id or "kongreq" }
+                handler:log(c)
+                ngx.var = nil
+            end
+            mock_kong.request.get_method, mock_kong.request.get_path = m, p
+            mock_kong.request.get_raw_body = b
+        end
+        local function checked_metrics()
+            local out = {}
+            for i, r in ipairs(http_mock.requests) do out[i] = cjson.decode(r.params.body).metricName end
+            return out
+        end
+        local function buffered(c)
+            return dict.store[handler._buffer_key(c)] or {}
+        end
+
+        it("does not meter the call it denied, and meters the one it allowed", function()
+            local c = conf({ exclude_status_codes = {} })
+            with_customer("cust_a")
+            http_mock.responses = { { status = 200, body = '{"decision":"DENY","retryAfterMs":5000}' } }
+            request(c, { method = "POST", path = "/v1/payments", log = true })
+            assert.equals(429, mock_kong.response._exit.status)
+            assert.equals("5", mock_kong.response._exit.headers["Retry-After"])
+            assert.equals(0, #buffered(c))
+
+            mock_kong.response._exit = nil
+            with_customer("cust_b")
+            http_mock.responses = { { status = 200, body = '{"decision":"ALLOW"}' } }
+            request(c, { method = "POST", path = "/v1/payments", log = true })
+            assert.is_nil(mock_kong.response._exit)
+            assert.equals(1, #buffered(c))
+        end)
+
+        it("never answers Retry-After: 0, and its Retry-After wins over the ingestor's", function()
+            with_customer("cust_a")
+            http_mock.responses = { { status = 200, body = '{"decision":"DENY","retryAfterMs":400,'
+                .. '"headers":{"Retry-After":"0","X-RateLimit-Remaining":"0"}}' } }
+            access(conf())
+            local h = mock_kong.response._exit.headers
+            assert.equals("1", h["Retry-After"])
+            assert.equals(1, mock_kong.response._exit.body.retryAfter)
+            assert.equals("0", h["X-RateLimit-Remaining"])
+        end)
+
+        it("waits 300 ms by default, then fails open", function()
+            with_customer("cust_a")
+            local c = conf()
+            c.preflight_quota_timeout_ms = nil   -- as Kong fills the schema default
+            http_mock.responses = { { err = "timeout" } }
+            access(c)
+            assert.equals(300, http_mock.timeout)
+            assert.is_nil(mock_kong.response._exit)
+            assert.is_nil(mock_kong.ctx.shared.aforo_refused)   -- let through, so metered
+        end)
+
+        it("checks the metric the request bills to: mappings, and an MCP_SERVER product's tool metric", function()
+            with_customer("cust_a")
+            local api = conf({ metric_mappings = { { path_pattern = "^/v1/payments", metric_name = "payments" } } })
+            request(api, { method = "POST", path = "/v1/payments" })
+            local mcp = conf({ product_type = "MCP_SERVER", default_metric = "ledger_tool_calls" })
+            request(mcp, { method = "POST", path = "/mcp",
+                           body = '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_balance"}}' })
+            assert.same({ "payments", "ledger_tool_calls" }, checked_metrics())
+        end)
+
+        it("never checks, so never blocks, an MCP message that is not a tool call", function()
+            with_customer("cust_a")
+            http_mock.responses = {}
+            for _ = 1, 5 do table.insert(http_mock.responses, { status = 200, body = '{"decision":"DENY"}' }) end
+            local mcp = conf({ product_type = "MCP_SERVER", default_metric = "ledger_tool_calls" })
+            for _, body in ipairs({
+                '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
+                '{"jsonrpc":"2.0","id":2,"method":"tools/list"}',
+                '{"jsonrpc":"2.0","id":3,"method":"ping"}',
+                '{"jsonrpc":"2.0","method":"notifications/initialized"}',
+            }) do
+                request(mcp, { method = "POST", path = "/mcp", body = body })
+            end
+            request(mcp, { method = "GET", path = "/mcp" })
+            -- Also on an mcp_enabled route of an API product.
+            request(conf({ mcp_enabled = true }), { method = "POST", path = "/mcp",
+                body = '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' })
+            assert.equals(0, #http_mock.requests)
+            assert.is_nil(mock_kong.response._exit)
+
+            -- A tool call is checked, and refused when the quota is spent.
+            request(mcp, { method = "POST", path = "/mcp",
+                           body = '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"t"}}' })
+            assert.equals(1, #http_mock.requests)
+            assert.equals(429, mock_kong.response._exit.status)
+        end)
+
+        it("skips excluded paths and checks both metrics of a mixed MCP batch it will bill twice", function()
+            with_customer("cust_a")
+            request(conf({ exclude_paths = { "/health" } }), { path = "/health/live" })
+            assert.equals(0, #http_mock.requests)
+            local c = conf({ mcp_enabled = true, mcp_meter_non_tool_calls = true })
+            request(c, { method = "POST", path = "/mcp", body = cjson.encode({
+                { jsonrpc = "2.0", id = 1, method = "tools/list" },
+                { jsonrpc = "2.0", id = 2, method = "tools/call", params = { name = "t" } },
+            }) })
+            assert.same({ "mcp_server.tool_invocations", "api_calls" }, checked_metrics())
         end)
     end)
     -- ── Schema ──────────────────────────────────────────────────

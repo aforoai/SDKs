@@ -18,7 +18,7 @@
 --   preflight_quota_enabled       boolean (default false)
 --   preflight_quota_url           string  (default: aforo_endpoint's origin + /api/v1/quota/check)
 --   preflight_quota_api_key       string  (default: api_key)
---   preflight_quota_timeout_ms    integer (default 100)
+--   preflight_quota_timeout_ms    integer (default 300)
 --   preflight_quota_cache_ttl_ms  integer (default 1000; 0 disables the cache)
 --   preflight_quota_fail_open     boolean (default true)
 
@@ -34,6 +34,11 @@ local M = {}
 local CACHE_DICT = "aforo_buffer"
 
 local QUOTA_CHECK_PATH = "/api/v1/quota/check"
+
+-- Kong to Aforo is a call over the internet, usually to another region: 100 ms
+-- (the old default) timed out often enough that the check silently failed
+-- open (2026-10-19). Raised to 300 ms; preflight_quota_timeout_ms overrides.
+local DEFAULT_TIMEOUT_MS = 300
 
 -- Same shape as handler.lua's throttle: a check that runs on every request
 -- would otherwise log on every request while the ingestor is unreachable.
@@ -108,7 +113,7 @@ function M.check(conf, customer_id, metric_name)
     end
 
     local httpc = http.new()
-    httpc:set_timeout(conf.preflight_quota_timeout_ms or 100)
+    httpc:set_timeout(conf.preflight_quota_timeout_ms or DEFAULT_TIMEOUT_MS)
 
     local res, err = httpc:request_uri(url, {
         method = "POST",
@@ -137,7 +142,7 @@ function M.check(conf, customer_id, metric_name)
         -- ADMIN / DEVELOPER) once RBAC is enforced, which an ingest-only key
         -- scoped usage:ingest does not carry -- hence preflight_quota_api_key.
         local hint = (res.status == 401 or res.status == 403)
-            and " -- check preflight_quota_api_key (needs quotas:read)" or ""
+            and " -- the ingestor refused the key: check preflight_quota_api_key (default api_key)" or ""
         return fallback(conf, dict, "status " .. res.status .. hint)
     end
 
@@ -151,16 +156,20 @@ function M.check(conf, customer_id, metric_name)
     local data = type(result.data) == "table" and result.data or result
 
     if data.decision == "DENY" then
-        local retry_after = tonumber(data.retryAfterMs) and math.ceil(data.retryAfterMs / 1000) or 60
-        local headers = {
-            ["Retry-After"] = tostring(retry_after),
-            ["Content-Type"] = "application/json",
-        }
+        -- Whole seconds, at least 1, and the same value in the header and the
+        -- body: the ingestor's own Retry-After header is retryAfterMs rounded
+        -- DOWN, so a wait under a second used to reach the client as
+        -- "Retry-After: 0" -- an invitation to retry at once.
+        local retry_ms = tonumber(data.retryAfterMs)
+        local retry_after = (retry_ms and retry_ms > 0) and math.max(1, math.ceil(retry_ms / 1000)) or 60
+        local headers = {}
         if type(data.headers) == "table" then
             for k, v in pairs(data.headers) do
                 headers[k] = v
             end
         end
+        headers["Retry-After"] = tostring(retry_after)
+        headers["Content-Type"] = "application/json"
         kong.response.exit(429, {
             message = data.reason or "Quota exceeded",
             retryAfter = retry_after,

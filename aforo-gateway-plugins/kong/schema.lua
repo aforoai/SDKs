@@ -366,7 +366,7 @@ return {
                         preflight_quota_enabled = {
                             type = "boolean",
                             default = false,
-                            description = "Ask Aforo before proxying whether the customer is within quota (rate limit, prepaid wallet, cumulative quota) and answer 429 on DENY. Adds a synchronous call on every request that misses the local cache, so it is off by default.",
+                            description = "Ask Aforo before proxying whether the customer is within quota (rate limit, prepaid wallet, cumulative quota) for the metric the request will be billed to, and answer 429 on DENY. Requests that will not be billed (e.g. MCP initialize) are not checked. Adds a synchronous call on every request that misses the local cache, so it is off by default.",
                         },
                     },
                     {
@@ -379,15 +379,15 @@ return {
                         preflight_quota_api_key = {
                             type = "string",
                             encrypted = true,
-                            description = "API key for the quota check, sent as X-API-Key. Defaults to api_key. Set it when api_key is an ingest-only key: with RBAC enforced the check needs quotas:read.",
+                            description = "API key for the quota check, sent as X-API-Key. Defaults to api_key. Set it only when the ingestor does not accept api_key for /api/v1/quota/check.",
                         },
                     },
                     {
                         preflight_quota_timeout_ms = {
                             type = "integer",
-                            default = 100,
+                            default = 300,
                             gt = 0,
-                            description = "Timeout for the quota check. This is on the request path; on timeout the request proceeds (see preflight_quota_fail_open).",
+                            description = "Timeout for the quota check, in ms. This is on the request path (only on a cache miss); on timeout the request proceeds (see preflight_quota_fail_open). 300 allows for Kong-to-Aforo over the internet.",
                         },
                     },
                     {

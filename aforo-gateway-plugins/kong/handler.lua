@@ -1541,6 +1541,51 @@ function AforoMeteringHandler:init_worker()
     event_buffer.init_worker()
 end
 
+-- The metrics the pre-flight quota check asks about: those this request's
+-- events will be billed to (2026-10-19). It used to resolve one metric the
+-- way a plain API call bills, so an MCP tool call was checked against
+-- default_metric but billed to its tool-call metric, and an initialize or
+-- tools/list -- billed nothing -- could still be refused 429.
+--
+-- Decided as the log phase decides (billable, tool_call_metric,
+-- resolve_metric_name), with what the access phase cannot know left out:
+--   * the upstream's metric_header. A backend that renames the metric for
+--     one response is checked against the configured metric; the metric it
+--     names is still enforced by the ingestor when the event arrives.
+--   * the upstream's quantity. The check asks whether the quota is already
+--     used up, not whether this call would exceed it.
+-- Empty for a request that will make no event: an excluded path, a CORS
+-- preflight, or an MCP request without a tools/call.
+local function preflight_metrics(conf, product_type, consumer)
+    local method, path = kong.request.get_method(), kong.request.get_path()
+    if should_exclude_path(path, conf.exclude_paths) then return {} end
+    if method == "OPTIONS" and kong.request.get_header("Access-Control-Request-Method") then
+        return {}
+    end
+
+    local jsonrpc
+    if mcp_on(conf, product_type) and method == "POST" then
+        jsonrpc = parse_jsonrpc(kong.ctx.shared.aforo_raw_body)
+    end
+    local tools, plain = billable(conf, product_type, jsonrpc)
+
+    local service, route = kong.router.get_service(), kong.router.get_route()
+    local service_name = service and service.name or ""
+    local route_name = route and route.name or ""
+    local consumer_name = consumer and (consumer.username or consumer.custom_id) or ""
+
+    local metrics = {}
+    if tools then
+        metrics[1] = tool_call_metric(conf, product_type, method, path, service_name, route_name,
+                                      consumer_name, nil)
+    end
+    if plain then
+        local m = resolve_metric_name(conf, method, path, service_name, route_name, consumer_name, nil)
+        if m ~= metrics[1] then metrics[#metrics + 1] = m end
+    end
+    return metrics
+end
+
 -- ────────────────────────────────────────────────────────────
 -- Access phase handler (runs before proxying to upstream)
 -- Currently a no-op that stashes trace context for correlation.
@@ -1641,16 +1686,14 @@ function AforoMeteringHandler:access(conf)
     -- point the upstream had already served the request. Off unless
     -- preflight_quota_enabled; fail-open; see preflight-quota.lua.
     --
-    -- The metric is resolved the same way the log phase will bill it, minus
-    -- the upstream response header, which does not exist yet.
+    -- It checks the metrics the log phase will bill (see preflight_metrics),
+    -- and nothing for a request that will not be billed: an MCP initialize
+    -- or tools/list is never refused for a spent tool-call quota.
     if conf.preflight_quota_enabled then
-        local service = kong.router.get_service()
-        local route = kong.router.get_route()
-        local metric = resolve_metric_name(conf, kong.request.get_method(), kong.request.get_path(),
-            service and service.name or "", route and route.name or "",
-            consumer and (consumer.username or consumer.custom_id) or "", nil)
-        if preflight_quota.check(conf, customer_id, metric) then
-            return  -- answered 429/503; skip the remaining checks
+        for _, metric in ipairs(preflight_metrics(conf, product_type, consumer)) do
+            if preflight_quota.check(conf, customer_id, metric) then
+                return  -- answered 429/503; skip the remaining checks
+            end
         end
     end
 
