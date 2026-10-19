@@ -709,7 +709,7 @@ describe("aforo-metering handler", function()
             end
         end)
 
-        it("re-sends only the events a 202 says could not be stored", function()
+        it("re-sends only the events a 202 says could not be stored (bare shape, no envelope)", function()
             local c = conf()
             log(c, "c1"); log(c, "c2"); log(c, "c3")
             http_mock.responses = { { status = 202, body = '{"accepted":1,"duplicates":0,"failed":2,"errors":['
@@ -719,6 +719,87 @@ describe("aforo-metering handler", function()
             local left = buffered(c)
             assert.equals(1, #left)
             assert.equals("c1", left[1].customerId)
+        end)
+
+        -- The ingestor's real 202 (KongBatchResponseShapeTest): the platform
+        -- envelope, per-event errors under data.errors, none at the top level.
+        local function envelope(accepted, failed, errors)
+            return cjson.encode({ success = true, data = { accepted = accepted, duplicates = 0,
+                                                           failed = failed, errors = errors } })
+        end
+        local function capture_errs()
+            local errs, orig = {}, mock_kong.log.err
+            mock_kong.log.err = function(...)
+                local parts = {}
+                for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+                errs[#errs + 1] = table.concat(parts)
+            end
+            return errs, function() mock_kong.log.err = orig end
+        end
+
+        it("reads per-event errors inside the envelope: accepted and failed in one batch", function()
+            local c = conf()
+            log(c, "c1"); log(c, "c2"); log(c, "c3")
+            local errs, restore = capture_errs()
+            http_mock.responses = { { status = 202, body = envelope(2, 1, {
+                { index = 2, message = "Quota exceeded for metric 'api_calls': 2/2 MONTHLY limit reached (HARD_LIMIT)" } }) } }
+            handler._flush_buffer(false, c)
+            restore()
+            assert.equals(0, #buffered(c))     -- two stored, one dropped: nothing left to send
+            assert.equals(1, #errs)
+            assert.truthy(errs[1]:find("rejected 1 of 3 event(s)", 1, true))
+            assert.truthy(errs[1]:find("dropped", 1, true))
+            assert.truthy(errs[1]:find("Quota exceeded for metric 'api_calls'", 1, true))
+        end)
+
+        it("re-sends, alone, an event the envelope says could not be stored", function()
+            local c = conf()
+            log(c, "c1"); log(c, "c2"); log(c, "c3")
+            http_mock.responses = {
+                { status = 202, body = envelope(2, 1, {
+                    { index = 1, message = "The event could not be stored: deadlock detected" } }) },
+                { status = 202, body = envelope(1, 0, {}) },
+            }
+            handler._flush_buffer(false, c)
+            local left = buffered(c)
+            assert.equals(1, #left)
+            assert.equals("c2", left[1].customerId)
+            -- The next flush sends that one event, not the batch again.
+            handler._flush_buffer(false, c)
+            assert.equals(2, #http_mock.requests)
+            local resent = sent(2)
+            assert.equals(1, #resent)
+            assert.equals("c2", resent[1].customerId)
+            assert.equals(0, #buffered(c))
+        end)
+
+        it("drops, with the count and the reason, an event the envelope rejects for good", function()
+            local c = conf()
+            log(c, "c1"); log(c, "c2")
+            local errs, restore = capture_errs()
+            http_mock.responses = { { status = 202, body = envelope(0, 2, {
+                { index = 0, message = "Quota exceeded for metric 'api_calls' (HARD_LIMIT)" },
+                { index = 1, message = "Unknown metric 'nope'" } }) } }
+            handler._flush_buffer(false, c)
+            restore()
+            assert.equals(1, #http_mock.requests)
+            assert.equals(0, #buffered(c))
+            assert.truthy(errs[1]:find("rejected 2 of 2 event(s) in a batch; dropped, not retried", 1, true))
+            assert.truthy(errs[1]:find("Unknown metric 'nope'", 1, true))
+        end)
+
+        it("treats an envelope without errors, or with null data, as all stored", function()
+            local c = conf()
+            log(c, "c1"); log(c, "c2")
+            http_mock.responses = {
+                { status = 202, body = '{"success":true,"data":{"accepted":2,"failed":0,"errors":null}}' },
+            }
+            handler._flush_buffer(false, c)
+            assert.equals(0, #buffered(c))
+            log(c, "c3")
+            http_mock.responses = { { status = 202, body = '{"success":true,"data":null}' } }
+            handler._flush_buffer(false, c)
+            assert.equals(0, #buffered(c))
         end)
 
         it("bisects a batch the ingestor answers 400, so one bad event costs only itself", function()

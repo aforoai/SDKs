@@ -400,17 +400,37 @@ local function rebuffer(dict, bkey, batch, held)
     return kept, dropped
 end
 
--- A 2xx can still carry per-event failures: /v1/ingest/batch answers 202
--- with {accepted, duplicates, failed, errors = [{index, message}]}. They used
--- to be ignored, so an event the ingestor could not store was gone. Returns
--- the events to send again (storage trouble); every other per-event error is
--- logged and not retried, since resending the same event gets the same answer.
+-- The per-event errors of a 2xx answer, or nil. /v1/ingest/batch answers
+-- 202 in the platform envelope:
+--   {"success": true, "data": {accepted, duplicates, failed,
+--                              errors = [{index, message}]}}
+-- with no top-level errors (locked by the ingestor's
+-- KongBatchResponseShapeTest). Only a top-level errors was read, so no
+-- per-event failure was ever seen (2026-10-19): an event refused for a spent
+-- quota went unreported, and one the ingestor could not store was never sent
+-- again -- lost. The bare {accepted, failed, errors} shape is still read, for
+-- anything that answers without the envelope.
+local function per_event_errors(resp)
+    if type(resp) ~= "table" then return nil end
+    if type(resp.data) == "table" and type(resp.data.errors) == "table" then
+        return resp.data.errors
+    end
+    if type(resp.errors) == "table" then return resp.errors end
+    return nil
+end
+
+-- A 2xx can still carry per-event failures (see per_event_errors); index is
+-- the event's position in the batch as sent. Returns the events to send
+-- again -- storage trouble, retried event by event, not as the whole batch.
+-- Every other per-event error is a judgement on the event (over a HARD_LIMIT
+-- quota, an unknown metric): it is dropped and logged with the count and the
+-- reasons, since resending the same event gets the same answer.
 local function per_event_retries(batch, body)
-    local resp = cjson.decode(body or "")
-    if type(resp) ~= "table" or type(resp.errors) ~= "table" then return {} end
+    local errors = per_event_errors(cjson.decode(body or ""))
+    if not errors then return {} end
 
     local retry, rejected = {}, {}
-    for _, e in ipairs(resp.errors) do
+    for _, e in ipairs(errors) do
         local idx = type(e) == "table" and tonumber(e.index)
         local event = idx and batch[idx + 1]
         if event then
@@ -428,7 +448,7 @@ local function per_event_retries(batch, body)
         for i = 1, math.min(3, #rejected) do sample[i] = rejected[i] end
         log_throttled("err", "ingest_event_rejected", 60,
             "[aforo-metering] The ingestor rejected ", #rejected, " of ", #batch,
-            " event(s) in a batch; they are not retried. First reasons: ",
+            " event(s) in a batch; dropped, not retried. First reasons: ",
             table.concat(sample, " | "), ". Repeats suppressed for 60s.")
     end
     if #retry > 0 then
