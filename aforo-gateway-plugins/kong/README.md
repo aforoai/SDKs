@@ -115,7 +115,7 @@ With `preflight_quota_enabled`, the access phase asks the ingestor's `POST /api/
 
 - It checks the metric(s) the call's events will be billed to (`metric_mappings`, central mappings, `default_metric`, the MCP tool-call metric). A call that will not be billed is not checked, so an MCP `initialize`, `tools/list` or `ping` is never refused.
 - `X-Aforo-Metric` and `X-Aforo-Quantity` come from the response and do not exist yet: the configured metric is checked, and the question is whether the quota is already used up. A metric the upstream renames is still enforced by the ingestor when the event arrives.
-- `DENY` answers 429 with `Retry-After` (whole seconds, at least 1), and the refused call is not metered. `WARN` lets the call through with `X-RateLimit-Warning`.
+- `DENY` answers 429 with `Retry-After` (whole seconds, at least 1), and the refused call is not metered. `WARN` lets the call through with `X-RateLimit-Warning`. `ALLOW` and `WARN` are cached for `preflight_quota_cache_ttl_ms`; `DENY` never is, so a top-up unblocks at once.
 - Timeout (default 300 ms), error or non-200: the call goes through (fail-open), unless `preflight_quota_fail_open=false`, which answers 503.
 
 ## Configuration
@@ -162,7 +162,7 @@ Every option lives under `config.*`. `aforo_endpoint`, `api_key`, and `tenant_id
 | `preflight_quota_url` | string | origin of `aforo_endpoint` + `/api/v1/quota/check` | Quota-check endpoint. |
 | `preflight_quota_api_key` | string | `api_key` | Key sent as `X-API-Key` on the check. Set it only when the ingestor does not accept `api_key` for the check. Stored encrypted. |
 | `preflight_quota_timeout_ms` | integer | `300` | Timeout for the check, in ms (it is on the request path, on a cache miss). 300 allows for Kong-to-Aforo over the internet. |
-| `preflight_quota_cache_ttl_ms` | integer | `1000` | How long an `ALLOW` is cached per tenant/customer/metric. `DENY` is never cached. `0` disables. |
+| `preflight_quota_cache_ttl_ms` | integer | `1000` | How long an `ALLOW` or `WARN` is cached per tenant/customer/metric. `DENY` is never cached. `0` disables. |
 | `preflight_quota_fail_open` | boolean | `true` | On error, timeout or non-200: let the request through (`true`) or answer 503 (`false`). |
 | `exclude_paths` | array | `["/health","/ready","/metrics"]` | Paths skipped from metering. An entry matches that path and anything below it: `/health` skips `/health` and `/health/live`, not `/healthcare`. |
 | `exclude_status_codes` | array | `[401,403,429]` | Status codes skipped from metering. Keep 401 and 403 in it when `key-auth` / `acl` sit in front: their refusals happen before this plugin runs. Separately, a request this plugin refuses itself (JWT 401, rate-limit or margin-guard 429, pre-flight quota 429/503) is never metered, whatever this list says. |

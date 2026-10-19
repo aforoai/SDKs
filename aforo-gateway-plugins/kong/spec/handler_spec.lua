@@ -2263,6 +2263,25 @@ describe("aforo-metering handler", function()
             assert.equals(3, #http_mock.requests)
         end)
 
+        it("caches WARN like ALLOW, still marking the response, and never DENY", function()
+            with_customer("cust_near_limit")
+            http_mock.responses = { { status = 200, body = '{"decision":"WARN","reason":"Overage"}' } }
+            access(conf())
+            mock_kong.response._set_headers = {}
+            access(conf())
+            access(conf())
+            assert.equals(1, #http_mock.requests)                  -- one call, then the cache
+            assert.equals("approaching-limit", mock_kong.response._set_headers["X-RateLimit-Warning"])
+            assert.is_nil(mock_kong.response._exit)
+
+            -- With the cache off, every request asks.
+            http_mock.responses = { { status = 200, body = '{"decision":"WARN"}' },
+                                    { status = 200, body = '{"decision":"WARN"}' } }
+            access(conf({ preflight_quota_cache_ttl_ms = 0 }))
+            access(conf({ preflight_quota_cache_ttl_ms = 0 }))
+            assert.equals(3, #http_mock.requests)
+        end)
+
         it("skips the check when no verified customer is known", function()
             mock_kong.ctx.shared = {}
             mock_kong.request._headers = { ["x-customer-id"] = "cust_forged" }

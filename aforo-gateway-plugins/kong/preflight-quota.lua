@@ -19,7 +19,8 @@
 --   preflight_quota_url           string  (default: aforo_endpoint's origin + /api/v1/quota/check)
 --   preflight_quota_api_key       string  (default: api_key)
 --   preflight_quota_timeout_ms    integer (default 300)
---   preflight_quota_cache_ttl_ms  integer (default 1000; 0 disables the cache)
+--   preflight_quota_cache_ttl_ms  integer (default 1000; 0 disables the cache;
+--                                 ALLOW and WARN are cached, DENY never)
 --   preflight_quota_fail_open     boolean (default true)
 
 local http = require("resty.http")
@@ -106,10 +107,20 @@ function M.check(conf, customer_id, metric_name)
     local cache_key = "aforo:preflight:" .. (conf.tenant_id or "") .. ":" .. customer_id
         .. ":" .. (metric_name or "_all")
     local ttl_ms = conf.preflight_quota_cache_ttl_ms or 1000
-    -- Only ALLOW is cached. A DENY is re-asked every time so a top-up or a new
-    -- window unblocks the customer immediately, not a TTL later.
-    if dict and ttl_ms > 0 and dict:get(cache_key) == "ALLOW" then
-        return false
+    -- ALLOW and WARN are cached; DENY never is, so a top-up or a new window
+    -- unblocks the customer immediately, not a TTL later. WARN lets the call
+    -- through just as ALLOW does, and the ingestor answers it for every
+    -- customer near their limit and for overage plans past it (2026-10-19):
+    -- uncached, those customers cost one quota call per request. A cached
+    -- WARN still marks the response with X-RateLimit-Warning.
+    if dict and ttl_ms > 0 then
+        local cached = dict:get(cache_key)
+        if cached == "ALLOW" then
+            return false
+        elseif cached == "WARN" then
+            kong.response.set_header("X-RateLimit-Warning", "approaching-limit")
+            return false
+        end
     end
 
     local httpc = http.new()
@@ -138,9 +149,8 @@ function M.check(conf, customer_id, metric_name)
 
     if res.status ~= 200 then
         -- 401/403 is a credential problem, not an outage; say so, since it will
-        -- not fix itself. /api/v1/quota/check needs quotas:read (or OWNER /
-        -- ADMIN / DEVELOPER) once RBAC is enforced, which an ingest-only key
-        -- scoped usage:ingest does not carry -- hence preflight_quota_api_key.
+        -- not fix itself. The key must be one the ingestor accepts for
+        -- /api/v1/quota/check -- hence preflight_quota_api_key.
         local hint = (res.status == 401 or res.status == 403)
             and " -- the ingestor refused the key: check preflight_quota_api_key (default api_key)" or ""
         return fallback(conf, dict, "status " .. res.status .. hint)
@@ -177,9 +187,9 @@ function M.check(conf, customer_id, metric_name)
         return true
     end
 
-    if data.decision == "ALLOW" and dict and ttl_ms > 0 then
+    if (data.decision == "ALLOW" or data.decision == "WARN") and dict and ttl_ms > 0 then
         -- safe_set: a cache never evicts buffered events; a full dict just misses.
-        dict:safe_set(cache_key, "ALLOW", ttl_ms / 1000)
+        dict:safe_set(cache_key, data.decision, ttl_ms / 1000)
     end
 
     if data.decision == "WARN" then

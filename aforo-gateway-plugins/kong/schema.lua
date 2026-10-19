@@ -395,7 +395,7 @@ return {
                             type = "integer",
                             default = 1000,
                             between = { 0, 60000 },
-                            description = "How long an ALLOW is cached per tenant/customer/metric. DENY is never cached, so a top-up unblocks immediately. 0 disables the cache.",
+                            description = "How long an ALLOW or WARN is cached per tenant/customer/metric. DENY is never cached, so a top-up unblocks immediately. 0 disables the cache.",
                         },
                     },
                     {
