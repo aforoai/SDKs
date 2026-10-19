@@ -1,6 +1,6 @@
 # kong-plugin-aforo-metering — User Guide
 
-**Version:** 2.1.0 · **Updated:** 2026-10-12 · **Audience:** engineers running Kong Gateway (OSS or Enterprise) who want API usage metered into Aforo.
+**Version:** 2.1.0 · **Updated:** 2026-10-19 · **Audience:** engineers running Kong Gateway (OSS or Enterprise) who want API usage metered into Aforo.
 
 ## What you'll build
 
@@ -129,9 +129,13 @@ Configurable via `metric_header` / `quantity_header`; set either to `null` to di
 ### Resolution order
 
 1. `metric_header` from the upstream response
-2. first matching `metric_mappings` rule
-3. `metric_name_pattern`, only if explicitly set to something other than the default
-4. `default_metric`
+2. a matching central mapping (`mappings_url`)
+3. first matching `metric_mappings` rule
+4. for an MCP tool call: `default_metric` on an `MCP_SERVER` product (unless it is still `api_calls`), else `mcp_server.tool_invocations`
+5. `metric_name_pattern`, only if explicitly set to something other than the default
+6. `default_metric`
+
+The pre-flight quota check, when on, checks the metric from steps 2-6: the response header does not exist yet when it runs.
 
 Existing deployments that set a custom `metric_name_pattern` keep working unchanged.
 
@@ -146,7 +150,9 @@ them from the client's request, because a client can set a request header to any
 1. Set `product_type: AI_AGENT` on the agent's service or route.
 2. Name the agent. Set `agent_id` in the plugin config (simplest when one service is
    one agent), or have the upstream send `X-Aforo-Agent-Id: <agent id>` on its response.
-   If both are present, the response header wins.
+   If both are present, the response header wins. With neither, the id of the Kong
+   service the request went to is the agent, so an agent with no configuration is
+   still metered.
 3. Report tokens. Have the upstream send `X-Aforo-Quantity: <tokens>` on its response,
    as in [When only the backend knows](#when-only-the-backend-knows). Without it, each
    request counts as 1.
@@ -183,9 +189,20 @@ X-Aforo-Quantity: 2100
 X-Aforo-Session-Id: sess-42
 ```
 
-is metered as `agentId: fraud-shield-agent`, `sessionId: sess-42`, `quantity: 2100`.
+is metered as `agentId: fraud-shield-agent`, `sessionId: sess-42`, `quantity: 2100`. The
+event's `traceId` is its session (`sess-42`): Aforo groups an agent's sessions by trace,
+and the client's `traceparent` is never used for that.
 
-If neither `agent_id` nor the response header supplies an agent ID, the event is not
+For an AI agent the headers are:
+
+| Response header | Required? | Without it |
+|---|---|---|
+| `X-Aforo-Quantity` | optional | 1 per request |
+| `X-Aforo-Session-Id` | optional | each request is its own session |
+| `X-Aforo-Agent-Id` | optional | `agent_id`, else the Kong service's id |
+| `X-Aforo-Metric` | optional | `default_metric` / mappings |
+
+Only a request routed to no Kong service can be left without an agent; it is not
 metered, and the log says how to fix it:
 
 ```
@@ -199,7 +216,29 @@ string for these settings).
 > ⚠ The plugin reads these headers after the response has gone to the client, so the
 > client receives them too. Do not remove them with another plugin such as
 > `response-transformer`. If you do, the plugin never sees them: the agent ID falls back
-> to `agent_id`, each request becomes its own session, and the quantity falls back to 1.
+> to `agent_id` (or the service id), each request becomes its own session, and the
+> quantity falls back to 1.
+
+### Metering an agentic API
+
+Set `product_type: AGENTIC_API`. Aforo bills an agentic API per trace: all calls of
+one trace are one goal. The trace is therefore billing identity, and the plugin never
+takes it from the client — a client that sent the same `traceparent` on every call would
+otherwise fold all its goals into one. It comes from:
+
+1. the upstream's `X-Aforo-Trace-Id` response header (`trace_id_header`), when several
+   calls make up one goal and the backend knows it;
+2. otherwise Kong's ID for the request: each call is its own goal.
+
+| Response header | Required? | Without it |
+|---|---|---|
+| `X-Aforo-Trace-Id` | optional | one goal per call |
+| `X-Aforo-Quantity` | optional | 1 per call |
+| `X-Aforo-Metric` | optional | `default_metric` / mappings |
+
+An upstream with no Aforo code is metered one goal per call. The client's `traceparent`,
+`tracestate`, `x-trace-id` and `x-request-id` are still sent in the event's `trace`, so
+you can correlate with your own tracing.
 
 ## Step 2 — Register the plugin and the shared buffer
 
@@ -306,24 +345,31 @@ A failure logs each attempt, then says what happened to the events. They are kep
 
 A 401, 403 or 404 means the key, its permission or `aforo_endpoint` is wrong, and the log says `The ingestor answered 401 ...`. The newest 500 events refused under that key are kept and retried with that same key, backing off to once every 5 minutes; they go out if the key works again, and are dropped after 72 hours. Events are never re-sent with a different key — see [Rotating the Aforo API key](#rotating-the-aforo-api-key).
 
-Then confirm the event under the matching customer + metric in your Aforo usage view. The metric name follows `metric_name_pattern` — by default `GET /my-service/anything`.
+Then confirm the event under the matching customer + metric in your Aforo usage view. The metric is the first matching mapping, else `default_metric` (`api_calls` unless you set it).
 
 ## Step 7 (optional) — Turn on MCP tool-invocation metering
 
-If the service proxies an MCP server, set `mcp_enabled=true`:
+If the service is an MCP server sold as an MCP product, set `product_type: MCP_SERVER` and its tool-call metric as `default_metric`:
 
 ```bash
 curl -X PATCH http://localhost:8001/services/my-service/plugins/<plugin-id> \
-  --data "config.mcp_enabled=true" \
-  --data "config.mcp_product_id=$AFORO_MCP_PRODUCT_ID"
+  --data "config.product_type=MCP_SERVER" \
+  --data "config.default_metric=ledger_tool_calls"
 ```
 
-The log phase parses POST bodies (up to 1 MB). Each JSON-RPC `2.0` message with `method: "tools/call"` becomes one event carrying `toolName`, `sessionId` (from the `Mcp-Session-Id` header), `executionStatus` and `executionDurationMs`. A JSON-RPC batch (an array) gives one event per `tools/call` in it.
+That is all; the MCP server needs no Aforo code. (`mcp_enabled=true` turns the same parsing on for a route of another product type.) The log phase parses POST bodies (up to 1 MB). Each JSON-RPC `2.0` message with `method: "tools/call"` becomes one `MCP_SERVER` event carrying `toolName`, `agentId`, `sessionId`, `executionStatus` and `executionDurationMs`, with quantity 1. A JSON-RPC batch (an array) gives one event per `tools/call` in it.
 
-- **Agent.** `agentId` is taken from `params._meta.agent_id`, else the upstream's `X-Aforo-Agent-Id` response header, else `config.agent_id`. The `X-Agent-Id` request header is never read: the client can set it to anything. With an agent the event is sent as `MCP_SERVER`; without one it keeps `product_type`.
-- **Metric.** The upstream's `X-Aforo-Metric` response header, else a matching central mapping or `metric_mappings` rule, else `mcp_server.tool_invocations`.
-- **Protocol messages are not billed.** `initialize`, `tools/list`, `ping` and notifications are MCP plumbing, so they are not metered. Set `config.mcp_meter_non_tool_calls=true` to meter them as plain API calls. Requests on the route that are not JSON-RPC are metered as usual.
+- **Agent.** The upstream's `X-Aforo-Agent-Id` response header, else the customer (the Kong consumer or JWT claim): the caller of an MCP server is the agent. `params._meta.agent_id` and the `X-Agent-Id` request header are never read, and neither is `config.agent_id`, which would put every customer under one agent.
+- **Session.** The upstream's `X-Aforo-Session-Id` response header, else the `Mcp-Session-Id` the upstream answered with, else none. The client's own `Mcp-Session-Id` request header is not used: Aforo bills MCP session time per session, and a client could rotate it.
+- **Metric.** The upstream's `X-Aforo-Metric` response header, else a matching central mapping or `metric_mappings` rule, else `default_metric` on an `MCP_SERVER` product (unless it is still `api_calls`), else `mcp_server.tool_invocations`.
+- **Only tool calls are billed.** `initialize`, `tools/list`, `ping` and notifications are MCP plumbing, so they are not metered, and the pre-flight quota check never refuses them. On an `MCP_SERVER` product nothing else is metered either (a `GET` or `DELETE` on the MCP endpoint is session plumbing). On a route of another product type, `config.mcp_meter_non_tool_calls=true` meters the protocol messages as plain API calls, and requests that are not JSON-RPC are metered as usual.
 - On a route with `product_type: AI_AGENT`, the agent and session come from config and the upstream only, as described in [Metering an AI agent](#metering-an-ai-agent).
+
+| Response header | Required? | Without it |
+|---|---|---|
+| `X-Aforo-Agent-Id` | optional | the customer |
+| `X-Aforo-Session-Id` / `Mcp-Session-Id` | optional | no session |
+| `X-Aforo-Metric` | optional | `default_metric` / mappings |
 
 ## Rotating the Aforo API key
 
