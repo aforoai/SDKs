@@ -147,6 +147,17 @@ return {
                             description = "Upstream RESPONSE header carrying the session ID for an AI_AGENT request, so several requests can share one session. Without it, each request is its own session (Kong's request ID). Set to null to disable.",
                         },
                     },
+                    -- AGENTIC_API trace (product_type=AGENTIC_API only). Aforo
+                    -- groups a trace's events into one goal, so the trace is
+                    -- billing identity: from the upstream RESPONSE, never the
+                    -- client's traceparent.
+                    {
+                        trace_id_header = {
+                            type = "string",
+                            default = "X-Aforo-Trace-Id",
+                            description = "Upstream RESPONSE header naming the trace (goal) an AGENTIC_API request belongs to, so several requests can be one goal. Without it, each request is its own trace (Kong's request ID). The client's traceparent is never used as the trace. Set to null to disable.",
+                        },
+                    },
                     {
                         customer_id_source = {
                             type = "string",

@@ -920,22 +920,6 @@ local function outcome_from_status(status, overrides)
     return "ERROR"
 end
 
--- The trace an AGENTIC_API call belongs to (2026-10-12): the trace-id of a
--- valid W3C traceparent, else x-trace-id, else Kong's own request id. Never
--- absent, so leaving the trace headers off cannot leave an event that the
--- ingestor refuses -- which made the call free.
-local function agentic_trace_id(trace, request_id)
-    local tp = trace and trace.traceparent
-    if tp then
-        local version, trace_id, parent_id, flags = string.match(tp, "^(%x%x)%-(%x+)%-(%x+)%-(%x%x)$")
-        if version and version ~= "ff" and #trace_id == 32 and #parent_id == 16
-            and flags and not string.find(trace_id, "^0+$") then
-            return string.lower(trace_id)
-        end
-    end
-    return (trace and trace.xTraceId) or request_id
-end
-
 -- ────────────────────────────────────────────────────────────
 -- Central metric mappings, fetched from Aforo
 -- ────────────────────────────────────────────────────────────
@@ -1222,6 +1206,30 @@ local function upstream_identity(header, max)
     local v = clean_string(raw, max)
     if not v then return nil, true end
     return v
+end
+
+-- The trace an AGENTIC_API call belongs to, or (nil, bad_header).
+--
+-- AGENTIC_API bills per trace: the ingestor folds every event of a
+-- (tenant, traceId) into one agentic session -- a goal -- which outcome
+-- billing, session budgets and the kill switch then act on. So the trace is
+-- billing identity, and the client must not choose it (2026-10-19). It was
+-- the client's traceparent, else its x-trace-id: a caller that sent one
+-- traceparent on every call folded all its goals into a single session, and
+-- one that sent another customer's trace id put its calls into that
+-- customer's session. Now only sources the client cannot touch:
+--   1. conf.trace_id_header from the upstream RESPONSE -- the backend knows
+--      which calls make up one goal
+--   2. Kong's ID for this request: one request, one goal
+-- The client's traceparent still travels in event.trace, for correlation.
+local function agentic_trace_id(conf, request_id)
+    local header = non_empty_string(conf.trace_id_header)
+    if header then
+        local v, bad = upstream_identity(header, IDENTITY_LIMITS.traceId)
+        if bad then return nil, header end
+        if v then return v end
+    end
+    return request_id
 end
 
 -- Returns agent_id, session_id, bad_agent_header, bad_session_header.
@@ -1741,9 +1749,23 @@ function AforoMeteringHandler:log(conf)
             goto continue
         end
 
-        -- AGENTIC_API: always a traceId (see agentic_trace_id).
+        -- AGENTIC_API: always a traceId, never the client's (see
+        -- agentic_trace_id). An unusable trace header skips the event.
         if event.productType == "AGENTIC_API" then
-            event.traceId = agentic_trace_id(trace, request_id)
+            local bad_trace
+            event.traceId, bad_trace = agentic_trace_id(conf, request_id)
+            if bad_trace then
+                skip_unusable(bad_trace)
+                goto continue
+            end
+        end
+        -- AI_AGENT: the ingestor aggregates an agent's sessions by traceId,
+        -- and an event without one gets the client's traceparent there -- the
+        -- client would choose the session its calls are folded into. The
+        -- session is the trusted grouping (config or upstream), so it is
+        -- the trace too, as Aforo's agent SDKs send it.
+        if event.productType == "AI_AGENT" then
+            event.traceId = event.sessionId
         end
 
         -- Top-level HTTP fields (hoisted from metadata for fast ClickHouse queries)

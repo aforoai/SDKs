@@ -751,18 +751,25 @@ describe("aforo-metering handler", function()
             assert.equals(0, #buffered(c))
         end)
 
-        it("gives every AGENTIC_API event a traceId the client cannot withhold", function()
-            local c = conf({ product_type = "AGENTIC_API" })
+        it("gives every AGENTIC_API event a traceId the client can neither withhold nor choose", function()
+            -- AGENTIC_API bills per trace (goal): a client that could pick the
+            -- trace could fold every goal into one by repeating a traceparent.
+            local c = conf({ product_type = "AGENTIC_API", trace_id_header = "X-Aforo-Trace-Id" })
+            local tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
             ngx.var = { request_id = "kongreq1" }
             log(c, "c1")
-            log(c, "c2", { traceparent = "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01" })
-            log(c, "c3", { ["x-trace-id"] = "legacy-1" })
-            log(c, "c4", { traceparent = "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
-                           ["x-trace-id"] = "legacy-2" })
+            log(c, "c2", { traceparent = tp, ["x-trace-id"] = "legacy-1" })
+            log(c, "c3", { traceparent = tp }, { ["X-Aforo-Trace-Id"] = "goal-42" })
+            -- Present but unusable: skipped, not billed as a one-request goal.
+            log(c, "c4", nil, { ["X-Aforo-Trace-Id"] = string.rep("t", 129) })
             ngx.var = nil
+            local evs = buffered(c)
             local ids = {}
-            for i, e in ipairs(buffered(c)) do ids[i] = e.traceId end
-            assert.same({ "kongreq1", "4bf92f3577b34da6a3ce929d0e0e4736", "legacy-1", "legacy-2" }, ids)
+            for i, e in ipairs(evs) do ids[i] = e.traceId end
+            assert.same({ "kongreq1", "kongreq1", "goal-42" }, ids)
+            -- The client's trace context is still recorded, for correlation only.
+            assert.equals(tp, evs[2].trace.traceparent)
+            assert.equals("legacy-1", evs[2].trace.xTraceId)
         end)
 
         it("caches central mappings per tenant", function()
@@ -1821,6 +1828,19 @@ describe("aforo-metering handler", function()
             assert.equals("kong-req-1", e.idempotencyKey)
         end)
 
+        it("uses the trusted session as the trace, never the client's traceparent", function()
+            -- The ingestor folds AI_AGENT events into sessions by traceId, and
+            -- fills a missing one from the client's traceparent.
+            local tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+            log(conf({ agent_id = "fraud-shield-agent" }), { traceparent = tp })
+            log(conf({ agent_id = "fraud-shield-agent" }), { traceparent = tp },
+                { ["X-Aforo-Session-Id"] = "sess-42" })
+            local evs = buffered()
+            assert.equals("kong-req-1", evs[1].traceId)
+            assert.equals("sess-42", evs[2].traceId)
+            assert.equals(tp, evs[2].trace.traceparent)
+        end)
+
         it("ignores a response header that is turned off (null)", function()
             -- Kong hands the handler nil for a setting configured as null.
             local c = conf({ agent_id = "fraud-shield-agent" })
@@ -2172,6 +2192,7 @@ describe("aforo-metering handler", function()
             assert.is_nil(field("agent_id").default)
             assert.equals("X-Aforo-Agent-Id", field("agent_id_header").default)
             assert.equals("X-Aforo-Session-Id", field("session_id_header").default)
+            assert.equals("X-Aforo-Trace-Id", field("trace_id_header").default)
         end)
 
         it("declares status_outcomes, which org-service writes, as a map of status code to outcome", function()
