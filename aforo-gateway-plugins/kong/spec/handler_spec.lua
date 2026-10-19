@@ -1482,6 +1482,39 @@ describe("aforo-metering handler", function()
             assert.same({ endpoint_path = "/v1/sms" }, e.metadata)
         end)
 
+        it("maps the upstream status to executionStatus by the shared table", function()
+            local o = handler._outcome_from_status
+            local expect = {
+                [200] = "SUCCESS", [204] = "SUCCESS", [304] = "SUCCESS",
+                [400] = "VALIDATION_FAILED", [422] = "VALIDATION_FAILED",
+                [401] = "BLOCKED", [403] = "BLOCKED", [429] = "BLOCKED",
+                [404] = "ERROR", [500] = "ERROR", [502] = "ERROR",
+                [408] = "TIMEOUT", [504] = "TIMEOUT", [499] = "CANCELLED",
+            }
+            for status, outcome in pairs(expect) do
+                assert.equals(outcome, o(status), tostring(status))
+            end
+            assert.is_nil(o(101))
+            assert.is_nil(o(nil))
+            assert.equals("VALIDATION_FAILED", o(404, { ["404"] = "validation_failed" }))
+            assert.equals("ERROR", o(500, { ["500"] = "NOT_A_STATUS" }))
+        end)
+
+        it("sends executionStatus on every event, MCP tool calls included", function()
+            local orig = mock_kong.response.get_status
+            local c = conf({ mcp_enabled = true, status_outcomes = { ["404"] = "VALIDATION_FAILED" } })
+            for _, s in ipairs({ 200, 500, 404 }) do
+                mock_kong.response.get_status = function() return s end
+                log(c, { var = { request_id = "r" .. s } })
+            end
+            mock_kong.response.get_status = function() return 503 end
+            log(c, { method = "POST", body = tool_call("search"), var = { request_id = "r-mcp" } })
+            mock_kong.response.get_status = orig
+            local got = {}
+            for i, e in ipairs(buffered(c)) do got[i] = e.executionStatus end
+            assert.same({ "SUCCESS", "ERROR", "VALIDATION_FAILED", "ERROR" }, got)
+        end)
+
         it("survives any MCP body, and still bills a tools/call without a usable name", function()
             local c = conf(MCP)
             local bodies = { "1", '"text"', "null", "[]", "[1,2]", "{}",
@@ -2139,6 +2172,15 @@ describe("aforo-metering handler", function()
             assert.is_nil(field("agent_id").default)
             assert.equals("X-Aforo-Agent-Id", field("agent_id_header").default)
             assert.equals("X-Aforo-Session-Id", field("session_id_header").default)
+        end)
+
+        it("declares status_outcomes, which org-service writes, as a map of status code to outcome", function()
+            local f = field("status_outcomes")
+            assert.equals("map", f.type)
+            assert.equals("^[2-5]%d%d$", f.keys.match)
+            assert.truthy(("404"):match(f.keys.match))
+            assert.falsy(("1xx"):match(f.keys.match))
+            assert.equals(11, #f.values.one_of)
         end)
     end)
 end)

@@ -881,6 +881,45 @@ local function identity_problem(event)
     return nil
 end
 
+-- ────────────────────────────────────────────────────────────
+-- Execution status (OUTCOME_BASED pricing)
+-- ────────────────────────────────────────────────────────────
+-- The upstream's HTTP status as the ingestor's executionStatus, on every
+-- event (2026-10-19). OUTCOME_BASED rate plans bill each event at a weight
+-- per status, and metric filters can count only SUCCESS; an event without a
+-- status bills at full weight and never matches such a filter. Only MCP tool
+-- calls used to carry one (2xx SUCCESS, anything else ERROR), so a 500 from
+-- an API, AI agent or agentic API billed exactly like a 200 under every plan.
+-- The table is the one all Aforo gateway plugins share (policy locked
+-- 2026-09-30):
+--   2xx/3xx -> SUCCESS, 408/504 -> TIMEOUT, 499 -> CANCELLED,
+--   400/422 -> VALIDATION_FAILED, 401/403/429 -> BLOCKED,
+--   every other 4xx and 5xx -> ERROR, anything else -> nil (field left out).
+-- conf.status_outcomes overrides it per exact code ("404" -> "VALIDATION_FAILED").
+local OUTCOME_STATUSES = {
+    SUCCESS = true, PARTIAL = true, TIMEOUT = true, ERROR = true,
+    VALIDATION_FAILED = true, FAILED = true, FAILURE = true,
+    CANCELLED = true, PENDING = true, BLOCKED = true, HITL_REQUIRED = true,
+}
+
+local function outcome_from_status(status, overrides)
+    local s = tonumber(status)
+    if not s or s < 200 or s > 599 then return nil end
+    s = math.floor(s)
+    if type(overrides) == "table" then
+        local o = overrides[tostring(s)]
+        if type(o) == "string" and OUTCOME_STATUSES[string.upper(o)] then
+            return string.upper(o)
+        end
+    end
+    if s < 400 then return "SUCCESS" end
+    if s == 408 or s == 504 then return "TIMEOUT" end
+    if s == 499 then return "CANCELLED" end
+    if s == 400 or s == 422 then return "VALIDATION_FAILED" end
+    if s == 401 or s == 403 or s == 429 then return "BLOCKED" end
+    return "ERROR"
+end
+
 -- The trace an AGENTIC_API call belongs to (2026-10-12): the trace-id of a
 -- valid W3C traceparent, else x-trace-id, else Kong's own request id. Never
 -- absent, so leaving the trace headers off cannot leave an event that the
@@ -1662,7 +1701,6 @@ function AforoMeteringHandler:log(conf)
                 event.agentId   = call.agent_id or trusted_agent
                 event.sessionId = mcp_session
             end
-            event.executionStatus = (status >= 200 and status < 300) and "SUCCESS" or "ERROR"
             event.executionDurationMs = response_ms
             -- MCP_SERVER requires toolName AND agentId. Classify the tool call as
             -- MCP_SERVER only when both are known; otherwise keep the configured
@@ -1713,6 +1751,8 @@ function AforoMeteringHandler:log(conf)
         event.httpMethod      = string.sub(method or "", 1, 16)
         event.statusCode      = status
         event.responseTimeMs  = response_ms
+        -- Every type, MCP tool calls included: see outcome_from_status.
+        event.executionStatus = outcome_from_status(status, conf.status_outcomes)
 
         -- W3C trace context (null when absent — fidelity, not synthetic)
         event.trace = trace
@@ -1834,5 +1874,6 @@ AforoMeteringHandler._rearm = event_buffer._rearm
 AforoMeteringHandler._conf_ttl = event_buffer.CONF_TTL
 AforoMeteringHandler._max_event_age = event_buffer.MAX_EVENT_AGE_SECONDS
 AforoMeteringHandler._mappings_key = mappings_key
+AforoMeteringHandler._outcome_from_status = outcome_from_status
 
 return AforoMeteringHandler

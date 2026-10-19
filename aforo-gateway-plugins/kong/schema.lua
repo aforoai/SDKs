@@ -209,6 +209,26 @@ return {
                             description = "Aforo product ID for MCP server metering (required when mcp_enabled=true)",
                         },
                     },
+                    -- executionStatus overrides (OUTCOME_BASED pricing): an
+                    -- exact upstream status code -> one of the ingestor's
+                    -- execution statuses. Wins over the default table (README
+                    -- "Execution status"). org-service writes this map.
+                    {
+                        status_outcomes = {
+                            type = "map",
+                            required = false,
+                            keys = { type = "string", match = "^[2-5]%d%d$" },
+                            values = {
+                                type = "string",
+                                one_of = {
+                                    "SUCCESS", "PARTIAL", "TIMEOUT", "ERROR",
+                                    "VALIDATION_FAILED", "FAILED", "FAILURE",
+                                    "CANCELLED", "PENDING", "BLOCKED", "HITL_REQUIRED",
+                                },
+                            },
+                            description = "Per-status-code executionStatus overrides, e.g. {\"404\": \"VALIDATION_FAILED\"}. Keys are exact HTTP codes 200-599. Without an entry: 2xx/3xx SUCCESS, 408/504 TIMEOUT, 499 CANCELLED, 400/422 VALIDATION_FAILED, 401/403/429 BLOCKED, other 4xx/5xx ERROR.",
+                        },
+                    },
                     -- ── JWT Validation ──
                     -- Enable to validate Aforo RS256 JWTs before metering.
                     -- Checks: expiry, issuer, RS256 signature, tenant_id (must
