@@ -1576,17 +1576,42 @@ describe("aforo-metering handler", function()
             assert.equals("api_calls", evs[1].metricName)
         end)
 
-        it("takes the MCP agent from _meta, then the agent response header, then config -- never X-Agent-Id", function()
+        it("takes the MCP agent from the agent response header, else the verified customer -- never the request", function()
+            -- _meta.agent_id and X-Agent-Id are the client's to write; config's
+            -- agent_id would put every customer under one agent.
             local c = conf({ mcp_enabled = true, agent_id = "agent_cfg" })
-            local forged = { ["x-agent-id"] = "forged", ["X-Agent-Id"] = "forged" }
+            local forged = { ["x-agent-id"] = "forged", ["X-Agent-Id"] = "forged",
+                             ["X-Aforo-Agent-Id"] = "forged" }
             log(c, { method = "POST", body = tool_call("t", { agent_id = "agent_meta" }), headers = forged,
                      response = { ["X-Aforo-Agent-Id"] = "agent_hdr" } })
-            log(c, { method = "POST", body = tool_call("t"), headers = forged,
-                     response = { ["X-Aforo-Agent-Id"] = "agent_hdr" } })
-            log(c, { method = "POST", body = tool_call("t"), headers = forged })
-            local ids = {}
-            for i, e in ipairs(buffered(c)) do ids[i] = e.agentId end
-            assert.same({ "agent_meta", "agent_hdr", "agent_cfg" }, ids)
+            log(c, { method = "POST", body = tool_call("t", { agent_id = "agent_meta" }), headers = forged })
+            local ids, types = {}, {}
+            for i, e in ipairs(buffered(c)) do ids[i], types[i] = e.agentId, e.productType end
+            assert.same({ "agent_hdr", "cust_a" }, ids)
+            assert.same({ "MCP_SERVER", "MCP_SERVER" }, types)
+        end)
+
+        it("takes the MCP session from the upstream response only", function()
+            local c = conf(MCP)
+            local client = { ["Mcp-Session-Id"] = "client-chosen" }
+            log(c, { method = "POST", body = tool_call("t"), headers = client, var = { request_id = "r1" } })
+            log(c, { method = "POST", body = tool_call("t"), headers = client, var = { request_id = "r2" },
+                     response = { ["Mcp-Session-Id"] = "srv-session-1" } })
+            log(c, { method = "POST", body = tool_call("t"), headers = client, var = { request_id = "r3" },
+                     response = { ["Mcp-Session-Id"] = "srv-session-1", ["X-Aforo-Session-Id"] = "aforo-sess" } })
+            -- MCP does not bound Mcp-Session-Id: a long one is hashed, not dropped.
+            local md5, long = ngx.md5, string.rep("s", 200)
+            ngx.md5 = function(x)   -- the buffer key is an md5 too
+                if x == long then return "0123456789abcdef0123456789abcdef" end
+                return md5(x)
+            end
+            log(c, { method = "POST", body = tool_call("t"), var = { request_id = "r4" },
+                     response = { ["Mcp-Session-Id"] = long } })
+            ngx.md5 = md5
+            local got = {}
+            for i, e in ipairs(buffered(c)) do got[i] = e.sessionId or "none" end
+            assert.same({ "none", "srv-session-1", "aforo-sess",
+                          "mcp-0123456789abcdef0123456789abcdef" }, got)
         end)
 
         it("on an AI_AGENT route, takes MCP agent and session from config and the upstream only", function()
@@ -1629,26 +1654,39 @@ describe("aforo-metering handler", function()
             log(c, { method = "POST", body = stash })
             assert.equals("big_tool", buffered(c)[1].toolName)
         end)
-        it("R5a: an unusable session header (unused off AI_AGENT) does not strip the MCP agent", function()
-            local c = conf({ mcp_enabled = true, agent_id = "agent-x" })      -- product_type API
-            log(c, { method = "POST", body = tool_call("search"),
-                     response = { ["X-Aforo-Session-Id"] = string.rep("s", 65) } })
-            local e = buffered(c)[1]
-            assert.is_not_nil(e)
-            assert.equals("agent-x", e.agentId)
-            assert.equals("MCP_SERVER", e.productType)
-        end)
-
-        it("R5b: an unusable agent header skips only the tool calls that would use it", function()
-            local c = conf({ mcp_enabled = true })
+        it("R5: an unusable agent or session response header skips the tool calls, not bills them elsewhere", function()
+            local c = conf(MCP)
             local body = cjson.encode({
-                { jsonrpc = "2.0", id = 1, method = "tools/call", params = { name = "own", _meta = { agent_id = "a1" } } },
-                { jsonrpc = "2.0", id = 2, method = "tools/call", params = { name = "needs_header" } },
+                { jsonrpc = "2.0", id = 1, method = "tools/call", params = { name = "a", _meta = { agent_id = "a1" } } },
+                { jsonrpc = "2.0", id = 2, method = "tools/call", params = { name = "b" } },
             })
             log(c, { method = "POST", body = body, response = { ["X-Aforo-Agent-Id"] = string.rep("a", 37) } })
+            log(c, { method = "POST", body = body, response = { ["X-Aforo-Session-Id"] = string.rep("s", 65) } })
+            assert.equals(0, #buffered(c))
+            log(c, { method = "POST", body = body })
+            assert.equals(2, #buffered(c))
+        end)
+
+        it("meters only tool calls on an MCP_SERVER product, with no mcp_enabled needed", function()
+            local c = conf({ product_type = "MCP_SERVER", mcp_meter_non_tool_calls = true })
+            log(c, { method = "POST", path = "/mcp", body = '{"jsonrpc":"2.0","id":1,"method":"initialize"}' })
+            log(c, { method = "GET", path = "/mcp" })          -- SSE stream
+            log(c, { method = "DELETE", path = "/mcp" })       -- session end
+            assert.equals(0, #buffered(c))
+            log(c, { method = "POST", path = "/mcp", body = tool_call("get_balance") })
             local evs = buffered(c)
             assert.equals(1, #evs)
-            assert.equals("own", evs[1].toolName)
+            assert.equals("MCP_SERVER", evs[1].productType)
+            assert.equals("get_balance", evs[1].toolName)
+            assert.equals("cust_a", evs[1].agentId)
+        end)
+
+        it("bills an MCP_SERVER product's tool calls to its default_metric, unless that is still api_calls", function()
+            local c = conf({ product_type = "MCP_SERVER", default_metric = "ledger_tool_calls" })
+            log(c, { method = "POST", path = "/mcp", body = tool_call("t") })
+            log(conf({ product_type = "MCP_SERVER" }), { method = "POST", path = "/mcp", body = tool_call("t") })
+            assert.equals("ledger_tool_calls", buffered(c)[1].metricName)
+            assert.equals("mcp_server.tool_invocations", buffered(conf())[2].metricName)
         end)
     end)
     -- ── productType ─────────────────────────────────────────────
@@ -1713,25 +1751,21 @@ describe("aforo-metering handler", function()
             assert.equals(0, #buffered())
         end)
 
-        it("sends an MCP tool call as MCP_SERVER only when agentId is known", function()
+        it("sends every MCP tool call as MCP_SERVER, the verified customer as the agent", function()
             local with_meta = '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"search",'
                 .. '"_meta":{"agent_id":"agent_1"}}}'
             log(conf("API"), "POST", with_meta, {})
             local configured = conf("API"); configured.agent_id = "agent_cfg"
             log(configured, "POST", TOOL_CALL, {})
-            log(conf("API"), "POST", TOOL_CALL, {})
             -- X-Agent-Id is the client's to set: never a source for agentId.
             log(conf("API"), "POST", TOOL_CALL, { ["x-agent-id"] = "agent_forged", ["X-Agent-Id"] = "agent_forged" })
             local events = buffered()
-            assert.equals(4, #events)
-            assert.equals("MCP_SERVER", events[1].productType)
-            assert.equals("search", events[1].toolName)
-            assert.equals("agent_1", events[1].agentId)
-            assert.equals("MCP_SERVER", events[2].productType)
-            assert.equals("agent_cfg", events[2].agentId)
-            assert.equals("API", events[3].productType)
-            assert.equals("API", events[4].productType)
-            assert.is_nil(events[4].agentId)
+            assert.equals(3, #events)
+            for _, e in ipairs(events) do
+                assert.equals("MCP_SERVER", e.productType)
+                assert.equals("search", e.toolName)
+                assert.equals("cust_a", e.agentId)
+            end
         end)
     end)
     -- ── AI_AGENT identity ───────────────────────────────────────

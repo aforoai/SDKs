@@ -669,7 +669,9 @@ local AforoMeteringHandler = {
 -- fields of their own. The ingestor validates a batch as a whole, so one event
 -- missing its type's fields fails every event it travels with; such events are
 -- skipped at the log phase instead. AI_AGENT gets agentId and sessionId from
--- trusted sources only (see resolve_ai_agent_identity). gRPC service/method,
+-- trusted sources only (see resolve_ai_agent_identity), an MCP tool call its
+-- agent from the upstream or the verified customer (mcp_agent_id), and
+-- AGENTIC_API its traceId from the upstream or Kong (agentic_trace_id). gRPC service/method,
 -- GraphQL operation, WebSocket connection and MQTT topic are not observable
 -- at an HTTP gateway, so those types are listed only so the check refuses
 -- them rather than poisoning batches. Unknown types are passed through
@@ -1341,17 +1343,27 @@ local MCP_TOOL_METRIC = "mcp_server.tool_invocations"
 -- Largest request body read from client_body_buffer_size's spill file.
 local MCP_MAX_BODY_BYTES = 1048576
 
+-- MCP metering is on for an mcp_enabled route, and always for an
+-- MCP_SERVER product (2026-10-19): an MCP_SERVER event needs the tool name,
+-- which only the JSON-RPC body has, so with mcp_enabled off such a product
+-- metered nothing at all.
+local function mcp_on(conf, product_type)
+    return conf.mcp_enabled == true or product_type == "MCP_SERVER"
+end
+
 -- Parse a request body as JSON-RPC (2026-10-12 rewrite). Returns nil when it
--- is not JSON-RPC at all, else { calls = { {tool_name, agent_id}, ... },
+-- is not JSON-RPC at all, else { calls = { {tool_name}, ... },
 -- other = <number of messages that are not tools/call> } --
 -- one entry per tools/call, also inside a JSON-RPC batch (an array), which
 -- used to be read as no tool call at all.
 --
 -- Every level is type-checked: the body is the client's. A body of `1`, or
--- "params": null / "_meta": null, used to raise in the log phase (indexing a
--- number or the cjson.null userdata) and lose the event. A tools/call whose
--- name is missing or not a string is still a tool call -- billed as
--- "unknown", so leaving the name out is not a way to skip billing.
+-- "params": null, used to raise in the log phase (indexing a number or the
+-- cjson.null userdata) and lose the event. A tools/call whose name is
+-- missing or not a string is still a tool call -- billed as "unknown", so
+-- leaving the name out is not a way to skip billing. params._meta.agent_id
+-- is not read (2026-10-19): it is the client's to write, and the agent is
+-- billing identity (see mcp_agent_id).
 local function parse_jsonrpc(raw_body)
     if type(raw_body) ~= "string" or raw_body == "" then return nil end
     local parsed = cjson.decode(raw_body)
@@ -1374,17 +1386,105 @@ local function parse_jsonrpc(raw_body)
                 other = other + 1
             else
                 local params = type(msg.params) == "table" and msg.params or {}
-                local meta = type(params._meta) == "table" and params._meta or {}
                 calls[#calls + 1] = {
                     -- Kept, escaped and capped, whatever the client sent: see escaped_string.
                     tool_name = escaped_string(params.name, 64) or "unknown",
-                    agent_id = clean_string(meta.agent_id, IDENTITY_LIMITS.agentId),
                 }
             end
         end
     end
     if not jsonrpc then return nil end
     return { calls = calls, other = other }
+end
+
+-- What a request bills: tool-call events, a plain event, both or neither.
+-- Decided here for both phases, so the access phase's pre-flight check asks
+-- about exactly the events the log phase will create.
+--   * tools: one event per tools/call in the body
+--   * plain: an event for the request itself. Never on an MCP_SERVER
+--     product, whose events need a tool name (a GET or DELETE on the MCP
+--     endpoint is session plumbing). On a JSON-RPC body, only for its
+--     non-tool messages and only with mcp_meter_non_tool_calls (2026-10-12):
+--     initialize, tools/list, ping and notifications are protocol traffic.
+local function billable(conf, product_type, jsonrpc)
+    local tools = jsonrpc ~= nil and #jsonrpc.calls > 0
+    local plain
+    if product_type == "MCP_SERVER" then
+        plain = false
+    elseif jsonrpc then
+        plain = conf.mcp_meter_non_tool_calls == true and jsonrpc.other > 0
+    else
+        plain = true
+    end
+    return tools, plain
+end
+
+-- The schema's default_metric. On an MCP_SERVER product a default_metric
+-- set to anything else is the product's tool-call metric.
+local SCHEMA_DEFAULT_METRIC = "api_calls"
+
+-- The metric a tools/call bills to: the upstream's metric header, central
+-- mappings, metric_mappings -- then, on an MCP_SERVER product,
+-- default_metric unless it is still the schema's api_calls (2026-10-19),
+-- else mcp_server.tool_invocations. An MCP_SERVER product's plugin is
+-- configured with its catalog metric as default_metric, and every tool call
+-- was billed to mcp_server.tool_invocations instead: a metric the catalog
+-- may not have, and not the one its quota rules name.
+local function tool_call_metric(conf, product_type, method, path, service_name, route_name,
+                                 consumer_name, header_metric)
+    local fallback = MCP_TOOL_METRIC
+    if product_type == "MCP_SERVER" then
+        local dm = non_empty_string(conf.default_metric)
+        if dm and dm ~= SCHEMA_DEFAULT_METRIC then fallback = dm end
+    end
+    return resolve_metric_name(conf, method, path, service_name, route_name, consumer_name,
+                               header_metric, fallback)
+end
+
+-- The agent of an MCP tool call (not on an AI_AGENT route), or
+-- (nil, bad_header). MCP_SERVER requires one on every event, and the agent
+-- is billing identity: the ingestor applies per-agent session limits, keys
+-- MCP sessions and their duration billing by it, and resolves the agent's
+-- team for budgets. So the client cannot name it (2026-10-19) -- it used to
+-- be params._meta.agent_id from the request body. Now:
+--   1. conf.agent_id_header from the upstream RESPONSE
+--   2. the verified customer (JWT claim or Kong consumer): the caller of an
+--      MCP server is the agent, and at a gateway the credential is all that
+--      identifies the caller
+-- conf.agent_id is not used here: it names one agent for the whole service,
+-- which for an MCP server would put every customer's sessions under one
+-- agent (one session limit, one duration bill).
+local function mcp_agent_id(conf, customer_id)
+    local header = non_empty_string(conf.agent_id_header)
+    if header then
+        local v, bad = upstream_identity(header, IDENTITY_LIMITS.agentId)
+        if bad then return nil, header end
+        if v then return v end
+    end
+    return customer_id
+end
+
+-- The MCP session of a tool call (not on an AI_AGENT route), or
+-- (nil, bad_header). Optional for MCP_SERVER, but the ingestor tracks
+-- sessions and bills their duration by it, so it comes from the upstream
+-- only (2026-10-19) -- it was the client's Mcp-Session-Id request header,
+-- and a client rotating it on every call billed no session time:
+--   1. conf.session_id_header from the upstream RESPONSE
+--   2. the Mcp-Session-Id the upstream answered with (MCP's own header).
+--      Its length is not bounded by MCP, so a value the ingestor would not
+--      take is hashed rather than dropped: the session survives.
+--   3. none
+local function mcp_session_id(conf)
+    local header = non_empty_string(conf.session_id_header)
+    if header then
+        local v, bad = upstream_identity(header, IDENTITY_LIMITS.sessionId)
+        if bad then return nil, header end
+        if v then return v end
+    end
+    local raw = kong.response.get_header("Mcp-Session-Id")
+    if type(raw) == "table" then raw = raw[1] end
+    if type(raw) ~= "string" or raw == "" then return nil end
+    return clean_string(raw, IDENTITY_LIMITS.sessionId) or ("mcp-" .. ngx.md5(raw))
 end
 
 -- A request body larger than client_body_buffer_size is spooled to a temp
@@ -1469,7 +1569,8 @@ function AforoMeteringHandler:access(conf)
     -- to buffer the whole request, which is real overhead on large uploads and
     -- pointless when nothing consumes it. pcall-guarded because the body is
     -- legitimately unavailable for streamed or oversized requests.
-    if conf.mcp_enabled then
+    local product_type = normalize_product_type(conf.product_type)
+    if mcp_on(conf, product_type) then
         local ok, body = pcall(kong.request.get_raw_body)
         body = ok and body or nil
         if body == nil then
@@ -1633,19 +1734,19 @@ function AforoMeteringHandler:log(conf)
         if bad then return skip_unusable(conf.metric_header) end
     end
 
-    -- MCP: JSON-RPC on an mcp_enabled route.
+    -- MCP: JSON-RPC on an mcp_enabled route or an MCP_SERVER product.
     local jsonrpc = nil
-    if conf.mcp_enabled and method == "POST" then
+    if mcp_on(conf, product_type) and method == "POST" then
         jsonrpc = parse_jsonrpc(raw_body)
     end
 
-    -- MCP protocol messages that are not tool calls -- initialize, tools/list,
-    -- ping, notifications/* -- are plumbing, not usage (2026-10-12). They used
-    -- to fall through and bill as plain API calls under default_metric.
-    -- mcp_meter_non_tool_calls=true restores that. Requests on the route that
-    -- are not JSON-RPC at all are unaffected.
-    if jsonrpc and #jsonrpc.calls == 0 and not conf.mcp_meter_non_tool_calls then
-        kong.log.debug("[aforo-metering] Not metering an MCP protocol message (no tools/call).")
+    -- Nothing billable: an MCP protocol message that is not a tool call
+    -- (initialize, tools/list, ping, notifications/*) without
+    -- mcp_meter_non_tool_calls, or anything but a tool call on an MCP_SERVER
+    -- product. See billable(); the pre-flight check uses the same decision.
+    local tools, plain = billable(conf, product_type, jsonrpc)
+    if not tools and not plain then
+        kong.log.debug("[aforo-metering] Not metering an MCP request without a tools/call.")
         return
     end
 
@@ -1664,73 +1765,57 @@ function AforoMeteringHandler:log(conf)
         -- fallback.
         if product_type == "AI_AGENT" then
             local bad_agent, bad_session
-            event.agentId, event.sessionId, bad_agent, bad_session = resolve_ai_agent_identity(conf, request_id)
+            event.agentId, event.sessionId, bad_agent, bad_session = resolve_ai_agent_identity(conf, request_id, service)
             if bad_agent or bad_session then return nil, bad_agent or bad_session end
         end
         return event
     end
 
     local events = {}
-    if jsonrpc and #jsonrpc.calls > 0 then
+    if tools then
         -- One event per tools/call: a JSON-RPC batch carries several.
-        local metric = resolve_metric_name(conf, method, path, service_name, route_name,
-                                           consumer_name, header_metric, MCP_TOOL_METRIC)
+        local metric = tool_call_metric(conf, product_type, method, path, service_name, route_name,
+                                        consumer_name, header_metric)
         -- AI_AGENT: agent and session come from config or the upstream only,
-        -- as for every other AI_AGENT event. Otherwise the agent is the call's
-        -- _meta.agent_id, then the agent_id_header response header, then
-        -- conf.agent_id -- never the X-Agent-Id request header, which is the
-        -- client's to set (documented as unread since 2.0.0, and still read
-        -- here until 2026-10-12).
-        local trusted_agent, trusted_session, bad_agent, bad_session =
-            resolve_ai_agent_identity(conf, request_id)
-        -- An unusable header matters only where its value would be used: on
-        -- an AI_AGENT route both are, for every call; elsewhere the session
-        -- header is not used at all, and the agent header only by a call
-        -- without its own _meta.agent_id -- only those calls are skipped.
-        if product_type == "AI_AGENT" and (bad_agent or bad_session) then
-            return skip_unusable(bad_agent or bad_session)
+        -- as for every other AI_AGENT event. Otherwise the call is an
+        -- MCP_SERVER event whose agent is the upstream's agent header or the
+        -- verified customer, and whose session is the upstream's (see
+        -- mcp_agent_id, mcp_session_id) -- never X-Agent-Id, _meta.agent_id
+        -- or the request's Mcp-Session-Id, which are the client's to set.
+        -- An unusable header skips the calls: every one of them would use it.
+        local agent_id, session_id, bad
+        if product_type == "AI_AGENT" then
+            local bad_agent, bad_session
+            agent_id, session_id, bad_agent, bad_session =
+                resolve_ai_agent_identity(conf, request_id, service)
+            bad = bad_agent or bad_session
+        else
+            agent_id, bad = mcp_agent_id(conf, customer_id)
+            if not bad then session_id, bad = mcp_session_id(conf) end
         end
-        local mcp_session = clean_string(kong.request.get_header("Mcp-Session-Id"), IDENTITY_LIMITS.sessionId)
-        for _, call in ipairs(jsonrpc.calls) do
-          if bad_agent and not call.agent_id then
-            skip_unusable(bad_agent)
-          else
-            local i = #events + 1
+        if bad then return skip_unusable(bad) end
+        for i, call in ipairs(jsonrpc.calls) do
             local event = { productType = product_type, customerId = customer_id }
+            if product_type ~= "AI_AGENT" then event.productType = "MCP_SERVER" end
             event.metricName     = metric
             event.quantity       = 1
             event.idempotencyKey = "mcp:" .. (conf.tenant_id or "") .. ":" .. request_id .. ":"
                                    .. i .. ":" .. call.tool_name
             event.occurredAt     = iso8601_utc(ngx.now())
             event.toolName       = call.tool_name
-            if product_type == "AI_AGENT" then
-                event.agentId, event.sessionId = trusted_agent, trusted_session
-            else
-                event.agentId   = call.agent_id or trusted_agent
-                event.sessionId = mcp_session
-            end
+            event.agentId        = agent_id
+            event.sessionId      = session_id
             event.executionDurationMs = response_ms
-            -- MCP_SERVER requires toolName AND agentId. Classify the tool call as
-            -- MCP_SERVER only when both are known; otherwise keep the configured
-            -- product_type rather than send an event the ingestor must reject.
-            if event.agentId then
-                event.productType = "MCP_SERVER"
-            end
             events[i] = event
-          end
         end
-        -- A mixed JSON-RPC batch with mcp_meter_non_tool_calls: its other
-        -- messages are metered too, as one plain API call -- as they would be
-        -- on their own.
-        if jsonrpc.other > 0 and conf.mcp_meter_non_tool_calls then
-            local event, unusable = api_event()
-            if not event then return skip_unusable(unusable) end
-            events[#events + 1] = event
-        end
-    else
+    end
+    -- The request itself; for a mixed JSON-RPC batch with
+    -- mcp_meter_non_tool_calls, its other messages as one plain API call --
+    -- as they would be on their own.
+    if plain then
         local event, unusable = api_event()
         if not event then return skip_unusable(unusable) end
-        events[1] = event
+        events[#events + 1] = event
     end
 
     -- The path is client-chosen: escaped and cut to the ingestor's 512 limit.

@@ -47,7 +47,7 @@ return {
                         product_type = {
                             type = "string",
                             default = "API",
-                            description = "Aforo productType sent on every event (trimmed, upper-cased): API, AGENTIC_API, AI_AGENT, MCP_SERVER, GRPC_API, GRAPHQL_API, WEBSOCKET_API or MQTT_BROKER. MCP tools/call is sent as MCP_SERVER when toolName and agentId are known. Events missing their type's required fields are skipped, as one invalid event fails the whole batch. AI_AGENT takes agentId from agent_id_header or agent_id. GRPC_API, GRAPHQL_API, WEBSOCKET_API and MQTT_BROKER need fields a gateway cannot observe.",
+                            description = "Aforo productType sent on every event (trimmed, upper-cased): API, AGENTIC_API, AI_AGENT, MCP_SERVER, GRPC_API, GRAPHQL_API, WEBSOCKET_API or MQTT_BROKER. MCP tools/call is sent as MCP_SERVER; on an MCP_SERVER product only tool calls are metered. Events missing their type's required fields are skipped, as one invalid event fails the whole batch. AI_AGENT takes agentId from agent_id_header or agent_id. GRPC_API, GRAPHQL_API, WEBSOCKET_API and MQTT_BROKER need fields a gateway cannot observe.",
                         },
                     },
                     -- Metric configuration
@@ -130,21 +130,21 @@ return {
                     {
                         agent_id = {
                             type = "string",
-                            description = "Agent ID for AI_AGENT events on the service/route this plugin is attached to. Operator config, so trusted. Used when the upstream does not send agent_id_header.",
+                            description = "Agent ID for AI_AGENT events on the service/route this plugin is attached to. Operator config, so trusted. Used when the upstream does not send agent_id_header. Not used for MCP tool calls, whose agent is the caller.",
                         },
                     },
                     {
                         agent_id_header = {
                             type = "string",
                             default = "X-Aforo-Agent-Id",
-                            description = "Upstream RESPONSE header carrying the agent ID for a single AI_AGENT request; wins over agent_id. Read from the response, so clients cannot forge it. Set to null to disable.",
+                            description = "Upstream RESPONSE header carrying the agent ID for a single AI_AGENT request (wins over agent_id) or MCP tool call (wins over the verified customer). Read from the response, so clients cannot forge it. Set to null to disable.",
                         },
                     },
                     {
                         session_id_header = {
                             type = "string",
                             default = "X-Aforo-Session-Id",
-                            description = "Upstream RESPONSE header carrying the session ID for an AI_AGENT request, so several requests can share one session. Without it, each request is its own session (Kong's request ID). Set to null to disable.",
+                            description = "Upstream RESPONSE header carrying the session ID for an AI_AGENT request or MCP tool call, so several requests can share one session. Without it, an AI_AGENT request is its own session (Kong's request ID) and an MCP call uses the upstream's Mcp-Session-Id response header. Set to null to disable.",
                         },
                     },
                     -- AGENTIC_API trace (product_type=AGENTIC_API only). Aforo
@@ -204,7 +204,7 @@ return {
                         mcp_enabled = {
                             type = "boolean",
                             default = false,
-                            description = "Meter MCP JSON-RPC tools/call requests as tool invocations (one event per call, also in a JSON-RPC batch). Bodies up to 1 MB are read.",
+                            description = "Meter MCP JSON-RPC tools/call requests as tool invocations (one event per call, also in a JSON-RPC batch). Bodies up to 1 MB are read. Always on when product_type is MCP_SERVER.",
                         },
                     },
                     {
