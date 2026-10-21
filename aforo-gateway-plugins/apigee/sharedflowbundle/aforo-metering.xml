@@ -2,8 +2,9 @@
 <SharedFlowBundle revision="1" name="aforo-metering">
     <DisplayName>Aforo Usage Metering</DisplayName>
     <Description>Auto-captures API usage events and forwards them to Aforo's
-        usage ingestor service for billing and analytics. Runs in
-        PostClientFlow — zero latency impact on the API response.</Description>
+        usage ingestor service for billing and analytics. Attach on the
+        response path (PostProxyFlowHook). A failed send never fails the
+        API call and adds at most about 4 seconds.</Description>
     <CreatedAt>1711036800000</CreatedAt>
     <LastModifiedAt>1711036800000</LastModifiedAt>
     <Policies>
@@ -15,10 +16,15 @@
         <Policy>AforoMarginGuardRaiseFault</Policy>
         <Policy>AforoMeteringBuildEvent</Policy>
         <Policy>AforoMeteringSendEvent</Policy>
+        <Policy>AforoMeteringRetryGate</Policy>
+        <Policy>AforoMeteringSendEventRetry1</Policy>
+        <Policy>AforoMeteringLogDeliveryFailure</Policy>
     </Policies>
     <Resources>
         <Resource>jsc://aforo-metering.js</Resource>
         <Resource>jsc://aforo-margin-guard.js</Resource>
+        <Resource>jsc://aforo-metering-retry-gate.js</Resource>
+        <Resource>jsc://aforo-metering-log-failure.js</Resource>
     </Resources>
     <SharedFlows>
         <SharedFlow>default</SharedFlow>

@@ -7,13 +7,12 @@
  * Fail-open: if the check fails or times out, the request proceeds.
  *
  * Flow variables consumed:
- *   aforo.marginGuardEnabled — "true" to enable (KVM margin_guard_enabled)
- *   aforo.marginGuardUrl — pricing-service base URL (KVM margin_guard_url)
- *   aforo.tenant_id — tenant from the verified JWT, else aforo.tenantId (KVM tenant_id)
- *   aforo.customer_id — customer from the verified JWT (VerifyJWT output claim)
- *
- * Previously read aforo.customerId (set by nothing) and aforo.marginGuard*
- * (never read from the KVM), so the check could never run.
+ *   private.aforo.marginGuardEnabled — "true" to enable (KVM margin_guard_enabled)
+ *   private.aforo.marginGuardUrl — pricing-service base URL (KVM margin_guard_url)
+ *     (each also read from the non-private aforo.* name when unset)
+ *   aforo.tenant_id — tenant from the verified JWT, else private.aforo.tenantId (KVM tenant_id)
+ *   aforo.customer_id — customer from the verified JWT (VerifyJWT output claim),
+ *     else aforo.customerId when the proxy sets it
  *
  * Flow variables produced:
  *   aforo.marginGuard.blocked — "true" if L3 block
@@ -28,10 +27,15 @@
  * variables and returns the appropriate 429 response.
  */
 
-var marginGuardEnabled = context.getVariable('aforo.marginGuardEnabled');
-var marginGuardUrl = context.getVariable('aforo.marginGuardUrl');
-var tenantId = context.getVariable('aforo.tenant_id') || context.getVariable('aforo.tenantId');
-var customerId = context.getVariable('aforo.customer_id');
+function mgSetting(name) {
+    var v = context.getVariable('private.aforo.' + name);
+    if (v === null || v === undefined || ('' + v) === '') v = context.getVariable('aforo.' + name);
+    return (v === null || v === undefined) ? '' : ('' + v);
+}
+var tenantId = context.getVariable('aforo.tenant_id') || mgSetting('tenantId');
+var customerId = context.getVariable('aforo.customer_id') || context.getVariable('aforo.customerId');
+var marginGuardEnabled = mgSetting('marginGuardEnabled');
+var marginGuardUrl = mgSetting('marginGuardUrl');
 
 // Initialize output variables to safe defaults
 context.setVariable('aforo.marginGuard.blocked', 'false');

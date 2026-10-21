@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- The one retry. Runs only when AforoMeteringRetryGate set
+     aforo.meteringRetry = "true": the first attempt failed to connect or
+     got a 5xx or 408, it failed quickly, and KVM max_retries is not 0.
+     Re-sends the SAME 'aforo.eventPayload' variable (built once by
+     AforoMeteringBuildEvent), so the idempotencyKey is byte-identical and
+     the ingestor dedups. Same literal timeouts as the first attempt.
+     continueOnError=true: a failed retry never fails the API call. -->
+<ServiceCallout name="AforoMeteringSendEventRetry1" continueOnError="true">
+    <DisplayName>Aforo Metering - Send Event Retry</DisplayName>
+    <Request variable="aforo.calloutRequestRetry1">
+        <Set>
+            <Verb>POST</Verb>
+            <Payload contentType="application/json">{aforo.eventPayload}</Payload>
+            <Headers>
+                <Header name="Content-Type">application/json</Header>
+                <Header name="X-API-Key">{private.aforo.apiKey}</Header>
+            </Headers>
+        </Set>
+    </Request>
+    <Response>aforo.calloutResponseRetry1</Response>
+    <HTTPTargetConnection>
+        <URL>{private.aforo.endpoint}</URL>
+        <Properties>
+            <Property name="connect.timeout.millis">1000</Property>
+            <Property name="io.timeout.millis">2000</Property>
+            <Property name="success.codes">1xx,2xx,3xx,4xx</Property>
+        </Properties>
+    </HTTPTargetConnection>
+</ServiceCallout>

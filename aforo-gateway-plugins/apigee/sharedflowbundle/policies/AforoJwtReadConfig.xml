@@ -2,6 +2,9 @@
 <!--
   Read Aforo JWT configuration from the organization-scoped KVM 'aforo-metering-config'.
   Must run BEFORE AforoJwtValidation in the SharedFlow step order.
+  continueOnError=true: an unreadable KVM must not fail the API call. If
+  jwt_validation_enabled is "true" and this read failed, VerifyJWT has no
+  key set and rejects the request (fails closed).
 
   KVM entries required (add via Apigee Management API or Console):
     aforo_jwks_uri    — JWKS endpoint URL
@@ -11,7 +14,7 @@
     aforo_redis_host  — (optional) Redis host for jti blocklist
     aforo_redis_port  — (optional) Redis port (default 6379)
 -->
-<KeyValueMapOperations name="AforoJwtReadConfig" mapIdentifier="aforo-metering-config">
+<KeyValueMapOperations name="AforoJwtReadConfig" mapIdentifier="aforo-metering-config" continueOnError="true">
     <DisplayName>Aforo JWT — Read Config from KVM</DisplayName>
     <ExpiryTimeInSecs>300</ExpiryTimeInSecs>
     <Scope>organization</Scope>

@@ -17,9 +17,11 @@ if (enabled !== 'true') {
     // Pre-flight disabled — skip
     context.setVariable('aforo.preflight_decision', 'ALLOW');
 } else {
-    var customerId = context.getVariable('aforo.customer_id') || '';
-    // Not apiproxy.consumerkey: that is the caller's API key (a credential),
-    // not an Aforo customer id.
+    // Verified identity only. Never apiproxy.consumerkey: that is the
+    // caller's API key (a credential), not an Aforo customer id.
+    var customerId = context.getVariable('aforo.customer_id') ||
+                     context.getVariable('developer.app.name') ||
+                     context.getVariable('developer.email') || '';
 
     if (!customerId) {
         context.setVariable('aforo.preflight_decision', 'ALLOW');
