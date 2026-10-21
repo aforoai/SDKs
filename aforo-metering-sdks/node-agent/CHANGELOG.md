@@ -2,6 +2,30 @@
 
 All notable changes to `@aforoai/agent-metering` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [2.0.0] - 2026-10-21
+
+The SDK now speaks the usage ingestor's batch contract.
+
+### Changed
+- **Endpoint.** Events are sent in batches of up to `maxBatchSize` (default 100, max 1000) to `POST /v1/ingest/batch` as `{"events":[...]}`. Default endpoint `https://api.aforo.ai/v1/ingest/batch` (new `endpoint` option; a bare host or `.../v1/ingest` is completed). Before, each event went alone to the Apigee-format `/v1/ingest/events`.
+- **Event shape.** Each event is an `IngestUsageEventRequest`: `customerId`, `metricName`, `quantity`, `occurredAt`, `idempotencyKey`, `productType` (`AI_AGENT`), top-level `agentId`, `sessionId`, `traceId`, optional `subscriptionId`, `capabilityName`, `executionStatus`, `executionDurationMs`, `stepNumber`, `parentStepId`, `sessionBoundary`, and `metadata` (`model_provider`, `model_name`, `input_tokens`, `output_tokens`, `productId`, ...). The `eventType` / `metricKey` / `value` / `properties` fields are gone.
+- **Metric names** are the default AI_AGENT catalog names (`Agent Sessions`, `Agent Steps`, `Agent Tool Calls`, `Tokens Consumed`, `Execution Minutes`, `GPU Hours`, `Knowledge Queries`, `Tasks Completed`, `Active Agents`) and can be overridden with `metricNames`. Before: `session_count`, `step_count`, `tokens_total`, `session_completed`.
+- **Session events.** `startSession()` sends nothing and returns the session synchronously (awaiting it still works). `end()` / `endSession()` sends `Tasks Completed` (if `taskCompleted`), `Execution Minutes` (if given), then `Agent Sessions` with `sessionBoundary: "SESSION_END"`. A `TOOL_CALL` step also counts one `Agent Tool Calls`.
+- **Idempotency keys** are deterministic, `<sessionId>:<n>`. Generated session ids are UUIDs; each session gets a 32-hex `traceId`.
+- **Failed flushes no longer lose events.** On a network error, 408, 429 (`Retry-After` honoured) or 5xx after `maxRetries` attempts, the batch stays in a bounded buffer (`maxBufferSize`, default 10000) and is re-sent on the next flush. Overflow drops the oldest events and reports them.
+- **The batch response is read.** A 202 with `data.failed > 0` / `data.errors[]` is reported as `partial` with the per-event messages and idempotency keys; duplicates count as accepted.
+- `record*` calls no longer wait for the network; a full batch flushes in the background. `flush()`, `end()` and the new `shutdown()` resolve to `{ accepted, duplicates, failed, pending }`.
+- Zero quantities are skipped instead of reported as invalid.
+
+### Added
+- `onError(err)` with `err.kind` `retrying` | `partial` | `rejected` | `invalid` | `overflow`; `logger` option (default `console`, `null` silences).
+- Config `agentId`, `subscriptionId`, `endpoint`, `metricNames`, `maxBatchSize`, `maxBufferSize`, `requestTimeoutMs`.
+- `session.recordTokens(model, input, output)`, `session.recordUsage(metric, quantity)`, `session.endSession()`, `agent.shutdown()`, `agent.pendingCount`, `DEFAULT_METRIC_NAMES`, `resolveEndpoint()`.
+
+### Deprecated
+- `tenantId` (ignored; the API key identifies the tenant, and `X-Tenant-Id` is no longer sent), `ingestorUrl` (use `endpoint`), `flushBatchSize` (use `maxBatchSize`), `onDrop` (use `onError`; still called for dropped events), `emitEvent()` (maps `metricKey`/`value` to `metricName`/`quantity`), the `UsageEvent` type (now `IngestEvent`).
+- `tenantId` and `productId` are no longer required.
+
 ## [1.2.0] - 2026-10-01
 
 Merge of the public-repo fixes with the working repo's wire contract. The wire shape is unchanged: one Apigee-format event per `POST <ingestorUrl>/events` (`/v1/ingest/events` in `contract/ingest-contract.json`). The public repo's switch to `/v1/ingest/batch` was not taken.

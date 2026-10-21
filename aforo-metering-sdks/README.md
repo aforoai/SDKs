@@ -54,7 +54,7 @@ sent as-is, the ingestor would reject that event and its usage would be lost.
 
 ## What every SDK does on the wire
 
-- **Endpoint and host.** `POST https://api.aforo.ai/v1/ingest/batch` with `{"events":[...]}`, at most 1000 events per request (`@aforoai/agent-metering` posts single events to `/v1/ingest/events`). Override the host with the base-URL option.
+- **Endpoint and host.** `POST https://api.aforo.ai/v1/ingest/batch` with `{"events":[...]}`, at most 1000 events per request. Override the host with the base-URL option.
 - **Auth.** The API key goes in `X-API-Key`. No `Authorization` header is sent.
 - **`productType`.** Every event carries a top-level `productType`; the production ingestor rejects events without one. Defaults: core SDKs `API`, GraphQL `GRAPHQL_API`, gRPC `GRPC_API`, WebSocket `WEBSOCKET_API`, MQTT `MQTT_BROKER`, MCP SDKs and proxy `MCP_SERVER`, agent SDKs `AI_AGENT`. Set it per client or per event.
 - **Idempotency keys.** One key per event, created when the event is recorded and reused on every retry, so a re-sent batch is deduplicated. Pass your own key to control deduplication; otherwise the SDK generates a random one.

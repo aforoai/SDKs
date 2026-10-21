@@ -4,10 +4,9 @@
  * Validates the OBSERVED wire request (endpoint path + body shape) against
  * the shared, checked-in contract fixture at contract/ingest-contract.json —
  * derived from the REAL usage-ingestor controllers/DTOs, never from this
- * SDK's own constants. node-agent is the one SDK contracted to the
- * Apigee-format SINGLE-event endpoint /v1/ingest/events (the 2026-07-05 D1
- * sweep reworked its wire path onto it) — this guard locks both the resolved
- * path and the single-event (NOT batch-wrapped) body shape.
+ * SDK's own constants. node-agent posts batch-wrapped
+ * IngestUsageEventRequest events to /v1/ingest/batch — this guard locks the
+ * resolved default path and the {"events":[...]} body shape.
  */
 
 import * as fs from 'fs';
@@ -60,41 +59,39 @@ describe('ingest contract guard (shared fixture)', () => {
     const spec = fixture.endpoints[endpoint];
     expect(spec).toBeDefined();
 
-    const capturingFetch = jest.fn(async () => ({ ok: true, status: 202 }));
+    const capturingFetch = jest.fn(async () => new Response(
+      JSON.stringify({ success: true, data: { accepted: 2, duplicates: 0, failed: 0, errors: [] } }),
+      { status: 202 },
+    ));
+    // endpoint deliberately omitted: the DEFAULT must resolve to the contracted path.
     const agent = new AforoAgent({
-      tenantId: 'tenant-001',
-      productId: 'prod-agent-001',
       apiKey: 'sk_agent_abc',
       customerId: 'cust_contract',
-      fetchImpl: capturingFetch,
-      // ingestorUrl deliberately omitted: the DEFAULT base must resolve to the
-      // contracted path (default already includes /v1/ingest; SDK appends /events).
-    } as any);
-
-    await agent.emitEvent({
-      eventType: 'agent_step',
-      metricKey: 'step_count',
-      value: 1,
       agentId: 'agent_contract',
-      sessionId: 'sess_contract',
-      properties: {},
+      fetchImpl: capturingFetch as unknown as typeof fetch,
+      logger: null,
     });
-    await agent.flush();
 
-    expect(capturingFetch).toHaveBeenCalled();
+    const session = agent.startSession({ sessionId: 'sess_contract' });
+    await session.recordStep({ stepKind: 'THOUGHT' });
+    await session.end({});
+
+    expect(capturingFetch).toHaveBeenCalledTimes(1);
     const [url, options] = capturingFetch.mock.calls[0] as any[];
     expect(new URL(String(url)).pathname).toBe(endpoint);
-    expect(options.method).toBe('POST');
-    assertBodyMatchesContract(spec, JSON.parse(options.body));
-    // Default host is the public API gateway.
     expect(new URL(String(url)).host).toBe('api.aforo.ai');
-    // Auth: X-API-Key only (the server accepts it for every key type).
+    expect(options.method).toBe('POST');
+    const body = JSON.parse(options.body);
+    assertBodyMatchesContract(spec, body);
+    // Auth: X-API-Key only (a non-JWT Bearer is rejected by the ingestor).
     expect(options.headers['X-API-Key']).toBe('sk_agent_abc');
     expect(options.headers['Authorization']).toBeUndefined();
-    // The endpoint requires a top-level customerId; productType is AI_AGENT.
-    const body = JSON.parse(options.body);
-    expect(body.customerId).toBe('cust_contract');
-    expect(body.productType).toBe('AI_AGENT');
+    for (const ev of body.events) {
+      expect(ev.productType).toBe('AI_AGENT');
+      expect(ev.agentId).toBe('agent_contract');
+      expect(ev.sessionId).toBe('sess_contract');
+      expect(ev.quantity).toBeGreaterThan(0);
+    }
   });
 
   test('ExecutionStatus lists exactly the contract\'s canonical statuses', () => {
