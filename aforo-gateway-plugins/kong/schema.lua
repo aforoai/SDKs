@@ -38,11 +38,16 @@ return {
                         },
                     },
                     -- Product type
+                    --
+                    -- Kong refuses a field description longer than 500
+                    -- characters, and the whole plugin then fails to load
+                    -- ("length must be at most 500"). Keep these short; the
+                    -- detail belongs in README.md.
                     {
                         product_type = {
                             type = "string",
                             default = "API",
-                            description = "Aforo productType sent on every event (trimmed, upper-cased): API, AGENTIC_API, AI_AGENT, MCP_SERVER, GRPC_API, GRAPHQL_API, WEBSOCKET_API or MQTT_BROKER. The ingestor requires it. MCP tools/call (mcp_enabled) is sent as MCP_SERVER when both toolName and agentId are known. Events missing the fields their type requires (MCP_SERVER: toolName + agentId) are skipped rather than sent, because one invalid event fails the whole batch. AI_AGENT / GRPC_API / GRAPHQL_API / WEBSOCKET_API / MQTT_BROKER need fields an HTTP gateway cannot observe or trust (agentId, gRPC/GraphQL/WebSocket/MQTT fields), so every non-MCP event would be skipped.",
+                            description = "Aforo productType sent on every event (trimmed, upper-cased): API, AGENTIC_API, AI_AGENT, MCP_SERVER, GRPC_API, GRAPHQL_API, WEBSOCKET_API or MQTT_BROKER. MCP tools/call is sent as MCP_SERVER; on an MCP_SERVER product only tool calls are metered. Events missing their type's required fields are skipped, as one invalid event fails the whole batch. AI_AGENT takes agentId from agent_id_header or agent_id. GRPC_API, GRAPHQL_API, WEBSOCKET_API and MQTT_BROKER need fields a gateway cannot observe.",
                         },
                     },
                     -- Metric configuration
@@ -99,21 +104,58 @@ return {
                         metric_header = {
                             type = "string",
                             default = "X-Aforo-Metric",
-                            description = "Upstream RESPONSE header that overrides the metric for a single request. For cases only the backend knows, e.g. one endpoint serving several billable actions. Read from the response, so clients cannot forge it. Set empty to disable.",
+                            description = "Upstream RESPONSE header that overrides the metric for a single request. For cases only the backend knows, e.g. one endpoint serving several billable actions. Read from the response, so clients cannot forge it. Set to null to disable.",
                         },
                     },
                     {
                         quantity_header = {
                             type = "string",
                             default = "X-Aforo-Quantity",
-                            description = "Upstream RESPONSE header supplying the quantity for a single request. Needed for metrics whose value only the backend knows -- call_minutes, tokens, bytes processed -- which a gateway cannot observe. Ignored unless it parses to a positive number. Set empty to disable.",
+                            description = "Upstream RESPONSE header supplying the quantity for a single request. Needed for metrics whose value only the backend knows -- call_minutes, tokens, bytes processed -- which a gateway cannot observe. Ignored unless it parses to a positive number. Set to null to disable.",
                         },
                     },
                     {
                         quantity_source = {
                             type = "string",
                             default = "1",
-                            description = "Quantity source: '1' (count), 'response_size' (bytes), or a number",
+                            description = "Quantity source: '1' (count), 'response_size' (response body bytes sent to the client, also for chunked and streamed responses), or a number",
+                        },
+                    },
+                    -- AI_AGENT identity (product_type=AI_AGENT only).
+                    -- Aforo requires agentId and sessionId on every AI_AGENT
+                    -- event. Both come from operator config or the upstream
+                    -- RESPONSE, never from a request header: X-Agent-Id and
+                    -- friends are client-settable, so a caller could choose
+                    -- which agent its usage is attributed to.
+                    {
+                        agent_id = {
+                            type = "string",
+                            description = "Agent ID for AI_AGENT events on the service/route this plugin is attached to. Operator config, so trusted. Used when the upstream does not send agent_id_header; without either, the Kong service's id is the agent. Not used for MCP tool calls, whose agent is the caller.",
+                        },
+                    },
+                    {
+                        agent_id_header = {
+                            type = "string",
+                            default = "X-Aforo-Agent-Id",
+                            description = "Upstream RESPONSE header carrying the agent ID for a single AI_AGENT request (wins over agent_id) or MCP tool call (wins over the verified customer). Read from the response, so clients cannot forge it. Set to null to disable.",
+                        },
+                    },
+                    {
+                        session_id_header = {
+                            type = "string",
+                            default = "X-Aforo-Session-Id",
+                            description = "Upstream RESPONSE header carrying the session ID for an AI_AGENT request or MCP tool call, so several requests can share one session. Without it, an AI_AGENT request is its own session (Kong's request ID) and an MCP call uses the upstream's Mcp-Session-Id response header. Set to null to disable.",
+                        },
+                    },
+                    -- AGENTIC_API trace (product_type=AGENTIC_API only). Aforo
+                    -- groups a trace's events into one goal, so the trace is
+                    -- billing identity: from the upstream RESPONSE, never the
+                    -- client's traceparent.
+                    {
+                        trace_id_header = {
+                            type = "string",
+                            default = "X-Aforo-Trace-Id",
+                            description = "Upstream RESPONSE header naming the trace (goal) an AGENTIC_API request belongs to, so several requests can be one goal. Without it, each request is its own trace (Kong's request ID). The client's traceparent is never used as the trace. Set to null to disable.",
                         },
                     },
                     {
@@ -162,7 +204,14 @@ return {
                         mcp_enabled = {
                             type = "boolean",
                             default = false,
-                            description = "Enable MCP JSON-RPC detection for tool call metering",
+                            description = "Meter MCP JSON-RPC tools/call requests as tool invocations (one event per call, also in a JSON-RPC batch). Bodies up to 1 MB are read. Always on when product_type is MCP_SERVER.",
+                        },
+                    },
+                    {
+                        mcp_meter_non_tool_calls = {
+                            type = "boolean",
+                            default = false,
+                            description = "With mcp_enabled: also meter JSON-RPC messages that are not tools/call (initialize, tools/list, ping, notifications), as plain API calls. Off by default: they are protocol traffic, not usage. Requests that are not JSON-RPC are always metered.",
                         },
                     },
                     {
@@ -171,11 +220,33 @@ return {
                             description = "Aforo product ID for MCP server metering (required when mcp_enabled=true)",
                         },
                     },
+                    -- executionStatus overrides (OUTCOME_BASED pricing): an
+                    -- exact upstream status code -> one of the ingestor's
+                    -- execution statuses. Wins over the default table (README
+                    -- "Execution status"). org-service writes this map.
+                    {
+                        status_outcomes = {
+                            type = "map",
+                            required = false,
+                            keys = { type = "string", match = "^[2-5]%d%d$" },
+                            values = {
+                                type = "string",
+                                one_of = {
+                                    "SUCCESS", "PARTIAL", "TIMEOUT", "ERROR",
+                                    "VALIDATION_FAILED", "FAILED", "FAILURE",
+                                    "CANCELLED", "PENDING", "BLOCKED", "HITL_REQUIRED",
+                                },
+                            },
+                            description = "Per-status-code executionStatus overrides, e.g. {\"404\": \"VALIDATION_FAILED\"}. Keys are exact HTTP codes 200-599. Without an entry: 2xx/3xx SUCCESS, 408/504 TIMEOUT, 499 CANCELLED, 400/422 VALIDATION_FAILED, 401/403/429 BLOCKED, other 4xx/5xx ERROR.",
+                        },
+                    },
                     -- ── JWT Validation ──
                     -- Enable to validate Aforo RS256 JWTs before metering.
-                    -- Checks: expiry, issuer, jti blocklist, client revocation.
-                    -- Signature verification requires lua-resty-jwt (Kong OSS) or
-                    -- the native JWT plugin with JWKS URI (Kong Enterprise).
+                    -- Checks: expiry, issuer, RS256 signature, tenant_id (must
+                    -- equal this plugin's tenant_id), jti blocklist, client
+                    -- revocation. The signature is verified with resty.openssl,
+                    -- which ships with Kong; no extra library is needed. The key
+                    -- comes from jwt_public_key, else from jwt_jwks_uri.
                     {
                         jwt_validation_enabled = {
                             type = "boolean",
@@ -193,27 +264,27 @@ return {
                     {
                         jwt_jwks_uri = {
                             type = "string",
-                            description = "Aforo JWKS URI for RS256 public key resolution (e.g. https://auth.smartai.com/.well-known/jwks.json). Used when lua-resty-jwt is installed.",
+                            description = "The token issuer's JWKS URL, e.g. https://<issuer>/.well-known/jwks.json. The key is chosen by the token's kid. Keys are cached for an hour and refreshed in the background; an unknown kid triggers a refetch at most every 30 s. Ignored when jwt_public_key is set.",
                         },
                     },
                     {
                         jwt_public_key = {
                             type = "string",
                             encrypted = true,
-                            description = "PEM-encoded RSA public key for offline RS256 verification. Alternative to jwt_jwks_uri for static key setups.",
+                            description = "PEM-encoded RSA public key for offline RS256 verification. Takes precedence over jwt_jwks_uri.",
                         },
                     },
                     {
                         jwt_allow_unverified_signature = {
                             type = "boolean",
                             default = false,
-                            description = "DANGEROUS. Accept JWTs whose RS256 signature could not be verified (lua-resty-jwt missing, or no jwt_public_key set). Defaults to false: unverifiable tokens are rejected. Enable ONLY when signatures are already verified upstream (Kong Enterprise native JWT plugin, service mesh, external authorizer). With this true and no verification upstream, any caller can mint a token naming any customer_id/tenant_id.",
+                            description = "DANGEROUS. Accept JWTs without verifying the signature, only when no key is configured (neither jwt_public_key nor jwt_jwks_uri) or resty.openssl cannot load. With a key configured, a token that does not verify, or names a kid the JWKS lacks, is always rejected. Enable ONLY when signatures are verified upstream; otherwise any caller can mint a token naming any customer_id.",
                         },
                     },
-                    -- Redis host/port are shared with rate-limit enforcement above.
-                    -- jwt_validation uses rate_limit_redis_host / rate_limit_redis_port.
-                    -- Add dedicated jwt_redis_host/jwt_redis_port below only if the
-                    -- jti blocklist Redis is on a different host than rate-limit Redis.
+                    -- Redis host/port/password are shared with rate-limit enforcement
+                    -- below. jwt_validation uses rate_limit_redis_host / _port /
+                    -- _password unless the jwt_redis_* settings say otherwise. Set
+                    -- them only if the jti blocklist Redis is not the rate-limit one.
                     {
                         jwt_redis_host = {
                             type = "string",
@@ -224,6 +295,13 @@ return {
                         jwt_redis_port = {
                             type = "integer",
                             description = "Redis port for jti blocklist (defaults to rate_limit_redis_port if not set)",
+                        },
+                    },
+                    {
+                        jwt_redis_password = {
+                            type = "string",
+                            encrypted = true,
+                            description = "Redis password for the jti blocklist. Defaults to rate_limit_redis_password when the blocklist uses the same Redis host and port as rate limiting.",
                         },
                     },
                     -- Rate limit enforcement (reads policies from Redis)
@@ -267,20 +345,20 @@ return {
                         margin_guard_enabled = {
                             type = "boolean",
                             default = false,
-                            description = "Enable margin guard pre-flight check in the access phase",
+                            description = "Ask pricing-service before proxying whether the tenant (GLOBAL scope) or the customer is margin-blocked or throttled, and answer 429 if so. Fails open. Requires margin_guard_url.",
                         },
                     },
                     {
                         margin_guard_url = {
                             type = "string",
-                            description = "Pricing-service base URL for margin guard quick-check (e.g. http://pricing:8083)",
+                            description = "Pricing-service base URL for the margin guard quick-check, e.g. http://pricing:8083. Kong must reach pricing's internal API (/internal/v1/margin-guard/quick-check, no auth). Required when margin_guard_enabled is true.",
                         },
                     },
                     {
                         margin_guard_cache_ttl = {
                             type = "integer",
                             default = 30,
-                            description = "Cache TTL in seconds for margin guard decisions (default 30s)",
+                            description = "How long an ALLOW or BLOCK answer is cached per tenant and scope, in seconds. THROTTLE is never cached. 0 disables the cache.",
                         },
                     },
                     -- Pre-flight quota check (calls the ingestor's /api/v1/quota/check)
@@ -288,7 +366,7 @@ return {
                         preflight_quota_enabled = {
                             type = "boolean",
                             default = false,
-                            description = "Ask Aforo before proxying whether the customer is within quota (rate limit, prepaid wallet, cumulative quota) and answer 429 on DENY. Adds a synchronous call on every request that misses the local cache, so it is off by default.",
+                            description = "Ask Aforo before proxying whether the customer is within quota (rate limit, prepaid wallet, cumulative quota) for the metric the request will be billed to, and answer 429 on DENY. Requests that will not be billed (e.g. MCP initialize) are not checked. Adds a synchronous call on every request that misses the local cache, so it is off by default.",
                         },
                     },
                     {
@@ -301,15 +379,15 @@ return {
                         preflight_quota_api_key = {
                             type = "string",
                             encrypted = true,
-                            description = "API key for the quota check, sent as X-API-Key. Defaults to api_key. Set it when api_key is an ingest-only key: with RBAC enforced the check needs quotas:read.",
+                            description = "API key for the quota check, sent as X-API-Key. Defaults to api_key. Set it only when the ingestor does not accept api_key for /api/v1/quota/check.",
                         },
                     },
                     {
                         preflight_quota_timeout_ms = {
                             type = "integer",
-                            default = 100,
+                            default = 300,
                             gt = 0,
-                            description = "Timeout for the quota check. This is on the request path; on timeout the request proceeds (see preflight_quota_fail_open).",
+                            description = "Timeout for the quota check, in ms. This is on the request path (only on a cache miss); on timeout the request proceeds (see preflight_quota_fail_open). 300 allows for Kong-to-Aforo over the internet.",
                         },
                     },
                     {
@@ -317,7 +395,7 @@ return {
                             type = "integer",
                             default = 1000,
                             between = { 0, 60000 },
-                            description = "How long an ALLOW is cached per tenant/customer/metric. DENY is never cached, so a top-up unblocks immediately. 0 disables the cache.",
+                            description = "How long an ALLOW or WARN is cached per tenant/customer/metric. DENY is never cached, so a top-up unblocks immediately. 0 disables the cache.",
                         },
                     },
                     {
@@ -333,7 +411,7 @@ return {
                             type = "array",
                             elements = { type = "string" },
                             default = { "/health", "/ready", "/metrics" },
-                            description = "Paths to exclude from metering",
+                            description = "Paths to exclude from metering. An entry matches that path and anything below it: /health excludes /health and /health/live, not /healthcare.",
                         },
                     },
                     {
@@ -347,5 +425,13 @@ return {
                 },
             },
         },
+    },
+    entity_checks = {
+        -- Without a URL the margin guard has nothing to ask; this used to be
+        -- accepted and then raise on every request (a 500).
+        { conditional = {
+            if_field = "config.margin_guard_enabled", if_match = { eq = true },
+            then_field = "config.margin_guard_url", then_match = { required = true },
+        } },
     },
 }

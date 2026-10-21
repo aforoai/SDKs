@@ -35,79 +35,25 @@ local rate_limit = require_sibling("rate-limit-enforce")
 local margin_guard = require_sibling("margin-guard")
 local preflight_quota = require_sibling("preflight-quota")
 
--- UUID source (2026-09-01 fix).
---
--- The call sites below previously reached for the uuid helper through the PDK
--- global. `kong.tools` is not part of the PDK in Kong 3.x, so that raised
--- "attempt to index field 'tools' (a nil value)" and aborted the entire log
--- phase -- meaning no event was buffered and the plugin metered nothing. The
--- module also moved between releases: kong.tools.utils.uuid before Kong 3.9,
--- kong.tools.uuid.uuid from 3.9 on. Resolve once at load with a fallback chain
--- so the plugin spans both without a version check.
-local uuid
-do
-    local function try(mod_name, fn_name)
-        local ok, mod = pcall(require, mod_name)
-        if ok and type(mod) == "table" and type(mod[fn_name]) == "function" then
-            return mod[fn_name]
-        end
-        return nil
-    end
+-- uuid() and iso8601_utc() live in event-util.lua, shared with
+-- compound-metering.lua; see there for why each is the way it is.
+local event_util = require_sibling("event-util")
+local event_buffer = require_sibling("event-buffer")
+local uuid = event_util.uuid
+local iso8601_utc = event_util.iso8601_utc
 
-    uuid = try("kong.tools.uuid", "uuid")        -- Kong >= 3.9
-        or try("kong.tools.utils", "uuid")       -- Kong <  3.9
-
-    if not uuid then
-        local ok, jit_uuid = pcall(require, "resty.jit-uuid")
-        if ok and type(jit_uuid) == "table" and type(jit_uuid.generate_v4) == "function" then
-            pcall(jit_uuid.seed)
-            uuid = jit_uuid.generate_v4
-        end
-    end
-
-    if not uuid then
-        -- Never leave this nil: both callers use it inside idempotency keys on
-        -- the metering hot path, and a nil here takes down the log phase again.
-        -- Not a real UUID, but unique enough to keep events distinct.
-        uuid = function()
-            return string.format("%d-%d-%d", ngx.worker.pid(), ngx.now() * 1000, math.random(1e9))
-        end
-    end
-end
 
 -- ────────────────────────────────────────────────────────────
 -- JWT Validation helpers
 -- ────────────────────────────────────────────────────────────
 
--- Extract Bearer token from Authorization header
+-- Extract Bearer token from Authorization header. The scheme is matched
+-- case-insensitively (RFC 7235): "bearer" is as valid as "Bearer".
 local function extract_bearer_token()
     local auth_header = kong.request.get_header("Authorization")
-    if not auth_header then return nil end
-    local _, _, token = string.find(auth_header, "^[Bb]earer%s+(.+)$")
+    if type(auth_header) ~= "string" then return nil end
+    local _, _, token = string.find(auth_header, "^[Bb][Ee][Aa][Rr][Ee][Rr]%s+(.+)$")
     return token
-end
-
--- Format an epoch timestamp as ISO-8601 UTC with milliseconds.
---
--- 2026-09-01 fix. occurredAt was emitted as `ngx.now() * 1000`, i.e. a bare
--- number of epoch MILLIseconds. The ingestor deserialises occurredAt into a
--- java.time.Instant, and Jackson reads a bare number as epoch SECONDS -- so
--- 1788268682221 was read as the year 58637 and every single event was rejected
--- with "Event timestamp is too far in the future". Gateway-metered usage never
--- persisted at all.
---
--- It failed quietly in the worst way: /v1/ingest/batch answers 202 with a
--- per-event `failed` count rather than an HTTP error, so the plugin's own
--- flush logged success and moved on. Emitting a string removes the ambiguity
--- entirely -- there is no unit to misread.
-local function iso8601_utc(epoch_seconds)
-    local secs = math.floor(epoch_seconds)
-    local ms = math.floor((epoch_seconds - secs) * 1000 + 0.5)
-    if ms >= 1000 then
-        secs = secs + 1
-        ms = 0
-    end
-    return string.format("%s.%03dZ", os.date("!%Y-%m-%dT%H:%M:%S", secs), ms)
 end
 
 -- Decode base64url to bytes
@@ -118,9 +64,30 @@ local function base64url_decode(str)
     return ngx.decode_base64(str)
 end
 
--- Parse a JWT into {header, claims, parts} without crypto verification.
--- Returns (claims_table, parts_array) on success, or (nil, err_string) on failure.
-local function parse_jwt_claims(token)
+-- v when it is a non-empty string, else nil. A type check rather than a
+-- truthiness one, so a null config value can never reach an event as a JSON
+-- null that the required-field check would wave through.
+local function non_empty_string(v)
+    if type(v) == "string" and v ~= "" then
+        return v
+    end
+    return nil
+end
+
+-- A claim as a non-empty string, or nil. Claims come from a token the caller
+-- built, and before the signature is checked that caller may be anyone, so
+-- nothing about their types can be assumed: a JSON null decodes to the
+-- cjson.null userdata, which is truthy, compares unequal to everything, and
+-- raises when concatenated or sent as a header -- a 500 on demand.
+local function claim_string(v)
+    if type(v) == "string" and v ~= "" then return v end
+    if type(v) == "number" then return tostring(v) end
+    return nil
+end
+
+-- Parse a JWT without crypto verification.
+-- Returns (claims, header) on success, or (nil, err_string) on failure.
+local function parse_jwt(token)
     local parts = {}
     for part in token:gmatch("([^.]+)") do
         table.insert(parts, part)
@@ -133,7 +100,16 @@ local function parse_jwt_claims(token)
     local ok, claims = pcall(cjson.decode, payload_json)
     if not ok or type(claims) ~= "table" then return nil, "invalid_jwt_payload" end
 
-    return claims, parts
+    -- The header only matters for its kid (JWKS key selection); a missing or
+    -- unreadable header is not an error here -- the signature check decides.
+    local header = {}
+    local header_json = base64url_decode(parts[1])
+    if header_json then
+        local hok, h = pcall(cjson.decode, header_json)
+        if hok and type(h) == "table" then header = h end
+    end
+
+    return claims, header
 end
 
 -- Shared dict backing the event buffer and the warning throttle below.
@@ -160,47 +136,314 @@ local function warn_throttled(key, ttl, ...)
         kong.log.warn(...)
         return
     end
-    if dict:add("aforo:warn:" .. key, 1, ttl or 60) then
+    if dict:safe_add("aforo:warn:" .. key, 1, ttl or 60) then
         kong.log.warn(...)
     end
 end
 
--- Check jti blocklist in Redis.  Fail-open: returns false on any Redis error.
-local function is_jti_blocked(jti, redis_host, redis_port)
-    if not jti or jti == "" then return false end
-    local red = require("resty.redis"):new()
-    red:set_timeout(500)
-    local ok, err = red:connect(redis_host or "127.0.0.1", redis_port or 6379)
-    if not ok then
-        warn_throttled("redis_jti", 60,
-            "[aforo-metering] Redis unreachable for jti-blocklist check at ",
-            redis_host or "127.0.0.1", ":", redis_port or 6379, " (", err, "). ",
-            "Failing OPEN -- revoked tokens are NOT being rejected. ",
-            "Set jwt_redis_host/jwt_redis_port. Repeats suppressed for 60s.")
-        return false  -- fail-open: do not block legitimate requests on Redis failure
+-- Revocation lists in Redis, as org-service's JtiBlocklistService writes them:
+--   jti:blocked:{jti}          one token                   (value "1")
+--   jti:client:{client_id}     every token for that client (value "revoked")
+-- jti:client:{key_id} is checked too, as a secondary key.
+--
+-- Fail-OPEN, as documented, and only on evidence (2026-10-12 fix). The value
+-- used to be treated as "revoked" whenever it was anything but nil or
+-- ngx.null. lua-resty-redis answers a Redis ERROR reply -- NOAUTH on a
+-- password-protected Redis, LOADING while it restores, MOVED in a cluster --
+-- with false, so every one of those turned into 401 TOKEN_REVOKED for every
+-- token: fail-CLOSED, with nothing in the log. And no AUTH was ever sent, so
+-- a protected Redis produced exactly that. Now only a real string value means
+-- revoked; an error reply is logged (throttled) and treated as not revoked,
+-- the same as an unreachable Redis.
+--
+-- One connection per request for all the lookups, not one per lookup.
+-- Returns "TOKEN_REVOKED", "CLIENT_REVOKED" or nil.
+local function revocation_reason(conf, claims)
+    local lookups = {}
+    if claims.jti then
+        lookups[#lookups + 1] = { "jti:blocked:" .. claims.jti, "TOKEN_REVOKED" }
     end
-    local val = red:get("jti:blocked:" .. jti)
-    red:set_keepalive(10000, 10)
-    return val ~= nil and val ~= ngx.null
-end
+    if claims.client_id then
+        lookups[#lookups + 1] = { "jti:client:" .. claims.client_id, "CLIENT_REVOKED" }
+    end
+    if claims.key_id and claims.key_id ~= claims.client_id then
+        lookups[#lookups + 1] = { "jti:client:" .. claims.key_id, "CLIENT_REVOKED" }
+    end
+    if #lookups == 0 then return nil end
 
--- Check client-level revocation via key_id.  Fail-open.
-local function is_client_revoked(key_id, redis_host, redis_port)
-    if not key_id or key_id == "" then return false end
+    -- Prefer dedicated jwt_redis_* config; fall back to rate_limit_redis_*.
+    -- The password goes with the server: rate_limit_redis_password is only
+    -- borrowed when the blocklist lives on the rate-limit Redis, so a
+    -- password-less blocklist Redis is not sent a password it would refuse.
+    local rl_host = conf.rate_limit_redis_host or "127.0.0.1"
+    local rl_port = conf.rate_limit_redis_port or 6379
+    local host = non_empty_string(conf.jwt_redis_host) or rl_host
+    local port = conf.jwt_redis_port or rl_port
+    local password = non_empty_string(conf.jwt_redis_password)
+    if not password and host == rl_host and port == rl_port then
+        password = non_empty_string(conf.rate_limit_redis_password)
+    end
+
     local red = require("resty.redis"):new()
     red:set_timeout(500)
-    local ok, err = red:connect(redis_host or "127.0.0.1", redis_port or 6379)
+    local ok, err = red:connect(host, port)
+    if ok and password then
+        ok, err = red:auth(password)
+        if not ok then err = "AUTH failed: " .. tostring(err) end
+    end
     if not ok then
         warn_throttled("redis_revocation", 60,
-            "[aforo-metering] Redis unreachable for client-revocation check at ",
-            redis_host or "127.0.0.1", ":", redis_port or 6379, " (", err, "). ",
-            "Failing OPEN -- revoked API keys are NOT being rejected. ",
-            "Set jwt_redis_host/jwt_redis_port. Repeats suppressed for 60s.")
-        return false
+            "[aforo-metering] Redis unavailable for the JWT revocation check at ",
+            host, ":", port, " (", tostring(err), "). ",
+            "Failing OPEN -- revoked tokens and clients are NOT being rejected. ",
+            "Check jwt_redis_host / jwt_redis_port / jwt_redis_password. Repeats suppressed for 60s.")
+        red:close()
+        return nil
     end
-    local val = red:get("jti:client:" .. key_id)
+
+    local failed
+    for _, lookup in ipairs(lookups) do
+        local val, gerr = red:get(lookup[1])
+        if type(val) == "string" then
+            red:set_keepalive(10000, 10)
+            return lookup[2]
+        end
+        if val ~= ngx.null then
+            -- An error reply or a broken connection: no evidence either way.
+            failed = gerr or "no reply"
+        end
+    end
+
+    if failed then
+        warn_throttled("redis_revocation_reply", 60,
+            "[aforo-metering] Redis answered the JWT revocation lookup with an error (",
+            tostring(failed), ") at ", host, ":", port, ". Failing OPEN -- revoked tokens ",
+            "and clients are NOT being rejected. NOAUTH means jwt_redis_password is missing ",
+            "or wrong. Repeats suppressed for 60s.")
+        red:close()
+        return nil
+    end
     red:set_keepalive(10000, 10)
-    return val ~= nil and val ~= ngx.null
+    return nil
+end
+
+-- ── JWKS (jwt_jwks_uri) ─────────────────────────────────────
+--
+-- The issuer's public keys, fetched from its JWKS document and selected by the
+-- token header's kid. Never fetched per request:
+--   * cached in aforo_buffer for JWKS_HARD_TTL, refreshed in the background
+--     (a timer) once the copy is older than JWKS_SOFT_TTL -- requests keep
+--     using the cached keys meanwhile
+--   * fetched in the request only when nothing is cached yet, or the token's
+--     kid is not in the cached set (the issuer rotated its key) -- and then at
+--     most once per JWKS_REFETCH_INTERVAL across all workers, so a stream of
+--     tokens with invented kids cannot become a stream of fetches
+-- A set older than JWKS_HARD_TTL is dropped rather than trusted indefinitely:
+-- a key the issuer withdrew must stop verifying eventually even if the JWKS
+-- endpoint stays unreachable.
+local JWKS_CACHE_PREFIX = "aforo:jwks:"
+local JWKS_FETCH_LOCK_PREFIX = "aforo:jwks_fetch:"
+local JWKS_REFRESH_LOCK_PREFIX = "aforo:jwks_refresh:"
+-- A fetch is running / the last fetch failed. Requests waiting on a cold
+-- cache wait only while one is running, and give up at once after a failure
+-- -- they used to sleep the full fetch timeout each, unable to tell the two
+-- apart (2026-10-13 fix).
+local JWKS_INFLIGHT_PREFIX = "aforo:jwks_inflight:"
+local JWKS_FAILED_PREFIX = "aforo:jwks_failed:"
+local JWKS_SOFT_TTL = 3600
+local JWKS_HARD_TTL = 86400
+local JWKS_REFETCH_INTERVAL = 30
+local JWKS_FETCH_TIMEOUT_MS = 2000
+
+-- cjson.null -> nil, for optional JWK members.
+local function json_opt(v)
+    if v == cjson.null then return nil end
+    return v
+end
+
+-- GET and parse the JWKS document. Returns an entry
+-- { fetched_at, count, keys = { [kid] = jwk_json } } or (nil, reason).
+-- Only RSA signing keys usable for RS256 are kept; a key without a kid is
+-- stored under "" and can only match a kid-less token.
+local function fetch_jwks(uri)
+    local httpc = http.new()
+    httpc:set_timeout(JWKS_FETCH_TIMEOUT_MS)
+    local res, err = httpc:request_uri(uri, {
+        method = "GET",
+        headers = { ["Accept"] = "application/json" },
+    })
+    if not res then return nil, "fetch failed: " .. tostring(err) end
+    if res.status ~= 200 then return nil, "status " .. tostring(res.status) end
+
+    local doc = cjson.decode(res.body)
+    if type(doc) ~= "table" or type(doc.keys) ~= "table" then
+        return nil, "response is not a JWKS document"
+    end
+
+    local keys, count = {}, 0
+    for _, k in ipairs(doc.keys) do
+        if type(k) == "table" and k.kty == "RSA"
+            and (json_opt(k.use) == nil or k.use == "sig")
+            and (json_opt(k.alg) == nil or k.alg == "RS256") then
+            keys[claim_string(k.kid) or ""] = cjson.encode(k)
+            count = count + 1
+        end
+    end
+    if count == 0 then return nil, "no RS256 signing keys in the JWKS" end
+    return { fetched_at = ngx.now(), count = count, keys = keys }
+end
+
+-- Shared across workers in the dict; also kept per worker, so a full dict
+-- (the write below is safe_set: it fails rather than evict buffered events)
+-- costs a refetch per worker, not every token for the next 30 s.
+local jwks_local = {}
+
+local function cached_jwks(dict, uri)
+    local raw = dict:get(JWKS_CACHE_PREFIX .. uri)
+    local entry = raw and cjson.decode(raw)
+    if type(entry) ~= "table" or type(entry.keys) ~= "table" then
+        entry = jwks_local[uri]
+    end
+    if entry and ngx.now() - (tonumber(entry.fetched_at) or 0) > JWKS_HARD_TTL then
+        return nil
+    end
+    return entry
+end
+
+local function store_jwks(dict, uri, entry)
+    if dict:safe_set(JWKS_CACHE_PREFIX .. uri, cjson.encode(entry), JWKS_HARD_TTL) then
+        jwks_local[uri] = nil
+    else
+        jwks_local[uri] = entry
+    end
+end
+
+-- The key for kid. A token without a kid only matches a set of exactly one
+-- key: with several, picking one would be a guess.
+local function pick_jwk(entry, kid)
+    if not entry then return nil end
+    if kid then return entry.keys[kid] end
+    if entry.count == 1 then
+        local _, jwk = next(entry.keys)
+        return jwk
+    end
+    return nil
+end
+
+local function refresh_jwks(premature, uri)
+    if premature then return end
+    local dict = ngx.shared[BUFFER_DICT]
+    if not dict then return end
+    local entry, err = fetch_jwks(uri)
+    if entry then
+        store_jwks(dict, uri, entry)
+    else
+        warn_throttled("jwks_refresh", 300,
+            "[aforo-metering] Could not refresh the JWKS from ", uri, " (", err, "). ",
+            "Keeping the cached keys. Repeats suppressed for 300s.")
+    end
+end
+
+-- Fetch the JWKS now and cache it, marking the fetch as running while it
+-- does and as failed (for JWKS_REFETCH_INTERVAL) when it does not work out.
+local function fetch_and_store(dict, uri)
+    dict:safe_set(JWKS_INFLIGHT_PREFIX .. uri, true, JWKS_FETCH_TIMEOUT_MS / 1000 + 1)
+    local fresh, err = fetch_jwks(uri)
+    dict:delete(JWKS_INFLIGHT_PREFIX .. uri)
+    if not fresh then
+        dict:safe_set(JWKS_FAILED_PREFIX .. uri, tostring(err), JWKS_REFETCH_INTERVAL)
+        return nil, err
+    end
+    dict:delete(JWKS_FAILED_PREFIX .. uri)
+    store_jwks(dict, uri, fresh)
+    return fresh
+end
+
+-- A token whose kid IS cached did not verify. The issuer may have replaced
+-- the key and kept the kid -- org-service generates a new key pair on every
+-- start and keeps kid "aforo-v1" -- in which case every new token failed
+-- until the cache's soft TTL ran out, an hour later (2026-10-13 fix). Refetch
+-- once, under the same lock as any other fetch (at most once per
+-- JWKS_REFETCH_INTERVAL, so bad signatures cannot drive fetches), and return
+-- the JWK for kid only if it changed. A failed refetch never accepts.
+local function jwks_refetch(uri, kid, old_jwk)
+    local dict = ngx.shared[BUFFER_DICT]
+    if not dict or not dict:safe_add(JWKS_FETCH_LOCK_PREFIX .. uri, 1, JWKS_REFETCH_INTERVAL) then
+        return nil
+    end
+    local fresh = fetch_and_store(dict, uri)
+    local jwk = fresh and pick_jwk(fresh, kid)
+    if jwk and jwk ~= old_jwk then return jwk end
+    return nil
+end
+
+-- The JWK (JSON string) to verify a token with kid, or (nil, reason).
+local function jwks_key(uri, kid)
+    local dict = ngx.shared[BUFFER_DICT]
+    if not dict then
+        return nil, "shared dict '" .. BUFFER_DICT .. "' not available"
+    end
+
+    local entry = cached_jwks(dict, uri)
+    local jwk = pick_jwk(entry, kid)
+    if jwk then
+        if ngx.now() - (tonumber(entry.fetched_at) or 0) > JWKS_SOFT_TTL
+            and dict:safe_add(JWKS_REFRESH_LOCK_PREFIX .. uri, 1, JWKS_REFETCH_INTERVAL) then
+            ngx.timer.at(0, refresh_jwks, uri)
+        end
+        return jwk
+    end
+
+    if not dict:safe_add(JWKS_FETCH_LOCK_PREFIX .. uri, 1, JWKS_REFETCH_INTERVAL) then
+        if entry then
+            return nil, "kid '" .. tostring(kid) .. "' is not in the cached JWKS, and it was "
+                .. "refetched less than " .. JWKS_REFETCH_INTERVAL .. "s ago"
+        end
+        -- Cold cache. If a fetch is running (just after a restart, typically),
+        -- wait for it rather than refusing a valid token; if the last one
+        -- failed, answer now.
+        for _ = 1, JWKS_FETCH_TIMEOUT_MS / 50 do
+            local failed = dict:get(JWKS_FAILED_PREFIX .. uri)
+            if failed then
+                return nil, "the last JWKS fetch failed (" .. tostring(failed) .. ")"
+            end
+            if not dict:get(JWKS_INFLIGHT_PREFIX .. uri) then break end
+            ngx.sleep(0.05)
+        end
+        entry = cached_jwks(dict, uri)
+        if entry then
+            jwk = pick_jwk(entry, kid)
+            if jwk then return jwk end
+            return nil, "kid '" .. tostring(kid) .. "' is not in the JWKS"
+        end
+        return nil, "the JWKS has not been fetched yet"
+    end
+
+    local fresh, err = fetch_and_store(dict, uri)
+    if not fresh then return nil, err end
+    jwk = pick_jwk(fresh, kid)
+    if not jwk then
+        return nil, "kid '" .. tostring(kid) .. "' is not in the JWKS"
+    end
+    return jwk
+end
+
+-- Parsed public keys, per worker, keyed by the JWK's JSON: building an RSA key
+-- from a JWK on every request is wasted work for a key that changes yearly.
+-- Bounded so a rotation cannot grow it without limit.
+local jwk_pkeys, jwk_pkey_count = {}, 0
+local function jwk_to_pkey(pkey, jwk)
+    local pk = jwk_pkeys[jwk]
+    if pk then return pk end
+    local err
+    pk, err = pkey.new(jwk, { format = "JWK" })
+    if not pk then return nil, err end
+    if jwk_pkey_count >= 16 then
+        jwk_pkeys, jwk_pkey_count = {}, 0
+    end
+    jwk_pkeys[jwk] = pk
+    jwk_pkey_count = jwk_pkey_count + 1
+    return pk
 end
 
 -- RS256 signature verification, via Kong's bundled resty.openssl.
@@ -228,16 +471,23 @@ end
 -- Enterprise native JWT plugin, a service mesh, an external authorizer) opt out
 -- via jwt_allow_unverified_signature=true: explicit, defaulting to false, and
 -- logged at ERROR so the posture is never silent.
-local function verify_rs256_signature(token, conf)
+--
+-- Key source (2026-10-12): jwt_public_key (a static PEM) when set, else the
+-- issuer's JWKS from jwt_jwks_uri, selected by the token's kid. jwt_jwks_uri
+-- used to be accepted and ignored, so a JWKS-only configuration rejected every
+-- token. jwt_allow_unverified_signature only decides when no key source is
+-- configured at all or resty.openssl cannot load; with a key source, a token
+-- that does not verify -- or that names a kid the JWKS does not have -- is
+-- always a rejection.
+local function verify_rs256_signature(token, conf, header)
     local allow_unverified = conf.jwt_allow_unverified_signature == true
+    local pem = non_empty_string(conf.jwt_public_key)
+    local jwks_uri = non_empty_string(conf.jwt_jwks_uri)
 
-    if not conf.jwt_public_key or conf.jwt_public_key == "" then
-        -- jwt_jwks_uri is declared in schema.lua but no JWKS fetcher is
-        -- implemented, so a JWKS-only configuration verifies nothing.
-        kong.log.err("[aforo-metering] No jwt_public_key configured -- RS256 signature CANNOT ",
-            "be verified (jwt_jwks_uri is declared but not yet implemented). Set jwt_public_key ",
-            "to the issuer's PEM public key, or jwt_allow_unverified_signature=true only if ",
-            "signatures are verified upstream.")
+    if not pem and not jwks_uri then
+        kong.log.err("[aforo-metering] Neither jwt_public_key nor jwt_jwks_uri is configured -- ",
+            "RS256 signature CANNOT be verified. Set one of them, or ",
+            "jwt_allow_unverified_signature=true only if signatures are verified upstream.")
         return allow_unverified
     end
 
@@ -263,14 +513,50 @@ local function verify_rs256_signature(token, conf)
         return false
     end
 
-    local pk, perr = pkey.new(conf.jwt_public_key)
-    if not pk then
-        -- A malformed configured key is an operator error, not an upstream
-        -- one. Never honour allow_unverified here: that would turn a typo in
-        -- the PEM into an open gate.
-        kong.log.err("[aforo-metering] jwt_public_key could not be parsed as a public key: ",
-            tostring(perr))
-        return false
+    local pk, perr
+    if pem then
+        pk, perr = pkey.new(pem)
+        if not pk then
+            -- A malformed configured key is an operator error, not an upstream
+            -- one. Never honour allow_unverified here: that would turn a typo in
+            -- the PEM into an open gate.
+            kong.log.err("[aforo-metering] jwt_public_key could not be parsed as a public key: ",
+                tostring(perr))
+            return false
+        end
+    else
+        -- With a JWKS configured, no key for the token is a rejection, never
+        -- jwt_allow_unverified_signature (2026-10-13 fix): the token picks
+        -- its own kid, so treating "no such key" as "cannot verify" let a
+        -- forged token choose to skip verification by naming a kid that does
+        -- not exist.
+        local kid = claim_string(header and header.kid)
+        local jwk, why = jwks_key(jwks_uri, kid)
+        if not jwk then
+            warn_throttled("jwks_key", 60,
+                "[aforo-metering] JWT rejected: no JWKS key for it (kid=", tostring(kid), ") from ",
+                jwks_uri, ": ", tostring(why), ". Repeats suppressed for 60s.")
+            return false
+        end
+        pk, perr = jwk_to_pkey(pkey, jwk)
+        if not pk then
+            kong.log.err("[aforo-metering] JWKS key (kid=", tostring(kid), ") from ", jwks_uri,
+                " could not be loaded: ", tostring(perr))
+            return false
+        end
+
+        local verified, verr = pk:verify(signature, signing_input, "sha256")
+        if verr then
+            kong.log.err("[aforo-metering] RS256 verification error: ", tostring(verr))
+            return false
+        end
+        if verified == true then return true end
+
+        -- Maybe the issuer replaced the key under the same kid: see jwks_refetch.
+        local fresh = jwks_refetch(jwks_uri, kid, jwk)
+        if not fresh then return false end
+        pk = jwk_to_pkey(pkey, fresh)
+        return pk ~= nil and pk:verify(signature, signing_input, "sha256") == true
     end
 
     local verified, verr = pk:verify(signature, signing_input, "sha256")
@@ -284,61 +570,91 @@ end
 
 -- Main JWT validation entry point.
 -- Returns {valid=bool, reason=string, customer_id, tenant_id, key_id, scopes, ...}
+--
+-- Ordering matters: nothing in the payload is trustworthy until the signature
+-- is checked, so before it only exp and iss are looked at -- each normalised
+-- first, because an unauthenticated caller chooses their types (see
+-- claim_string). A non-numeric exp used to reach `ngx.time() > exp` as a
+-- string or a null and raise: a 500 for anyone who asked.
 local function validate_jwt(token, conf)
     -- 1. Parse claims (structure + encoding check)
-    local claims, parts = parse_jwt_claims(token)
-    if not claims then
+    local raw, header = parse_jwt(token)
+    if not raw then
         return { valid = false, reason = "MALFORMED_TOKEN" }
     end
 
+    local claims = {
+        sub         = claim_string(raw.sub),
+        iss         = claim_string(raw.iss),
+        jti         = claim_string(raw.jti),
+        tenant_id   = claim_string(raw.tenant_id),
+        customer_id = claim_string(raw.customer_id),
+        key_id      = claim_string(raw.key_id),
+        client_id   = claim_string(raw.client_id),
+        environment = claim_string(raw.environment),
+    }
+
     -- 2. Expiry check
-    local exp = claims.exp
-    if not exp or ngx.time() > tonumber(exp) then
+    local exp = tonumber(raw.exp)
+    if not exp or ngx.time() > exp then
         return { valid = false, reason = "TOKEN_EXPIRED" }
     end
 
     -- 3. Issuer check
     if conf.jwt_issuer and conf.jwt_issuer ~= "" and claims.iss ~= conf.jwt_issuer then
-        kong.log.warn("[aforo-metering] JWT issuer mismatch: got '", claims.iss,
+        kong.log.warn("[aforo-metering] JWT issuer mismatch: got '", tostring(claims.iss),
             "', expected '", conf.jwt_issuer, "'")
         return { valid = false, reason = "INVALID_ISSUER" }
     end
 
     -- 4. RS256 signature verification (resty.openssl; fail-closed -- see above)
-    if not verify_rs256_signature(token, conf) then
+    if not verify_rs256_signature(token, conf, header) then
         return { valid = false, reason = "INVALID_SIGNATURE" }
     end
 
-    -- Resolve Redis coords for jti blocklist checks.
-    -- Prefer dedicated jwt_redis_* config; fall back to rate_limit_redis_*.
-    local redis_host = (conf.jwt_redis_host and conf.jwt_redis_host ~= "" and conf.jwt_redis_host)
-                       or conf.rate_limit_redis_host or "127.0.0.1"
-    local redis_port = conf.jwt_redis_port or conf.rate_limit_redis_port or 6379
-
-    -- 5. jti blocklist (revoked individual token)
-    local jti = claims.jti
-    if is_jti_blocked(jti, redis_host, redis_port) then
-        return { valid = false, reason = "TOKEN_REVOKED" }
+    -- 5. Tenant binding (2026-10-12 security fix). org-service signs every
+    -- tenant's tokens with the same key and issuer, so a valid signature says
+    -- nothing about WHICH tenant the token belongs to. Without this check a
+    -- token minted for tenant A was accepted by tenant B's gateway, metered as
+    -- B, and forwarded upstream with A's X-Tenant-Id.
+    if non_empty_string(conf.tenant_id) and claims.tenant_id ~= conf.tenant_id then
+        warn_throttled("jwt_tenant_mismatch", 60,
+            "[aforo-metering] JWT rejected: tenant_id '", tostring(claims.tenant_id),
+            "' does not match this plugin's tenant_id '", conf.tenant_id,
+            "'. Repeats suppressed for 60s.")
+        return { valid = false, reason = "TENANT_MISMATCH" }
     end
 
-    -- 6. Client-level revocation (all tokens for this key_id revoked)
-    local key_id = claims.key_id
-    if is_client_revoked(key_id, redis_host, redis_port) then
-        return { valid = false, reason = "CLIENT_REVOKED" }
+    -- 6. Revocation: this token (jti), or every token of its client
+    -- (client_id, then key_id). Fail-open on Redis trouble; see above.
+    local revoked = revocation_reason(conf, claims)
+    if revoked then
+        return { valid = false, reason = revoked }
     end
 
-    -- 7. Return validated claims
+    -- 7. Return validated claims. Only strings leave here: these become
+    -- upstream headers, and a non-string header value raises.
+    local scopes = raw.scopes
+    if type(scopes) == "table" then
+        local parts = {}
+        for _, sc in ipairs(scopes) do
+            if type(sc) == "string" then parts[#parts + 1] = sc end
+        end
+        scopes = table.concat(parts, " ")
+    else
+        scopes = claim_string(scopes) or ""
+    end
+
     return {
         valid        = true,
         customer_id  = claims.customer_id or claims.sub or "",
-        tenant_id    = claims.tenant_id   or "",
-        key_id       = claims.key_id      or "",
-        scopes       = type(claims.scopes) == "table"
-                           and table.concat(claims.scopes, " ")
-                           or (claims.scopes or ""),
+        tenant_id    = claims.tenant_id or "",
+        key_id       = claims.key_id or "",
+        client_id    = claims.client_id,
+        scopes       = scopes,
         environment  = claims.environment or "live",
-        offering_ids = claims.offering_ids,
-        jti          = jti,
+        offering_ids = type(raw.offering_ids) == "table" and raw.offering_ids or nil,
+        jti          = claims.jti,
     }
 end
 
@@ -347,46 +663,23 @@ local AforoMeteringHandler = {
     VERSION  = "1.1.0",
 }
 
--- Shared memory buffer name (must be declared in kong.conf: lua_shared_dict aforo_buffer 10m)
---
--- The buffer is a shared-dict LIST, one JSON-encoded event per element
--- (2026-09-21). It used to be a single JSON array under one key, appended by
--- get -> decode -> insert -> set and drained by get -> delete. Neither sequence
--- is atomic, and every nginx worker runs them concurrently: two workers
--- appending at once each wrote back their own copy of the array and the other's
--- event vanished, and an append landing between a flush's get and its delete
--- was deleted unsent. Silent, proportional to traffic, and invisible in the
--- logs -- the worst kind of metering loss. rpush / lpop are single atomic
--- operations under the dict's own lock, so neither race exists any more.
---
--- A new key name on purpose: rpush against the old key, if it still held the
--- legacy string after a hot reload, fails with "value not a list".
-local BUFFER_KEY = "aforo:events"
-local MAX_BUFFER_SIZE = 10000
-
--- The ingestor rejects a batch of more than 1000 events with 400 -- which the
--- drop-on-4xx rule in flush_buffer would turn into silently discarding the
--- whole backlog. So a backlog (after an outage, say) is drained in slices no
--- larger than this, rather than as one oversized request.
-local MAX_BATCH_SIZE = 1000
-
--- Longest Retry-After (seconds) honoured on a 429 before the next attempt.
--- The flush runs in a timer, so a longer wait would only hold later slices;
--- past this the batch is re-buffered for a later flush instead.
-local MAX_RETRY_AFTER_SECONDS = 30
+-- The event buffer and its delivery to the ingestor live in event-buffer.lua.
 
 -- productType is REQUIRED by the ingestor in production, and some types carry
 -- fields of their own. The ingestor validates a batch as a whole, so one event
 -- missing its type's fields fails every event it travels with; such events are
--- skipped at the log phase instead. An AI_AGENT agentId (no trusted source:
--- X-Agent-Id is client-settable), gRPC service/method, GraphQL operation,
--- WebSocket connection and MQTT topic are not observable at an HTTP gateway,
--- so those types are listed only so the check refuses them rather than
--- poisoning batches. Unknown types are passed through unchecked.
+-- skipped at the log phase instead. AI_AGENT gets agentId and sessionId from
+-- trusted sources only (see resolve_ai_agent_identity), an MCP tool call its
+-- agent from the upstream or the verified customer (mcp_agent_id), and
+-- AGENTIC_API its traceId from the upstream or Kong (agentic_trace_id). gRPC service/method,
+-- GraphQL operation, WebSocket connection and MQTT topic are not observable
+-- at an HTTP gateway, so those types are listed only so the check refuses
+-- them rather than poisoning batches. Unknown types are passed through
+-- unchecked.
 local DEFAULT_PRODUCT_TYPE = "API"
 local PRODUCT_TYPE_REQUIRED_FIELDS = {
     API           = {},
-    AGENTIC_API   = {},
+    AGENTIC_API   = { "traceId" },
     AI_AGENT      = { "agentId", "sessionId" },
     MCP_SERVER    = { "toolName", "agentId" },
     GRPC_API      = { "grpcService", "grpcMethod" },
@@ -421,11 +714,20 @@ end
 -- Helpers
 -- ────────────────────────────────────────────────────────────
 
+-- An exclude_paths entry matches the path itself and anything below it: "/health"
+-- excludes "/health" and "/health/live", not "/healthcare/patients" (2026-10-12
+-- fix). It was a bare string prefix, so the defaults (/health, /ready,
+-- /metrics) quietly stopped billing any API whose path merely began with them.
 local function should_exclude_path(path, exclude_paths)
-    if not exclude_paths then return false end
+    if not exclude_paths or type(path) ~= "string" then return false end
     for _, excluded in ipairs(exclude_paths) do
-        if path == excluded or string.sub(path, 1, #excluded) == excluded then
-            return true
+        if type(excluded) == "string" and excluded ~= "" then
+            if path == excluded then return true end
+            if string.sub(path, 1, #excluded) == excluded
+                and (string.sub(excluded, -1) == "/"
+                     or string.sub(path, #excluded + 1, #excluded + 1) == "/") then
+                return true
+            end
         end
     end
     return false
@@ -439,6 +741,185 @@ local function should_exclude_status(status, exclude_status_codes)
         end
     end
     return false
+end
+
+-- ── Text hygiene ────────────────────────────────────────────
+--
+-- What keeps a batch readable is valid JSON, and cjson emits a Lua string's
+-- bytes as they are: one malformed UTF-8 sequence in any event (a client's
+-- header, a path) made the ingestor unable to read the whole request
+-- (Jackson answers 400), and every event batched with it went down too. So
+-- every string an event carries must be well-formed UTF-8. Valid Unicode is
+-- legitimate and passes through unchanged -- a path, a tool name or a
+-- customer id may well be "café".
+--
+-- Lengths are counted the way the ingestor counts them: Java's
+-- String.length(), i.e. UTF-16 code units (@Size, and the Postgres VARCHAR
+-- behind it, count characters, not bytes). A 4-byte UTF-8 character is 2.
+
+-- The character at byte i of s, if it is well-formed UTF-8: its length in
+-- bytes, and in UTF-16 code units. nil for a malformed, overlong or
+-- surrogate sequence.
+local function utf8_char(s, i)
+    local c = string.byte(s, i)
+    if c < 0x80 then return 1, 1 end
+    if c >= 0xC2 and c <= 0xDF then
+        local c2 = string.byte(s, i + 1)
+        if c2 and c2 >= 0x80 and c2 <= 0xBF then return 2, 1 end
+        return nil
+    end
+    if c >= 0xE0 and c <= 0xEF then
+        local c2, c3 = string.byte(s, i + 1, i + 2)
+        if not c3 or c2 < 0x80 or c2 > 0xBF or c3 < 0x80 or c3 > 0xBF then return nil end
+        if (c == 0xE0 and c2 < 0xA0) or (c == 0xED and c2 > 0x9F) then return nil end
+        return 3, 1
+    end
+    if c >= 0xF0 and c <= 0xF4 then
+        local c2, c3, c4 = string.byte(s, i + 1, i + 3)
+        if not c4 or c2 < 0x80 or c2 > 0xBF or c3 < 0x80 or c3 > 0xBF
+            or c4 < 0x80 or c4 > 0xBF then return nil end
+        if (c == 0xF0 and c2 < 0x90) or (c == 0xF4 and c2 > 0x8F) then return nil end
+        return 4, 2
+    end
+    return nil
+end
+
+local function is_control(c)
+    return c < 0x20 or c == 0x7F
+end
+
+-- s's length in UTF-16 code units when it is well-formed UTF-8 -- and, unless
+-- allow_control, free of control characters -- else nil.
+local function text_length(s, allow_control)
+    local i, n, len = 1, #s, 0
+    while i <= n do
+        if not allow_control and is_control(string.byte(s, i)) then return nil end
+        local bytes, units = utf8_char(s, i)
+        if not bytes then return nil end
+        i = i + bytes
+        len = len + units
+    end
+    return len
+end
+
+-- A header or body value copied into an event: kept only when it is
+-- well-formed UTF-8 text without control characters and at most max
+-- characters, else dropped. A repeated header arrives as a table (the first
+-- value is used).
+local function clean_string(v, max)
+    if type(v) == "table" then v = v[1] end
+    if type(v) ~= "string" or v == "" then return nil end
+    local len = text_length(v)
+    if not len or len > max then return nil end
+    return v
+end
+
+-- A value that must stay on the event whatever the client sent -- the request
+-- path, an MCP tool name: dropping it would let a client opt out of metering.
+-- Valid UTF-8 is kept as it is; only malformed bytes and control characters
+-- are percent-encoded (Kong hands the path over decoded, so it can hold raw
+-- bytes). Then it is cut to max characters, at a character boundary.
+local function escaped_string(v, max)
+    if type(v) == "table" then v = v[1] end
+    if type(v) ~= "string" then return nil end
+    local out, len, i, n = {}, 0, 1, #v
+    while i <= n do
+        local c = string.byte(v, i)
+        local bytes, units
+        if not is_control(c) then bytes, units = utf8_char(v, i) end
+        local piece
+        if bytes then
+            piece = string.sub(v, i, i + bytes - 1)
+        else
+            piece, bytes, units = string.format("%%%02X", c), 1, 3
+        end
+        if len + units > max then break end
+        out[#out + 1] = piece
+        len = len + units
+        i = i + bytes
+    end
+    return table.concat(out)
+end
+
+-- A value for event metadata (names Kong holds: service, route, consumer):
+-- kept when it is valid text, else left out.
+local function text_or_nil(v)
+    if type(v) == "string" and text_length(v, true) then return v end
+    return nil
+end
+
+-- quantity as the ingestor stores it: @Digits(integer = 14, fraction = 6).
+-- More decimals failed the event (0.3333333 from an upstream header was
+-- refused); rounded here instead. A value that rounds to 0 is not billable.
+local function round_quantity(q)
+    return math.floor(q * 1e6 + 0.5) / 1e6
+end
+
+-- Ingestor limits (IngestUsageEventRequest @Size) on fields that identify what
+-- is billed. These are not cut short -- a truncated agent or customer id would
+-- bill the wrong one -- and an event over a limit is refused by the ingestor
+-- anyway, so it is skipped here with the reason instead.
+local IDENTITY_LIMITS = {
+    customerId = 64, metricName = 255, idempotencyKey = 255,
+    agentId = 36, sessionId = 64, productType = 20, traceId = 128,
+}
+
+-- The first identity field the ingestor would refuse, and why -- or nil.
+-- Counted in characters (see text_length); control characters are allowed
+-- here, since cjson escapes them and they are someone's actual identifier.
+local function identity_problem(event)
+    for field, max in pairs(IDENTITY_LIMITS) do
+        local v = event[field]
+        if type(v) == "string" then
+            local len = text_length(v, true)
+            if not len then
+                return field, "is not valid UTF-8 text"
+            end
+            if len > max then
+                return field, "is longer than the ingestor's " .. max .. "-character limit"
+            end
+        end
+    end
+    return nil
+end
+
+-- ────────────────────────────────────────────────────────────
+-- Execution status (OUTCOME_BASED pricing)
+-- ────────────────────────────────────────────────────────────
+-- The upstream's HTTP status as the ingestor's executionStatus, on every
+-- event (2026-10-19). OUTCOME_BASED rate plans bill each event at a weight
+-- per status, and metric filters can count only SUCCESS; an event without a
+-- status bills at full weight and never matches such a filter. Only MCP tool
+-- calls used to carry one (2xx SUCCESS, anything else ERROR), so a 500 from
+-- an API, AI agent or agentic API billed exactly like a 200 under every plan.
+-- The table is the one all Aforo gateway plugins share (policy locked
+-- 2026-09-30):
+--   2xx/3xx -> SUCCESS, 408/504 -> TIMEOUT, 499 -> CANCELLED,
+--   400/422 -> VALIDATION_FAILED, 401/403/429 -> BLOCKED,
+--   every other 4xx and 5xx -> ERROR, anything else -> nil (field left out).
+-- conf.status_outcomes overrides it per exact code ("404" -> "VALIDATION_FAILED").
+local OUTCOME_STATUSES = {
+    SUCCESS = true, PARTIAL = true, TIMEOUT = true, ERROR = true,
+    VALIDATION_FAILED = true, FAILED = true, FAILURE = true,
+    CANCELLED = true, PENDING = true, BLOCKED = true, HITL_REQUIRED = true,
+}
+
+local function outcome_from_status(status, overrides)
+    local s = tonumber(status)
+    if not s or s < 200 or s > 599 then return nil end
+    s = math.floor(s)
+    if type(overrides) == "table" then
+        local o = overrides[tostring(s)]
+        if type(o) == "string" and OUTCOME_STATUSES[string.upper(o)] then
+            return string.upper(o)
+        end
+    end
+    if s < 400 then return "SUCCESS" end
+    if s == 408 or s == 504 then return "TIMEOUT" end
+    if s == 499 then return "CANCELLED" end
+    if s == 400 or s == 422 then return "VALIDATION_FAILED" end
+    if s == 401 or s == 403 or s == 429 then return "BLOCKED" end
+    return "ERROR"
 end
 
 -- ────────────────────────────────────────────────────────────
@@ -462,9 +943,14 @@ end
 -- Cached in the existing aforo_buffer dict on purpose: requiring a second
 -- lua_shared_dict would add a deployment step operators forget, and a missing
 -- dict already costs this plugin all of its metering.
-local MAPPINGS_KEY = "aforo:gateway_mappings"
-local MAPPINGS_FETCHED_AT_KEY = "aforo:gateway_mappings_at"
-local MAPPINGS_INFLIGHT_KEY = "aforo:gateway_mappings_inflight"
+--
+-- Keyed by tenant_id + mappings_url (2026-10-12 fix). The cache used to be one
+-- global key, so with two plugin instances the second tenant's traffic was
+-- named by the first tenant's catalog rules -- metric names from somebody
+-- else's catalog, which the ingestor then rejected or, worse, accepted.
+local function mappings_key(conf)
+    return "aforo:gateway_mappings:" .. ngx.md5((conf.tenant_id or "") .. "\n" .. (conf.mappings_url or ""))
+end
 
 local function fetch_mappings(premature, conf)
     if premature then return end
@@ -481,7 +967,8 @@ local function fetch_mappings(premature, conf)
         headers = { ["Accept"] = "application/json" },
     })
 
-    dict:delete(MAPPINGS_INFLIGHT_KEY)
+    local key = mappings_key(conf)
+    dict:delete(key .. ":inflight")
 
     if not res or res.status < 200 or res.status >= 300 then
         -- Keep whatever is cached. Do not clear it.
@@ -498,10 +985,19 @@ local function fetch_mappings(premature, conf)
         return
     end
 
-    dict:set(MAPPINGS_KEY, cjson.encode(body.mappings))
-    dict:set(MAPPINGS_FETCHED_AT_KEY, ngx.now())
+    -- safe_set: never evict buffered events to make room for a cache. If the
+    -- dict is full the table is not stored -- and then neither is its
+    -- timestamp, so the next request tries again instead of treating an
+    -- empty cache as fresh.
+    local stored, serr = dict:safe_set(key, cjson.encode(body.mappings))
+    if not stored then
+        kong.log.warn("[aforo-metering] Could not cache the metric mappings (", tostring(serr),
+            "); using the previous table or local metric_mappings until the next refresh.")
+        return
+    end
+    dict:safe_set(key .. ":at", ngx.now())
     if body.cacheTtlSeconds and tonumber(body.cacheTtlSeconds) then
-        dict:set("aforo:gateway_mappings_ttl", tonumber(body.cacheTtlSeconds))
+        dict:safe_set(key .. ":ttl", tonumber(body.cacheTtlSeconds))
     end
     kong.log.info("[aforo-metering] Loaded ", #body.mappings, " metric mappings for tenant ",
         conf.tenant_id or "?")
@@ -515,18 +1011,19 @@ local function maybe_refresh_mappings(conf)
     local dict = ngx.shared[BUFFER_DICT]
     if not dict then return end
 
-    local fetched_at = dict:get(MAPPINGS_FETCHED_AT_KEY)
-    local ttl = dict:get("aforo:gateway_mappings_ttl") or conf.mappings_refresh_seconds or 300
+    local key = mappings_key(conf)
+    local fetched_at = dict:get(key .. ":at")
+    local ttl = dict:get(key .. ":ttl") or conf.mappings_refresh_seconds or 300
     if fetched_at and (ngx.now() - fetched_at) < ttl then return end
 
     -- One worker fetches; the rest carry on with the cache. add() is atomic, so
     -- a burst of concurrent requests cannot stampede catalog.
-    local claimed = dict:add(MAPPINGS_INFLIGHT_KEY, 1, 30)
+    local claimed = dict:safe_add(key .. ":inflight", 1, 30)
     if not claimed then return end
 
     local ok, err = ngx.timer.at(0, fetch_mappings, conf)
     if not ok then
-        dict:delete(MAPPINGS_INFLIGHT_KEY)
+        dict:delete(key .. ":inflight")
         kong.log.warn("[aforo-metering] Could not schedule mappings refresh: ", err)
     end
 end
@@ -548,10 +1045,11 @@ local function mapping_matches(path, rule)
     return false
 end
 
-local function metric_from_cached_mappings(path)
+local function metric_from_cached_mappings(conf, path)
     local dict = ngx.shared[BUFFER_DICT]
     if not dict then return nil end
-    local raw = dict:get(MAPPINGS_KEY)
+    if not conf.mappings_url or conf.mappings_url == "" then return nil end
+    local raw = dict:get(mappings_key(conf))
     if not raw then return nil end
     local ok, rules = pcall(cjson.decode, raw)
     if not ok or type(rules) ~= "table" then return nil end
@@ -594,7 +1092,7 @@ local DEFAULT_METRIC_PATTERN = "{method} {path}"
 --   5. default_metric -- a single registered fallback, so an unmapped endpoint
 --      still bills as generic usage rather than being rejected
 local function resolve_metric_name(conf, method, path, service_name, route_name,
-                                   consumer_name, header_metric)
+                                   consumer_name, header_metric, mcp_fallback)
     -- 1. Upstream override. This reads the RESPONSE header, which the upstream
     -- sets and the client cannot -- so it is not a spoofable input the way a
     -- request header would be.
@@ -607,7 +1105,7 @@ local function resolve_metric_name(conf, method, path, service_name, route_name,
     -- for a single request. Falls through when the cache is empty or has no rule
     -- for this path, so an unreachable catalog degrades to local config rather
     -- than to nothing.
-    local central = metric_from_cached_mappings(path)
+    local central = metric_from_cached_mappings(conf, path)
     if central and central ~= "" then
         return central
     end
@@ -630,6 +1128,12 @@ local function resolve_metric_name(conf, method, path, service_name, route_name,
                 end
             end
         end
+    end
+
+    -- An MCP tool call stops here: after the header and the mappings it is a
+    -- tool invocation, not generic API usage under default_metric.
+    if mcp_fallback then
+        return mcp_fallback
     end
 
     -- 4. Legacy template, honoured only if the operator actually chose one.
@@ -677,6 +1181,94 @@ local function resolve_quantity(conf, response_size, header_quantity)
     end
 end
 
+-- Resolve agentId and sessionId for an AI_AGENT event.
+--
+-- Aforo requires both on every AI_AGENT event and a gateway observes neither.
+-- The obvious sources -- X-Agent-Id or X-Aforo-Session-Id on the REQUEST --
+-- are client-settable, so they are never read: a caller could choose which
+-- agent its usage is attributed to. Only sources the client cannot touch:
+--   agentId:   conf.agent_id_header from the upstream RESPONSE, then the
+--              operator's conf.agent_id for this service/route, then the
+--              id of the Kong service the request was proxied to
+--              (2026-10-19): an AI_AGENT product with neither configured
+--              used to meter nothing at all. The service is the agent, and
+--              its id is the operator's, never the client's.
+--   sessionId: conf.session_id_header from the upstream RESPONSE, then this
+--              request's idempotency key (Kong's request ID, never a client
+--              header) -- so without the header, one request is one session
+-- agentId comes back nil only for a request routed to no service; the
+-- required-field check in the log phase then refuses the event and says how
+-- to supply it.
+-- An upstream response header that names who or what is billed. Returns
+-- (value) when usable, (nil) when absent, and (nil, true) when it is present
+-- but unusable -- malformed text, a control character, or longer than the
+-- ingestor allows. The caller must then skip the event, not fall back
+-- (2026-10-12 fix): falling back used to bill an agent's usage to
+-- config.agent_id, a multi-request session as one-off requests, and a
+-- metric the backend named to default_metric -- quietly, to the wrong thing.
+local function upstream_identity(header, max)
+    local raw = kong.response.get_header(header)
+    if type(raw) == "table" then raw = raw[1] end
+    if raw == nil or raw == "" then return nil end
+    local v = clean_string(raw, max)
+    if not v then return nil, true end
+    return v
+end
+
+-- The trace an AGENTIC_API call belongs to, or (nil, bad_header).
+--
+-- AGENTIC_API bills per trace: the ingestor folds every event of a
+-- (tenant, traceId) into one agentic session -- a goal -- which outcome
+-- billing, session budgets and the kill switch then act on. So the trace is
+-- billing identity, and the client must not choose it (2026-10-19). It was
+-- the client's traceparent, else its x-trace-id: a caller that sent one
+-- traceparent on every call folded all its goals into a single session, and
+-- one that sent another customer's trace id put its calls into that
+-- customer's session. Now only sources the client cannot touch:
+--   1. conf.trace_id_header from the upstream RESPONSE -- the backend knows
+--      which calls make up one goal
+--   2. Kong's ID for this request: one request, one goal
+-- The client's traceparent still travels in event.trace, for correlation.
+local function agentic_trace_id(conf, request_id)
+    local header = non_empty_string(conf.trace_id_header)
+    if header then
+        local v, bad = upstream_identity(header, IDENTITY_LIMITS.traceId)
+        if bad then return nil, header end
+        if v then return v end
+    end
+    return request_id
+end
+
+-- Returns agent_id, session_id, bad_agent_header, bad_session_header.
+-- A bad_* is the name of a header the upstream sent with a value that cannot
+-- be used; the matching value is then nil -- never a fallback -- and the
+-- other one is still resolved, so a caller that does not need the bad one
+-- can go on (2026-10-13 fix: one bad header used to void both).
+local function resolve_ai_agent_identity(conf, request_key, service)
+    local agent_id, session_id, bad_agent, bad_session
+
+    local agent_header = non_empty_string(conf.agent_id_header)
+    if agent_header then
+        local v, bad = upstream_identity(agent_header, IDENTITY_LIMITS.agentId)
+        if bad then bad_agent = agent_header else agent_id = v end
+    end
+    if not bad_agent then
+        agent_id = agent_id or non_empty_string(conf.agent_id)
+            or (type(service) == "table" and clean_string(service.id, IDENTITY_LIMITS.agentId))
+    end
+
+    local session_header = non_empty_string(conf.session_id_header)
+    if session_header then
+        local v, bad = upstream_identity(session_header, IDENTITY_LIMITS.sessionId)
+        if bad then bad_session = session_header else session_id = v end
+    end
+    if not bad_session then
+        session_id = session_id or request_key
+    end
+
+    return agent_id, session_id, bad_agent, bad_session
+end
+
 -- resolve_customer_id
 --
 -- Priority order (post-2026-04-23 IDOR fix):
@@ -701,8 +1293,35 @@ local function resolve_customer_id(conf, consumer, headers)  -- luacheck: ignore
     return nil
 end
 
-local function generate_idempotency_key(request_id)
-    return request_id or uuid()
+-- Kong's own ID for the current request -- the idempotency key (2026-10-12).
+--
+-- The key used to be the client's X-Request-Id header, falling back to
+-- X-Kong-Request-Id, which is a request header too. The ingestor dedups on
+-- (tenant_id, idempotency_key) and silently drops a repeat, so a caller that
+-- sent the same X-Request-Id on every call was billed for the first one and
+-- never again -- and any other customer of the tenant who happened to send a
+-- colliding ID lost those events as well. A value the client chooses cannot
+-- decide whether usage counts. Only a server-generated ID is used now:
+--   1. kong.request.get_id(), where the PDK has it (not in Kong 3.4)
+--   2. nginx's $request_id: 32 random hex characters per request, generated
+--      by nginx and not influenced by any request header (verified on 3.4)
+--   3. a fresh UUID
+-- Resolved once per event in the log phase. The key is then part of the
+-- buffered JSON, so a re-buffered or retried event carries the same key and
+-- the ingestor still collapses a retry that did land.
+local function kong_request_id()
+    local get_id = kong.request.get_id
+    if type(get_id) == "function" then
+        local ok, id = pcall(get_id)
+        if ok and type(id) == "string" and id ~= "" then
+            return id
+        end
+    end
+    local ok, id = pcall(function() return ngx.var.request_id end)
+    if ok and type(id) == "string" and id ~= "" then
+        return id
+    end
+    return uuid()
 end
 
 -- ────────────────────────────────────────────────────────────
@@ -712,255 +1331,259 @@ end
 -- ────────────────────────────────────────────────────────────
 
 local function extract_trace_context()
+    -- Client headers: see clean_string. Informational only, never identity.
     return {
-        traceparent = kong.request.get_header("traceparent"),
-        tracestate  = kong.request.get_header("tracestate"),
-        xTraceId    = kong.request.get_header("x-trace-id"),
-        xRequestId  = kong.request.get_header("x-request-id"),
+        traceparent = clean_string(kong.request.get_header("traceparent"), 128),
+        tracestate  = clean_string(kong.request.get_header("tracestate"), 512),
+        xTraceId    = clean_string(kong.request.get_header("x-trace-id"), 128),
+        xRequestId  = clean_string(kong.request.get_header("x-request-id"), 128),
     }
-end
-
--- ────────────────────────────────────────────────────────────
--- Flush buffered events to Aforo ingestor
--- ────────────────────────────────────────────────────────────
-
--- Take up to `max` events off the head of the buffer. Each lpop is atomic, so
--- concurrent flushes in different workers take disjoint events: nothing is sent
--- twice and nothing is lost between a read and a delete.
-local function pop_batch(dict, max)
-    local batch = {}
-    for i = 1, max do
-        local item, err = dict:lpop(BUFFER_KEY)
-        if not item then
-            if err then
-                kong.log.err("[aforo-metering] Could not read buffer: ", err)
-            end
-            break
-        end
-        batch[i] = item
-    end
-    return batch
-end
-
--- Put a failed batch back at the head of the buffer, oldest first, and trim
--- the tail back to MAX_BUFFER_SIZE. Returns how many events were dropped.
---
--- Ordering: failed events are older than anything buffered during the
--- attempt, so they go in front. On overflow we keep the OLDEST and drop the
--- newest, because the oldest are the ones closest to falling outside the
--- ingestor's 90-day occurredAt acceptance window -- and losing recent events
--- is recoverable from upstream logs far more often than losing old ones.
-local function rebuffer(dict, batch)
-    local dropped = 0
-    for i = #batch, 1, -1 do
-        local len, err = dict:lpush(BUFFER_KEY, batch[i])
-        if not len then
-            -- Only "no memory" in practice: the dict is full. The events
-            -- further down this loop are newer, so this is still "drop newest".
-            kong.log.err("[aforo-metering] Could not re-buffer event: ", err)
-            dropped = dropped + 1
-        end
-    end
-    local len = dict:llen(BUFFER_KEY) or 0
-    while len > MAX_BUFFER_SIZE do
-        if not dict:rpop(BUFFER_KEY) then break end
-        dropped = dropped + 1
-        len = len - 1
-    end
-    return dropped
-end
-
--- 4xx other than 408 / 429: the ingestor understood the batch and refused it.
--- See the drop-on-rejection comment in send_batch for why these are not retried.
-local function is_permanent_rejection(status)
-    return status ~= nil and status >= 400 and status < 500
-        and status ~= 408 and status ~= 429
-end
-
--- POST one batch. Returns "sent", "rejected" (permanent -- dropped, do not
--- retry) or "failed" (transient -- the caller keeps the events).
-local function send_batch(conf, batch)
-    local httpc = http.new()
-    httpc:set_timeout(10000)
-
-    -- Each element is already a JSON-encoded event, so the body is assembled
-    -- rather than decoded and re-encoded: cheaper, and the bytes sent are
-    -- exactly the bytes buffered.
-    local body = '{"events":[' .. table.concat(batch, ",") .. ']}'
-
-    local max_retries = 3
-    local last_status, last_body
-    for attempt = 1, max_retries do
-        local res, err = httpc:request_uri(conf.aforo_endpoint, {
-            method  = "POST",
-            body    = body,
-            -- X-API-Key, not Authorization: Bearer (2026-09-03).
-            --
-            -- The ingestor authenticates keys through aforo-common's
-            -- ApiKeyAuthFilter, which reads X-API-Key and nothing else. A key sent
-            -- as a Bearer token is simply not seen: the request stays anonymous and
-            -- /v1/ingest/batch answers 403 "You don't have permission to
-            -- usage-events:ingest", which reads like a permissions problem on the
-            -- key rather than a header the server never looked at.
-            --
-            -- Sent ALONE. Adding Authorization: Bearer alongside as a fallback was
-            -- tried and is actively harmful: an API key in that header is parsed as
-            -- a JWT, fails, and the request is rejected 401 before the API-key
-            -- filter ever runs. Verified against production -- X-API-Key alone
-            -- returns 202, the two together return 401.
-            headers = {
-                ["Content-Type"]  = "application/json",
-                ["X-API-Key"]     = conf.api_key or "",
-                ["X-Tenant-Id"]   = conf.tenant_id or "",
-            },
-        })
-
-        if res and res.status >= 200 and res.status < 300 then
-            kong.log.info("[aforo-metering] Flushed ", #batch, " events to Aforo (status=", res.status, ")")
-            return "sent"
-        end
-
-        local status = res and res.status or "no response"
-        last_status = res and res.status or nil
-        last_body = res and res.body or nil
-        kong.log.warn("[aforo-metering] Flush attempt ", attempt, "/", max_retries,
-            " failed (status=", status, ", err=", err or "none", ")")
-
-        -- Name the fix for the one failure that is reliably misdiagnosed.
-        -- OpenSSL error 20 against an https endpoint almost always means Kong's
-        -- lua_ssl_verify_depth (default 1) is too shallow for the chain, NOT a
-        -- missing CA bundle -- so operators go install certificates that are
-        -- already there. Only logged on the final attempt to avoid noise.
-        if attempt == max_retries and err and string.find(err, "unable to get local issuer certificate", 1, true) then
-            kong.log.err("[aforo-metering] TLS verification failed for ", conf.aforo_endpoint, ". ",
-                "This is usually lua_ssl_verify_depth, which Kong defaults to 1 -- too shallow for a ",
-                "leaf/intermediate/root chain. Set lua_ssl_verify_depth = 3 in kong.conf (or ",
-                "KONG_LUA_SSL_VERIFY_DEPTH=3). Adding CA certificates will not help: Kong already ",
-                "trusts the system bundle via lua_ssl_trusted_certificate.")
-        end
-
-        -- A permanent rejection (see below) gets the same answer on every
-        -- attempt, so stop here rather than sleeping through two more of them
-        -- -- which, with a backlog drained in slices, would hold every slice
-        -- behind it for 3s per rejected batch.
-        if is_permanent_rejection(last_status) then
-            break
-        end
-
-        if attempt < max_retries then
-            local wait = math.pow(2, attempt - 1)
-            -- Honour the ingestor's Retry-After on 429 (delta-seconds form).
-            -- Longer than MAX_RETRY_AFTER_SECONDS: stop here and let the
-            -- caller re-buffer, rather than sleep through the flush.
-            if last_status == 429 then
-                local ra = res.headers and tonumber(res.headers["Retry-After"]
-                    or res.headers["retry-after"])
-                if ra and ra >= 0 then
-                    if ra > MAX_RETRY_AFTER_SECONDS then
-                        break
-                    end
-                    wait = ra
-                end
-            end
-            ngx.sleep(wait)
-        end
-    end
-
-    -- Drop on a permanent rejection; only retry what retrying can fix
-    -- (2026-09-03 fix).
-    --
-    -- Re-buffering EVERY failure, added 2026-09-01, created a poison pill. The
-    -- ingestor validates the batch as a whole: one event the server considers
-    -- malformed fails the request with 400, so the whole batch came back and was
-    -- re-buffered -- including every well-formed event in it. The bad event was
-    -- then retried forever, failing the batch every time and dragging good
-    -- events down with it. Metering stops permanently and the log only says
-    -- "flush attempts failed", which reads like the ingestor being unwell rather
-    -- than one unacceptable event stuck at the head of the queue.
-    --
-    -- 4xx means the server understood us and refused; retrying sends the same
-    -- bytes to the same judgement. 408 and 429 are the exceptions -- both
-    -- explicitly invite a retry. Anything else (5xx, timeout, connection
-    -- refused) is transient and worth keeping, which is what the original fix
-    -- was for.
-    if is_permanent_rejection(last_status) then
-        kong.log.err("[aforo-metering] Ingestor rejected the batch with ", last_status,
-            " -- dropping ", #batch, " event(s) rather than retrying them forever. ",
-            "Response: ", string.sub(tostring(last_body or ""), 1, 500))
-        return "rejected"
-    end
-
-    return "failed"
-end
-
-local function flush_buffer(premature, conf)
-    if premature then return end
-
-    local dict = ngx.shared[BUFFER_DICT]
-    if not dict then
-        kong.log.err("[aforo-metering] Shared dict '", BUFFER_DICT, "' not found")
-        return
-    end
-
-    -- Drain in slices of MAX_BATCH_SIZE. Bounded so one flush cannot chase a
-    -- buffer that live traffic refills as fast as it drains; whatever is left
-    -- is picked up by the flush the next buffered event schedules.
-    for _ = 1, math.ceil(MAX_BUFFER_SIZE / MAX_BATCH_SIZE) do
-        local batch = pop_batch(dict, MAX_BATCH_SIZE)
-        if #batch == 0 then return end
-
-        local outcome = send_batch(conf, batch)
-
-        if outcome == "failed" then
-            -- Re-buffer transient failures (2026-09-01 fix).
-            -- The events were taken off the buffer before the first attempt, so
-            -- an ingestor outage outlasting 3 retries used to destroy the only
-            -- copy of them: unbilled usage, no dead-letter, nothing to
-            -- reconstruct from. Push them back so a later flush retries them,
-            -- and stop draining -- the next slice would only fail the same way.
-            local dropped = rebuffer(dict, batch)
-            if dropped > 0 then
-                kong.log.err("[aforo-metering] All flush attempts failed. ",
-                    #batch, " events re-buffered for retry; ", dropped,
-                    " dropped (buffer at MAX_BUFFER_SIZE=", MAX_BUFFER_SIZE,
-                    "). Raise lua_shared_dict aforo_buffer if this recurs.")
-            else
-                kong.log.err("[aforo-metering] All flush attempts failed. ",
-                    #batch, " events re-buffered for retry on the next flush.")
-            end
-            return
-        end
-
-        if #batch < MAX_BATCH_SIZE then return end
-    end
 end
 
 -- ────────────────────────────────────────────────────────────
 -- MCP JSON-RPC Detection
 -- ────────────────────────────────────────────────────────────
 
-local function detect_mcp_tool_call(raw_body)
-    if not raw_body or raw_body == "" then return nil end
+local MCP_TOOL_METRIC = "mcp_server.tool_invocations"
 
-    local ok, parsed = pcall(cjson.decode, raw_body)
-    if not ok or not parsed then return nil end
+-- Largest request body read from client_body_buffer_size's spill file.
+local MCP_MAX_BODY_BYTES = 1048576
 
-    if parsed.jsonrpc ~= "2.0" then return nil end
-    if parsed.method ~= "tools/call" then return nil end
+-- MCP metering is on for an mcp_enabled route, and always for an
+-- MCP_SERVER product (2026-10-19): an MCP_SERVER event needs the tool name,
+-- which only the JSON-RPC body has, so with mcp_enabled off such a product
+-- metered nothing at all.
+local function mcp_on(conf, product_type)
+    return conf.mcp_enabled == true or product_type == "MCP_SERVER"
+end
 
-    local params = parsed.params or {}
-    local tool_name = params.name
-    if not tool_name then return nil end
+-- Parse a request body as JSON-RPC (2026-10-12 rewrite). Returns nil when it
+-- is not JSON-RPC at all, else { calls = { {tool_name}, ... },
+-- other = <number of messages that are not tools/call> } --
+-- one entry per tools/call, also inside a JSON-RPC batch (an array), which
+-- used to be read as no tool call at all.
+--
+-- Every level is type-checked: the body is the client's. A body of `1`, or
+-- "params": null, used to raise in the log phase (indexing a number or the
+-- cjson.null userdata) and lose the event. A tools/call whose name is
+-- missing or not a string is still a tool call -- billed as "unknown", so
+-- leaving the name out is not a way to skip billing. params._meta.agent_id
+-- is not read (2026-10-19): it is the client's to write, and the agent is
+-- billing identity (see mcp_agent_id).
+local function parse_jsonrpc(raw_body)
+    if type(raw_body) ~= "string" or raw_body == "" then return nil end
+    local parsed = cjson.decode(raw_body)
+    if type(parsed) ~= "table" then return nil end
 
-    local agent_id = nil
-    if params._meta and params._meta.agent_id then
-        agent_id = params._meta.agent_id
+    local messages
+    if parsed.jsonrpc ~= nil then
+        messages = { parsed }
+    elseif #parsed > 0 then
+        messages = parsed
+    else
+        return nil
     end
 
-    return {
-        tool_name = tool_name,
-        agent_id = agent_id,
-    }
+    local calls, other, jsonrpc = {}, 0, false
+    for _, msg in ipairs(messages) do
+        if type(msg) == "table" and msg.jsonrpc == "2.0" then
+            jsonrpc = true
+            if msg.method ~= "tools/call" then
+                other = other + 1
+            else
+                local params = type(msg.params) == "table" and msg.params or {}
+                calls[#calls + 1] = {
+                    -- Kept, escaped and capped, whatever the client sent: see escaped_string.
+                    tool_name = escaped_string(params.name, 64) or "unknown",
+                }
+            end
+        end
+    end
+    if not jsonrpc then return nil end
+    return { calls = calls, other = other }
+end
+
+-- What a request bills: tool-call events, a plain event, both or neither.
+-- Decided here for both phases, so the access phase's pre-flight check asks
+-- about exactly the events the log phase will create.
+--   * tools: one event per tools/call in the body
+--   * plain: an event for the request itself. Never on an MCP_SERVER
+--     product, whose events need a tool name (a GET or DELETE on the MCP
+--     endpoint is session plumbing). On a JSON-RPC body, only for its
+--     non-tool messages and only with mcp_meter_non_tool_calls (2026-10-12):
+--     initialize, tools/list, ping and notifications are protocol traffic.
+local function billable(conf, product_type, jsonrpc)
+    local tools = jsonrpc ~= nil and #jsonrpc.calls > 0
+    local plain
+    if product_type == "MCP_SERVER" then
+        plain = false
+    elseif jsonrpc then
+        plain = conf.mcp_meter_non_tool_calls == true and jsonrpc.other > 0
+    else
+        plain = true
+    end
+    return tools, plain
+end
+
+-- The schema's default_metric. On an MCP_SERVER product a default_metric
+-- set to anything else is the product's tool-call metric.
+local SCHEMA_DEFAULT_METRIC = "api_calls"
+
+-- The metric a tools/call bills to: the upstream's metric header, central
+-- mappings, metric_mappings -- then, on an MCP_SERVER product,
+-- default_metric unless it is still the schema's api_calls (2026-10-19),
+-- else mcp_server.tool_invocations. An MCP_SERVER product's plugin is
+-- configured with its catalog metric as default_metric, and every tool call
+-- was billed to mcp_server.tool_invocations instead: a metric the catalog
+-- may not have, and not the one its quota rules name.
+local function tool_call_metric(conf, product_type, method, path, service_name, route_name,
+                                 consumer_name, header_metric)
+    local fallback = MCP_TOOL_METRIC
+    if product_type == "MCP_SERVER" then
+        local dm = non_empty_string(conf.default_metric)
+        if dm and dm ~= SCHEMA_DEFAULT_METRIC then fallback = dm end
+    end
+    return resolve_metric_name(conf, method, path, service_name, route_name, consumer_name,
+                               header_metric, fallback)
+end
+
+-- The agent of an MCP tool call (not on an AI_AGENT route), or
+-- (nil, bad_header). MCP_SERVER requires one on every event, and the agent
+-- is billing identity: the ingestor applies per-agent session limits, keys
+-- MCP sessions and their duration billing by it, and resolves the agent's
+-- team for budgets. So the client cannot name it (2026-10-19) -- it used to
+-- be params._meta.agent_id from the request body. Now:
+--   1. conf.agent_id_header from the upstream RESPONSE
+--   2. the verified customer (JWT claim or Kong consumer): the caller of an
+--      MCP server is the agent, and at a gateway the credential is all that
+--      identifies the caller
+-- conf.agent_id is not used here: it names one agent for the whole service,
+-- which for an MCP server would put every customer's sessions under one
+-- agent (one session limit, one duration bill).
+local function mcp_agent_id(conf, customer_id)
+    local header = non_empty_string(conf.agent_id_header)
+    if header then
+        local v, bad = upstream_identity(header, IDENTITY_LIMITS.agentId)
+        if bad then return nil, header end
+        if v then return v end
+    end
+    return customer_id
+end
+
+-- The MCP session of a tool call (not on an AI_AGENT route), or
+-- (nil, bad_header). Optional for MCP_SERVER, but the ingestor tracks
+-- sessions and bills their duration by it, so it comes from the upstream
+-- only (2026-10-19) -- it was the client's Mcp-Session-Id request header,
+-- and a client rotating it on every call billed no session time:
+--   1. conf.session_id_header from the upstream RESPONSE
+--   2. the Mcp-Session-Id the upstream answered with (MCP's own header).
+--      Its length is not bounded by MCP, so a value the ingestor would not
+--      take is hashed rather than dropped: the session survives.
+--   3. none
+local function mcp_session_id(conf)
+    local header = non_empty_string(conf.session_id_header)
+    if header then
+        local v, bad = upstream_identity(header, IDENTITY_LIMITS.sessionId)
+        if bad then return nil, header end
+        if v then return v end
+    end
+    local raw = kong.response.get_header("Mcp-Session-Id")
+    if type(raw) == "table" then raw = raw[1] end
+    if type(raw) ~= "string" or raw == "" then return nil end
+    return clean_string(raw, IDENTITY_LIMITS.sessionId) or ("mcp-" .. ngx.md5(raw))
+end
+
+-- A request body larger than client_body_buffer_size is spooled to a temp
+-- file, and kong.request.get_raw_body() returns nil for it, so a large
+-- tools/call was never seen. Read from the file instead, up to
+-- MCP_MAX_BODY_BYTES; past that it is not parsed (and is metered as a plain
+-- API call).
+local function read_body_file()
+    local ok, path = pcall(ngx.req.get_body_file)
+    if not ok or type(path) ~= "string" then return nil end
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local data = f:read(MCP_MAX_BODY_BYTES + 1)
+    f:close()
+    if not data or #data > MCP_MAX_BODY_BYTES then return nil end
+    return data
+end
+
+-- nginx variables, read defensively (absent outside a request).
+local function ngx_var(name)
+    local ok, v = pcall(function() return ngx.var[name] end)
+    return ok and v or nil
+end
+
+-- Bytes of response body sent to the client (2026-10-12 fix). Content-Length
+-- was used, which a chunked or streaming (SSE) response does not have -- so
+-- quantity_source=response_size billed it as nothing.
+local function response_bytes()
+    return tonumber(ngx_var("body_bytes_sent"))
+        or tonumber(kong.response.get_header("Content-Length")) or 0
+end
+
+-- The whole request as the client saw it, in ms (2026-10-12 fix).
+-- X-Kong-Proxy-Latency is only Kong's own overhead: an upstream that took
+-- 504 ms was reported as 2.
+local function response_time_ms(latency)
+    local t = tonumber(ngx_var("request_time"))
+    if t then return math.floor(t * 1000 + 0.5) end
+    return tonumber(latency) or 0
+end
+
+-- ────────────────────────────────────────────────────────────
+-- init_worker: re-arm flushes for buffered events no timer is waiting on
+-- (after a kong reload, or a worker that crashed). See event-buffer.lua.
+-- ────────────────────────────────────────────────────────────
+
+function AforoMeteringHandler:init_worker()
+    event_buffer.init_worker()
+end
+
+-- The metrics the pre-flight quota check asks about: those this request's
+-- events will be billed to (2026-10-19). It used to resolve one metric the
+-- way a plain API call bills, so an MCP tool call was checked against
+-- default_metric but billed to its tool-call metric, and an initialize or
+-- tools/list -- billed nothing -- could still be refused 429.
+--
+-- Decided as the log phase decides (billable, tool_call_metric,
+-- resolve_metric_name), with what the access phase cannot know left out:
+--   * the upstream's metric_header. A backend that renames the metric for
+--     one response is checked against the configured metric; the metric it
+--     names is still enforced by the ingestor when the event arrives.
+--   * the upstream's quantity. The check asks whether the quota is already
+--     used up, not whether this call would exceed it.
+-- Empty for a request that will make no event: an excluded path, a CORS
+-- preflight, or an MCP request without a tools/call.
+local function preflight_metrics(conf, product_type, consumer)
+    local method, path = kong.request.get_method(), kong.request.get_path()
+    if should_exclude_path(path, conf.exclude_paths) then return {} end
+    if method == "OPTIONS" and kong.request.get_header("Access-Control-Request-Method") then
+        return {}
+    end
+
+    local jsonrpc
+    if mcp_on(conf, product_type) and method == "POST" then
+        jsonrpc = parse_jsonrpc(kong.ctx.shared.aforo_raw_body)
+    end
+    local tools, plain = billable(conf, product_type, jsonrpc)
+
+    local service, route = kong.router.get_service(), kong.router.get_route()
+    local service_name = service and service.name or ""
+    local route_name = route and route.name or ""
+    local consumer_name = consumer and (consumer.username or consumer.custom_id) or ""
+
+    local metrics = {}
+    if tools then
+        metrics[1] = tool_call_metric(conf, product_type, method, path, service_name, route_name,
+                                      consumer_name, nil)
+    end
+    if plain then
+        local m = resolve_metric_name(conf, method, path, service_name, route_name, consumer_name, nil)
+        if m ~= metrics[1] then metrics[#metrics + 1] = m end
+    end
+    return metrics
 end
 
 -- ────────────────────────────────────────────────────────────
@@ -970,6 +1593,15 @@ end
 -- ────────────────────────────────────────────────────────────
 
 function AforoMeteringHandler:access(conf)
+    -- Requests this plugin refuses are not billable usage (2026-10-12 fix).
+    -- The flag is raised on entry and lowered only when the access phase
+    -- completes, so every refusal below (401 / 429 / 503) and any error that
+    -- aborts this handler (Kong answers 500) leaves it set, and the log phase
+    -- skips the request. A preflight fail-closed 503 used to be metered: the
+    -- customer was billed for a call the gateway itself turned away.
+    -- exclude_status_codes still applies on top, to every request.
+    kong.ctx.shared.aforo_refused = true
+
     kong.ctx.shared.aforo_trace = extract_trace_context()
 
     -- Only ever schedules a background refresh; never waits on one.
@@ -988,9 +1620,14 @@ function AforoMeteringHandler:access(conf)
     -- to buffer the whole request, which is real overhead on large uploads and
     -- pointless when nothing consumes it. pcall-guarded because the body is
     -- legitimately unavailable for streamed or oversized requests.
-    if conf.mcp_enabled then
+    local product_type = normalize_product_type(conf.product_type)
+    if mcp_on(conf, product_type) then
         local ok, body = pcall(kong.request.get_raw_body)
-        kong.ctx.shared.aforo_raw_body = ok and body or nil
+        body = ok and body or nil
+        if body == nil then
+            body = read_body_file()
+        end
+        kong.ctx.shared.aforo_raw_body = body
     end
 
     -- ── JWT Validation (runs first — all subsequent checks depend on validated identity) ──
@@ -1018,7 +1655,9 @@ function AforoMeteringHandler:access(conf)
         -- Propagate verified claims as trusted downstream headers
         -- (overwrite any client-supplied headers — these come from the validated JWT)
         kong.service.request.set_header("X-Customer-Id", result.customer_id)
-        kong.service.request.set_header("X-Tenant-Id",   result.tenant_id)
+        -- conf.tenant_id, not the claim: the plugin instance decides the tenant
+        -- (the claim has been checked equal to it above).
+        kong.service.request.set_header("X-Tenant-Id",   conf.tenant_id)
         kong.service.request.set_header("X-Key-Id",      result.key_id)
         kong.service.request.set_header("X-Scopes",      result.scopes)
         if result.environment then
@@ -1026,8 +1665,14 @@ function AforoMeteringHandler:access(conf)
         end
     end
 
-    -- Rate limit enforcement (reads policy from Redis, returns 429 on HARD breach)
-    rate_limit.enforce(conf)
+    -- Rate limit enforcement (reads policy from Redis, returns 429 on HARD breach).
+    -- Each check below returns true when it has answered the request; stop
+    -- there. In the access phase kong.response.exit only records the
+    -- response, so carrying on would run the later checks -- and could answer
+    -- twice.
+    if rate_limit.enforce(conf) then
+        return
+    end
 
     -- resolve_customer_id() prefers the JWT-validated claim stashed above;
     -- falls back to Kong consumer identity (credential-bound). Never reads
@@ -1041,21 +1686,24 @@ function AforoMeteringHandler:access(conf)
     -- point the upstream had already served the request. Off unless
     -- preflight_quota_enabled; fail-open; see preflight-quota.lua.
     --
-    -- The metric is resolved the same way the log phase will bill it, minus
-    -- the upstream response header, which does not exist yet.
+    -- It checks the metrics the log phase will bill (see preflight_metrics),
+    -- and nothing for a request that will not be billed: an MCP initialize
+    -- or tools/list is never refused for a spent tool-call quota.
     if conf.preflight_quota_enabled then
-        local service = kong.router.get_service()
-        local route = kong.router.get_route()
-        local metric = resolve_metric_name(conf, kong.request.get_method(), kong.request.get_path(),
-            service and service.name or "", route and route.name or "",
-            consumer and (consumer.username or consumer.custom_id) or "", nil)
-        if preflight_quota.check(conf, customer_id, metric) then
-            return  -- answered 429/503; skip the remaining checks
+        for _, metric in ipairs(preflight_metrics(conf, product_type, consumer)) do
+            if preflight_quota.check(conf, customer_id, metric) then
+                return  -- answered 429/503; skip the remaining checks
+            end
         end
     end
 
-    -- Margin guard pre-flight check (calls pricing-service quick-check, returns 429 on L2/L3).
-    margin_guard.check(conf, conf.tenant_id, customer_id)
+    -- Margin guard pre-flight check (calls pricing-service quick-check, returns
+    -- 429 on THROTTLE / BLOCK).
+    if margin_guard.check(conf, conf.tenant_id, customer_id) then
+        return
+    end
+
+    kong.ctx.shared.aforo_refused = nil
 end
 
 -- ────────────────────────────────────────────────────────────
@@ -1063,6 +1711,13 @@ end
 -- ────────────────────────────────────────────────────────────
 
 function AforoMeteringHandler:log(conf)
+    -- Refused by this plugin's access phase, or that phase failed: never
+    -- billable. See the flag in access().
+    if kong.ctx.shared.aforo_refused then
+        kong.log.debug("[aforo-metering] Not metering a request this plugin refused.")
+        return
+    end
+
     local method = kong.request.get_method()
     local path = kong.request.get_path()
     local status = kong.response.get_status()
@@ -1092,12 +1747,12 @@ function AforoMeteringHandler:log(conf)
     local raw_body = kong.ctx.shared.aforo_raw_body
     -- Content-Length when the body was not captured, so request_size stays
     -- populated for the common non-MCP path instead of reporting a flat 0.
-    local request_size = raw_body and #raw_body
+    local request_size = type(raw_body) == "string" and #raw_body
         or tonumber(kong.request.get_header("Content-Length")) or 0
-    local response_size = tonumber(kong.response.get_header("Content-Length")) or 0
-    local request_id = kong.request.get_header("X-Request-Id")
-        or kong.request.get_header("X-Kong-Request-Id")
-    local session_id = kong.request.get_header("Mcp-Session-Id")
+    local response_size = response_bytes()
+    local response_ms = response_time_ms(latency)
+    -- Never a request header: see kong_request_id.
+    local request_id = kong_request_id()
 
     local service_name = service and service.name or ""
     local route_name = route and route.name or ""
@@ -1107,205 +1762,274 @@ function AforoMeteringHandler:log(conf)
     -- W3C trace context (prefer access-phase stash, fallback to re-extraction)
     local trace = kong.ctx.shared.aforo_trace or extract_trace_context()
 
-    -- MCP Detection
-    local mcp_info = nil
-    if conf.mcp_enabled and method == "POST" then
-        mcp_info = detect_mcp_tool_call(raw_body)
-    end
-
     -- productType on every event (conf.product_type, default "API").
     local product_type = normalize_product_type(conf.product_type)
 
-    -- Build usage event
-    local event = {}
-    event.productType = product_type
+    -- An upstream identity header that is present but unusable: the event is
+    -- not metered, rather than billed under a different identity.
+    local function skip_unusable(header)
+        warn_throttled("unusable_" .. header, 60, "[aforo-metering] Skipping events: the upstream ",
+            "sent ", header, " with a value that cannot be used (not valid UTF-8 text, a control ",
+            "character, or longer than the ingestor allows), e.g. ", method, " ", path, ". Not ",
+            "metered, rather than billed to a different ", header, ". Repeats suppressed for 60s.")
+    end
 
-    if mcp_info then
-        event.customerId     = customer_id
-        event.metricName     = "mcp_server.tool_invocations"
-        event.quantity       = 1
-        event.idempotencyKey = "mcp:" .. (conf.tenant_id or "") .. ":" ..
-                               (request_id or uuid()) .. ":" ..
-                               mcp_info.tool_name .. ":" .. tostring(ngx.now())
-        event.occurredAt     = iso8601_utc(ngx.now())
-        event.toolName       = mcp_info.tool_name
-        event.agentId        = mcp_info.agent_id or headers["x-agent-id"]
-        event.sessionId      = session_id
-        event.executionStatus = (status >= 200 and status < 300) and "SUCCESS" or "ERROR"
-        event.executionDurationMs = tonumber(latency) or 0
-        -- MCP_SERVER requires toolName AND agentId. Classify the tool call as
-        -- MCP_SERVER only when both are known; otherwise keep the configured
-        -- product_type rather than send an event the ingestor must reject.
-        if event.toolName and event.toolName ~= ""
-            and event.agentId and event.agentId ~= "" then
-            event.productType = "MCP_SERVER"
-        end
-    else
-        event.customerId     = customer_id
-        -- Upstream-supplied overrides, read from the response so a client
-        -- cannot forge them.
-        local header_metric = conf.metric_header and conf.metric_header ~= ""
-            and kong.response.get_header(conf.metric_header) or nil
+    -- Upstream-supplied overrides, read from the response so a client cannot
+    -- forge them.
+    local header_metric
+    if conf.metric_header and conf.metric_header ~= "" then
+        local bad
+        header_metric, bad = upstream_identity(conf.metric_header, IDENTITY_LIMITS.metricName)
+        if bad then return skip_unusable(conf.metric_header) end
+    end
+
+    -- MCP: JSON-RPC on an mcp_enabled route or an MCP_SERVER product.
+    local jsonrpc = nil
+    if mcp_on(conf, product_type) and method == "POST" then
+        jsonrpc = parse_jsonrpc(raw_body)
+    end
+
+    -- Nothing billable: an MCP protocol message that is not a tool call
+    -- (initialize, tools/list, ping, notifications/*) without
+    -- mcp_meter_non_tool_calls, or anything but a tool call on an MCP_SERVER
+    -- product. See billable(); the pre-flight check uses the same decision.
+    local tools, plain = billable(conf, product_type, jsonrpc)
+    if not tools and not plain then
+        kong.log.debug("[aforo-metering] Not metering an MCP request without a tools/call.")
+        return
+    end
+
+    local function api_event()
         local header_quantity = conf.quantity_header and conf.quantity_header ~= ""
             and kong.response.get_header(conf.quantity_header) or nil
-
+        local event = { productType = product_type, customerId = customer_id }
         event.metricName     = resolve_metric_name(conf, method, path, service_name,
                                                    route_name, consumer_name, header_metric)
         event.quantity       = resolve_quantity(conf, response_size, header_quantity)
-        event.idempotencyKey = generate_idempotency_key(request_id)
+        event.idempotencyKey = request_id
         event.occurredAt     = iso8601_utc(ngx.now())
-    end
-
-    -- quantity must be > 0 (e.g. quantity_source=response_size with an empty
-    -- body); one such event would fail the whole batch.
-    if type(event.quantity) ~= "number" or event.quantity <= 0 then
-        kong.log.debug("[aforo-metering] Skipping ", method, " ", path,
-            " -- quantity is not > 0.")
-        return
-    end
-
-    -- Top-level HTTP fields (hoisted from metadata for fast ClickHouse queries)
-    event.endpointPath    = path
-    event.httpMethod      = method
-    event.statusCode      = status
-    event.responseTimeMs  = tonumber(latency) or 0
-
-    -- W3C trace context (null when absent — fidelity, not synthetic)
-    event.trace = trace
-
-    -- Metadata (kept for backward compat — HTTP fields will be removed here in a follow-up)
-    if conf.include_metadata then
-        event.metadata = {
-            gateway       = "kong",
-            method        = method,
-            path          = path,
-            status        = status,
-            latency       = tonumber(latency) or 0,
-            endpoint_path = path,
-            http_method   = method,
-            status_code   = status,
-            response_time_ms = tonumber(latency) or 0,
-            requestSize   = request_size,
-            responseSize  = response_size,
-            service       = service_name,
-            route         = route_name,
-            consumer      = consumer_name,
-        }
-    end
-
-    -- Billing-hierarchy identity (2026-09-01 fix).
-    -- usage-ingestor's BillingHierarchyEnricher resolves team / member /
-    -- subscription for an event from an identity carried in metadata. Until now
-    -- this plugin emitted none, so every gateway-metered event reached the
-    -- ingestor unattributed: teamId stayed null, and because budget enforcement
-    -- is gated on a non-null teamId, team budgets were silently never enforced
-    -- for gateway traffic.
-    --
-    -- key_id is the JWT's Aforo API-key id (UUID). It is deliberately NOT the
-    -- same value as keyHash (SHA-256 hex of the raw key) which the enricher's
-    -- older :apikey: index is built on -- the gateway never sees the raw key, so
-    -- it cannot compute that hash. The ingestor therefore maintains a parallel
-    -- :keyid: index; see BillingHierarchySyncJob.
-    --
-    -- Set outside the include_metadata block on purpose: include_metadata=false
-    -- turns off *diagnostic* metadata, and must not silently disable billing
-    -- attribution.
-    local jwt_claims = kong.ctx.shared and kong.ctx.shared.aforo_jwt_claims
-    if jwt_claims and jwt_claims.key_id and jwt_claims.key_id ~= "" then
-        event.metadata = event.metadata or {}
-        event.metadata.keyId = jwt_claims.key_id
-    end
-
-    -- Refuse to buffer an event that can never be accepted (2026-09-03).
-    --
-    -- customerId is what usage attributes to; the ingestor rejects a blank one.
-    -- Because it validates a batch as a whole, a single such event fails the
-    -- request and every well-formed event batched with it is rejected too. Since
-    -- nothing downstream can supply the missing value later, buffering it only
-    -- damages the events around it -- so it is dropped here, at the one point
-    -- where the loss is limited to the event actually at fault.
-    if not event.customerId or event.customerId == "" then
-        kong.log.warn("[aforo-metering] Skipping ", method, " ", path,
-            " -- no customer identity resolved. With jwt_validation_enabled the ",
-            "customer_id claim supplies this; otherwise set customer_id_source to a ",
-            "Kong consumer. Event not metered.")
-        return
-    end
-
-    -- Refuse to buffer an event its productType makes invalid, for the same
-    -- reason as the customerId skip above: one such event fails its batch.
-    local missing = missing_required_fields(event)
-    if missing then
-        warn_throttled("missing_fields_" .. event.productType, 300,
-            "[aforo-metering] Skipping events: product_type ", event.productType,
-            " requires ", table.concat(missing, ", "), ", which this request did not ",
-            "supply (e.g. ", method, " ", path, "). Repeats suppressed for 300s.")
-        return
-    end
-
-    -- Buffer the event
-    local dict = ngx.shared[BUFFER_DICT]
-    if not dict then
-        kong.log.err("[aforo-metering] Shared dict '", BUFFER_DICT, "' not available. ",
-            "Add 'lua_shared_dict aforo_buffer 10m;' to kong.conf")
-        return
-    end
-
-    local encoded, enc_err = cjson.encode(event)
-    if not encoded then
-        kong.log.err("[aforo-metering] Could not encode event for ", method, " ", path,
-            ": ", enc_err, ". Event not metered.")
-        return
-    end
-
-    -- One atomic append; the returned length is this event's position, so it
-    -- doubles as the count that drives flush scheduling below without a
-    -- separate counter that could drift from the list.
-    local count, push_err = dict:rpush(BUFFER_KEY, encoded)
-    if not count then
-        kong.log.err("[aforo-metering] Could not buffer event (", push_err, "). ",
-            "Raise lua_shared_dict aforo_buffer if this recurs. Event not metered.")
-        return
-    end
-
-    if count > MAX_BUFFER_SIZE then
-        -- Over the cap: take one event back off the tail. That is this event or
-        -- one a concurrent worker appended a moment later -- either way the
-        -- newest, so the oldest (closest to the ingestor's acceptance window)
-        -- are the ones kept, matching the re-buffer rule in flush_buffer.
-        dict:rpop(BUFFER_KEY)
-        warn_throttled("buffer_overflow", 10,
-            "[aforo-metering] Buffer full (", MAX_BUFFER_SIZE, " events) -- dropping the ",
-            "newest event. The ingestor is failing or unreachable; see the flush errors. ",
-            "Repeats suppressed for 10s.")
-        -- Keep a flush coming. Previously an overflow returned without
-        -- scheduling one, so once the buffer was full and the last flush had
-        -- re-buffered, nothing ever flushed again even after the ingestor
-        -- recovered -- every new event was dropped at this line. add() limits
-        -- it to one attempt per second across workers rather than one per request.
-        if dict:add("aforo:overflow_flush", 1, 1) then
-            ngx.timer.at(0, flush_buffer, conf)
+        -- AI_AGENT only. Other types do not define these fields, so they are
+        -- left off rather than sent on every API call. The idempotency key is
+        -- Kong's own request ID, so it doubles as the per-request session
+        -- fallback.
+        if product_type == "AI_AGENT" then
+            local bad_agent, bad_session
+            event.agentId, event.sessionId, bad_agent, bad_session = resolve_ai_agent_identity(conf, request_id, service)
+            if bad_agent or bad_session then return nil, bad_agent or bad_session end
         end
-        return
+        return event
     end
 
-    if count >= (conf.flush_count or 50) then
-        local ok, err = ngx.timer.at(0, flush_buffer, conf)
-        if not ok then
-            kong.log.warn("[aforo-metering] Failed to schedule immediate flush: ", err)
+    local events = {}
+    if tools then
+        -- One event per tools/call: a JSON-RPC batch carries several.
+        local metric = tool_call_metric(conf, product_type, method, path, service_name, route_name,
+                                        consumer_name, header_metric)
+        -- AI_AGENT: agent and session come from config or the upstream only,
+        -- as for every other AI_AGENT event. Otherwise the call is an
+        -- MCP_SERVER event whose agent is the upstream's agent header or the
+        -- verified customer, and whose session is the upstream's (see
+        -- mcp_agent_id, mcp_session_id) -- never X-Agent-Id, _meta.agent_id
+        -- or the request's Mcp-Session-Id, which are the client's to set.
+        -- An unusable header skips the calls: every one of them would use it.
+        local agent_id, session_id, bad
+        if product_type == "AI_AGENT" then
+            local bad_agent, bad_session
+            agent_id, session_id, bad_agent, bad_session =
+                resolve_ai_agent_identity(conf, request_id, service)
+            bad = bad_agent or bad_session
+        else
+            agent_id, bad = mcp_agent_id(conf, customer_id)
+            if not bad then session_id, bad = mcp_session_id(conf) end
         end
-    elseif count == 1 then
-        local interval = (conf.flush_interval_ms or 5000) / 1000
-        local ok, err = ngx.timer.at(interval, flush_buffer, conf)
-        if not ok then
-            kong.log.warn("[aforo-metering] Failed to schedule timed flush: ", err)
+        if bad then return skip_unusable(bad) end
+        for i, call in ipairs(jsonrpc.calls) do
+            local event = { productType = product_type, customerId = customer_id }
+            if product_type ~= "AI_AGENT" then event.productType = "MCP_SERVER" end
+            event.metricName     = metric
+            event.quantity       = 1
+            event.idempotencyKey = "mcp:" .. (conf.tenant_id or "") .. ":" .. request_id .. ":"
+                                   .. i .. ":" .. call.tool_name
+            event.occurredAt     = iso8601_utc(ngx.now())
+            event.toolName       = call.tool_name
+            event.agentId        = agent_id
+            event.sessionId      = session_id
+            event.executionDurationMs = response_ms
+            events[i] = event
         end
+    end
+    -- The request itself; for a mixed JSON-RPC batch with
+    -- mcp_meter_non_tool_calls, its other messages as one plain API call --
+    -- as they would be on their own.
+    if plain then
+        local event, unusable = api_event()
+        if not event then return skip_unusable(unusable) end
+        events[#events + 1] = event
+    end
+
+    -- The path is client-chosen: escaped and cut to the ingestor's 512 limit.
+    local event_path = escaped_string(path, 512) or "/"
+
+    for _, event in ipairs(events) do
+        -- quantity must be > 0 (e.g. quantity_source=response_size with an empty
+        -- body) after rounding to the ingestor's 6 decimals, and below its 14
+        -- integer digits; such an event would only be refused.
+        if type(event.quantity) == "number" then
+            event.quantity = round_quantity(event.quantity)
+        end
+        if type(event.quantity) ~= "number" or event.quantity <= 0 or event.quantity >= 1e14 then
+            kong.log.debug("[aforo-metering] Skipping ", method, " ", path,
+                " -- quantity is not > 0 (after rounding to 6 decimals) or is too large.")
+            goto continue
+        end
+
+        -- AGENTIC_API: always a traceId, never the client's (see
+        -- agentic_trace_id). An unusable trace header skips the event.
+        if event.productType == "AGENTIC_API" then
+            local bad_trace
+            event.traceId, bad_trace = agentic_trace_id(conf, request_id)
+            if bad_trace then
+                skip_unusable(bad_trace)
+                goto continue
+            end
+        end
+        -- AI_AGENT: the ingestor aggregates an agent's sessions by traceId,
+        -- and an event without one gets the client's traceparent there -- the
+        -- client would choose the session its calls are folded into. The
+        -- session is the trusted grouping (config or upstream), so it is
+        -- the trace too, as Aforo's agent SDKs send it.
+        if event.productType == "AI_AGENT" then
+            event.traceId = event.sessionId
+        end
+
+        -- Top-level HTTP fields (hoisted from metadata for fast ClickHouse queries)
+        event.endpointPath    = event_path
+        event.httpMethod      = string.sub(method or "", 1, 16)
+        event.statusCode      = status
+        event.responseTimeMs  = response_ms
+        -- Every type, MCP tool calls included: see outcome_from_status.
+        event.executionStatus = outcome_from_status(status, conf.status_outcomes)
+
+        -- W3C trace context (null when absent — fidelity, not synthetic)
+        event.trace = trace
+
+        -- Metadata (kept for backward compat — HTTP fields will be removed here in a follow-up)
+        if conf.include_metadata then
+            event.metadata = {
+                gateway       = "kong",
+                method        = method,
+                path          = event_path,
+                status        = status,
+                latency       = tonumber(latency) or 0,
+                endpoint_path = event_path,
+                http_method   = method,
+                status_code   = status,
+                response_time_ms = response_ms,
+                requestSize   = request_size,
+                responseSize  = response_size,
+                service       = text_or_nil(service_name),
+                route         = text_or_nil(route_name),
+                consumer      = text_or_nil(consumer_name),
+            }
+        else
+            -- endpoint_path stays whatever include_metadata says (2026-10-12):
+            -- central mappings and the ingestor's metric filters and
+            -- aggregation read this key, so without it include_metadata=false
+            -- silently changed what was billed.
+            event.metadata = { endpoint_path = event_path }
+        end
+
+        -- Billing-hierarchy identity (2026-09-01 fix).
+        -- usage-ingestor's BillingHierarchyEnricher resolves team / member /
+        -- subscription for an event from an identity carried in metadata. Until now
+        -- this plugin emitted none, so every gateway-metered event reached the
+        -- ingestor unattributed: teamId stayed null, and because budget enforcement
+        -- is gated on a non-null teamId, team budgets were silently never enforced
+        -- for gateway traffic.
+        --
+        -- key_id is the JWT's Aforo API-key id (UUID). It is deliberately NOT the
+        -- same value as keyHash (SHA-256 hex of the raw key) which the enricher's
+        -- older :apikey: index is built on -- the gateway never sees the raw key, so
+        -- it cannot compute that hash. The ingestor therefore maintains a parallel
+        -- :keyid: index; see BillingHierarchySyncJob.
+        --
+        -- Set outside the include_metadata block on purpose: include_metadata=false
+        -- turns off *diagnostic* metadata, and must not silently disable billing
+        -- attribution.
+        local jwt_claims = kong.ctx.shared and kong.ctx.shared.aforo_jwt_claims
+        if jwt_claims and jwt_claims.key_id and jwt_claims.key_id ~= "" then
+            event.metadata.keyId = jwt_claims.key_id
+        end
+
+        -- Refuse to buffer an event that can never be accepted (2026-09-03).
+        --
+        -- customerId is what usage attributes to; the ingestor rejects a blank one.
+        -- Nothing downstream can supply the missing value later, so buffering it
+        -- only costs a round trip -- it is dropped here, at the one point where the
+        -- loss is limited to the event actually at fault.
+        if not event.customerId or event.customerId == "" then
+            warn_throttled("no_customer", 60, "[aforo-metering] Skipping ", method, " ", path,
+                " -- no customer identity resolved. With jwt_validation_enabled the ",
+                "customer_id claim supplies this; otherwise set customer_id_source to a ",
+                "Kong consumer. Event not metered. Repeats suppressed for 60s.")
+            return
+        end
+
+        local field, why = identity_problem(event)
+        if field then
+            warn_throttled("identity_" .. field, 300,
+                "[aforo-metering] Skipping events: ", field, " ", why, " (e.g. ", method, " ",
+                event_path, "). Event not metered. Repeats suppressed for 300s.")
+            goto continue
+        end
+
+        -- Refuse to buffer an event its productType makes invalid, for the same
+        -- reason as the customerId skip above.
+        do
+            local missing = missing_required_fields(event)
+            if missing then
+                -- Name the fix where there is one. An AI_AGENT agentId has exactly
+                -- two sources, both in the operator's hands; sessionId always has
+                -- its Kong request-ID fallback, so it is never the gap.
+                local fix = ""
+                if event.productType == "AI_AGENT" and not event.agentId then
+                    local agent_header = non_empty_string(conf.agent_id_header)
+                    fix = " Fix: set config.agent_id to this service's agent ID, or have the upstream "
+                        .. (agent_header
+                            and ("send it in the " .. agent_header .. " response header.")
+                            or "send it in a response header and set config.agent_id_header to its name.")
+                end
+                warn_throttled("missing_fields_" .. event.productType, 300,
+                    "[aforo-metering] Skipping events: product_type ", event.productType,
+                    " requires ", table.concat(missing, ", "), ", which this request did not ",
+                    "supply (e.g. ", method, " ", path, ").", fix, " Repeats suppressed for 300s.")
+                goto continue
+            end
+        end
+
+        do
+            local encoded, enc_err = cjson.encode(event)
+            if not encoded then
+                kong.log.err("[aforo-metering] Could not encode event for ", method, " ", path,
+                    ": ", enc_err, ". Event not metered.")
+                goto continue
+            end
+            event_buffer.push(conf, encoded)
+        end
+
+        ::continue::
     end
 end
 
 -- Exported for unit testing — not used by the Kong runtime.
 -- Keep the top-level handler contract (access/log) unchanged.
 AforoMeteringHandler._resolve_customer_id = resolve_customer_id
-AforoMeteringHandler._flush_buffer = flush_buffer
+AforoMeteringHandler._flush_buffer = event_buffer.flush
+AforoMeteringHandler._buffer_key = event_buffer.key
+AforoMeteringHandler._rearm = event_buffer._rearm
+AforoMeteringHandler._conf_ttl = event_buffer.CONF_TTL
+AforoMeteringHandler._max_event_age = event_buffer.MAX_EVENT_AGE_SECONDS
+AforoMeteringHandler._mappings_key = mappings_key
+AforoMeteringHandler._outcome_from_status = outcome_from_status
 
 return AforoMeteringHandler

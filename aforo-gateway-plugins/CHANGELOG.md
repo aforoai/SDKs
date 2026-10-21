@@ -4,6 +4,16 @@ This monorepo ships five gateway metering plugins (Kong, Apigee, AWS Lambda, Azu
 
 ## Unreleased
 
+- Kong: `AI_AGENT` metering, with `agent_id` / `agent_id_header` / `session_id_header` (operator config or upstream response headers, never request headers). Also fixes the Kong plugin failing to load at startup because a schema description exceeded Kong's 500-character limit.
+- Kong (security): JWTs are bound to the plugin's `tenant_id` (a token for another tenant is rejected), client revocation is looked up by `client_id`, Redis errors no longer reject every token, and `jwt_jwks_uri` is implemented.
+- Kong: rate limiting no longer returns 500 on policies with null fields, can't be bypassed with a lower-case `bearer`, and now covers key-auth traffic. JWT-authenticated requests are not rate limited yet.
+- Kong: the margin guard now applies pricing's BLOCK/THROTTLE verdicts (it read the wrong fields and never blocked), checks the GLOBAL scope, and requires `margin_guard_url`.
+- Kong: requests the plugin itself refuses (401/429/503) are no longer metered.
+- Kong: one event buffer per destination (a second plugin instance's usage was sent with the first one's key), no retry storms or stranded events, 401/403/404 and per-event storage failures kept for retry, 400/413 batches split, and unusable client values kept out of batches.
+- Kong: `exclude_paths` no longer skips paths that only share a prefix (`/healthcare`), streamed responses bill their bytes, `responseTimeMs` is the real response time, MCP bodies can't crash metering, JSON-RPC batches bill each tool call, MCP protocol messages are not billed (new `mcp_meter_non_tool_calls`), and the MCP agent is never taken from `X-Agent-Id`.
+- Kong: one buffer per endpoint, tenant and key, never moved or mixed (rotate by adding the new key in Kong before revoking the old one); a destination the ingestor refuses keeps at most its newest 500 events, backs off to every 5 minutes and gives way to healthy ones when memory runs low; caches can no longer evict buffered events; a 413 is split until it fits; buffered events are flushed again after a reload; valid Unicode passes through unchanged; JWKS handles an issuer that reuses its `kid`; a margin-guard throttle pass is no longer cached (exact with the matching pricing-service update); `PER_CUSTOMER` rate limits count per customer.
+- Kong: the event idempotency key is now Kong's own request ID instead of the client's `X-Request-Id` header. A client that repeated one `X-Request-Id` was billed only once.
+
 ## v2.1.0 — 2026-10-01
 
 - Every event now carries `productType` (required by the ingestor in production): new per-plugin setting, default `API` — Kong `product_type`, Apigee KVM `product_type`, AWS Lambda `PRODUCT_TYPE` / `ProductType`, Azure Named Value `aforo-product-type`, MuleSoft `product-type`. MCP `tools/call` is sent as `MCP_SERVER` only when both `toolName` and `agentId` are present; events missing their type's required fields are skipped rather than failing the batch.
