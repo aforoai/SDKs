@@ -113,7 +113,7 @@
     "node-mqtt": { "endpoint": "/v1/ingest/batch" },
     "node-ws": { "endpoint": "/v1/ingest/batch" },
     "node-mcp": { "endpoint": "/v1/ingest/batch" },
-    "node-agent": { "endpoint": "/v1/ingest/events" },
+    "node-agent": { "endpoint": "/v1/ingest/batch" },
     "mcp-proxy": { "endpoint": "/v1/ingest/batch" },
     "python": { "endpoint": "/v1/ingest/batch" },
     "python-agent": { "endpoint": "/v1/ingest/batch" },

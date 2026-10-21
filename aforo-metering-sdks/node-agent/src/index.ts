@@ -1,64 +1,34 @@
 /**
  * @aforoai/agent-metering — Aforo AI Agent Metering SDK
  *
- * Thin wrapper that turns the agent's runtime lifecycle (start session →
- * record step → record tool call → end session) into Aforo metering events.
- * Sits one layer above the generic {@code @aforoai/metering} ingestor client
- * (no peer dependency — events are POSTed directly so the SDK is
- * stand-alone) and is parallel to {@code @aforoai/mcp-metering}'s
- * {@code wrapToolHandler} but for AI agent product types.
+ * Turns an agent's runtime lifecycle (start session → steps / tool calls /
+ * tokens → end session) into Aforo usage events and POSTs them, batched, to
+ * the usage ingestor's batch endpoint (`POST /v1/ingest/batch`, body
+ * `{"events":[…]}`, header `X-API-Key`). Stand-alone: no runtime dependencies.
  *
  * Usage:
  *   import { AforoAgent } from '@aforoai/agent-metering';
  *
  *   const agent = new AforoAgent({
- *     tenantId: 'tenant_xxx',
- *     productId: 'prod_xxx',
- *     apiKey: process.env.AFORO_API_KEY!,
- *     customerId: 'cust_xxx', // or per session via startSession({ customerId })
+ *     apiKey: process.env.AFORO_API_KEY!,   // workspace API key
+ *     customerId: 'cust_xxx',                // Aforo customer billed for the usage
+ *     agentId: 'support-bot',                // ≤ 36 chars
+ *     onError: (err) => console.error(err.kind, err.message),
  *   });
  *
- *   const session = await agent.startSession({
- *     agentId: 'agt_001', framework: 'CLAUDE',
- *     modelProvider: 'ANTHROPIC', modelName: 'claude-sonnet-4-6',
- *   });
- *
- *   await session.recordStep({
- *     stepKind: 'TOOL_CALL', capabilityName: 'web-search',
- *     inputTokens: 320, outputTokens: 84, durationMs: 510,
- *     executionStatus: 'SUCCESS',
- *   });
- *
- *   await session.end({ taskCompleted: true });
+ *   const session = agent.startSession({ framework: 'CLAUDE', modelProvider: 'ANTHROPIC' });
+ *   await session.recordToolCall('web_search', { durationMs: 510 });
+ *   await session.recordTokens('claude-sonnet-4-6', 320, 84);
+ *   await session.endSession({ taskCompleted: true });   // flushes
  */
 
-export type AgentFramework =
-  | 'CLAUDE'
-  | 'GPT'
-  | 'LANGCHAIN'
-  | 'CREWAI'
-  | 'AUTOGEN'
-  | 'CUSTOM';
+export type AgentFramework = 'CLAUDE' | 'GPT' | 'LANGCHAIN' | 'CREWAI' | 'AUTOGEN' | 'CUSTOM';
 
-export type ModelProvider =
-  | 'ANTHROPIC'
-  | 'OPENAI'
-  | 'GOOGLE'
-  | 'COHERE'
-  | 'CUSTOM';
+export type ModelProvider = 'ANTHROPIC' | 'OPENAI' | 'GOOGLE' | 'COHERE' | 'CUSTOM';
 
-export type StepKind =
-  | 'TOOL_CALL'
-  | 'THOUGHT'
-  | 'OBSERVATION'
-  | 'FINAL_ANSWER';
+export type StepKind = 'TOOL_CALL' | 'THOUGHT' | 'OBSERVATION' | 'FINAL_ANSWER';
 
-/**
- * The 11 canonical execution statuses the usage ingestor accepts (the same
- * set as contract/ingest-contract.json and the core SDKs). OUTCOME_BASED rate
- * plans bill each step at the weight set for its status; the SDK drops an
- * unknown value (with a warning) and the step bills at full weight.
- */
+/** The 11 canonical execution statuses the usage ingestor accepts (contract/ingest-contract.json). */
 export const EXECUTION_STATUSES = [
   'SUCCESS',
   'PARTIAL',
@@ -76,628 +46,846 @@ export const EXECUTION_STATUSES = [
 export type ExecutionStatus = (typeof EXECUTION_STATUSES)[number];
 
 /**
- * Trims and upper-cases a caller's status; missing or blank → SUCCESS (the
- * step ran). A value outside {@link EXECUTION_STATUSES} is logged and left
- * off the event, so the step bills at full weight — what the server would do
- * with it anyway.
+ * Catalog metric names the SDK emits. Defaults are the exact names of the
+ * default AI_AGENT catalog metrics; override any of them with
+ * {@link AforoAgentConfig.metricNames} if your catalog uses different names.
  */
-function normalizeExecutionStatus(value: unknown): ExecutionStatus | undefined {
-  if (value === undefined || value === null) return 'SUCCESS';
-  if (typeof value !== 'string') {
-    console.warn('[aforo-agent] executionStatus must be a string; dropping it', value);
-    return undefined;
-  }
-  const status = value.trim().toUpperCase();
-  if (!status) return 'SUCCESS';
-  if ((EXECUTION_STATUSES as readonly string[]).includes(status)) return status as ExecutionStatus;
-  console.warn(`[aforo-agent] "${value}" is not an execution status; dropping it (the step bills at full weight)`);
-  return undefined;
+export interface MetricNames {
+  /** One per session, on the session-closing event. */
+  sessions: string;
+  /** One per recordStep(). */
+  steps: string;
+  /** One per tool call (recordToolCall(), or recordStep({ stepKind: 'TOOL_CALL' })). */
+  toolCalls: string;
+  /** input + output tokens, per recordTokens() / step with tokens. */
+  tokens: string;
+  executionMinutes: string;
+  gpuHours: string;
+  knowledgeQueries: string;
+  /** One per session ended with taskCompleted: true. */
+  tasksCompleted: string;
+  activeAgents: string;
+}
+
+export const DEFAULT_METRIC_NAMES: Readonly<MetricNames> = Object.freeze({
+  sessions: 'Agent Sessions',
+  steps: 'Agent Steps',
+  toolCalls: 'Agent Tool Calls',
+  tokens: 'Tokens Consumed',
+  executionMinutes: 'Execution Minutes',
+  gpuHours: 'GPU Hours',
+  knowledgeQueries: 'Knowledge Queries',
+  tasksCompleted: 'Tasks Completed',
+  activeAgents: 'Active Agents',
+});
+
+/** One event exactly as sent inside `{"events":[…]}` to `/v1/ingest/batch`. */
+export interface IngestEvent {
+  customerId: string;
+  metricName: string;
+  quantity: number;
+  /** ISO-8601 UTC. */
+  occurredAt: string;
+  /** Deterministic per event: `<sessionId>:<sequence>`. Reused by every retry. */
+  idempotencyKey: string;
+  productType: string;
+  agentId: string;
+  sessionId: string;
+  traceId?: string;
+  subscriptionId?: string;
+  capabilityName?: string;
+  executionStatus?: ExecutionStatus;
+  executionDurationMs?: number;
+  stepNumber?: number;
+  parentStepId?: string;
+  /** Set to SESSION_END on the session-closing event only. */
+  sessionBoundary?: 'SESSION_END';
+  metadata: Record<string, unknown>;
+}
+
+/** @deprecated Use {@link IngestEvent}. Kept so existing `onDrop` handlers type-check. */
+export type UsageEvent = IngestEvent;
+
+/**
+ * What went wrong:
+ * - `retrying`  — the ingestor was unreachable / returned 408, 429 or 5xx on every
+ *                 attempt. The events are KEPT in the buffer and re-sent on the next flush.
+ * - `rejected`  — the ingestor refused the whole request (non-retryable 4xx). Events dropped.
+ * - `partial`   — HTTP 2xx, but the response reported `data.failed > 0`; the
+ *                 failed events (see `errors`) are dropped, the rest were accepted.
+ * - `invalid`   — an event failed a client-side check and was never sent.
+ * - `overflow`  — the buffer hit `maxBufferSize`; the oldest events were dropped.
+ */
+export type AforoErrorKind = 'retrying' | 'rejected' | 'partial' | 'invalid' | 'overflow';
+
+export interface AforoAgentError {
+  kind: AforoErrorKind;
+  message: string;
+  /** HTTP status of the last attempt, when there was a response. */
+  status?: number;
+  /** Events affected (kept for `retrying`, dropped for every other kind). */
+  events: IngestEvent[];
+  /** Per-event errors from a batch response (`partial`). */
+  errors?: Array<{ index: number; message: string; idempotencyKey?: string }>;
+  /** True when the events are still buffered and will be re-sent. */
+  willRetry: boolean;
+}
+
+/** @deprecated Reasons passed to the legacy `onDrop` hook. */
+export type DropReason = 'retry_exhausted' | 'rejected' | 'invalid' | 'overflow';
+
+export interface AforoLogger {
+  warn(message: string, ...args: unknown[]): void;
 }
 
 export interface AforoAgentConfig {
-  tenantId: string;
-  productId: string;
+  /** Workspace API key, sent as `X-API-Key`. Required. */
   apiKey: string;
-  /**
-   * Aforo customer the agent's usage is billed to. Can be overridden (or
-   * supplied only) per session via {@link StartSessionOptions.customerId};
-   * one of the two is required.
-   */
+  /** Aforo customer (customer-service id) billed for the usage. Overridable per session. */
   customerId?: string;
+  /** Optional subscription to bill against. Overridable per session. */
+  subscriptionId?: string;
+  /** Default agent id (≤ 36 chars). Overridable per session. */
+  agentId?: string;
   /**
-   * {@code productType} stamped on every event. Defaults to {@code AI_AGENT};
-   * trimmed and uppercased, unknown values are passed through. (The
-   * {@code /v1/ingest/events} endpoint itself derives the product type from
-   * the event type — {@code agent_*} and {@code token_usage} are AI_AGENT.)
-   * Overridable per session
-   * ({@link StartSessionOptions.productType}) and per event
-   * ({@link AgentEventInput.productType}).
+   * Batch ingest URL. Default `https://api.aforo.ai/v1/ingest/batch`. A bare
+   * host gets `/v1/ingest/batch`; a URL ending in `/v1/ingest` (or
+   * `/v1/ingest/events`) gets `/batch`.
    */
-  productType?: string;
-  /**
-   * Aforo usage-ingestor URL. Defaults to
-   * {@code https://api.aforo.ai/v1/ingest} — override for local dev or
-   * air-gapped deployments. Events are POSTed one per request to
-   * {@code <ingestorUrl>/events}; a URL already ending in {@code /events}
-   * or {@code /batch} is accepted.
-   */
-  ingestorUrl?: string;
-  /**
-   * Maximum events to buffer before forcing a flush. Defaults to 50.
-   * Lower this for low-volume agents to surface metrics faster; raise it
-   * for high-volume agents to amortize the per-batch HTTP cost.
-   */
-  flushBatchSize?: number;
-  /**
-   * Maximum milliseconds an event can sit in the buffer before flush.
-   * Defaults to 5000 (5s). Forces flush on session.end() regardless.
-   */
+  endpoint?: string;
+  /** Aforo product id; sent as `metadata.productId`. */
+  productId?: string;
+  /** Override catalog metric names (defaults: {@link DEFAULT_METRIC_NAMES}). */
+  metricNames?: Partial<MetricNames>;
+  /** Max ms an event waits before a timed flush. Default 5000. */
   flushIntervalMs?: number;
-  /**
-   * Attempts per event for 408/429/5xx/network failures (other 4xx are never
-   * retried). Defaults to 3.
-   */
+  /** Events per request, 1..1000. Default 100. A full batch triggers a flush. */
+  maxBatchSize?: number;
+  /** Max events held in memory (including ones kept after a failed flush). Default 10000. */
+  maxBufferSize?: number;
+  /** Attempts per flush request for 408/429/5xx/network failures. Default 3. */
   maxRetries?: number;
-  /** Base backoff between attempts in ms (doubles each time; a 429's Retry-After wins). Defaults to 1000. */
+  /** Base backoff in ms, doubled per attempt; a 429's Retry-After wins. Default 500. */
   retryBaseDelayMs?: number;
-  /** Pluggable transport for tests. Defaults to global {@code fetch}. */
+  /** Per-request timeout in ms. Default 10000. */
+  requestTimeoutMs?: number;
+  /** `productType` on every event. Default `AI_AGENT`. */
+  productType?: string;
+  /** Called for every delivery problem. When unset, problems are logged via `logger`. */
+  onError?: (error: AforoAgentError) => void;
+  /** Where warnings go when `onError` is unset. Default `console`; `null` silences. */
+  logger?: AforoLogger | null;
+  /** Pluggable transport (tests, Node < 18). Defaults to global `fetch`. */
   fetchImpl?: typeof fetch;
-  /**
-   * Opt-in hook receiving events that were permanently dropped:
-   * 'retry_exhausted' — every send attempt failed (network error, 5xx, 408,
-   * 429); 'rejected' — the ingestor returned a non-retryable 4xx; 'invalid' —
-   * the event failed a client-side check and was never sent. Events carry their idempotency keys (stamped
-   * at creation), so persisting and re-submitting them after recovery is
-   * dedup-safe. Exceptions thrown by the hook are swallowed. Default:
-   * none (drops are still counted in droppedCount and WARN-logged).
-   */
-  onDrop?: (events: UsageEvent[], reason: DropReason) => void;
+
+  /** @deprecated Not needed: the API key identifies the tenant. Ignored. */
+  tenantId?: string;
+  /** @deprecated Use `endpoint`. */
+  ingestorUrl?: string;
+  /** @deprecated Use `maxBatchSize`. */
+  flushBatchSize?: number;
+  /** @deprecated Use `onError`. Called with events that are permanently dropped. */
+  onDrop?: (events: IngestEvent[], reason: DropReason) => void;
 }
 
-/** Why an event was permanently dropped. */
-export type DropReason = 'retry_exhausted' | 'rejected' | 'invalid';
-
 export interface StartSessionOptions {
-  agentId: string;
-  /** Aforo customer to bill for this run. Defaults to the client's {@code customerId}. */
+  /** Defaults to the client's `agentId`. ≤ 36 chars. */
+  agentId?: string;
   customerId?: string;
-  /** Customer-side identifier for the run (defaults to a generated UUID). */
+  subscriptionId?: string;
+  /** Unique per run (≤ 64 chars). Generated (UUID) if omitted. Idempotency keys derive from it. */
   sessionId?: string;
-  /** Distributed-trace id for the run. Defaults to the sessionId. */
+  /** Distributed-trace id. Generated (32 hex chars) if omitted. */
   traceId?: string;
-  /** Product type for this session's events. Defaults to the client's {@code productType}. */
   productType?: string;
   framework?: AgentFramework;
-  modelProvider?: ModelProvider;
+  modelProvider?: ModelProvider | string;
   modelName?: string;
-  /** Free-form metadata — landed in the metric event's properties block. */
+  /** Merged into every event's metadata. */
   metadata?: Record<string, unknown>;
 }
 
 export interface RecordStepOptions {
-  stepKind: StepKind;
+  stepKind?: StepKind;
   capabilityName?: string;
   inputTokens?: number;
   outputTokens?: number;
   durationMs?: number;
-  executionStatus?: ExecutionStatus;
-  /** Id of the step that spawned this one (sub-agent / nested tool call). */
+  executionStatus?: ExecutionStatus | string;
   parentStepId?: string;
+  /** Model for the step's tokens; defaults to the session's modelName. */
+  modelName?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface RecordTokensOptions {
+  provider?: ModelProvider | string;
+  capabilityName?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface RecordUsageOptions {
+  capabilityName?: string;
+  executionStatus?: ExecutionStatus | string;
+  durationMs?: number;
   metadata?: Record<string, unknown>;
 }
 
 export interface EndSessionOptions {
-  taskCompleted: boolean;
+  /** Emits one `Tasks Completed` event when true. */
+  taskCompleted?: boolean;
   errorMessage?: string;
+  /** Emits `Execution Minutes` with this quantity (skipped when 0 / unset). */
+  executionMinutes?: number;
   metadata?: Record<string, unknown>;
 }
 
-export interface UsageEvent {
-  tenantId: string;
-  productId: string;
-  /** Aforo customer billed for the event (top-level `customerId` on the wire). */
-  customerId: string;
-  /** Product type of the event (default AI_AGENT). */
-  productType: string;
-  eventType: string;
+export interface FlushResult {
+  /** Events the ingestor accepted (including duplicates). */
+  accepted: number;
+  /** Of those, how many it reported as duplicates. */
+  duplicates: number;
+  /** Events permanently dropped during this flush. */
+  failed: number;
+  /** Events still buffered (e.g. kept after a retryable failure). */
+  pending: number;
+}
+
+/**
+ * @deprecated Legacy input for {@link AforoAgent.emitEvent}. `metricKey` is
+ * sent as `metricName`, `value` as `quantity`, `properties` as `metadata`.
+ */
+export interface AgentEventInput {
+  eventType?: string;
   metricKey: string;
   value: number;
-  agentId: string;
+  agentId?: string;
   sessionId: string;
-  /**
-   * Top-level capability name — parity with MCP's toolName. When present, the
-   * usage-ingestor extractor prefers this over metadata.capability_name /
-   * metadata.capabilityName (see ApigeeEventRequest.capabilityName + G11
-   * precedence chain, 2026-07-11). Omitted for non-capability events like
-   * agent_session_start / agent_session_end.
-   */
   capabilityName?: string;
-  properties: Record<string, unknown>;
-  /** Distributed-trace id, when the caller supplied one. */
+  customerId?: string;
+  productType?: string;
   traceId?: string;
-  timestamp: string;
-  /** Stamped at event creation — dedup-safe replay of dropped events. */
-  idempotencyKey: string;
+  properties?: Record<string, unknown>;
 }
 
-/**
- * Input to {@link AforoAgent.emitEvent}: a {@link UsageEvent} without the
- * fields the client stamps. `customerId` and `productType` default to the
- * client's values.
- */
-export type AgentEventInput =
-  Omit<UsageEvent, 'tenantId' | 'productId' | 'timestamp' | 'idempotencyKey' | 'customerId' | 'productType'> & {
-    /** Defaults to the client's {@code customerId}. */
-    customerId?: string;
-    /** Defaults to the client's {@code productType} ({@code AI_AGENT}). */
-    productType?: string;
-  };
-
-const DEFAULT_INGESTOR = 'https://api.aforo.ai/v1/ingest';
+const DEFAULT_ENDPOINT = 'https://api.aforo.ai/v1/ingest/batch';
 const DEFAULT_PRODUCT_TYPE = 'AI_AGENT';
-/** Ingestor field limits (IngestUsageEventRequest / ApigeeEventRequest @Size). */
-const MAX_AGENT_ID = 36;
-const MAX_CUSTOMER_ID = 64;
-const MAX_SESSION_ID = 64;
-const MAX_CAPABILITY_NAME = 64;
-const MAX_METRIC_NAME = 255;
-const MAX_PRODUCT_TYPE = 20;
+const MAX_BATCH = 1000;
+const MAX_RETRY_AFTER_MS = 30_000;
+/** IngestUsageEventRequest @Size limits. */
+const LIMITS = {
+  customerId: 64,
+  metricName: 255,
+  agentId: 36,
+  sessionId: 64,
+  traceId: 128,
+  subscriptionId: 64,
+  capabilityName: 64,
+  parentStepId: 64,
+  productType: 20,
+} as const;
 
-function normalizeProductType(value: unknown): string | undefined {
-  if (typeof value !== 'string') return undefined;
-  const trimmed = value.trim();
-  return trimmed ? trimmed.toUpperCase() : undefined;
-}
-
-/** Shorten an offending value for a log line. */
 function clip(value: unknown): string {
   return String(value).slice(0, 80);
-}
-
-/**
- * `<base>/events`. Accepts the base (`…/v1/ingest`), a bare host
- * (`https://api.aforo.ai` → `/v1/ingest` is added) and, for callers who pass
- * a full endpoint, `…/v1/ingest/events` or `…/v1/ingest/batch`.
- */
-function eventsUrl(ingestorUrl: string | undefined): string {
-  let base = (ingestorUrl || DEFAULT_INGESTOR).replace(/\/+$/, '').replace(/\/(events|batch)$/, '');
-  if (/^[a-z][a-z0-9+.-]*:\/\/[^/]+$/i.test(base)) base += '/v1/ingest';
-  return base + '/events';
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** First reason the ingestor would reject this event, or null. */
-function describeInvalidEvent(ev: UsageEvent): string | null {
-  const blank = (v: unknown) => typeof v !== 'string' || !v.trim();
-  if (blank(ev.customerId)) {
-    return 'customerId is required (config.customerId, startSession({ customerId }) or emitEvent({ customerId }))';
-  }
-  if (ev.customerId.length > MAX_CUSTOMER_ID) return `customerId "${clip(ev.customerId)}" exceeds ${MAX_CUSTOMER_ID} chars`;
-  if (blank(ev.metricKey)) return `metricKey is required (got "${clip(ev.metricKey)}")`;
-  if (ev.metricKey.length > MAX_METRIC_NAME) return `metricKey "${clip(ev.metricKey)}" exceeds ${MAX_METRIC_NAME} chars`;
-  if (blank(ev.agentId)) return `agentId is required (got "${clip(ev.agentId)}")`;
-  if (ev.agentId.length > MAX_AGENT_ID) return `agentId "${clip(ev.agentId)}" exceeds ${MAX_AGENT_ID} chars`;
-  if (blank(ev.sessionId)) return `sessionId is required (got "${clip(ev.sessionId)}")`;
-  if (ev.sessionId.length > MAX_SESSION_ID) return `sessionId "${clip(ev.sessionId)}" exceeds ${MAX_SESSION_ID} chars`;
-  if (typeof ev.value !== 'number' || !Number.isFinite(ev.value) || ev.value <= 0) {
-    return `value must be a number > 0 (got "${clip(ev.value)}")`;
-  }
-  if (typeof ev.capabilityName === 'string' && ev.capabilityName.length > MAX_CAPABILITY_NAME) {
-    return `capabilityName "${clip(ev.capabilityName)}" exceeds ${MAX_CAPABILITY_NAME} chars`;
-  }
-  if (ev.productType.length > MAX_PRODUCT_TYPE) return `productType "${clip(ev.productType)}" exceeds ${MAX_PRODUCT_TYPE} chars`;
-  return null;
+function cryptoObj(): { randomUUID?: () => string; getRandomValues?: (a: Uint8Array) => Uint8Array } | undefined {
+  return (globalThis as any).crypto;
 }
 
-/** Best-effort server explanation for a rejected request. */
-async function readErrorMessage(res: { json?: () => Promise<unknown> }): Promise<string | undefined> {
+function randomHex(bytes: number): string {
+  const arr = new Uint8Array(bytes);
+  const c = cryptoObj();
+  if (c && typeof c.getRandomValues === 'function') c.getRandomValues(arr);
+  else for (let i = 0; i < bytes; i++) arr[i] = Math.floor(Math.random() * 256);
+  return Array.from(arr, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function genSessionId(): string {
+  const c = cryptoObj();
+  if (c && typeof c.randomUUID === 'function') return c.randomUUID();
+  const h = randomHex(16);
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+/** Resolve the batch URL from `endpoint` (or the deprecated `ingestorUrl`). */
+export function resolveEndpoint(url?: string): string {
+  let u = (url || DEFAULT_ENDPOINT).trim().replace(/\/+$/, '');
+  if (/\/ingest\/batch$/.test(u)) return u;
+  u = u.replace(/\/ingest\/events$/, '/ingest');
+  if (/\/ingest$/.test(u)) return u + '/batch';
+  if (/^[a-z][a-z0-9+.-]*:\/\/[^/]+$/i.test(u)) return u + '/v1/ingest/batch';
+  return u;
+}
+
+function normalizeProductType(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const t = value.trim();
+  return t ? t.toUpperCase() : undefined;
+}
+
+function unwrapEnvelope(body: any): any {
+  const data = body && typeof body === 'object' && !Array.isArray(body) ? body.data : undefined;
+  return data && typeof data === 'object' && !Array.isArray(data) ? data : body;
+}
+
+async function readJson(res: any): Promise<any> {
   try {
-    if (typeof res.json !== 'function') return undefined;
-    const body = (await res.json()) as Record<string, any> | undefined;
-    if (!body || typeof body !== 'object') return undefined;
-    const first = Array.isArray(body.errors) ? body.errors[0] : undefined;
-    const text = first?.message ?? body.detail ?? body.message ?? body.error ?? body.title;
-    return typeof text === 'string' && text ? text.slice(0, 500) : undefined;
+    if (typeof res?.text === 'function') {
+      const text = await res.text();
+      return text ? JSON.parse(text) : undefined;
+    }
+    if (typeof res?.json === 'function') return await res.json();
   } catch {
-    return undefined;
+    // empty / non-JSON body
   }
+  return undefined;
 }
+
+function errorMessageOf(body: any): string | undefined {
+  if (!body || typeof body !== 'object') return undefined;
+  const inner = unwrapEnvelope(body);
+  const first = Array.isArray(inner?.errors) ? inner.errors[0] : Array.isArray(body.errors) ? body.errors[0] : undefined;
+  const text = first?.message ?? body.detail ?? body.message ?? body.error ?? body.title;
+  return typeof text === 'string' && text ? text.slice(0, 500) : undefined;
+}
+
+type SendOutcome =
+  | { kind: 'ok'; status: number; duplicates: number; failed: number; errors: Array<{ index: number; message: string }> }
+  | { kind: 'retryable'; status?: number; detail: string }
+  | { kind: 'rejected'; status: number; detail: string };
 
 /**
- * Generate a UUID v4 without depending on Node's crypto module so the SDK
- * works in browser-bundled / edge-runtime contexts too. Not crypto-grade —
- * the session id is observable in metering events anyway.
- */
-function genId(): string {
-  return 'sess_' + Math.random().toString(36).substring(2, 10)
-      + Date.now().toString(36);
-}
-
-/** Random idempotency key stamped at event creation (dedup opt-out). */
-function genKey(): string {
-  const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
-  if (c && typeof c.randomUUID === 'function') return 'agent:' + c.randomUUID();
-  // Fallback for Node <18 with an injected fetchImpl: two random draws +
-  // time — collision-safe enough for a dedup-opt-out key.
-  return 'agent:' + Math.random().toString(36).slice(2, 12)
-      + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-}
-
-/**
- * Map an internal event to the Apigee-format shape `/v1/ingest/events`
- * accepts. customerId is top-level (the endpoint requires it). The endpoint
- * derives the product type from eventType (`agent_*` / `token_usage` →
- * AI_AGENT); productType is still sent, top-level and in properties, so it is
- * on record. agentId/sessionId/productId ride in properties (the server maps
- * properties → metadata).
- *
- * G11 (2026-07-11): capabilityName is emitted BOTH as a top-level field
- * (matches the server's ApigeeEventRequest.capabilityName so it survives the
- * mapper into IngestUsageEventRequest.capabilityName) AND left inside
- * properties for backward compat with older servers that only read metadata.
- * The server's extractor precedence chain (top-level wins) resolves any
- * conflict deterministically.
- */
-function toApigeeEvent(ev: UsageEvent): Record<string, unknown> {
-  const payload: Record<string, unknown> = {
-    eventType: ev.eventType,
-    metricKey: ev.metricKey,
-    value: ev.value,
-    customerId: ev.customerId,
-    productType: ev.productType,
-    timestamp: ev.timestamp,
-    idempotencyKey: ev.idempotencyKey,
-    properties: {
-      ...ev.properties,
-      agentId: ev.agentId,
-      sessionId: ev.sessionId,
-      productId: ev.productId,
-      productType: ev.productType,
-      ...(ev.traceId ? { traceId: ev.traceId } : {}),
-    },
-  };
-  if (ev.capabilityName && ev.capabilityName.trim().length > 0) {
-    payload.capabilityName = ev.capabilityName;
-  }
-  return payload;
-}
-
-/**
- * Per-run handle returned by {@link AforoAgent.startSession}. Exposes
- * {@link recordStep} and {@link recordToolCall} which are session-scoped
- * (auto-attach sessionId + agentId to the event), and {@link end} which
- * forces a final flush.
+ * Per-run handle returned by {@link AforoAgent.startSession}. Every event it
+ * emits carries the session's agentId, sessionId, traceId, customerId and a
+ * deterministic idempotency key `<sessionId>:<n>`.
  */
 export class AgentSession {
-  private stepCount = 0;
+  readonly startedAt = Date.now();
+  private seq = 0;
+  private steps = 0;
+  private ended = false;
 
+  /** @internal — use {@link AforoAgent.startSession}. */
   constructor(
-      private readonly client: AforoAgent,
-      readonly agentId: string,
-      readonly sessionId: string,
-      private readonly meta: Record<string, unknown>,
-      readonly customerId?: string,
-      readonly traceId?: string,
-      readonly productType?: string,
+    private readonly client: AforoAgent,
+    readonly agentId: string,
+    readonly sessionId: string,
+    readonly traceId: string,
+    readonly customerId: string,
+    readonly subscriptionId: string | undefined,
+    readonly productType: string,
+    readonly modelProvider: string | undefined,
+    readonly modelName: string | undefined,
+    private readonly meta: Record<string, unknown>,
   ) {}
 
+  /** Number of steps recorded so far. */
+  get stepCount(): number {
+    return this.steps;
+  }
+
+  /** True after {@link end} / {@link endSession}. */
+  get isEnded(): boolean {
+    return this.ended;
+  }
+
+  /** @internal */
+  nextIdempotencyKey(): string {
+    this.seq += 1;
+    return `${this.sessionId}:${this.seq}`;
+  }
+
   /**
-   * Record a single step in the agent's reasoning loop. Each step counts
-   * toward the {@code agent_step} metric on the AI_AGENT product type.
+   * One reasoning step → `Agent Steps` (1). A `TOOL_CALL` step also emits
+   * `Agent Tool Calls` (1); tokens on the step emit `Tokens Consumed`.
    */
-  async recordStep(options: RecordStepOptions): Promise<void> {
-    this.stepCount += 1;
-    await this.client.emitEvent({
-      eventType: 'agent_step',
-      metricKey: 'step_count',
-      value: 1,
-      agentId: this.agentId,
-      sessionId: this.sessionId,
-      // G11 (2026-07-11): top-level capabilityName for per-capability billing parity
-      // with MCP's toolName. Kept in properties too for backward-compat with servers
-      // that only read the metadata path.
+  async recordStep(options: RecordStepOptions = {}): Promise<void> {
+    this.steps += 1;
+    const stepNumber = this.steps;
+    const status = this.client.normalizeStatus(options.executionStatus);
+    const common = {
       capabilityName: options.capabilityName,
-      customerId: this.customerId,
-      traceId: this.traceId,
-      productType: this.productType,
-      properties: {
-        stepKind: options.stepKind,
-        stepIndex: this.stepCount,
-        capabilityName: options.capabilityName,
-        inputTokens: options.inputTokens || 0,
-        outputTokens: options.outputTokens || 0,
-        durationMs: options.durationMs,
-        parentStepId: options.parentStepId,
-        ...this.meta,
-        ...(options.metadata || {}),
-        // Last, so a metadata key of the same name can't override it.
-        executionStatus: normalizeExecutionStatus(options.executionStatus),
-      },
-    });
+      executionStatus: status,
+      durationMs: options.durationMs,
+      stepNumber,
+      parentStepId: options.parentStepId,
+    };
+    const meta = { ...(options.stepKind ? { stepKind: options.stepKind } : {}), ...(options.metadata || {}) };
+    this.client.enqueue(this, this.client.metricNames.steps, 1, { ...common, metadata: meta });
+    if (options.stepKind === 'TOOL_CALL') {
+      this.client.enqueue(this, this.client.metricNames.toolCalls, 1, { ...common, metadata: meta });
+    }
     if (options.inputTokens || options.outputTokens) {
-      await this.client.emitEvent({
-        eventType: 'token_usage',
-        metricKey: 'tokens_total',
-        value: (options.inputTokens || 0) + (options.outputTokens || 0),
-        agentId: this.agentId,
-        sessionId: this.sessionId,
-        customerId: this.customerId,
-        traceId: this.traceId,
-        productType: this.productType,
-        properties: {
-          inputTokens: options.inputTokens || 0,
-          outputTokens: options.outputTokens || 0,
-          stepIndex: this.stepCount,
-          ...this.meta,
-        },
+      this.client.enqueue(this, this.client.metricNames.tokens, (options.inputTokens || 0) + (options.outputTokens || 0), {
+        capabilityName: options.capabilityName,
+        stepNumber,
+        metadata: this.tokenMeta(options.modelName, options.inputTokens, options.outputTokens, undefined, options.metadata),
       });
     }
+    await this.client.maybeFlush();
+  }
+
+  /** A tool call: same as `recordStep({ stepKind: 'TOOL_CALL', capabilityName: toolName, ... })`. */
+  async recordToolCall(
+    toolName: string,
+    options: Omit<RecordStepOptions, 'stepKind' | 'capabilityName'> = {},
+  ): Promise<void> {
+    return this.recordStep({ ...options, stepKind: 'TOOL_CALL', capabilityName: toolName });
+  }
+
+  /** `Tokens Consumed` = input + output (skipped when both are 0). */
+  async recordTokens(
+    model: string | undefined,
+    inputTokens: number,
+    outputTokens: number,
+    options: RecordTokensOptions = {},
+  ): Promise<void> {
+    this.client.enqueue(this, this.client.metricNames.tokens, (inputTokens || 0) + (outputTokens || 0), {
+      capabilityName: options.capabilityName,
+      metadata: this.tokenMeta(model, inputTokens, outputTokens, options.provider, options.metadata),
+    });
+    await this.client.maybeFlush();
   }
 
   /**
-   * Convenience for the common case where the step IS a tool call —
-   * stamps the step kind and ensures capabilityName is present.
+   * Any other metric, e.g. `recordUsage('knowledgeQueries', 1)` or
+   * `recordUsage('gpuHours', 0.25)`. `metric` is a key of {@link MetricNames}
+   * or a literal catalog metric name. Zero quantities are skipped.
    */
-  async recordToolCall(toolName: string, options: Omit<RecordStepOptions, 'stepKind' | 'capabilityName'> = {}): Promise<void> {
-    return this.recordStep({
-      ...options,
-      stepKind: 'TOOL_CALL',
-      capabilityName: toolName,
+  async recordUsage(metric: keyof MetricNames | string, quantity: number, options: RecordUsageOptions = {}): Promise<void> {
+    const names = this.client.metricNames as unknown as Record<string, string>;
+    const metricName = Object.prototype.hasOwnProperty.call(names, metric) ? names[metric] : metric;
+    this.client.enqueue(this, metricName, quantity, {
+      capabilityName: options.capabilityName,
+      executionStatus: options.executionStatus === undefined ? undefined : this.client.normalizeStatus(options.executionStatus),
+      durationMs: options.durationMs,
+      metadata: options.metadata || {},
     });
+    await this.client.maybeFlush();
   }
 
   /**
-   * End the session. Emits a final {@code agent_session_end} event with the
-   * step count and task outcome, then forces a buffer flush so the metrics
-   * land in Aforo's analytics tier before the agent process exits.
+   * Close the session: `Tasks Completed` (if `taskCompleted`), `Execution
+   * Minutes` (if given), then `Agent Sessions` (1) carrying
+   * `sessionBoundary: SESSION_END`; then flushes. Calling it twice is a no-op.
    */
-  async end(options: EndSessionOptions): Promise<void> {
-    await this.client.emitEvent({
-      eventType: 'agent_session_end',
-      metricKey: 'session_completed',
-      value: 1,
-      agentId: this.agentId,
-      sessionId: this.sessionId,
-      customerId: this.customerId,
-      traceId: this.traceId,
-      productType: this.productType,
-      properties: {
-        stepCount: this.stepCount,
-        taskCompleted: options.taskCompleted,
-        errorMessage: options.errorMessage,
-        ...this.meta,
-        ...(options.metadata || {}),
-      },
+  async end(options: EndSessionOptions = {}): Promise<FlushResult> {
+    if (this.ended) return this.client.flush();
+    this.ended = true;
+    const meta = {
+      stepCount: this.steps,
+      ...(options.taskCompleted !== undefined ? { taskCompleted: options.taskCompleted } : {}),
+      ...(options.errorMessage ? { errorMessage: String(options.errorMessage).slice(0, 500) } : {}),
+      ...(options.metadata || {}),
+    };
+    if (options.taskCompleted) {
+      this.client.enqueue(this, this.client.metricNames.tasksCompleted, 1, { metadata: meta });
+    }
+    if (options.executionMinutes) {
+      this.client.enqueue(this, this.client.metricNames.executionMinutes, options.executionMinutes, { metadata: meta });
+    }
+    this.client.enqueue(this, this.client.metricNames.sessions, 1, {
+      executionStatus: options.taskCompleted === false ? 'FAILED' : 'SUCCESS',
+      durationMs: Date.now() - this.startedAt,
+      sessionBoundary: 'SESSION_END',
+      metadata: meta,
     });
-    await this.client.flush();
+    return this.client.flush();
+  }
+
+  /** Alias of {@link end}. */
+  endSession(options: EndSessionOptions = {}): Promise<FlushResult> {
+    return this.end(options);
+  }
+
+  /** @internal */
+  baseMetadata(): Record<string, unknown> {
+    return this.meta;
+  }
+
+  private tokenMeta(
+    model: string | undefined,
+    input: number | undefined,
+    output: number | undefined,
+    provider: string | undefined,
+    extra: Record<string, unknown> | undefined,
+  ): Record<string, unknown> {
+    const out: Record<string, unknown> = { ...(extra || {}) };
+    const p = provider || this.modelProvider;
+    const m = model || this.modelName;
+    if (p) out.model_provider = p;
+    if (m) out.model_name = m;
+    out.input_tokens = input || 0;
+    out.output_tokens = output || 0;
+    return out;
   }
 }
 
+interface EnqueueExtras {
+  capabilityName?: string;
+  executionStatus?: ExecutionStatus;
+  durationMs?: number;
+  stepNumber?: number;
+  parentStepId?: string;
+  sessionBoundary?: 'SESSION_END';
+  metadata: Record<string, unknown>;
+}
+
 /**
- * Top-level SDK client. Holds buffered events and flushes them in batches.
- * One instance per process is enough — sessions share the same flush queue.
+ * Top-level client. Buffers events (bounded) and flushes them in batches of
+ * ≤ `maxBatchSize` to `/v1/ingest/batch`. Never throws from record/flush
+ * calls; problems go to `onError` (or the logger).
  */
 export class AforoAgent {
-  private readonly buffer: UsageEvent[] = [];
-  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  readonly metricNames: Readonly<MetricNames>;
+  readonly endpoint: string;
+  private readonly buffer: IngestEvent[] = [];
   private readonly fetchImpl: typeof fetch;
-  private dropped = 0;
-  private invalidDrops = 0;
   private readonly productType: string;
+  private readonly maxBatchSize: number;
+  private readonly maxBufferSize: number;
+  private readonly logger: AforoLogger | null;
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private flushing: Promise<FlushResult> | null = null;
+  private dropped = 0;
+  private invalidCount = 0;
 
   constructor(private readonly config: AforoAgentConfig) {
-    if (!config.tenantId) throw new Error('AforoAgent: tenantId is required');
-    if (!config.productId) throw new Error('AforoAgent: productId is required');
-    if (!config.apiKey) throw new Error('AforoAgent: apiKey is required');
-    this.fetchImpl = config.fetchImpl
-        || (typeof fetch !== 'undefined' ? fetch : null as unknown as typeof fetch);
-    if (!this.fetchImpl) {
-      throw new Error('AforoAgent: no fetch available — pass fetchImpl in config (Node <18)');
-    }
+    if (!config || !config.apiKey) throw new Error('AforoAgent: apiKey is required');
+    const f = config.fetchImpl || (typeof fetch !== 'undefined' ? fetch : undefined);
+    if (!f) throw new Error('AforoAgent: no fetch available — pass fetchImpl in config (Node < 18)');
+    this.fetchImpl = f;
+    this.endpoint = resolveEndpoint(config.endpoint || config.ingestorUrl);
     this.productType = normalizeProductType(config.productType) ?? DEFAULT_PRODUCT_TYPE;
-  }
-
-  /** Open a new session. Returns a session handle for emitting per-step events. */
-  async startSession(options: StartSessionOptions): Promise<AgentSession> {
-    const sessionId = options.sessionId || genId();
-    // Missing / invalid ids do not throw here: every event of the session is
-    // then dropped with reason 'invalid' (counted, WARN-logged, onDrop).
-    const customerId = options.customerId || this.config.customerId;
-    const agentId = typeof options.agentId === 'string' ? options.agentId.trim() : options.agentId;
-    const productType = normalizeProductType(options.productType);
-    const traceId = options.traceId;
-    const meta: Record<string, unknown> = {
-      framework: options.framework || 'CUSTOM',
-      modelProvider: options.modelProvider,
-      modelName: options.modelName,
-      ...(options.metadata || {}),
-    };
-    await this.emitEvent({
-      eventType: 'agent_session_start',
-      metricKey: 'session_count',
-      value: 1,
-      agentId,
-      sessionId,
-      customerId,
-      traceId,
-      productType,
-      properties: { ...meta },
-    });
-    return new AgentSession(this, agentId, sessionId, meta, customerId, traceId, productType);
+    this.metricNames = Object.freeze({ ...DEFAULT_METRIC_NAMES, ...(config.metricNames || {}) });
+    const batch = config.maxBatchSize ?? config.flushBatchSize ?? 100;
+    this.maxBatchSize = Math.min(MAX_BATCH, Math.max(1, Math.floor(batch)));
+    this.maxBufferSize = Math.max(this.maxBatchSize, Math.floor(config.maxBufferSize ?? 10_000));
+    this.logger = config.logger === undefined ? console : config.logger;
   }
 
   /**
-   * Lower-level emit. Public so the SDK's internal AgentSession can call it,
-   * but stable enough to be used directly when an agent framework already
-   * has its own lifecycle hooks and just wants to plug in a metering tap.
-   *
-   * Never throws for event content. An event the ingestor would reject --
-   * no customerId (config or per session / event), blank metricKey, blank
-   * agentId or sessionId, a value that is not > 0, or customerId over 64
-   * chars, agentId over 36, sessionId over 64, capabilityName over 64,
-   * metricKey over 255, productType over 20 -- is not buffered or sent. It is
-   * counted in {@code droppedCount}, WARN-logged and passed to {@code onDrop}
-   * with reason {@code 'invalid'}. Nothing is truncated.
+   * Open a session. Synchronous (no network); the returned handle is also
+   * safe to `await` for code written against the 1.x async signature.
+   */
+  startSession(options: StartSessionOptions = {}): AgentSession {
+    const agentId = (options.agentId ?? this.config.agentId ?? '').trim();
+    const customerId = (options.customerId ?? this.config.customerId ?? '').trim();
+    const meta: Record<string, unknown> = {
+      ...(options.framework ? { framework: options.framework } : {}),
+      ...(this.config.productId ? { productId: this.config.productId } : {}),
+      ...(options.metadata || {}),
+    };
+    return new AgentSession(
+      this,
+      agentId,
+      options.sessionId || genSessionId(),
+      options.traceId || randomHex(16),
+      customerId,
+      options.subscriptionId ?? this.config.subscriptionId,
+      normalizeProductType(options.productType) ?? this.productType,
+      options.modelProvider,
+      options.modelName,
+      meta,
+    );
+  }
+
+  /**
+   * @deprecated Use session methods ({@link AgentSession.recordUsage}). Kept
+   * for 1.x callers: `metricKey` → `metricName`, `value` → `quantity`,
+   * `properties` → `metadata`; idempotency key is random.
    */
   async emitEvent(partial: AgentEventInput): Promise<void> {
-    const customerId = partial.customerId || this.config.customerId;
-    const event: UsageEvent = {
-      tenantId: this.config.tenantId,
-      productId: this.config.productId,
-      timestamp: new Date().toISOString(),
-      // Random key stamped at creation (dedup opt-out semantics): the
-      // ingestor requires one, and dropped events handed to onDrop stay
-      // replayable without double-billing a successfully-sent sibling.
-      // Never regenerated: every retry of this event re-sends this key.
-      idempotencyKey: genKey(),
-      ...partial,
-      customerId: typeof customerId === 'string' ? customerId.trim() : (customerId as unknown as string),
+    if (partial.value === 0) return;
+    const event: IngestEvent = {
+      customerId: String(partial.customerId ?? this.config.customerId ?? '').trim(),
+      metricName: partial.metricKey,
+      quantity: partial.value,
+      occurredAt: new Date().toISOString(),
+      idempotencyKey: `${partial.sessionId}:${randomHex(8)}`,
       productType: normalizeProductType(partial.productType) ?? this.productType,
+      agentId: String(partial.agentId ?? this.config.agentId ?? '').trim(),
+      sessionId: partial.sessionId,
+      ...(partial.traceId ? { traceId: partial.traceId } : {}),
+      ...(this.config.subscriptionId ? { subscriptionId: this.config.subscriptionId } : {}),
+      ...(partial.capabilityName && partial.capabilityName.trim() ? { capabilityName: partial.capabilityName } : {}),
+      metadata: {
+        ...(this.config.productId ? { productId: this.config.productId } : {}),
+        ...(partial.eventType ? { eventType: partial.eventType } : {}),
+        ...(partial.properties || {}),
+      },
     };
+    this.push(event);
+    await this.maybeFlush();
+  }
 
-    const violation = describeInvalidEvent(event);
-    if (violation) {
-      this.recordDrop([event], 'invalid', `event ${clip(event.eventType)} is invalid: ${violation}`);
-      return;
-    }
+  /** @internal Build, validate and buffer one event for a session. */
+  enqueue(session: AgentSession, metricName: string, quantity: number, extras: EnqueueExtras): void {
+    if (quantity === 0) return; // zero usage is not an event
+    const event: IngestEvent = {
+      customerId: session.customerId,
+      metricName,
+      quantity,
+      occurredAt: new Date().toISOString(),
+      idempotencyKey: session.nextIdempotencyKey(),
+      productType: session.productType,
+      agentId: session.agentId,
+      sessionId: session.sessionId,
+      traceId: session.traceId,
+      ...(session.subscriptionId ? { subscriptionId: session.subscriptionId } : {}),
+      ...(extras.capabilityName && extras.capabilityName.trim() ? { capabilityName: extras.capabilityName.trim() } : {}),
+      ...(extras.executionStatus ? { executionStatus: extras.executionStatus } : {}),
+      ...(typeof extras.durationMs === 'number' && Number.isFinite(extras.durationMs) && extras.durationMs >= 0
+        ? { executionDurationMs: Math.round(extras.durationMs) }
+        : {}),
+      ...(extras.stepNumber !== undefined ? { stepNumber: extras.stepNumber } : {}),
+      ...(extras.parentStepId ? { parentStepId: extras.parentStepId } : {}),
+      ...(extras.sessionBoundary ? { sessionBoundary: extras.sessionBoundary } : {}),
+      metadata: { ...session.baseMetadata(), ...extras.metadata },
+    };
+    this.push(event);
+  }
 
-    this.buffer.push(event);
-    if (this.buffer.length >= (this.config.flushBatchSize || 50)) {
-      await this.flush();
-    } else {
+  /** @internal Trim/upper-case a status; blank → SUCCESS; unknown → dropped with a warning. */
+  normalizeStatus(value: unknown): ExecutionStatus | undefined {
+    if (value === undefined || value === null) return 'SUCCESS';
+    const s = String(value).trim().toUpperCase();
+    if (!s) return 'SUCCESS';
+    if ((EXECUTION_STATUSES as readonly string[]).includes(s)) return s as ExecutionStatus;
+    this.logger?.warn(`[aforo-agent] "${clip(value)}" is not an execution status; leaving it off the event`);
+    return undefined;
+  }
+
+  /** @internal Flush in the background once a full batch is buffered; otherwise arm the timer. */
+  async maybeFlush(): Promise<void> {
+    if (this.buffer.length >= this.maxBatchSize) {
+      if (!this.flushing) void this.flush();
+    } else if (this.buffer.length > 0) {
       this.scheduleFlush();
     }
   }
 
   /**
-   * Force a flush of the buffered events. Called automatically by
-   * {@link AgentSession.end}; call manually if your agent process is about
-   * to exit and you want to guarantee delivery.
-   *
-   * Events are sent to {@code <ingestorUrl>/events} — the Apigee-format
-   * endpoint that takes ONE event per request — so the batch fans out
-   * concurrently. Each event is retried on 408/429/5xx/network failure
-   * (honouring a 429's Retry-After) up to {@code maxRetries} attempts, always
-   * with the same body and idempotency key; other 4xx are never retried.
-   *
-   * An event that still fails is counted, logged and handed to the opt-in
-   * onDrop hook: 'rejected' for a non-retryable 4xx, 'retry_exhausted'
-   * otherwise. For mission-critical billing, prefer the gateway-plugin path;
-   * SDK direct-emit is for first-party customers running their own
-   * infrastructure.
+   * Send everything buffered. Resolves (never rejects) once the buffer is
+   * drained or a retryable failure stops the pass — in that case the unsent
+   * events stay buffered for the next flush and `onError` gets `retrying`.
    */
-  async flush(): Promise<void> {
+  async flush(): Promise<FlushResult> {
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
-    if (this.buffer.length === 0) return;
-    const batch = this.buffer.splice(0, this.buffer.length);
-    const url = eventsUrl(this.config.ingestorUrl);
-
-    const results = await Promise.all(batch.map((ev) => this.send(url, ev)));
-
-    // Partition failures by drop reason: terminal 4xx → rejected,
-    // network error / 5xx / 408 / 429 after all attempts → retry_exhausted.
-    const rejected: UsageEvent[] = [];
-    const failed: UsageEvent[] = [];
-    let rejectedDetail = '';
-    let failedDetail = '';
-    results.forEach((r, i) => {
-      if (r.ok) return;
-      if (r.reason === 'rejected') {
-        rejected.push(batch[i]);
-        rejectedDetail = r.detail;
-      } else {
-        failed.push(batch[i]);
-        failedDetail = r.detail;
-      }
-    });
-    if (rejected.length > 0) this.recordDrop(rejected, 'rejected', rejectedDetail);
-    if (failed.length > 0) this.recordDrop(failed, 'retry_exhausted', failedDetail);
-  }
-
-  /** POST one event, retrying transient failures. Never throws. */
-  private async send(url: string, ev: UsageEvent): Promise<{ ok: true } | { ok: false; reason: DropReason; detail: string }> {
-    // Serialised once, so every retry re-sends the same idempotency key.
-    const body = JSON.stringify(toApigeeEvent(ev));
-    const maxAttempts = Math.max(1, this.config.maxRetries ?? 3);
-    const baseDelay = this.config.retryBaseDelayMs ?? 1000;
-    let detail = 'flush failed';
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      let delayMs = baseDelay * Math.pow(2, attempt - 1);
-      try {
-        const res = await this.fetchImpl(url, {
-          method: 'POST',
-          headers: {
-            'X-API-Key': this.config.apiKey,
-            'Content-Type': 'application/json',
-            'X-Tenant-Id': this.config.tenantId,
-          },
-          body,
-        });
-        if (res.ok) return { ok: true };
-        const message = await readErrorMessage(res);
-        detail = `ingestor returned ${res.status}${message ? ` (${message})` : ''}`;
-        const retryable = res.status === 408 || res.status === 429 || res.status >= 500;
-        if (!retryable) return { ok: false, reason: 'rejected', detail };
-        if (res.status === 429) {
-          const retryAfter = res.headers && typeof res.headers.get === 'function' ? res.headers.get('Retry-After') : null;
-          const seconds = retryAfter ? parseInt(retryAfter, 10) : NaN;
-          if (!isNaN(seconds) && seconds >= 0) delayMs = seconds * 1000;
-        }
-      } catch (e) {
-        detail = `flush failed: ${e}`;
-      }
-      if (attempt < maxAttempts) await sleep(delayMs);
+    while (this.flushing) await this.flushing;
+    const run = this.drain();
+    this.flushing = run;
+    try {
+      return await run;
+    } finally {
+      this.flushing = null;
+      if (this.buffer.length > 0) this.scheduleFlush();
     }
-    return { ok: false, reason: 'retry_exhausted', detail };
   }
 
-  /** Number of events permanently dropped since this instance was created. */
+  /** Flush and stop the timer. Call before the process exits. */
+  async shutdown(): Promise<FlushResult> {
+    const result = await this.flush();
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    return result;
+  }
+
+  /** Events permanently dropped since this client was created. */
   get droppedCount(): number {
     return this.dropped;
   }
 
-  /**
-   * Account for permanently lost events: bump the counter, WARN-log, and
-   * invoke the opt-in onDrop hook. The buffer is drained at flush start, so
-   * send drops are bounded by flush cadence; 'invalid' WARNs are throttled
-   * (first, then every 1000th) so a tight loop of bad events can't storm the log.
-   */
-  private recordDrop(events: UsageEvent[], reason: DropReason, detail: string): void {
-    this.dropped += events.length;
-    let log = true;
-    if (reason === 'invalid') {
-      this.invalidDrops += events.length;
-      log = this.invalidDrops === 1 || this.invalidDrops % 1000 === 0;
+  /** Events currently buffered (not yet accepted by the ingestor). */
+  get pendingCount(): number {
+    return this.buffer.length;
+  }
+
+  private push(event: IngestEvent): void {
+    const problem = describeInvalidEvent(event);
+    if (problem) {
+      this.invalidCount += 1;
+      // Throttle the log (first, then every 1000th); onError sees every one.
+      const quiet = !this.config.onError && this.invalidCount !== 1 && this.invalidCount % 1000 !== 0;
+      this.report({ kind: 'invalid', message: `event "${clip(event.metricName)}" is invalid: ${problem}`, events: [event], willRetry: false }, quiet);
+      return;
     }
-    if (log) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        `[aforo-agent] ${detail}; dropped ${events.length} events — ${reason} (${this.dropped} total dropped)`,
-      );
+    this.buffer.push(event);
+    this.enforceBound();
+  }
+
+  private enforceBound(): void {
+    const excess = this.buffer.length - this.maxBufferSize;
+    if (excess > 0) {
+      const evicted = this.buffer.splice(0, excess);
+      this.report({
+        kind: 'overflow',
+        message: `buffer full (${this.maxBufferSize}); dropped the ${evicted.length} oldest event(s)`,
+        events: evicted,
+        willRetry: false,
+      });
     }
-    if (this.config.onDrop) {
+  }
+
+  private async drain(): Promise<FlushResult> {
+    const result: FlushResult = { accepted: 0, duplicates: 0, failed: 0, pending: 0 };
+    while (this.buffer.length > 0) {
+      const batch = this.buffer.splice(0, this.maxBatchSize);
+      const outcome = await this.send(batch);
+      if (outcome.kind === 'retryable') {
+        this.buffer.unshift(...batch);
+        this.enforceBound();
+        this.report({
+          kind: 'retrying',
+          message: `ingest failed (${outcome.detail}); keeping ${batch.length} event(s) for the next flush`,
+          ...(outcome.status ? { status: outcome.status } : {}),
+          events: batch,
+          willRetry: true,
+        });
+        break;
+      }
+      if (outcome.kind === 'rejected') {
+        result.failed += batch.length;
+        this.report({ kind: 'rejected', message: `ingest rejected: ${outcome.detail}`, status: outcome.status, events: batch, willRetry: false });
+        continue;
+      }
+      result.duplicates += outcome.duplicates;
+      const failed = Math.min(batch.length, outcome.failed);
+      result.accepted += batch.length - failed;
+      if (failed > 0) {
+        result.failed += failed;
+        const errors = outcome.errors.map((e) => ({ ...e, idempotencyKey: batch[e.index]?.idempotencyKey }));
+        const identified = errors.length === failed;
+        this.report({
+          kind: 'partial',
+          message: `ingestor rejected ${failed} of ${batch.length} event(s)${errors[0] ? `: ${errors[0].message}` : ''}`,
+          status: outcome.status,
+          events: identified ? errors.map((e) => batch[e.index]) : batch,
+          errors,
+          willRetry: false,
+        }, false, failed);
+      }
+    }
+    result.pending = this.buffer.length;
+    return result;
+  }
+
+  /** POST one batch with retries. Never throws. */
+  private async send(batch: IngestEvent[]): Promise<SendOutcome> {
+    const body = JSON.stringify({ events: batch }); // serialised once: retries re-send identical keys
+    const attempts = Math.max(1, Math.floor(this.config.maxRetries ?? 3));
+    const base = this.config.retryBaseDelayMs ?? 500;
+    const timeoutMs = this.config.requestTimeoutMs ?? 10_000;
+    let last: SendOutcome = { kind: 'retryable', detail: 'not sent' };
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      let delay = base * Math.pow(2, attempt - 1);
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : undefined;
+      const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
       try {
-        this.config.onDrop(events, reason);
+        const res = await this.fetchImpl(this.endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-API-Key': this.config.apiKey },
+          body,
+          ...(controller ? { signal: controller.signal } : {}),
+        });
+        const json = await readJson(res);
+        if (res.ok) {
+          const data = unwrapEnvelope(json) || {};
+          const errors: Array<{ index: number; message: string }> = [];
+          const seen = new Set<number>();
+          for (const e of Array.isArray(data.errors) ? data.errors : []) {
+            const index = Number(e?.index);
+            if (!Number.isInteger(index) || index < 0 || index >= batch.length || seen.has(index)) continue;
+            seen.add(index);
+            errors.push({ index, message: String(e?.message ?? 'rejected by the ingestor').slice(0, 500) });
+          }
+          const reported = typeof data.failed === 'number' && data.failed > 0 ? Math.floor(data.failed) : 0;
+          return {
+            kind: 'ok',
+            status: res.status,
+            duplicates: typeof data.duplicates === 'number' ? data.duplicates : 0,
+            failed: Math.max(reported, errors.length),
+            errors,
+          };
+        }
+        const msg = errorMessageOf(json);
+        const detail = `HTTP ${res.status}${msg ? `: ${msg}` : ''}`;
+        if (!(res.status === 408 || res.status === 429 || res.status >= 500)) {
+          return { kind: 'rejected', status: res.status, detail };
+        }
+        last = { kind: 'retryable', status: res.status, detail };
+        if (res.status === 429) {
+          const ra = res.headers && typeof res.headers.get === 'function' ? res.headers.get('Retry-After') : null;
+          const secs = ra ? Number(ra) : NaN;
+          if (Number.isFinite(secs) && secs >= 0) delay = Math.min(MAX_RETRY_AFTER_MS, secs * 1000);
+        }
+      } catch (e) {
+        last = { kind: 'retryable', detail: `network error: ${clip((e as Error)?.message ?? e)}` };
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+      if (attempt < attempts) await sleep(delay);
+    }
+    return last;
+  }
+
+  private report(error: AforoAgentError, quiet = false, droppedOverride?: number): void {
+    if (!error.willRetry) this.dropped += droppedOverride ?? error.events.length;
+    if (this.config.onError) {
+      try {
+        this.config.onError(error);
       } catch {
-        // A hook bug must never break flushing.
+        // a handler bug must never break metering
+      }
+    } else if (!quiet) {
+      this.logger?.warn(`[aforo-agent] ${error.kind}: ${error.message}`);
+    }
+    if (!error.willRetry && this.config.onDrop) {
+      const reason: DropReason = error.kind === 'invalid' ? 'invalid' : error.kind === 'overflow' ? 'overflow' : 'rejected';
+      try {
+        this.config.onDrop(error.events, reason);
+      } catch {
+        // ignore
       }
     }
   }
 
   private scheduleFlush(): void {
-    if (this.flushTimer) return;
-    const interval = this.config.flushIntervalMs || 5000;
+    if (this.flushTimer || this.flushing) return;
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
-      this.flush().catch(() => { /* swallowed in flush() */ });
-    }, interval);
+      void this.flush();
+    }, this.config.flushIntervalMs ?? 5000);
+    // Don't keep the process alive just for metering.
+    (this.flushTimer as any)?.unref?.();
   }
+}
+
+/** First reason the ingestor would reject this event, or null. */
+function describeInvalidEvent(ev: IngestEvent): string | null {
+  const blank = (v: unknown) => typeof v !== 'string' || !v.trim();
+  if (blank(ev.customerId)) return 'customerId is required (config.customerId or startSession({ customerId }))';
+  if (blank(ev.metricName)) return 'metricName is required';
+  if (blank(ev.agentId)) return 'agentId is required for AI_AGENT events (config.agentId or startSession({ agentId }))';
+  if (blank(ev.sessionId)) return 'sessionId is required';
+  if (typeof ev.quantity !== 'number' || !Number.isFinite(ev.quantity) || ev.quantity <= 0) {
+    return `quantity must be a number > 0 (got ${clip(ev.quantity)})`;
+  }
+  for (const [field, max] of Object.entries(LIMITS)) {
+    const v = (ev as unknown as Record<string, unknown>)[field];
+    if (typeof v === 'string' && v.length > max) return `${field} "${clip(v)}" exceeds ${max} chars`;
+  }
+  return null;
 }
 
 export default AforoAgent;
