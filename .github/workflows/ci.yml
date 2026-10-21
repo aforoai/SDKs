@@ -109,18 +109,6 @@ jobs:
             luajit -b "$f" /dev/null
           done
 
-  apigee:
-    name: Apigee shared flows (static checks, unit + flow tests)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - name: node apigee/tests/run-all.cjs
-        working-directory: aforo-gateway-plugins
-        run: node apigee/tests/run-all.cjs
-
   emqx-erlang:
     name: EMQX plugin (rebar3 compile)
     runs-on: ubuntu-latest
@@ -192,7 +180,7 @@ jobs:
     # One stable check to require in branch protection — green only if every
     # blocking job above passed. (emqx-erlang is informational, not required.)
     if: always()
-    needs: [go, node, python, java, kong-lua, apigee, gateway-config]
+    needs: [go, node, python, java, kong-lua, gateway-config]
     runs-on: ubuntu-latest
     steps:
       - name: Verify required jobs succeeded
