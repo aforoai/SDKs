@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Reads the global settings and the matched API product's settings from the
+     organization-scoped KVM aforo-metering-config (AC2). Product keys are
+     <setting>__<apiproduct.name>: Apigee joins the Parameters with "__".
+     Every value lands in private.aforo.* (Apigee X requires private.* for an
+     encrypted KVM, and it keeps api_key out of Debug sessions). aforo-metering
+     reads the same variables later in the transaction; it reads no KVM itself.
+     continueOnError="true": without config the call goes through unmetered
+     and unchecked (fail open). -->
+<KeyValueMapOperations name="AforoAccessReadConfig" mapIdentifier="aforo-metering-config" continueOnError="true">
+    <DisplayName>Aforo Access - Read Config from KVM</DisplayName>
+    <ExpiryTimeInSecs>60</ExpiryTimeInSecs>
+    <Scope>organization</Scope>
+    <!-- Global -->
+    <Get assignTo="private.aforo.endpoint">
+        <Key><Parameter>aforo_endpoint</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo.apiKey">
+        <Key><Parameter>api_key</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo.tenantId">
+        <Key><Parameter>tenant_id</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo.quotaCheckUrl">
+        <Key><Parameter>quota_check_url</Parameter></Key>
+    </Get>
+    <!-- Informational: Apigee takes only literal ServiceCallout timeouts, so
+         AforoQuotaCheck waits 1500 ms whatever this says. -->
+    <Get assignTo="private.aforo.quotaTimeoutMs">
+        <Key><Parameter>quota_timeout_ms</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo.quotaFailOpen">
+        <Key><Parameter>quota_fail_open</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo.quotaCacheTtlMs">
+        <Key><Parameter>quota_cache_ttl_ms</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo.deliveryMode">
+        <Key><Parameter>delivery_mode</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo.maxRetries">
+        <Key><Parameter>max_retries</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo.excludePaths">
+        <Key><Parameter>exclude_paths</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo.excludeStatusCodes">
+        <Key><Parameter>exclude_status_codes</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo.includeMetadata">
+        <Key><Parameter>include_metadata</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo.quantitySource">
+        <Key><Parameter>quantity_source</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo.jwtValidationEnabled">
+        <Key><Parameter>jwt_validation_enabled</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo.jwksUri">
+        <Key><Parameter>aforo_jwks_uri</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo.jwtIssuer">
+        <Key><Parameter>aforo_jwt_issuer</Parameter></Key>
+    </Get>
+    <!-- Per API product -->
+    <Get assignTo="private.aforo.product.type">
+        <Key><Parameter>product_type</Parameter><Parameter ref="verifyapikey.AforoVerifyApiKey.apiproduct.name"/></Key>
+    </Get>
+    <Get assignTo="private.aforo.product.defaultMetric">
+        <Key><Parameter>default_metric</Parameter><Parameter ref="verifyapikey.AforoVerifyApiKey.apiproduct.name"/></Key>
+    </Get>
+    <Get assignTo="private.aforo.product.metricMappings">
+        <Key><Parameter>metric_mappings</Parameter><Parameter ref="verifyapikey.AforoVerifyApiKey.apiproduct.name"/></Key>
+    </Get>
+    <Get assignTo="private.aforo.product.agentId">
+        <Key><Parameter>agent_id</Parameter><Parameter ref="verifyapikey.AforoVerifyApiKey.apiproduct.name"/></Key>
+    </Get>
+    <Get assignTo="private.aforo.product.quantityHeader">
+        <Key><Parameter>quantity_header</Parameter><Parameter ref="verifyapikey.AforoVerifyApiKey.apiproduct.name"/></Key>
+    </Get>
+    <Get assignTo="private.aforo.product.traceIdHeader">
+        <Key><Parameter>trace_id_header</Parameter><Parameter ref="verifyapikey.AforoVerifyApiKey.apiproduct.name"/></Key>
+    </Get>
+    <Get assignTo="private.aforo.product.enforceQuota">
+        <Key><Parameter>enforce_quota</Parameter><Parameter ref="verifyapikey.AforoVerifyApiKey.apiproduct.name"/></Key>
+    </Get>
+    <Get assignTo="private.aforo.product.aforoProductId">
+        <Key><Parameter>aforo_product_id</Parameter><Parameter ref="verifyapikey.AforoVerifyApiKey.apiproduct.name"/></Key>
+    </Get>
+    <Get assignTo="private.aforo.product.statusOutcomes">
+        <Key><Parameter>status_outcomes</Parameter><Parameter ref="verifyapikey.AforoVerifyApiKey.apiproduct.name"/></Key>
+    </Get>
+</KeyValueMapOperations>

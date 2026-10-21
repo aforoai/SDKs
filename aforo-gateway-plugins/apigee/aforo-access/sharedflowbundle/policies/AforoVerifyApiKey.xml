@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Verifies the caller's API key (AC4: the Aforo credential imported as the
+     developer app's consumerKey). A missing key, an unknown or revoked key,
+     or a key whose API products do not include this proxy fails with
+     Apigee's standard 401 (oauth.v2.FailedToResolveAPIKey,
+     oauth.v2.InvalidApiKey, oauth.v2.InvalidApiKeyForGivenResource): the
+     per-product access control Kong's ACL gives.
+     On success it exposes the app's and developer's custom attributes as
+     verifyapikey.AforoVerifyApiKey.app.<attr> / .developer.<attr>, and the
+     matched product as verifyapikey.AforoVerifyApiKey.apiproduct.name;
+     aforo-access.js reads them. Renaming this policy renames those. -->
+<VerifyAPIKey name="AforoVerifyApiKey" continueOnError="false">
+    <DisplayName>Aforo Access - Verify API Key</DisplayName>
+    <APIKey ref="aforo.access.clientKey"/>
+</VerifyAPIKey>
