@@ -1,0 +1,190 @@
+# Aforo Usage Metering — policy definition (Mule 4 custom policy).
+#
+# API Manager renders the configuration form from this file. The policy
+# itself is src/main/mule/template.xml; every property declared here is
+# read there, and tests/policy.test.cjs fails when the two disagree.
+#
+# Identity: the customer id comes from a claim of the JWT that MuleSoft's
+# JWT Validation policy verified (authentication.properties.claims). Apply
+# JWT Validation before this policy. No request header is read for identity.
+#
+# The four properties at the end with an underscore in the name are the
+# 2.1.0 spellings. Each is read only when its hyphenated property is blank.
+id: aforo-metering
+name: Aforo Usage Metering
+description: Sends one usage event per API call to Aforo, after the response, without adding latency.
+category: Custom
+type: custom
+resourceLevelSupported: true
+encryptionSupported: true
+standalone: true
+supportedJavaVersions: ["8", "11", "17"]
+requiredCharacteristics: []
+providedCharacteristics: []
+configuration:
+  - propertyName: aforo-endpoint
+    name: Aforo Endpoint
+    description: Aforo usage ingestor batch URL, e.g. https://api.aforo.ai/v1/ingest/batch
+    type: string
+    optional: false
+    sensitive: false
+    allowMultiple: false
+  - propertyName: aforo-api-key
+    name: Aforo API Key
+    description: API key the policy sends to the ingestor in the X-API-Key header
+    type: string
+    optional: false
+    sensitive: true
+    allowMultiple: false
+  - propertyName: aforo-tenant-id
+    name: Workspace (Tenant) ID
+    description: Your Aforo workspace id. Stamped on every event unless a tenant claim is configured. The ingestor takes the workspace from the API key.
+    type: string
+    optional: false
+    sensitive: false
+    allowMultiple: false
+  - propertyName: customer-id-claim
+    name: Customer ID Claim
+    description: >-
+      Claim of the verified JWT that holds the Aforo customer id. Leave
+      empty for "customer_id"; "sub" is used when that claim is absent.
+    type: string
+    optional: true
+    sensitive: false
+    allowMultiple: false
+  - propertyName: tenant-id-claim
+    name: Tenant ID Claim
+    description: >-
+      Claim of the verified JWT that holds the Aforo workspace id. Leave
+      empty to use the Workspace (Tenant) ID above for every event.
+    type: string
+    optional: true
+    sensitive: false
+    allowMultiple: false
+  - propertyName: mcp-enabled
+    name: MCP Detection Enabled
+    description: Classify JSON-RPC tools/call requests as MCP tool invocations. Reads the JSON request body of POST requests.
+    type: boolean
+    optional: true
+    defaultValue: false
+    sensitive: false
+    allowMultiple: false
+  - propertyName: mcp-product-id
+    name: MCP Product ID
+    description: Aforo product id of the MCP server (used when MCP detection is on)
+    type: string
+    optional: true
+    sensitive: false
+    allowMultiple: false
+  - propertyName: status-outcomes
+    name: executionStatus Overrides
+    description: >-
+      Optional per-status-code executionStatus overrides for OUTCOME_BASED
+      pricing, e.g. "404=VALIDATION_FAILED,429=ERROR". Exact HTTP codes
+      200-599; invalid entries are ignored.
+    type: string
+    optional: true
+    sensitive: false
+    allowMultiple: false
+  - propertyName: exclude-status-codes
+    name: Status Codes Not Metered
+    description: >-
+      Comma-separated HTTP status codes that produce no usage event.
+      Leave empty for the default "401,403,429". A value replaces the
+      default. "none" meters every status.
+    type: string
+    optional: true
+    sensitive: false
+    allowMultiple: false
+  - propertyName: exclude-paths
+    name: Paths Not Metered
+    description: >-
+      Comma-separated path prefixes that produce no usage event. Leave
+      empty for the default "/health,/ready,/metrics". A value replaces
+      the default. "none" meters every path.
+    type: string
+    optional: true
+    sensitive: false
+    allowMultiple: false
+  - propertyName: product-type
+    name: Product Type
+    description: >-
+      productType on every event, trimmed and upper-cased. Leave empty for
+      "API". A request with a trace id is sent as AGENTIC_API and an MCP
+      tools/call that names an agent as MCP_SERVER, whatever is set here.
+    type: string
+    optional: true
+    sensitive: false
+    allowMultiple: false
+  - propertyName: default-metric
+    name: Default Metric
+    description: >-
+      Metric name for requests no mapping rule matches. Leave empty for
+      "api_calls". The tokens {method} and {path} are replaced, so
+      "{method} {path}" names the metric after the route. The metric must
+      exist in your Aforo catalog.
+    type: string
+    optional: true
+    sensitive: false
+    allowMultiple: false
+  - propertyName: metric-mappings
+    name: Metric Mappings
+    description: >-
+      Path-to-metric rules, first match wins: "KIND|value|metricName"
+      separated by ";". KIND is EXACT, PREFIX or CONTAINS, compared with the
+      request path. Example: "PREFIX|/v1/search|search_calls;EXACT|/v1/export|exports".
+    type: string
+    optional: true
+    sensitive: false
+    allowMultiple: false
+  - propertyName: quantity-source
+    name: Quantity Source
+    description: >-
+      "request_count" (the default) sends quantity 1. "response_size" sends
+      the response Content-Length in bytes; a response without that header
+      produces no event.
+    type: string
+    optional: true
+    sensitive: false
+    allowMultiple: false
+  - propertyName: include-metadata
+    name: Include Metadata
+    description: >-
+      "false" leaves the metadata object (gateway, method, path, status) off
+      the event. Leave empty to send it.
+    type: string
+    optional: true
+    sensitive: false
+    allowMultiple: false
+  - propertyName: product_type
+    name: product_type (deprecated)
+    description: >-
+      Deprecated 2.1.0 name of product-type. Read only when product-type is empty.
+    type: string
+    optional: true
+    sensitive: false
+    allowMultiple: false
+  - propertyName: default_metric
+    name: default_metric (deprecated)
+    description: >-
+      Deprecated 2.1.0 name of default-metric. Read only when default-metric is empty.
+    type: string
+    optional: true
+    sensitive: false
+    allowMultiple: false
+  - propertyName: quantity_source
+    name: quantity_source (deprecated)
+    description: >-
+      Deprecated 2.1.0 name of quantity-source. Read only when quantity-source is empty.
+    type: string
+    optional: true
+    sensitive: false
+    allowMultiple: false
+  - propertyName: include_metadata
+    name: include_metadata (deprecated)
+    description: >-
+      Deprecated 2.1.0 name of include-metadata. Read only when include-metadata is empty.
+    type: string
+    optional: true
+    sensitive: false
+    allowMultiple: false
