@@ -1,117 +1,106 @@
-# Aforo Metering — MuleSoft Anypoint Custom Policy — User Guide
+# Aforo for MuleSoft — User Guide
 
-**Version:** 2.1.0 · **Updated:** 2026-10-01 · **Audience:** engineers who own a MuleSoft Anypoint API and need gateway-level metering for Aforo billing.
+**Version:** 3.0.0 · **Updated:** 2026-10-22 · **Audience:** engineers who own an API in Anypoint API Manager and sell it through Aforo.
 
-> ⛔ **NOT PRODUCTION-READY.** The artifacts this guide walks through are not a deployable Anypoint policy format and have not been run on a gateway. Follow the rebuild guidance at the top of [README.md](README.md) before using this guide.
+Normally you do none of this by hand: when you connect your Anypoint org in Aforo and deploy an Aforo product to an API instance, Aforo publishes the policy to your Exchange and applies it with the right configuration. This guide explains what that does, how to do it manually, and how to check it.
 
-## What you'll build
+## 1. What you get
 
-A MuleSoft API in Anypoint API Manager with JWT validation + Aforo metering applied, emitting a usage event after every response with customer/tenant identity taken from the verified JWT. By the end you'll have called the API and confirmed the event landed in Aforo — plus a forged-header check proving a spoofed `X-Client-Id` is ignored.
+- Every call must carry the end customer's **Aforo API key** in `x-api-key`. The policy checks it with Aforo, so one key works on every gateway Aforo supports; Anypoint client applications and contracts are not involved.
+- A customer whose hard limit is used up gets **429** before your API is called (when quota is enforced).
+- Every call that reaches your API is metered in Aforo, for API, AGENTIC_API, AI_AGENT and MCP_SERVER products. See the [README](README.md#product-types) for the rules per type.
+- Your API never sees the `x-api-key` header.
 
-## Prerequisites
+## 2. Requirements
 
-- An **Anypoint Platform** org with API Manager, and an API you can apply policies to.
-- The **Mule JWT Module** available to your gateway (`com.mulesoft.modules:mule-jwt-module`, classifier `mule-plugin`).
-- Aforo `ingestor_url`, `api_key`, `tenant_id`, and your Aforo **JWKS URI** + **issuer**.
-- Two test JWTs signed by that JWKS with different `customer_id` claims (for the security check in Step 6).
-- Optional: pricing-service URL (margin-guard), usage-ingestor quota URL (pre-flight quota).
+- An API instance managed by API Manager on a **Mule 4.4+ runtime** (CloudHub, CloudHub 2.0, Runtime Fabric or a hybrid server), Java 8, 11 or 17. A basic-endpoint proxy or an application with API autodiscovery both work.
+- Outbound HTTPS from the runtime to Aforo (`api.aforo.ai`).
+- Your Aforo tenant id, an Aforo API key with scope `usage:ingest`, and the Aforo product id of what this API instance sells.
 
-## Step 1 — Publish the policy descriptors to your org
+## 3. Configuration properties
 
-Publish each YAML to Anypoint Exchange so it appears in API Manager's policy list. At minimum you need `jwt-validation-config.yaml` and `mule-policy.yaml`.
+The policy reads only these. Aforo's deploy sets them per API instance; in API Manager they are the policy's configuration form.
 
-```bash
-cd SDKs/aforo-gateway-plugins/mulesoft
-# Publish via the Anypoint CLI or Exchange UI. Policy ids are declared in each file:
-#   aforo-jwt-validation, aforo-metering, aforo-mcp-metering,
-#   aforo-margin-guard, aforo-preflight-quota, aforo-compound-metering
-```
-
-> ⚠ `jwt-validation-config.yaml` is a descriptor *plus* an inline Mule flow (in its comment block). Paste that flow into your gateway project (`src/main/mule/aforo-jwt-validation.xml`) and add the Mule JWT Module dependency — the descriptor alone doesn't validate tokens.
-
-## Step 2 — Set JWT validation secrets
-
-In Anypoint Runtime Secrets Manager (or secure properties), set:
-
-```
-AFORO_JWKS_URI   = https://auth.aforo.ai/.well-known/jwks.json
-AFORO_JWT_ISSUER = https://auth.aforo.ai
-```
-
-## Step 3 — Apply JWT validation to the API
-
-In API Manager → your API → Policies → Apply, select **Aforo JWT Validation**. This declares the `aforo-jwt-validated` capability that the metering policy requires.
-
-## Step 4 — Apply the metering policy
-
-Apply **Aforo Metering Policy** to the same API.
-
-> ⚠ Anypoint enforces ordering via `requiredCharacteristics`. If JWT validation isn't applied first, Anypoint **rejects** the metering policy configuration — that's the security boundary working, not a bug. Apply JWT validation, then metering.
-
-Set the metering policy properties:
-
-| Property | Value |
-|---|---|
-| `aforo-endpoint` | `https://api.aforo.ai/v1/ingest/batch` |
-| `aforo-api-key` | your Aforo API key (sensitive) |
-| `aforo-tenant-id` | `tenant_acme` (admin-pinned tenant fallback) |
-| `mcp-enabled` | `false` (set `true` only if fronting an MCP server) |
-
-## Step 5 — Enable MCP metering (only if fronting an MCP server)
-
-Either set `mcp-enabled = true` on the standard `aforo-metering` policy, or apply the dedicated `aforo-mcp-metering` policy. Both branch on a JSON-RPC `tools/call` body and emit `mcp_server.tool_invocations`.
-
-> ⚠ `agentId` is read only from the request body's `params._meta.agent_id` — the `X-Agent-Id` header fallback was removed in v2.0.0. If your clients don't put the agent in `_meta`, `agentId` is empty.
-
-## Step 6 — Call the API and verify it landed
-
-Call through the gateway with a valid JWT and trace headers:
-
-```bash
-curl -X GET "https://<your-app>.cloudhub.io/v1/accounts/123" \
-  -H "Authorization: Bearer <JWT_FOR_cust_legit>" \
-  -H "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" \
-  -H "tracestate: congo=t61rcWkgMzE"
-```
-
-In Aforo's usage view, filter to your tenant and confirm one event with `customerId = cust_legit` (the JWT value), `metricName = "GET /v1/accounts/123"`, `statusCode = 200`, `trace.traceparent = 00-4bf9...`.
-
-Now the security check and the no-JWT check:
-
-```bash
-# Forged X-Client-Id must be IGNORED — event still attributes to the JWT customer.
-curl -X GET "https://<your-app>.cloudhub.io/v1/accounts/123" \
-  -H "Authorization: Bearer <JWT_FOR_cust_legit>" \
-  -H "X-Client-Id: cust_victim"
-# Expected: ingestor event carries customerId=cust_legit, NOT cust_victim.
-
-# No JWT → 401 at the validation policy, request never reaches metering.
-curl -X GET "https://<your-app>.cloudhub.io/v1/accounts/123"
-# Expected: 401 invalid_token.
-```
-
-> ⚠ If the forged-header request produces `customerId=cust_victim`, the IDOR has regressed — you're running a pre-v2.0.0 policy. Re-publish `mule-policy.yaml`.
-
-This is exactly TEST 1–2 from [`tests/policy-contract.md`](tests/policy-contract.md); run the full matrix there before shipping a fork.
-
-## Configuration reference
-
-See the README's Configuration table for every property. Core: `aforo-endpoint`, `aforo-api-key`, `aforo-tenant-id`. JWT: `jwks-uri`/`AFORO_JWKS_URI`, `jwt-issuer`/`AFORO_JWT_ISSUER`, `jwks-cache-ttl-seconds`, `org-service-token-check-url`. MCP: `mcp-enabled`, `mcp-product-id`. Margin-guard: `enabled`, `marginGuardUrl`, `tenantId`. Quota: `enabled`, `preflightUrl`, `fallback`. Compound: `enabled`, `extractionPaths`, `dimensionPaths`, `ingestorUrl`.
-
-## Troubleshooting
-
-| Symptom | Cause | Fix |
+| Property | Default | What it does |
 |---|---|---|
-| Anypoint won't let me apply the metering policy | The API has no `aforo-jwt-validation` policy, so the `aforo-jwt-validated` capability the metering policy requires is missing. | Apply JWT validation first (Step 3), then metering. |
-| Event lands but `events` array is empty / no event at all | `vars.aforo.customerId` or `vars.aforo.tenantId` is empty — the metering policy fails closed and writes no event. | Confirm the JWT validation flow actually sets those vars (the inline flow's Step 3). A valid token with no `customer_id`/`sub` and `tenant_id` won't be metered. |
-| Forged `X-Client-Id` shows up as the customer | You're running a pre-v2.0.0 policy that trusted the header. | Re-publish `mule-policy.yaml` / `mcp-mule-policy.yaml`. v2.0.0 reads only `vars.aforo.*`. |
-| 401 on every request after applying JWT validation | Wrong `AFORO_JWKS_URI`/`AFORO_JWT_ISSUER`, expired token, or the Mule JWT Module flow isn't wired. | Verify the secrets and that the inline JWT flow + `mule-jwt-module` dependency are in the gateway project. |
-| No event reaches the ingestor, request succeeded | The metering POST runs `afterResponse` and is best-effort; `aforo-endpoint` unreachable or `aforo-api-key` wrong. | Check gateway logs for the HTTP requester error. There's no on-gateway buffer for standard metering. |
-| Margin-guard returns 429 unexpectedly | The quick-check resolved a customer + tenant and blocked (L3) or throttled (L2). | Confirm the endpoint should be guarded; public endpoints with no resolved `vars.aforo.customerId` skip the check by design. |
-| MCP requests metered as standard API | `mcp-enabled` is `false`, or the body isn't a JSON-RPC `tools/call` (must be `jsonrpc: "2.0"`, `method: "tools/call"`). | Set `mcp-enabled = true` and confirm the request body shape. |
+| `aforo-endpoint` | **required** | Ingest batch URL, `https://api.aforo.ai/v1/ingest/batch`. Its origin is the default origin of the two URLs below. |
+| `aforo-api-key` | **required**, sensitive | The policy's own Aforo key (`usage:ingest`). Sent as `X-API-Key` on introspection, quota checks and ingest. Encrypted when your runtime has a gateway encryption key. |
+| `aforo-tenant-id` | **required** | Your Aforo tenant id: `X-Tenant-Id` on the quota check, and part of the MCP idempotency key. |
+| `aforo-product-id` | **required** | The Aforo product this API instance sells. A key whose `productIds` do not contain it gets 403. |
+| `introspect-url` | origin of `aforo-endpoint` + `/api/v1/customer-keys/introspect` | Where keys are checked. |
+| `key-header` | `x-api-key` | Request header carrying the end customer's key. Removed before your API. |
+| `identity-cache-ttl-s` | `60` (max 3600) | How long an active key is trusted without asking Aforo; never past the key's `expiresAt`. The longest a revoked key keeps working. `0` asks on every call. |
+| `identity-negative-ttl-s` | `10` (max 600) | How long an unknown or inactive key is refused without asking. |
+| `identity-stale-ttl-s` | `900` (max 86400) | When introspection fails, an active answer up to this old is still used. |
+| `identity-fail-open` | `false` | When introspection fails and no answer may be used: `false` answers 503; `true` lets the call through **unchecked and unmetered**. |
+| `product-type` | `API` | `API`, `AGENTIC_API`, `AI_AGENT` or `MCP_SERVER`. |
+| `default-metric` | `api_calls` | Metric of calls no mapping matches (an MCP tool call: `mcp_server.tool_invocations` unless this is set). |
+| `metric-mappings` | none | JSON array `[{"pathPattern": "^/v1/search", "method": "GET", "metricName": "searches"}]`, first match wins. `pathPattern` is a **Lua pattern**, as on Kong (`%d`, `%w`, `[...]`, `.-`, `^`, `$`; unanchored unless it starts with `^`); `%b`, `%f` and back-references are not supported and skip the rule. `method` is optional. |
+| `quantity-header` | `X-Aforo-Quantity` | Upstream response header with the event quantity. |
+| `agent-id` | the Aforo product id | AI_AGENT: the agent when the upstream sends no `X-Aforo-Agent-Id`. At most 36 characters. |
+| `trace-id-header` | `X-Aforo-Trace-Id` | AGENTIC_API: upstream response header naming the trace. |
+| `status-outcomes` | none | `{"404": "VALIDATION_FAILED"}` (or `404=VALIDATION_FAILED,429=ERROR`): `executionStatus` per HTTP status. |
+| `exclude-paths` | `/health,/ready,/metrics` | Paths neither metered nor quota-checked (the key is still checked). An entry matches itself and the paths below it, not `/healthcare`. `none` meters every path. |
+| `exclude-status-codes` | `401,403,429` | Statuses that produce no event. `none` meters every status. |
+| `quota-enabled` | `false` | Ask Aforo before your API whether the customer is within quota for the metric the call bills; DENY answers 429. Aforo sets it for products with hard limits. |
+| `quota-check-url` | origin of `aforo-endpoint` + `/api/v1/quota/check` | Where quota is checked. |
+| `quota-timeout-ms` | `1500` (100–10000) | Quota check timeout. |
+| `quota-fail-open` | `true` | When the quota check fails: `true` lets the call through, `false` answers 503. |
 
-## What this guide does NOT cover
+Values are rendered into the policy as text. A value must not contain `${` (Mule would read it as a property placeholder).
 
-- **Building/deploying the Mule gateway app itself** (CloudHub/RTF, the JWT-module wiring beyond the supplied inline flow). That's your Anypoint deployment.
-- **The Aforo product/rate-plan configuration** that consumes these events — set that up in the Aforo console.
-- **Compound-metering path design** — the policy runs whatever `extractionPaths` map you supply against your response body; designing it for your payload is on you.
+## 4. Install by hand
+
+1. **Build** the jar ([README → Build](README.md#build)), or take `aforo-metering-3.0.0-mule-policy.jar` from the release.
+2. **Publish** it to your Exchange as a policy: groupId = your Anypoint organization id, assetId `aforo-metering`, version `3.0.0`, with `aforo-metering.yaml` as the `policy-definition`. Either `mvn deploy -Danypoint.org.id=<org id>` from `aforo-metering/`, or Exchange → Publish new asset → Policy, uploading both files.
+3. **Apply** it in API Manager → your API instance → Policies → Add policy → *Aforo Usage Metering*, filling in the properties above. Put it **first** in the policy order (it is the API's authentication). If browsers call the API, apply MuleSoft's CORS policy before it.
+4. **Map** the product in Aforo (Aforo's deploy records the API instance id against the product).
+
+Removing the policy from the API instance stops key checks and metering at once.
+
+## 5. Check it
+
+With a test key for a customer subscribed to the product:
+
+```bash
+curl -i https://your-api/v1/orders                                   # 401 No API key found in request
+curl -i https://your-api/v1/orders -H "x-api-key: not-a-key"         # 401 Invalid authentication credentials
+curl -i https://your-api/v1/orders -H "x-api-key: $KEY_OTHER_PRODUCT"   # 403
+curl -i https://your-api/v1/orders -H "x-api-key: $KEY"              # your API's answer; usage appears in Aforo
+```
+
+Your API should not receive an `x-api-key` header. The full checklist, including quota, MCP and outage behaviour, is [`tests/policy-contract.md`](tests/policy-contract.md).
+
+## 6. Upgrading from 2.x
+
+3.0.0 is a rewrite and replaces the policy. What changes:
+
+- **Identity**: 2.x took the customer from a JWT claim (`customer-id-claim`, `tenant-id-claim`, MuleSoft's JWT Validation policy) and emitted nothing without one. 3.0.0 takes it from the Aforo key via introspection. Remove the JWT-based setup for Aforo; a missing key is now refused (401).
+- **Removed properties**: `customer-id-claim`, `tenant-id-claim`, `mcp-enabled`, `mcp-product-id`, `quantity-source`, `include-metadata` and the deprecated `product_type`, `default_metric`, `quantity_source`, `include_metadata`. MCP is now `product-type: MCP_SERVER`.
+- **`metric-mappings`** is now Kong's JSON with Lua patterns (2.2.0 used `KIND|value|metric`).
+- **`status-outcomes`** takes JSON (the CSV form still works).
+- **AGENTIC_API** no longer reads the client's `traceparent` / `x-trace-id` for the trace, and a trace header no longer changes the product type.
+- **MCP**: the agent is no longer `params._meta.agent_id` from the body, the session no longer the request's `Mcp-Session-Id`; batches bill every tool call and protocol messages bill nothing.
+- New: 401/403/429/503 answers, the quota pre-flight, key removal, AI_AGENT events, upstream `X-Aforo-*` headers.
+
+Publish 3.0.0 as a new version of the asset and re-apply it on each API instance; the 2.x configuration is not carried over.
+
+## 7. Troubleshooting
+
+All log lines start with `[aforo-metering]`.
+
+| Log line | Meaning |
+|---|---|
+| `policy not configured: …` (and every call gets 503) | a required property is empty |
+| `introspection failed (HTTP 401: Aforo refused aforo-api-key …)` | the policy's key is wrong or lacks `usage:ingest` |
+| `introspection failed (no response: …): using the cached answer` | Aforo unreachable; cached answers are used up to `identity-stale-ttl-s` |
+| `introspection failed (…): answering 503` | Aforo unreachable and no usable cached answer |
+| `quota check unavailable (…): failing OPEN` | quota not enforced while the check fails |
+| `could not remove the x-api-key header before the upstream` | the runtime refused the request rewrite; the call still went through, with the header |
+| `USAGE EVENT REFUSED (permanent, not retried): <metric> <key>: <reason>` | the ingestor rejected an event (unknown metric, unknown customer, missing field) |
+| `USAGE NOT DELIVERED after 3 attempts` | the ingestor did not take the batch; that usage is lost |
+| `USAGE DROPPED: 1000 calls' usage is already waiting` | the backlog is full (ingestor down or slow) |
+| `events skipped: unusable X-Aforo-… response header` | your API sent a header Aforo cannot use (too long, control characters) |
+| `metric-mappings rule … skipped` | the rule has no `metricName` or uses an unsupported Lua pattern |
+
+Repeating warnings (introspection, quota, backlog) are logged at most once a minute.

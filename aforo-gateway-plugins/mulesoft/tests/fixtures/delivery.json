@@ -1,0 +1,280 @@
+{
+  "script": "delivery",
+  "base": {
+    "vars": {
+      "aforoPendingText": "{\"events\": [{\"metricName\": \"api_calls\", \"idempotencyKey\": \"k1\", \"quantity\": 1}, {\"metricName\": \"mcp_server.tool_invocations\", \"idempotencyKey\": \"k2\", \"quantity\": 1}, {\"metricName\": \"tokens\", \"idempotencyKey\": \"k3\", \"quantity\": 5}]}",
+      "aforoIngestResponse": null
+    }
+  },
+  "cases": [
+    {
+      "name": "202 with no errors: delivered",
+      "expect": {
+        "status": 202,
+        "retryText": null,
+        "refusedLog": null
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 202,
+          "text": "{\"success\": true, \"data\": {\"accepted\": 3, \"failed\": 0, \"errors\": []}}"
+        }
+      }
+    },
+    {
+      "name": "\"could not be stored\" is transient: only that event is re-sent",
+      "expect": {
+        "retryText.#json": {
+          "events": [
+            {
+              "metricName": "mcp_server.tool_invocations",
+              "idempotencyKey": "k2",
+              "quantity": 1
+            }
+          ]
+        },
+        "retryReason": "1 event(s) could not be stored",
+        "refusedLog": null
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 202,
+          "text": "{\"success\": true, \"data\": {\"accepted\": 2, \"failed\": 1, \"errors\": [{\"index\": 1, \"message\": \"The event could not be stored. Retry later.\"}]}}"
+        }
+      }
+    },
+    {
+      "name": "any other per-event error is permanent: logged, not re-sent",
+      "expect": {
+        "retryText": null,
+        "refusedLog": "[aforo-metering] USAGE EVENT REFUSED (permanent, not retried): tokens k3: Unknown metric: tokens"
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 202,
+          "text": "{\"success\": true, \"data\": {\"accepted\": 2, \"failed\": 1, \"errors\": [{\"index\": 2, \"message\": \"Unknown metric: tokens\"}]}}"
+        }
+      }
+    },
+    {
+      "name": "mixed: transient re-sent, permanent logged",
+      "expect": {
+        "retryText.#json": {
+          "events": [
+            {
+              "metricName": "api_calls",
+              "idempotencyKey": "k1",
+              "quantity": 1
+            }
+          ]
+        },
+        "refusedLog": "[aforo-metering] USAGE EVENT REFUSED (permanent, not retried): mcp_server.tool_invocations k2: productType MCP_SERVER requires agentId"
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 202,
+          "text": "{\"success\": true, \"data\": {\"accepted\": 1, \"failed\": 2, \"errors\": [{\"index\": 0, \"message\": \"The event could not be stored\"}, {\"index\": 1, \"message\": \"productType MCP_SERVER requires agentId\"}, {\"message\": \"no index: ignored\"}, {\"index\": 9, \"message\": \"The event could not be stored\"}]}}"
+        }
+      }
+    },
+    {
+      "name": "the unwrapped {errors} shape is read too",
+      "expect": {
+        "retryText.#json": {
+          "events": [
+            {
+              "metricName": "tokens",
+              "idempotencyKey": "k3",
+              "quantity": 5
+            }
+          ]
+        }
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 200,
+          "text": "{\"errors\": [{\"index\": 2, \"message\": \"The event could not be stored\"}]}"
+        }
+      }
+    },
+    {
+      "name": "HTTP 500: the whole batch is re-sent",
+      "expect": {
+        "retryText.#json": {
+          "events": [
+            {
+              "metricName": "api_calls",
+              "idempotencyKey": "k1",
+              "quantity": 1
+            },
+            {
+              "metricName": "mcp_server.tool_invocations",
+              "idempotencyKey": "k2",
+              "quantity": 1
+            },
+            {
+              "metricName": "tokens",
+              "idempotencyKey": "k3",
+              "quantity": 5
+            }
+          ]
+        },
+        "retryReason": "the ingestor answered HTTP 500",
+        "refusedLog": null
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 500,
+          "text": "busy"
+        }
+      }
+    },
+    {
+      "name": "HTTP 503: the whole batch is re-sent",
+      "expect": {
+        "retryText.#json": {
+          "events": [
+            {
+              "metricName": "api_calls",
+              "idempotencyKey": "k1",
+              "quantity": 1
+            },
+            {
+              "metricName": "mcp_server.tool_invocations",
+              "idempotencyKey": "k2",
+              "quantity": 1
+            },
+            {
+              "metricName": "tokens",
+              "idempotencyKey": "k3",
+              "quantity": 5
+            }
+          ]
+        },
+        "retryReason": "the ingestor answered HTTP 503",
+        "refusedLog": null
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 503,
+          "text": "busy"
+        }
+      }
+    },
+    {
+      "name": "HTTP 408: the whole batch is re-sent",
+      "expect": {
+        "retryText.#json": {
+          "events": [
+            {
+              "metricName": "api_calls",
+              "idempotencyKey": "k1",
+              "quantity": 1
+            },
+            {
+              "metricName": "mcp_server.tool_invocations",
+              "idempotencyKey": "k2",
+              "quantity": 1
+            },
+            {
+              "metricName": "tokens",
+              "idempotencyKey": "k3",
+              "quantity": 5
+            }
+          ]
+        },
+        "retryReason": "the ingestor answered HTTP 408",
+        "refusedLog": null
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 408,
+          "text": "busy"
+        }
+      }
+    },
+    {
+      "name": "HTTP 429: the whole batch is re-sent",
+      "expect": {
+        "retryText.#json": {
+          "events": [
+            {
+              "metricName": "api_calls",
+              "idempotencyKey": "k1",
+              "quantity": 1
+            },
+            {
+              "metricName": "mcp_server.tool_invocations",
+              "idempotencyKey": "k2",
+              "quantity": 1
+            },
+            {
+              "metricName": "tokens",
+              "idempotencyKey": "k3",
+              "quantity": 5
+            }
+          ]
+        },
+        "retryReason": "the ingestor answered HTTP 429",
+        "refusedLog": null
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 429,
+          "text": "busy"
+        }
+      }
+    },
+    {
+      "name": "HTTP 401: the ingestor refused the batch, logged with the body, not re-sent",
+      "expect": {
+        "retryText": null,
+        "refusedLog": "[aforo-metering] USAGE EVENT REFUSED (permanent, not retried): the ingestor refused the batch (HTTP 401; check aforo-api-key and aforo-endpoint): {\"error\":\"bad key\"}"
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 401,
+          "text": "{\"error\":\"bad key\"}"
+        }
+      }
+    },
+    {
+      "name": "HTTP 400 with a long body: the body is cut to 300 characters",
+      "expect": {
+        "retryText": null
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 400,
+          "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        }
+      }
+    },
+    {
+      "name": "HTTP 301 (wrong URL): refused, not re-sent",
+      "expect": {
+        "retryText": null,
+        "refusedLog": "[aforo-metering] USAGE EVENT REFUSED (permanent, not retried): the ingestor refused the batch (HTTP 301; check aforo-api-key and aforo-endpoint): "
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 301,
+          "text": ""
+        }
+      }
+    },
+    {
+      "name": "a 202 whose body cannot be read counts as delivered",
+      "expect": {
+        "retryText": null,
+        "refusedLog": null
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 202,
+          "text": "<html>"
+        }
+      }
+    }
+  ]
+}

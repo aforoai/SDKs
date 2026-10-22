@@ -44,7 +44,7 @@ Base SDKs ship framework middleware (Express/Fastify/Koa, FastAPI/Django/Flask, 
 | Apigee | [`aforo-gateway-plugins/apigee`](aforo-gateway-plugins/apigee) | Shared-flow bundle (JS callout) |
 | AWS API Gateway | [`aforo-gateway-plugins/aws-lambda`](aforo-gateway-plugins/aws-lambda) | Lambda + SAM template + JWT authorizer |
 | Azure APIM | [`aforo-gateway-plugins/azure-apim`](aforo-gateway-plugins/azure-apim) | Outbound XML/C# policy |
-| MuleSoft | [`aforo-gateway-plugins/mulesoft`](aforo-gateway-plugins/mulesoft) | DataWeave custom policy |
+| MuleSoft | [`aforo-gateway-plugins/mulesoft`](aforo-gateway-plugins/mulesoft) | Mule 4 custom policy (key introspection, quota, metering) |
 
 Plus IaC templates in [`aforo-gateway-plugins/aws-cloudformation`](aforo-gateway-plugins/aws-cloudformation) and [`aforo-gateway-plugins/azure-arm-templates`](aforo-gateway-plugins/azure-arm-templates), and per-gateway deployment notes in [`aforo-gateway-plugins/docs`](aforo-gateway-plugins/docs). All five gateway plugins detect MCP `tools/call` JSON-RPC and meter the tool name + agent id alongside standard HTTP requests.
 

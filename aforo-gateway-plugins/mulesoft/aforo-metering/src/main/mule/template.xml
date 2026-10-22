@@ -1,0 +1,1629 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Aforo Usage Metering 3.0.0 - Mule 4 custom policy template.
+
+  One API call:
+    1. Configuration. Every policy property arrives as the attribute value
+       of a set-variable: "=" followed by the property name in double
+       braces. Double braces HTML-escape the value and
+       the XML parser decodes it again, so JSON properties (metric-mappings,
+       status-outcomes) reach DataWeave byte for byte; the leading "=" keeps
+       an empty value valid and stops a value from being read as an
+       expression. The "config" script normalises them into vars.aforoCfg.
+    2. Identity (MC1/MC2). The end customer's Aforo key comes from the
+       key-header. Its SHA-256 is the cache key. A fresh cached answer is
+       used as is; otherwise POST {key} to introspect-url with the policy's
+       own X-API-Key. Active and covering aforo-product-id: allow. Missing
+       or inactive key: 401. Active but another product: 403. Introspection
+       down: a cached active answer up to identity-stale-ttl-s old, else 503
+       (or pass unmetered with identity-fail-open).
+    3. Quota pre-flight, before the upstream, on the metric the call bills:
+       POST {customerId, metricName} to quota-check-url. DENY: 429 with
+       Retry-After and {message, retryAfter}; ALLOW / WARN cached 1 s; no
+       answer: fail open (or 503 with quota-fail-open=false).
+    4. A refused call (401/403/429/503) is answered here: the upstream is not
+       called and nothing is metered.
+    5. The key header is removed from the request the API receives.
+    6. execute-next. The response goes back untouched.
+    7. Metering runs in an async scope on a copy of the event: the "events"
+       script builds the call's events once (API / AGENTIC_API / AI_AGENT /
+       MCP_SERVER, as the Kong and Apigee plugins do), and the delivery posts
+       them to aforo-endpoint, re-sending only what the ingestor reports as
+       "The event could not be stored..." (or the whole batch on no answer,
+       5xx, 408, 429), up to 3 attempts. At most 16 deliveries run at once
+       and at most 1000 wait; past that the usage is dropped with a WARN.
+
+  The DataWeave scripts are the only copy of the billing logic. Each starts
+  with a "// aforo-script: <name>" line; tests/dataweave.test.cjs runs them
+  with the DataWeave CLI against tests/fixtures, and tests/policy.test.cjs
+  checks this file's structure.
+
+  The gateway renders this file with Handlebars when the policy is applied,
+  comments included: besides the properties, the only names are policyId
+  (triple braces) and the "if encrypted" block. Never write braces in a
+  comment here; tests/policy.test.cjs rejects any unknown token.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:http-policy="http://www.mulesoft.org/schema/mule/http-policy"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:java="http://www.mulesoft.org/schema/mule/java"
+      xmlns:secure-properties="http://www.mulesoft.org/schema/mule/secure-properties"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/http-policy http://www.mulesoft.org/schema/mule/http-policy/current/mule-http-policy.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/java http://www.mulesoft.org/schema/mule/java/current/mule-java.xsd
+        http://www.mulesoft.org/schema/mule/secure-properties http://www.mulesoft.org/schema/mule/secure-properties/current/mule-secure-properties.xsd">
+
+    {{#if encrypted}}
+    <secure-properties:config key="${anypoint.platform.encryption_key}" file="${encryptedPropertiesFile}" name="encryptionConfiguration">
+        <secure-properties:encrypt algorithm="AES" mode="CBC"/>
+    </secure-properties:config>
+    {{/if}}
+
+    <!-- Outbound calls to Aforo. Every request names its own url (introspection,
+         quota, ingest) and its own responseTimeout. -->
+    <http:request-config name="{{{policyId}}}-aforo-http">
+        <http:request-connection usePersistentConnections="true" connectionIdleTimeout="30000"/>
+    </http:request-config>
+
+    <!-- Introspection answers by SHA-256 of the key. Entries carry their own
+         timestamps; the scripts decide what is fresh or stale. -->
+    <os:object-store name="{{{policyId}}}-aforo-identity" persistent="false" maxEntries="10000"
+                     entryTtl="1" entryTtlUnit="DAYS" expirationInterval="5" expirationIntervalUnit="MINUTES"/>
+    <!-- Quota decisions (1 s) and the last time each kind of warning was logged. -->
+    <os:object-store name="{{{policyId}}}-aforo-state" persistent="false" maxEntries="10000"
+                     entryTtl="10" entryTtlUnit="MINUTES" expirationInterval="1" expirationIntervalUnit="MINUTES"/>
+    <!-- Usage waiting for delivery, one entry per call. The entry count bounds
+         the backlog; the TTL clears an entry a crashed delivery left behind. -->
+    <os:object-store name="{{{policyId}}}-aforo-pending" persistent="false" maxEntries="2000"
+                     entryTtl="5" entryTtlUnit="MINUTES" expirationInterval="1" expirationIntervalUnit="MINUTES"/>
+
+    <http-policy:proxy name="{{{policyId}}}-aforo-metering">
+        <!-- propagateMessageTransformations: the request the API receives is the
+             one this policy hands to execute-next, without the key header. -->
+        <http-policy:source propagateMessageTransformations="true">
+
+            <!-- ═════ 1-4. Configuration, identity, quota ═════
+                 Any unexpected failure here refuses the call with 503: this
+                 policy is the API's authentication, so it fails closed. -->
+            <try>
+                <set-variable variableName="aforoPropAforoEndpoint" value="={{aforo-endpoint}}"/>
+                <set-variable variableName="aforoPropAforoApiKey" value="={{aforo-api-key}}"/>
+                <set-variable variableName="aforoPropAforoTenantId" value="={{aforo-tenant-id}}"/>
+                <set-variable variableName="aforoPropAforoProductId" value="={{aforo-product-id}}"/>
+                <set-variable variableName="aforoPropIntrospectUrl" value="={{introspect-url}}"/>
+                <set-variable variableName="aforoPropKeyHeader" value="={{key-header}}"/>
+                <set-variable variableName="aforoPropIdentityCacheTtlS" value="={{identity-cache-ttl-s}}"/>
+                <set-variable variableName="aforoPropIdentityNegativeTtlS" value="={{identity-negative-ttl-s}}"/>
+                <set-variable variableName="aforoPropIdentityStaleTtlS" value="={{identity-stale-ttl-s}}"/>
+                <set-variable variableName="aforoPropIdentityFailOpen" value="={{identity-fail-open}}"/>
+                <set-variable variableName="aforoPropProductType" value="={{product-type}}"/>
+                <set-variable variableName="aforoPropDefaultMetric" value="={{default-metric}}"/>
+                <set-variable variableName="aforoPropMetricMappings" value="={{metric-mappings}}"/>
+                <set-variable variableName="aforoPropQuantityHeader" value="={{quantity-header}}"/>
+                <set-variable variableName="aforoPropAgentId" value="={{agent-id}}"/>
+                <set-variable variableName="aforoPropTraceIdHeader" value="={{trace-id-header}}"/>
+                <set-variable variableName="aforoPropStatusOutcomes" value="={{status-outcomes}}"/>
+                <set-variable variableName="aforoPropExcludePaths" value="={{exclude-paths}}"/>
+                <set-variable variableName="aforoPropExcludeStatusCodes" value="={{exclude-status-codes}}"/>
+                <set-variable variableName="aforoPropQuotaEnabled" value="={{quota-enabled}}"/>
+                <set-variable variableName="aforoPropQuotaCheckUrl" value="={{quota-check-url}}"/>
+                <set-variable variableName="aforoPropQuotaTimeoutMs" value="={{quota-timeout-ms}}"/>
+                <set-variable variableName="aforoPropQuotaFailOpen" value="={{quota-fail-open}}"/>
+
+                <ee:transform>
+                    <ee:variables>
+                        <ee:set-variable variableName="aforoCfg"><![CDATA[%dw 2.0
+// aforo-script: config
+// The policy properties, normalised once per call. Nothing here throws on a
+// bad value: it falls back to the default and says so in "warnings".
+output application/java
+var DEFAULT_EXCLUDE_PATHS = ["/health", "/ready", "/metrics"]
+var DEFAULT_EXCLUDE_STATUS_CODES = [401, 403, 429]
+var OUTCOMES = ["SUCCESS", "PARTIAL", "TIMEOUT", "ERROR", "VALIDATION_FAILED", "FAILED",
+  "FAILURE", "CANCELLED", "PENDING", "BLOCKED", "HITL_REQUIRED"]
+// Lua character classes as Java regex set contents.
+var LUA = {
+  a: "A-Za-z", d: "0-9", l: "a-z", u: "A-Z", w: "A-Za-z0-9", x: "0-9A-Fa-f",
+  s: "\\x20\\t\\n\\r\\f\\x0B", c: "\\x00-\\x1F\\x7F",
+  p: "\\x21-\\x2F\\x3A-\\x40\\x5B-\\x60\\x7B-\\x7E", g: "\\x21-\\x7E"
+}
+fun prop(v) = if (v is String) trim(v replace /^=/ with "") else ""
+fun flag(v, dflt) = do {
+  var t = lower(prop(v))
+  ---
+  if (t == "true") true else if (t == "false") false else dflt
+}
+fun bounded(v, dflt, lo, hi) = do {
+  var t = prop(v)
+  var n = if (t matches /[0-9]{1,9}/) (t as Number) else dflt
+  ---
+  if (n < lo) lo else if (n > hi) hi else n
+}
+fun origin(url) = do {
+  var m = url scan /^(https?:\/\/[^\/?#]+)/
+  ---
+  if (isEmpty(m)) "" else m[0][1]
+}
+fun csv(v) = ((prop(v) splitBy ",") map trim($)) filter ($ != "")
+fun str(v) = if (v is String) v else if ((v is Number) or (v is Boolean)) (v as String) else ""
+
+// ── metric-mappings: Kong's Lua patterns, translated to Java regex ──
+// string.find semantics: unanchored unless the pattern starts with ^. %b, %f
+// and back-references are not supported; such a rule is skipped.
+fun rxEscape(ch) = if ("\\^\$.|?*+()[]{}/-&" contains ch) ("\\" ++ ch) else ch
+fun setEscape(ch) = if ("\\]^[-&" contains ch) ("\\" ++ ch) else ch
+fun luaClass(ch) = do {
+  var lc = lower(ch)
+  var cls = LUA[lc]
+  ---
+  if (cls != null)
+    (if (ch == lc) {inner: cls, outer: "[" ++ cls ++ "]"} else {inner: null, outer: "[^" ++ cls ++ "]"})
+  else if (ch matches /[A-Za-z0-9]/) null
+  else {inner: setEscape(ch), outer: rxEscape(ch)}
+}
+fun st(out, pending, mode, set, first, err) =
+  {out: out, pending: pending, mode: mode, set: set, first: first, err: err}
+fun flush(s) = s.out ++ (s.pending default "")
+fun luaStep(s, i, cs, n) = do {
+  var ch = cs[i]
+  var nxt = if (i + 1 < n) cs[i + 1] else null
+  ---
+  if (s.err) s
+  else if (s.mode == "pct") do {
+    var c = luaClass(ch)
+    ---
+    if (c == null) st(s.out, null, s.mode, s.set, s.first, true) else st(s.out, c.outer, "normal", "", false, false)
+  }
+  else if (s.mode == "setpct") do {
+    var c = luaClass(ch)
+    ---
+    if ((c == null) or (c.inner == null)) st(s.out, null, s.mode, s.set, s.first, true)
+    else st(s.out, null, "set", s.set ++ c.inner, false, false)
+  }
+  else if (s.mode == "set")
+    (if ((ch == "^") and (s.set == "[")) st(s.out, null, "set", "[^", true, false)
+    else if ((ch == "]") and (not s.first)) st(s.out, s.set ++ "]", "normal", "", false, false)
+    else if (ch == "%") st(s.out, null, "setpct", s.set, s.first, false)
+    else if ((ch == "-") and (not s.first) and (nxt != null) and (nxt != "]")) st(s.out, null, "set", s.set ++ "-", false, false)
+    else st(s.out, null, "set", s.set ++ setEscape(ch), false, false))
+  else if ((s.pending != null) and (["*", "+", "?"] contains ch)) st(s.out ++ s.pending ++ ch, null, "normal", "", false, false)
+  else if ((s.pending != null) and (ch == "-")) st(s.out ++ s.pending ++ "*?", null, "normal", "", false, false)
+  else do {
+    var out = flush(s)
+    ---
+    if (ch == "%") st(out, null, "pct", "", false, false)
+    else if (ch == "[") st(out, null, "set", "[", true, false)
+    else if (ch == ".") st(out, "[\\s\\S]", "normal", "", false, false)
+    else if ((ch == "^") and (i == 0)) st(out ++ "^", null, "normal", "", false, false)
+    else if ((ch == "\$") and (i == n - 1)) st(out ++ "\$", null, "normal", "", false, false)
+    else if ((ch == "(") or (ch == ")")) st(out ++ ch, null, "normal", "", false, false)
+    else st(out, rxEscape(ch), "normal", "", false, false)
+  }
+}
+fun luaToRegex(p) =
+  if ((not (p is String)) or (p == "") or (sizeOf(p) > 512)) null
+  else do {
+    var cs = p splitBy ""
+    var n = sizeOf(cs)
+    var final = (0 to n - 1) reduce ((i, s = st("", null, "normal", "", false, false)) -> luaStep(s, i, cs, n))
+    var rx = if (final.err or (final.mode != "normal")) null else flush(final)
+    ---
+    if ((rx != null) and dw::Runtime::try(() -> ("" contains (rx as Regex))).success) rx else null
+  }
+var mappingsText = prop(vars.aforoPropMetricMappings)
+var mappingsParsed = if (mappingsText == "") [] else (dw::Runtime::try(() -> read(mappingsText, "application/json")).result default "invalid")
+var mappingRules = (if (mappingsParsed is Array) mappingsParsed else []) map ((r) -> do {
+  var rule = if (r is Object) r else {}
+  var pattern = rule.pathPattern default rule.path_pattern
+  ---
+  {
+    pathPattern: pattern,
+    method: upper(trim(str(rule.method))),
+    metricName: trim(str(rule.metricName default rule.metric_name)),
+    re: luaToRegex(pattern)
+  }
+})
+var metricRules = (mappingRules filter ((r) -> (r.metricName != "") and (r.re != null)))
+  map ((r) -> {method: r.method, metricName: r.metricName, re: r.re})
+var badRules = mappingRules filter ((r) -> (r.metricName == "") or (r.re == null))
+
+// ── status-outcomes: {"404":"VALIDATION_FAILED"} or 404=VALIDATION_FAILED,... ──
+var outcomesText = prop(vars.aforoPropStatusOutcomes)
+var outcomePairs =
+  if (outcomesText startsWith "{") do {
+    var o = dw::Runtime::try(() -> read(outcomesText, "application/json")).result
+    ---
+    if (o is Object) (o pluck ((v, k) -> [k as String, str(v)])) else []
+  }
+  else (csv(vars.aforoPropStatusOutcomes) map ((e) -> (e splitBy "=") map trim($)))
+    filter ((kv) -> sizeOf(kv) == 2)
+var statusOutcomes = outcomePairs reduce ((kv, acc = {}) -> do {
+  var code = trim(kv[0] default "")
+  var outcome = upper(trim(kv[1] default ""))
+  ---
+  if ((code matches /[2-5][0-9][0-9]/) and (OUTCOMES contains outcome)) ((acc - code) ++ {(code): outcome}) else acc
+})
+
+var endpoint = prop(vars.aforoPropAforoEndpoint)
+var apiKey = prop(vars.aforoPropAforoApiKey)
+var productId = prop(vars.aforoPropAforoProductId)
+var introspectProp = prop(vars.aforoPropIntrospectUrl)
+var introspectUrl = if (introspectProp != "") introspectProp
+  else if (origin(endpoint) != "") origin(endpoint) ++ "/api/v1/customer-keys/introspect" else ""
+var quotaProp = prop(vars.aforoPropQuotaCheckUrl)
+var quotaUrl = if (quotaProp != "") quotaProp
+  else if (origin(endpoint) != "") origin(endpoint) ++ "/api/v1/quota/check" else ""
+var keyHeader = lower(prop(vars.aforoPropKeyHeader))
+var productType = upper(prop(vars.aforoPropProductType))
+var excludePathEntries = csv(vars.aforoPropExcludePaths)
+var excludeStatusEntries = csv(vars.aforoPropExcludeStatusCodes)
+var problems =
+  (if (endpoint == "") ["aforo-endpoint is not set"] else []) ++
+  (if (apiKey == "") ["aforo-api-key is not set"] else []) ++
+  (if (productId == "") ["aforo-product-id is not set"] else []) ++
+  (if (introspectUrl == "") ["introspect-url is not set and aforo-endpoint has no http(s) origin"] else [])
+---
+{
+  endpoint: endpoint,
+  apiKey: apiKey,
+  tenantId: prop(vars.aforoPropAforoTenantId),
+  productId: productId,
+  introspectUrl: introspectUrl,
+  introspectTimeoutMs: 1500,
+  keyHeader: if (keyHeader == "") "x-api-key" else keyHeader,
+  identityTtlS: bounded(vars.aforoPropIdentityCacheTtlS, 60, 0, 3600),
+  identityNegativeTtlS: bounded(vars.aforoPropIdentityNegativeTtlS, 10, 0, 600),
+  identityStaleTtlS: bounded(vars.aforoPropIdentityStaleTtlS, 900, 0, 86400),
+  identityFailOpen: flag(vars.aforoPropIdentityFailOpen, false),
+  productType: if (productType == "") "API" else productType,
+  defaultMetric: prop(vars.aforoPropDefaultMetric),
+  metricRules: metricRules,
+  quantityHeader: if (prop(vars.aforoPropQuantityHeader) == "") "X-Aforo-Quantity" else prop(vars.aforoPropQuantityHeader),
+  agentId: prop(vars.aforoPropAgentId),
+  traceIdHeader: if (prop(vars.aforoPropTraceIdHeader) == "") "X-Aforo-Trace-Id" else prop(vars.aforoPropTraceIdHeader),
+  statusOutcomes: statusOutcomes,
+  excludePaths:
+    if (isEmpty(excludePathEntries)) DEFAULT_EXCLUDE_PATHS
+    else if ((sizeOf(excludePathEntries) == 1) and (lower(excludePathEntries[0]) == "none")) []
+    else excludePathEntries,
+  excludeStatusCodes:
+    if (isEmpty(excludeStatusEntries)) DEFAULT_EXCLUDE_STATUS_CODES
+    else if ((sizeOf(excludeStatusEntries) == 1) and (lower(excludeStatusEntries[0]) == "none")) []
+    else (excludeStatusEntries filter ($ matches /[1-5][0-9][0-9]/)) map ($ as Number),
+  quotaEnabled: flag(vars.aforoPropQuotaEnabled, false),
+  quotaUrl: quotaUrl,
+  quotaTimeoutMs: bounded(vars.aforoPropQuotaTimeoutMs, 1500, 100, 10000),
+  quotaFailOpen: flag(vars.aforoPropQuotaFailOpen, true),
+  quotaCacheTtlMs: 1000,
+  problems: problems,
+  warnings:
+    (if (mappingsParsed == "invalid") ["metric-mappings is not valid JSON; ignored"] else []) ++
+    (badRules map ((r) -> "metric-mappings rule " ++ write(r.pathPattern default null, "application/json") ++ " skipped (no metricName, or not a supported Lua pattern)"))
+}]]></ee:set-variable>
+                    </ee:variables>
+                </ee:transform>
+
+                <!-- The call's own id: minted here, once, and never taken from a
+                     client header. It is the idempotency key of the call's events. -->
+                <set-variable variableName="aforoRequestId" value="#[uuid()]"/>
+                <set-variable variableName="aforoStartMs" value="#[now() as Number {unit: 'milliseconds'}]"/>
+                <set-variable variableName="aforoRequestText" value="#[null]"/>
+                <!-- MCP_SERVER: the JSON-RPC body, for tools/call detection. The
+                     payload stream is repeatable, so the API still reads it. -->
+                <choice>
+                    <when expression="#[vars.aforoCfg.productType == 'MCP_SERVER' and upper(attributes.method default '') == 'POST']">
+                        <try>
+                            <set-variable variableName="aforoRequestText" value="#[if (((attributes.headers.'content-length' default '0') as Number) > 1048576) null else ((payload.^raw default '') as String {encoding: 'UTF-8'})]"/>
+                            <error-handler>
+                                <on-error-continue type="ANY" logException="false">
+                                    <set-variable variableName="aforoRequestText" value="#[null]"/>
+                                </on-error-continue>
+                            </error-handler>
+                        </try>
+                    </when>
+                </choice>
+
+                <ee:transform>
+                    <ee:variables>
+                        <ee:set-variable variableName="aforoReq"><![CDATA[%dw 2.0
+// aforo-script: request
+// Request facts and the billing plan: who is calling (the key and its hash),
+// which metric the call bills and whether it bills anything at all. Decided
+// once, so the quota pre-flight asks about exactly what metering bills.
+import * from dw::Crypto
+import toHex from dw::core::Binaries
+import charCode from dw::core::Strings
+output application/java
+var cfg = vars.aforoCfg
+var HEX = "0123456789ABCDEF"
+fun str(v) = if (v is String) v else if ((v is Number) or (v is Boolean)) (v as String) else ""
+// First value of a header, case-insensitive; null when absent.
+fun header(hs, name) = do {
+  var all = valuesOf((if (hs is Object) hs else {}) filterObject ((v, k) -> (v != null) and (lower(k as String) == lower(name))))
+  var first = all[0]
+  ---
+  if (first == null) null else if (first is Array) str(first[0]) else str(first)
+}
+fun clean(v, max) =
+  if ((v is String) and (v != "") and (sizeOf(v) <= max) and (not (v contains /[\x00-\x1F\x7F]/))) v else null
+fun pct(ch) = do {
+  var c = charCode(ch)
+  ---
+  "%" ++ HEX[floor(c / 16)] ++ HEX[c mod 16]
+}
+// A client value that must stay on the event (a tool name): control
+// characters percent-encoded, then cut to max.
+fun escaped(v, max) = do {
+  var s = if (v is String) (v replace /[\x00-\x1F\x7F]/ with ((m) -> pct(m[0]))) else ""
+  ---
+  if (sizeOf(s) > max) s[0 to max - 1] else s
+}
+// "/health" excludes "/health" and "/health/live", not "/healthcare".
+fun isExcludedPath(path, entries) = sizeOf(entries filter ((x) ->
+  (x != "") and ((path == x) or ((path startsWith x) and ((x endsWith "/") or (path[sizeOf(x)] == "/")))))) > 0
+
+// ── MCP (JSON-RPC 2.0): one entry per tools/call, batches included ──
+// params._meta.agent_id is never read: the client does not name the agent.
+fun parseJsonRpc(text) =
+  if ((not (text is String)) or (text == "") or (sizeOf(text) > 1048576)) null
+  else do {
+    var parsed = dw::Runtime::try(() -> read(text, "application/json")).result
+    var messages = if (parsed is Array) parsed
+      else if ((parsed is Object) and (parsed.jsonrpc != null)) [parsed] else []
+    var rpc = messages filter ((m) -> (m is Object) and (m.jsonrpc == "2.0"))
+    var calls = (rpc filter ((m) -> m.method == "tools/call")) map ((m) -> do {
+      var params = if (m.params is Object) m.params else {}
+      var name = if (params.name is String) escaped(params.name, 64) else ""
+      ---
+      {
+        toolName: if (name == "") "unknown" else name,
+        id: if ((m.id is String) or (m.id is Number)) m.id else null
+      }
+    })
+    ---
+    if (isEmpty(rpc)) null else {calls: calls, other: sizeOf(rpc) - sizeOf(calls)}
+  }
+
+// ── Metric: metric-mappings (first match), then the fallback ──
+fun mappedMetric(method, path) =
+  (cfg.metricRules filter ((r) -> ((r.method == "") or (r.method == method)) and (path contains (r.re as Regex))))[0].metricName
+var method = upper(str(attributes.method))
+var path = if (str(attributes.requestPath) == "") "/" else str(attributes.requestPath)
+var defaultMetric = if (cfg.defaultMetric != "") cfg.defaultMetric else "api_calls"
+var plainMetric = mappedMetric(method, path) default defaultMetric
+// A tools/call: mappings, then an MCP_SERVER product's own default metric
+// (unless it is still api_calls), else mcp_server.tool_invocations.
+var toolMetric = mappedMetric(method, path) default
+  (if ((cfg.defaultMetric != "") and (cfg.defaultMetric != "api_calls")) cfg.defaultMetric else "mcp_server.tool_invocations")
+
+var isMcp = cfg.productType == "MCP_SERVER"
+var jsonrpc = if (isMcp and (method == "POST")) parseJsonRpc(vars.aforoRequestText) else null
+var tools = isMcp and (jsonrpc != null) and (sizeOf(jsonrpc.calls) > 0)
+// MCP_SERVER bills tool calls only: initialize, tools/list, ping and
+// notifications are protocol traffic, never billed and never refused.
+var plain = not isMcp
+var excluded = isExcludedPath(path, cfg.excludePaths)
+var cors = (method == "OPTIONS") and (header(attributes.headers, "access-control-request-method") != null)
+
+var rawKey = header(attributes.headers, cfg.keyHeader)
+var key = trim(rawKey default "")
+var keyProblem = if (key == "") "missing"
+  else if ((sizeOf(key) > 1024) or (key contains /[\x00-\x1F\x7F]/)) "invalid" else null
+---
+{
+  requestId: vars.aforoRequestId,
+  startMs: vars.aforoStartMs,
+  method: method,
+  path: path,
+  excluded: excluded,
+  cors: cors,
+  key: if (keyProblem == null) key else null,
+  keyHash: if (keyProblem == null) lower(toHex(hashWith(key as Binary {encoding: "UTF-8"}, "SHA-256"))) else null,
+  keyProblem: keyProblem,
+  // The client's trace context: informational only, it never names the
+  // trace and never changes the product type.
+  trace: {
+    traceparent: clean(header(attributes.headers, "traceparent"), 128),
+    tracestate: clean(header(attributes.headers, "tracestate"), 512),
+    xTraceId: clean(header(attributes.headers, "x-trace-id"), 128),
+    xRequestId: clean(header(attributes.headers, "x-request-id"), 128)
+  },
+  plan: {
+    productType: cfg.productType,
+    tools: tools,
+    plain: plain,
+    calls: if (tools) jsonrpc.calls else [],
+    otherMessages: if (jsonrpc != null) jsonrpc.other else 0,
+    metric: plainMetric,
+    toolMetric: if (tools) toolMetric else null,
+    // The pre-flight check: only the metric this call bills, and nothing for
+    // a call that bills nothing.
+    quotaMetric: if (excluded or cors) null else if (tools) toolMetric else if (plain) plainMetric else null
+  }
+}]]></ee:set-variable>
+                    </ee:variables>
+                </ee:transform>
+
+                <!-- ── 2. Identity ── -->
+                <set-variable variableName="aforoIdentityCached" value="#['']"/>
+                <choice>
+                    <when expression="#[vars.aforoReq.keyHash != null]">
+                        <try>
+                            <os:retrieve key="#[vars.aforoReq.keyHash]" objectStore="{{{policyId}}}-aforo-identity" target="aforoIdentityCached">
+                                <os:default-value>#['']</os:default-value>
+                            </os:retrieve>
+                            <error-handler>
+                                <on-error-continue type="ANY" logException="false">
+                                    <set-variable variableName="aforoIdentityCached" value="#['']"/>
+                                </on-error-continue>
+                            </error-handler>
+                        </try>
+                    </when>
+                </choice>
+                <ee:transform>
+                    <ee:variables>
+                        <ee:set-variable variableName="aforoIdLookup"><![CDATA[%dw 2.0
+// aforo-script: identity-lookup
+// What the cache knows about this key, and whether Aforo must be asked.
+//   fresh positive: age < identity-cache-ttl-s and before expiresAt
+//   fresh negative: age < identity-negative-ttl-s
+//   stale usable:   positive, age <= identity-stale-ttl-s, before expiresAt
+output application/java
+var cfg = vars.aforoCfg
+var req = vars.aforoReq
+var now = req.startMs
+var text = if (vars.aforoIdentityCached is String) vars.aforoIdentityCached else ""
+var parsed = if (text == "") null else dw::Runtime::try(() -> read(text, "application/json")).result
+var entry = if ((parsed is Object) and (parsed.v == 1) and (parsed.storedAtMs is Number) and (parsed.active is Boolean)) parsed else null
+var age = if (entry == null) 0 else now - entry.storedAtMs
+var beforeExpiry = (entry != null) and ((entry.expiresAtMs == null) or (now < entry.expiresAtMs))
+var freshPositive = (entry != null) and (entry.active == true) and beforeExpiry and (age >= 0) and (age < cfg.identityTtlS * 1000)
+var freshNegative = (entry != null) and (entry.active == false) and (age >= 0) and (age < cfg.identityNegativeTtlS * 1000)
+var staleUsable = (entry != null) and (entry.active == true) and beforeExpiry and (age <= cfg.identityStaleTtlS * 1000)
+---
+{
+  entry: entry,
+  fresh: freshPositive or freshNegative,
+  staleUsable: staleUsable,
+  introspect: isEmpty(cfg.problems) and (req.keyProblem == null) and (not (freshPositive or freshNegative))
+}]]></ee:set-variable>
+                    </ee:variables>
+                </ee:transform>
+                <set-variable variableName="aforoIntrospection" value="#[null]"/>
+                <choice>
+                    <when expression="#[vars.aforoIdLookup.introspect == true]">
+                        <try>
+                            <http:request config-ref="{{{policyId}}}-aforo-http" method="POST" url="#[vars.aforoCfg.introspectUrl]"
+                                          responseTimeout="#[vars.aforoCfg.introspectTimeoutMs]" followRedirects="false"
+                                          outputMimeType="text/plain" target="aforoIntrospection"
+                                          targetValue="#[{status: attributes.statusCode, text: (payload default '') as String}]">
+                                <http:body><![CDATA[#[output application/json --- {key: vars.aforoReq.key}]]]></http:body>
+                                <http:headers><![CDATA[#[{'Content-Type': 'application/json', 'X-API-Key': vars.aforoCfg.apiKey}]]]></http:headers>
+                                <http:response-validator>
+                                    <http:success-status-code-validator values="100..599"/>
+                                </http:response-validator>
+                            </http:request>
+                            <error-handler>
+                                <on-error-continue type="ANY" logException="false">
+                                    <set-variable variableName="aforoIntrospection" value="#[{status: 0, error: error.description default 'no response'}]"/>
+                                </on-error-continue>
+                            </error-handler>
+                        </try>
+                    </when>
+                </choice>
+                <ee:transform>
+                    <ee:variables>
+                        <ee:set-variable variableName="aforoAccess"><![CDATA[%dw 2.0
+// aforo-script: identity-decide
+// The access decision (MC2), and what to cache.
+//   outcome "allow"              identified: quota, then upstream, then metered
+//   outcome "allow-unidentified" identity-fail-open: upstream, not metered
+//   outcome "reject"             answered here: {status, headers, body}
+output application/java
+var cfg = vars.aforoCfg
+var req = vars.aforoReq
+var lookup = vars.aforoIdLookup
+var resp = vars.aforoIntrospection
+var now = req.startMs
+fun str(v) = if (v is String) v else if ((v is Number) or (v is Boolean)) (v as String) else ""
+fun clean(v, max) =
+  if ((v is String) and (v != "") and (sizeOf(v) <= max) and (not (v contains /[\x00-\x1F\x7F]/))) v else null
+fun reject(status, message, headers, reason) =
+  {outcome: "reject", status: status, headers: headers, body: {message: message}, reason: reason}
+fun epochMs(v) =
+  if (v is Number) (if (v > 100000000000) v else v * 1000)
+  else if ((v is String) and (trim(v) != "")) (
+    dw::Runtime::try(() -> (v as DateTime) as Number {unit: "milliseconds"}).result default
+    (dw::Runtime::try(() -> ((v as LocalDateTime) ++ |Z|) as Number {unit: "milliseconds"}).result default null))
+  else null
+
+// The introspection answer: {kind: active|inactive|failed, ...}.
+// {"active":...} or the platform's {"success":..,"data":{"active":...}}.
+var answer =
+  if (resp == null) {kind: "none"}
+  else if (resp.status != 200) {
+    kind: "failed",
+    reason: if (resp.status == 0) ("no response: " ++ str(resp.error))
+      else if ((resp.status == 401) or (resp.status == 403)) ("HTTP " ++ str(resp.status) ++ ": Aforo refused aforo-api-key (it needs scope usage:ingest)")
+      else ("HTTP " ++ str(resp.status))
+  }
+  else do {
+    var parsed = dw::Runtime::try(() -> read(str(resp.text), "application/json")).result
+    var body = if ((parsed is Object) and (parsed.data is Object)) parsed.data else parsed
+    var expiresAtMs = if (body is Object) epochMs(body.expiresAt) else null
+    var customerId = if (body is Object) clean(str(body.customerId), 64) else null
+    var productIds = if (body is Object)
+      (((if (body.productIds is Array) body.productIds else []) ++ (if (body.productId != null) [body.productId] else []))
+        map trim(str($))) filter ($ != "")
+      else []
+    ---
+    if (not (body is Object)) {kind: "failed", reason: "unreadable introspection answer"}
+    else if (body.active == false) {kind: "inactive"}
+    else if (body.active != true) {kind: "failed", reason: "introspection answer has no active field"}
+    else if ((expiresAtMs != null) and (expiresAtMs <= now)) {kind: "inactive"}
+    else if (customerId == null) {kind: "failed", reason: "active key without a usable customerId"}
+    else {
+      kind: "active",
+      entry: {
+        v: 1,
+        active: true,
+        customerId: customerId,
+        productIds: productIds,
+        keyId: clean(str(body.keyId), 128),
+        subscriptionId: clean(str(body.subscriptionId), 128),
+        productType: clean(str(body.productType), 20),
+        expiresAtMs: expiresAtMs,
+        storedAtMs: now
+      }
+    }
+  }
+
+fun fromEntry(entry, source) =
+  if (entry.active != true) reject(401, "Invalid authentication credentials", {}, "inactive key (" ++ source ++ ")")
+  else if (not ((entry.productIds default []) contains cfg.productId))
+    reject(403, "This API key does not grant access to this API", {}, "key does not cover product " ++ cfg.productId ++ " (" ++ source ++ ")")
+  else {
+    outcome: "allow",
+    source: source,
+    identity: {
+      customerId: entry.customerId,
+      keyId: entry.keyId,
+      subscriptionId: entry.subscriptionId
+    }
+  }
+
+var decision =
+  if (not isEmpty(cfg.problems))
+    reject(503, "Aforo policy is not configured", {"Retry-After": "60"}, "configuration: " ++ (cfg.problems joinBy "; "))
+  else if (req.keyProblem == "missing") reject(401, "No API key found in request", {}, "no key")
+  else if (req.keyProblem != null) reject(401, "Invalid authentication credentials", {}, "unusable key")
+  else if (lookup.fresh) fromEntry(lookup.entry, "cache")
+  else if (answer.kind == "active") fromEntry(answer.entry, "introspection")
+  else if (answer.kind == "inactive") reject(401, "Invalid authentication credentials", {}, "inactive key (introspection)")
+  else if (lookup.staleUsable) fromEntry(lookup.entry, "stale cache")
+  else if (cfg.identityFailOpen) {outcome: "allow-unidentified", source: "fail-open"}
+  else reject(503, "Access check unavailable", {"Retry-After": "5"}, "introspection unavailable")
+
+var cacheWrite =
+  if (answer.kind == "active")
+    (if ((cfg.identityTtlS > 0) or (cfg.identityStaleTtlS > 0)) answer.entry else null)
+  else if (answer.kind == "inactive")
+    (if (cfg.identityNegativeTtlS > 0) {v: 1, active: false, storedAtMs: now} else null)
+  else null
+
+var quota =
+  if ((decision.outcome == "allow") and cfg.quotaEnabled and (req.plan.quotaMetric != null) and (cfg.quotaUrl != ""))
+    {
+      metricName: req.plan.quotaMetric,
+      customerId: decision.identity.customerId,
+      cacheKey: "quota|" ++ decision.identity.customerId ++ "|" ++ req.plan.quotaMetric
+    }
+  else null
+---
+decision ++ {
+  cacheWrite: if (cacheWrite == null) null else write(cacheWrite, "application/json", {indent: false}),
+  quota: quota,
+  warn:
+    if (answer.kind == "failed")
+      {kind: "introspection", message: "[aforo-metering] introspection failed (" ++ answer.reason ++ "): " ++
+        (if (decision.outcome == "allow") "using the cached answer"
+         else if (decision.outcome == "allow-unidentified") "identity-fail-open is on, the call passes unchecked and unmetered"
+         else "answering " ++ str(decision.status)) ++ ". Repeats suppressed for 60 s."}
+    else if ((decision.reason default "") startsWith "configuration")
+      {kind: "configuration", message: "[aforo-metering] policy not configured: " ++ (cfg.problems joinBy "; ") ++ ". Every call gets 503."}
+    else if (not isEmpty(cfg.warnings))
+      {kind: "configuration", message: "[aforo-metering] " ++ (cfg.warnings joinBy "; ")}
+    else null
+}]]></ee:set-variable>
+                    </ee:variables>
+                </ee:transform>
+                <choice>
+                    <when expression="#[vars.aforoAccess.cacheWrite != null]">
+                        <try>
+                            <os:store key="#[vars.aforoReq.keyHash]" objectStore="{{{policyId}}}-aforo-identity">
+                                <os:value>#[vars.aforoAccess.cacheWrite]</os:value>
+                            </os:store>
+                            <error-handler>
+                                <on-error-continue type="ANY" logException="false"/>
+                            </error-handler>
+                        </try>
+                    </when>
+                </choice>
+                <choice>
+                    <when expression="#[vars.aforoAccess.warn != null]">
+                        <try>
+                            <os:retrieve key="#['warn|' ++ vars.aforoAccess.warn.kind]" objectStore="{{{policyId}}}-aforo-state" target="aforoWarnedAt">
+                                <os:default-value>#[0]</os:default-value>
+                            </os:retrieve>
+                            <choice>
+                                <when expression="#[(vars.aforoStartMs - (vars.aforoWarnedAt default 0)) >= 60000]">
+                                    <logger level="WARN" message="#[vars.aforoAccess.warn.message]"/>
+                                    <os:store key="#['warn|' ++ vars.aforoAccess.warn.kind]" objectStore="{{{policyId}}}-aforo-state">
+                                        <os:value>#[vars.aforoStartMs]</os:value>
+                                    </os:store>
+                                </when>
+                            </choice>
+                            <error-handler>
+                                <on-error-continue type="ANY" logException="false"/>
+                            </error-handler>
+                        </try>
+                    </when>
+                </choice>
+
+                <!-- ── 3. Quota pre-flight ── -->
+                <choice>
+                    <when expression="#[vars.aforoAccess.quota != null]">
+                        <set-variable variableName="aforoQuotaCached" value="#['']"/>
+                        <try>
+                            <os:retrieve key="#[vars.aforoAccess.quota.cacheKey]" objectStore="{{{policyId}}}-aforo-state" target="aforoQuotaCached">
+                                <os:default-value>#['']</os:default-value>
+                            </os:retrieve>
+                            <error-handler>
+                                <on-error-continue type="ANY" logException="false">
+                                    <set-variable variableName="aforoQuotaCached" value="#['']"/>
+                                </on-error-continue>
+                            </error-handler>
+                        </try>
+                        <ee:transform>
+                            <ee:variables>
+                                <ee:set-variable variableName="aforoQuotaLookup"><![CDATA[%dw 2.0
+// aforo-script: quota-lookup
+// A cached ALLOW or WARN younger than 1 s answers the check; DENY is never
+// cached, so a top-up unblocks the customer at once.
+output application/java
+var now = vars.aforoReq.startMs
+var text = if (vars.aforoQuotaCached is String) vars.aforoQuotaCached else ""
+var parsed = if (text == "") null else dw::Runtime::try(() -> read(text, "application/json")).result
+var fresh = (parsed is Object) and (["ALLOW", "WARN"] contains parsed.decision) and (parsed.storedAtMs is Number)
+  and ((now - parsed.storedAtMs) >= 0) and ((now - parsed.storedAtMs) < vars.aforoCfg.quotaCacheTtlMs)
+---
+{
+  call: not fresh,
+  cachedDecision: if (fresh) parsed.decision else null
+}]]></ee:set-variable>
+                            </ee:variables>
+                        </ee:transform>
+                        <set-variable variableName="aforoQuotaResponse" value="#[null]"/>
+                        <choice>
+                            <when expression="#[vars.aforoQuotaLookup.call == true]">
+                                <try>
+                                    <http:request config-ref="{{{policyId}}}-aforo-http" method="POST" url="#[vars.aforoCfg.quotaUrl]"
+                                                  responseTimeout="#[vars.aforoCfg.quotaTimeoutMs]" followRedirects="false"
+                                                  outputMimeType="text/plain" target="aforoQuotaResponse"
+                                                  targetValue="#[{status: attributes.statusCode, text: (payload default '') as String}]">
+                                        <http:body><![CDATA[#[output application/json --- {customerId: vars.aforoAccess.quota.customerId, metricName: vars.aforoAccess.quota.metricName}]]]></http:body>
+                                        <http:headers><![CDATA[#[{'Content-Type': 'application/json', 'X-API-Key': vars.aforoCfg.apiKey, 'X-Tenant-Id': vars.aforoCfg.tenantId}]]]></http:headers>
+                                        <http:response-validator>
+                                            <http:success-status-code-validator values="100..599"/>
+                                        </http:response-validator>
+                                    </http:request>
+                                    <error-handler>
+                                        <on-error-continue type="ANY" logException="false">
+                                            <set-variable variableName="aforoQuotaResponse" value="#[{status: 0, error: error.description default 'no response'}]"/>
+                                        </on-error-continue>
+                                    </error-handler>
+                                </try>
+                            </when>
+                        </choice>
+                        <ee:transform>
+                            <ee:variables>
+                                <ee:set-variable variableName="aforoQuota"><![CDATA[%dw 2.0
+// aforo-script: quota-decide
+// The answer of POST /api/v1/quota/check, as Kong's preflight-quota.lua reads it:
+//   DENY        429, Retry-After = max(1, ceil(retryAfterMs / 1000)) (60 when
+//               none), the same number in {message, retryAfter}
+//   ALLOW/WARN  let through, cached 1 s
+//   no answer   fail open (quota-fail-open, the default), else 503
+output application/java
+var cfg = vars.aforoCfg
+var lookup = vars.aforoQuotaLookup
+var resp = vars.aforoQuotaResponse
+var now = vars.aforoReq.startMs
+fun str(v) = if (v is String) v else if ((v is Number) or (v is Boolean)) (v as String) else ""
+var parsed = if ((resp != null) and (resp.status == 200)) dw::Runtime::try(() -> read(str(resp.text), "application/json")).result else null
+var data = if ((parsed is Object) and (parsed.data is Object)) parsed.data else parsed
+var problem =
+  if (not lookup.call) null
+  else if (resp == null) "no response"
+  else if (resp.status == 0) ("no response: " ++ str(resp.error))
+  else if ((resp.status == 401) or (resp.status == 403)) ("HTTP " ++ str(resp.status) ++ ": the ingestor refused aforo-api-key / aforo-tenant-id")
+  else if (resp.status != 200) ("HTTP " ++ str(resp.status))
+  else if (not ((data is Object) and (data.decision is String))) "no decision in the answer"
+  else null
+var ms = if ((data is Object) and (data.retryAfterMs is Number)) data.retryAfterMs
+  else if (data is Object) (dw::Runtime::try(() -> str(data.retryAfterMs) as Number).result default 0) else 0
+var retryAfter = if (ms > 0) max([1, ceil(ms / 1000)]) else 60
+// Headers the ingestor asks to pass on (X-RateLimit-*), text values only.
+var extraHeaders = if ((data is Object) and (data.headers is Object))
+  (data.headers filterObject ((v, k) -> (v is String) or (v is Number))) mapObject ((v, k) -> {(k): str(v)})
+  else {}
+---
+if (not lookup.call) {outcome: "allow", decision: lookup.cachedDecision, source: "cache", cacheWrite: null, warn: null}
+else if (problem != null) (
+  if (cfg.quotaFailOpen)
+    {outcome: "allow", decision: "UNAVAILABLE", source: "fail-open", cacheWrite: null,
+     warn: {kind: "quota", message: "[aforo-metering] quota check unavailable (" ++ problem ++ "): failing OPEN, quota NOT enforced. Repeats suppressed for 60 s."}}
+  else
+    {outcome: "reject", status: 503, headers: {"Retry-After": "1"}, body: {message: "Quota check unavailable"},
+     reason: "quota check unavailable", cacheWrite: null,
+     warn: {kind: "quota", message: "[aforo-metering] quota check unavailable (" ++ problem ++ "): quota-fail-open is false, answering 503. Repeats suppressed for 60 s."}})
+else if (data.decision == "DENY")
+  {outcome: "reject", status: 429,
+   headers: (extraHeaders - "Retry-After" - "retry-after" - "Content-Type" - "content-type") ++ {"Retry-After": str(retryAfter)},
+   body: {message: if ((data.reason is String) and (data.reason != "")) data.reason else "Quota exceeded", retryAfter: retryAfter},
+   reason: "quota DENY", cacheWrite: null, warn: null}
+else
+  {outcome: "allow", decision: data.decision, source: "quota-check",
+   cacheWrite: if (["ALLOW", "WARN"] contains data.decision) write({decision: data.decision, storedAtMs: now}, "application/json", {indent: false}) else null,
+   warn: null}]]></ee:set-variable>
+                            </ee:variables>
+                        </ee:transform>
+                        <choice>
+                            <when expression="#[vars.aforoQuota.cacheWrite != null]">
+                                <try>
+                                    <os:store key="#[vars.aforoAccess.quota.cacheKey]" objectStore="{{{policyId}}}-aforo-state">
+                                        <os:value>#[vars.aforoQuota.cacheWrite]</os:value>
+                                    </os:store>
+                                    <error-handler>
+                                        <on-error-continue type="ANY" logException="false"/>
+                                    </error-handler>
+                                </try>
+                            </when>
+                        </choice>
+                        <choice>
+                            <when expression="#[vars.aforoQuota.warn != null]">
+                                <try>
+                                    <os:retrieve key="#['warn|' ++ vars.aforoQuota.warn.kind]" objectStore="{{{policyId}}}-aforo-state" target="aforoWarnedAt">
+                                        <os:default-value>#[0]</os:default-value>
+                                    </os:retrieve>
+                                    <choice>
+                                        <when expression="#[(vars.aforoStartMs - (vars.aforoWarnedAt default 0)) >= 60000]">
+                                            <logger level="WARN" message="#[vars.aforoQuota.warn.message]"/>
+                                            <os:store key="#['warn|' ++ vars.aforoQuota.warn.kind]" objectStore="{{{policyId}}}-aforo-state">
+                                                <os:value>#[vars.aforoStartMs]</os:value>
+                                            </os:store>
+                                        </when>
+                                    </choice>
+                                    <error-handler>
+                                        <on-error-continue type="ANY" logException="false"/>
+                                    </error-handler>
+                                </try>
+                            </when>
+                        </choice>
+                        <choice>
+                            <when expression="#[vars.aforoQuota.outcome == 'reject']">
+                                <set-variable variableName="aforoAccess" value="#[vars.aforoQuota]"/>
+                            </when>
+                        </choice>
+                    </when>
+                </choice>
+
+                <error-handler>
+                    <on-error-continue type="ANY" logException="true">
+                        <logger level="ERROR" message="#['[aforo-metering] access check failed, answering 503: ' ++ (error.description default 'unknown error')]"/>
+                        <set-variable variableName="aforoAccess" value="#[{outcome: 'reject', status: 503, headers: {'Retry-After': '5'}, body: {message: 'Access check unavailable'}, reason: 'policy error'}]"/>
+                    </on-error-continue>
+                </error-handler>
+            </try>
+
+            <choice>
+                <!-- ═════ 4. Refused: answered here. No upstream call, no usage. ═════ -->
+                <when expression="#[vars.aforoAccess.outcome == 'reject']">
+                    <ee:transform>
+                        <ee:message>
+                            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+vars.aforoAccess.body]]></ee:set-payload>
+                            <ee:set-attributes><![CDATA[%dw 2.0
+// The listener builds the response from HttpPolicyResponseAttributes.
+output application/java
+---
+{
+  statusCode: vars.aforoAccess.status as Number,
+  headers: (vars.aforoAccess.headers default {}) ++ {"Content-Type": "application/json"}
+} as Object {class: "org.mule.extension.http.api.policy.HttpPolicyResponseAttributes"}]]></ee:set-attributes>
+                        </ee:message>
+                    </ee:transform>
+                </when>
+                <otherwise>
+                    <!-- ═════ 5. Remove the key header from the request the API gets ═════
+                         new HttpRequestAttributesBuilder(attributes).headers(copy
+                         without the key).build(), as MuleSoft's http-transform
+                         remove-headers does. If the runtime refuses it, the call
+                         still goes through, with the header, and a WARN says so. -->
+                    <try>
+                        <java:new class="org.mule.runtime.http.api.domain.CaseInsensitiveMultiMap" constructor="CaseInsensitiveMultiMap(MultiMap)" target="aforoForwardHeaders">
+                            <java:args>#[{arg0: attributes.headers}]</java:args>
+                        </java:new>
+                        <java:invoke instance="#[vars.aforoForwardHeaders]" class="org.mule.runtime.api.util.MultiMap" method="removeAll(Object)" target="aforoRemovedKey">
+                            <java:args>#[{arg0: vars.aforoCfg.keyHeader}]</java:args>
+                        </java:invoke>
+                        <java:new class="org.mule.extension.http.api.HttpRequestAttributesBuilder" constructor="HttpRequestAttributesBuilder(HttpRequestAttributes)" target="aforoForwardBuilder">
+                            <java:args>#[{arg0: attributes}]</java:args>
+                        </java:new>
+                        <java:invoke instance="#[vars.aforoForwardBuilder]" class="org.mule.extension.http.api.HttpRequestAttributesBuilder" method="headers(MultiMap)" target="aforoForwardBuilder">
+                            <java:args>#[{arg0: vars.aforoForwardHeaders}]</java:args>
+                        </java:invoke>
+                        <java:invoke instance="#[vars.aforoForwardBuilder]" class="org.mule.extension.http.api.HttpRequestAttributesBuilder" method="build()" target="aforoForwardAttributes"/>
+                        <ee:transform>
+                            <ee:message>
+                                <ee:set-attributes><![CDATA[%dw 2.0
+output application/java
+---
+vars.aforoForwardAttributes]]></ee:set-attributes>
+                            </ee:message>
+                        </ee:transform>
+                        <error-handler>
+                            <on-error-continue type="ANY" logException="false">
+                                <logger level="WARN" message="#['[aforo-metering] could not remove the ' ++ (vars.aforoCfg.keyHeader default 'key') ++ ' header before the upstream: ' ++ (error.description default 'unknown error')]"/>
+                            </on-error-continue>
+                        </error-handler>
+                    </try>
+
+                    <!-- ═════ 6. The API ═════ -->
+                    <set-variable variableName="aforoFlowFailed" value="#[false]"/>
+                    <try>
+                        <http-policy:execute-next/>
+                        <error-handler>
+                            <!-- The API failed (an APIkit 404, a 5xx): its error response
+                                 still reaches the client unchanged; meter it, then
+                                 propagate the same error. -->
+                            <on-error-propagate type="ANY" logException="false">
+                                <set-variable variableName="aforoFlowFailed" value="#[true]"/>
+                                <!-- >>> METER BLOCK (copy 1 of 2; tests/policy.test.cjs keeps the copies identical) -->
+                                <try>
+                                    <choice>
+                                        <when expression="#[vars.aforoAccess.outcome == 'allow']">
+                                            <set-variable variableName="aforoEndMs" value="#[now() as Number {unit: 'milliseconds'}]"/>
+                                            <ee:transform>
+                                                <ee:variables>
+                                                    <ee:set-variable variableName="aforoEvents"><![CDATA[%dw 2.0
+// aforo-script: events
+// The usage events of one call, built once. Trusted sources only: the
+// introspected customer, the policy configuration, the gateway's own request
+// id, and the upstream's RESPONSE headers (the client cannot set them).
+//   API          one event
+//   AGENTIC_API  traceId = trace-id-header (X-Aforo-Trace-Id), else the request id
+//   AI_AGENT     agentId = X-Aforo-Agent-Id, else agent-id, else the product id;
+//                sessionId = X-Aforo-Session-Id, else the request id; traceId = sessionId
+//   MCP_SERVER   one event per tools/call; agentId = X-Aforo-Agent-Id, else the
+//                customer; sessionId = X-Aforo-Session-Id, else the upstream's
+//                Mcp-Session-Id (hashed when too long)
+// A present but unusable identity header skips the event rather than billing
+// a different identity.
+import * from dw::Crypto
+import toHex from dw::core::Binaries
+import charCode from dw::core::Strings
+output application/java
+var cfg = vars.aforoCfg
+var req = vars.aforoReq
+var plan = req.plan
+var identity = vars.aforoAccess.identity
+var MAX = {customerId: 64, metricName: 255, idempotencyKey: 255, agentId: 36, sessionId: 64,
+  productType: 20, traceId: 128, toolName: 64}
+var REQUIRED = {API: [], AGENTIC_API: ["traceId"], AI_AGENT: ["agentId", "sessionId"], MCP_SERVER: ["toolName", "agentId"]}
+var HEX = "0123456789ABCDEF"
+fun str(v) = if (v is String) v else if ((v is Number) or (v is Boolean)) (v as String) else ""
+fun header(hs, name) = do {
+  var all = valuesOf((if (hs is Object) hs else {}) filterObject ((v, k) -> (v != null) and (lower(k as String) == lower(name))))
+  var first = all[0]
+  ---
+  if (first == null) null else if (first is Array) str(first[0]) else str(first)
+}
+fun clean(v, max) =
+  if ((v is String) and (v != "") and (sizeOf(v) <= max) and (not (v contains /[\x00-\x1F\x7F]/))) v else null
+fun pct(ch) = do {
+  var c = charCode(ch)
+  ---
+  "%" ++ HEX[floor(c / 16)] ++ HEX[c mod 16]
+}
+fun escaped(v, max) = do {
+  var s = if (v is String) (v replace /[\x00-\x1F\x7F]/ with ((m) -> pct(m[0]))) else ""
+  ---
+  if (sizeOf(s) > max) s[0 to max - 1] else s
+}
+// An upstream response header naming who or what is billed:
+// {value} usable, {} absent, {bad: name} present but unusable.
+fun upstream(name, max) = do {
+  var raw = header(attributes.headers, name)
+  ---
+  if ((raw == null) or (raw == "")) {} else if (clean(raw, max) != null) {value: raw} else {bad: name}
+}
+fun sha256(s) = lower(toHex(hashWith(s as Binary {encoding: "UTF-8"}, "SHA-256")))
+fun outcomeOf(status) =
+  if ((not (status is Number)) or (status < 200) or (status > 599)) null
+  else if (cfg.statusOutcomes[(floor(status) as String)] != null) cfg.statusOutcomes[(floor(status) as String)]
+  else if (status < 400) "SUCCESS"
+  else if ((status == 408) or (status == 504)) "TIMEOUT"
+  else if (status == 499) "CANCELLED"
+  else if ((status == 400) or (status == 422)) "VALIDATION_FAILED"
+  else if ((status == 401) or (status == 403) or (status == 429)) "BLOCKED"
+  else "ERROR"
+
+var status = if (attributes.statusCode is Number) attributes.statusCode else if (vars.aforoFlowFailed == true) 500 else 0
+var requestId = str(req.requestId)
+var elapsed = if ((vars.aforoEndMs is Number) and (req.startMs is Number) and (vars.aforoEndMs >= req.startMs)) vars.aforoEndMs - req.startMs else 0
+var occurredAt = ((((if (vars.aforoEndMs is Number) vars.aforoEndMs else req.startMs) as DateTime {unit: "milliseconds"}) >> "UTC")
+  as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"})
+var customerId = if (identity == null) null else clean(str(identity.customerId), MAX.customerId)
+var metricHeader = upstream("X-Aforo-Metric", MAX.metricName)
+
+var skipReason =
+  if (customerId == null) "no verified customer"
+  else if (req.excluded) "excluded path"
+  else if (cfg.excludeStatusCodes contains status) "excluded status code"
+  else if (req.cors) "CORS preflight"
+  else if (requestId == "") "no request id"
+  else if ((not plan.tools) and (not plan.plain)) "nothing billable (no tools/call)"
+  else if (metricHeader.bad != null) "unusable X-Aforo-Metric response header"
+  else null
+
+// ── MCP tool calls ──
+var mcpAgent = upstream("X-Aforo-Agent-Id", MAX.agentId)
+var mcpSessionHeader = upstream("X-Aforo-Session-Id", MAX.sessionId)
+var rawMcpSession = header(attributes.headers, "Mcp-Session-Id")
+var mcpSession =
+  if (mcpSessionHeader.bad != null) mcpSessionHeader
+  else if (mcpSessionHeader.value != null) mcpSessionHeader
+  else if ((rawMcpSession == null) or (rawMcpSession == "")) {}
+  else if (clean(rawMcpSession, MAX.sessionId) != null) {value: rawMcpSession}
+  else {value: "mcp-" ++ (sha256(rawMcpSession)[0 to 55])}
+var toolProblem =
+  if (not plan.tools) null
+  else if (mcpAgent.bad != null) "unusable " ++ mcpAgent.bad ++ " response header"
+  else if (mcpSession.bad != null) "unusable " ++ mcpSession.bad ++ " response header"
+  else null
+var toolEvents = if ((skipReason != null) or (not plan.tools) or (toolProblem != null)) []
+  else (plan.calls default []) map ((call, i) -> do {
+    var tool = do {
+      var t = escaped(str(call.toolName), MAX.toolName)
+      ---
+      if (t == "") "unknown" else t
+    }
+    ---
+    {
+      productType: "MCP_SERVER",
+      customerId: customerId,
+      metricName: metricHeader.value default plan.toolMetric,
+      quantity: 1,
+      idempotencyKey: "mcp:" ++ cfg.tenantId ++ ":" ++ requestId ++ ":" ++ ((i + 1) as String) ++ ":" ++ tool,
+      occurredAt: occurredAt,
+      toolName: tool,
+      agentId: mcpAgent.value default customerId,
+      (sessionId: mcpSession.value) if (mcpSession.value != null),
+      executionDurationMs: elapsed
+    }
+  })
+
+// ── The call itself (API, AGENTIC_API, AI_AGENT) ──
+var quantityRaw = header(attributes.headers, cfg.quantityHeader)
+var quantityNum = if ((quantityRaw != null) and (trim(quantityRaw) matches /[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?/))
+  dw::Runtime::try(() -> trim(quantityRaw) as Number).result else null
+var quantity = if ((quantityNum != null) and (quantityNum > 0)) quantityNum else 1
+var aiAgent = upstream("X-Aforo-Agent-Id", MAX.agentId)
+var aiSession = upstream("X-Aforo-Session-Id", MAX.sessionId)
+var traceHeader = upstream(cfg.traceIdHeader, MAX.traceId)
+var plainProblem =
+  if (not plan.plain) null
+  else if ((plan.productType == "AI_AGENT") and (aiAgent.bad != null)) "unusable " ++ aiAgent.bad ++ " response header"
+  else if ((plan.productType == "AI_AGENT") and (aiSession.bad != null)) "unusable " ++ aiSession.bad ++ " response header"
+  else if ((plan.productType == "AGENTIC_API") and (traceHeader.bad != null)) "unusable " ++ traceHeader.bad ++ " response header"
+  else null
+var aiSessionId = aiSession.value default requestId
+var plainEvents = if ((skipReason != null) or (not plan.plain) or (plainProblem != null)) []
+  else [{
+    productType: plan.productType,
+    customerId: customerId,
+    metricName: metricHeader.value default plan.metric,
+    quantity: quantity,
+    idempotencyKey: requestId,
+    occurredAt: occurredAt,
+    (traceId: traceHeader.value default requestId) if (plan.productType == "AGENTIC_API"),
+    (agentId: aiAgent.value default (if (cfg.agentId != "") cfg.agentId else clean(cfg.productId, MAX.agentId))) if (plan.productType == "AI_AGENT"),
+    (sessionId: aiSessionId) if (plan.productType == "AI_AGENT"),
+    (traceId: aiSessionId) if (plan.productType == "AI_AGENT")
+  }]
+
+// ── Common fields, then the checks the ingestor would apply ──
+var endpointPath = do {
+  var p = escaped(req.path, 512)
+  ---
+  if (p == "") "/" else p
+}
+var executionStatus = outcomeOf(status)
+var built = (toolEvents ++ plainEvents) map ((e) -> e ++ {
+  endpointPath: endpointPath,
+  httpMethod: if (sizeOf(req.method default "") > 16) req.method[0 to 15] else (req.method default ""),
+  statusCode: status,
+  responseTimeMs: elapsed,
+  (executionStatus: executionStatus) if (executionStatus != null),
+  trace: req.trace,
+  metadata: {
+    gateway: "mulesoft",
+    method: req.method,
+    path: endpointPath,
+    status: status,
+    endpoint_path: endpointPath,
+    http_method: req.method,
+    status_code: status,
+    response_time_ms: elapsed,
+    productId: cfg.productId,
+    (keyId: identity.keyId) if ((identity != null) and (identity.keyId != null))
+  }
+})
+fun problemOf(e) = do {
+  var tooLong = (keysOf(MAX) map ($ as String)) filter ((f) -> (e[f] is String) and (sizeOf(e[f]) > MAX[f]))
+  var missing = (REQUIRED[e.productType] default []) filter ((f) -> (e[f] == null) or (e[f] == ""))
+  var q = e.quantity
+  ---
+  if (not isEmpty(tooLong)) (tooLong[0] ++ " is longer than " ++ (MAX[tooLong[0]] as String) ++ " characters")
+  else if (not isEmpty(missing)) ("productType " ++ e.productType ++ " requires " ++ missing[0])
+  else if ((not (q is Number)) or (q <= 0) or (q >= 100000000000000)) "quantity not > 0 or too large"
+  else null
+}
+var checked = built map ((e) -> do {
+  var q = if (e.quantity is Number) (round(e.quantity * 1000000) / 1000000) else e.quantity
+  var rounded = (e - "quantity") ++ {quantity: q}
+  ---
+  {event: rounded, problem: problemOf(rounded)}
+})
+var ready = (checked filter ($.problem == null)) map $.event
+var dropped = ((checked filter ($.problem != null)) map $.problem)
+  ++ (if (toolProblem != null) [toolProblem] else []) ++ (if (plainProblem != null) [plainProblem] else [])
+---
+{
+  events: ready,
+  payload: if (isEmpty(ready)) null else write({events: ready}, "application/json", {indent: false}),
+  skipReason: if (skipReason != null) skipReason else if (isEmpty(ready)) (dropped joinBy "; ") else null,
+  dropped: dropped
+}]]></ee:set-variable>
+                                                </ee:variables>
+                                            </ee:transform>
+                                            <choice>
+                                                <when expression="#[vars.aforoEvents.payload != null]">
+                                                    <!-- Backlog bound: at most 1000 calls' usage waiting. -->
+                                                    <os:retrieve-all-keys objectStore="{{{policyId}}}-aforo-pending" target="aforoPendingKeys"/>
+                                                    <choice>
+                                                        <when expression="#[1000 > sizeOf(vars.aforoPendingKeys default [])]">
+                                                            <os:store key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending">
+                                                                <os:value>#[vars.aforoEvents.payload]</os:value>
+                                                            </os:store>
+                                                            <!-- ═════ 7. Delivery, after the response ═════ -->
+                                                            <async maxConcurrency="16">
+                                                                <try>
+                                                                    <!-- Each attempt sends what the pending entry still holds:
+                                                                         the whole batch first, then only the events to re-send.
+                                                                         The idempotencyKeys never change, so a copy that did
+                                                                         land is deduplicated, never billed twice. -->
+                                                                    <until-successful maxRetries="2" millisBetweenRetries="2000">
+                                                                        <os:retrieve key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending" target="aforoPendingText">
+                                                                            <os:default-value>#['']</os:default-value>
+                                                                        </os:retrieve>
+                                                                        <choice>
+                                                                            <when expression="#[vars.aforoPendingText != '']">
+                                                                                <http:request config-ref="{{{policyId}}}-aforo-http" method="POST" url="#[vars.aforoCfg.endpoint]"
+                                                                                              responseTimeout="10000" followRedirects="false"
+                                                                                              outputMimeType="text/plain" target="aforoIngestResponse"
+                                                                                              targetValue="#[{status: attributes.statusCode, text: (payload default '') as String}]">
+                                                                                    <http:body><![CDATA[#[vars.aforoPendingText]]]></http:body>
+                                                                                    <http:headers><![CDATA[#[{'Content-Type': 'application/json', 'X-API-Key': vars.aforoCfg.apiKey}]]]></http:headers>
+                                                                                    <http:response-validator>
+                                                                                        <http:success-status-code-validator values="100..599"/>
+                                                                                    </http:response-validator>
+                                                                                </http:request>
+                                                                                <ee:transform>
+                                                                                    <ee:variables>
+                                                                                        <ee:set-variable variableName="aforoDelivery"><![CDATA[%dw 2.0
+// aforo-script: delivery
+// The ingestor's answer to one attempt:
+//   202 {"success":true,"data":{"accepted","failed","errors":[{index,message}]}}
+//     an error starting "The event could not be stored" is transient: that
+//     event is re-sent; any other is permanent: logged and dropped
+//   5xx, 408, 429: the whole batch is re-sent
+//   any other status: the ingestor refused the request (key, URL): logged
+output application/java
+fun str(v) = if (v is String) v else if ((v is Number) or (v is Boolean)) (v as String) else ""
+var TRANSIENT = "The event could not be stored"
+var pending = dw::Runtime::try(() -> read(str(vars.aforoPendingText), "application/json")).result
+var events = if ((pending is Object) and (pending.events is Array)) pending.events else []
+var resp = vars.aforoIngestResponse
+var status = if (resp.status is Number) resp.status else 0
+var body = dw::Runtime::try(() -> read(str(resp.text), "application/json")).result
+var errors =
+  if ((body is Object) and (body.data is Object) and (body.data.errors is Array)) body.data.errors
+  else if ((body is Object) and (body.errors is Array)) body.errors
+  else []
+var indexed = (errors filter ((e) -> (e is Object) and (e.index is Number))) map ((e) -> {index: e.index, message: str(e.message)})
+var transientIdx = (indexed filter ($.message startsWith TRANSIENT)) map $.index
+var permanent = indexed filter (not ($.message startsWith TRANSIENT))
+fun describe(i) = do {
+  var e = events[i]
+  ---
+  if (e is Object) (str(e.metricName) ++ " " ++ str(e.idempotencyKey)) else ("event " ++ (i as String))
+}
+var wholeRetry = (status >= 500) or (status == 408) or (status == 429) or (status == 0)
+var refusedBatch = (not wholeRetry) and ((status < 200) or (status >= 300))
+var retryEvents =
+  if (wholeRetry) events
+  else if (refusedBatch) []
+  else (transientIdx map events[$]) filter ($ != null)
+var refused =
+  if (refusedBatch) ["the ingestor refused the batch (HTTP " ++ (status as String) ++ "; check aforo-api-key and aforo-endpoint): " ++
+    (do { var t = str(resp.text) --- if (sizeOf(t) > 300) t[0 to 299] else t })]
+  else permanent map ((p) -> describe(p.index) ++ ": " ++ p.message)
+---
+{
+  status: status,
+  retryText: if (isEmpty(retryEvents)) null else write({events: retryEvents}, "application/json", {indent: false}),
+  retryReason: if (wholeRetry) ("the ingestor answered HTTP " ++ (status as String))
+    else ((sizeOf(retryEvents) as String) ++ " event(s) could not be stored"),
+  refusedLog: if (isEmpty(refused)) null
+    else "[aforo-metering] USAGE EVENT REFUSED (permanent, not retried): " ++ (refused joinBy " | ")
+}]]></ee:set-variable>
+                                                                                    </ee:variables>
+                                                                                </ee:transform>
+                                                                                <choice>
+                                                                                    <when expression="#[vars.aforoDelivery.refusedLog != null]">
+                                                                                        <logger level="WARN" message="#[vars.aforoDelivery.refusedLog]"/>
+                                                                                    </when>
+                                                                                </choice>
+                                                                                <choice>
+                                                                                    <when expression="#[vars.aforoDelivery.retryText != null]">
+                                                                                        <os:store key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending">
+                                                                                            <os:value>#[vars.aforoDelivery.retryText]</os:value>
+                                                                                        </os:store>
+                                                                                        <raise-error type="AFORO:DELIVERY_RETRY" description="#[vars.aforoDelivery.retryReason]"/>
+                                                                                    </when>
+                                                                                    <otherwise>
+                                                                                        <os:remove key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending"/>
+                                                                                    </otherwise>
+                                                                                </choice>
+                                                                            </when>
+                                                                        </choice>
+                                                                    </until-successful>
+                                                                    <error-handler>
+                                                                        <on-error-continue type="ANY" logException="false">
+                                                                            <logger level="WARN" message="#['[aforo-metering] USAGE NOT DELIVERED after 3 attempts (' ++ (error.description default 'unknown error') ++ '): request ' ++ (vars.aforoReq.requestId default '?')]"/>
+                                                                            <try>
+                                                                                <os:remove key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending"/>
+                                                                                <error-handler>
+                                                                                    <on-error-continue type="ANY" logException="false"/>
+                                                                                </error-handler>
+                                                                            </try>
+                                                                        </on-error-continue>
+                                                                    </error-handler>
+                                                                </try>
+                                                            </async>
+                                                        </when>
+                                                        <otherwise>
+                                                            <try>
+                                                                <os:retrieve key="#['warn|backlog']" objectStore="{{{policyId}}}-aforo-state" target="aforoWarnedAt">
+                                                                    <os:default-value>#[0]</os:default-value>
+                                                                </os:retrieve>
+                                                                <choice>
+                                                                    <when expression="#[(vars.aforoEndMs - (vars.aforoWarnedAt default 0)) >= 60000]">
+                                                                        <logger level="WARN" message="[aforo-metering] USAGE DROPPED: 1000 calls' usage is already waiting for delivery (is the ingestor reachable?). Repeats suppressed for 60 s."/>
+                                                                        <os:store key="#['warn|backlog']" objectStore="{{{policyId}}}-aforo-state">
+                                                                            <os:value>#[vars.aforoEndMs]</os:value>
+                                                                        </os:store>
+                                                                    </when>
+                                                                </choice>
+                                                                <error-handler>
+                                                                    <on-error-continue type="ANY" logException="false"/>
+                                                                </error-handler>
+                                                            </try>
+                                                        </otherwise>
+                                                    </choice>
+                                                </when>
+                                            </choice>
+                                            <choice>
+                                                <when expression="#[not isEmpty(vars.aforoEvents.dropped default [])]">
+                                                    <logger level="WARN" message="#['[aforo-metering] events skipped: ' ++ (vars.aforoEvents.dropped joinBy '; ')]"/>
+                                                </when>
+                                            </choice>
+                                        </when>
+                                    </choice>
+                                    <error-handler>
+                                        <on-error-continue type="ANY" logException="false">
+                                            <logger level="WARN" message="#['[aforo-metering] not metered: ' ++ (error.description default 'unknown error')]"/>
+                                        </on-error-continue>
+                                    </error-handler>
+                                </try>
+                                <!-- <<< METER BLOCK -->
+                            </on-error-propagate>
+                        </error-handler>
+                    </try>
+                    <!-- >>> METER BLOCK (copy 2 of 2) -->
+                    <try>
+                        <choice>
+                            <when expression="#[vars.aforoAccess.outcome == 'allow']">
+                                <set-variable variableName="aforoEndMs" value="#[now() as Number {unit: 'milliseconds'}]"/>
+                                <ee:transform>
+                                    <ee:variables>
+                                        <ee:set-variable variableName="aforoEvents"><![CDATA[%dw 2.0
+// aforo-script: events
+// The usage events of one call, built once. Trusted sources only: the
+// introspected customer, the policy configuration, the gateway's own request
+// id, and the upstream's RESPONSE headers (the client cannot set them).
+//   API          one event
+//   AGENTIC_API  traceId = trace-id-header (X-Aforo-Trace-Id), else the request id
+//   AI_AGENT     agentId = X-Aforo-Agent-Id, else agent-id, else the product id;
+//                sessionId = X-Aforo-Session-Id, else the request id; traceId = sessionId
+//   MCP_SERVER   one event per tools/call; agentId = X-Aforo-Agent-Id, else the
+//                customer; sessionId = X-Aforo-Session-Id, else the upstream's
+//                Mcp-Session-Id (hashed when too long)
+// A present but unusable identity header skips the event rather than billing
+// a different identity.
+import * from dw::Crypto
+import toHex from dw::core::Binaries
+import charCode from dw::core::Strings
+output application/java
+var cfg = vars.aforoCfg
+var req = vars.aforoReq
+var plan = req.plan
+var identity = vars.aforoAccess.identity
+var MAX = {customerId: 64, metricName: 255, idempotencyKey: 255, agentId: 36, sessionId: 64,
+  productType: 20, traceId: 128, toolName: 64}
+var REQUIRED = {API: [], AGENTIC_API: ["traceId"], AI_AGENT: ["agentId", "sessionId"], MCP_SERVER: ["toolName", "agentId"]}
+var HEX = "0123456789ABCDEF"
+fun str(v) = if (v is String) v else if ((v is Number) or (v is Boolean)) (v as String) else ""
+fun header(hs, name) = do {
+  var all = valuesOf((if (hs is Object) hs else {}) filterObject ((v, k) -> (v != null) and (lower(k as String) == lower(name))))
+  var first = all[0]
+  ---
+  if (first == null) null else if (first is Array) str(first[0]) else str(first)
+}
+fun clean(v, max) =
+  if ((v is String) and (v != "") and (sizeOf(v) <= max) and (not (v contains /[\x00-\x1F\x7F]/))) v else null
+fun pct(ch) = do {
+  var c = charCode(ch)
+  ---
+  "%" ++ HEX[floor(c / 16)] ++ HEX[c mod 16]
+}
+fun escaped(v, max) = do {
+  var s = if (v is String) (v replace /[\x00-\x1F\x7F]/ with ((m) -> pct(m[0]))) else ""
+  ---
+  if (sizeOf(s) > max) s[0 to max - 1] else s
+}
+// An upstream response header naming who or what is billed:
+// {value} usable, {} absent, {bad: name} present but unusable.
+fun upstream(name, max) = do {
+  var raw = header(attributes.headers, name)
+  ---
+  if ((raw == null) or (raw == "")) {} else if (clean(raw, max) != null) {value: raw} else {bad: name}
+}
+fun sha256(s) = lower(toHex(hashWith(s as Binary {encoding: "UTF-8"}, "SHA-256")))
+fun outcomeOf(status) =
+  if ((not (status is Number)) or (status < 200) or (status > 599)) null
+  else if (cfg.statusOutcomes[(floor(status) as String)] != null) cfg.statusOutcomes[(floor(status) as String)]
+  else if (status < 400) "SUCCESS"
+  else if ((status == 408) or (status == 504)) "TIMEOUT"
+  else if (status == 499) "CANCELLED"
+  else if ((status == 400) or (status == 422)) "VALIDATION_FAILED"
+  else if ((status == 401) or (status == 403) or (status == 429)) "BLOCKED"
+  else "ERROR"
+
+var status = if (attributes.statusCode is Number) attributes.statusCode else if (vars.aforoFlowFailed == true) 500 else 0
+var requestId = str(req.requestId)
+var elapsed = if ((vars.aforoEndMs is Number) and (req.startMs is Number) and (vars.aforoEndMs >= req.startMs)) vars.aforoEndMs - req.startMs else 0
+var occurredAt = ((((if (vars.aforoEndMs is Number) vars.aforoEndMs else req.startMs) as DateTime {unit: "milliseconds"}) >> "UTC")
+  as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"})
+var customerId = if (identity == null) null else clean(str(identity.customerId), MAX.customerId)
+var metricHeader = upstream("X-Aforo-Metric", MAX.metricName)
+
+var skipReason =
+  if (customerId == null) "no verified customer"
+  else if (req.excluded) "excluded path"
+  else if (cfg.excludeStatusCodes contains status) "excluded status code"
+  else if (req.cors) "CORS preflight"
+  else if (requestId == "") "no request id"
+  else if ((not plan.tools) and (not plan.plain)) "nothing billable (no tools/call)"
+  else if (metricHeader.bad != null) "unusable X-Aforo-Metric response header"
+  else null
+
+// ── MCP tool calls ──
+var mcpAgent = upstream("X-Aforo-Agent-Id", MAX.agentId)
+var mcpSessionHeader = upstream("X-Aforo-Session-Id", MAX.sessionId)
+var rawMcpSession = header(attributes.headers, "Mcp-Session-Id")
+var mcpSession =
+  if (mcpSessionHeader.bad != null) mcpSessionHeader
+  else if (mcpSessionHeader.value != null) mcpSessionHeader
+  else if ((rawMcpSession == null) or (rawMcpSession == "")) {}
+  else if (clean(rawMcpSession, MAX.sessionId) != null) {value: rawMcpSession}
+  else {value: "mcp-" ++ (sha256(rawMcpSession)[0 to 55])}
+var toolProblem =
+  if (not plan.tools) null
+  else if (mcpAgent.bad != null) "unusable " ++ mcpAgent.bad ++ " response header"
+  else if (mcpSession.bad != null) "unusable " ++ mcpSession.bad ++ " response header"
+  else null
+var toolEvents = if ((skipReason != null) or (not plan.tools) or (toolProblem != null)) []
+  else (plan.calls default []) map ((call, i) -> do {
+    var tool = do {
+      var t = escaped(str(call.toolName), MAX.toolName)
+      ---
+      if (t == "") "unknown" else t
+    }
+    ---
+    {
+      productType: "MCP_SERVER",
+      customerId: customerId,
+      metricName: metricHeader.value default plan.toolMetric,
+      quantity: 1,
+      idempotencyKey: "mcp:" ++ cfg.tenantId ++ ":" ++ requestId ++ ":" ++ ((i + 1) as String) ++ ":" ++ tool,
+      occurredAt: occurredAt,
+      toolName: tool,
+      agentId: mcpAgent.value default customerId,
+      (sessionId: mcpSession.value) if (mcpSession.value != null),
+      executionDurationMs: elapsed
+    }
+  })
+
+// ── The call itself (API, AGENTIC_API, AI_AGENT) ──
+var quantityRaw = header(attributes.headers, cfg.quantityHeader)
+var quantityNum = if ((quantityRaw != null) and (trim(quantityRaw) matches /[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?/))
+  dw::Runtime::try(() -> trim(quantityRaw) as Number).result else null
+var quantity = if ((quantityNum != null) and (quantityNum > 0)) quantityNum else 1
+var aiAgent = upstream("X-Aforo-Agent-Id", MAX.agentId)
+var aiSession = upstream("X-Aforo-Session-Id", MAX.sessionId)
+var traceHeader = upstream(cfg.traceIdHeader, MAX.traceId)
+var plainProblem =
+  if (not plan.plain) null
+  else if ((plan.productType == "AI_AGENT") and (aiAgent.bad != null)) "unusable " ++ aiAgent.bad ++ " response header"
+  else if ((plan.productType == "AI_AGENT") and (aiSession.bad != null)) "unusable " ++ aiSession.bad ++ " response header"
+  else if ((plan.productType == "AGENTIC_API") and (traceHeader.bad != null)) "unusable " ++ traceHeader.bad ++ " response header"
+  else null
+var aiSessionId = aiSession.value default requestId
+var plainEvents = if ((skipReason != null) or (not plan.plain) or (plainProblem != null)) []
+  else [{
+    productType: plan.productType,
+    customerId: customerId,
+    metricName: metricHeader.value default plan.metric,
+    quantity: quantity,
+    idempotencyKey: requestId,
+    occurredAt: occurredAt,
+    (traceId: traceHeader.value default requestId) if (plan.productType == "AGENTIC_API"),
+    (agentId: aiAgent.value default (if (cfg.agentId != "") cfg.agentId else clean(cfg.productId, MAX.agentId))) if (plan.productType == "AI_AGENT"),
+    (sessionId: aiSessionId) if (plan.productType == "AI_AGENT"),
+    (traceId: aiSessionId) if (plan.productType == "AI_AGENT")
+  }]
+
+// ── Common fields, then the checks the ingestor would apply ──
+var endpointPath = do {
+  var p = escaped(req.path, 512)
+  ---
+  if (p == "") "/" else p
+}
+var executionStatus = outcomeOf(status)
+var built = (toolEvents ++ plainEvents) map ((e) -> e ++ {
+  endpointPath: endpointPath,
+  httpMethod: if (sizeOf(req.method default "") > 16) req.method[0 to 15] else (req.method default ""),
+  statusCode: status,
+  responseTimeMs: elapsed,
+  (executionStatus: executionStatus) if (executionStatus != null),
+  trace: req.trace,
+  metadata: {
+    gateway: "mulesoft",
+    method: req.method,
+    path: endpointPath,
+    status: status,
+    endpoint_path: endpointPath,
+    http_method: req.method,
+    status_code: status,
+    response_time_ms: elapsed,
+    productId: cfg.productId,
+    (keyId: identity.keyId) if ((identity != null) and (identity.keyId != null))
+  }
+})
+fun problemOf(e) = do {
+  var tooLong = (keysOf(MAX) map ($ as String)) filter ((f) -> (e[f] is String) and (sizeOf(e[f]) > MAX[f]))
+  var missing = (REQUIRED[e.productType] default []) filter ((f) -> (e[f] == null) or (e[f] == ""))
+  var q = e.quantity
+  ---
+  if (not isEmpty(tooLong)) (tooLong[0] ++ " is longer than " ++ (MAX[tooLong[0]] as String) ++ " characters")
+  else if (not isEmpty(missing)) ("productType " ++ e.productType ++ " requires " ++ missing[0])
+  else if ((not (q is Number)) or (q <= 0) or (q >= 100000000000000)) "quantity not > 0 or too large"
+  else null
+}
+var checked = built map ((e) -> do {
+  var q = if (e.quantity is Number) (round(e.quantity * 1000000) / 1000000) else e.quantity
+  var rounded = (e - "quantity") ++ {quantity: q}
+  ---
+  {event: rounded, problem: problemOf(rounded)}
+})
+var ready = (checked filter ($.problem == null)) map $.event
+var dropped = ((checked filter ($.problem != null)) map $.problem)
+  ++ (if (toolProblem != null) [toolProblem] else []) ++ (if (plainProblem != null) [plainProblem] else [])
+---
+{
+  events: ready,
+  payload: if (isEmpty(ready)) null else write({events: ready}, "application/json", {indent: false}),
+  skipReason: if (skipReason != null) skipReason else if (isEmpty(ready)) (dropped joinBy "; ") else null,
+  dropped: dropped
+}]]></ee:set-variable>
+                                    </ee:variables>
+                                </ee:transform>
+                                <choice>
+                                    <when expression="#[vars.aforoEvents.payload != null]">
+                                        <!-- Backlog bound: at most 1000 calls' usage waiting. -->
+                                        <os:retrieve-all-keys objectStore="{{{policyId}}}-aforo-pending" target="aforoPendingKeys"/>
+                                        <choice>
+                                            <when expression="#[1000 > sizeOf(vars.aforoPendingKeys default [])]">
+                                                <os:store key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending">
+                                                    <os:value>#[vars.aforoEvents.payload]</os:value>
+                                                </os:store>
+                                                <!-- ═════ 7. Delivery, after the response ═════ -->
+                                                <async maxConcurrency="16">
+                                                    <try>
+                                                        <!-- Each attempt sends what the pending entry still holds:
+                                                             the whole batch first, then only the events to re-send.
+                                                             The idempotencyKeys never change, so a copy that did
+                                                             land is deduplicated, never billed twice. -->
+                                                        <until-successful maxRetries="2" millisBetweenRetries="2000">
+                                                            <os:retrieve key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending" target="aforoPendingText">
+                                                                <os:default-value>#['']</os:default-value>
+                                                            </os:retrieve>
+                                                            <choice>
+                                                                <when expression="#[vars.aforoPendingText != '']">
+                                                                    <http:request config-ref="{{{policyId}}}-aforo-http" method="POST" url="#[vars.aforoCfg.endpoint]"
+                                                                                  responseTimeout="10000" followRedirects="false"
+                                                                                  outputMimeType="text/plain" target="aforoIngestResponse"
+                                                                                  targetValue="#[{status: attributes.statusCode, text: (payload default '') as String}]">
+                                                                        <http:body><![CDATA[#[vars.aforoPendingText]]]></http:body>
+                                                                        <http:headers><![CDATA[#[{'Content-Type': 'application/json', 'X-API-Key': vars.aforoCfg.apiKey}]]]></http:headers>
+                                                                        <http:response-validator>
+                                                                            <http:success-status-code-validator values="100..599"/>
+                                                                        </http:response-validator>
+                                                                    </http:request>
+                                                                    <ee:transform>
+                                                                        <ee:variables>
+                                                                            <ee:set-variable variableName="aforoDelivery"><![CDATA[%dw 2.0
+// aforo-script: delivery
+// The ingestor's answer to one attempt:
+//   202 {"success":true,"data":{"accepted","failed","errors":[{index,message}]}}
+//     an error starting "The event could not be stored" is transient: that
+//     event is re-sent; any other is permanent: logged and dropped
+//   5xx, 408, 429: the whole batch is re-sent
+//   any other status: the ingestor refused the request (key, URL): logged
+output application/java
+fun str(v) = if (v is String) v else if ((v is Number) or (v is Boolean)) (v as String) else ""
+var TRANSIENT = "The event could not be stored"
+var pending = dw::Runtime::try(() -> read(str(vars.aforoPendingText), "application/json")).result
+var events = if ((pending is Object) and (pending.events is Array)) pending.events else []
+var resp = vars.aforoIngestResponse
+var status = if (resp.status is Number) resp.status else 0
+var body = dw::Runtime::try(() -> read(str(resp.text), "application/json")).result
+var errors =
+  if ((body is Object) and (body.data is Object) and (body.data.errors is Array)) body.data.errors
+  else if ((body is Object) and (body.errors is Array)) body.errors
+  else []
+var indexed = (errors filter ((e) -> (e is Object) and (e.index is Number))) map ((e) -> {index: e.index, message: str(e.message)})
+var transientIdx = (indexed filter ($.message startsWith TRANSIENT)) map $.index
+var permanent = indexed filter (not ($.message startsWith TRANSIENT))
+fun describe(i) = do {
+  var e = events[i]
+  ---
+  if (e is Object) (str(e.metricName) ++ " " ++ str(e.idempotencyKey)) else ("event " ++ (i as String))
+}
+var wholeRetry = (status >= 500) or (status == 408) or (status == 429) or (status == 0)
+var refusedBatch = (not wholeRetry) and ((status < 200) or (status >= 300))
+var retryEvents =
+  if (wholeRetry) events
+  else if (refusedBatch) []
+  else (transientIdx map events[$]) filter ($ != null)
+var refused =
+  if (refusedBatch) ["the ingestor refused the batch (HTTP " ++ (status as String) ++ "; check aforo-api-key and aforo-endpoint): " ++
+    (do { var t = str(resp.text) --- if (sizeOf(t) > 300) t[0 to 299] else t })]
+  else permanent map ((p) -> describe(p.index) ++ ": " ++ p.message)
+---
+{
+  status: status,
+  retryText: if (isEmpty(retryEvents)) null else write({events: retryEvents}, "application/json", {indent: false}),
+  retryReason: if (wholeRetry) ("the ingestor answered HTTP " ++ (status as String))
+    else ((sizeOf(retryEvents) as String) ++ " event(s) could not be stored"),
+  refusedLog: if (isEmpty(refused)) null
+    else "[aforo-metering] USAGE EVENT REFUSED (permanent, not retried): " ++ (refused joinBy " | ")
+}]]></ee:set-variable>
+                                                                        </ee:variables>
+                                                                    </ee:transform>
+                                                                    <choice>
+                                                                        <when expression="#[vars.aforoDelivery.refusedLog != null]">
+                                                                            <logger level="WARN" message="#[vars.aforoDelivery.refusedLog]"/>
+                                                                        </when>
+                                                                    </choice>
+                                                                    <choice>
+                                                                        <when expression="#[vars.aforoDelivery.retryText != null]">
+                                                                            <os:store key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending">
+                                                                                <os:value>#[vars.aforoDelivery.retryText]</os:value>
+                                                                            </os:store>
+                                                                            <raise-error type="AFORO:DELIVERY_RETRY" description="#[vars.aforoDelivery.retryReason]"/>
+                                                                        </when>
+                                                                        <otherwise>
+                                                                            <os:remove key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending"/>
+                                                                        </otherwise>
+                                                                    </choice>
+                                                                </when>
+                                                            </choice>
+                                                        </until-successful>
+                                                        <error-handler>
+                                                            <on-error-continue type="ANY" logException="false">
+                                                                <logger level="WARN" message="#['[aforo-metering] USAGE NOT DELIVERED after 3 attempts (' ++ (error.description default 'unknown error') ++ '): request ' ++ (vars.aforoReq.requestId default '?')]"/>
+                                                                <try>
+                                                                    <os:remove key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending"/>
+                                                                    <error-handler>
+                                                                        <on-error-continue type="ANY" logException="false"/>
+                                                                    </error-handler>
+                                                                </try>
+                                                            </on-error-continue>
+                                                        </error-handler>
+                                                    </try>
+                                                </async>
+                                            </when>
+                                            <otherwise>
+                                                <try>
+                                                    <os:retrieve key="#['warn|backlog']" objectStore="{{{policyId}}}-aforo-state" target="aforoWarnedAt">
+                                                        <os:default-value>#[0]</os:default-value>
+                                                    </os:retrieve>
+                                                    <choice>
+                                                        <when expression="#[(vars.aforoEndMs - (vars.aforoWarnedAt default 0)) >= 60000]">
+                                                            <logger level="WARN" message="[aforo-metering] USAGE DROPPED: 1000 calls' usage is already waiting for delivery (is the ingestor reachable?). Repeats suppressed for 60 s."/>
+                                                            <os:store key="#['warn|backlog']" objectStore="{{{policyId}}}-aforo-state">
+                                                                <os:value>#[vars.aforoEndMs]</os:value>
+                                                            </os:store>
+                                                        </when>
+                                                    </choice>
+                                                    <error-handler>
+                                                        <on-error-continue type="ANY" logException="false"/>
+                                                    </error-handler>
+                                                </try>
+                                            </otherwise>
+                                        </choice>
+                                    </when>
+                                </choice>
+                                <choice>
+                                    <when expression="#[not isEmpty(vars.aforoEvents.dropped default [])]">
+                                        <logger level="WARN" message="#['[aforo-metering] events skipped: ' ++ (vars.aforoEvents.dropped joinBy '; ')]"/>
+                                    </when>
+                                </choice>
+                            </when>
+                        </choice>
+                        <error-handler>
+                            <on-error-continue type="ANY" logException="false">
+                                <logger level="WARN" message="#['[aforo-metering] not metered: ' ++ (error.description default 'unknown error')]"/>
+                            </on-error-continue>
+                        </error-handler>
+                    </try>
+                    <!-- <<< METER BLOCK -->
+                </otherwise>
+            </choice>
+
+        </http-policy:source>
+    </http-policy:proxy>
+</mule>
