@@ -1,29 +1,31 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<!-- Sends the usage event payload to the Aforo ingestor service.
-     Uses ServiceCallout with continueOnError=true so API response
-     is never impacted by metering failures. Runs only when
-     aforo-metering.js set aforo.sendEvent = "true" (see sharedflows/default.xml). -->
+<!-- delivery_mode sync: sends the events and waits for the ingestor's answer
+     (read by AforoMeteringCheckDelivery). The client waits too, so the wait is
+     short: 1 s to connect, 2 s for the answer (Apigee takes only literal
+     values here). 4xx counts as policy success, so the answer is kept and
+     servicecallout.AforoMeteringSendEvent.failed means a transport error or a
+     5xx. continueOnError="true": a failed send never fails the API call. -->
 <ServiceCallout name="AforoMeteringSendEvent" continueOnError="true">
-    <DisplayName>Aforo Metering - Send Event to Ingestor</DisplayName>
-    <Request variable="aforo.calloutRequest">
+    <DisplayName>Aforo Metering - Send Events (wait for 202)</DisplayName>
+    <Request variable="aforo.calloutRequest" clearPayload="true">
+        <IgnoreUnresolvedVariables>true</IgnoreUnresolvedVariables>
         <Set>
-            <Verb>POST</Verb>
-            <Payload contentType="application/json">{aforo.eventPayload}</Payload>
             <Headers>
                 <Header name="Content-Type">application/json</Header>
-                <!-- X-API-Key ALONE: the ingestor's ApiKeyAuthFilter reads only this
-                     header; Authorization: Bearer is parsed as a JWT and rejected
-                     401. The tenant comes from the key, so no X-Tenant-Id. -->
                 <Header name="X-API-Key">{private.aforo.apiKey}</Header>
             </Headers>
+            <Verb>POST</Verb>
+            <Payload contentType="application/json">{aforo.eventPayload}</Payload>
         </Set>
     </Request>
     <Response>aforo.calloutResponse</Response>
+    <Timeout>3000</Timeout>
     <HTTPTargetConnection>
-        <URL>{aforo.endpoint}</URL>
         <Properties>
-            <Property name="connect.timeout.millis">5000</Property>
-            <Property name="io.timeout.millis">10000</Property>
+            <Property name="connect.timeout.millis">1000</Property>
+            <Property name="io.timeout.millis">2000</Property>
+            <Property name="success.codes">1xx,2xx,3xx,4xx</Property>
         </Properties>
+        <URL>{private.aforo.endpoint}</URL>
     </HTTPTargetConnection>
 </ServiceCallout>

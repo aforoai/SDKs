@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Builds the call's usage events into aforo.eventPayload (see
+     aforo-metering.js). Sets aforo.meteringSend = "true" when there is
+     something to send, else aforo.skipReason says why not. -->
+<Javascript name="AforoMeteringBuildEvents" timeLimit="1000" continueOnError="true">
+    <DisplayName>Aforo Metering - Build Events</DisplayName>
+    <IncludeURL>jsc://aforo-billing.js</IncludeURL>
+    <ResourceURL>jsc://aforo-metering.js</ResourceURL>
+</Javascript>

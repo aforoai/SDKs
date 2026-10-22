@@ -4,6 +4,7 @@ This monorepo ships five gateway metering plugins (Kong, Apigee, AWS Lambda, Azu
 
 ## Unreleased
 
+- Apigee 3.0.0 (breaking): a new `aforo-access` shared flow on the PreProxyFlowHook verifies the key, takes the customer from the app's `aforo_customer_id` attribute, strips the key before the upstream, and runs the pre-flight quota check (429). `aforo-metering` on the PostProxyFlowHook now bills API, AGENTIC_API, AI_AGENT and MCP_SERVER as Kong does, never blocks the response by default (`delivery_mode`), and handles the 202's per-event errors in `sync` mode. Per-product config comes from the KVM. See `apigee/CHANGELOG.md`.
 - Kong: `AI_AGENT` metering, with `agent_id` / `agent_id_header` / `session_id_header` (operator config or upstream response headers, never request headers). Also fixes the Kong plugin failing to load at startup because a schema description exceeded Kong's 500-character limit.
 - Kong (security): JWTs are bound to the plugin's `tenant_id` (a token for another tenant is rejected), client revocation is looked up by `client_id`, Redis errors no longer reject every token, and `jwt_jwks_uri` is implemented.
 - Kong: rate limiting no longer returns 500 on policies with null fields, can't be bypassed with a lower-case `bearer`, and now covers key-auth traffic. JWT-authenticated requests are not rate limited yet.

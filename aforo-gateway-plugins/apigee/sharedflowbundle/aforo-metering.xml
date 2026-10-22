@@ -1,24 +1,25 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <SharedFlowBundle revision="1" name="aforo-metering">
     <DisplayName>Aforo Usage Metering</DisplayName>
-    <Description>Auto-captures API usage events and forwards them to Aforo's
-        usage ingestor service for billing and analytics. Runs in
-        PostClientFlow — zero latency impact on the API response.</Description>
+    <Description>Builds the Aforo usage events of each call to a managed proxy
+        and sends them to the Aforo ingestor. Attach to the environment's
+        PostProxyFlowHook, together with aforo-access on the
+        PreProxyFlowHook (it bills only calls aforo-access verified). A failed
+        send never fails the API call.</Description>
     <CreatedAt>1711036800000</CreatedAt>
-    <LastModifiedAt>1711036800000</LastModifiedAt>
+    <LastModifiedAt>1761004800000</LastModifiedAt>
     <Policies>
-        <Policy>AforoMeteringReadConfig</Policy>
-        <Policy>AforoJwtReadConfig</Policy>
-        <Policy>AforoJwtValidation</Policy>
-        <Policy>AforoJwtAssignHeaders</Policy>
-        <Policy>AforoMarginGuardCheck</Policy>
-        <Policy>AforoMarginGuardRaiseFault</Policy>
-        <Policy>AforoMeteringBuildEvent</Policy>
+        <Policy>AforoMeteringBuildEvents</Policy>
+        <Policy>AforoMeteringSendAsync</Policy>
         <Policy>AforoMeteringSendEvent</Policy>
+        <Policy>AforoMeteringCheckDelivery</Policy>
+        <Policy>AforoMeteringSendEventRetry1</Policy>
+        <Policy>AforoMeteringLogDeliveryFailure</Policy>
     </Policies>
     <Resources>
+        <Resource>jsc://aforo-billing.js</Resource>
         <Resource>jsc://aforo-metering.js</Resource>
-        <Resource>jsc://aforo-margin-guard.js</Resource>
+        <Resource>jsc://aforo-metering-delivery.js</Resource>
     </Resources>
     <SharedFlows>
         <SharedFlow>default</SharedFlow>

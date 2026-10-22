@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- The quota is used up: 429 with Retry-After (whole seconds, at least 1)
+     and {"message": reason, "retryAfter": seconds}, as Kong answers. The call
+     never reaches the upstream and is not metered. -->
+<RaiseFault name="AforoQuotaExceeded" continueOnError="false" enabled="true">
+    <DisplayName>Aforo Access - Quota Exceeded (429)</DisplayName>
+    <FaultResponse>
+        <Set>
+            <Headers>
+                <Header name="Retry-After">{aforo.access.retryAfter}</Header>
+            </Headers>
+            <Payload contentType="application/json">{aforo.access.denyBody}</Payload>
+            <StatusCode>429</StatusCode>
+            <ReasonPhrase>Too Many Requests</ReasonPhrase>
+        </Set>
+    </FaultResponse>
+    <IgnoreUnresolvedVariables>true</IgnoreUnresolvedVariables>
+</RaiseFault>

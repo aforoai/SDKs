@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- delivery_mode sync: reads the 202's per-event errors and decides the one
+     retry (transient failures only). See aforo-metering-delivery.js. -->
+<Javascript name="AforoMeteringCheckDelivery" timeLimit="500" continueOnError="true">
+    <DisplayName>Aforo Metering - Check Delivery</DisplayName>
+    <Properties>
+        <Property name="phase">first</Property>
+    </Properties>
+    <IncludeURL>jsc://aforo-billing.js</IncludeURL>
+    <ResourceURL>jsc://aforo-metering-delivery.js</ResourceURL>
+</Javascript>

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- 401 for a valid Aforo JWT issued for another tenant than KVM tenant_id
+     (or with no tenant_id claim). -->
+<RaiseFault name="AforoJwtRejected" continueOnError="false" enabled="true">
+    <DisplayName>Aforo Access - JWT For Another Tenant (401)</DisplayName>
+    <FaultResponse>
+        <Set>
+            <Headers>
+                <Header name="WWW-Authenticate">Bearer error="invalid_token"</Header>
+            </Headers>
+            <Payload contentType="application/json">{aforo.access.jwtRejectedBody}</Payload>
+            <StatusCode>401</StatusCode>
+            <ReasonPhrase>Unauthorized</ReasonPhrase>
+        </Set>
+    </FaultResponse>
+    <IgnoreUnresolvedVariables>true</IgnoreUnresolvedVariables>
+</RaiseFault>

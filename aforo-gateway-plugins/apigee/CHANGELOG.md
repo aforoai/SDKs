@@ -6,6 +6,54 @@ This bundle ships on the Aforo gateway-plugins line; the whole repo is versioned
 
 ## [Unreleased]
 
+## [3.0.0] — 2026-10-21
+
+The Apigee path rebuilt to match the Kong plugin. There are now two shared flows: `aforo-access` (new, PreProxyFlowHook) and `aforo-metering` (PostProxyFlowHook). This repo is again the single source of truth; it starts from org-service's newer bundled copy (aforo-gateway-plugins@04f5165) and the unmerged `sync/gateway-plugins-2026-10-02` work. **Breaking**: see "Upgrading from 2.x" in the user guide. Not yet verified on a live Apigee org.
+
+### Added
+- **`aforo-access`** (`aforo-access/sharedflowbundle/`), for the PreProxyFlowHook:
+  - Runs only on proxies the KVM marks `managed_proxy__{proxy}`.
+  - VerifyAPIKey on header `x-api-key`, header `apikey` or query `apikey`, with Apigee's standard 401. The key is stripped before the upstream, as Kong's `hide_credentials` does.
+  - The customer comes from the verified app's (else developer's) `aforo_customer_id` attribute.
+  - Per-API-product settings come from `{setting}__{apiproduct.name}` KVM keys.
+  - Pre-flight quota check on the metric the call bills to:
+    - 1500 ms timeout, fail-open (503 with `quota_fail_open=false`)
+    - ALLOW/WARN cached 1 s, DENY never cached
+    - 429 with `Retry-After` and a JSON body
+    - MCP: only `tools/call` is checked
+- `aforo-billing.js`: the rules both flows share (metric resolution, MCP parsing, exclusions, the status table). One copy in each bundle; the tests keep the two identical.
+- Per product type, as Kong:
+  - AGENTIC_API `traceId`: upstream `X-Aforo-Trace-Id`, else `messageid`.
+  - AI_AGENT `agentId`: `X-Aforo-Agent-Id`, else `agent_id__{p}`, else the proxy name. `sessionId`: `X-Aforo-Session-Id`, else `messageid`.
+  - MCP_SERVER: one event per `tools/call`, batches included. `agentId`: the upstream's, else the customer. Session: the upstream `Mcp-Session-Id`.
+- Upstream `X-Aforo-Quantity` (`quantity_header__{p}`) and `X-Aforo-Metric`.
+- `delivery_mode`: `async` (default, ServiceCallout without `<Response>`: the client never waits) or `sync` (waits for the 202, re-sends the events it reports as "could not be stored" once, logs the rest).
+- Metering upstream 4xx/5xx through a FlowCallout in the proxy's DefaultFaultRule; refused calls are never billed.
+- Tests:
+  - static bundle checks
+  - unit tests
+  - end-to-end flow tests in a Node model of the Apigee runtime
+  - CI job `apigee`
+
+### Fixed
+- **Customer** came from `developer.app.name` / `developer.email` (Apigee names, not Aforo ids). It now comes only from the `aforo_customer_id` attribute.
+- **JWT**: `AforoJwtValidation` had an `<OutputClaims>` element (not part of VerifyJWT) and a `<URI>` child under `<JWKS>`, so no claim was ever copied. It now uses `<JWKS uriRef>`, then copies `jwt.AforoJwtValidation.decoded.claim.*`. It also moved to the request path, with a tenant binding.
+- **Metric**: no `{method} {path}` names. `metric_mappings__{p}` uses Kong's Lua patterns, then the product's `default_metric__{p}`. MCP tool calls bill to the product's metric, not a hard-coded one.
+- **AGENTIC_API**: a client `traceparent` named the trace and turned API calls into AGENTIC_API.
+- **AI_AGENT**: every event was skipped (no agent), and the session came from a client header.
+- **MCP**:
+  - `agentId` came from the client's body
+  - batches were not parsed
+  - `initialize` / `tools/list` were billed
+- **Quantity**: `response_size` billed chunked responses as 0.
+- **Delivery**: the send held every response and the 202's per-event errors were ignored. Now `async` by default, or `sync` with per-event handling.
+- **Pre-flight**: `aforo-preflight-quota.js` was wired to nothing, and from the PostProxyFlowHook it could not have blocked anyway.
+
+### Removed
+- Margin guard, from the Apigee flows: it ran after the upstream had served the call and called an internal pricing endpoint.
+- The unwired `aforo-compound-metering.js`, `aforo-jwt-jti-check.js` and `aforo-preflight-quota.js`.
+- Global `product_type`, `default_metric`, `metric_mappings`, `metric_name_pattern`, `customer_id_source`, `mcp_enabled`, `mcp_product_id`.
+
 ## [2.1.0] — 2026-10-01
 
 ### Added

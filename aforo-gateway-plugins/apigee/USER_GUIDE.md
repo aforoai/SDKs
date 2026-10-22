@@ -1,124 +1,169 @@
-# aforo-metering (Apigee shared flow) — User Guide
+# Aforo for Apigee X: user guide
 
-**Version:** 2.1.0 · **Updated:** 2026-10-01 · **Audience:** engineers running Apigee X / hybrid who want API usage metered into Aforo without changing their proxies' business logic.
+**Version:** 3.0.0 · **Updated:** 2026-10-21 · **Audience:** engineers running Apigee X or hybrid who want their API metered and quota-enforced by Aforo without changing their API.
+
+Aforo's organization service normally does every step below when you connect your Apigee org in Aforo and deploy a product to it. This guide does it by hand: for a test org, for troubleshooting, or to see exactly what Aforo changes. The [README](README.md) is the reference for every setting.
 
 ## What you'll build
 
-An `aforo-metering` shared flow deployed to your Apigee environment and attached to your API proxies via a Flow Hook. After each call returns, the shared flow builds a usage event and POSTs it to Aforo in `PostClientFlow`, so the response is never delayed.
+- `aforo-access` on the **PreProxyFlowHook** and `aforo-metering` on the **PostProxyFlowHook** of one environment.
+- The KVM `aforo-metering-config` that marks which proxies Aforo manages and how each API product bills.
+- A developer and a developer app for one end customer, holding their Aforo key.
 
 ## Prerequisites
 
-- An Apigee X (or hybrid) org + environment you can deploy to, with `apigeecli` and `gcloud` authenticated.
-- Permission to create an org-scoped KVM and attach a Flow Hook.
-- An Aforo API key with scope `usage:ingest` (the tenant comes from the key). The metric you bill against (default `api_calls`) registered in your Aforo catalog. Events go to `https://api.aforo.ai/v1/ingest/batch` (set per environment in the KVM).
+- An Apigee X org and environment, with `gcloud` and [`apigeecli`](https://github.com/apigee/apigeecli) logged in as an org admin (attaching flow hooks needs one).
+- An API proxy in that environment, for example `payments-proxy`, and an API product that includes it, for example `payments-product`.
+- From Aforo:
+  - your tenant id
+  - an Aforo API key with scope `usage:ingest`
+  - the product's metric name
+  - an end customer id and that customer's `sk_live_…` key (or, for AI_AGENT and MCP products, an agent credential's client secret)
 
-## Step 1 — Import the shared flow from source
+```bash
+export ORG=my-org ENV=test TOKEN="$(gcloud auth print-access-token)"
+```
 
-Not a registry release, so deploy the bundle in this folder:
+## Step 1: import and deploy both shared flows
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
 cd SDKs/aforo-gateway-plugins/apigee
 
-apigeecli sharedflows create bundle \
-  --name aforo-metering \
-  --folder sharedflowbundle \
-  --org "$APIGEE_ORG" \
-  --token "$(gcloud auth print-access-token)"
+apigeecli sharedflows create bundle --name aforo-access   --folder aforo-access/sharedflowbundle --org "$ORG" --token "$TOKEN"
+apigeecli sharedflows create bundle --name aforo-metering --folder sharedflowbundle              --org "$ORG" --token "$TOKEN"
+apigeecli sharedflows deploy --name aforo-access   --rev 1 --env "$ENV" --org "$ORG" --token "$TOKEN"
+apigeecli sharedflows deploy --name aforo-metering --rev 1 --env "$ENV" --org "$ORG" --token "$TOKEN"
 ```
 
-`--folder sharedflowbundle` points at the bundle root (the folder containing `aforo-metering.xml`, `policies/`, `resources/`, and `sharedflows/`).
+The metering bundle stays at `sharedflowbundle/`, its 2.x path. The access bundle is in `aforo-access/sharedflowbundle/`. Each folder is a bundle root: its manifest XML, `policies/`, `resources/` and `sharedflows/`.
 
-## Step 2 — Deploy it to your environment
+## Step 2: create the KVM
+
+The KVM is **organization**-scoped, so don't pass `--env`. Values are strings.
 
 ```bash
-apigeecli sharedflows deploy \
-  --name aforo-metering \
-  --rev 1 \
-  --env "$APIGEE_ENV" \
-  --org "$APIGEE_ORG" \
-  --token "$(gcloud auth print-access-token)"
+apigeecli kvms create --name aforo-metering-config --org "$ORG" --token "$TOKEN"
+kv() { apigeecli kvms entries create --map aforo-metering-config --org "$ORG" --key "$1" --value "$2" --token "$TOKEN"; }
+
+# global
+kv aforo_endpoint      https://api.aforo.ai/v1/ingest/batch
+kv api_key             "$AFORO_API_KEY"          # scope usage:ingest
+kv tenant_id           "$AFORO_TENANT_ID"
+kv quota_fail_open     true
+kv quota_cache_ttl_ms  1000
+kv delivery_mode       sync                      # while testing: failures show in Debug; async in production
+
+# this proxy is Aforo's
+kv managed_proxy__payments-proxy true
+
+# this API product
+kv product_type__payments-product   API
+kv default_metric__payments-product api_calls_metric
+kv enforce_quota__payments-product  true
+kv metric_mappings__payments-product '[{"pathPattern":"^/payments/v1/charge","method":"POST","metricName":"charges"}]'
 ```
 
-## Step 3 — Create the config KVM
+For the other product types, set `product_type__{p}` to `AGENTIC_API`, `AI_AGENT` (optionally `agent_id__{p}`) or `MCP_SERVER` (set `default_metric__{p}` to the tool-call metric). The README lists every key.
 
-The bundle reads the **organization-scoped** KVM `aforo-metering-config` (no `--env`). See the README Configuration table for every key.
+## Step 3: attach the flow hooks
 
 ```bash
-TOKEN="$(gcloud auth print-access-token)"
-apigeecli kvms create --name aforo-metering-config --org "$APIGEE_ORG" --token "$TOKEN"
-kv() { apigeecli kvms entries create --map aforo-metering-config --org "$APIGEE_ORG" --key "$1" --value "$2" --token "$TOKEN"; }
-kv aforo_endpoint https://api.aforo.ai/v1/ingest/batch
-kv api_key "$AFORO_API_KEY"
-kv default_metric api_calls
-kv metric_mappings '[{"matchType":"PREFIX","value":"/sms/v1/send","metricName":"sms_sent"}]'
+curl -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  "https://apigee.googleapis.com/v1/organizations/$ORG/environments/$ENV/flowhooks/PreProxyFlowHook" \
+  -d '{"sharedFlow":"aforo-access","continueOnError":false}'
+curl -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  "https://apigee.googleapis.com/v1/organizations/$ORG/environments/$ENV/flowhooks/PostProxyFlowHook" \
+  -d '{"sharedFlow":"aforo-metering","continueOnError":true}'
 ```
 
-Then choose how callers are identified as Aforo customers — at least one is required, or nothing is metered:
+- `aforo-access` must be able to refuse a call (401, 429), so attach it with `continueOnError: false`. Its own steps already fail open on an Aforo outage.
+- Each hook takes one shared flow. If your environment already uses one of these hooks, call the Aforo flow from your shared flow with a FlowCallout instead.
+- These hooks cover every proxy in the environment. Proxies without `managed_proxy__{proxy} = true` are untouched.
 
-- **Aforo JWTs**: `kv jwt_validation_enabled true`, plus `aforo_jwks_uri` and `aforo_jwt_issuer`. With this on, requests without a valid Aforo JWT get 401 — only enable it on proxies whose callers all carry one.
-- **API keys / developer apps**: store each app's Aforo customer id in a custom attribute (e.g. `aforo_customer_id`) and set `kv customer_id_source flow_variable:verifyapikey.<YourVerifyAPIKeyPolicy>.app.aforo_customer_id`. Confirm the variable name in a Debug session.
-
-> ⚠ `api_key` is sent only as `X-API-Key`; `tenant_id` is never sent to the ingestor.
-
-## Step 4 — Attach the shared flow to your proxies
-
-Attach `aforo-metering` with a Flow Hook so it runs for every proxy in the environment:
+## Step 4: add the end customer
 
 ```bash
-apigeecli flowhooks attach \
-  --name post-proxy-flow-hook \
-  --sharedflow aforo-metering \
-  --org "$APIGEE_ORG" --env "$APIGEE_ENV" \
-  --token "$(gcloud auth print-access-token)"
+CUST=<aforo customer id>
+apigeecli developers create --email "aforo-$CUST@customers.aforo.invalid" --first Aforo --last "$CUST" \
+  --user "aforo-$CUST" --attrs "aforo_customer_id=$CUST" --org "$ORG" --token "$TOKEN"
+apigeecli apps create --name "aforo-$CUST" --email "aforo-$CUST@customers.aforo.invalid" \
+  --prods payments-product --attrs "aforo_customer_id=$CUST" --org "$ORG" --token "$TOKEN"
+# import the customer's Aforo key as the app's consumerKey (consumerSecret: random)
+apigeecli apps keys create --name "aforo-$CUST" --dev "aforo-$CUST@customers.aforo.invalid" \
+  --key "$CUSTOMER_SK_LIVE_KEY" --secret "$(openssl rand -hex 32)" --prods payments-product \
+  --org "$ORG" --token "$TOKEN"
 ```
 
-Or, for per-proxy control, add a `FlowCallout` step referencing `aforo-metering` in the proxy's `PostClientFlow`.
+Check the `apigeecli` flag names against `apigeecli <command> --help` for your version; the Apigee API equivalents are `POST /developers`, `POST /developers/{email}/apps` and `POST /developers/{email}/apps/{app}/keys/create`.
 
-> ⚠ The flow mixes request-phase steps (JWT, margin guard) and the response-phase metering step — see the README's "Phase mixing" note before choosing the hook.
+The customer is taken **only** from the `aforo_customer_id` attribute: on the app, else on the developer. The app name and the email are labels and are never billed.
 
-## Step 5 — Call an attached API
+## Step 5: check it
 
 ```bash
-curl "https://$APIGEE_HOST/your-proxy/anything?apikey=$APP_KEY"
+HOST=<your environment group host>
+curl -i "https://$HOST/payments/v1/accounts"                                  # 401: no key
+curl -i -H "x-api-key: wrong" "https://$HOST/payments/v1/accounts"            # 401
+curl -i -H "x-api-key: $CUSTOMER_SK_LIVE_KEY" "https://$HOST/payments/v1/accounts"   # your API's answer
 ```
 
-The shared flow runs after the response: `AforoMeteringReadConfig` loads the KVM, `AforoMeteringBuildEvent` (the `aforo-metering.js` resource) builds the event, and `AforoMeteringSendEvent` POSTs `{ "events": [ ... ] }` to your `aforo_endpoint`.
+Then look for the event under the customer and metric in Aforo. In an Apigee **Debug** session on the proxy, check these variables:
 
-## Step 6 — Verify it landed in Aforo
+- `aforo.verified.customerId`: the customer the call billed to.
+- `aforo.access.quotaDecision`: ALLOW, WARN, DENY or UNAVAILABLE.
+- `aforo.skipReason`: why a call was not metered.
+- With `delivery_mode = sync`: `aforo.meteringFirstAttempt`, `aforo.meteringDroppedEvents`, and the `print` lines starting `[aforo-metering]`.
 
-The send uses a `ServiceCallout` with `continueOnError="true"`, so the response is returned regardless of the callout result. To confirm delivery, inspect the callout response in Apigee's Debug (Trace) tool:
+Your upstream should not see an `x-api-key` header: the access flow strips the key once it is verified.
 
-1. Start a Trace session on the proxy in the Apigee console.
-2. Send the request from Step 5.
-3. In the trace, open the `AforoMeteringSendEvent` step and check the `aforo.calloutResponse` status code — `2xx` means accepted.
+To see the 429, use up the customer's hard limit in Aforo. The next call answers `429` with `Retry-After` and `{"message":…,"retryAfter":…}`, and your upstream is not called.
 
-If `AforoMeteringSendEvent` did not run, check `aforo.skipReason` on the `AforoMeteringBuildEvent` step (`OPTIONS`, `no customerId`, `excluded path`, …). Then confirm the event under the Aforo customer and metric (`api_calls` unless a mapping matched) in your Aforo usage view.
+## Metering upstream errors
 
-## Step 7 (optional) — MCP tool-invocation metering
+Apigee sends a target's 4xx/5xx to the error flow, which skips the PostProxyFlowHook, so such calls are not metered by the hook. To bill them (as `ERROR`, `TIMEOUT` and so on), add a FlowCallout to the proxy's `DefaultFaultRule`. This is proxy configuration, not code:
 
-Set the KVM keys `mcp_enabled = true` (and `mcp_product_id`) for proxies fronting an MCP server. For POST requests, the JS parses `request.content`; any JSON-RPC `2.0` body with `method: "tools/call"` emits an `mcp_server.tool_invocations` event with `toolName`, `sessionId` (from `Mcp-Session-Id`), and `executionStatus`. Its `productType` is `MCP_SERVER` when `params._meta.agent_id` is present; otherwise it keeps the KVM `product_type` (default `API`), which every other event carries.
+```xml
+<!-- apiproxy/policies/FC-aforo-metering.xml -->
+<FlowCallout name="FC-aforo-metering" continueOnError="true">
+    <SharedFlowBundle>aforo-metering</SharedFlowBundle>
+</FlowCallout>
 
-> ⚠ `agentId` is read only from the JSON-RPC payload at `params._meta.agent_id`. The `X-Agent-Id` request-header fallback was removed in 2.0.0 — it's client-settable and was a billing-attribution spoof vector.
+<!-- in apiproxy/proxies/default.xml -->
+<DefaultFaultRule name="aforo">
+    <AlwaysEnforce>true</AlwaysEnforce>
+    <Step><Name>FC-aforo-metering</Name></Step>
+</DefaultFaultRule>
+```
 
-## Configuration reference
+- **No double billing.** A call that reached the PostProxyFlowHook did not fault, so the fault rule never runs for it. A call `aforo-access` refused (401/429/503) is marked refused and never billed.
+- **Default exclusions.** Upstream 401, 403 and 429 are still not billed (`exclude_status_codes`).
+- **The other option** is `success.codes` on your TargetEndpoint. It changes how your proxy, analytics and fault rules see errors, so the FlowCallout is the smaller change.
 
-Full KVM key tables (metering + JWT) are in [README.md](README.md#configuration). You must set `aforo_endpoint`, `api_key`, `default_metric`, and one customer-identity source.
+## Delivery mode
+
+- **`async`** (the default): the client never waits for Aforo. An event the ingestor does not store is lost without a trace. Use it in production.
+- **`sync`**: the client waits for the ingestor's answer, which takes at most about 4 s. A transient failure is re-sent once and every loss is logged. Use it while testing, or where every event matters more than latency.
+
+See the README for why Apigee forces this choice.
+
+## Upgrading from 2.x
+
+3.0.0 is a breaking change:
+
+1. Deploy `aforo-access` and attach it to the PreProxyFlowHook. `aforo-metering` bills nothing without it.
+2. Add `managed_proxy__{proxy} = true` for each proxy, and the per-product keys (`product_type__{p}`, `default_metric__{p}`, …) for each API product.
+3. Give each app (or developer) the `aforo_customer_id` attribute. `customer_id_source` is gone.
+4. Global `product_type`, `default_metric`, `metric_mappings` (EXACT/PREFIX/CONTAINS), `metric_name_pattern`, `mcp_enabled` and `mcp_product_id` are no longer read. `metric_mappings__{p}` uses Lua patterns, as in Kong.
+5. Margin guard (`margin_guard_enabled`, `margin_guard_url`) was removed. It ran after the upstream had already served the call and called an internal Aforo endpoint.
+6. Move the JWT keys you use (`jwt_validation_enabled`, `aforo_jwks_uri`, `aforo_jwt_issuer`) as they are: they are now read by `aforo-access`.
 
 ## Troubleshooting
 
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| No event; `aforo.skipReason = no customerId` | Neither a verified Aforo JWT nor `customer_id_source` produced a customer | Enable `jwt_validation_enabled` for JWT callers, or configure `customer_id_source` to your verified app attribute. |
-| Every request 401s | `jwt_validation_enabled = true` on a proxy whose callers don't send Aforo JWTs | Turn it off for that proxy's traffic and use `customer_id_source`. |
-| Callout returns 400 | `default_metric` / a mapped metric is not in the catalog, or the customer id is not an Aforo customer | Register the metric / fix the mapping; the callout response body names the field. |
-| No callout at all in the trace | Shared flow not attached, or attached on the wrong Flow Hook | Confirm the `post-proxy-flow-hook` attachment, or add a `FlowCallout` step in `PostClientFlow`. |
-| `aforo.endpoint` resolves empty | KVM key missing or KVM not in the deployed environment | Create the `aforo-metering-config` KVM in the same env and add `aforo_endpoint`. KVM reads are cached 300 s — wait or re-deploy. |
-| Callout returns 401 | Wrong `api_key`, or an `Authorization` header on the callout | The key is sent only as `X-API-Key`; check the key has scope `usage:ingest`. |
-| JWT requests pass with no revocation check | `aforo_redis_host`/`aforo_redis_port` KVM keys unset | Add the Redis KVM keys; without them only `exp`/`iss`/signature run, not the jti blocklist. |
-
-## What this guide does NOT cover
-
-- **The margin-guard and preflight-quota policies** (`AforoMarginGuardCheck`, `aforo-margin-guard.js`, `aforo-preflight-quota.js`) ship in the bundle and run before metering, but their pricing-service quick-check contract is documented with the Aforo platform, not here.
-- **Flow Hook precedence with your existing shared flows** — if you already use the `PostProxyFlowHook`, you'll wire `aforo-metering` as a `FlowCallout` instead; that ordering is your proxy design, not the bundle's.
-- **Guaranteed delivery.** `continueOnError="true"` means a failed ingestor callout is dropped silently in favor of returning the API response. Reconcile against your own access logs if you need exactly-once accounting.
+| Symptom | Check |
+|---|---|
+| Every call 401 | Is the key the app's **consumerKey**, approved, with an API product that includes this proxy? With JWT on, is there a valid `Authorization: Bearer`? |
+| Calls pass but nothing in Aforo | Debug: `aforo.skipReason`. Look for `no verified customer` (attribute missing), `API product … has no Aforo settings`, or `KVM aforo_endpoint or api_key is not set`. In `async` mode, also try `sync` to see the ingestor's answer. |
+| Wrong metric | `metric_mappings__{p}` patterns are Lua patterns matched against base path + suffix (`/payments/v1/charge`, not `/v1/charge`). Escape `-` and `.` as `%-` and `%.`. |
+| Never 429 | `enforce_quota__{p}` = `true`? `aforo.access.quotaDecision` UNAVAILABLE means no answer within 1500 ms, or a 401 for `api_key` / `tenant_id`. |
+| KVM change ignored | Values are cached 60 s. |
