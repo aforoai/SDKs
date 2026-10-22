@@ -16,7 +16,7 @@ All five plugins source tenant/customer identity from **authenticated sources on
 | **Apigee** | `apigee-shared-flow-aforo-metering/` | Google Apigee | PostClientFlow (JavaScript callout) | `node tests/unit-tests.js` |
 | **AWS** | `aws-lambda-aforo-metering/` | AWS API Gateway | CloudWatch Logs (Lambda subscriber) | `npm test` |
 | **Azure APIM** | `azure-apim-policy-aforo-metering/` | Azure API Management | Outbound policy fragment | Manual (see README) |
-| **MuleSoft** | `mulesoft-policy-aforo-metering/` | MuleSoft Anypoint | Response phase (DataWeave) | Manual (see README) |
+| **MuleSoft** | `mulesoft/aforo-metering/` | MuleSoft Anypoint (Mule 4 gateway) | request (key introspection, quota) + async after the response | `node mulesoft/tests/policy.test.cjs`, `mulesoft/tests/run-dataweave.sh` |
 
 ## W3C Trace Context Headers
 
@@ -72,7 +72,7 @@ Every event carries `productType`, which the ingestor requires in production. Ea
 | Apigee | KVM key `product_type` |
 | AWS Lambda | `PRODUCT_TYPE` env var / `ProductType` SAM parameter |
 | Azure APIM | Named Value `aforo-product-type` (per-API override: `set-variable name="aforo-product-type"` before `aforo-context`) |
-| MuleSoft | `product-type` property (`${product_type}` in `template.xml`) |
+| MuleSoft | `product-type` policy property (per API instance) |
 
 An MCP `tools/call` is sent as `MCP_SERVER` only when both `toolName` and `agentId` are known; otherwise it keeps the configured type. Events missing the fields their type requires (e.g. `MCP_SERVER` without `agentId`, or `AI_AGENT` / `GRPC_API` / `GRAPHQL_API` / `WEBSOCKET_API` / `MQTT_BROKER`, whose fields an HTTP gateway cannot observe or trust) are skipped rather than sent, because one invalid event fails the whole batch.
 
