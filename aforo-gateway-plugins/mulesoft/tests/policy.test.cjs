@@ -1,39 +1,34 @@
 /**
- * MuleSoft policy checks — run with `node mulesoft/tests/policy.test.cjs`.
+ * MuleSoft policy structure checks — `node mulesoft/tests/policy.test.cjs`
+ * from aforo-gateway-plugins/ (node 18+, no dependencies).
  *
- * DataWeave cannot be executed here (no Mule runtime, no DataWeave CLI),
- * so this file does NOT prove the script evaluates correctly. It proves:
- *   1. The package is complete: pom.xml (packaging mule-policy),
- *      mule-artifact.json, aforo-metering.yaml and src/main/mule/template.xml
- *      exist, and the template and the definition agree on every property.
- *   2. template.xml is well-formed XML (xmllint when installed), wraps the
- *      flow in http-policy:proxy / source / execute-next, meters inside an
- *      async scope, and makes no outbound call for an empty events array.
- *   3. The metering script in template.xml (the only copy) keeps its
- *      exclusion block identical to mcp-mule-policy.yaml, declares the
- *      documented defaults, and gates the events array.
- *   4. Idempotency keys are unchanged (Rule #21).
- *   5. The 2.2.0 merge: productType on every event, metric mappings and
- *      the default metric, OPTIONS / no-identity / long-customer / zero
- *      quantity produce no event, the deprecated alias properties exist
- *      and are read second, 408 is retried, X-API-Key is the only
- *      credential header.
- * Behaviour is covered by the black-box matrix in policy-contract.md,
- * which needs a deployed API.
+ * The billing logic (the DataWeave scripts) is executed by
+ * dataweave.test.cjs with the DataWeave CLI. This file checks everything
+ * around it that a Mule runtime would otherwise be needed for:
+ *   1. the package: pom (mule-policy, 3.0.0 = VERSION, public repositories
+ *      only), mule-artifact.json, the policy definition (every MC3 property,
+ *      defaults, the secret marked sensitive)
+ *   2. the template agrees with the definition: every property is read
+ *      exactly once, as "={{name}}", and nothing else is rendered by
+ *      Handlebars (no property ever reaches DataWeave source text)
+ *   3. template.xml is well-formed XML and the flow is in the right order:
+ *      identity, quota check, refusal without execute-next, key removal,
+ *      execute-next, metering in async; every variable read is written
+ *   4. the outbound calls: URLs, headers, timeouts, validators, targets
+ *   5. the two METER BLOCK copies are identical
+ *   6. the docs name every property
  */
 'use strict';
 
 const fs = require('fs');
 const path = require('path');
-const { spawnSync } = require('child_process');
+const sync = require('./sync-meter-block.cjs');
 
 const DIR = path.join(__dirname, '..');
 const read = function (f) { return fs.readFileSync(path.join(DIR, f), 'utf8'); };
-const PKG = 'aforo-metering';
-const DEFINITION = PKG + '/aforo-metering.yaml';
-const TEMPLATE = path.join(DIR, PKG, 'src/main/mule/template.xml');
-const BEGIN = '// >>> BEGIN metering script — the only copy; tests/policy.test.cjs locks its invariants';
-const END = '// <<< END shared script';
+const template = read('aforo-metering/src/main/mule/template.xml');
+const definition = read('aforo-metering/aforo-metering.yaml');
+const pom = read('aforo-metering/pom.xml');
 
 let passed = 0;
 let failed = 0;
@@ -43,286 +38,300 @@ function check(name, cond, detail) {
     console.error('FAIL: ' + name + (detail !== undefined ? ' — ' + detail : ''));
 }
 function eq(name, actual, expected) {
-    check(name, actual === expected, 'expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual));
+    check(name, JSON.stringify(actual) === JSON.stringify(expected),
+        'expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual));
 }
-
-// The DataWeave under `afterResponse: |`, dedented, without the
-// `%dw 2.0` / `output` header lines (the template supplies its own).
-function scriptOf(yamlFile) {
-    const text = read(yamlFile);
-    const at = text.indexOf('  afterResponse: |\n');
-    if (at === -1) throw new Error(yamlFile + ': afterResponse block not found');
-    const lines = text.slice(at + '  afterResponse: |\n'.length).split('\n').map(function (l) {
-        if (l.trim() === '') return '';
-        if (!l.startsWith('    ')) throw new Error(yamlFile + ': line outside the block scalar: ' + l);
-        return l.slice(4);
-    });
-    while (lines.length && lines[lines.length - 1] === '') lines.pop();
-    return lines;
+function count(text, needle) {
+    return text.split(needle).length - 1;
 }
-function sharedBody(yamlFile) {
-    const lines = scriptOf(yamlFile);
-    if (lines[0] !== '%dw 2.0' || lines[1] !== 'output application/json') {
-        throw new Error(yamlFile + ': script must start with "%dw 2.0" / "output application/json"');
-    }
-    return lines.slice(2).join('\n').replace(/^\n+/, '');
-}
-function between(text, a, b) {
-    const i = text.indexOf(a);
+function between(text, a, b, from) {
+    const i = text.indexOf(a, from || 0);
+    if (i === -1) return null;
     const j = text.indexOf(b, i + a.length);
-    return i === -1 || j === -1 ? null : text.slice(i + a.length, j);
+    return j === -1 ? null : text.slice(i + a.length, j);
 }
+const stripCdata = function (t) { return t.replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, '<![CDATA[]]>'); };
+const stripComments = function (t) { return t.replace(/<!--[\s\S]*?-->/g, ''); };
+const xmlOnly = stripComments(stripCdata(template));
+const code = stripComments(template);
 
-const template = fs.readFileSync(TEMPLATE, 'utf8');
-const definition = read(DEFINITION);
+// MC3, in the order of the definition file.
+const MC3 = [
+    'aforo-endpoint', 'aforo-api-key', 'aforo-tenant-id', 'aforo-product-id',
+    'introspect-url', 'key-header',
+    'identity-cache-ttl-s', 'identity-negative-ttl-s', 'identity-stale-ttl-s', 'identity-fail-open',
+    'product-type', 'default-metric', 'metric-mappings', 'quantity-header', 'agent-id', 'trace-id-header',
+    'status-outcomes', 'exclude-paths', 'exclude-status-codes',
+    'quota-enabled', 'quota-check-url', 'quota-timeout-ms', 'quota-fail-open'
+];
 
 // ── 1. Package ───────────────────────────────────────────────────────
-const mainBody = between(template, BEGIN + '\n', '\n' + END);
-check('template.xml carries the metering-script markers', mainBody !== null);
-if (mainBody === null) { console.error('cannot continue without the script'); process.exit(1); }
-check('metering script cannot terminate the CDATA section', mainBody.indexOf(']]>') === -1);
+const VERSION = read('VERSION').trim();
+eq('VERSION', VERSION, '3.0.0');
+check('pom packaging is mule-policy', pom.indexOf('<packaging>mule-policy</packaging>') !== -1);
+eq('pom artifactId/version',
+    (pom.match(/<artifactId>aforo-metering<\/artifactId>\s*<version>([^<]+)<\/version>/) || [])[1], VERSION);
+check('pom groupId is the Anypoint org id property', pom.indexOf('<groupId>${anypoint.org.id}</groupId>') !== -1);
+check('pom uses mule-maven-plugin as an extension',
+    /<artifactId>mule-maven-plugin<\/artifactId>\s*<version>[^<]+<\/version>\s*<extensions>true<\/extensions>/.test(pom));
+check('pom publishes the definition as classifier policy-definition',
+    pom.indexOf('<classifier>policy-definition</classifier>') !== -1 && pom.indexOf('<packaging>yaml</packaging>') !== -1);
+[['org.mule.connectors', 'mule-http-connector'], ['org.mule.connectors', 'mule-objectstore-connector'],
+    ['org.mule.module', 'mule-java-module'], ['com.mulesoft.modules', 'mule-secure-configuration-property-module']].forEach(function (dep) {
+    check('pom depends on ' + dep[1] + ' (mule-plugin)',
+        new RegExp('<groupId>' + dep[0].replace(/\./g, '\\.') + '</groupId>\\s*<artifactId>' + dep[1] +
+            '</artifactId>\\s*<version>[^<]+</version>\\s*<classifier>mule-plugin</classifier>').test(pom));
+});
 {
-    const pom = read(PKG + '/pom.xml');
-    check('pom packaging is mule-policy', pom.indexOf('<packaging>mule-policy</packaging>') !== -1);
-    check('pom artifactId matches the definition file name', pom.indexOf('<artifactId>aforo-metering</artifactId>') !== -1);
-    check('pom uses mule-maven-plugin as an extension',
-        /<artifactId>mule-maven-plugin<\/artifactId>\s*<version>[^<]+<\/version>\s*<extensions>true<\/extensions>/.test(pom));
-    check('pom publishes the definition as classifier policy-definition',
-        pom.indexOf('<classifier>policy-definition</classifier>') !== -1 && pom.indexOf('<packaging>yaml</packaging>') !== -1);
-    check('pom deploys to the Exchange Maven facade for the organization',
-        pom.indexOf('https://maven.anypoint.mulesoft.com/api/v3/organizations/${anypoint.org.id}/maven') !== -1);
-    const version = (pom.match(/<artifactId>aforo-metering<\/artifactId>\s*<version>([^<]+)<\/version>/) || [])[1];
-    check('pom version is a release version', /^\d+\.\d+\.\d+$/.test(version || ''), version);
-    eq('pom version equals the VERSION file', version, read('VERSION').trim());
-    eq('VERSION', read('VERSION').trim(), '2.2.0');
+    const repos = (between(pom, '<repositories>', '</repositories>') || '') + (between(pom, '<pluginRepositories>', '</pluginRepositories>') || '');
+    const urls = (repos.match(/<url>([^<]+)<\/url>/g) || []).map(function (u) { return u.replace(/<\/?url>/g, ''); });
+    check('build resolves from public repositories only (no Anypoint / EE credentials)',
+        urls.length > 0 && urls.every(function (u) { return u === 'https://repository.mulesoft.org/releases/'; }), urls.join(', '));
+}
+{
     let artifact = null;
-    try { artifact = JSON.parse(read(PKG + '/mule-artifact.json')); } catch (e) { /* reported below */ }
-    check('mule-artifact.json parses and sets minMuleVersion', artifact !== null && /^4\./.test(artifact.minMuleVersion || ''));
-    eq('definition id', (definition.match(/^id: (.*)$/m) || [])[1], 'aforo-metering');
-    check('definition has no template block (API Manager schema)', !/^template:/m.test(definition));
-    check('definition marks the API key sensitive',
-        /- propertyName: aforo-api-key\n(?:    .*\n)*?    sensitive: true\n/.test(definition));
+    try { artifact = JSON.parse(read('aforo-metering/mule-artifact.json')); } catch (e) { /* reported below */ }
+    check('mule-artifact.json parses and sets minMuleVersion 4.x', artifact !== null && /^4\./.test(artifact.minMuleVersion || ''));
+}
 
-    // Every Handlebars name the template renders is declared, and every
-    // declared property is rendered.
-    const builtin = ['policyId', 'encrypted'];
-    const declared = (definition.match(/^  - propertyName: (.+)$/gm) || []).map(function (l) { return l.replace('  - propertyName: ', ''); });
-    const used = {};
-    (template.match(/\{\{\{[^}]+\}\}\}|\{\{#if [^}]+\}\}/g) || []).forEach(function (m) {
-        used[m.replace(/^\{\{\{|\}\}\}$|^\{\{#if |\}\}$/g, '')] = true;
+// Policy definition (a small reader for this file's own regular shape).
+const props = {};
+const declared = [];
+definition.split(/\n  - propertyName: /).slice(1).forEach(function (block) {
+    const lines = block.split('\n');
+    const name = lines[0].trim();
+    const fields = {};
+    lines.slice(1).forEach(function (l) {
+        const m = l.match(/^    ([A-Za-z]+): (.*)$/);
+        if (m) fields[m[1]] = m[2].trim();
     });
-    Object.keys(used).forEach(function (name) {
-        check('template property ' + name + ' is declared in the definition',
-            builtin.indexOf(name) !== -1 || declared.indexOf(name) !== -1);
-    });
-    declared.forEach(function (name) {
-        check('declared property ' + name + ' is used by the template', used[name] === true);
-    });
-    eq('declared properties', declared.join(','),
-        'aforo-endpoint,aforo-api-key,aforo-tenant-id,customer-id-claim,tenant-id-claim,mcp-enabled,mcp-product-id,status-outcomes,exclude-status-codes,exclude-paths,' +
-        'product-type,default-metric,metric-mappings,quantity-source,include-metadata,' +
-        'product_type,default_metric,quantity_source,include_metadata');
-    // The one-click installer (organization-service) sets these names.
-    ['aforo-endpoint', 'aforo-api-key', 'aforo-tenant-id', 'exclude-status-codes', 'exclude-paths', 'status-outcomes'].forEach(function (name) {
-        check('installer property ' + name + ' still declared', declared.indexOf(name) !== -1);
-    });
-    // Only the three the installer always sets are required; a new required
-    // property would make every existing policy instance invalid.
-    eq('required properties',
-        (definition.match(/^  - propertyName: .+\n(?:    .*\n)*?    optional: false$/gm) || [])
-            .map(function (b) { return b.split('\n')[0].replace('  - propertyName: ', ''); }).join(','),
-        'aforo-endpoint,aforo-api-key,aforo-tenant-id');
-    // Mule property placeholders would be resolved against the API's own
-    // properties, not the policy configuration. Only the two the gateway
-    // itself supplies for encryption are allowed.
+    declared.push(name);
+    props[name] = fields;
+});
+eq('definition id', (definition.match(/^id: (.*)$/m) || [])[1], 'aforo-metering');
+check('definition has no template block (API Manager schema)', !/^template:/m.test(definition));
+check('definition supports encryption (the API key arrives encrypted when the gateway has a key)',
+    /^encryptionSupported: true$/m.test(definition));
+eq('definition declares exactly the MC3 properties', declared, MC3);
+eq('required properties', declared.filter(function (n) { return props[n].optional === 'false'; }),
+    ['aforo-endpoint', 'aforo-api-key', 'aforo-tenant-id', 'aforo-product-id']);
+eq('sensitive properties', declared.filter(function (n) { return props[n].sensitive === 'true'; }), ['aforo-api-key']);
+declared.forEach(function (n) {
+    const p = props[n];
+    check(n + ' has name, description, type, optional, sensitive, allowMultiple',
+        ['name', 'description', 'type', 'optional', 'sensitive', 'allowMultiple'].every(function (k) { return p[k] !== undefined; }));
+});
+[['identity-cache-ttl-s', 'int', '60'], ['identity-negative-ttl-s', 'int', '10'], ['identity-stale-ttl-s', 'int', '900'],
+    ['identity-fail-open', 'boolean', 'false'], ['quota-enabled', 'boolean', 'false'], ['quota-timeout-ms', 'int', '1500'],
+    ['quota-fail-open', 'boolean', 'true'], ['key-header', 'string', 'x-api-key'], ['product-type', 'string', 'API']].forEach(function (t) {
+    eq(t[0] + ' type/default', [props[t[0]].type, props[t[0]].defaultValue], [t[1], t[2]]);
+});
+
+// ── 2. Template <-> definition ───────────────────────────────────────
+function pascal(name) {
+    return name.split('-').map(function (w) { return w.charAt(0).toUpperCase() + w.slice(1); }).join('');
+}
+declared.forEach(function (n) {
+    const tag = '<set-variable variableName="aforoProp' + pascal(n) + '" value="={{' + n + '}}"/>';
+    eq('property ' + n + ' is read once, as an attribute value', count(template, tag), 1);
+    check('the config script reads vars.aforoProp' + pascal(n), template.indexOf('vars.aforoProp' + pascal(n)) !== -1);
+});
+{
+    const tokens = template.match(/\{\{[^}]*\}\}\}?/g) || [];
+    const allowed = ['{{{policyId}}}', '{{#if encrypted}}', '{{/if}}'].concat(declared.map(function (n) { return '{{' + n + '}}'; }));
+    const unknown = tokens.filter(function (t) { return allowed.indexOf(t) === -1; });
+    eq('only known Handlebars tokens (properties double-braced, never triple)', unknown, []);
+    eq('{{#if encrypted}} and {{/if}} balance', count(template, '{{#if encrypted}}'), count(template, '{{/if}}'));
+    const cdata = template.match(/<!\[CDATA\[[\s\S]*?\]\]>/g) || [];
+    check('no Handlebars inside any CDATA (DataWeave never sees a raw property)',
+        cdata.every(function (c) { return c.indexOf('{{') === -1; }));
     const placeholders = (template.match(/\$\{[^}]+\}/g) || []).filter(function (m) {
         return m !== '${anypoint.platform.encryption_key}' && m !== '${encryptedPropertiesFile}';
     });
-    eq('no Mule property placeholders for policy configuration', placeholders.join(','), '');
+    eq('no Mule property placeholders besides the gateway encryption ones', placeholders, []);
+    const propVars = (template.match(/vars\.aforoProp[A-Za-z]+/g) || []).filter(function (v, i, a) { return a.indexOf(v) === i; });
+    eq('every vars.aforoProp* read is a declared property',
+        propVars.filter(function (v) { return declared.map(function (n) { return 'vars.aforoProp' + pascal(n); }).indexOf(v) === -1; }), []);
 }
 
-// ── 2. Transport ─────────────────────────────────────────────────────
-const lint = spawnSync('xmllint', ['--noout', TEMPLATE], { encoding: 'utf8' });
-if (lint.error) {
-    console.log('note: xmllint not installed — template.xml well-formedness not checked');
-} else {
-    eq('template.xml is well formed (xmllint)', lint.status, 0);
-    if (lint.status !== 0) console.error(lint.stderr);
-}
-{
-    const gate = template.indexOf('<when expression="#[sizeOf(payload.events default []) > 0]">');
-    const send = template.indexOf('<http:request ');
-    const gateEnd = template.indexOf('</when>', gate);
-    const next = template.indexOf('<http-policy:execute-next/>');
-    check('outbound call is gated on a non-empty events array', gate !== -1 && gate < send && send < gateEnd);
-    eq('exactly one outbound request', (template.match(/<http:request /g) || []).length, 1);
-    check('no <otherwise> branch anywhere', template.indexOf('<otherwise') === -1);
-    check('no <choose> element (the Mule router is <choice>)', template.indexOf('<choose') === -1);
-    check('policy wraps the flow: proxy > source > execute-next',
-        template.indexOf('<http-policy:proxy name="{{{policyId}}}-aforo-metering">') !== -1 &&
-        template.indexOf('<http-policy:source>') < next && next !== -1 &&
-        (template.match(/<http-policy:execute-next\/>/g) || []).length === 1);
-    check('metering runs after the flow, inside async', next < template.indexOf('<async>'));
-    check('request capture cannot fail the API call',
-        template.indexOf('<try>') < next && template.indexOf('<on-error-continue type="ANY" logException="false"/>') < next);
-    check('request id is minted once, before the flow', template.indexOf('requestId: uuid(),') !== -1 && template.indexOf('requestId: uuid(),') < next);
-    check('request id is not taken from a client header',
-        template.indexOf('correlationId') === -1 && !/requestId: [^\n]*headers/.test(template));
-    check('identity comes from verified JWT claims', template.indexOf('authentication.properties.claims') !== -1);
-    check('try() resolves to dw::Runtime and yields the value',
-        template.indexOf('fun try(delegate) = dw::Runtime::try(delegate).result') !== -1);
-    check('payload is built before the retry scope',
-        template.lastIndexOf('</ee:transform>') < template.indexOf('<until-successful'));
-    check('retried: transport, 5xx, 408 and 429; other 4xx accepted and logged',
-        template.indexOf('<http:success-status-code-validator values="200..299,400..407,409..428,430..499" />') !== -1 &&
-        template.indexOf('usage event rejected by the ingestor, not retried') > template.indexOf('</until-successful>'));
-    {
-        const headers = between(template, '<http:headers><![CDATA[#[{', '}]]]></http:headers>') || '';
-        eq('ingestor headers are Content-Type and X-API-Key only',
-            (headers.match(/"[^"]+":/g) || []).join(''), '"Content-Type":"X-API-Key":');
-    }
-    check('unusable metric name is logged at WARN, other skips at DEBUG',
-        /<when expression="#\[payload\.skipReason == 'metric'\]">\s*<logger level="WARN"/.test(template) &&
-        /<when expression="#\[payload\.skipReason != null\]">\s*<logger level="DEBUG"/.test(template));
-    check('response body is not read for quantity',
-        template.indexOf("responseContentLength: dw::Runtime::try(() -> (attributes.headers.'content-length' as Number)).result") !== -1);
-    check('vars.aforo is only a fallback behind the verified claims',
-        template.indexOf("customerId: if (claimCustomer != '') claimCustomer else text(prior.customerId)") !== -1);
-    check('retry kept: 2 retries inside async',
-        /<until-successful maxRetries="2" millisBetweenRetries="1000">/.test(template) &&
-        template.indexOf('<async>') < template.indexOf('<until-successful'));
-    ['x-customer-id', 'authentication.clientId', 'customer_id_source', 'X-Client-Id'].forEach(function (banned) {
-        check('template does not read identity from ' + banned,
-            template.replace(/<!--[\s\S]*?-->/g, '').replace(/\/\/.*$/gm, '').indexOf(banned) === -1);
-    });
-}
-
-// ── 3. Exclusions ────────────────────────────────────────────────────
-const X_BEGIN = '// ── Exclusions (requests that are NOT metered at all) ── [shared block]';
-const X_END = '// ── end exclusions ── [shared block]';
-const mcpBody = sharedBody('mcp-mule-policy.yaml');
-const xMain = between(mainBody, X_BEGIN, X_END);
-const xMcp = between(mcpBody, X_BEGIN, X_END);
-check('exclusion block present in template.xml', xMain !== null);
-eq('exclusion block identical in mcp-mule-policy.yaml', xMcp, xMain);
-
-[['template.xml', mainBody, DEFINITION], ['mcp-mule-policy.yaml', mcpBody, 'mcp-mule-policy.yaml']].forEach(function (pair) {
-    const file = pair[0];
-    const body = pair[1];
-    const yaml = read(pair[2]);
-    const code = body.split('\n').filter(function (l) { return !/^\s*\/\//.test(l); }).join('\n');
-    ['exclude-status-codes', 'exclude-paths', 'status-outcomes'].forEach(function (prop) {
-        check(file + ' declares property ' + prop, yaml.indexOf('  - propertyName: ' + prop + '\n') !== -1);
-        check(file + ' reads configuration.' + prop, code.indexOf("configuration.'" + prop + "'") !== -1);
-    });
-    check(file + ' default status codes 401,403,429', code.indexOf('var defaultExcludeStatusCodes = [401, 403, 429]') !== -1);
-    check(file + ' default paths /health,/ready,/metrics',
-        code.indexOf('var defaultExcludePaths = ["/health", "/ready", "/metrics"]') !== -1);
-    check(file + ' "none" excludes nothing', code.indexOf('lower(entries[0]) == "none"') !== -1);
-    check(file + ' equal-or-prefix path match', code.indexOf('attributes.requestPath startsWith prefix') !== -1);
-    check(file + ' status entries limited to 100-599', code.indexOf('entry matches /[1-5][0-9][0-9]/') !== -1);
-    check(file + ' non-text config is read as blank, not coerced',
-        code.indexOf('if (raw is String) raw else if (raw is Number) (raw as String) else ""') !== -1);
-    eq(file + ' events array gated on isMeterable',
-        (code.match(/events: if \(isMeterable\) \[/g) || []).length, 1);
-    eq(file + ' exactly one events array', (code.match(/events: /g) || []).length, 1);
-    {
-        const gateDef = code.slice(code.indexOf(file === 'template.xml' ? 'var skipReason =' : 'var isMeterable ='), code.lastIndexOf('\n---\n'));
-        check(file + ' gate covers exclusions', gateDef.indexOf('isExcluded') !== -1);
-        check(file + ' gate covers a missing identity', gateDef.indexOf('hasAuthenticatedIdentity') !== -1);
-        check(file + ' gate covers OPTIONS', gateDef.indexOf('isPreflight') !== -1 &&
-            code.indexOf('var isPreflight = upper(requestMethod) == "OPTIONS"') !== -1);
-        check(file + ' gate covers a customer id over 64 characters',
-            /sizeOf\(authenticatedCustomerId\) (> 64|<= 64)/.test(gateDef));
-    }
-    check(file + ' never sends a placeholder customer',
-        !/customerId: [^\n]*("unknown"|"anonymous"|null)/.test(code));
-    eq(file + ' productType on both event shapes', (code.match(/^\s+productType: /gm) || []).length, 2);
-    check(file + ' MCP_SERVER only with an agentId',
-        code.indexOf('var mcpProductType = if ((agentId as String) != "") "MCP_SERVER" else productType') !== -1 &&
-        code.indexOf('productType: mcpProductType,') !== -1);
-    check(file + ' product type defaults to API, trimmed and upper-cased',
-        code.indexOf('var productType = if (configuredProductType == "") "API" else configuredProductType') !== -1 &&
-        /var configuredProductType = upper\((trim|setting)\(/.test(code));
-    check(file + ' default metric is api_calls with {method} / {path} tokens',
-        code.indexOf('(if (defaultMetricSetting == "") "api_calls" else defaultMetricSetting)') !== -1 ||
-        code.indexOf('(if (configuredDefaultMetric == "") "api_calls" else configuredDefaultMetric)') !== -1);
-    check(file + ' no route-shaped metric name by default', code.indexOf('++ " " ++ (attributes.requestPath') === -1);
-    check(file + ' isExcluded is defined before the body separator',
-        code.indexOf('var isExcluded = isExcludedStatus or isExcludedPath') !== -1 &&
-        code.indexOf('var isExcluded = ') < code.lastIndexOf('\n---\n'));
-    eq(file + ' executionStatus on both event shapes',
-        (code.match(/\(executionStatus: executionStatus\) if executionStatus != null/g) || []).length, 2);
-    eq(file + ' occurredAt on both event shapes', (code.match(/occurredAt: occurredAtUtc,/g) || []).length, 2);
-    check(file + ' occurredAt is shifted to UTC before the literal Z',
-        code.indexOf("var occurredAtUtc = (now() >> \"UTC\") as String {format: \"yyyy-MM-dd'T'HH:mm:ss.SSS'Z'\"}") !== -1);
-
-    // ── 4. Idempotency keys (Rule #21) ──
-    const keys = code.match(/idempotencyKey: .*/g) || [];
-    eq(file + ' two idempotency keys', keys.length, 2);
-    check(file + ' MCP key unchanged',
-        keys.indexOf('idempotencyKey: "mcp:mulesoft:" ++ (attributes.requestId default uuid()) ++ ":" ++ toolName,') !== -1);
-    check(file + ' standard key unchanged',
-        keys.indexOf('idempotencyKey: attributes.requestId default uuid(),') !== -1);
-    check(file + ' no clock in an idempotency key', keys.every(function (k) { return k.indexOf('now()') === -1; }));
-});
-
-// ── 5. 2.2.0 merge (package template) ────────────────────────────────
-{
-    const code = mainBody.split('\n').filter(function (l) { return !/^\s*\/\//.test(l); }).join('\n');
-    // Aliases: canonical first, alias only when the canonical one is blank.
-    check('setting() prefers the canonical property',
-        code.indexOf('if (canonical != "") canonical else fallback') !== -1);
-    [['product-type', 'product_type'], ['default-metric', 'default_metric'],
-        ['quantity-source', 'quantity_source'], ['include-metadata', 'include_metadata']].forEach(function (pair) {
-        check('alias ' + pair[1] + ' is read behind ' + pair[0],
-            code.indexOf('setting("' + pair[0] + '", "' + pair[1] + '")') !== -1);
-        check('alias ' + pair[1] + ' is rendered into configuration',
-            template.indexOf('"' + pair[1] + '": "{{{' + pair[1] + '}}}"') !== -1 &&
-            template.indexOf('"' + pair[0] + '": "{{{' + pair[0] + '}}}"') !== -1);
-        check('alias ' + pair[1] + ' is described as deprecated',
-            new RegExp('- propertyName: ' + pair[1] + '\\n    name: ' + pair[1] + ' \\(deprecated\\)').test(definition));
-    });
-    // Metric naming: mapping match, then the default metric.
-    check('mapping rules are KIND|value|metric separated by ";"',
-        code.indexOf('(setting("metric-mappings", null) splitBy ";")') !== -1 && code.indexOf('(rule splitBy "|")') !== -1);
-    check('mapping kinds are EXACT, PREFIX, CONTAINS',
-        code.indexOf('["EXACT", "PREFIX", "CONTAINS"] contains upper(rule[0])') !== -1 &&
-        code.indexOf('if (upper(rule[0]) == "EXACT") requestPath == rule[1]') !== -1 &&
-        code.indexOf('else if (upper(rule[0]) == "PREFIX") requestPath startsWith rule[1]') !== -1 &&
-        code.indexOf('else requestPath contains rule[1]))[0]') !== -1);
-    check('mapping match wins over the default metric',
-        code.indexOf('var metricName = if (matchedRule != null) matchedRule[2] else defaultMetric') !== -1);
-    check('standard event sends the resolved metric', code.indexOf('metricName: metricName,') !== -1);
-    check('MCP metric name unchanged', code.indexOf('metricName: "mcp_server.tool_invocations",') !== -1);
-    check('empty or over-255 metric name is not sent',
-        code.indexOf('var isMetricSendable = (sizeOf(metricName) > 0) and (sizeOf(metricName) <= 255)') !== -1 &&
-        code.indexOf('else if ((not isMcpToolCall) and (not isMetricSendable)) "metric"') !== -1);
-    // Skip order: one reason, first match.
-    eq('skip reasons in order',
-        (code.slice(code.indexOf('var skipReason ='), code.indexOf('var isMeterable')).match(/"[a-z0-9-]+"/g) || []).join(','),
-        '"options","excluded","no-identity","customer-id-too-long","quantity","metric"');
-    check('skipReason is only present with an empty events array',
-        code.indexOf('(skipReason: skipReason) if (not isMeterable),') !== -1 &&
-        code.indexOf('var isMeterable = skipReason == null') !== -1);
-    check('quantity 0 is skipped', code.indexOf('else if ((not isMcpToolCall) and (quantity <= 0)) "quantity"') !== -1);
-    check('standard event sends the resolved quantity', code.indexOf('quantity: quantity,') !== -1);
-    check('traceparent still wins the product type',
-        code.indexOf('productType: if (isAgenticApi) "AGENTIC_API" else productType,') !== -1 &&
-        code.indexOf('(traceId: agenticTraceId) if isAgenticApi,') !== -1);
-    eq('metadata is optional on both event shapes', (code.match(/\}\) if includeMetadata/g) || []).length, 2);
-}
-
-check('balanced brackets in the shared script', (function () {
-    const stripped = mainBody.replace(/\/\/.*$/gm, '').replace(/"(\\.|[^"\\])*"/g, '""').replace(/\/[^\/\n]+\/(?=[\s)])/g, 'RE');
-    const pairs = { ')': '(', ']': '[', '}': '{' };
+// ── 3. XML and flow order ────────────────────────────────────────────
+function wellFormed(xml) {
+    let rest = xml.replace(/^<\?xml[^>]*\?>/, '');
     const stack = [];
-    for (const c of stripped) {
-        if ('([{'.indexOf(c) !== -1) stack.push(c);
-        else if (pairs[c]) { if (stack.pop() !== pairs[c]) return false; }
+    const re = /<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<(\/?)([A-Za-z_][\w:.-]*)((?:\s+[\w:.-]+\s*=\s*(?:"[^"]*"|'[^']*'))*)\s*(\/?)>|<|&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)/g;
+    let m;
+    while ((m = re.exec(rest)) !== null) {
+        if (m[0].startsWith('<!--') || m[0].startsWith('<![CDATA[')) continue;
+        if (m[0] === '<') return 'stray "<" at ' + m.index;
+        if (m[0] === '&') return 'unescaped "&" at ' + m.index;
+        if (m[3] && /\s[\w:.-]+\s*=\s*"[^"]*</.test(m[3])) return 'raw "<" in an attribute of <' + m[2] + '>';
+        if (m[1] === '/') {
+            const open = stack.pop();
+            if (open !== m[2]) return '</' + m[2] + '> closes <' + open + '>';
+        } else if (m[4] !== '/') {
+            stack.push(m[2]);
+        }
     }
-    return stack.length === 0;
-})());
+    return stack.length === 0 ? null : 'unclosed <' + stack.join('>, <') + '>';
+}
+eq('template.xml is well-formed XML', wellFormed(template), null);
+eq('mule-artifact.json is JSON', (function () { try { JSON.parse(read('aforo-metering/mule-artifact.json')); return null; } catch (e) { return e.message; } })(), null);
 
-console.log('\nMuleSoft policy checks: ' + passed + ' passed, ' + failed + ' failed (DataWeave not executed)');
+const NEXT = '<http-policy:execute-next/>';
+const next = template.indexOf(NEXT);
+eq('exactly one execute-next', count(template, NEXT), 1);
+check('policy wraps the flow: proxy > source (propagating) > execute-next',
+    template.indexOf('<http-policy:proxy name="{{{policyId}}}-aforo-metering">') !== -1 &&
+    template.indexOf('<http-policy:source propagateMessageTransformations="true">') !== -1 &&
+    template.indexOf('<http-policy:source propagateMessageTransformations="true">') < next);
+const pos = {
+    config: template.indexOf('// aforo-script: config'),
+    request: template.indexOf('// aforo-script: request'),
+    identityLookup: template.indexOf('// aforo-script: identity-lookup'),
+    introspect: template.indexOf('url="#[vars.aforoCfg.introspectUrl]"'),
+    identityDecide: template.indexOf('// aforo-script: identity-decide'),
+    quotaLookup: template.indexOf('// aforo-script: quota-lookup'),
+    quotaCall: template.indexOf('url="#[vars.aforoCfg.quotaUrl]"'),
+    quotaDecide: template.indexOf('// aforo-script: quota-decide'),
+    reject: template.indexOf('<when expression="#[vars.aforoAccess.outcome == \'reject\']">'),
+    strip: template.indexOf('method="removeAll(Object)"'),
+    next: next,
+    events: template.indexOf('// aforo-script: events'),
+    async: template.indexOf('<async maxConcurrency="16">'),
+    delivery: template.indexOf('// aforo-script: delivery')
+};
+Object.keys(pos).forEach(function (k) { check('template has ' + k, pos[k] !== -1); });
+const order = ['config', 'request', 'identityLookup', 'introspect', 'identityDecide', 'quotaLookup', 'quotaCall', 'quotaDecide', 'reject', 'strip', 'next'];
+check('order: config, request, identity, quota check, refusal, key removal, execute-next',
+    order.every(function (k, i) { return i === 0 || pos[order[i - 1]] < pos[k]; }), order.map(function (k) { return k + '@' + pos[k]; }).join(' '));
+check('the quota check runs before execute-next', pos.quotaCall < next);
+check('metering (events, delivery) only after execute-next',
+    template.indexOf('// aforo-script: events') > next && template.indexOf('<async') > next &&
+    template.indexOf('url="#[vars.aforoCfg.endpoint]"') > next);
+{
+    // The refusal branch: answers with HttpPolicyResponseAttributes and never calls the API or meters.
+    const start = pos.reject;
+    const otherwise = template.indexOf('<otherwise>', start);
+    const branch = template.slice(start, otherwise);
+    check('a refused call never reaches execute-next', branch.indexOf(NEXT) === -1 && next > otherwise);
+    check('a refused call is never metered', branch.indexOf('<async') === -1 && branch.indexOf('<http:request') === -1);
+    check('a refusal is a JSON body with HttpPolicyResponseAttributes(status, headers)',
+        branch.indexOf('class: "org.mule.extension.http.api.policy.HttpPolicyResponseAttributes"') !== -1 &&
+        branch.indexOf('statusCode: vars.aforoAccess.status as Number') !== -1 &&
+        branch.indexOf('"Content-Type": "application/json"') !== -1 &&
+        branch.indexOf('output application/json\n---\nvars.aforoAccess.body') !== -1);
+}
+{
+    // The key header leaves the request before execute-next.
+    const strip = template.slice(pos.reject, next);
+    check('key removal copies the headers and removes key-header',
+        strip.indexOf('constructor="CaseInsensitiveMultiMap(MultiMap)"') !== -1 &&
+        strip.indexOf('<java:args>#[{arg0: vars.aforoCfg.keyHeader}]</java:args>') !== -1);
+    check('key removal rebuilds HttpRequestAttributes with those headers',
+        strip.indexOf('constructor="HttpRequestAttributesBuilder(HttpRequestAttributes)"') !== -1 &&
+        strip.indexOf('method="headers(MultiMap)"') !== -1 && strip.indexOf('method="build()"') !== -1 &&
+        strip.indexOf('<ee:set-attributes><![CDATA[%dw 2.0\noutput application/java\n---\nvars.aforoForwardAttributes]]></ee:set-attributes>') !== -1);
+    check('a failed key removal never fails the call',
+        /method="build\(\)"[\s\S]*?<on-error-continue type="ANY" logException="false">\s*<logger level="WARN"/.test(strip));
+}
+check('any failure in the access section fails closed (503)',
+    /<on-error-continue type="ANY" logException="true">\s*<logger level="ERROR"[^>]*>\s*<set-variable variableName="aforoAccess" value="#\[\{outcome: 'reject', status: 503/.test(template) &&
+    template.indexOf('logException="true"') < pos.reject);
+check('an API error is metered then propagated unchanged',
+    /<http-policy:execute-next\/>\s*<error-handler>[\s\S]*?<on-error-propagate type="ANY" logException="false">\s*<set-variable variableName="aforoFlowFailed" value="#\[true\]"\/>/.test(template));
+check('request id minted once with uuid(), never from the client', code.indexOf('<set-variable variableName="aforoRequestId" value="#[uuid()]"/>') !== -1 &&
+    code.indexOf('correlationId') === -1);
+{
+    const noComments = code.split('\n').filter(function (l) { return !/^\s*\/\//.test(l); }).join('\n');
+    ['X-Client-Id', 'x-customer-id', 'X-Agent-Id', 'authentication.properties', '_meta', 'traceparent" ==', "attributes.headers.'x-aforo"].forEach(function (banned) {
+        check('no identity from the client: ' + banned, noComments.indexOf(banned) === -1);
+    });
+}
+{
+    // Every variable read is written somewhere (set-variable, ee:set-variable or target).
+    const written = {};
+    (template.match(/(?:variableName|target)="(aforo\w+)"/g) || []).forEach(function (m) { written[m.replace(/.*="|"/g, '')] = true; });
+    const reads = (template.match(/vars\.(aforo\w+)/g) || []).map(function (m) { return m.slice(5); })
+        .filter(function (v, i, a) { return a.indexOf(v) === i; });
+    eq('every vars.aforo* read is written', reads.filter(function (v) { return !written[v]; }), []);
+}
+check('object stores are per policy instance and in memory',
+    (xmlOnly.match(/<os:object-store [^>]*>/g) || []).length === 3 &&
+    (xmlOnly.match(/<os:object-store [^>]*>/g) || []).every(function (t) { return /name="\{\{\{policyId\}\}\}-aforo-/.test(t) && /persistent="false"/.test(t); }));
+check('the identity cache is keyed by the SHA-256 of the key, never the key',
+    template.indexOf('<os:retrieve key="#[vars.aforoReq.keyHash]" objectStore="{{{policyId}}}-aforo-identity"') !== -1 &&
+    template.indexOf('<os:store key="#[vars.aforoReq.keyHash]" objectStore="{{{policyId}}}-aforo-identity">') !== -1 &&
+    !/key="#\[vars\.aforoReq\.key\]"/.test(template));
+
+// ── 4. Outbound calls ────────────────────────────────────────────────
+const requests = xmlOnly.match(/<http:request [\s\S]*?<\/http:request>/g) || [];
+const requestsFull = code.match(/<http:request [\s\S]*?<\/http:request>/g) || [];
+eq('three kinds of outbound call (introspection, quota, ingest) x meter copies', requestsFull.length, 4);
+requestsFull.forEach(function (r, i) {
+    const label = 'outbound call ' + (i + 1);
+    check(label + ' uses the policy http config, no redirects, own target',
+        r.indexOf('config-ref="{{{policyId}}}-aforo-http"') !== -1 && r.indexOf('followRedirects="false"') !== -1 &&
+        /target="aforo\w+"/.test(r) && r.indexOf('targetValue="#[{status: attributes.statusCode, text: (payload default \'\') as String}]"') !== -1);
+    check(label + ' reads every status itself (validator 100..599)', r.indexOf('<http:success-status-code-validator values="100..599"/>') !== -1);
+    check(label + ' sends its own body, never the API payload', r.indexOf('<http:body>') !== -1);
+});
+function headerNames(r) {
+    const h = between(r, '<http:headers><![CDATA[#[{', '}]]]></http:headers>') || '';
+    return (h.match(/'[^']+':/g) || []).map(function (s) { return s.slice(1, -2); });
+}
+{
+    const intro = requestsFull.filter(function (r) { return r.indexOf('vars.aforoCfg.introspectUrl') !== -1; });
+    eq('one introspection call', intro.length, 1);
+    eq('introspection headers', headerNames(intro[0] || ''), ['Content-Type', 'X-API-Key']);
+    check('introspection body is {key}, timeout introspectTimeoutMs (1500)',
+        (intro[0] || '').indexOf('{key: vars.aforoReq.key}') !== -1 &&
+        (intro[0] || '').indexOf('responseTimeout="#[vars.aforoCfg.introspectTimeoutMs]"') !== -1 &&
+        template.indexOf('introspectTimeoutMs: 1500') !== -1);
+    const quota = requestsFull.filter(function (r) { return r.indexOf('vars.aforoCfg.quotaUrl') !== -1; });
+    eq('one quota call', quota.length, 1);
+    eq('quota headers', headerNames(quota[0] || ''), ['Content-Type', 'X-API-Key', 'X-Tenant-Id']);
+    check('quota body is {customerId, metricName}, timeout quota-timeout-ms',
+        (quota[0] || '').indexOf('{customerId: vars.aforoAccess.quota.customerId, metricName: vars.aforoAccess.quota.metricName}') !== -1 &&
+        (quota[0] || '').indexOf('responseTimeout="#[vars.aforoCfg.quotaTimeoutMs]"') !== -1);
+    const ingest = requestsFull.filter(function (r) { return r.indexOf('vars.aforoCfg.endpoint') !== -1; });
+    eq('ingest call in each meter copy', ingest.length, 2);
+    ingest.forEach(function (r) {
+        eq('ingest headers (X-API-Key only, no Bearer, no tenant)', headerNames(r), ['Content-Type', 'X-API-Key']);
+        check('ingest sends the pending entry', r.indexOf('<http:body><![CDATA[#[vars.aforoPendingText]]]></http:body>') !== -1);
+    });
+}
+check('delivery: 3 attempts, re-send only what the pending entry holds',
+    count(template, '<until-successful maxRetries="2" millisBetweenRetries="2000">') === 2 &&
+    count(template, '<raise-error type="AFORO:DELIVERY_RETRY"') === 2);
+check('delivery is bounded: 16 at once, 1000 waiting',
+    count(template, '<async maxConcurrency="16">') === 2 &&
+    count(template, '<when expression="#[1000 > sizeOf(vars.aforoPendingKeys default [])]">') === 2);
+check('the transient ingest error text matches the ingestor', template.indexOf('var TRANSIENT = "The event could not be stored"') !== -1);
+check('warnings are throttled to one a minute per kind', count(template, '>= 60000]">') === 4);
+
+// ── 5. METER BLOCK copies ────────────────────────────────────────────
+{
+    const b = sync.blocks(template);
+    const body2 = template.slice(template.indexOf('\n', b.s2) + 1, template.lastIndexOf('\n', b.e2) + 1).split('\n').slice(0, -1);
+    eq('METER BLOCK copy 2 is copy 1 (run tests/sync-meter-block.cjs after editing copy 1)',
+        body2.join('\n') === sync.expectedCopy2(template).join('\n'), true);
+    check('METER BLOCK copy 1 is inside the API error handler, copy 2 after it',
+        b.s1 > next && template.lastIndexOf('<on-error-propagate', b.s1) > next && b.s2 > template.indexOf('</on-error-propagate>', b.s1));
+}
+
+// ── 6. Docs ──────────────────────────────────────────────────────────
+{
+    const guide = read('USER_GUIDE.md');
+    const readme = read('README.md');
+    declared.forEach(function (n) {
+        check('USER_GUIDE.md documents ' + n, guide.indexOf('`' + n + '`') !== -1);
+    });
+    ['401', '403', '429', '503', 'X-Aforo-Agent-Id', 'X-Aforo-Session-Id', 'X-Aforo-Trace-Id', 'X-Aforo-Quantity', 'Mcp-Session-Id', '60 s'].forEach(function (t) {
+        check('README.md mentions ' + t, readme.indexOf(t) !== -1);
+    });
+    check('README names the jar this version builds', readme.indexOf('aforo-metering-' + VERSION + '-mule-policy.jar') !== -1);
+    check('CHANGELOG has the ' + VERSION + ' entry', read('CHANGELOG.md').indexOf('## [' + VERSION + ']') !== -1);
+}
+
+console.log('\nMuleSoft policy structure checks: ' + passed + ' passed, ' + failed + ' failed');
 process.exit(failed === 0 ? 0 : 1);
