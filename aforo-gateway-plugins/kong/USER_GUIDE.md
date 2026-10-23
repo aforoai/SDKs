@@ -1,6 +1,6 @@
 # kong-plugin-aforo-metering — User Guide
 
-**Version:** 2.1.0 · **Updated:** 2026-10-19 · **Audience:** engineers running Kong Gateway (OSS or Enterprise) who want API usage metered into Aforo.
+**Version:** 2.1.0 · **Updated:** 2026-10-22 · **Audience:** engineers running Kong Gateway (OSS, Enterprise or Kong Konnect data planes) who want API usage metered into Aforo.
 
 ## What you'll build
 
@@ -8,7 +8,7 @@ A Kong service with the `aforo-metering` plugin enabled, capturing one usage eve
 
 ## Prerequisites
 
-- A running Kong Gateway (3.x) you can reload, with Admin API access (or declarative config you can edit).
+- A running Kong Gateway (3.x; tested on 3.4, 3.14 and 3.16) you can reload, with Admin API access (or declarative config you can edit, or a Kong Konnect control plane).
 - LuaRocks on the Kong host (to build the plugin from source).
 - An Aforo API key and tenant id. Production events go to `https://api.aforo.ai/v1/ingest/batch` (`aforo_endpoint` is required; set it per environment).
 - For MCP metering: a route that proxies JSON-RPC `tools/call` POST bodies.
@@ -47,7 +47,16 @@ docker run -d --name kong --network=kong-net \
   -p 8000:8000 -p 8001:8001 kong-aforo:3.4
 ```
 
-The `Dockerfile` sets `KONG_PLUGINS` and the `aforo_buffer` shared dict for you. Verify:
+The `Dockerfile` sets `KONG_PLUGINS` and the `aforo_buffer` shared dict for you. It builds on
+`kong:3.4` unless you pass another base, e.g. the Kong Gateway image (Kong ships no open-source image
+after 3.9; see "Supported Kong versions" in the README for what was tested, and for the read-only
+mode of unlicensed Kong Gateway 3.16):
+
+```bash
+docker build --build-arg KONG_IMAGE_BASE=kong/kong-gateway:3.16.0.1 -t kong-aforo:3.16 .
+```
+
+Verify:
 
 ```bash
 curl -s http://localhost:8001/ | grep -o aforo-metering

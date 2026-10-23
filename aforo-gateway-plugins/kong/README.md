@@ -41,6 +41,49 @@ nginx_http_lua_shared_dict = aforo_buffer 10m
 
 Reload Kong: `kong reload`.
 
+## Supported Kong versions
+
+| Kong | Image | Result |
+|---|---|---|
+| 3.4 | `kong:3.4` (open source) | in production, self-hosted. busted 181/181. End-to-end against a stand-in Aforo: set up through the Admin API (21 checks) and DB-less (8 checks) |
+| 3.14 LTS | `kong/kong-gateway:3.14.0.15` | busted 181/181. End-to-end: Admin API (21 checks) and DB-less (8 checks) |
+| 3.16 | `kong/kong-gateway:3.16.0.1` | busted 181/181. End-to-end DB-less (8 checks). Starts as a Kong Konnect data plane with the plugin loaded (tested without reaching a real control plane) |
+
+Tested 2026-10-22. On every version above, all four product types (`API`, `AI_AGENT`, `AGENTIC_API`,
+`MCP_SERVER`) produce the same events, the pre-flight quota check answers 429 with `Retry-After`, and
+RS256 verification through `resty.openssl` works. No code change was needed past 3.4.
+
+Things that differ on newer Kong, none of them in the plugin:
+
+- Kong ships no open-source image after 3.9. The Kong Gateway image (`kong/kong-gateway`) runs
+  without a license. **From 3.16, unlicensed Kong Gateway is read-only**: the Admin API answers every
+  write with 403 "Enterprise license missing or expired", so a self-hosted 3.16 needs a license to be
+  configured through its Admin API. DB-less configuration still loads, and Konnect licenses its data
+  planes.
+- Kong Gateway creates a route for `https` only when `protocols` is not given (Kong 3.4: `http` and
+  `https`). Plain-http calls to such a route get 426 "Please use HTTPS protocol". Set `protocols`
+  when you create routes.
+
+Build the image on another Kong with the `KONG_IMAGE_BASE` build argument (default `kong:3.4`):
+
+```bash
+docker build --build-arg KONG_IMAGE_BASE=kong/kong-gateway:3.16.0.1 -t kong-aforo:3.16 .
+```
+
+### Kong Konnect
+
+On Kong Konnect, the plugin runs on your data plane nodes; Konnect is the control plane.
+
+- **Data plane:** run a Kong Gateway image with the plugin installed, `KONG_PLUGINS=bundled,aforo-metering`
+  and the `aforo_buffer` shared dict, i.e. the image above, with the settings from Konnect's "New Data
+  Plane Node" page (`KONG_ROLE=data_plane`, `KONG_DATABASE=off`, `KONG_KONNECT_MODE=on`,
+  `KONG_CLUSTER_MTLS=pki`, the control plane and telemetry endpoints, and the certificate and key it
+  generates). Every data plane of the control plane needs the plugin.
+- **Control plane:** Konnect stores an `aforo-metering` plugin only once it knows the plugin's schema.
+  Upload `schema.lua` as a custom plugin schema (Konnect API `POST /v2/control-planes/{id}/core-entities/plugin-schemas`
+  with `{"lua_schema": "<schema.lua>"}`, or the Konnect UI). Aforo does this when you connect Konnect
+  in Aforo.
+
 ## Quickstart
 
 Enable the plugin on a service via the Admin API with the three values every Aforo artifact needs — `aforo_endpoint`, `api_key`, `tenant_id`:
