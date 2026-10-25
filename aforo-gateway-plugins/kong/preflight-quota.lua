@@ -18,8 +18,9 @@
 --   preflight_quota_enabled       boolean (default false)
 --   preflight_quota_url           string  (default: aforo_endpoint's origin + /api/v1/quota/check)
 --   preflight_quota_api_key       string  (default: api_key)
---   preflight_quota_timeout_ms    integer (default 100)
---   preflight_quota_cache_ttl_ms  integer (default 1000; 0 disables the cache)
+--   preflight_quota_timeout_ms    integer (default 300)
+--   preflight_quota_cache_ttl_ms  integer (default 1000; 0 disables the cache;
+--                                 ALLOW and WARN are cached, DENY never)
 --   preflight_quota_fail_open     boolean (default true)
 
 local http = require("resty.http")
@@ -35,6 +36,11 @@ local CACHE_DICT = "aforo_buffer"
 
 local QUOTA_CHECK_PATH = "/api/v1/quota/check"
 
+-- Kong to Aforo is a call over the internet, usually to another region: 100 ms
+-- (the old default) timed out often enough that the check silently failed
+-- open (2026-10-19). Raised to 300 ms; preflight_quota_timeout_ms overrides.
+local DEFAULT_TIMEOUT_MS = 300
+
 -- Same shape as handler.lua's throttle: a check that runs on every request
 -- would otherwise log on every request while the ingestor is unreachable.
 local function warn_throttled(dict, key, ...)
@@ -42,7 +48,7 @@ local function warn_throttled(dict, key, ...)
         kong.log.warn(...)
         return
     end
-    if dict:add("aforo:warn:" .. key, 1, 60) then
+    if dict:safe_add("aforo:warn:" .. key, 1, 60) then
         kong.log.warn(...)
     end
 end
@@ -101,14 +107,24 @@ function M.check(conf, customer_id, metric_name)
     local cache_key = "aforo:preflight:" .. (conf.tenant_id or "") .. ":" .. customer_id
         .. ":" .. (metric_name or "_all")
     local ttl_ms = conf.preflight_quota_cache_ttl_ms or 1000
-    -- Only ALLOW is cached. A DENY is re-asked every time so a top-up or a new
-    -- window unblocks the customer immediately, not a TTL later.
-    if dict and ttl_ms > 0 and dict:get(cache_key) == "ALLOW" then
-        return false
+    -- ALLOW and WARN are cached; DENY never is, so a top-up or a new window
+    -- unblocks the customer immediately, not a TTL later. WARN lets the call
+    -- through just as ALLOW does, and the ingestor answers it for every
+    -- customer near their limit and for overage plans past it (2026-10-19):
+    -- uncached, those customers cost one quota call per request. A cached
+    -- WARN still marks the response with X-RateLimit-Warning.
+    if dict and ttl_ms > 0 then
+        local cached = dict:get(cache_key)
+        if cached == "ALLOW" then
+            return false
+        elseif cached == "WARN" then
+            kong.response.set_header("X-RateLimit-Warning", "approaching-limit")
+            return false
+        end
     end
 
     local httpc = http.new()
-    httpc:set_timeout(conf.preflight_quota_timeout_ms or 100)
+    httpc:set_timeout(conf.preflight_quota_timeout_ms or DEFAULT_TIMEOUT_MS)
 
     local res, err = httpc:request_uri(url, {
         method = "POST",
@@ -133,11 +149,10 @@ function M.check(conf, customer_id, metric_name)
 
     if res.status ~= 200 then
         -- 401/403 is a credential problem, not an outage; say so, since it will
-        -- not fix itself. /api/v1/quota/check needs quotas:read (or OWNER /
-        -- ADMIN / DEVELOPER) once RBAC is enforced, which an ingest-only key
-        -- scoped usage:ingest does not carry -- hence preflight_quota_api_key.
+        -- not fix itself. The key must be one the ingestor accepts for
+        -- /api/v1/quota/check -- hence preflight_quota_api_key.
         local hint = (res.status == 401 or res.status == 403)
-            and " -- check preflight_quota_api_key (needs quotas:read)" or ""
+            and " -- the ingestor refused the key: check preflight_quota_api_key (default api_key)" or ""
         return fallback(conf, dict, "status " .. res.status .. hint)
     end
 
@@ -151,16 +166,20 @@ function M.check(conf, customer_id, metric_name)
     local data = type(result.data) == "table" and result.data or result
 
     if data.decision == "DENY" then
-        local retry_after = tonumber(data.retryAfterMs) and math.ceil(data.retryAfterMs / 1000) or 60
-        local headers = {
-            ["Retry-After"] = tostring(retry_after),
-            ["Content-Type"] = "application/json",
-        }
+        -- Whole seconds, at least 1, and the same value in the header and the
+        -- body: the ingestor's own Retry-After header is retryAfterMs rounded
+        -- DOWN, so a wait under a second used to reach the client as
+        -- "Retry-After: 0" -- an invitation to retry at once.
+        local retry_ms = tonumber(data.retryAfterMs)
+        local retry_after = (retry_ms and retry_ms > 0) and math.max(1, math.ceil(retry_ms / 1000)) or 60
+        local headers = {}
         if type(data.headers) == "table" then
             for k, v in pairs(data.headers) do
                 headers[k] = v
             end
         end
+        headers["Retry-After"] = tostring(retry_after)
+        headers["Content-Type"] = "application/json"
         kong.response.exit(429, {
             message = data.reason or "Quota exceeded",
             retryAfter = retry_after,
@@ -168,8 +187,9 @@ function M.check(conf, customer_id, metric_name)
         return true
     end
 
-    if data.decision == "ALLOW" and dict and ttl_ms > 0 then
-        dict:set(cache_key, "ALLOW", ttl_ms / 1000)
+    if (data.decision == "ALLOW" or data.decision == "WARN") and dict and ttl_ms > 0 then
+        -- safe_set: a cache never evicts buffered events; a full dict just misses.
+        dict:safe_set(cache_key, data.decision, ttl_ms / 1000)
     end
 
     if data.decision == "WARN" then

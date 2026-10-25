@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Copies the verified Aforo JWT claims into aforo.jwt.* (key_id becomes the
+     events' metadata.keyId; tenant_id must match KVM tenant_id, see
+     aforo-access.js) and forwards them to the upstream, overwriting any
+     client-sent header of the same name. The billed customer is still the
+     app's aforo_customer_id (AC1), never a claim. -->
+<AssignMessage name="AforoJwtAssignClaims" continueOnError="true">
+    <DisplayName>Aforo Access - Copy JWT Claims</DisplayName>
+    <AssignVariable>
+        <Name>aforo.jwt.tenant_id</Name>
+        <Ref>jwt.AforoJwtValidation.decoded.claim.tenant_id</Ref>
+    </AssignVariable>
+    <AssignVariable>
+        <Name>aforo.jwt.customer_id</Name>
+        <Ref>jwt.AforoJwtValidation.decoded.claim.customer_id</Ref>
+    </AssignVariable>
+    <AssignVariable>
+        <Name>aforo.jwt.key_id</Name>
+        <Ref>jwt.AforoJwtValidation.decoded.claim.key_id</Ref>
+    </AssignVariable>
+    <AssignVariable>
+        <Name>aforo.jwt.scopes</Name>
+        <Ref>jwt.AforoJwtValidation.decoded.claim.scopes</Ref>
+    </AssignVariable>
+    <AssignVariable>
+        <Name>aforo.jwt.environment</Name>
+        <Ref>jwt.AforoJwtValidation.decoded.claim.environment</Ref>
+    </AssignVariable>
+    <Set>
+        <Headers>
+            <Header name="X-Customer-Id">{aforo.jwt.customer_id}</Header>
+            <Header name="X-Tenant-Id">{aforo.jwt.tenant_id}</Header>
+            <Header name="X-Key-Id">{aforo.jwt.key_id}</Header>
+            <Header name="X-Scopes">{aforo.jwt.scopes}</Header>
+            <Header name="X-Environment">{aforo.jwt.environment}</Header>
+        </Headers>
+    </Set>
+    <IgnoreUnresolvedVariables>true</IgnoreUnresolvedVariables>
+    <AssignTo createNew="false" transport="http" type="request"/>
+</AssignMessage>

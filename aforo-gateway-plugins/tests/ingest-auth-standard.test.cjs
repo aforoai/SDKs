@@ -6,12 +6,15 @@ const path = require('path');
 const root = path.join(__dirname, '..');
 
 const senders = [
-  'kong/handler.lua',
+  'kong/event-buffer.lua',  // delivery moved out of handler.lua in 2.6.0
+  'kong/preflight-quota.lua',
   'aws-lambda/index.js',
   'aws-lambda/compound-metering.js',
   'aws-lambda/preflight-quota.js',
   'apigee/sharedflowbundle/policies/AforoMeteringSendEvent.xml',
   'apigee/sharedflowbundle/policies/AforoMeteringSendEventRetry1.xml',
+  'apigee/sharedflowbundle/policies/AforoMeteringSendAsync.xml',
+  'apigee/aforo-access/sharedflowbundle/policies/AforoQuotaCheck.xml',
   'azure-apim/outbound-policy.xml',
   'azure-apim/compound-metering-policy-fragment.xml',
   'azure-apim/preflight-quota-policy-fragment.xml',

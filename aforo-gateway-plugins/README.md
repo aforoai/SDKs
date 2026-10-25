@@ -1,6 +1,6 @@
 # Aforo Gateway Metering Plugins
 
-**Current versions**: Kong 2.3.0 (2026-10-15), AWS Lambda 2.3.0 (2026-10-16); Apigee, Azure APIM and MuleSoft 2.2.0 (2026-10-02). Each plugin directory has its own `VERSION` / `CHANGELOG.md` / `USER_GUIDE.md`; `CHANGELOG.md` here is the cross-plugin history. 2.2.0 merges the public 2.1.0 release (Gowtham, Eswar) with this repository's line.
+**Current versions**: Kong 2.6.0 (2026-10-25); Apigee 3.0.0 and MuleSoft 3.0.0 (2026-10-22); AWS Lambda 2.3.0 (2026-10-16); Azure APIM 2.2.0 (2026-10-02). Each plugin directory has its own `VERSION` / `CHANGELOG.md` / `USER_GUIDE.md`; `CHANGELOG.md` here is the cross-plugin history. 2.6.0 / 3.0.0 merge the public work after 2.1.0 (Gowtham) with this repository's line.
 
 Gateway plugins that capture API usage events at the edge and forward them to the Aforo usage ingestor service. Each plugin supports Standard API metering, MCP Server tool invocation detection, and W3C Trace Context capture.
 
@@ -14,21 +14,21 @@ A request with no verified customer produces no event, on every plugin. None of 
 
 | Gateway | `customerId` comes from |
 |---|---|
-| Kong | `customer_id_jwt_claim` (claim of the JWT Kong's `jwt` plugin verified; exclusive when set), else the `customer_id` claim of the Aforo JWT the plugin verified itself (`jwt_validation_enabled` + `jwt_public_key`), else the Kong consumer. See `kong/README.md` "Customer identity". |
+| Kong | `customer_id_jwt_claim` (claim of the JWT Kong's `jwt` plugin verified; exclusive when set), else the `customer_id` claim of the Aforo JWT the plugin verified itself (`jwt_validation_enabled` + `jwt_jwks_uri` or `jwt_public_key`), else the Kong consumer. See `kong/README.md` "Customer identity". |
 | AWS Lambda | `$context.authorizer.customerId` in the access log (set by `authorizer.js` from a verified Aforo JWT, or by `key-authorizer.js` from the customer's Aforo key as introspected by Aforo), else the IAM caller. |
-| Apigee | The verified JWT claim, else a configured `flow_variable:<name>`, else `developer.app.name` / `developer.email`. |
+| Apigee | The `aforo_customer_id` attribute of the app (else the developer) whose key `aforo-access` verified with VerifyAPIKey; the opt-in Aforo JWT check takes the verified claim. See `apigee/README.md`. |
 | Azure APIM | Context variable `aforo-customer-id` (set by the `aforo-context` fragment from the validated JWT or the subscription→customer map), else the subscription id. |
-| MuleSoft | `authentication.properties.claims` (MuleSoft's JWT Validation policy), claim named by `customer-id-claim`. |
+| MuleSoft | The `customerId` Aforo returns when the policy introspects the caller's key (`introspect-url`); never a value the client sends. See `mulesoft/README.md`. |
 
 ## Plugins
 
 | Plugin | Directory | Gateway | Phase | Tests |
 |--------|-----------|---------|-------|-------|
 | **Kong** | `kong/` | Kong Gateway | access (optional checks) + log (metering) | `cd kong && busted spec/` |
-| **Apigee** | `apigee/` | Google Apigee | Shared flow on `PostProxyFlowHook` (JavaScript + ServiceCallout; sends before the response returns) | `node apigee/tests/unit-tests.cjs` |
+| **Apigee** | `apigee/` | Google Apigee | Two shared flows: `aforo-access` on `PreProxyFlowHook` (verifies the key, pre-flight quota, 429) and `aforo-metering` on `PostProxyFlowHook` | `node apigee/tests/run-all.cjs` |
 | **AWS** | `aws-lambda/` | AWS API Gateway | CloudWatch Logs (Lambda subscriber) | `cd aws-lambda && npm test` |
 | **Azure APIM** | `azure-apim/` | Azure API Management | Outbound policy fragment | `node azure-apim/tests/policy.test.cjs` (runs the policy expressions against a mock context; no APIM runtime) |
-| **MuleSoft** | `mulesoft/aforo-metering/` (Mule 4 custom policy, `mvn clean package`) | MuleSoft Anypoint, Mule 4.4+ runtime | After the flow, async (DataWeave) | `node mulesoft/tests/policy.test.cjs` (structure only; DataWeave is not executed) + `mvn clean package` + `tests/policy-contract.md` |
+| **MuleSoft** | `mulesoft/aforo-metering/` (Mule 4 custom policy, `mvn clean package`) | MuleSoft Anypoint, Mule 4.4+ runtime | request (key introspection, quota) + async after the response | `node mulesoft/tests/policy.test.cjs` + `mulesoft/tests/run-dataweave.sh` (needs the DataWeave CLI) + `mvn clean package` |
 
 ## Where events go
 
@@ -151,7 +151,7 @@ What doesn't work: a gRPC-Web upstream that encodes the status in the body frame
 
 ## Product type and metric name
 
-Every event carries `productType` (default `API`, trimmed and upper-cased), which the ingestor requires in production. An MCP `tools/call` is `MCP_SERVER` when the tool name and agent id are known, a request with a trace id is `AGENTIC_API`, and Kong's gRPC / GraphQL / WebSocket detection sets its own type.
+Every event carries `productType` (default `API`, trimmed and upper-cased), which the ingestor requires in production. An MCP `tools/call` is `MCP_SERVER`. A request is `AGENTIC_API` when the product type is set to it (Kong, Apigee and MuleSoft take the trace from the upstream's `X-Aforo-Trace-Id` response header or the gateway's request id, never the client's `traceparent`; AWS Lambda and Azure APIM still classify a request carrying a trace id as `AGENTIC_API`). Kong's gRPC / GraphQL / WebSocket detection sets its own type.
 
 The metric of a plain HTTP event is the first of: an endpoint-to-metric mapping, the plugin's metric pattern when one is configured, the default metric (`api_calls`). The plugins cannot see your catalog: a name that is blank or longer than 255 characters is dropped at the gateway with a warning; a well-formed name the catalog does not know is refused by the ingestor for that event and reported in the batch response (Kong and AWS Lambda count these; see their READMEs).
 

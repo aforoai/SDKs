@@ -1,0 +1,267 @@
+{
+  "script": "quota-decide",
+  "base": {
+    "vars": {
+      "aforoCfg": {
+        "endpoint": "https://api.aforo.ai/v1/ingest/batch",
+        "apiKey": "ak_test_policy",
+        "tenantId": "42",
+        "productId": "prod-7",
+        "introspectUrl": "https://api.aforo.ai/api/v1/customer-keys/introspect",
+        "introspectTimeoutMs": 1500,
+        "keyHeader": "x-api-key",
+        "identityTtlS": 60,
+        "identityNegativeTtlS": 10,
+        "identityStaleTtlS": 900,
+        "identityFailOpen": false,
+        "productType": "API",
+        "defaultMetric": "",
+        "metricRules": [],
+        "quantityHeader": "X-Aforo-Quantity",
+        "agentId": "",
+        "traceIdHeader": "X-Aforo-Trace-Id",
+        "statusOutcomes": {},
+        "excludePaths": [
+          "/health",
+          "/ready",
+          "/metrics"
+        ],
+        "excludeStatusCodes": [
+          401,
+          403,
+          429
+        ],
+        "quotaEnabled": true,
+        "quotaUrl": "https://api.aforo.ai/api/v1/quota/check",
+        "quotaTimeoutMs": 1500,
+        "quotaFailOpen": true,
+        "quotaCacheTtlMs": 1000,
+        "problems": [],
+        "warnings": []
+      },
+      "aforoReq": {
+        "requestId": "req-1",
+        "startMs": 1792653973000
+      },
+      "aforoQuotaLookup": {
+        "call": true,
+        "cachedDecision": null
+      },
+      "aforoQuotaResponse": null
+    }
+  },
+  "cases": [
+    {
+      "name": "cached ALLOW: let through without a call",
+      "expect": {
+        "outcome": "allow",
+        "decision": "ALLOW",
+        "source": "cache",
+        "cacheWrite": null
+      },
+      "vars": {
+        "aforoQuotaLookup": {
+          "call": false,
+          "cachedDecision": "ALLOW"
+        }
+      }
+    },
+    {
+      "name": "ALLOW: let through and cache 1 s",
+      "expect": {
+        "outcome": "allow",
+        "decision": "ALLOW",
+        "cacheWrite.#json": {
+          "decision": "ALLOW",
+          "storedAtMs": 1792653973000
+        },
+        "warn": null
+      },
+      "vars": {
+        "aforoQuotaResponse": {
+          "status": 200,
+          "text": "{\"success\": true, \"data\": {\"decision\": \"ALLOW\", \"reason\": null, \"retryAfterMs\": null}}"
+        }
+      }
+    },
+    {
+      "name": "WARN: let through and cache",
+      "expect": {
+        "outcome": "allow",
+        "decision": "WARN",
+        "cacheWrite.#json.decision": "WARN"
+      },
+      "vars": {
+        "aforoQuotaResponse": {
+          "status": 200,
+          "text": "{\"success\": true, \"data\": {\"decision\": \"WARN\", \"reason\": \"80% used\"}}"
+        }
+      }
+    },
+    {
+      "name": "the bare {decision} answer is read too",
+      "expect": {
+        "outcome": "allow",
+        "decision": "ALLOW"
+      },
+      "vars": {
+        "aforoQuotaResponse": {
+          "status": 200,
+          "text": "{\"decision\": \"ALLOW\"}"
+        }
+      }
+    },
+    {
+      "name": "DENY: 429, Retry-After = ceil(retryAfterMs / 1000), same number in the body, never cached",
+      "expect": {
+        "outcome": "reject",
+        "status": 429,
+        "headers": {
+          "Retry-After": "3"
+        },
+        "body": {
+          "message": "Monthly quota exhausted",
+          "retryAfter": 3
+        },
+        "cacheWrite": null
+      },
+      "vars": {
+        "aforoQuotaResponse": {
+          "status": 200,
+          "text": "{\"success\": true, \"data\": {\"decision\": \"DENY\", \"reason\": \"Monthly quota exhausted\", \"retryAfterMs\": 2001}}"
+        }
+      }
+    },
+    {
+      "name": "DENY under a second: Retry-After 1, never 0",
+      "expect": {
+        "status": 429,
+        "headers": {
+          "Retry-After": "1"
+        },
+        "body.retryAfter": 1
+      },
+      "vars": {
+        "aforoQuotaResponse": {
+          "status": 200,
+          "text": "{\"success\": true, \"data\": {\"decision\": \"DENY\", \"reason\": \"x\", \"retryAfterMs\": 20}}"
+        }
+      }
+    },
+    {
+      "name": "DENY without retryAfterMs: 60, default message",
+      "expect": {
+        "status": 429,
+        "headers": {
+          "Retry-After": "60"
+        },
+        "body": {
+          "message": "Quota exceeded",
+          "retryAfter": 60
+        }
+      },
+      "vars": {
+        "aforoQuotaResponse": {
+          "status": 200,
+          "text": "{\"success\": true, \"data\": {\"decision\": \"DENY\"}}"
+        }
+      }
+    },
+    {
+      "name": "DENY passes on the ingestor headers but owns Retry-After",
+      "expect": {
+        "headers": {
+          "X-RateLimit-Limit": "100",
+          "X-RateLimit-Remaining": "0",
+          "Retry-After": "2"
+        }
+      },
+      "vars": {
+        "aforoQuotaResponse": {
+          "status": 200,
+          "text": "{\"success\": true, \"data\": {\"decision\": \"DENY\", \"retryAfterMs\": 1500, \"headers\": {\"X-RateLimit-Limit\": 100, \"X-RateLimit-Remaining\": \"0\", \"Retry-After\": \"0\", \"bad\": {\"x\": 1}}}}"
+        }
+      }
+    },
+    {
+      "name": "timeout, fail open (default): let through, warn",
+      "expect": {
+        "outcome": "allow",
+        "decision": "UNAVAILABLE",
+        "source": "fail-open",
+        "cacheWrite": null,
+        "warn.kind": "quota",
+        "warn.message": "[aforo-metering] quota check unavailable (no response: HTTP:TIMEOUT): failing OPEN, quota NOT enforced. Repeats suppressed for 60 s."
+      },
+      "vars": {
+        "aforoQuotaResponse": {
+          "status": 0,
+          "error": "HTTP:TIMEOUT"
+        }
+      }
+    },
+    {
+      "name": "5xx with quota-fail-open false: 503 Quota check unavailable, Retry-After 1",
+      "expect": {
+        "outcome": "reject",
+        "status": 503,
+        "headers": {
+          "Retry-After": "1"
+        },
+        "body": {
+          "message": "Quota check unavailable"
+        },
+        "warn.kind": "quota"
+      },
+      "vars": {
+        "aforoCfg": {
+          "quotaFailOpen": false
+        },
+        "aforoQuotaResponse": {
+          "status": 502,
+          "text": ""
+        }
+      }
+    },
+    {
+      "name": "401 from the quota endpoint names the credentials",
+      "expect": {
+        "outcome": "allow",
+        "warn.message": "[aforo-metering] quota check unavailable (HTTP 401: the ingestor refused aforo-api-key / aforo-tenant-id): failing OPEN, quota NOT enforced. Repeats suppressed for 60 s."
+      },
+      "vars": {
+        "aforoQuotaResponse": {
+          "status": 401,
+          "text": "{}"
+        }
+      }
+    },
+    {
+      "name": "a 200 without a decision is unavailable",
+      "expect": {
+        "outcome": "allow",
+        "decision": "UNAVAILABLE"
+      },
+      "vars": {
+        "aforoQuotaResponse": {
+          "status": 200,
+          "text": "{\"success\": true, \"data\": {\"reason\": \"?\"}}"
+        }
+      }
+    },
+    {
+      "name": "an unknown decision lets the call through, uncached",
+      "expect": {
+        "outcome": "allow",
+        "decision": "MAYBE",
+        "cacheWrite": null
+      },
+      "vars": {
+        "aforoQuotaResponse": {
+          "status": 200,
+          "text": "{\"success\": true, \"data\": {\"decision\": \"MAYBE\"}}"
+        }
+      }
+    }
+  ]
+}

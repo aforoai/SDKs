@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- POST {quota_check_url} {"customerId","metricName"} with X-API-Key and
+     X-Tenant-Id. Waits at most 1500 ms: a check from far away (Kong from
+     India) needed about 1 s cold, and Apigee accepts only literal timeouts
+     here, so KVM quota_timeout_ms cannot change it.
+     continueOnError="true": a timeout or error is read by AforoQuotaDecide,
+     which fails open unless quota_fail_open is "false". -->
+<ServiceCallout name="AforoQuotaCheck" continueOnError="true">
+    <DisplayName>Aforo Access - Pre-flight Quota Check</DisplayName>
+    <Request variable="aforo.access.quotaRequest" clearPayload="true">
+        <IgnoreUnresolvedVariables>true</IgnoreUnresolvedVariables>
+        <Set>
+            <Headers>
+                <Header name="Content-Type">application/json</Header>
+                <Header name="X-API-Key">{private.aforo.apiKey}</Header>
+                <Header name="X-Tenant-Id">{private.aforo.tenantId}</Header>
+            </Headers>
+            <Verb>POST</Verb>
+            <Payload contentType="application/json">{aforo.access.quotaBody}</Payload>
+        </Set>
+    </Request>
+    <Response>aforo.access.quotaResponse</Response>
+    <Timeout>1500</Timeout>
+    <HTTPTargetConnection>
+        <Properties>
+            <Property name="connect.timeout.millis">1500</Property>
+            <Property name="io.timeout.millis">1500</Property>
+        </Properties>
+        <URL>{aforo.access.quotaUrl}</URL>
+    </HTTPTargetConnection>
+</ServiceCallout>

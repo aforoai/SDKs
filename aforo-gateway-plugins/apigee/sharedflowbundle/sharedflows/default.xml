@@ -1,103 +1,56 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  aforo-metering: attach to the environment's PostProxyFlowHook, with
+  aforo-access on the PreProxyFlowHook. It bills only calls aforo-access let
+  through on a managed proxy; on any other proxy no step runs.
+
+  The PostProxyFlowHook runs right before the response goes to the client,
+  so how the events are sent decides what the client waits for
+  (KVM delivery_mode):
+
+    async (default)  AforoMeteringSendAsync: a ServiceCallout with no
+                     <Response>. Apigee does not wait for the answer and the
+                     flow goes on at once, so the ingestor adds no latency.
+                     The answer is never seen: an event the ingestor does not
+                     store (outage, 5xx, a refused key, a per-event "could not
+                     be stored") is lost, and nothing is logged.
+    sync             AforoMeteringSendEvent waits for the 202 (1 s to
+                     connect, 2 s for the answer), re-sends once what failed
+                     transiently (whole batch on no answer / 5xx / 408; just
+                     the events the 202 reports as "could not be stored"),
+                     and logs what is lost. Adds the ingestor's response time
+                     to every metered call, at most about 4 s.
+
+  Every step has continueOnError="true": metering never fails the API call.
+
+  Upstream 4xx/5xx: by default Apigee routes a target error to the error flow,
+  which skips the PostProxyFlowHook, so those calls are not metered from the
+  hook. See the user guide ("Metering upstream errors") for the FlowCallout to
+  add to the proxy's DefaultFaultRule.
+-->
 <SharedFlow name="default">
-    <!-- Step 1: Read all Aforo config from KVM (metering, JWT flag, margin guard) -->
     <Step>
-        <Name>AforoMeteringReadConfig</Name>
-    </Step>
-
-    <!--
-      Steps 2-4: JWT validation. OPT-IN. It runs when
-        - KVM jwt_validation_enabled is "true", or
-        - KVM aforo_jwks_uri is set and jwt_validation_enabled is not "false".
-      With neither, VerifyJWT does not run. Unconditional, it faulted (401)
-      on every call that carried no Aforo-issued token, the fault ended the
-      shared flow, and nothing after it (metering included) ran.
-      JWT validation only makes sense on the request path. If you turn it
-      on, attach this flow where the request is still in flight
-      (PreProxyFlowHook or a request-side FlowCallout).
-    -->
-    <Step>
-        <!-- Unconditional: the conditions below need aforo_jwks_uri. -->
-        <Name>AforoJwtReadConfig</Name>
+        <Name>AforoMeteringBuildEvents</Name>
+        <Condition>(private.aforo.managedProxy = "true") and (aforo.access.refused = "false")</Condition>
     </Step>
     <Step>
-        <!-- RS256 signature verification + exp + iss check via Apigee built-in -->
-        <Name>AforoJwtValidation</Name>
-        <Condition>(private.aforo.jwtValidationEnabled = "true") or ((private.aforo_jwks_uri != null) and (private.aforo.jwtValidationEnabled != "false"))</Condition>
+        <Name>AforoMeteringSendAsync</Name>
+        <Condition>(aforo.meteringSend = "true") and (private.aforo.deliveryMode != "sync")</Condition>
     </Step>
-    <Step>
-        <!-- Set X-Customer-Id, X-Tenant-Id, X-Key-Id, X-Scopes from verified claims -->
-        <Name>AforoJwtAssignHeaders</Name>
-        <Condition>(private.aforo.jwtValidationEnabled = "true") or ((private.aforo_jwks_uri != null) and (private.aforo.jwtValidationEnabled != "false"))</Condition>
-    </Step>
-
-    <!-- Step 5: Margin guard pre-flight check — only when margin_guard_enabled is "true" -->
-    <Step>
-        <Name>AforoMarginGuardCheck</Name>
-        <Condition>(private.aforo.marginGuardEnabled = "true") or (aforo.marginGuardEnabled = "true")</Condition>
-    </Step>
-    <Step>
-        <Name>AforoMarginGuardRaiseFault</Name>
-        <Condition>(aforo.marginGuard.blocked = "true") or (aforo.marginGuard.throttled = "true")</Condition>
-    </Step>
-
-    <!-- Steps 6+: Metering. An event is built and sent only when the request is
-         not OPTIONS, not excluded, has a customer identity, a metric name
-         and quantity > 0. -->
-    <Step>
-        <Name>AforoMeteringBuildEvent</Name>
-    </Step>
-    <!--
-      Skips: AforoMeteringBuildEvent sets aforo.skip = "true" (and
-      aforo.skipReason) for a request whose status is in KVM
-      exclude_status_codes (default 401,403,429), whose path matches KVM
-      exclude_paths (default /health,/ready,/metrics), that is an OPTIONS
-      preflight, or that has no customer identity. It builds no payload
-      for those, and the send, retry and failure-log steps below do not
-      run: no event, no outbound call.
-    -->
-    <!--
-      aforo.meteringSend is set by AforoMeteringBuildEvent only when it
-      built a payload. If that script or the KVM read failed, there is
-      nothing to send and the steps below do not run.
-    -->
     <Step>
         <Name>AforoMeteringSendEvent</Name>
-        <Condition>(aforo.skip != "true") and (aforo.meteringSend = "true") and (private.aforo.endpoint != null)</Condition>
+        <Condition>(aforo.meteringSend = "true") and (private.aforo.deliveryMode = "sync")</Condition>
     </Step>
-
-    <!--
-      Bounded redelivery. This flow runs before the client gets its
-      response, so the delay a broken ingestor can add is capped.
-
-      AforoMeteringRetryGate allows ONE retry, and only when the first
-      attempt failed to connect or got a 5xx or 408, failed quickly (a response
-      timeout is not retried), and KVM max_retries is not 0. Any other 4xx is
-      the ingestor's answer and is never re-sent; a 429 is not re-sent
-      because honouring Retry-After would hold the API response.
-
-      Each attempt waits at most 1 s to connect and 2 s for the response.
-      Worst case: about 2 s when the ingestor is unreachable, about 4 s at
-      the limit.
-
-      Dedup safety: the retry re-sends the SAME 'aforo.eventPayload'
-      variable (built once by AforoMeteringBuildEvent from request
-      identity, no clock in the idempotencyKey).
-
-      Every step here has continueOnError=true: metering cannot fail the
-      API call. An undelivered event is recorded by
-      AforoMeteringLogDeliveryFailure.
-    -->
     <Step>
-        <Name>AforoMeteringRetryGate</Name>
-        <Condition>(aforo.skip != "true") and (aforo.meteringSend = "true") and (private.aforo.endpoint != null)</Condition>
+        <Name>AforoMeteringCheckDelivery</Name>
+        <Condition>(aforo.meteringSend = "true") and (private.aforo.deliveryMode = "sync")</Condition>
     </Step>
     <Step>
         <Name>AforoMeteringSendEventRetry1</Name>
-        <Condition>(aforo.skip != "true") and (aforo.meteringRetry = "true")</Condition>
+        <Condition>(aforo.meteringSend = "true") and (private.aforo.deliveryMode = "sync") and (aforo.meteringRetry = "true")</Condition>
     </Step>
     <Step>
         <Name>AforoMeteringLogDeliveryFailure</Name>
-        <Condition>(aforo.skip != "true") and (aforo.meteringSend = "true") and (aforo.meteringFirstAttempt != "delivered")</Condition>
+        <Condition>(aforo.meteringSend = "true") and (private.aforo.deliveryMode = "sync") and (aforo.meteringFirstAttempt != "delivered")</Condition>
     </Step>
 </SharedFlow>

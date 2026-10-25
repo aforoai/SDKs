@@ -1,8 +1,48 @@
 # Changelog — Aforo Metering MuleSoft Policy
 
-Format follows [Keep a Changelog](https://keepachangelog.com); versioning follows [SemVer](https://semver.org). Version is declared in the `VERSION` file. This artifact ships on the shared `aforo-gateway-plugins` monorepo tag — see the repo-root `CHANGELOG.md` for the cross-plugin release record.
+Format follows [Keep a Changelog](https://keepachangelog.com); versioning follows [SemVer](https://semver.org). Version is declared in the `VERSION` file and in `aforo-metering/pom.xml`. This artifact ships on the shared `aforo-gateway-plugins` monorepo tag — see the repo-root `CHANGELOG.md` for the cross-plugin release record.
 
 ## [Unreleased]
+
+## [3.0.0] — 2026-10-22
+
+The MuleSoft path rebuilt to match the Kong plugin (proven in prod) and the Apigee 3.0.0 shared flows. **Breaking**: see "Upgrading from 2.x" in the user guide. Not yet verified on a live Anypoint org.
+
+### Source of truth
+- The installable Mule 4 policy project (`aforo-metering/`: `pom.xml` with packaging `mule-policy`, `aforo-metering.yaml`, `src/main/mule/template.xml`, `mule-artifact.json`) now lives here. It existed only on the unmerged `sync/gateway-plugins-2026-10-02` branch, which organization-service's bundled 2.2.0 jar was built from.
+- The 2.1.0 descriptors (`mule-policy.yaml`, `mcp-mule-policy.yaml`, `compound-metering-policy.yaml`, `margin-guard-policy.yaml`, `preflight-quota-policy.yaml`, `jwt-validation-config.yaml`) and the root `template.xml` are removed: they were never a deployable Anypoint format. They remain in git history.
+- `mvn package` builds `aforo-metering-3.0.0-mule-policy.jar` from MuleSoft's public repository only (no Anypoint Exchange or EE credentials), with a fixed jar timestamp.
+
+### Added
+- **Identity by introspection** (the key is the Aforo key; Aforo pushes nothing into Anypoint):
+  - the key from `key-header` (default `x-api-key`), checked with `POST {introspect-url}` `{"key"}` and the policy's own `X-API-Key`; `{"success","data"}` envelopes tolerated;
+  - allowed only when `active` and `productIds` contains `aforo-product-id`; missing or inactive key 401, other product 403, JSON bodies;
+  - cache by SHA-256 of the key: active 60 s (never past `expiresAt`), inactive 10 s; on introspection failure an active answer up to 900 s old, else 503 (`identity-fail-open` lets the call through unchecked and unmetered);
+  - the key header is removed before the API (`propagateMessageTransformations` plus a rebuilt `HttpRequestAttributes`, as MuleSoft's `http-transform:remove-headers` does).
+- **Pre-flight quota check** before `execute-next` (`quota-enabled`): `POST {quota-check-url}` `{customerId, metricName}` with `X-API-Key` and `X-Tenant-Id`, for the metric the call bills only. DENY: 429 with `Retry-After` = max(1, ceil(retryAfterMs/1000)) and `{message, retryAfter}`, upstream not called, not metered, never cached. ALLOW / WARN cached 1 s. No answer within `quota-timeout-ms` (1500): fail open, or 503 with `quota-fail-open=false`.
+- **All four product types, as Kong / Apigee**: AGENTIC_API `traceId` from upstream `X-Aforo-Trace-Id`, else the gateway request id; AI_AGENT `agentId` / `sessionId` from upstream `X-Aforo-Agent-Id` / `X-Aforo-Session-Id`, `agent-id`, the product id and the request id; MCP_SERVER one event per `tools/call` (batches too), protocol messages never billed or refused, agent = upstream header else the customer, session = upstream `X-Aforo-Session-Id` else the upstream `Mcp-Session-Id` response header.
+- Upstream `X-Aforo-Quantity` (`quantity-header`) and `X-Aforo-Metric`.
+- `metric-mappings` as Kong's JSON `[{pathPattern, method, metricName}]` with Lua patterns; `status-outcomes` as JSON (CSV still read).
+- **Delivery** reads the 202 body: events reported "The event could not be stored…" are re-sent, any other per-event error is logged and dropped; no answer, 5xx, 408, 429 re-send the batch; 3 attempts. At most 16 deliveries at once and 1000 calls waiting per policy instance.
+- An API error (APIkit 404, 5xx) is metered too, and its response reaches the client unchanged.
+- Repeating warnings are logged once a minute.
+- Tests: `tests/dataweave.test.cjs` runs the template's DataWeave scripts under the open-source DataWeave CLI against `tests/fixtures/` (166 cases); `tests/policy.test.cjs` checks the package, the definition ↔ template contract, the flow order and the outbound calls. `tests/policy-contract.md` is the live checklist.
+
+### Fixed
+- **No events with Aforo keys**: 2.2.0 read the customer only from `authentication.properties.claims[customer_id]` / `sub` (a JWT), so with Aforo keys it emitted nothing.
+- **AI_AGENT**: events had no `agentId` / `sessionId` and were all rejected.
+- **AGENTIC_API**: the trace came from the client's `traceparent`, and a trace header turned API calls into AGENTIC_API.
+- **MCP**: the agent came from the client's body and the session from the request; batches were not parsed; `initialize` / `tools/list` were billed; the metric was hard-coded.
+- **Pre-flight**: there was none in the template (`preflight-quota-policy.yaml` was an unwired spec).
+- **Delivery**: the 202's `data.errors` was ignored and nothing bounded concurrent deliveries.
+- Product type, metric and quota are per API instance (the product it sells), from the policy configuration.
+- Policy properties reach DataWeave as data, never as source text: a JSON value with quotes broke the 2.x scripts.
+
+### Removed
+- `customer-id-claim`, `tenant-id-claim`, `mcp-enabled`, `mcp-product-id`, `quantity-source`, `include-metadata` and the deprecated 2.1.0 aliases.
+
+### Known differences from Kong / Apigee
+- No `X-RateLimit-Warning` header on a quota WARN; no JSON-RPC error detection in MCP answers (status only); no `response_size` quantity.
 
 ## [2.2.0] - 2026-10-02
 

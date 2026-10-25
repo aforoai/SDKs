@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Reads the quota answer: DENY, ALLOW/WARN (cacheable) or unavailable
+     (fail open, or 503 with quota_fail_open = "false"). -->
+<Javascript name="AforoQuotaDecide" timeLimit="200" continueOnError="true">
+    <DisplayName>Aforo Access - Quota Decision</DisplayName>
+    <IncludeURL>jsc://aforo-billing.js</IncludeURL>
+    <ResourceURL>jsc://aforo-quota-decide.js</ResourceURL>
+</Javascript>

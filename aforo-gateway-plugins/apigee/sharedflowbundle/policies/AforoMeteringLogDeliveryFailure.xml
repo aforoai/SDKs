@@ -1,10 +1,11 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<!-- Records a usage event that was not delivered: the send (and the retry,
-     if one ran) failed, or the ingestor refused it. Gated in
-     sharedflows/default.xml so it does not run for a delivered event.
-     Sets aforo.meteringDeliveryFailed and prints the event's identity to
-     the debug session. continueOnError=true. -->
-<Javascript name="AforoMeteringLogDeliveryFailure" timeLimit="200" continueOnError="true">
+<!-- delivery_mode sync: logs the events lost for good (print, visible in a
+     Debug session) and sets aforo.meteringDroppedEvents. -->
+<Javascript name="AforoMeteringLogDeliveryFailure" timeLimit="500" continueOnError="true">
     <DisplayName>Aforo Metering - Log Delivery Failure</DisplayName>
-    <ResourceURL>jsc://aforo-metering-log-failure.js</ResourceURL>
+    <Properties>
+        <Property name="phase">final</Property>
+    </Properties>
+    <IncludeURL>jsc://aforo-billing.js</IncludeURL>
+    <ResourceURL>jsc://aforo-metering-delivery.js</ResourceURL>
 </Javascript>

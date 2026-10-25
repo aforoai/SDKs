@@ -1,190 +1,199 @@
-# Aforo Usage Metering — policy definition (Mule 4 custom policy).
+# Aforo Usage Metering — policy definition (Mule 4 custom policy, 3.0.0).
 #
-# API Manager renders the configuration form from this file. The policy
-# itself is src/main/mule/template.xml; every property declared here is
-# read there, and tests/policy.test.cjs fails when the two disagree.
+# API Manager renders the configuration form from this file, and Aforo's
+# deploy (organization-service) writes these properties on every API
+# instance it manages. The policy itself is src/main/mule/template.xml:
+# every property declared here is read there (as the attribute value
+# "={{name}}"), and tests/policy.test.cjs fails when the two disagree.
 #
-# Identity: the customer id comes from a claim of the JWT that MuleSoft's
-# JWT Validation policy verified (authentication.properties.claims). Apply
-# JWT Validation before this policy. No request header is read for identity.
-#
-# The four properties at the end with an underscore in the name are the
-# 2.1.0 spellings. Each is read only when its hyphenated property is blank.
+# Identity: the end customer sends its Aforo key in the key-header
+# (default x-api-key). The policy checks it against Aforo's introspection
+# endpoint (cached), lets the call through only when the key is active and
+# covers aforo-product-id, and removes the header before the upstream. No
+# other authentication policy is needed for Aforo.
 id: aforo-metering
 name: Aforo Usage Metering
-description: Sends one usage event per API call to Aforo, after the response, without adding latency.
+description: Checks the caller's Aforo API key, enforces Aforo quotas (429) and sends the call's usage to Aforo after the response.
 category: Custom
 type: custom
-resourceLevelSupported: true
+resourceLevelSupported: false
 encryptionSupported: true
 standalone: true
 supportedJavaVersions: ["8", "11", "17"]
 requiredCharacteristics: []
 providedCharacteristics: []
 configuration:
+  # ── Aforo connection ──────────────────────────────────────────────
   - propertyName: aforo-endpoint
-    name: Aforo Endpoint
-    description: Aforo usage ingestor batch URL, e.g. https://api.aforo.ai/v1/ingest/batch
+    name: Aforo Ingest URL
+    description: Aforo usage ingest batch URL, e.g. https://api.aforo.ai/v1/ingest/batch. Its origin is also the default origin of the introspection and quota URLs.
     type: string
     optional: false
     sensitive: false
     allowMultiple: false
   - propertyName: aforo-api-key
     name: Aforo API Key
-    description: API key the policy sends to the ingestor in the X-API-Key header
+    description: The policy's own Aforo key (scope usage:ingest), sent as X-API-Key to the ingest, introspection and quota endpoints. Never an end customer's key.
     type: string
     optional: false
     sensitive: true
     allowMultiple: false
   - propertyName: aforo-tenant-id
-    name: Workspace (Tenant) ID
-    description: Your Aforo workspace id. Stamped on every event unless a tenant claim is configured. The ingestor takes the workspace from the API key.
+    name: Aforo Tenant ID
+    description: The Aforo tenant (workspace) id. Sent as X-Tenant-Id on the quota check and part of the MCP idempotency key.
     type: string
     optional: false
     sensitive: false
     allowMultiple: false
-  - propertyName: customer-id-claim
-    name: Customer ID Claim
-    description: >-
-      Claim of the verified JWT that holds the Aforo customer id. Leave
-      empty for "customer_id"; "sub" is used when that claim is absent.
+  - propertyName: aforo-product-id
+    name: Aforo Product ID
+    description: The Aforo product this API instance sells. A key is accepted only when its productIds contain this id; otherwise the call gets 403.
+    type: string
+    optional: false
+    sensitive: false
+    allowMultiple: false
+  # ── Identity (introspection) ──────────────────────────────────────
+  - propertyName: introspect-url
+    name: Introspection URL
+    description: Leave empty for the Aforo Ingest URL's origin plus /api/v1/customer-keys/introspect.
     type: string
     optional: true
     sensitive: false
     allowMultiple: false
-  - propertyName: tenant-id-claim
-    name: Tenant ID Claim
-    description: >-
-      Claim of the verified JWT that holds the Aforo workspace id. Leave
-      empty to use the Workspace (Tenant) ID above for every event.
+  - propertyName: key-header
+    name: Key Header
+    description: Request header that carries the end customer's Aforo key. Leave empty for x-api-key. The header is removed before the upstream.
     type: string
     optional: true
+    defaultValue: x-api-key
     sensitive: false
     allowMultiple: false
-  - propertyName: mcp-enabled
-    name: MCP Detection Enabled
-    description: Classify JSON-RPC tools/call requests as MCP tool invocations. Reads the JSON request body of POST requests.
+  - propertyName: identity-cache-ttl-s
+    name: Identity Cache TTL (s)
+    description: How long an active key is trusted without asking Aforo again (never past its expiresAt). This is the longest a revoked key keeps working. 0 asks on every call. Maximum 3600.
+    type: int
+    optional: true
+    defaultValue: 60
+    sensitive: false
+    allowMultiple: false
+  - propertyName: identity-negative-ttl-s
+    name: Identity Negative Cache TTL (s)
+    description: How long an unknown or inactive key is refused (401) without asking Aforo again. Maximum 600.
+    type: int
+    optional: true
+    defaultValue: 10
+    sensitive: false
+    allowMultiple: false
+  - propertyName: identity-stale-ttl-s
+    name: Identity Stale TTL (s)
+    description: When introspection fails (timeout, 5xx), an active answer up to this old is still used. Past it the call gets 503, or passes unmetered with Identity Fail Open. Maximum 86400.
+    type: int
+    optional: true
+    defaultValue: 900
+    sensitive: false
+    allowMultiple: false
+  - propertyName: identity-fail-open
+    name: Identity Fail Open
+    description: When introspection fails and no usable cached answer exists, let the call through unchecked and unmetered (true) instead of answering 503 (false, the default).
     type: boolean
     optional: true
     defaultValue: false
     sensitive: false
     allowMultiple: false
-  - propertyName: mcp-product-id
-    name: MCP Product ID
-    description: Aforo product id of the MCP server (used when MCP detection is on)
-    type: string
-    optional: true
-    sensitive: false
-    allowMultiple: false
-  - propertyName: status-outcomes
-    name: executionStatus Overrides
-    description: >-
-      Optional per-status-code executionStatus overrides for OUTCOME_BASED
-      pricing, e.g. "404=VALIDATION_FAILED,429=ERROR". Exact HTTP codes
-      200-599; invalid entries are ignored.
-    type: string
-    optional: true
-    sensitive: false
-    allowMultiple: false
-  - propertyName: exclude-status-codes
-    name: Status Codes Not Metered
-    description: >-
-      Comma-separated HTTP status codes that produce no usage event.
-      Leave empty for the default "401,403,429". A value replaces the
-      default. "none" meters every status.
-    type: string
-    optional: true
-    sensitive: false
-    allowMultiple: false
-  - propertyName: exclude-paths
-    name: Paths Not Metered
-    description: >-
-      Comma-separated path prefixes that produce no usage event. Leave
-      empty for the default "/health,/ready,/metrics". A value replaces
-      the default. "none" meters every path.
-    type: string
-    optional: true
-    sensitive: false
-    allowMultiple: false
+  # ── What a call bills ─────────────────────────────────────────────
   - propertyName: product-type
     name: Product Type
-    description: >-
-      productType on every event, trimmed and upper-cased. Leave empty for
-      "API". A request with a trace id is sent as AGENTIC_API and an MCP
-      tools/call that names an agent as MCP_SERVER, whatever is set here.
+    description: API, AGENTIC_API, AI_AGENT or MCP_SERVER. Leave empty for API.
     type: string
     optional: true
+    defaultValue: API
     sensitive: false
     allowMultiple: false
   - propertyName: default-metric
     name: Default Metric
-    description: >-
-      Metric name for requests no mapping rule matches. Leave empty for
-      "api_calls". The tokens {method} and {path} are replaced, so
-      "{method} {path}" names the metric after the route. The metric must
-      exist in your Aforo catalog.
+    description: Metric for calls no mapping matches. Leave empty for api_calls; an MCP tools/call then bills mcp_server.tool_invocations.
     type: string
     optional: true
     sensitive: false
     allowMultiple: false
   - propertyName: metric-mappings
     name: Metric Mappings
-    description: >-
-      Path-to-metric rules, first match wins: "KIND|value|metricName"
-      separated by ";". KIND is EXACT, PREFIX or CONTAINS, compared with the
-      request path. Example: "PREFIX|/v1/search|search_calls;EXACT|/v1/export|exports".
+    description: 'JSON array of {"pathPattern","method","metricName"}, first match wins. pathPattern is a Lua pattern, as on Kong: unanchored unless it starts with ^. method is optional.'
     type: string
     optional: true
     sensitive: false
     allowMultiple: false
-  - propertyName: quantity-source
-    name: Quantity Source
-    description: >-
-      "request_count" (the default) sends quantity 1. "response_size" sends
-      the response Content-Length in bytes; a response without that header
-      produces no event.
+  - propertyName: quantity-header
+    name: Quantity Header
+    description: Upstream RESPONSE header with the event quantity (a positive number). Leave empty for X-Aforo-Quantity. Absent or unusable means 1.
     type: string
     optional: true
     sensitive: false
     allowMultiple: false
-  - propertyName: include-metadata
-    name: Include Metadata
-    description: >-
-      "false" leaves the metadata object (gateway, method, path, status) off
-      the event. Leave empty to send it.
+  - propertyName: agent-id
+    name: Agent ID
+    description: AI_AGENT only. The agentId when the upstream sends no X-Aforo-Agent-Id response header. Leave empty to use the Aforo product id.
     type: string
     optional: true
     sensitive: false
     allowMultiple: false
-  - propertyName: product_type
-    name: product_type (deprecated)
-    description: >-
-      Deprecated 2.1.0 name of product-type. Read only when product-type is empty.
+  - propertyName: trace-id-header
+    name: Trace ID Header
+    description: AGENTIC_API only. Upstream RESPONSE header naming the trace (one goal). Leave empty for X-Aforo-Trace-Id. Without it, each call is its own trace (the gateway request id).
     type: string
     optional: true
     sensitive: false
     allowMultiple: false
-  - propertyName: default_metric
-    name: default_metric (deprecated)
-    description: >-
-      Deprecated 2.1.0 name of default-metric. Read only when default-metric is empty.
+  - propertyName: status-outcomes
+    name: executionStatus Overrides
+    description: 'JSON object of HTTP status to executionStatus, e.g. {"404":"VALIDATION_FAILED"}. The older "404=VALIDATION_FAILED,429=ERROR" form is read too.'
     type: string
     optional: true
     sensitive: false
     allowMultiple: false
-  - propertyName: quantity_source
-    name: quantity_source (deprecated)
-    description: >-
-      Deprecated 2.1.0 name of quantity-source. Read only when quantity-source is empty.
+  - propertyName: exclude-paths
+    name: Paths Not Metered
+    description: Comma-separated paths that are neither metered nor quota-checked (the key is still checked). An entry matches itself and the paths below it. Leave empty for /health,/ready,/metrics; "none" meters every path.
     type: string
     optional: true
     sensitive: false
     allowMultiple: false
-  - propertyName: include_metadata
-    name: include_metadata (deprecated)
-    description: >-
-      Deprecated 2.1.0 name of include-metadata. Read only when include-metadata is empty.
+  - propertyName: exclude-status-codes
+    name: Status Codes Not Metered
+    description: Comma-separated HTTP status codes that produce no usage event. Leave empty for 401,403,429; "none" meters every status.
     type: string
     optional: true
+    sensitive: false
+    allowMultiple: false
+  # ── Pre-flight quota check ────────────────────────────────────────
+  - propertyName: quota-enabled
+    name: Enforce Quota
+    description: Ask Aforo before the upstream whether the customer is within quota for the metric the call bills, and answer 429 on DENY (not metered). ALLOW and WARN are cached for 1 s, DENY never.
+    type: boolean
+    optional: true
+    defaultValue: false
+    sensitive: false
+    allowMultiple: false
+  - propertyName: quota-check-url
+    name: Quota Check URL
+    description: Leave empty for the Aforo Ingest URL's origin plus /api/v1/quota/check.
+    type: string
+    optional: true
+    sensitive: false
+    allowMultiple: false
+  - propertyName: quota-timeout-ms
+    name: Quota Check Timeout (ms)
+    description: Timeout of the quota check, 100 to 10000. On timeout or error the call proceeds unless Quota Fail Open is off.
+    type: int
+    optional: true
+    defaultValue: 1500
+    sensitive: false
+    allowMultiple: false
+  - propertyName: quota-fail-open
+    name: Quota Fail Open
+    description: When the quota check fails, let the call through (true, the default) or answer 503 (false).
+    type: boolean
+    optional: true
+    defaultValue: true
     sensitive: false
     allowMultiple: false

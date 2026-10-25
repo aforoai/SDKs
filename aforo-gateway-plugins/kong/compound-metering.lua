@@ -4,8 +4,23 @@
 --
 -- Runs in the `log` phase (zero latency impact on client response).
 -- Requires: resty.http, cjson
+--
+-- Not called by handler.lua yet; it ships in the rockspec for integrations
+-- that build compound events themselves.
 
 local cjson = require("cjson.safe")
+
+-- Installed: kong.plugins.aforo-metering.event-util. From the source tree
+-- (busted): the bare filename. Same fallback as handler.lua.
+local function require_sibling(name)
+    local ok, mod = pcall(require, "kong.plugins.aforo-metering." .. name)
+    if ok then
+        return mod
+    end
+    return require(name)
+end
+
+local event_util = require_sibling("event-util")
 
 local M = {}
 
@@ -111,36 +126,11 @@ local function nonempty(v)
     return v
 end
 
--- resty.jit-uuid is bundled with OpenResty/Kong; loaded lazily + pcall-guarded so this
--- module still loads under the plain-Lua unit tests. Replaces a broken PDK uuid call: the
--- `kong` global exposes no `tools` field on Kong 3.x, so it crashed the build. Random v4 —
--- the last-resort correlationId is a documented dedup opt-out (see the block above).
-local _jit_uuid
-local function random_uuid()
-    if _jit_uuid == nil then
-        local ok, mod = pcall(require, "resty.jit-uuid")
-        _jit_uuid = (ok and type(mod) == "table" and mod) or false
-    end
-    if _jit_uuid and _jit_uuid.generate_v4 then
-        return _jit_uuid.generate_v4()
-    end
-    return nil
-end
-
--- ISO-8601 UTC with milliseconds ("2026-09-30T15:48:29.554Z"), the format the
--- ingestor's occurredAt (java.time.Instant) expects and the other four gateways
--- send. A bare number is read as epoch SECONDS by Jackson, so the old
--- ngx.now() * 1000 (epoch millis) parsed as the year 58717 and every event
--- failed the ingestor's future-timestamp check.
-local function iso8601_utc(t)
-    local sec = math.floor(t)
-    local ms = math.floor((t - sec) * 1000 + 0.5)
-    if ms >= 1000 then
-        sec = sec + 1
-        ms = ms - 1000
-    end
-    return os.date("!%Y-%m-%dT%H:%M:%S", sec) .. string.format(".%03dZ", ms)
-end
+-- uuid() and iso8601_utc() come from event-util.lua, shared with handler.lua
+-- (Gowtham, 2026-10-12): one UUID source that works on every supported Kong,
+-- one occurredAt format. The uuid is only the LAST RESORT below.
+local random_uuid = event_util.uuid
+local iso8601_utc = event_util.iso8601_utc
 
 local function derive_correlation_id(seed)
     local hex = ngx.md5("aforo-compound:" .. seed)
@@ -191,9 +181,13 @@ M.DEFAULT_LLM_PATHS = {
     ["$.usage.total_tokens"]      = "total-tokens",
 }
 
+-- Byte counts go to byte metrics. They used to be sent as bandwidth-in-gb /
+-- -out-gb with the raw byte count as the quantity: a 1 GB transfer billed as a
+-- billion GB. Renamed rather than converted, so no unit (GB or GiB?) and no
+-- rounding is guessed here; the catalog metric decides how bytes are priced.
 M.DEFAULT_CDN_PATHS = {
-    ["$.bandwidth.in_bytes"]  = "bandwidth-in-gb",
-    ["$.bandwidth.out_bytes"] = "bandwidth-out-gb",
+    ["$.bandwidth.in_bytes"]  = "bandwidth-in-bytes",
+    ["$.bandwidth.out_bytes"] = "bandwidth-out-bytes",
     ["$.compute.seconds"]     = "compute-seconds",
     ["$.request_count"]       = "request-count",
 }

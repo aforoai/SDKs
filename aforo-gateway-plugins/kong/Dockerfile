@@ -16,10 +16,19 @@
 #     -e KONG_ADMIN_LISTEN=0.0.0.0:8001 \
 #     -p 8000:8000 -p 8001:8001 kong-aforo:3.4
 #
+# Other Kong versions: pass the base image. Kong ships no open-source image
+# after 3.9; the Kong Gateway (Enterprise) image runs without a license in free
+# mode, and it is the image Kong Konnect data plane nodes run.
+#
+#   docker build --build-arg KONG_IMAGE_BASE=kong/kong-gateway:3.16.0.1 -t kong-aforo:3.16 .
+#
+# Tested bases: see "Supported Kong versions" in README.md.
+#
 # For a fast edit-reload loop that does not rebuild, see USER_GUIDE.md
 # ("Local development: mounting the plugin from source").
 
-FROM kong:3.4
+ARG KONG_IMAGE_BASE=kong:3.4
+FROM ${KONG_IMAGE_BASE}
 
 USER root
 
@@ -36,7 +45,7 @@ USER root
 # rockspec passed as a path.
 COPY . /tmp/aforo-plugin/
 RUN cd /tmp/aforo-plugin \
-    && luarocks make kong-plugin-aforo-metering-2.5.0-1.rockspec \
+    && luarocks make kong-plugin-aforo-metering-2.6.0-1.rockspec \
     && rm -rf /tmp/aforo-plugin
 
 USER kong
@@ -45,7 +54,7 @@ ENV KONG_PLUGINS=bundled,aforo-metering
 
 # handler.lua buffers events in ngx.shared.aforo_buffer. Without this dict the
 # plugin loads and proxies traffic but silently meters nothing -- every log-phase
-# call bails out with "Shared dict 'aforo_buffer' not available".
+# call bails out with "Shared dict 'aforo_buffer' not found".
 ENV KONG_NGINX_HTTP_LUA_SHARED_DICT="aforo_buffer 10m"
 
 # Required for an https aforo_endpoint -- i.e. every production deployment.

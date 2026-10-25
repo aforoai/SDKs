@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<SharedFlowBundle revision="1" name="aforo-access">
+    <DisplayName>Aforo Access</DisplayName>
+    <Description>Aforo access control for managed proxies. Attach to the
+        environment's PreProxyFlowHook. On a proxy whose KVM key
+        managed_proxy__{proxy} is "true": verifies the caller's API key,
+        resolves the Aforo customer from the app's aforo_customer_id
+        attribute, and runs the pre-flight quota check (429 when the quota is
+        used up). Does nothing on any other proxy.</Description>
+    <CreatedAt>1761004800000</CreatedAt>
+    <LastModifiedAt>1761004800000</LastModifiedAt>
+    <Policies>
+        <Policy>AforoAccessReadManaged</Policy>
+        <Policy>AforoAccessPrepare</Policy>
+        <Policy>AforoVerifyApiKey</Policy>
+        <Policy>AforoAccessHideCredentials</Policy>
+        <Policy>AforoAccessReadConfig</Policy>
+        <Policy>AforoJwtValidation</Policy>
+        <Policy>AforoJwtAssignClaims</Policy>
+        <Policy>AforoAccessDecide</Policy>
+        <Policy>AforoJwtRejected</Policy>
+        <Policy>AforoQuotaLookupCache</Policy>
+        <Policy>AforoQuotaCheck</Policy>
+        <Policy>AforoQuotaDecide</Policy>
+        <Policy>AforoQuotaPopulateCache</Policy>
+        <Policy>AforoQuotaExceeded</Policy>
+        <Policy>AforoQuotaUnavailable</Policy>
+        <Policy>AforoAccessComplete</Policy>
+    </Policies>
+    <Resources>
+        <Resource>jsc://aforo-billing.js</Resource>
+        <Resource>jsc://aforo-access-prepare.js</Resource>
+        <Resource>jsc://aforo-access.js</Resource>
+        <Resource>jsc://aforo-quota-decide.js</Resource>
+    </Resources>
+    <SharedFlows>
+        <SharedFlow>default</SharedFlow>
+    </SharedFlows>
+</SharedFlowBundle>

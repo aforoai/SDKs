@@ -1,246 +1,154 @@
-# Aforo Usage Metering — MuleSoft custom policy
+# Aforo for MuleSoft (Mule 4 custom policy)
 
-`aforo-metering/` is a Mule 4 custom policy you publish to your Anypoint Exchange and apply to an API in API Manager. After each response it posts one usage event to Aforo from an async scope, so the API call is not delayed.
+One custom policy, **`aforo-metering`**, that Aforo applies to an API instance in Anypoint API Manager. On every call it checks the end customer's **Aforo API key**, refuses a customer whose hard limit is used up (**429**), lets the call through, and sends the call's usage to Aforo after the response. Your API needs no Aforo code.
 
-**Version**: 2.2.0 (`VERSION` and `aforo-metering/pom.xml` carry the same number). Changes: [CHANGELOG.md](CHANGELOG.md). Step-by-step install: [USER_GUIDE.md](USER_GUIDE.md).
+**Version:** 3.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
-**Not run against a Mule runtime.** The package builds (`mvn clean package`) and its structure is checked, but nobody has applied it in an Anypoint organization from this repository. Run "Verify on your gateway" below before you bill from it.
+Target: **Mule 4 runtimes as API gateways** (CloudHub, CloudHub 2.0, Runtime Fabric, hybrid), Mule 4.4 or later, Java 8, 11 or 17. Flex Gateway is not covered (it needs a separate PDK policy).
 
-## What is in this directory
+> **Not verified on a live Anypoint org yet.** The billing logic runs under the open-source DataWeave CLI against 166 cases, and the template's structure is checked statically (see [Tests](#tests)). See [What only a live runtime can prove](#what-only-a-live-runtime-can-prove).
 
-| Path | What it is |
-|------|------------|
-| `aforo-metering/pom.xml` | Maven project, packaging `mule-policy` |
-| `aforo-metering/aforo-metering.yaml` | Policy definition: the configuration form API Manager shows |
-| `aforo-metering/src/main/mule/template.xml` | The policy: request capture, the metering script, the retrying send |
-| `aforo-metering/mule-artifact.json` | Minimum Mule version (4.4.0) and Java versions (8, 11, 17) |
-| `tests/policy.test.cjs` | Structural checks (178) |
-| `tests/policy-contract.md` | Behavioural tests to run against a deployed API |
-| `mcp-mule-policy.yaml`, `compound-metering-policy.yaml`, `margin-guard-policy.yaml`, `preflight-quota-policy.yaml`, `jwt-validation-config.yaml` | Specifications only. None of them is a package and none can be uploaded to Exchange. |
+## What Aforo deploys
 
-## Install
+Aforo's organization service does this when you connect your Anypoint org and deploy an Aforo product to an API instance. To do it by hand, see the [user guide](USER_GUIDE.md).
 
-There are two routes. Both end with the same asset in your Exchange and the same policy applied in API Manager.
+| What | Where | Notes |
+|---|---|---|
+| Policy asset `aforo-metering` **3.0.0** | your org's Exchange, groupId = your **Anypoint organization id** | the jar `aforo-metering-3.0.0-mule-policy.jar` plus its definition [`aforo-metering.yaml`](aforo-metering/aforo-metering.yaml) (classifier `policy-definition`) |
+| The policy, applied to each API instance | API Manager, per API instance (and environment) | with the [configuration properties](USER_GUIDE.md#configuration-properties) for the Aforo product it sells: `aforo-product-id`, `product-type`, metrics, quota |
+| The product ↔ API instance mapping | Aforo, `gateway_product_meterings` | provider `mulesoft`, `gateway_resource_id` = the API instance id |
 
-### Route A — from Aforo (one click)
+Aforo pushes **no keys and no client applications** into Anypoint: Anypoint generates its own client ids, so the policy checks the Aforo key itself (below). One Aforo key works on every gateway Aforo supports.
 
-In Aforo, open Integrations → your MuleSoft connection → Metering and choose Deploy. Aforo publishes `aforo-metering` to your Exchange if that version is not there yet, then applies it to every Mule 4 API instance in the connected environment, or updates the configuration where it is already applied. The connection's credentials need the Exchange Contributor and API Manager "Manage Policies" permissions.
+## The single-key model
 
-### Route B — yourself
-
-You need JDK 17 or later, Maven 3.9, your Anypoint organization id (Access Management → Organization), and a connected app or user with the Exchange Contributor role.
-
-1. Get the sources: clone this repository. The GitHub release for a `mulesoft-v*` tag carries no built files; to inspect the jar, build it with `mvn clean package` (step 3).
-
-2. Add your Exchange credentials to `~/.m2/settings.xml`. For a connected app:
-
-   ```xml
-   <servers>
-     <server>
-       <id>exchange-server</id>
-       <username>~~~Client~~~</username>
-       <password>CLIENT_ID~?~CLIENT_SECRET</password>
-     </server>
-   </servers>
-   ```
-
-3. Build and publish. Exchange only accepts an asset whose group id is your organization id, so pass it:
-
-   ```bash
-   cd mulesoft/aforo-metering
-   mvn clean deploy -Danypoint.org.id=YOUR_ORG_ID
-   ```
-
-   On the EU control plane, add `-Dexchange.url=https://maven.eu1.anypoint.mulesoft.com/api/v3/organizations/YOUR_ORG_ID/maven`; the default in `pom.xml` is the US host `maven.anypoint.mulesoft.com`.
-
-   `mvn clean package` alone builds `target/aforo-metering-2.2.0-mule-policy.jar` without publishing. An Exchange version is immutable: to publish a change, raise `<version>` in `pom.xml` first.
-
-4. Apply MuleSoft's **JWT Validation** policy to the API, if it is not there already. The metering policy takes the customer id from the claims that policy verifies.
-
-5. In API Manager open the API instance → Policies → Add policy → Custom → **Aforo Usage Metering**, fill in the configuration below, and apply. Give it a higher order number than JWT Validation so it runs after it.
-
-## Configuration
-
-| Property | What it does | Required |
-|----------|--------------|----------|
-| `aforo-endpoint` | Ingestor batch URL, e.g. `https://api.aforo.ai/v1/ingest/batch` | Yes |
-| `aforo-api-key` | Sent as the `X-API-Key` header. Marked sensitive: masked in API Manager, encrypted on runtimes with gateway encryption on | Yes |
-| `aforo-tenant-id` | Your Aforo workspace id. Stamped on every event as `tenantId`. Not sent as a header: the ingestor takes the workspace from the API key | Yes |
-| `customer-id-claim` | JWT claim that holds the Aforo customer id | No (default `customer_id`, then `sub`) |
-| `tenant-id-claim` | JWT claim that holds the workspace id. Set it only if one API serves several workspaces | No (default: use `aforo-tenant-id`) |
-| `mcp-enabled` | Classify JSON-RPC `tools/call` POSTs as MCP tool invocations. Reads the JSON request body | No (default `false`) |
-| `mcp-product-id` | Aforo product id of the MCP server | No |
-| `status-outcomes` | `executionStatus` overrides, e.g. `404=VALIDATION_FAILED,429=ERROR` (repo README, "Execution status mapping") | No |
-| `exclude-status-codes` | Comma-separated status codes that are not metered | No (default `401,403,429`) |
-| `exclude-paths` | Comma-separated path prefixes that are not metered | No (default `/health,/ready,/metrics`) |
-| `product-type` | `productType` on every event, trimmed and upper-cased | No (default `API`) |
-| `default-metric` | Metric name when no mapping rule matches. `{method}` and `{path}` are replaced | No (default `api_calls`) |
-| `metric-mappings` | Path-to-metric rules, `KIND\|value\|metricName` separated by `;` | No |
-| `quantity-source` | `request_count` sends quantity 1; `response_size` sends the response `Content-Length` in bytes | No (default `request_count`) |
-| `include-metadata` | `false` leaves the `metadata` object off the event | No (default: sent) |
-| `product_type`, `default_metric`, `quantity_source`, `include_metadata` | Deprecated 2.1.0 names. Each is read only when the hyphenated property above is empty | No |
-
-Values are placed inside quoted strings in the policy, so a value must not contain a double quote or a `$`.
-
-## Metric name and product type
-
-The metric name of a standard or AGENTIC_API event is resolved in this order:
-
-1. The first `metric-mappings` rule that matches the request path. `EXACT` compares the whole path, `PREFIX` its start, `CONTAINS` any part; all three are plain text comparisons, not patterns. Example: `PREFIX|/v1/search|search_calls;EXACT|/v1/export|exports`. A rule that does not have three parts or names another kind is ignored.
-2. `default-metric`, `api_calls` when empty.
-
-An MCP tool call always uses `mcp_server.tool_invocations` and quantity 1.
-
-The policy does not know your catalog. A name that is not a metric in your Aforo catalog is rejected by the ingestor for that event; the rejection, with the ingestor's response body, is logged at WARN. A resolved name that is empty or longer than 255 characters is not sent at all (WARN in the runtime log).
-
-Before 2.2.0 the package sent `"{method} {path}"` (for example `GET /v1/accounts/123`) as the metric name. To keep that, set `default-metric` to `{method} {path}`.
-
-`productType` is on every event:
-
-| Request | `productType` |
-|---|---|
-| MCP `tools/call` whose body names an agent (`params._meta.agent_id`) | `MCP_SERVER` |
-| MCP `tools/call` without an agent | `product-type` (the ingestor rejects `MCP_SERVER` without `agentId`) |
-| Any other request with a valid `traceparent`, or an `x-trace-id` | `AGENTIC_API` |
-| Everything else | `product-type`, `API` when empty |
-
-## Where identity comes from
-
-| Field | Source |
-|-------|--------|
-| `customerId` | `authentication.properties.claims[customer-id-claim]`, else the `sub` claim. Set by MuleSoft's JWT Validation policy after it verifies the token. When both are empty: `vars.aforo.customerId` |
-| `tenantId` | `aforo-tenant-id`, or the `tenant-id-claim` claim when you set one. When that is empty: `vars.aforo.tenantId` |
-| `agentId` (MCP) | JSON-RPC `params._meta.agent_id` in the request body |
-
-No request header is read for identity: `X-Client-Id`, `X-Customer-Id`, `X-Tenant-Id` and `?customer_id=` are caller-settable. A request with no verified customer id produces no event, and the API call still goes through. The policy never sends a placeholder (`unknown`, `anonymous`, a client IP, an API key) as the customer. A customer id longer than 64 characters produces no event either.
-
-`vars.aforo.*` is the 2.1.0 identity model: a separate `aforo-jwt-validation` flow sets it from a JWT that flow verified. The policy reads it second, after the gateway's authentication context. Mule 4 does not share variables between policies, so on a stock gateway it is empty and the claims are the only source; do not rely on it for a new install.
-
-## Delivery
-
-The event, including its `idempotencyKey`, is built once. The send is tried up to three times, one second apart, on a transport error, a 5xx, a 408 or a 429; each attempt sends the same bytes, so a redelivery is deduplicated by the ingestor. The wait is fixed: `Retry-After` is not read. Any other 4xx is a permanent rejection: it is not retried, and the status and the first 500 characters of the response body are logged at WARN (`usage event rejected by the ingestor, not retried`). The only credential sent is `X-API-Key`. All of this runs in the async scope after the response has gone back to the caller. After the third failure the event is dropped and the runtime logs `[aforo-metering] usage event not delivered`.
-
-The key is a UUID the policy mints when the request arrives. It is not read from `X-Correlation-Id` or any other header, so a caller cannot make two calls share one key.
-
-## Requests that are not metered
-
-An excluded request produces no event and no call to Aforo: the script returns an empty `events` array, and the policy only sends when the array has an entry. Standard API, AGENTIC_API and MCP tool calls follow the same rules.
-
-Besides the two lists below, these never produce an event: `OPTIONS` requests (CORS preflight), requests with no verified customer, a customer id over 64 characters, and a quantity of 0 (`quantity-source: response_size` on a response with no `Content-Length`). Each is logged at DEBUG as `[aforo-metering] not metered: <reason>`.
-
-**Status codes.** With `exclude-status-codes` left empty, 401, 403 and 429 are not metered — the same default as Kong, AWS Lambda, Apigee and Azure APIM. A value replaces the default; it does not add to it:
-
-| `exclude-status-codes` | Not metered |
-|---|---|
-| empty | 401, 403, 429 |
-| `404,500` | 404 and 500 only — 401, 403 and 429 are now metered |
-| `none` | nothing — every status is metered |
-
-A 401, 403 or 429 that you choose to meter carries `executionStatus: BLOCKED` unless `status-outcomes` says otherwise.
-
-**Paths.** A request is excluded when its path equals an entry or starts with it, so `/health` also excludes `/health/live` (and `/healthz`). A value replaces the default; `none` excludes nothing.
-
-**Malformed values.** Spaces and empty entries are ignored. A status entry that isn't a whole number from 100 to 599 is ignored. A list with no valid code in it (`abc`) excludes nothing.
-
-## What is not covered
-
-- **Unhandled flow errors.** If the API's flow ends in an error that propagates out of `execute-next`, the policy's after-phase does not run and the call is not metered. Calls where the flow returns an error status normally (an error handler that sets the status) are metered.
-- **Flex Gateway.** This is a Mule runtime policy. Flex Gateway policies are built with the Policy Development Kit and are a different artifact.
-- **Mule 3**, and Mule 4 before 4.4.0.
-- **Client-ID-only APIs.** Without a JWT there is no verified customer id and nothing is metered.
-- **JSON-RPC errors inside a 2xx.** The response body is never read, so an MCP call that returns an `error` object with HTTP 200 is `SUCCESS`.
-- **Non-repeatable request streams with `mcp-enabled`.** MCP detection reads the request body before the flow. Mule's default repeatable streams let the flow read it again; an HTTP listener configured with a non-repeatable stream would hand the flow an already-read body. Leave `mcp-enabled` off on such APIs.
-- **Compound metering, margin guard, pre-flight quota, the MCP-only variant.** Their YAML files here are specifications, not packages.
-- **`Retry-After`.** A 429 from the ingestor is retried after the fixed one-second wait, not after the interval the header names.
-- **Response size of chunked responses.** `quantity-source: response_size` reads `Content-Length`; the body is never read.
-
-## Verify on your gateway
-
-Nothing below has been run from this repository.
-
-1. Apply the policy to a test API with only the three required properties. The runtime log must show no template-rendering or DataWeave error for the policy.
-2. Send one request with a valid JWT. One event arrives with the token's `customer_id` (or `sub`), your `aforo-tenant-id`, `metricName: api_calls`, `productType: API`, an `executionStatus` and a UTC `occurredAt`.
-3. Send one with `X-Client-Id: someone_else`. The event still carries the token's customer.
-4. Send one that returns 401 and one to `/health`. No event and no call to the ingestor.
-5. Point `aforo-endpoint` at a host that refuses connections. API responses are unchanged and one WARN is logged per request after three attempts.
-6. Run the rest of `tests/policy-contract.md`.
-
-## Fail-closed behavior
-
-A request that cannot be attributed to a verified customer is never billed: the script returns an empty `events` array and nothing is sent. The API call itself is never blocked or failed by this policy; request capture and the send both swallow their own errors.
-
-Margin-guard and preflight-quota (specifications) skip their check when there is no customer id.
-
-## W3C Trace Context
-
-The metering policy captures these headers from inbound requests:
-- `traceparent` — W3C trace parent header
-- `tracestate` — W3C trace state header
-- `x-trace-id` — Legacy trace ID header
-- `x-request-id` — Legacy request ID header
-
-Absent headers are emitted as `null` (no synthetic values).
-
-## Example requests
+The end customer calls your API with the key they got from Aforo, in the `x-api-key` header (name: `key-header`):
 
 ```bash
-# 1. Standard API request with a valid JWT — metering event attributed to JWT customer_id
-curl -X GET "https://your-mulesoft-app.cloudhub.io/v1/accounts/123" \
-  -H "Authorization: Bearer <VALID_JWT>" \
-  -H "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" \
-  -H "tracestate: congo=t61rcWkgMzE"
-
-# 2. Security regression test — forged X-Client-Id header must be IGNORED
-#    (metering event should still attribute to the JWT's customer_id, not
-#    the value of X-Client-Id).
-curl -X GET "https://your-mulesoft-app.cloudhub.io/v1/accounts/123" \
-  -H "Authorization: Bearer <VALID_JWT_FOR_cust_legit>" \
-  -H "X-Client-Id: cust_victim"
-# Expected: ingestor event carries customerId=cust_legit (the JWT value),
-# NOT cust_victim (the header value).
-
-# 3. Request with no JWT — gateway returns 401 (JWT Validation policy fails);
-#    nothing is metered.
-curl -X GET "https://your-mulesoft-app.cloudhub.io/v1/accounts/123"
-# Expected: 401 invalid_token.
-
-# 4. MCP tools/call request with valid JWT
-curl -X POST "https://your-mulesoft-app.cloudhub.io/v1/mcp" \
-  -H "Authorization: Bearer <VALID_JWT>" \
-  -H "Content-Type: application/json" \
-  -H "traceparent: 00-abc123-def456-01" \
-  -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"search_docs"}}'
+curl https://api.example.com/v1/orders -H "x-api-key: sk_live_…"
 ```
+
+- The key is either an `sk_live_…` / `sk_test_…` key from the storefront, or, for AI_AGENT and MCP_SERVER products, the **client secret** of an agent credential (48 lowercase hex characters). The policy does not judge the shape: Aforo does. Only a missing key, one longer than 1024 characters or one with control characters is refused without asking.
+- The policy asks Aforo: `POST {introspect-url}` with `{"key": "<the key>"}` and `X-API-Key: {aforo-api-key}` (the policy's own `usage:ingest` key; the tenant comes from it). Aforo answers `{"active": true, "keyId", "customerId", "subscriptionId", "subscriptionIds", "productIds", "productType", "scopes", "expiresAt"}` or exactly `{"active": false}`, bare or inside `{"success", "data"}`.
+- **Allowed** only when the key is active and its `productIds` contain this API instance's `aforo-product-id`. The customer billed is the answer's `customerId`, never anything the client sends.
+- The `x-api-key` header is **removed** before the request reaches your API (as Kong's `hide_credentials`).
+
+## Responses
+
+| Status | When | Body | Metered |
+|---|---|---|---|
+| **401** | no key | `{"message":"No API key found in request"}` | no |
+| **401** | unknown, revoked, suspended, expired, another tenant's, or no live subscription (Aforo answers all of these `{"active":false}`) | `{"message":"Invalid authentication credentials"}` | no |
+| **403** | active key whose subscriptions do not include this product (`productIds` may be `[]`) | `{"message":"This API key does not grant access to this API"}` | no |
+| **429** | the pre-flight quota check said DENY | `{"message": "<reason>", "retryAfter": <s>}`, header `Retry-After: <s>` = max(1, ceil(retryAfterMs / 1000)), 60 when Aforo gives none | no |
+| **503** | Aforo's introspection did not answer and no cached answer may be used | `{"message":"Access check unavailable"}`, `Retry-After: 5` | no |
+| **503** | the quota check did not answer and `quota-fail-open` is `false` | `{"message":"Quota check unavailable"}`, `Retry-After: 1` | no |
+| **503** | the policy is missing `aforo-endpoint`, `aforo-api-key` or `aforo-product-id` | `{"message":"Aforo policy is not configured"}` | no |
+| anything else | your API's own answer, unchanged | | yes (see exclusions) |
+
+A refused call never reaches your API.
+
+## Caching and revocation latency
+
+| Cache | Where | How long |
+|---|---|---|
+| Active key | the policy (per worker, in memory, by SHA-256 of the key) | `identity-cache-ttl-s` = **60 s**, never past the key's `expiresAt` |
+| Unknown / inactive key | the policy | `identity-negative-ttl-s` = 10 s |
+| Active key | Aforo (server side) | 30 s, **evicted at once** on revoke, cancel, pause, suspend, resume, upgrade and downgrade |
+| Unknown / inactive key | Aforo | 10 s |
+| Quota ALLOW / WARN | the policy | 1 s (DENY is never cached) |
+
+So **a revoked key or a cancelled subscription stops working at the gateway within about 60 s** (the policy's positive cache; Aforo's own cache is cleared at once). A new key, or a new subscription for a key that was refused, works within about 20 s (both negative caches). While Aforo's introspection is down, an active answer up to `identity-stale-ttl-s` (**900 s**) old is still used, so during an outage a revocation can take up to 15 minutes; with no usable answer the call gets 503 (or passes unchecked and unmetered with `identity-fail-open`).
+
+## Product types
+
+Trusted sources only: the introspected key, the policy configuration, the gateway's own request id, and your API's **response** headers, which a client cannot set. A response header that is present but unusable (control characters, or longer than Aforo allows) skips the event; it never falls back to another identity.
+
+| `product-type` | Events per call | Type-specific fields |
+|---|---|---|
+| `API` (default) | 1 | none |
+| `AGENTIC_API` | 1 | `traceId` = upstream `X-Aforo-Trace-Id` (name: `trace-id-header`), else the gateway request id (one call, one goal). The client's `traceparent` only travels in `event.trace`: it never names the trace and never changes the type. |
+| `AI_AGENT` | 1 | `agentId` = upstream `X-Aforo-Agent-Id`, else `agent-id`, else the Aforo product id. `sessionId` = upstream `X-Aforo-Session-Id`, else the gateway request id. `traceId` = `sessionId`. Request headers such as `X-Agent-Id` are never read. |
+| `MCP_SERVER` | 1 per JSON-RPC `tools/call`, batches included; **0** for `initialize`, `tools/list`, `ping` and notifications, which are also never quota-refused | `toolName` from the body (`unknown` when missing); `agentId` = upstream `X-Aforo-Agent-Id`, else the customer (never `params._meta.agent_id`); `sessionId` = upstream `X-Aforo-Session-Id`, else the upstream's `Mcp-Session-Id` **response** header (hashed when longer than 64 characters). |
+
+Every event carries `customerId`, `metricName`, `quantity`, `idempotencyKey` (a UUID the policy mints per call; for MCP `mcp:{tenant}:{id}:{n}:{tool}`; never a client header), `occurredAt`, `productType`, `executionStatus`, `endpointPath`, `httpMethod`, `statusCode`, `responseTimeMs`, `trace` (the client's trace headers, for correlation only) and `metadata` (`gateway: mulesoft`, `productId`, `keyId`, …).
+
+- **Metric**: upstream `X-Aforo-Metric`, else the first matching `metric-mappings` rule (Kong's Lua patterns), else for a tool call the product's `default-metric` (unless it is `api_calls`) or `mcp_server.tool_invocations`, else `default-metric`, else `api_calls`. The pre-flight quota check asks about the same metric, minus the response header it cannot know yet.
+- **Quantity**: upstream `X-Aforo-Quantity` (name: `quantity-header`; a positive number, rounded to 6 decimals), else 1.
+- **`executionStatus`**, the table every Aforo gateway uses: 2xx/3xx `SUCCESS`, 408/504 `TIMEOUT`, 499 `CANCELLED`, 400/422 `VALIDATION_FAILED`, 401/403/429 `BLOCKED`, any other 4xx/5xx `ERROR`. `status-outcomes` overrides it per code.
+- **Not metered**: `exclude-paths` (default `/health`, `/ready`, `/metrics` and the paths below them), `exclude-status-codes` (default 401, 403, 429), CORS preflights. The key is still checked on excluded paths.
+
+### Optional upstream response headers
+
+| Header | Effect |
+|---|---|
+| `X-Aforo-Quantity` | quantity of this call (tokens, minutes, …) |
+| `X-Aforo-Metric` | metric of this call |
+| `X-Aforo-Agent-Id` | agent (AI_AGENT, MCP_SERVER), at most 36 characters |
+| `X-Aforo-Session-Id` | session (AI_AGENT, MCP_SERVER), at most 64 characters |
+| `X-Aforo-Trace-Id` | goal / trace (AGENTIC_API), at most 128 characters |
+| `Mcp-Session-Id` | MCP's own session header; the MCP session when `X-Aforo-Session-Id` is absent |
+
+## Delivery, latency and loss
+
+- On the request path the policy adds at most one introspection call (1500 ms timeout) when the key is not cached, and one quota call (`quota-timeout-ms`, 1500 ms) when quota is enforced and not cached for that customer and metric.
+- Usage is sent **after** the response, in an async scope: `POST {aforo-endpoint}` with `{"events": [...]}` and `X-API-Key: {aforo-api-key}`. The ingestor answers 202 `{"success":true,"data":{"accepted","failed","errors":[{"index","message"}]}}`:
+  - an error starting "The event could not be stored" is transient: only those events are re-sent;
+  - any other per-event error is permanent: logged (`USAGE EVENT REFUSED`) and dropped;
+  - no answer, 5xx, 408 or 429: the whole batch is re-sent;
+  - up to 3 attempts, 2 s apart. The idempotency keys never change, so a copy that did land is deduplicated, never billed twice.
+- At most 16 deliveries run at once per policy instance and at most 1000 calls' usage waits; past that the usage is dropped with a `USAGE DROPPED` warning (once a minute). A worker restart loses usage that was still waiting.
+- Warnings that could repeat on every call (introspection or quota unavailable, backlog full) are logged once a minute.
+
+## Build
+
+```bash
+cd aforo-gateway-plugins/mulesoft/aforo-metering
+docker run --rm -v "$PWD":/src -v "$HOME/.m2":/root/.m2 -w /src maven:3.9-eclipse-temurin-17 mvn -B -ntp clean package
+# -> target/aforo-metering-3.0.0-mule-policy.jar
+```
+
+Everything resolves from MuleSoft's public repository (`repository.mulesoft.org/releases`) and Maven Central: no Anypoint or Nexus EE credentials. The policy bundles the HTTP connector 1.10.3, the ObjectStore connector 1.2.2, the Java module 1.2.16 and the secure configuration property module 1.2.7. `mvn deploy -Danypoint.org.id=<org id>` publishes the jar and the definition to your Exchange (credentials in `~/.m2/settings.xml`, server id `exchange-server`).
 
 ## Tests
 
+From `aforo-gateway-plugins/`:
+
 ```bash
-node mulesoft/tests/policy.test.cjs            # structure, 178 checks
-(cd mulesoft/aforo-metering && mvn clean package)   # assembles the jar
+# Structure: package, definition <-> template, flow order, outbound calls, docs
+docker run --rm -v "$PWD":/src -w /src node:22 node mulesoft/tests/policy.test.cjs
+# Billing logic: the template's 8 DataWeave scripts under the DataWeave CLI 2.12.3
+mulesoft/tests/run-dataweave.sh
 ```
 
-The first checks that the package files exist, that `template.xml` and `aforo-metering.yaml` agree on every property, that the send is skipped for an empty `events` array, that the exclusion block matches `mcp-mule-policy.yaml`, that the idempotency keys are untouched, and that the metric, product type, skip and alias rules are in the script. Neither command executes DataWeave or starts a Mule runtime.
+- `dataweave.test.cjs` reads the scripts straight out of `template.xml` (the only copy) and runs them against [`tests/fixtures/`](tests/fixtures): configuration parsing and Lua patterns, the key and its hash, identity and cache decisions (fresh, stale, negative, `expiresAt`, failures, fail-open), quota decisions, the events of all four product types with MCP batches and protocol messages, and the ingestor's 202 handling.
+- `policy.test.cjs` checks what the CLI cannot: every property is declared and read exactly once, no property ever reaches DataWeave source text, the quota check and the key removal come before `execute-next`, a refusal never reaches `execute-next`, every variable read is written, the outbound calls' URLs and headers, and that the two copies of the metering block are identical.
+- [`tests/policy-contract.md`](tests/policy-contract.md) is the checklist for a test API on a live runtime.
 
-## Troubleshooting
+## What only a live runtime can prove
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| `mvn deploy` returns 401 or 403 | The connected app lacks Exchange Contributor, or the `exchange-server` credentials are wrong | Check the `~~~Client~~~` username and the `id~?~secret` password form; add the role |
-| `mvn deploy` returns 409 | That version already exists in your Exchange | Raise `<version>` in `pom.xml` |
-| `mvn deploy` returns 400 about the group id | `-Danypoint.org.id` missing, so the placeholder group id was sent | Pass your organization id |
-| The policy is not listed in API Manager | The API instance is Mule 3 or Flex Gateway, or the asset is in another business group | Use a Mule 4 instance in the organization you published to |
-| No events at all, API calls succeed | No verified JWT claims: JWT Validation is not applied, runs after this policy, or the token has neither `customer_id` nor `sub` | Apply JWT Validation with a lower order number; set `customer-id-claim` to the claim your tokens carry |
-| 401/403/429 calls do not appear in usage | They are excluded by default | Set `exclude-status-codes` to `none`, or to a list without those codes |
-| Health checks are still metered | No entry is a prefix of the path, or a custom `exclude-paths` replaced the default | Add the path; include `/health` again if you set your own list |
-| Policy fails to apply after a configuration change | A value contains a double quote | Remove the quote |
-| WARN `usage event rejected by the ingestor, not retried: HTTP 400` | The metric name is not in your catalog, or the customer id is unknown | Read the response body in the log line; fix `metric-mappings` / `default-metric`, or create the metric |
-| No events for byte-metered APIs | `quantity-source` is `response_size` and the response has no `Content-Length` | Have the API set `Content-Length`, or use `request_count` |
+There is no Mule 4 runtime that runs a custom policy offline: policies need the Enterprise runtime with API Gateway, which is not on a public registry, so none of this was run on a runtime.
 
-## Upgrading from the pre-package files
+- That the gateway applies the policy: the Handlebars rendering of `={{property}}` attribute values (double braces HTML-escape, the XML parser decodes), the `{{#if encrypted}}` block, and encrypted `aforo-api-key` values.
+- **Key removal**: `propagateMessageTransformations="true"` on `http-policy:source` and the Java module rebuilding `HttpRequestAttributes` without the header (what MuleSoft's own `http-transform:remove-headers` does). If the runtime refuses it, the call still goes through, with the header, and the policy logs `could not remove the x-api-key header`.
+- **Refusals**: the listener building the 401/403/429/503 response from `HttpPolicyResponseAttributes`.
+- That an API error (APIkit 404, 5xx) reaches the policy's `on-error-propagate` with the error response's status, and that propagating it leaves the client's response unchanged.
+- Object store, `async maxConcurrency` and `until-successful` behaviour; per-worker caches on multi-worker deployments.
+- How a 1.10.3 HTTP connector in the policy coexists with your application's own HTTP connector version.
 
-Earlier releases shipped `mule-policy.yaml` and a root `template.xml` that could not be uploaded to Exchange. If you built your own policy from them:
+## Known differences from Kong and Apigee
 
-1. Publish `aforo-metering` (Route A or B) and apply it.
-2. Remove your hand-built policy from the API.
-3. Property names are unchanged. `customer-id-claim` and `tenant-id-claim` are new and optional. The 2.1.0 `product-type` property works as before; the `${product_type}`, `${default_metric}`, `${quantity_source}` and `${include_metadata}` placeholders of the old `template.xml` are policy properties now (same names, and hyphenated names that win when both are set). `${api_key}` and `${aforo_endpoint}` are `aforo-api-key` and `aforo-endpoint`.
-4. `tenantId` is now your configured `aforo-tenant-id` unless you set `tenant-id-claim`. `metricName` is `api_calls` unless you configure it (see "Metric name and product type").
+- A quota WARN is not marked with `X-RateLimit-Warning` on the response (the response attributes are not rebuilt).
+- A JSON-RPC error inside a 2xx MCP answer is not detected: the response body is streamed to the client and not read. MCP events are classified by HTTP status only.
+- Quantity comes from `X-Aforo-Quantity` or is 1; there is no `response_size` option.
+- No CORS bypass: apply MuleSoft's CORS policy before this one if browsers call the API.
+
+## Files
+
+| Path | What |
+|---|---|
+| [`aforo-metering/pom.xml`](aforo-metering/pom.xml) | Maven `mule-policy` project |
+| [`aforo-metering/aforo-metering.yaml`](aforo-metering/aforo-metering.yaml) | policy definition: the configuration form, every property |
+| [`aforo-metering/src/main/mule/template.xml`](aforo-metering/src/main/mule/template.xml) | the policy, including the DataWeave scripts |
+| [`aforo-metering/mule-artifact.json`](aforo-metering/mule-artifact.json) | minimum Mule version, Java versions |
+| [`tests/`](tests) | structure tests, DataWeave CLI tests and fixtures, the live checklist |

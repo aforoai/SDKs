@@ -1,0 +1,646 @@
+{
+  "script": "identity-decide",
+  "base": {
+    "vars": {
+      "aforoCfg": {
+        "endpoint": "https://api.aforo.ai/v1/ingest/batch",
+        "apiKey": "ak_test_policy",
+        "tenantId": "42",
+        "productId": "prod-7",
+        "introspectUrl": "https://api.aforo.ai/api/v1/customer-keys/introspect",
+        "introspectTimeoutMs": 1500,
+        "keyHeader": "x-api-key",
+        "identityTtlS": 60,
+        "identityNegativeTtlS": 10,
+        "identityStaleTtlS": 900,
+        "identityFailOpen": false,
+        "productType": "API",
+        "defaultMetric": "",
+        "metricRules": [],
+        "quantityHeader": "X-Aforo-Quantity",
+        "agentId": "",
+        "traceIdHeader": "X-Aforo-Trace-Id",
+        "statusOutcomes": {},
+        "excludePaths": [
+          "/health",
+          "/ready",
+          "/metrics"
+        ],
+        "excludeStatusCodes": [
+          401,
+          403,
+          429
+        ],
+        "quotaEnabled": false,
+        "quotaUrl": "https://api.aforo.ai/api/v1/quota/check",
+        "quotaTimeoutMs": 1500,
+        "quotaFailOpen": true,
+        "quotaCacheTtlMs": 1000,
+        "problems": [],
+        "warnings": []
+      },
+      "aforoReq": {
+        "requestId": "req-1",
+        "startMs": 1792653973000,
+        "method": "GET",
+        "path": "/v1/orders",
+        "key": "sk_live_abc",
+        "keyHash": "h",
+        "keyProblem": null,
+        "excluded": false,
+        "cors": false,
+        "plan": {
+          "productType": "API",
+          "tools": false,
+          "plain": true,
+          "calls": [],
+          "otherMessages": 0,
+          "metric": "api_calls",
+          "toolMetric": null,
+          "quotaMetric": "api_calls"
+        }
+      },
+      "aforoIdLookup": {
+        "entry": null,
+        "fresh": false,
+        "staleUsable": false,
+        "introspect": true
+      },
+      "aforoIntrospection": null
+    }
+  },
+  "cases": [
+    {
+      "name": "active key covering the product: allow, cache the answer",
+      "expect": {
+        "outcome": "allow",
+        "source": "introspection",
+        "identity": {
+          "customerId": "cust-9",
+          "keyId": "key-9",
+          "subscriptionId": "sub-9"
+        },
+        "cacheWrite.#json.active": true,
+        "cacheWrite.#json.customerId": "cust-9",
+        "cacheWrite.#json.productIds": [
+          "prod-7",
+          "prod-8"
+        ],
+        "cacheWrite.#json.storedAtMs": 1792653973000,
+        "cacheWrite.#json.expiresAtMs": null,
+        "cacheWrite.#json.productType": "AI_AGENT",
+        "warn": null,
+        "quota": null
+      },
+      "vars": {
+        "aforoIntrospection": {
+          "status": 200,
+          "text": "{\"active\": true, \"keyId\": \"key-9\", \"customerId\": \"cust-9\", \"subscriptionId\": \"sub-9\", \"subscriptionIds\": [\"sub-9\"], \"productIds\": [\"prod-7\", \"prod-8\"], \"productType\": \"AI_AGENT\", \"scopes\": [\"usage\"], \"expiresAt\": null}"
+        }
+      }
+    },
+    {
+      "name": "the {success,data} envelope is read too",
+      "expect": {
+        "outcome": "allow",
+        "identity.customerId": "cust-9"
+      },
+      "vars": {
+        "aforoIntrospection": {
+          "status": 200,
+          "text": "{\"success\": true, \"data\": {\"active\": true, \"keyId\": \"key-9\", \"customerId\": \"cust-9\", \"subscriptionId\": \"sub-9\", \"subscriptionIds\": [\"sub-9\"], \"productIds\": [\"prod-7\", \"prod-8\"], \"productType\": \"AI_AGENT\", \"scopes\": [\"usage\"], \"expiresAt\": null}}"
+        }
+      }
+    },
+    {
+      "name": "productIds [] means 403 for every product (and the answer is cached)",
+      "expect": {
+        "outcome": "reject",
+        "status": 403,
+        "body": {
+          "message": "This API key does not grant access to this API"
+        },
+        "cacheWrite.#json.productIds": []
+      },
+      "vars": {
+        "aforoIntrospection": {
+          "status": 200,
+          "text": "{\"active\": true, \"keyId\": \"key-9\", \"customerId\": \"cust-9\", \"subscriptionId\": \"sub-9\", \"subscriptionIds\": [\"sub-9\"], \"productIds\": [], \"productType\": \"AI_AGENT\", \"scopes\": [\"usage\"], \"expiresAt\": null}"
+        }
+      }
+    },
+    {
+      "name": "active key for another product: 403",
+      "expect": {
+        "outcome": "reject",
+        "status": 403
+      },
+      "vars": {
+        "aforoIntrospection": {
+          "status": 200,
+          "text": "{\"active\": true, \"keyId\": \"key-9\", \"customerId\": \"cust-9\", \"subscriptionId\": \"sub-9\", \"subscriptionIds\": [\"sub-9\"], \"productIds\": [\"prod-1\"], \"productType\": \"AI_AGENT\", \"scopes\": [\"usage\"], \"expiresAt\": null}"
+        }
+      }
+    },
+    {
+      "name": "numeric product ids compare as text",
+      "expect": {
+        "outcome": "allow"
+      },
+      "vars": {
+        "aforoCfg": {
+          "productId": "7"
+        },
+        "aforoIntrospection": {
+          "status": 200,
+          "text": "{\"active\": true, \"keyId\": \"key-9\", \"customerId\": \"cust-9\", \"subscriptionId\": \"sub-9\", \"subscriptionIds\": [\"sub-9\"], \"productIds\": [7, 8], \"productType\": \"AI_AGENT\", \"scopes\": [\"usage\"], \"expiresAt\": null}"
+        }
+      }
+    },
+    {
+      "name": "null productType and expiresAt are fine",
+      "expect": {
+        "outcome": "allow",
+        "cacheWrite.#json.productType": null,
+        "cacheWrite.#json.expiresAtMs": null
+      },
+      "vars": {
+        "aforoIntrospection": {
+          "status": 200,
+          "text": "{\"active\": true, \"keyId\": \"key-9\", \"customerId\": \"cust-9\", \"subscriptionId\": \"sub-9\", \"subscriptionIds\": [\"sub-9\"], \"productIds\": [\"prod-7\", \"prod-8\"], \"productType\": null, \"scopes\": [\"usage\"], \"expiresAt\": null}"
+        }
+      }
+    },
+    {
+      "name": "expiresAt (ISO-8601) in the future is kept on the cache entry",
+      "expect": {
+        "outcome": "allow",
+        "cacheWrite.#json.expiresAtMs": 1792663200000
+      },
+      "vars": {
+        "aforoIntrospection": {
+          "status": 200,
+          "text": "{\"active\": true, \"keyId\": \"key-9\", \"customerId\": \"cust-9\", \"subscriptionId\": \"sub-9\", \"subscriptionIds\": [\"sub-9\"], \"productIds\": [\"prod-7\", \"prod-8\"], \"productType\": \"AI_AGENT\", \"scopes\": [\"usage\"], \"expiresAt\": \"2026-10-22T10:00:00Z\"}"
+        }
+      }
+    },
+    {
+      "name": "expiresAt in epoch seconds is read as such",
+      "expect": {
+        "outcome": "allow",
+        "cacheWrite.#json.expiresAtMs": 1792663200000
+      },
+      "vars": {
+        "aforoIntrospection": {
+          "status": 200,
+          "text": "{\"active\": true, \"keyId\": \"key-9\", \"customerId\": \"cust-9\", \"subscriptionId\": \"sub-9\", \"subscriptionIds\": [\"sub-9\"], \"productIds\": [\"prod-7\", \"prod-8\"], \"productType\": \"AI_AGENT\", \"scopes\": [\"usage\"], \"expiresAt\": 1792663200}"
+        }
+      }
+    },
+    {
+      "name": "expiresAt already past: 401 and a negative entry",
+      "expect": {
+        "outcome": "reject",
+        "status": 401,
+        "cacheWrite.#json": {
+          "v": 1,
+          "active": false,
+          "storedAtMs": 1792653973000
+        }
+      },
+      "vars": {
+        "aforoIntrospection": {
+          "status": 200,
+          "text": "{\"active\": true, \"keyId\": \"key-9\", \"customerId\": \"cust-9\", \"subscriptionId\": \"sub-9\", \"subscriptionIds\": [\"sub-9\"], \"productIds\": [\"prod-7\", \"prod-8\"], \"productType\": \"AI_AGENT\", \"scopes\": [\"usage\"], \"expiresAt\": \"2026-10-01T00:00:00Z\"}"
+        }
+      }
+    },
+    {
+      "name": "{\"active\":false}: 401 Invalid authentication credentials, cached as negative",
+      "expect": {
+        "outcome": "reject",
+        "status": 401,
+        "body": {
+          "message": "Invalid authentication credentials"
+        },
+        "cacheWrite.#json": {
+          "v": 1,
+          "active": false,
+          "storedAtMs": 1792653973000
+        },
+        "warn": null
+      },
+      "vars": {
+        "aforoIntrospection": {
+          "status": 200,
+          "text": "{\"active\": false}"
+        }
+      }
+    },
+    {
+      "name": "{\"success\":true,\"data\":{\"active\":false}}: 401",
+      "expect": {
+        "outcome": "reject",
+        "status": 401
+      },
+      "vars": {
+        "aforoIntrospection": {
+          "status": 200,
+          "text": "{\"success\": true, \"data\": {\"active\": false}}"
+        }
+      }
+    },
+    {
+      "name": "identity-negative-ttl-s 0: nothing cached for an inactive key",
+      "expect": {
+        "status": 401,
+        "cacheWrite": null
+      },
+      "vars": {
+        "aforoCfg": {
+          "identityNegativeTtlS": 0
+        },
+        "aforoIntrospection": {
+          "status": 200,
+          "text": "{\"active\": false}"
+        }
+      }
+    },
+    {
+      "name": "no key: 401 No API key found in request, Aforo not asked",
+      "expect": {
+        "outcome": "reject",
+        "status": 401,
+        "body": {
+          "message": "No API key found in request"
+        },
+        "cacheWrite": null
+      },
+      "vars": {
+        "aforoReq": {
+          "key": null,
+          "keyHash": null,
+          "keyProblem": "missing"
+        },
+        "aforoIdLookup": {
+          "introspect": false
+        }
+      }
+    },
+    {
+      "name": "an unusable key: 401",
+      "expect": {
+        "outcome": "reject",
+        "status": 401,
+        "body": {
+          "message": "Invalid authentication credentials"
+        }
+      },
+      "vars": {
+        "aforoReq": {
+          "key": null,
+          "keyHash": null,
+          "keyProblem": "invalid"
+        },
+        "aforoIdLookup": {
+          "introspect": false
+        }
+      }
+    },
+    {
+      "name": "fresh cached active answer: allow without asking",
+      "expect": {
+        "outcome": "allow",
+        "source": "cache",
+        "identity.customerId": "cust-1",
+        "cacheWrite": null
+      },
+      "vars": {
+        "aforoIdLookup": {
+          "entry": {
+            "v": 1,
+            "active": true,
+            "customerId": "cust-1",
+            "productIds": [
+              "prod-7"
+            ],
+            "keyId": "key-1",
+            "subscriptionId": "sub-1",
+            "productType": "API",
+            "expiresAtMs": null,
+            "storedAtMs": 1792653943000
+          },
+          "fresh": true,
+          "staleUsable": true,
+          "introspect": false
+        }
+      }
+    },
+    {
+      "name": "fresh cached answer for another product: 403",
+      "expect": {
+        "outcome": "reject",
+        "status": 403
+      },
+      "vars": {
+        "aforoIdLookup": {
+          "entry": {
+            "v": 1,
+            "active": true,
+            "customerId": "cust-1",
+            "productIds": [
+              "other"
+            ],
+            "keyId": "key-1",
+            "subscriptionId": "sub-1",
+            "productType": "API",
+            "expiresAtMs": null,
+            "storedAtMs": 1792653943000
+          },
+          "fresh": true,
+          "staleUsable": true,
+          "introspect": false
+        }
+      }
+    },
+    {
+      "name": "fresh cached inactive answer: 401 without asking",
+      "expect": {
+        "outcome": "reject",
+        "status": 401,
+        "cacheWrite": null
+      },
+      "vars": {
+        "aforoIdLookup": {
+          "entry": {
+            "v": 1,
+            "active": false,
+            "storedAtMs": 1792653971000
+          },
+          "fresh": true,
+          "staleUsable": false,
+          "introspect": false
+        }
+      }
+    },
+    {
+      "name": "introspection 5xx with a usable stale answer: allow from the stale cache, warn once",
+      "expect": {
+        "outcome": "allow",
+        "source": "stale cache",
+        "identity.customerId": "cust-1",
+        "cacheWrite": null,
+        "warn.kind": "introspection",
+        "warn.message": "[aforo-metering] introspection failed (HTTP 503): using the cached answer. Repeats suppressed for 60 s."
+      },
+      "vars": {
+        "aforoIdLookup": {
+          "entry": {
+            "v": 1,
+            "active": true,
+            "customerId": "cust-1",
+            "productIds": [
+              "prod-7"
+            ],
+            "keyId": "key-1",
+            "subscriptionId": "sub-1",
+            "productType": "API",
+            "expiresAtMs": null,
+            "storedAtMs": 1792653673000
+          },
+          "fresh": false,
+          "staleUsable": true,
+          "introspect": true
+        },
+        "aforoIntrospection": {
+          "status": 503,
+          "text": "down"
+        }
+      }
+    },
+    {
+      "name": "introspection timeout and no usable answer: 503 Access check unavailable, Retry-After 5",
+      "expect": {
+        "outcome": "reject",
+        "status": 503,
+        "headers": {
+          "Retry-After": "5"
+        },
+        "body": {
+          "message": "Access check unavailable"
+        },
+        "warn.kind": "introspection",
+        "warn.message": "[aforo-metering] introspection failed (no response: HTTP:TIMEOUT): answering 503. Repeats suppressed for 60 s."
+      },
+      "vars": {
+        "aforoIntrospection": {
+          "status": 0,
+          "error": "HTTP:TIMEOUT"
+        }
+      }
+    },
+    {
+      "name": "Aforo refuses the policy key (401): 503 and a warning naming aforo-api-key",
+      "expect": {
+        "status": 503,
+        "warn.message": "[aforo-metering] introspection failed (HTTP 401: Aforo refused aforo-api-key (it needs scope usage:ingest)): answering 503. Repeats suppressed for 60 s."
+      },
+      "vars": {
+        "aforoIntrospection": {
+          "status": 401,
+          "text": "{}"
+        }
+      }
+    },
+    {
+      "name": "an unreadable 200 is a failure, not a 401",
+      "expect": {
+        "status": 503,
+        "cacheWrite": null
+      },
+      "vars": {
+        "aforoIntrospection": {
+          "status": 200,
+          "text": "<html>"
+        }
+      }
+    },
+    {
+      "name": "an active answer without a customerId is a failure",
+      "expect": {
+        "status": 503,
+        "cacheWrite": null
+      },
+      "vars": {
+        "aforoIntrospection": {
+          "status": 200,
+          "text": "{\"active\": true, \"keyId\": \"key-9\", \"customerId\": \"\", \"subscriptionId\": \"sub-9\", \"subscriptionIds\": [\"sub-9\"], \"productIds\": [\"prod-7\", \"prod-8\"], \"productType\": \"AI_AGENT\", \"scopes\": [\"usage\"], \"expiresAt\": null}"
+        }
+      }
+    },
+    {
+      "name": "an over-long customerId is a failure",
+      "expect": {
+        "status": 503
+      },
+      "vars": {
+        "aforoIntrospection": {
+          "status": 200,
+          "text": "{\"active\": true, \"keyId\": \"key-9\", \"customerId\": \"ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\", \"subscriptionId\": \"sub-9\", \"subscriptionIds\": [\"sub-9\"], \"productIds\": [\"prod-7\", \"prod-8\"], \"productType\": \"AI_AGENT\", \"scopes\": [\"usage\"], \"expiresAt\": null}"
+        }
+      }
+    },
+    {
+      "name": "identity-fail-open: no usable answer lets the call through unidentified",
+      "expect": {
+        "outcome": "allow-unidentified",
+        "source": "fail-open",
+        "warn.kind": "introspection"
+      },
+      "vars": {
+        "aforoCfg": {
+          "identityFailOpen": true
+        },
+        "aforoIntrospection": {
+          "status": 502,
+          "text": ""
+        }
+      },
+      "absent": [
+        "identity"
+      ]
+    },
+    {
+      "name": "identity-fail-open does not override a definite 401",
+      "expect": {
+        "outcome": "reject",
+        "status": 401
+      },
+      "vars": {
+        "aforoCfg": {
+          "identityFailOpen": true
+        },
+        "aforoIntrospection": {
+          "status": 200,
+          "text": "{\"active\": false}"
+        }
+      }
+    },
+    {
+      "name": "a policy configuration problem: 503 and a configuration warning",
+      "expect": {
+        "outcome": "reject",
+        "status": 503,
+        "body": {
+          "message": "Aforo policy is not configured"
+        },
+        "headers": {
+          "Retry-After": "60"
+        },
+        "warn.kind": "configuration"
+      },
+      "vars": {
+        "aforoCfg": {
+          "problems": [
+            "aforo-product-id is not set"
+          ]
+        },
+        "aforoIdLookup": {
+          "introspect": false
+        }
+      }
+    },
+    {
+      "name": "quota enabled: the check is prepared for the billed metric",
+      "expect": {
+        "outcome": "allow",
+        "quota": {
+          "metricName": "api_calls",
+          "customerId": "cust-9",
+          "cacheKey": "quota|cust-9|api_calls"
+        }
+      },
+      "vars": {
+        "aforoCfg": {
+          "quotaEnabled": true
+        },
+        "aforoIntrospection": {
+          "status": 200,
+          "text": "{\"active\": true, \"keyId\": \"key-9\", \"customerId\": \"cust-9\", \"subscriptionId\": \"sub-9\", \"subscriptionIds\": [\"sub-9\"], \"productIds\": [\"prod-7\", \"prod-8\"], \"productType\": \"AI_AGENT\", \"scopes\": [\"usage\"], \"expiresAt\": null}"
+        }
+      }
+    },
+    {
+      "name": "quota enabled but the call bills nothing (excluded, MCP protocol message): no check",
+      "expect": {
+        "outcome": "allow",
+        "quota": null
+      },
+      "vars": {
+        "aforoCfg": {
+          "quotaEnabled": true
+        },
+        "aforoReq": {
+          "plan": {
+            "quotaMetric": null
+          }
+        },
+        "aforoIntrospection": {
+          "status": 200,
+          "text": "{\"active\": true, \"keyId\": \"key-9\", \"customerId\": \"cust-9\", \"subscriptionId\": \"sub-9\", \"subscriptionIds\": [\"sub-9\"], \"productIds\": [\"prod-7\", \"prod-8\"], \"productType\": \"AI_AGENT\", \"scopes\": [\"usage\"], \"expiresAt\": null}"
+        }
+      }
+    },
+    {
+      "name": "quota enabled but no quota URL: no check",
+      "expect": {
+        "quota": null
+      },
+      "vars": {
+        "aforoCfg": {
+          "quotaEnabled": true,
+          "quotaUrl": ""
+        },
+        "aforoIntrospection": {
+          "status": 200,
+          "text": "{\"active\": true, \"keyId\": \"key-9\", \"customerId\": \"cust-9\", \"subscriptionId\": \"sub-9\", \"subscriptionIds\": [\"sub-9\"], \"productIds\": [\"prod-7\", \"prod-8\"], \"productType\": \"AI_AGENT\", \"scopes\": [\"usage\"], \"expiresAt\": null}"
+        }
+      }
+    },
+    {
+      "name": "a refused call is never quota-checked",
+      "expect": {
+        "status": 401,
+        "quota": null
+      },
+      "vars": {
+        "aforoCfg": {
+          "quotaEnabled": true
+        },
+        "aforoIntrospection": {
+          "status": 200,
+          "text": "{\"active\": false}"
+        }
+      }
+    },
+    {
+      "name": "configuration warnings are passed on to the log",
+      "expect": {
+        "outcome": "allow",
+        "warn.kind": "configuration",
+        "warn.message": "[aforo-metering] metric-mappings is not valid JSON; ignored"
+      },
+      "vars": {
+        "aforoCfg": {
+          "warnings": [
+            "metric-mappings is not valid JSON; ignored"
+          ]
+        },
+        "aforoIntrospection": {
+          "status": 200,
+          "text": "{\"active\": true, \"keyId\": \"key-9\", \"customerId\": \"cust-9\", \"subscriptionId\": \"sub-9\", \"subscriptionIds\": [\"sub-9\"], \"productIds\": [\"prod-7\", \"prod-8\"], \"productType\": \"AI_AGENT\", \"scopes\": [\"usage\"], \"expiresAt\": null}"
+        }
+      }
+    }
+  ]
+}

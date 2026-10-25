@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Resolves the customer (AC1), the product type and the billed metric, and
+     whether the pre-flight quota check runs. See aforo-access.js. -->
+<Javascript name="AforoAccessDecide" timeLimit="500" continueOnError="true">
+    <DisplayName>Aforo Access - Decide</DisplayName>
+    <IncludeURL>jsc://aforo-billing.js</IncludeURL>
+    <ResourceURL>jsc://aforo-access.js</ResourceURL>
+</Javascript>

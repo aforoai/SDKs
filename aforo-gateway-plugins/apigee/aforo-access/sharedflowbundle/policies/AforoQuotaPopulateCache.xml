@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Caches an ALLOW or WARN for quota_cache_ttl_ms, rounded up to whole
+     seconds (the cache's unit; default 1 s). DENY is never cached, so a
+     top-up or a new period unblocks the customer at once. -->
+<PopulateCache name="AforoQuotaPopulateCache" continueOnError="true">
+    <DisplayName>Aforo Access - Quota Cache Store</DisplayName>
+    <CacheKey>
+        <Prefix>aforo-quota</Prefix>
+        <KeyFragment ref="aforo.access.quotaCacheKey"/>
+    </CacheKey>
+    <Scope>Global</Scope>
+    <ExpirySettings>
+        <TimeoutInSeconds ref="aforo.access.quotaCacheTtlSec">1</TimeoutInSeconds>
+    </ExpirySettings>
+    <Source>aforo.access.quotaDecision</Source>
+</PopulateCache>

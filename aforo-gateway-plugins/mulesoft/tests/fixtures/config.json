@@ -1,0 +1,283 @@
+{
+  "script": "config",
+  "base": {
+    "vars": {
+      "aforoPropAforoEndpoint": "=https://api.aforo.ai/v1/ingest/batch",
+      "aforoPropAforoApiKey": "=ak_test_policy",
+      "aforoPropAforoTenantId": "=42",
+      "aforoPropAforoProductId": "=prod-7",
+      "aforoPropIntrospectUrl": "=",
+      "aforoPropKeyHeader": "=",
+      "aforoPropIdentityCacheTtlS": "=",
+      "aforoPropIdentityNegativeTtlS": "=",
+      "aforoPropIdentityStaleTtlS": "=",
+      "aforoPropIdentityFailOpen": "=",
+      "aforoPropProductType": "=",
+      "aforoPropDefaultMetric": "=",
+      "aforoPropMetricMappings": "=",
+      "aforoPropQuantityHeader": "=",
+      "aforoPropAgentId": "=",
+      "aforoPropTraceIdHeader": "=",
+      "aforoPropStatusOutcomes": "=",
+      "aforoPropExcludePaths": "=",
+      "aforoPropExcludeStatusCodes": "=",
+      "aforoPropQuotaEnabled": "=",
+      "aforoPropQuotaCheckUrl": "=",
+      "aforoPropQuotaTimeoutMs": "=",
+      "aforoPropQuotaFailOpen": "="
+    }
+  },
+  "cases": [
+    {
+      "name": "defaults when only the required properties are set",
+      "expect": {
+        "endpoint": "https://api.aforo.ai/v1/ingest/batch",
+        "apiKey": "ak_test_policy",
+        "tenantId": "42",
+        "productId": "prod-7",
+        "introspectUrl": "https://api.aforo.ai/api/v1/customer-keys/introspect",
+        "introspectTimeoutMs": 1500,
+        "quotaUrl": "https://api.aforo.ai/api/v1/quota/check",
+        "keyHeader": "x-api-key",
+        "identityTtlS": 60,
+        "identityNegativeTtlS": 10,
+        "identityStaleTtlS": 900,
+        "identityFailOpen": false,
+        "productType": "API",
+        "defaultMetric": "",
+        "metricRules": [],
+        "quantityHeader": "X-Aforo-Quantity",
+        "traceIdHeader": "X-Aforo-Trace-Id",
+        "statusOutcomes": {},
+        "excludePaths": [
+          "/health",
+          "/ready",
+          "/metrics"
+        ],
+        "excludeStatusCodes": [
+          401,
+          403,
+          429
+        ],
+        "quotaEnabled": false,
+        "quotaTimeoutMs": 1500,
+        "quotaFailOpen": true,
+        "quotaCacheTtlMs": 1000,
+        "problems": [],
+        "warnings": []
+      }
+    },
+    {
+      "name": "every property set explicitly",
+      "vars": {
+        "aforoPropIntrospectUrl": "=https://id.example.test/introspect",
+        "aforoPropKeyHeader": "=X-Customer-Key",
+        "aforoPropIdentityCacheTtlS": "=30",
+        "aforoPropIdentityNegativeTtlS": "=5",
+        "aforoPropIdentityStaleTtlS": "=120",
+        "aforoPropIdentityFailOpen": "=true",
+        "aforoPropProductType": "= ai_agent ",
+        "aforoPropDefaultMetric": "=agent_calls",
+        "aforoPropQuantityHeader": "=X-Units",
+        "aforoPropAgentId": "=agent-1",
+        "aforoPropTraceIdHeader": "=X-Goal-Id",
+        "aforoPropQuotaEnabled": "=true",
+        "aforoPropQuotaCheckUrl": "=https://q.example.test/check",
+        "aforoPropQuotaTimeoutMs": "=800",
+        "aforoPropQuotaFailOpen": "=false"
+      },
+      "expect": {
+        "introspectUrl": "https://id.example.test/introspect",
+        "keyHeader": "x-customer-key",
+        "identityTtlS": 30,
+        "identityNegativeTtlS": 5,
+        "identityStaleTtlS": 120,
+        "identityFailOpen": true,
+        "productType": "AI_AGENT",
+        "defaultMetric": "agent_calls",
+        "quantityHeader": "X-Units",
+        "agentId": "agent-1",
+        "traceIdHeader": "X-Goal-Id",
+        "quotaEnabled": true,
+        "quotaUrl": "https://q.example.test/check",
+        "quotaTimeoutMs": 800,
+        "quotaFailOpen": false
+      }
+    },
+    {
+      "name": "numbers are clamped and junk falls back to the default",
+      "vars": {
+        "aforoPropIdentityCacheTtlS": "=999999",
+        "aforoPropIdentityStaleTtlS": "=abc",
+        "aforoPropQuotaTimeoutMs": "=5",
+        "aforoPropQuotaEnabled": "=yes"
+      },
+      "expect": {
+        "identityTtlS": 3600,
+        "identityStaleTtlS": 900,
+        "quotaTimeoutMs": 100,
+        "quotaEnabled": false
+      }
+    },
+    {
+      "name": "a property that was never rendered (no leading =) still reads as text",
+      "vars": {
+        "aforoPropProductType": "MCP_SERVER"
+      },
+      "expect": {
+        "productType": "MCP_SERVER"
+      }
+    },
+    {
+      "name": "Lua patterns become Java regex, Kong snake_case accepted",
+      "vars": {
+        "aforoPropMetricMappings": "=[{\"pathPattern\": \"^/v1/users/%d+$\", \"method\": \"get\", \"metricName\": \"user_reads\"}, {\"path_pattern\": \"/search\", \"metric_name\": \"searches\"}, {\"pathPattern\": \"^/items/[%w_-]+\", \"metricName\": \"items\"}, {\"pathPattern\": \"%.json$\", \"metricName\": \"json\"}, {\"pathPattern\": \"^/a.-/b\", \"metricName\": \"lazy\"}, {\"pathPattern\": \"^/x/[^/]+/%S+\", \"metricName\": \"sets\"}]"
+      },
+      "expect": {
+        "metricRules": [
+          {
+            "method": "GET",
+            "metricName": "user_reads",
+            "re": "^\\/v1\\/users\\/[0-9]+$"
+          },
+          {
+            "method": "",
+            "metricName": "searches",
+            "re": "\\/search"
+          },
+          {
+            "method": "",
+            "metricName": "items",
+            "re": "^\\/items\\/[A-Za-z0-9_\\-]+"
+          },
+          {
+            "method": "",
+            "metricName": "json",
+            "re": "\\.json$"
+          },
+          {
+            "method": "",
+            "metricName": "lazy",
+            "re": "^\\/a[\\s\\S]*?\\/b"
+          },
+          {
+            "method": "",
+            "metricName": "sets",
+            "re": "^\\/x\\/[^/]+\\/[^\\x20\\t\\n\\r\\f\\x0B]+"
+          }
+        ],
+        "warnings": []
+      }
+    },
+    {
+      "name": "unsupported or incomplete rules are skipped with a warning",
+      "vars": {
+        "aforoPropMetricMappings": "=[{\"pathPattern\": \"%bxy\", \"metricName\": \"balanced\"}, {\"pathPattern\": \"/ok\", \"metricName\": \"\"}, {\"pathPattern\": \"/open[set\", \"metricName\": \"unclosed\"}, {\"pathPattern\": \"/fine\", \"metricName\": \"fine\"}]"
+      },
+      "expect": {
+        "metricRules": [
+          {
+            "method": "",
+            "metricName": "fine",
+            "re": "\\/fine"
+          }
+        ],
+        "warnings.#length": 3
+      }
+    },
+    {
+      "name": "invalid metric-mappings JSON is ignored with a warning",
+      "vars": {
+        "aforoPropMetricMappings": "=[{\"pathPattern\":"
+      },
+      "expect": {
+        "metricRules": [],
+        "warnings": [
+          "metric-mappings is not valid JSON; ignored"
+        ]
+      }
+    },
+    {
+      "name": "status-outcomes as JSON; invalid entries ignored",
+      "vars": {
+        "aforoPropStatusOutcomes": "={\"404\":\"validation_failed\",\"429\":\"ERROR\",\"200\":\"NOPE\",\"99\":\"ERROR\"}"
+      },
+      "expect": {
+        "statusOutcomes": {
+          "404": "VALIDATION_FAILED",
+          "429": "ERROR"
+        }
+      }
+    },
+    {
+      "name": "status-outcomes in the older CSV form; the last entry for a code wins",
+      "vars": {
+        "aforoPropStatusOutcomes": "=404=ERROR, 404=VALIDATION_FAILED ,503=TIMEOUT,bad"
+      },
+      "expect": {
+        "statusOutcomes": {
+          "404": "VALIDATION_FAILED",
+          "503": "TIMEOUT"
+        }
+      }
+    },
+    {
+      "name": "exclusions: \"none\" and explicit lists",
+      "vars": {
+        "aforoPropExcludePaths": "=none",
+        "aforoPropExcludeStatusCodes": "=404, 500,abc,1000"
+      },
+      "expect": {
+        "excludePaths": [],
+        "excludeStatusCodes": [
+          404,
+          500
+        ]
+      }
+    },
+    {
+      "name": "exclude-status-codes \"none\" meters every status",
+      "vars": {
+        "aforoPropExcludeStatusCodes": "=NONE",
+        "aforoPropExcludePaths": "=/internal, /status/"
+      },
+      "expect": {
+        "excludeStatusCodes": [],
+        "excludePaths": [
+          "/internal",
+          "/status/"
+        ]
+      }
+    },
+    {
+      "name": "missing required properties are reported as problems",
+      "vars": {
+        "aforoPropAforoEndpoint": "=",
+        "aforoPropAforoApiKey": "=  ",
+        "aforoPropAforoProductId": "="
+      },
+      "expect": {
+        "problems": [
+          "aforo-endpoint is not set",
+          "aforo-api-key is not set",
+          "aforo-product-id is not set",
+          "introspect-url is not set and aforo-endpoint has no http(s) origin"
+        ],
+        "introspectUrl": "",
+        "quotaUrl": ""
+      }
+    },
+    {
+      "name": "an explicit introspect-url makes a missing endpoint origin harmless for identity",
+      "vars": {
+        "aforoPropAforoEndpoint": "=not-a-url",
+        "aforoPropIntrospectUrl": "=http://localhost:8081/introspect"
+      },
+      "expect": {
+        "problems": [],
+        "introspectUrl": "http://localhost:8081/introspect",
+        "quotaUrl": ""
+      }
+    }
+  ]
+}

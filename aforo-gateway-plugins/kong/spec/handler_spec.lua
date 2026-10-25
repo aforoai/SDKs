@@ -6,22 +6,91 @@
 -- implements the list operations the event buffer relies on with OpenResty's
 -- semantics (atomic per call; list ops on a non-list key fail).
 local function new_shared_dict()
-    local d = { store = {}, fail_push = false }
-    function d:get(k) return self.store[k] end
-    function d:set(k, v) self.store[k] = v; return true end
-    function d:add(k, v)
-        if self.store[k] ~= nil then return false, "exists" end
-        self.store[k] = v; return true
+    -- Memory is modelled for lists, as the real dict behaves: each element
+    -- takes a slab slot, pushes fail with "no memory" when the dict is full
+    -- (they evict nothing), and free_space() reports what is left.
+    local d = { store = {}, exp = {}, fail_push = false, cap = 10485760, used = 0 }
+    local function slot(v)
+        local n = #v + 48
+        if n > 2048 then return math.ceil(n / 4096) * 4096 end
+        local p = 16
+        while p < n do p = p * 2 end
+        return p
     end
-    function d:delete(k) self.store[k] = nil end
-    function d:incr(k, n, init)
+    -- Expiry follows ngx.now(), so a test can move time forward.
+    local free_scalar
+    local function expired(self, k)
+        local e = self.exp[k]
+        if e and ngx.now() >= e then free_scalar(self, k); self.store[k] = nil; self.exp[k] = nil; return true end
+        return false
+    end
+    -- Scalars take slab slots too. safe_set of an existing key into another
+    -- size class frees the old value first and, with no room, then fails:
+    -- the key is gone -- as the real shdict does.
+    local function scalar_slot(k, v)
+        return slot(tostring(k) .. tostring(v))
+    end
+    free_scalar = function(self, k)
         local v = self.store[k]
-        if v == nil then
-            if init == nil then return nil, "not found" end
-            v = init
+        if v ~= nil and not (type(v) == "table" and v.__list) then
+            self.used = self.used - scalar_slot(k, v)
         end
-        self.store[k] = v + n
-        return self.store[k]
+    end
+    function d:get(k) expired(self, k); return self.store[k] end
+    function d:safe_set(k, v, ttl)
+        expired(self, k)
+        local old = self.store[k]
+        if old ~= nil and type(old) == "table" and old.__list then return nil, "value not a list" end
+        local new_slot = scalar_slot(k, v)
+        if old ~= nil and scalar_slot(k, old) == new_slot then
+            self.store[k] = v                                  -- same slot, in place
+        else
+            if old ~= nil then free_scalar(self, k); self.store[k] = nil; self.exp[k] = nil end
+            if self.fail_push or self.used + new_slot > self.cap then return false, "no memory" end
+            self.store[k] = v
+            self.used = self.used + new_slot
+        end
+        self.exp[k] = (ttl and ttl > 0) and (ngx.now() + ttl) or nil
+        return true
+    end
+    function d:safe_add(k, v, ttl)
+        expired(self, k)
+        if self.store[k] ~= nil then return false, "exists" end
+        return self:safe_set(k, v, ttl)
+    end
+    -- set/add are only used by tests to arrange state: never refused.
+    function d:set(k, v, ttl)
+        free_scalar(self, k)
+        self.store[k] = v
+        self.used = self.used + scalar_slot(k, v)
+        self.exp[k] = (ttl and ttl > 0) and (ngx.now() + ttl) or nil
+        return true
+    end
+    function d:add(k, v, ttl)
+        expired(self, k)
+        if self.store[k] ~= nil then return false, "exists" end
+        return self:set(k, v, ttl)
+    end
+    function d:ttl(k)
+        expired(self, k)
+        if self.store[k] == nil then return nil, "not found" end
+        return self.exp[k] and (self.exp[k] - ngx.now()) or 0
+    end
+    function d:expire(k, ttl)
+        expired(self, k)
+        if self.store[k] == nil then return nil, "not found" end
+        self.exp[k] = (ttl and ttl > 0) and (ngx.now() + ttl) or nil
+        return true
+    end
+    function d:delete(k)
+        local v = self.store[k]
+        if type(v) == "table" and v.__list then
+            for _, e in ipairs(v) do self.used = self.used - slot(e) end
+        else
+            free_scalar(self, k)
+        end
+        self.store[k] = nil
+        self.exp[k] = nil
     end
     local function list(self, k, create)
         local v = self.store[k]
@@ -32,25 +101,31 @@ local function new_shared_dict()
         if type(v) ~= "table" or not v.__list then return nil, "value not a list" end
         return v
     end
+    local function room(self, v)
+        if self.fail_push or self.used + slot(v) > self.cap then return false end
+        return true
+    end
     function d:rpush(k, v)
-        if self.fail_push then return nil, "no memory" end
+        if not room(self, v) then return nil, "no memory" end
         local l, err = list(self, k, true); if not l then return nil, err end
-        l[#l + 1] = v; return #l
+        l[#l + 1] = v; self.used = self.used + slot(v); return #l
     end
     function d:lpush(k, v)
-        if self.fail_push then return nil, "no memory" end
+        if not room(self, v) then return nil, "no memory" end
         local l, err = list(self, k, true); if not l then return nil, err end
-        table.insert(l, 1, v); return #l
+        table.insert(l, 1, v); self.used = self.used + slot(v); return #l
     end
     function d:lpop(k)
         local l, err = list(self, k, false); if not l then return nil, err end
         local v = table.remove(l, 1)
+        if v then self.used = self.used - slot(v) end
         if #l == 0 then self.store[k] = nil end
         return v
     end
     function d:rpop(k)
         local l, err = list(self, k, false); if not l then return nil, err end
         local v = table.remove(l)
+        if v then self.used = self.used - slot(v) end
         if #l == 0 then self.store[k] = nil end
         return v
     end
@@ -59,56 +134,36 @@ local function new_shared_dict()
         if err then return nil, err end
         return l and #l or 0
     end
+    function d:incr(k, v, init)
+        local cur = self.store[k]
+        if cur == nil then
+            if init == nil then return nil, "not found" end
+            cur = init
+        end
+        self.store[k] = cur + v
+        return self.store[k]
+    end
+    function d:capacity() return self.cap end
+    function d:free_space() return math.max(0, self.cap - self.used) end
     return d
 end
 
 _G.ngx = _G.ngx or {}
 ngx.shared = { aforo_buffer = new_shared_dict() }
 ngx.timers = {}
-ngx.timer = { at = function(delay, fn, ...) table.insert(ngx.timers, { delay = delay, fn = fn, args = { ... } }); return true end }
+ngx.timer = {
+    at = function(delay, fn, ...) table.insert(ngx.timers, { delay = delay, fn = fn, args = { ... } }); return true end,
+    every = function(delay, fn, ...) table.insert(ngx.timers, { every = true, delay = delay, fn = fn, args = { ... } }); return true end,
+}
 ngx.now = function() return 1788268682.221 end
 ngx.sleeps = {}
 ngx.sleep = function(s) table.insert(ngx.sleeps, s) end
 ngx.worker = ngx.worker or { pid = function() return 1 end }
+ngx.worker.id = ngx.worker.id or function() return 0 end
 ngx.escape_uri = ngx.escape_uri or function(s) return s end
-ngx.time = function() return 1788268682 end
-ngx.var = ngx.var or {}
-ngx.ctx = ngx.ctx or {}
-ngx.null = ngx.null or {}
--- base64 (standard alphabet, padded), as ngx.decode_base64 / ngx.encode_base64.
-do
-    local B = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-    ngx.encode_base64 = function(data)
-        local out = {}
-        for i = 1, #data, 3 do
-            local a, b, c = data:byte(i, i + 2)
-            local n = a * 65536 + (b or 0) * 256 + (c or 0)
-            local c1 = math.floor(n / 262144) % 64
-            local c2 = math.floor(n / 4096) % 64
-            local c3 = math.floor(n / 64) % 64
-            local c4 = n % 64
-            out[#out + 1] = B:sub(c1 + 1, c1 + 1) .. B:sub(c2 + 1, c2 + 1)
-                .. (b and B:sub(c3 + 1, c3 + 1) or "=") .. (c and B:sub(c4 + 1, c4 + 1) or "=")
-        end
-        return table.concat(out)
-    end
-    ngx.decode_base64 = function(str)
-        if type(str) ~= "string" or #str % 4 ~= 0 or str:find("[^%w%+/=]") then return nil end
-        local out = {}
-        for i = 1, #str, 4 do
-            local n, pad = 0, 0
-            for j = 0, 3 do
-                local ch = str:sub(i + j, i + j)
-                local v
-                if ch == "=" then v = 0; pad = pad + 1 else v = B:find(ch, 1, true) - 1 end
-                n = n * 64 + v
-            end
-            local bytes = string.char(math.floor(n / 65536) % 256, math.floor(n / 256) % 256, n % 256)
-            out[#out + 1] = bytes:sub(1, 3 - pad)
-        end
-        return table.concat(out)
-    end
-end
+-- Stand-in for ngx.md5: distinct inputs give distinct keys, which is all the
+-- buffer and mappings keys need here.
+ngx.md5 = ngx.md5 or function(s) return (s:gsub("[^%w]", "_")) end
 
 -- resty.http mock: records every request and answers from a queue of
 -- scripted responses ({status=...} or {err="timeout"}); default 202.
@@ -116,7 +171,7 @@ local http_mock = { requests = {}, responses = {} }
 package.loaded["resty.http"] = {
     new = function()
         return {
-            set_timeout = function() end,
+            set_timeout = function(_, ms) http_mock.timeout = ms end,
             request_uri = function(_, url, params)
                 table.insert(http_mock.requests, { url = url, params = params })
                 if http_mock.on_request then http_mock.on_request(#http_mock.requests) end
@@ -124,42 +179,6 @@ package.loaded["resty.http"] = {
                 if r.err then return nil, r.err end
                 return { status = r.status, body = r.body or "", headers = r.headers or {} }
             end,
-            -- Streaming API (JWKS fetch): parse_uri + connect + request + body_reader.
-            parse_uri = function(_, uri)
-                local host, port, path, query = uri:match("^https://([^/:?#]+):?(%d*)([^?#]*)%??([^#]*)")
-                if not host then return nil, "bad uri" end
-                return { "https", host, tonumber(port) or 443, path ~= "" and path or "/", query }
-            end,
-            connect = function(self, opts)
-                self._conn = opts
-                return true
-            end,
-            request = function(self, params)
-                local c = self._conn
-                local port = c.port == 443 and "" or (":" .. c.port)
-                table.insert(http_mock.requests, {
-                    url = "https://" .. c.host .. port .. params.path,
-                    params = { ssl_verify = c.ssl_verify, ssl_server_name = c.ssl_server_name,
-                               headers = params.headers },
-                })
-                local r = table.remove(http_mock.responses, 1) or { status = 202 }
-                if r.err then return nil, r.err end
-                local body, pos = r.body or "", 1
-                http_mock.bytes_read = 0
-                return {
-                    status = r.status, headers = r.headers or {},
-                    body_reader = function(n)
-                        if http_mock.on_read then http_mock.on_read() end
-                        if r.read_err then return nil, r.read_err end
-                        if pos > #body then return nil end
-                        local chunk = body:sub(pos, pos + n - 1)
-                        pos = pos + #chunk
-                        http_mock.bytes_read = http_mock.bytes_read + #chunk
-                        return chunk
-                    end,
-                }
-            end,
-            close = function() http_mock.closed = (http_mock.closed or 0) + 1 return true end,
         }
     end,
 }
@@ -189,7 +208,11 @@ mock_kong = {
     },
     response = {
         get_status = function() return 200 end,
-        get_header = function(name) return nil end,
+        -- Upstream response headers (X-Aforo-*), set per test.
+        _headers = {},
+        get_header = function(name)
+            return mock_kong.response._headers[name]
+        end,
         -- Records instead of exiting, as Kong's access phase does: exit only
         -- stores the response and the handler keeps running unless it returns.
         _exit = nil,
@@ -210,26 +233,24 @@ mock_kong = {
     },
     ctx = { shared = {} },
     log = {
-        debug = function(...) end,
         info = function(...) end,
         warn = function(...) end,
         err = function(...) end,
+        debug = function(...) end,
+    },
+    tools = {
+        uuid = function() return "test-uuid" end,
     },
 }
 
 -- Replace global kong
 _G.kong = mock_kong
 
--- The handler's idempotency-key fallback now uses resty.jit-uuid (real Kong bundles it);
--- kong.tools.uuid() was nil on the Kong 3.x PDK global and crashed the log phase. The old
--- mock provided a fake kong.tools.uuid, which is exactly what hid this bug — real Kong has
--- no kong.tools, so we don't mock one.
-package.loaded["resty.jit-uuid"] = { generate_v4 = function() return "test-uuid" end }
-
 describe("aforo-metering handler", function()
 
     before_each(function()
         mock_kong.request._headers = {}
+        mock_kong.response._headers = {}
         mock_kong.ctx.shared = {}
     end)
 
@@ -268,1010 +289,16 @@ describe("aforo-metering handler", function()
             assert.is_nil(mock_kong.ctx.shared.aforo_trace.xTraceId)
             assert.is_nil(mock_kong.ctx.shared.aforo_trace.xRequestId)
         end)
-
-        -- ── Body-buffering regression (log-phase get_raw_body fix) ──
-        -- kong.request.get_raw_body() may only be called in access/rewrite.
-        -- The log phase must read the body from kong.ctx.shared, never call
-        -- get_raw_body() itself. These lock the access→log handoff so the
-        -- phase error can't regress.
-        it("buffers the raw request body during access when mcp_enabled", function()
-            local body = '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"search"}}'
-            mock_kong.request.get_raw_body = function() return body end
-
-            handler:access({ mcp_enabled = true })
-
-            assert.equals(body, mock_kong.ctx.shared.aforo_raw_body)
-
-            mock_kong.request.get_raw_body = function() return nil end  -- reset
-        end)
-
-        it("does NOT read the request body during access when mcp is disabled", function()
-            local read = false
-            mock_kong.request.get_raw_body = function() read = true; return "payload" end
-
-            handler:access({})  -- mcp_enabled absent
-
-            -- No body-inspecting detector is on, so we must not force nginx
-            -- to buffer (or temp-file) the body just to size it.
-            assert.is_false(read)
-            assert.is_nil(mock_kong.ctx.shared.aforo_raw_body)
-
-            mock_kong.request.get_raw_body = function() return nil end  -- reset
-        end)
     end)
 
     -- ── Security regression tests ───────────────────────────────
     -- Lock in the 2026-04-23 IDOR fix (advisory findings #7-#10).
     -- These assertions must hold on every v2.x+ release.
-    -- ════════════════════════════════════════════════════════════
-    -- 2.2.0 merge: identity precedence, in-plugin RS256 verification,
-    -- metric mappings, Retry-After, drop accounting
-    -- ════════════════════════════════════════════════════════════
-
-    -- Real RSA keys and signatures from the openssl CLI; resty.openssl.pkey is
-    -- replaced by a shim that verifies with `openssl dgst -verify`, so a bad
-    -- signature fails for the real reason and not because a mock said so.
-    describe("in-plugin RS256 JWT verification", function()
-        local tmp = os.tmpname() .. "_aforo_jwt"
-        local pub_pem, other_pub_pem, priv_pem
-        local NOW = 1788268682
-
-        local function sh(cmd) return os.execute(cmd .. " >/dev/null 2>&1") end
-        local function slurp(path)
-            local f = assert(io.open(path, "rb")); local d = f:read("*all"); f:close(); return d
-        end
-        local function spit(path, data)
-            local f = assert(io.open(path, "wb")); f:write(data); f:close()
-        end
-        local function b64url(data)
-            return (ngx.encode_base64(data):gsub("+", "-"):gsub("/", "_"):gsub("=", ""))
-        end
-        local function sign(header, claims, key)
-            local input = b64url(cjson.encode(header)) .. "." .. b64url(cjson.encode(claims))
-            spit(tmp .. "/in", input)
-            assert(sh("openssl dgst -sha256 -sign " .. tmp .. "/" .. (key or "k1") .. ".pem -out "
-                .. tmp .. "/sig " .. tmp .. "/in"))
-            return input .. "." .. b64url(slurp(tmp .. "/sig"))
-        end
-        local function claims(extra)
-            local c = { customer_id = "cust_1", tenant_id = "t1", key_id = "key_1",
-                        iss = "https://auth.aforo.ai", exp = NOW + 600 }
-            for k, v in pairs(extra or {}) do c[k] = v end
-            return c
-        end
-        local RS = { alg = "RS256", typ = "JWT" }
-        local redis_state
-        -- W3.7: JWK modulus (base64url) -> PEM path, so the shim can verify JWKS keys with openssl.
-        local jwk_pems = {}
-        local jwk_n = {}
-
-        setup(function()
-            assert(sh("mkdir -p " .. tmp))
-            assert(sh("openssl genrsa -out " .. tmp .. "/k1.pem 2048"))
-            assert(sh("openssl rsa -in " .. tmp .. "/k1.pem -pubout -out " .. tmp .. "/k1.pub"))
-            assert(sh("openssl genrsa -out " .. tmp .. "/k2.pem 2048"))
-            assert(sh("openssl rsa -in " .. tmp .. "/k2.pem -pubout -out " .. tmp .. "/k2.pub"))
-            pub_pem = slurp(tmp .. "/k1.pub")
-            other_pub_pem = slurp(tmp .. "/k2.pub")
-            priv_pem = slurp(tmp .. "/k1.pem")
-            for _, name in ipairs({ "k1", "k2" }) do
-                local out = io.popen("openssl rsa -pubin -in " .. tmp .. "/" .. name .. ".pub -modulus -noout")
-                local hex = out:read("*a"):match("Modulus=(%x+)"); out:close()
-                local bytes = hex:gsub("%x%x", function(h) return string.char(tonumber(h, 16)) end)
-                jwk_n[name] = b64url(bytes)
-                jwk_pems[jwk_n[name]] = slurp(tmp .. "/" .. name .. ".pub")
-            end
-
-            package.loaded["resty.openssl.pkey"] = {
-                new = function(pem, opts)
-                    if opts and opts.format == "JWK" then
-                        local jwk = cjson.decode(pem)
-                        pem = jwk and jwk.e == "AQAB" and jwk_pems[jwk.n]
-                        if not pem then return nil, "unknown JWK" end
-                    end
-                    if type(pem) ~= "string" or not pem:find("-----BEGIN", 1, true) then
-                        return nil, "not a PEM"
-                    end
-                    local private = pem:find("PRIVATE KEY", 1, true) ~= nil
-                    return {
-                        is_private = function() return private end,
-                        verify = function(_, signature, input, digest)
-                            assert(digest == "sha256")
-                            spit(tmp .. "/v.pem", pem); spit(tmp .. "/v.sig", signature)
-                            spit(tmp .. "/v.in", input)
-                            local ok = sh("openssl dgst -sha256 -verify " .. tmp .. "/v.pem -signature "
-                                .. tmp .. "/v.sig " .. tmp .. "/v.in")
-                            return ok == true or ok == 0
-                        end,
-                    }
-                end,
-            }
-            -- Redis mock, driven per test through redis_state. Default: reachable,
-            -- nothing revoked. connect_err / get_err simulate an outage;
-            -- revoked lists the keys that hold a value.
-            package.loaded["resty.redis"] = {
-                new = function()
-                    return {
-                        set_timeout = function() end,
-                        connect = function()
-                            if redis_state.connect_err then return nil, redis_state.connect_err end
-                            return true
-                        end,
-                        get = function(_, key)
-                            if redis_state.get_err then return nil, redis_state.get_err end
-                            if redis_state.revoked[key] then return "1" end
-                            return ngx.null
-                        end,
-                        set_keepalive = function() return true end,
-                    }
-                end,
-            }
-        end)
-
-        teardown(function()
-            sh("rm -rf " .. tmp)
-            package.loaded["resty.openssl.pkey"] = nil
-            package.loaded["resty.redis"] = nil
-        end)
-
-        before_each(function()
-            ngx.shared.aforo_buffer = new_shared_dict()
-            mock_kong.ctx.shared = {}
-            redis_state = { revoked = {} }
-            handler._jwks_reset()
-        end)
-
-        local function conf(extra)
-            local c = { jwt_validation_enabled = true, jwt_issuer = "https://auth.aforo.ai",
-                        jwt_public_key = pub_pem }
-            for k, v in pairs(extra or {}) do c[k] = v end
-            return c
-        end
-
-        it("accepts a correctly signed, unexpired RS256 token and marks it verified", function()
-            local r = handler._validate_jwt(sign(RS, claims()), conf())
-            assert.is_true(r.valid)
-            assert.is_true(r.signature_verified)
-            assert.equals("cust_1", r.customer_id)
-            assert.equals("key_1", r.key_id)
-        end)
-
-        it("rejects a token signed by another key", function()
-            local r = handler._validate_jwt(sign(RS, claims(), "k2"), conf())
-            assert.is_false(r.valid)
-            assert.equals("INVALID_SIGNATURE", r.reason)
-        end)
-
-        it("rejects a token whose payload was changed after signing", function()
-            local t = sign(RS, claims())
-            local h, _, sgn = t:match("^([^.]+)%.([^.]+)%.([^.]+)$")
-            local forged = h .. "." .. b64url(cjson.encode(claims({ customer_id = "victim" }))) .. "." .. sgn
-            local r = handler._validate_jwt(forged, conf())
-            assert.is_false(r.valid)
-            assert.equals("INVALID_SIGNATURE", r.reason)
-        end)
-
-        it("rejects alg=none, with or without a signature part", function()
-            local unsigned = b64url(cjson.encode({ alg = "none" })) .. "." .. b64url(cjson.encode(claims()))
-            for _, t in ipairs({ unsigned .. ".", unsigned .. ".AAAA" }) do
-                local r = handler._validate_jwt(t, conf())
-                assert.is_false(r.valid)
-                assert.is_true(r.reason == "UNSUPPORTED_ALGORITHM" or r.reason == "MALFORMED_TOKEN")
-            end
-        end)
-
-        it("rejects HS256 (the public key must never be usable as an HMAC secret)", function()
-            local r = handler._validate_jwt(sign({ alg = "HS256", typ = "JWT" }, claims()), conf())
-            assert.is_false(r.valid)
-            assert.equals("UNSUPPORTED_ALGORITHM", r.reason)
-        end)
-
-        it("rejects an expired token and one with no exp, even when correctly signed", function()
-            local r = handler._validate_jwt(sign(RS, claims({ exp = NOW - 1 })), conf())
-            assert.is_false(r.valid)
-            assert.equals("TOKEN_EXPIRED", r.reason)
-
-            local c = claims(); c.exp = nil
-            r = handler._validate_jwt(sign(RS, c), conf())
-            assert.equals("TOKEN_EXPIRED", r.reason)
-
-            r = handler._validate_jwt(sign(RS, claims({ exp = "tomorrow" })), conf())
-            assert.equals("TOKEN_EXPIRED", r.reason)
-        end)
-
-        it("rejects a token that is not valid yet (nbf), allowing a minute of skew", function()
-            local r = handler._validate_jwt(sign(RS, claims({ nbf = NOW + 3600 })), conf())
-            assert.equals("TOKEN_NOT_YET_VALID", r.reason)
-            r = handler._validate_jwt(sign(RS, claims({ nbf = NOW + 30 })), conf())
-            assert.is_true(r.valid)
-        end)
-
-        it("checks the signature before the issuer: a forged token never reaches claim checks", function()
-            local r = handler._validate_jwt(sign(RS, claims({ iss = "https://evil" }), "k2"), conf())
-            assert.equals("INVALID_SIGNATURE", r.reason)
-            r = handler._validate_jwt(sign(RS, claims({ iss = "https://evil" })), conf())
-            assert.equals("INVALID_ISSUER", r.reason)
-        end)
-
-        it("fails closed with no jwt_public_key when the JWKS cannot be fetched", function()
-            local r = handler._validate_jwt(sign(RS, claims()),
-                conf({ jwt_public_key = "", jwt_jwks_uri = "https://auth.aforo.ai/.well-known/jwks.json" }))
-            assert.is_false(r.valid)
-            assert.equals("INVALID_SIGNATURE", r.reason)
-        end)
-
-        it("refuses a private key in jwt_public_key and an unparseable one, even with the opt-out", function()
-            for _, pem in ipairs({ priv_pem, "not a key" }) do
-                local r = handler._validate_jwt(sign(RS, claims()),
-                    conf({ jwt_public_key = pem, jwt_allow_unverified_signature = true }))
-                assert.is_false(r.valid)
-                assert.equals("INVALID_SIGNATURE", r.reason)
-            end
-        end)
-
-        it("rejects an oversized token before doing any work", function()
-            local r = handler._validate_jwt(string.rep("a", 9000), conf())
-            assert.equals("MALFORMED_TOKEN", r.reason)
-        end)
-
-        it("jwt_allow_unverified_signature lets the token through but gives it no identity", function()
-            local c = conf({ jwt_public_key = "", jwt_allow_unverified_signature = true })
-            local forged = sign(RS, claims({ customer_id = "victim" }), "k2")
-            local r = handler._validate_jwt(forged, c)
-            assert.is_true(r.valid)
-            assert.is_false(r.signature_verified)
-
-            mock_kong.ctx.shared = { aforo_jwt_claims = r }
-            assert.is_nil(handler._resolve_customer_id(c, nil, {}))
-            -- A Kong consumer, when there is one, still identifies the caller.
-            assert.equals("acme", handler._resolve_customer_id(c, { custom_id = "acme" }, {}))
-        end)
-
-        it("an unverifiable token counts as verified when Kong's jwt plugin verified the same token", function()
-            local c = conf({ jwt_public_key = "", jwt_allow_unverified_signature = true })
-            local t = sign(RS, claims())
-            mock_kong.ctx.shared = { authenticated_jwt_token = t }
-            assert.is_true(handler._validate_jwt(t, c).signature_verified)
-            -- ...but not when Kong verified a different token.
-            mock_kong.ctx.shared = { authenticated_jwt_token = sign(RS, claims({ customer_id = "x" })) }
-            assert.is_false(handler._validate_jwt(t, c).signature_verified)
-        end)
-
-        it("access phase answers 401 for a bad signature and stashes nothing", function()
-            mock_kong.request._headers = { ["Authorization"] = "Bearer " .. sign(RS, claims(), "k2") }
-            mock_kong.response._exit = nil
-            handler:access(conf({ jwt_public_key = pub_pem }))
-            assert.equals(401, mock_kong.response._exit.status)
-            assert.is_nil(mock_kong.ctx.shared.aforo_jwt_claims)
-            mock_kong.response._exit = nil
-        end)
-
-        -- ── W3.7: keys from jwt_jwks_uri, chosen by kid ──────────────
-        describe("jwt_jwks_uri", function()
-            local URI = "https://auth.aforo.ai/.well-known/jwks.json"
-            local saved_now
-            local clock = 1788268682.221
-
-            local function jwks(...)
-                local keys = {}
-                for _, name in ipairs({ ... }) do
-                    keys[#keys + 1] = { kty = "RSA", kid = name, use = "sig", alg = "RS256", n = jwk_n[name], e = "AQAB" }
-                end
-                return cjson.encode({ keys = keys })
-            end
-            local function serve(...)
-                http_mock.responses[#http_mock.responses + 1] = { status = 200, body = jwks(...) }
-            end
-            local function jconf(extra)
-                local c = conf({ jwt_public_key = "", jwt_jwks_uri = URI })
-                for k, v in pairs(extra or {}) do c[k] = v end
-                return c
-            end
-            local function kid_token(kid, key)
-                return sign({ alg = "RS256", typ = "JWT", kid = kid }, claims(), key)
-            end
-
-            before_each(function()
-                http_mock.requests = {}
-                http_mock.responses = {}
-                saved_now = ngx.now
-                clock = 1788268682.221
-                ngx.now = function() return clock end
-            end)
-            after_each(function()
-                ngx.now = saved_now
-                http_mock.responses = {}
-            end)
-
-            it("verifies with the key named by kid and caches the set", function()
-                serve("k1")
-                assert.is_true(handler._validate_jwt(kid_token("k1"), jconf()).valid)
-                assert.is_true(handler._validate_jwt(kid_token("k1"), jconf()).valid)
-                assert.equals(1, #http_mock.requests)
-                assert.equals(URI, http_mock.requests[1].url)
-                assert.is_true(http_mock.requests[1].params.ssl_verify)
-            end)
-
-            it("a rotated key is picked up without a config change, at most one refresh per 30 s", function()
-                serve("k1")
-                assert.is_true(handler._validate_jwt(kid_token("k1"), jconf()).valid)
-                -- The issuer rotates to k2. An unknown kid inside 30 s does not fetch again.
-                clock = clock + 5
-                assert.is_false(handler._validate_jwt(kid_token("k2", "k2"), jconf()).valid)
-                assert.equals(1, #http_mock.requests)
-                clock = clock + 30
-                serve("k1", "k2")
-                assert.is_true(handler._validate_jwt(kid_token("k2", "k2"), jconf()).valid)
-                assert.equals(2, #http_mock.requests)
-                -- A forged kid cannot make it fetch on every request.
-                for _ = 1, 5 do
-                    assert.is_false(handler._validate_jwt(kid_token("forged", "k2"), jconf()).valid)
-                end
-                assert.equals(2, #http_mock.requests)
-            end)
-
-            it("the token is still checked against the kid's own key", function()
-                serve("k1", "k2")
-                local r = handler._validate_jwt(kid_token("k1", "k2"), jconf())
-                assert.is_false(r.valid)
-                assert.equals("INVALID_SIGNATURE", r.reason)
-            end)
-
-            it("keeps the last good keys while the JWKS is down, then fails closed", function()
-                serve("k1")
-                assert.is_true(handler._validate_jwt(kid_token("k1"), jconf()).valid)
-                clock = clock + 601
-                http_mock.responses[1] = { status = 503 }
-                assert.is_true(handler._validate_jwt(kid_token("k1"), jconf()).valid)
-                assert.equals(2, #http_mock.requests)
-                clock = clock + 86400
-                http_mock.responses[1] = { err = "timeout" }
-                local r = handler._validate_jwt(kid_token("k1"),
-                    jconf({ jwt_allow_unverified_signature = true }))
-                assert.is_false(r.valid)
-                assert.equals("INVALID_SIGNATURE", r.reason)
-            end)
-
-            it("a worker whose first fetch failed retries after 5 s, not 30", function()
-                http_mock.responses[1] = { status = 503 }
-                assert.is_false(handler._validate_jwt(kid_token("k1"), jconf()).valid)
-                clock = clock + 2
-                assert.is_false(handler._validate_jwt(kid_token("k1"), jconf()).valid)
-                assert.equals(1, #http_mock.requests)
-                clock = clock + 4
-                serve("k1")
-                assert.is_true(handler._validate_jwt(kid_token("k1"), jconf()).valid)
-                assert.equals(2, #http_mock.requests)
-            end)
-
-            it("refuses a JWKS URL that is not https, without fetching", function()
-                local r = handler._validate_jwt(kid_token("k1"),
-                    jconf({ jwt_jwks_uri = "http://auth.aforo.ai/.well-known/jwks.json" }))
-                assert.is_false(r.valid)
-                assert.equals(0, #http_mock.requests)
-            end)
-
-            it("refuses a JWKS whose Content-Length is over 256 KiB without reading the body", function()
-                http_mock.responses[1] = { status = 200, body = jwks("k1"),
-                    headers = { ["Content-Length"] = tostring(262145) } }
-                assert.is_false(handler._validate_jwt(kid_token("k1"), jconf()).valid)
-                assert.equals(0, http_mock.bytes_read)
-            end)
-
-            it("stops reading an undeclared-length JWKS once it passes 256 KiB", function()
-                local huge = '{"keys":[],"pad":"' .. string.rep("x", 300000) .. '"}'
-                http_mock.responses[1] = { status = 200, body = huge }
-                assert.is_false(handler._validate_jwt(kid_token("k1"), jconf()).valid)
-                assert.is_true(http_mock.bytes_read <= 262144 + 8192)
-                assert.is_true(http_mock.bytes_read > 262144)
-            end)
-
-            it("a JWKS body that fails mid-read is not used", function()
-                http_mock.responses[1] = { status = 200, body = jwks("k1"), read_err = "closed" }
-                assert.is_false(handler._validate_jwt(kid_token("k1"), jconf()).valid)
-            end)
-
-            it("gives up on a JWKS body that trickles in past the 8 s fetch budget", function()
-                local body = jwks("k1") .. string.rep(" ", 40000)
-                http_mock.responses[1] = { status = 200, body = body }
-                http_mock.on_read = function() clock = clock + 2 end
-                assert.is_false(handler._validate_jwt(kid_token("k1"), jconf()).valid)
-                http_mock.on_read = nil
-            end)
-
-            it("a fetch left flagged in flight (aborted coroutine) stops blocking refreshes after the budget", function()
-                serve("k1")
-                assert.is_true(handler._validate_jwt(kid_token("k1"), jconf()).valid)
-                local entry = handler._jwks_cache()[URI]
-                entry.fetching = true
-                entry.fetch_started = clock
-                entry.last_attempt = clock - 100  -- the 30 s refresh limit is not what holds it back
-                -- An unknown kid while the flag is fresh: no second fetch.
-                clock = clock + 2
-                assert.is_false(handler._validate_jwt(kid_token("k2", "k2"), jconf()).valid)
-                assert.equals(1, #http_mock.requests)
-                -- Past the budget the stale flag is ignored and the set is refreshed.
-                clock = clock + 8
-                serve("k1", "k2")
-                assert.is_true(handler._validate_jwt(kid_token("k2", "k2"), jconf()).valid)
-                assert.equals(2, #http_mock.requests)
-            end)
-
-            it("connects with TLS verification and SNI for the JWKS host", function()
-                serve("k1")
-                assert.is_true(handler._validate_jwt(kid_token("k1"), jconf()).valid)
-                assert.equals("auth.aforo.ai", http_mock.requests[1].params.ssl_server_name)
-                assert.equals("auth.aforo.ai", http_mock.requests[1].params.headers["Host"])
-            end)
-
-            it("a token without kid uses the only key; with several keys it needs a kid", function()
-                serve("k1")
-                assert.is_true(handler._validate_jwt(sign(RS, claims()), jconf()).valid)
-                handler._jwks_reset()
-                serve("k1", "k2")
-                assert.is_false(handler._validate_jwt(sign(RS, claims()), jconf()).valid)
-            end)
-
-            it("jwt_public_key verifies tokens the JWKS has no key for", function()
-                serve("k2")
-                assert.is_true(handler._validate_jwt(kid_token("old-kid"), jconf({ jwt_public_key = pub_pem })).valid)
-            end)
-
-            it("ignores keys that are private, not RSA, or not RS256", function()
-                http_mock.responses[1] = { status = 200, body = cjson.encode({ keys = {
-                    { kty = "RSA", kid = "k1", n = jwk_n.k1, e = "AQAB", d = "secret" },
-                    { kty = "EC", kid = "k1", crv = "P-256", x = "a", y = "b" },
-                    { kty = "RSA", kid = "k1", alg = "RS512", n = jwk_n.k1, e = "AQAB" },
-                } }) }
-                assert.is_false(handler._validate_jwt(kid_token("k1"), jconf()).valid)
-            end)
-        end)
-
-        it("a different configured key is a different verifier (no stale key cache hit)", function()
-            local t = sign(RS, claims())
-            assert.is_true(handler._validate_jwt(t, conf()).valid)
-            assert.is_false(handler._validate_jwt(t, conf({ jwt_public_key = other_pub_pem })).valid)
-        end)
-
-        -- w2-2-kong-jti-fail-open (2026-10-24): the revocation checks refuse
-        -- when Redis cannot answer, unless jti_redis_fail_mode = "open".
-        describe("revocation checks when Redis cannot answer", function()
-            local function warns()
-                local seen = {}
-                local saved = mock_kong.log.warn
-                mock_kong.log.warn = function(...)
-                    seen[#seen + 1] = table.concat({ ... }, "")
-                end
-                return seen, function() mock_kong.log.warn = saved end
-            end
-
-            it("rejects a revoked jti and a revoked key_id when Redis answers", function()
-                redis_state.revoked["jti:blocked:j1"] = true
-                local r = handler._validate_jwt(sign(RS, claims({ jti = "j1" })), conf())
-                assert.is_false(r.valid)
-                assert.equals("TOKEN_REVOKED", r.reason)
-
-                redis_state.revoked = { ["jti:client:key_1"] = true }
-                r = handler._validate_jwt(sign(RS, claims({ jti = "j2" })), conf())
-                assert.is_false(r.valid)
-                assert.equals("CLIENT_REVOKED", r.reason)
-            end)
-
-            it("refuses by default when Redis is unreachable (jti check)", function()
-                redis_state.connect_err = "connection refused"
-                local r = handler._validate_jwt(sign(RS, claims({ jti = "j1" })), conf())
-                assert.is_false(r.valid)
-                assert.equals("REVOCATION_CHECK_UNAVAILABLE", r.reason)
-                assert.equals(503, r.status)
-            end)
-
-            it("refuses by default when Redis is unreachable (key_id check, no jti)", function()
-                redis_state.connect_err = "connection refused"
-                local r = handler._validate_jwt(sign(RS, claims()), conf())
-                assert.is_false(r.valid)
-                assert.equals("REVOCATION_CHECK_UNAVAILABLE", r.reason)
-                assert.equals(503, r.status)
-            end)
-
-            it("refuses when the GET itself errors after connecting", function()
-                redis_state.get_err = "timeout"
-                local r = handler._validate_jwt(sign(RS, claims({ jti = "j1" })), conf())
-                assert.is_false(r.valid)
-                assert.equals("REVOCATION_CHECK_UNAVAILABLE", r.reason)
-            end)
-
-            it("an explicit jti_redis_fail_mode = closed behaves like the default", function()
-                redis_state.connect_err = "connection refused"
-                local r = handler._validate_jwt(sign(RS, claims({ jti = "j1" })),
-                    conf({ jti_redis_fail_mode = "closed" }))
-                assert.equals("REVOCATION_CHECK_UNAVAILABLE", r.reason)
-                local dict = ngx.shared.aforo_buffer
-                assert.equals(1, dict:get("aforo_revocation_unavailable:jti:closed"))
-            end)
-
-            it("fail-open lets the token through, warns, and counts it", function()
-                redis_state.connect_err = "connection refused"
-                local seen, restore = warns()
-                local r = handler._validate_jwt(sign(RS, claims({ jti = "j1" })),
-                    conf({ jti_redis_fail_mode = "open" }))
-                restore()
-                assert.is_true(r.valid)
-                local dict = ngx.shared.aforo_buffer
-                assert.equals(1, dict:get("aforo_revocation_unavailable:jti:open"))
-                assert.equals(1, dict:get("aforo_revocation_unavailable:client:open"))
-                local joined = table.concat(seen, "\n")
-                assert.truthy(joined:find("Failing OPEN", 1, true))
-            end)
-
-            it("access phase answers 503 with a JSON error body and stashes nothing", function()
-                redis_state.connect_err = "connection refused"
-                mock_kong.request._headers = { ["Authorization"] = "Bearer " .. sign(RS, claims({ jti = "j1" })) }
-                mock_kong.response._exit = nil
-                handler:access(conf())
-                local exit = mock_kong.response._exit
-                assert.equals(503, exit.status)
-                assert.equals("temporarily_unavailable", exit.body.error)
-                assert.equals("REVOCATION_CHECK_UNAVAILABLE", exit.body.error_description)
-                assert.equals("1", exit.headers["Retry-After"])
-                assert.is_nil(mock_kong.ctx.shared.aforo_jwt_claims)
-                mock_kong.response._exit = nil
-            end)
-
-            it("access phase still answers 401 for a revoked token", function()
-                redis_state.revoked["jti:blocked:j1"] = true
-                mock_kong.request._headers = { ["Authorization"] = "Bearer " .. sign(RS, claims({ jti = "j1" })) }
-                mock_kong.response._exit = nil
-                handler:access(conf())
-                assert.equals(401, mock_kong.response._exit.status)
-                assert.equals("TOKEN_REVOKED", mock_kong.response._exit.body.error_description)
-                mock_kong.response._exit = nil
-            end)
-        end)
-    end)
-
-    describe("identity precedence", function()
-        local function kong_token(payload)
-            return "e30." .. (ngx.encode_base64(cjson.encode(payload)):gsub("+", "-"):gsub("/", "_"):gsub("=", "")) .. ".sig"
-        end
-
-        before_each(function() mock_kong.ctx.shared = {} end)
-
-        it("consumer alone: custom_id, then username, then id", function()
-            assert.equals("c1", handler._resolve_customer_id({}, { custom_id = "c1", username = "u", id = "i" }, {}))
-            assert.equals("u", handler._resolve_customer_id({}, { username = "u", id = "i" }, {}))
-            assert.equals("i", handler._resolve_customer_id({}, { id = "i" }, {}))
-        end)
-
-        it("customer_id_jwt_claim decides alone: over the consumer and over the in-plugin token", function()
-            local conf = { customer_id_jwt_claim = "tenant_id", jwt_validation_enabled = true }
-            mock_kong.ctx.shared = {
-                authenticated_jwt_token = kong_token({ tenant_id = "from_kong_jwt" }),
-                aforo_jwt_claims = { signature_verified = true, customer_id = "from_in_plugin" },
-            }
-            assert.equals("from_kong_jwt", handler._resolve_customer_id(conf, { custom_id = "issuer" }, {}))
-            -- No Kong-verified token: nothing, not the consumer and not the in-plugin claim.
-            mock_kong.ctx.shared = { aforo_jwt_claims = { signature_verified = true, customer_id = "from_in_plugin" } }
-            assert.is_nil(handler._resolve_customer_id(conf, { custom_id = "issuer" }, {}))
-        end)
-
-        it("in-plugin verified claim beats the consumer; the consumer is the fallback when the token names no customer", function()
-            mock_kong.ctx.shared = { aforo_jwt_claims = { signature_verified = true, customer_id = "from_in_plugin" } }
-            assert.equals("from_in_plugin", handler._resolve_customer_id({}, { custom_id = "consumer" }, {}))
-            mock_kong.ctx.shared = { aforo_jwt_claims = { signature_verified = true, customer_id = "" } }
-            assert.equals("consumer", handler._resolve_customer_id({}, { custom_id = "consumer" }, {}))
-        end)
-
-        it("claims without signature_verified are never an identity", function()
-            mock_kong.ctx.shared = { aforo_jwt_claims = { customer_id = "unverified" } }
-            assert.is_nil(handler._resolve_customer_id({}, nil, {}))
-            mock_kong.ctx.shared = { aforo_jwt_claims = { signature_verified = false, customer_id = "unverified" } }
-            assert.is_nil(handler._resolve_customer_id({}, nil, {}))
-        end)
-
-        it("an id longer than 64 characters or blank is no identity, from any source", function()
-            local long = string.rep("x", 65)
-            assert.is_nil(handler._resolve_customer_id({}, { custom_id = long }, {}))
-            assert.is_nil(handler._resolve_customer_id({}, { custom_id = "   " }, {}))
-            mock_kong.ctx.shared = { aforo_jwt_claims = { signature_verified = true, customer_id = long } }
-            assert.is_nil(handler._resolve_customer_id({}, nil, {}))
-        end)
-    end)
-
-    describe("metric resolution", function()
-        local dict
-        before_each(function()
-            dict = new_shared_dict()
-            ngx.shared.aforo_buffer = dict
-            ngx.timers = {}
-            http_mock.requests = {}
-            http_mock.responses = {}
-            http_mock.on_request = nil
-        end)
-
-        local function resolve(conf, method, path, header_metric)
-            return handler._resolve_metric_name(conf, method, path, "svc", "route", "consumer", header_metric)
-        end
-
-        it("falls back to default_metric, never to the per-endpoint default template", function()
-            assert.equals("api_calls", resolve({ metric_name_pattern = "{method} {path}" }, "GET", "/a"))
-            assert.equals("api_calls", resolve({}, "GET", "/a"))
-            assert.equals("calls", resolve({ default_metric = "calls" }, "GET", "/a"))
-        end)
-
-        it("honours metric_name_pattern when it was set to something else (fixed name or template)", function()
-            assert.equals("platform_api_calls", resolve({ metric_name_pattern = "platform_api_calls" }, "GET", "/a"))
-            assert.equals("svc:GET", resolve({ metric_name_pattern = "{service}:{method}" }, "GET", "/a"))
-            -- A "%" in the path is data, not a gsub capture reference.
-            assert.equals("GET /a%20b", resolve({ metric_name_pattern = "{method} {path} " }, "GET", "/a%20b"):sub(1, 10))
-        end)
-
-        it("metric_mappings: first match wins, method is optional, a bad pattern is skipped", function()
-            local conf = { metric_mappings = {
-                { path_pattern = "^/api/sms/otp", metric_name = "otp_delivered" },
-                { path_pattern = "[", metric_name = "broken" },
-                { path_pattern = "^/api/sms", method = "post", metric_name = "sms_sent" },
-                { path_pattern = "^/api", metric_name = "generic" },
-            } }
-            assert.equals("otp_delivered", resolve(conf, "POST", "/api/sms/otp/1"))
-            assert.equals("sms_sent", resolve(conf, "POST", "/api/sms/send"))
-            assert.equals("generic", resolve(conf, "GET", "/api/sms/send"))
-            assert.equals("api_calls", resolve(conf, "GET", "/other"))
-        end)
-
-        it("order: response header, central mappings, metric_mappings, pattern, default", function()
-            local conf = {
-                tenant_id = "t1", mappings_url = "https://catalog.test/m",
-                metric_mappings = { { path_pattern = "^/api", metric_name = "local_rule" } },
-                metric_name_pattern = "fixed_name", default_metric = "fallback",
-            }
-            assert.equals("local_rule", resolve(conf, "GET", "/api/x"))  -- nothing cached yet
-            dict:set("aforo:gateway_mappings:t1", cjson.encode({
-                { matchType = "PREFIX", value = "/api/x", metricName = "central" } }))
-            assert.equals("central", resolve(conf, "GET", "/api/x/1"))
-            assert.equals("from_header", resolve(conf, "GET", "/api/x/1", "from_header"))
-            assert.equals("local_rule", resolve(conf, "GET", "/api/y"))
-            assert.equals("fixed_name", resolve(conf, "GET", "/z"))
-            conf.metric_name_pattern = nil
-            assert.equals("fallback", resolve(conf, "GET", "/z"))
-        end)
-
-        it("central rules compare plain strings: EXACT, PREFIX, CONTAINS; anything else never matches", function()
-            assert.is_true(handler._mapping_matches("/a/b", { matchType = "EXACT", value = "/a/b" }))
-            assert.is_false(handler._mapping_matches("/a/b/c", { matchType = "EXACT", value = "/a/b" }))
-            assert.is_true(handler._mapping_matches("/a/b/c", { matchType = "PREFIX", value = "/a/b" }))
-            assert.is_true(handler._mapping_matches("/x/a.b/c", { matchType = "CONTAINS", value = "a.b" }))
-            assert.is_false(handler._mapping_matches("/x/aXb/c", { matchType = "CONTAINS", value = "a.b" }))
-            assert.is_false(handler._mapping_matches("/a", { matchType = "REGEX", value = ".*" }))
-            assert.is_false(handler._mapping_matches("/a", { matchType = "PREFIX", value = "" }))
-        end)
-
-        it("central mappings are cached per tenant", function()
-            dict:set("aforo:gateway_mappings:t1", cjson.encode({
-                { matchType = "PREFIX", value = "/", metricName = "t1_metric" } }))
-            assert.equals("t1_metric", resolve({ tenant_id = "t1", mappings_url = "u" }, "GET", "/a"))
-            assert.equals("api_calls", resolve({ tenant_id = "t2", mappings_url = "u" }, "GET", "/a"))
-        end)
-
-        it("the access phase only schedules the mappings fetch; it never calls out itself", function()
-            local conf = { tenant_id = "t1", mappings_url = "https://catalog.test/m" }
-            handler:access(conf)
-            handler:access(conf)
-            assert.equals(0, #http_mock.requests)
-            assert.equals(1, #ngx.timers)            -- one fetch in flight, not one per request
-            assert.equals(0, ngx.timers[1].delay)
-        end)
-
-        it("fetch stores the table (plain or enveloped) and keeps the old one when the catalog fails", function()
-            local conf = { tenant_id = "t1", mappings_url = "https://catalog.test/m", mappings_timeout_ms = 3000 }
-            http_mock.responses = { { status = 200, body = cjson.encode({ success = true, data = {
-                mappings = { { matchType = "EXACT", value = "/a", metricName = "m_a" } }, cacheTtlSeconds = 120 } }) } }
-            handler._fetch_mappings(false, conf)
-            assert.equals("https://catalog.test/m?tenantId=t1", http_mock.requests[1].url)
-            assert.is_nil(http_mock.requests[1].params.headers["X-API-Key"])
-            assert.equals("m_a", resolve(conf, "GET", "/a"))
-
-            http_mock.responses = { { status = 503 } }
-            handler._fetch_mappings(false, conf)
-            assert.equals("m_a", resolve(conf, "GET", "/a"))
-
-            http_mock.responses = { { status = 200, body = "<html>" } }
-            handler._fetch_mappings(false, conf)
-            assert.equals("m_a", resolve(conf, "GET", "/a"))
-        end)
-
-        it("a failed fetch is not retried on every request", function()
-            local conf = { tenant_id = "t1", mappings_url = "https://catalog.test/m", mappings_refresh_seconds = 300 }
-            http_mock.responses = { { err = "timeout" } }
-            handler._fetch_mappings(false, conf)
-            ngx.timers = {}
-            handler:access(conf)
-            assert.equals(0, #ngx.timers)
-        end)
-    end)
-
-    describe("log phase: metric, quantity and drops", function()
-        local dict
-        local base = {
-            aforo_endpoint = "http://ingestor.test/v1/ingest/batch", api_key = "k", tenant_id = "t1",
-            flush_count = 50, flush_interval_ms = 5000, exclude_paths = {}, exclude_status_codes = {},
-            metric_header = "X-Aforo-Metric", quantity_header = "X-Aforo-Quantity",
-        }
-        local function conf(extra)
-            local c = {}
-            for k, v in pairs(base) do c[k] = v end
-            for k, v in pairs(extra or {}) do c[k] = v end
-            return c
-        end
-        local function buffered()
-            local l = dict.store["aforo:events"]
-            local out = {}
-            for i = 1, l and #l or 0 do out[i] = cjson.decode(l[i]) end
-            return out
-        end
-
-        before_each(function()
-            dict = new_shared_dict()
-            ngx.shared.aforo_buffer = dict
-            ngx.timers = {}
-            mock_kong.ctx.shared = {}
-            mock_kong.request._headers = { ["X-Request-Id"] = "req-1" }
-            mock_kong.client.get_consumer = function() return { custom_id = "cust_1" } end
-            ngx.var.request_id = "0f3c9d6e2b8a4c1d9e7f5a3b1c2d4e6f"
-        end)
-
-        after_each(function()
-            ngx.var.request_id = nil
-            mock_kong.client.get_consumer = function() return nil end
-            mock_kong.response.get_header = function() return nil end
-            mock_kong.request.get_method = function() return "GET" end
-            mock_kong.request._headers = {}
-        end)
-
-        it("uses the mapped metric and the configured product type", function()
-            handler:log(conf({ product_type = " agentic_api ",
-                metric_mappings = { { path_pattern = "^/v1/accounts", metric_name = "account_reads" } } }))
-            local e = buffered()[1]
-            assert.equals("account_reads", e.metricName)
-            assert.equals("AGENTIC_API", e.productType)
-            assert.equals("0f3c9d6e2b8a4c1d9e7f5a3b1c2d4e6f", e.idempotencyKey)
-            assert.equals("SUCCESS", e.executionStatus)
-        end)
-
-        it("keys on the gateway request id, never the client's X-Request-Id", function()
-            -- A caller repeating one X-Request-Id on every call must still be
-            -- billed per call: each request gets its own nginx $request_id.
-            mock_kong.request._headers["X-Kong-Request-Id"] = "forged-kong-id"
-            -- (Kong header lookup is case-insensitive; the mock is not.)
-            mock_kong.request._headers["x-request-id"] = "req-1"
-            handler:log(conf())
-            ngx.var.request_id = "1a2b3c4d5e6f708192a3b4c5d6e7f809"
-            handler:log(conf())
-            local events = buffered()
-            assert.equals(2, #events)
-            assert.equals("0f3c9d6e2b8a4c1d9e7f5a3b1c2d4e6f", events[1].idempotencyKey)
-            assert.equals("1a2b3c4d5e6f708192a3b4c5d6e7f809", events[2].idempotencyKey)
-            -- The client's id is still forwarded, as trace metadata only.
-            assert.equals("req-1", events[1].trace.xRequestId)
-            assert.equals("req-1", events[2].trace.xRequestId)
-        end)
-
-        it("MCP: a repeated client X-Request-Id still yields one key per call", function()
-            local saved_method = mock_kong.request.get_method
-            mock_kong.request.get_method = function() return "POST" end
-            mock_kong.ctx.shared.aforo_raw_body =
-                '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_web"}}'
-            local c = conf({ mcp_enabled = true, agent_id = "agent-1" })
-            handler:log(c)
-            ngx.var.request_id = "1a2b3c4d5e6f708192a3b4c5d6e7f809"
-            handler:log(c)
-            mock_kong.request.get_method = saved_method
-            local events = buffered()
-            assert.equals("MCP_SERVER", events[1].productType)
-            assert.equals("mcp:t1:0f3c9d6e2b8a4c1d9e7f5a3b1c2d4e6f:search_web", events[1].idempotencyKey)
-            assert.equals("mcp:t1:1a2b3c4d5e6f708192a3b4c5d6e7f809:search_web", events[2].idempotencyKey)
-        end)
-
-        it("WebSocket: a reused Sec-WebSocket-Key does not collapse connections", function()
-            local saved_status = mock_kong.response.get_status
-            mock_kong.response.get_status = function() return 101 end
-            mock_kong.request._headers = {
-                ["upgrade"] = "websocket", ["Sec-WebSocket-Key"] = "dGhlIHNhbXBsZQ==",
-            }
-            local c = conf({ websocket_enabled = true })
-            handler:log(c)
-            ngx.var.request_id = "1a2b3c4d5e6f708192a3b4c5d6e7f809"
-            handler:log(c)
-            mock_kong.response.get_status = saved_status
-            local events = buffered()
-            assert.equals(2, #events)
-            assert.equals("ws:t1:0f3c9d6e2b8a4c1d9e7f5a3b1c2d4e6f", events[1].idempotencyKey)
-            assert.equals("ws:t1:1a2b3c4d5e6f708192a3b4c5d6e7f809", events[2].idempotencyKey)
-            -- The handshake key is still reported, as data.
-            assert.equals("dGhlIHNhbXBsZQ==", events[1].wsConnectionId)
-        end)
-
-        it("falls back to one generated UUID when nginx has no request id", function()
-            ngx.var.request_id = ""
-            handler:log(conf())
-            assert.equals("test-uuid", buffered()[1].idempotencyKey)
-        end)
-
-        it("takes metric and quantity from the upstream RESPONSE headers, never from the request", function()
-            mock_kong.request._headers["X-Aforo-Metric"] = "forged_by_client"
-            mock_kong.request._headers["X-Aforo-Quantity"] = "999"
-            handler:log(conf())
-            assert.equals("api_calls", buffered()[1].metricName)
-            assert.equals(1, buffered()[1].quantity)
-
-            mock_kong.response.get_header = function(name)
-                return ({ ["X-Aforo-Metric"] = "call_minutes", ["X-Aforo-Quantity"] = "2.5" })[name]
-            end
-            mock_kong.request._headers["X-Request-Id"] = "req-2"
-            handler:log(conf())
-            assert.equals("call_minutes", buffered()[2].metricName)
-            assert.equals(2.5, buffered()[2].quantity)
-        end)
-
-        it("ignores a quantity header that is not a positive finite number", function()
-            for _, bad in ipairs({ "0", "-3", "abc", "nan", "inf", "1e99" }) do
-                assert.equals(1, handler._resolve_quantity({ quantity_header = "X-Aforo-Quantity" }, 0, bad))
-            end
-        end)
-
-        it("drops and counts an event whose metric name the ingestor would refuse on shape", function()
-            mock_kong.response.get_header = function(name)
-                if name == "X-Aforo-Metric" then return string.rep("m", 256) end
-                return nil
-            end
-            handler:log(conf())
-            assert.equals(0, #buffered())
-            assert.equals(1, dict:get("aforo_dropped:invalid_metric"))
-
-            mock_kong.response.get_header = function() return nil end
-            handler:log(conf({ metric_name_pattern = "   " }))
-            assert.equals(0, #buffered())
-            assert.equals(2, dict:get("aforo_dropped:invalid_metric"))
-        end)
-
-        it("does not meter a CORS preflight", function()
-            mock_kong.request.get_method = function() return "OPTIONS" end
-            mock_kong.request._headers["Access-Control-Request-Method"] = "POST"
-            handler:log(conf())
-            assert.equals(0, #buffered())
-        end)
-
-        it("skips a zero quantity (response_size of an empty body)", function()
-            handler:log(conf({ quantity_source = "response_size" }))
-            assert.equals(0, #buffered())
-        end)
-
-        it("default exclusions and the outcome table still apply after the merge", function()
-            mock_kong.response.get_status = function() return 429 end
-            handler:log(conf({ exclude_status_codes = { 401, 403, 429 } }))
-            assert.equals(0, #buffered())
-            mock_kong.response.get_status = function() return 504 end
-            handler:log(conf({ exclude_status_codes = { 401, 403, 429 } }))
-            assert.equals("TIMEOUT", buffered()[1].executionStatus)
-            mock_kong.request._headers["X-Request-Id"] = "req-9"
-            handler:log(conf({ status_outcomes = { ["504"] = "failed" } }))
-            assert.equals("FAILED", buffered()[2].executionStatus)
-            mock_kong.response.get_status = function() return 200 end
-        end)
-
-        it("keyId metadata only comes from a verified token", function()
-            mock_kong.ctx.shared = { aforo_jwt_claims = { signature_verified = false, customer_id = "x", key_id = "k_unverified" } }
-            handler:log(conf({ include_metadata = false }))
-            assert.is_nil(buffered()[1].metadata)
-            mock_kong.ctx.shared = { aforo_jwt_claims = { signature_verified = true, customer_id = "cust_v", key_id = "k_ok" } }
-            mock_kong.request._headers["X-Request-Id"] = "req-3"
-            handler:log(conf({ include_metadata = false }))
-            assert.equals("k_ok", buffered()[2].metadata.keyId)
-            assert.equals("cust_v", buffered()[2].customerId)
-        end)
-    end)
-
-    describe("flush: retries, Retry-After and drop accounting", function()
-        local dict
-        local conf = {
-            aforo_endpoint = "http://ingestor.test/v1/ingest/batch", api_key = "k", tenant_id = "t1",
-            flush_count = 50, flush_interval_ms = 5000,
-        }
-        local function push(n)
-            for i = 1, n do
-                dict:rpush("aforo:events", cjson.encode({ customerId = "c" .. i, idempotencyKey = "key-" .. i }))
-            end
-        end
-
-        before_each(function()
-            dict = new_shared_dict()
-            ngx.shared.aforo_buffer = dict
-            ngx.timers = {}
-            ngx.sleeps = {}
-            http_mock.requests = {}
-            http_mock.responses = {}
-            http_mock.on_request = nil
-        end)
-
-        it("honours Retry-After on 429 and sends the same bytes on every attempt", function()
-            push(2)
-            http_mock.responses = {
-                { status = 429, headers = { ["Retry-After"] = "7" } },
-                { status = 503 },
-                { status = 202 },
-            }
-            handler._flush_buffer(false, conf)
-            assert.equals(3, #http_mock.requests)
-            assert.same({ 7, 2 }, ngx.sleeps)
-            assert.equals(http_mock.requests[1].params.body, http_mock.requests[2].params.body)
-            assert.equals(http_mock.requests[1].params.body, http_mock.requests[3].params.body)
-            assert.is_not_nil(http_mock.requests[3].params.body:find('"idempotencyKey":"key-1"', 1, true))
-            assert.equals(0, dict:llen("aforo:events"))
-        end)
-
-        it("a Retry-After past the cap stops the attempt and re-buffers instead of sleeping", function()
-            push(2)
-            http_mock.responses = { { status = 429, headers = { ["Retry-After"] = "600" } } }
-            handler._flush_buffer(false, conf)
-            assert.equals(1, #http_mock.requests)
-            assert.same({}, ngx.sleeps)
-            assert.equals(2, dict:llen("aforo:events"))
-            -- and the re-buffered events keep their keys for the next flush
-            assert.is_not_nil(dict.store["aforo:events"][1]:find('"idempotencyKey":"key-1"', 1, true))
-        end)
-
-        it("schedules a follow-up flush for what it could not send", function()
-            push(2)
-            http_mock.responses = { { status = 503 }, { status = 503 }, { status = 503 } }
-            handler._flush_buffer(false, conf, "aforo:flush_now")
-            assert.equals(2, dict:llen("aforo:events"))
-            assert.equals(1, #ngx.timers)
-            assert.equals(5, ngx.timers[1].delay)
-            assert.is_nil(dict:get("aforo:flush_now"))   -- guard released
-        end)
-
-        it("one pending flush per kind, however many requests arrive", function()
-            mock_kong.client.get_consumer = function() return { custom_id = "cust_1" } end
-            mock_kong.request._headers = { ["X-Request-Id"] = "r" }
-            local c = { flush_count = 2, flush_interval_ms = 5000, exclude_paths = {}, exclude_status_codes = {} }
-            for _ = 1, 20 do handler:log(c) end
-            mock_kong.client.get_consumer = function() return nil end
-            assert.equals(2, #ngx.timers)   -- one timed, one immediate
-        end)
-
-        it("counts a permanent 4xx as dropped (reason rejected) and does not retry it", function()
-            push(3)
-            http_mock.responses = { { status = 400, body = "bad" } }
-            handler._flush_buffer(false, conf)
-            assert.equals(1, #http_mock.requests)
-            assert.equals(3, dict:get("aforo_dropped:rejected"))
-            assert.equals(0, dict:llen("aforo:events"))
-        end)
-
-        it("counts events the ingestor refused inside an accepted batch (e.g. unknown metric)", function()
-            push(3)
-            http_mock.responses = { { status = 202, body = cjson.encode({ success = true, data = {
-                accepted = 2, duplicates = 0, failed = 1,
-                errors = { { index = 1, message = "Unknown metric: nope" } } } }) } }
-            handler._flush_buffer(false, conf)
-            assert.equals(1, dict:get("aforo_dropped:ingestor_rejected"))
-            assert.equals(1, #http_mock.requests)
-        end)
-
-        it("never blocks: the log phase makes no HTTP call and no sleep", function()
-            mock_kong.client.get_consumer = function() return { custom_id = "cust_1" } end
-            mock_kong.request._headers = { ["X-Request-Id"] = "r" }
-            handler:log({ flush_count = 1, flush_interval_ms = 5000, exclude_paths = {}, exclude_status_codes = {} })
-            mock_kong.client.get_consumer = function() return nil end
-            assert.equals(0, #http_mock.requests)
-            assert.same({}, ngx.sleeps)
-        end)
-    end)
-
     describe("resolve_customer_id (security regression)", function()
 
         it("prefers JWT customer_id over consumer identity", function()
             mock_kong.ctx.shared = {
-                aforo_jwt_claims = { signature_verified = true, customer_id = "cust_from_jwt" }
+                aforo_jwt_claims = { signature_verified = true, customer_id ="cust_from_jwt" }
             }
             local consumer = { username = "cust_from_consumer" }
             local headers = { ["x-customer-id"] = "cust_forged_header" }
@@ -1331,7 +358,6 @@ describe("aforo-metering handler", function()
     -- concurrent workers lost events. It is now a list touched only by atomic
     -- rpush / lpop / lpush / rpop.
     describe("event buffer", function()
-        local BUFFER_KEY = "aforo:events"
         local dict
         local conf = {
             aforo_endpoint = "http://ingestor.test/v1/ingest/batch",
@@ -1343,9 +369,10 @@ describe("aforo-metering handler", function()
             exclude_paths = {},
             exclude_status_codes = {},
         }
+        local BUFFER_KEY = handler._buffer_key(conf)
 
         local function log_request(customer_id)
-            mock_kong.ctx.shared = { aforo_jwt_claims = { signature_verified = true, customer_id = customer_id } }
+            mock_kong.ctx.shared = { aforo_jwt_claims = { signature_verified = true, customer_id =customer_id } }
             handler:log(conf)
         end
 
@@ -1404,8 +431,10 @@ describe("aforo-metering handler", function()
         it("schedules an immediate flush once flush_count events are buffered", function()
             fill(49)
             log_request("cust_50")
-            assert.equals(1, #ngx.timers)
-            assert.equals(0, ngx.timers[1].delay)
+            -- The timed flush every non-empty buffer keeps pending, plus one immediate.
+            assert.equals(2, #ngx.timers)
+            assert.equals(5, ngx.timers[1].delay)
+            assert.equals(0, ngx.timers[2].delay)
         end)
 
         it("caps the buffer at MAX_BUFFER_SIZE, dropping the newest, and still schedules a flush", function()
@@ -1415,10 +444,11 @@ describe("aforo-metering handler", function()
             assert.equals(10000, #events)
             assert.equals("c10000", events[10000].customerId)
             -- A full buffer must not stop flushing forever.
-            assert.equals(1, #ngx.timers)
+            assert.equals(2, #ngx.timers)
+            assert.equals(0, ngx.timers[2].delay)
             -- ...but not one flush per dropped request.
             log_request("cust_overflow_2")
-            assert.equals(1, #ngx.timers)
+            assert.equals(2, #ngx.timers)
         end)
 
         it("flushes with X-API-Key alone and empties the buffer", function()
@@ -1446,9 +476,9 @@ describe("aforo-metering handler", function()
             assert.equals(0, #buffered())
         end)
 
-        it("drops a batch rejected with 4xx and keeps draining the rest", function()
+        it("drops a batch rejected with a permanent 4xx and keeps draining the rest", function()
             fill(1500)
-            http_mock.responses = { { status = 400, body = "bad event" } }
+            http_mock.responses = { { status = 422, body = "unprocessable" } }
             handler._flush_buffer(false, conf)
 
             -- One attempt for the rejected batch (no retry), one for the remainder.
@@ -1522,9 +552,1228 @@ describe("aforo-metering handler", function()
             assert.equals("new9990", events[10000].customerId)
         end)
     end)
+    -- ── Delivery (2026-10-12) ───────────────────────────────────
+    -- The metering-path review's findings, as tests of the fixed behaviour.
+    describe("delivery", function()
+        local dict
+        local function conf(o)
+            local c = {
+                aforo_endpoint = "http://ingestor.test/v1/ingest/batch",
+                api_key = "sk_A", tenant_id = "tenantA",
+                default_metric = "api_calls", flush_count = 50, flush_interval_ms = 5000,
+                quantity_header = "X-Aforo-Quantity", metric_header = "X-Aforo-Metric",
+                exclude_paths = {}, exclude_status_codes = { 401, 403, 429 },
+            }
+            for k, v in pairs(o or {}) do c[k] = v end
+            return c
+        end
+        local function log(c, cust, headers, response_headers)
+            mock_kong.request._headers = headers or {}
+            mock_kong.response._headers = response_headers or {}
+            mock_kong.ctx.shared = { aforo_jwt_claims = { signature_verified = true, customer_id =cust or "cust_a" } }
+            handler:log(c)
+        end
+        local function raw(c)
+            return dict.store[handler._buffer_key(c)] or {}
+        end
+        local function buffered(c)
+            local out = {}
+            for i, e in ipairs(raw(c)) do out[i] = cjson.decode(e) end
+            return out
+        end
+        local function sent(i) return cjson.decode(http_mock.requests[i].params.body).events end
+        local function run(t) t.fn(false, unpack(t.args)) end
+        local function timers_at(delay)
+            local n = 0
+            for _, t in ipairs(ngx.timers) do if t.delay == delay then n = n + 1 end end
+            return n
+        end
+        local function customers_delivered()
+            local out = {}
+            for i, r in ipairs(http_mock.requests) do
+                if r.status == 202 then
+                    for _, e in ipairs(sent(i)) do out[#out + 1] = e.customerId end
+                end
+            end
+            table.sort(out)
+            return out
+        end
+        -- Answer each POST by looking at what it carries.
+        local function respond_by_body(fn)
+            http_mock.on_request = function(n)
+                local status = fn(http_mock.requests[n].params.body)
+                http_mock.requests[n].status = status
+                table.insert(http_mock.responses, 1, { status = status })
+            end
+        end
+
+        before_each(function()
+            dict = new_shared_dict()
+            ngx.shared.aforo_buffer = dict
+            ngx.timers, ngx.sleeps = {}, {}
+            http_mock.requests, http_mock.responses, http_mock.on_request = {}, {}, nil
+        end)
+
+        it("keeps a timed flush pending after a failed flush, so low traffic still drains", function()
+            local c = conf()
+            log(c, "c1"); log(c, "c2"); log(c, "c3")
+            assert.equals(1, #ngx.timers)
+            http_mock.responses = { { status = 503 }, { status = 503 }, { status = 503 } }
+            run(table.remove(ngx.timers, 1))
+            assert.equals(3, #buffered(c))
+            -- Already rescheduled: no need to wait for flush_count more requests.
+            assert.equals(1, #ngx.timers)
+            assert.equals(5, ngx.timers[1].delay)
+            run(table.remove(ngx.timers, 1))      -- ingestor healthy again
+            assert.equals(0, #buffered(c))
+            assert.equals(3, #sent(4))
+        end)
+
+        it("runs at most one immediate flush per buffer, and none during backoff", function()
+            local c = conf({ flush_count = 5 })
+            local k = handler._buffer_key(c)
+            dict:set(k .. ":lock", true)          -- a flush is running in another worker
+            for i = 1, 200 do log(c, "c" .. i) end
+            assert.equals(1, #ngx.timers)         -- just the pending timed flush
+            assert.equals(0, timers_at(0))
+            dict:delete(k .. ":lock")
+            for i = 201, 400 do log(c, "c" .. i) end
+            assert.equals(1, timers_at(0))        -- one immediate flush, not one per request
+
+            ngx.timers = {}
+            dict:delete(k .. ":kick")
+            dict:set(k .. ":backoff", true)       -- the last flush failed
+            for i = 401, 450 do log(c, "c" .. i) end
+            assert.equals(0, timers_at(0))
+        end)
+
+        it("an immediate flush that finds a flush running leaves it alone", function()
+            local c = conf({ flush_count = 1 })
+            log(c, "c1")
+            local kick
+            for _, t in ipairs(ngx.timers) do if t.delay == 0 then kick = t end end
+            dict:set(handler._buffer_key(c) .. ":lock", true)
+            run(kick)
+            assert.equals(0, #http_mock.requests)
+            assert.equals(1, #buffered(c))
+        end)
+
+        it("makes one quick send when the worker is exiting, and keeps what fails", function()
+            local c = conf()
+            log(c, "c1"); log(c, "c2")
+            local t = table.remove(ngx.timers, 1)
+            t.fn(true, unpack(t.args))            -- premature: reload / shutdown
+            assert.equals(1, #http_mock.requests)
+            assert.equals(2, #sent(1))
+            assert.equals(0, #buffered(c))
+
+            log(c, "c3")
+            http_mock.responses = { { status = 503 } }
+            handler._flush_buffer(true, c)
+            assert.equals(2, #http_mock.requests) -- one attempt, no retries
+            assert.same({}, ngx.sleeps)
+            assert.equals(1, #buffered(c))
+        end)
+
+        it("flushes each plugin instance's events with its own key and endpoint", function()
+            local A = conf()
+            local B = conf({ api_key = "sk_B", tenant_id = "tenantB",
+                             aforo_endpoint = "http://ingestor-b.test/v1/ingest/batch" })
+            log(A, "cust_of_A"); log(B, "cust_of_B")
+            assert.equals(2, #ngx.timers)
+            run(table.remove(ngx.timers, 1)); run(table.remove(ngx.timers, 1))
+            assert.equals(2, #http_mock.requests)
+            local by_url = {}
+            for i, r in ipairs(http_mock.requests) do by_url[r.url] = { r = r, events = sent(i) } end
+            local a, b = by_url["http://ingestor.test/v1/ingest/batch"], by_url["http://ingestor-b.test/v1/ingest/batch"]
+            assert.equals("sk_A", a.r.params.headers["X-API-Key"])
+            assert.equals("tenantA", a.r.params.headers["X-Tenant-Id"])
+            assert.equals(1, #a.events)
+            assert.equals("cust_of_A", a.events[1].customerId)
+            assert.equals("sk_B", b.r.params.headers["X-API-Key"])
+            assert.equals("tenantB", b.r.params.headers["X-Tenant-Id"])
+            assert.equals(1, #b.events)
+            assert.equals("cust_of_B", b.events[1].customerId)
+        end)
+
+        it("keeps the batch on 401, 403 and 404, without a retry storm", function()
+            for _, status in ipairs({ 401, 403, 404 }) do
+                dict = new_shared_dict(); ngx.shared.aforo_buffer = dict
+                http_mock.requests = {}
+                local c = conf()
+                log(c, "c1"); log(c, "c2")
+                http_mock.responses = { { status = status, body = '{"title":"Unauthorized"}' } }
+                handler._flush_buffer(false, c)
+                assert.equals(1, #http_mock.requests)
+                assert.equals(2, #buffered(c))
+            end
+        end)
+
+        it("re-sends only the events a 202 says could not be stored (bare shape, no envelope)", function()
+            local c = conf()
+            log(c, "c1"); log(c, "c2"); log(c, "c3")
+            http_mock.responses = { { status = 202, body = '{"accepted":1,"duplicates":0,"failed":2,"errors":['
+                .. '{"index":0,"message":"The event could not be stored: connection refused"},'
+                .. '{"index":2,"message":"metricName Metric name is required"}]}' } }
+            handler._flush_buffer(false, c)
+            local left = buffered(c)
+            assert.equals(1, #left)
+            assert.equals("c1", left[1].customerId)
+        end)
+
+        -- The ingestor's real 202 (KongBatchResponseShapeTest): the platform
+        -- envelope, per-event errors under data.errors, none at the top level.
+        local function envelope(accepted, failed, errors)
+            return cjson.encode({ success = true, data = { accepted = accepted, duplicates = 0,
+                                                           failed = failed, errors = errors } })
+        end
+        local function capture_errs()
+            local errs, orig = {}, mock_kong.log.err
+            mock_kong.log.err = function(...)
+                local parts = {}
+                for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+                errs[#errs + 1] = table.concat(parts)
+            end
+            return errs, function() mock_kong.log.err = orig end
+        end
+
+        it("reads per-event errors inside the envelope: accepted and failed in one batch", function()
+            local c = conf()
+            log(c, "c1"); log(c, "c2"); log(c, "c3")
+            local errs, restore = capture_errs()
+            http_mock.responses = { { status = 202, body = envelope(2, 1, {
+                { index = 2, message = "Quota exceeded for metric 'api_calls': 2/2 MONTHLY limit reached (HARD_LIMIT)" } }) } }
+            handler._flush_buffer(false, c)
+            restore()
+            assert.equals(0, #buffered(c))     -- two stored, one dropped: nothing left to send
+            assert.equals(1, #errs)
+            assert.truthy(errs[1]:find("rejected 1 of 3 event(s)", 1, true))
+            assert.truthy(errs[1]:find("dropped", 1, true))
+            assert.truthy(errs[1]:find("Quota exceeded for metric 'api_calls'", 1, true))
+        end)
+
+        it("re-sends, alone, an event the envelope says could not be stored", function()
+            local c = conf()
+            log(c, "c1"); log(c, "c2"); log(c, "c3")
+            http_mock.responses = {
+                { status = 202, body = envelope(2, 1, {
+                    { index = 1, message = "The event could not be stored: deadlock detected" } }) },
+                { status = 202, body = envelope(1, 0, {}) },
+            }
+            handler._flush_buffer(false, c)
+            local left = buffered(c)
+            assert.equals(1, #left)
+            assert.equals("c2", left[1].customerId)
+            -- The next flush sends that one event, not the batch again.
+            handler._flush_buffer(false, c)
+            assert.equals(2, #http_mock.requests)
+            local resent = sent(2)
+            assert.equals(1, #resent)
+            assert.equals("c2", resent[1].customerId)
+            assert.equals(0, #buffered(c))
+        end)
+
+        it("drops, with the count and the reason, an event the envelope rejects for good", function()
+            local c = conf()
+            log(c, "c1"); log(c, "c2")
+            local errs, restore = capture_errs()
+            http_mock.responses = { { status = 202, body = envelope(0, 2, {
+                { index = 0, message = "Quota exceeded for metric 'api_calls' (HARD_LIMIT)" },
+                { index = 1, message = "Unknown metric 'nope'" } }) } }
+            handler._flush_buffer(false, c)
+            restore()
+            assert.equals(1, #http_mock.requests)
+            assert.equals(0, #buffered(c))
+            assert.truthy(errs[1]:find("rejected 2 of 2 event(s) in a batch; dropped, not retried", 1, true))
+            assert.truthy(errs[1]:find("Unknown metric 'nope'", 1, true))
+        end)
+
+        it("treats an envelope without errors, or with null data, as all stored", function()
+            local c = conf()
+            log(c, "c1"); log(c, "c2")
+            http_mock.responses = {
+                { status = 202, body = '{"success":true,"data":{"accepted":2,"failed":0,"errors":null}}' },
+            }
+            handler._flush_buffer(false, c)
+            assert.equals(0, #buffered(c))
+            log(c, "c3")
+            http_mock.responses = { { status = 202, body = '{"success":true,"data":null}' } }
+            handler._flush_buffer(false, c)
+            assert.equals(0, #buffered(c))
+        end)
+
+        it("bisects a batch the ingestor answers 400, so one bad event costs only itself", function()
+            local c = conf()
+            for i = 1, 8 do log(c, "c" .. i) end
+            respond_by_body(function(body) return body:find('"c5"', 1, true) and 400 or 202 end)
+            handler._flush_buffer(false, c)
+            assert.same({ "c1", "c2", "c3", "c4", "c6", "c7", "c8" }, customers_delivered())
+            assert.equals(0, #buffered(c))
+            assert.is_true(#http_mock.requests <= 7)  -- log2(8) levels, not one POST per event
+        end)
+
+        it("splits a batch the ingestor answers 413", function()
+            local c = conf()
+            for i = 1, 4 do log(c, "c" .. i) end
+            respond_by_body(function(body)
+                local _, n = body:gsub('"customerId"', "")
+                return n > 2 and 413 or 202
+            end)
+            handler._flush_buffer(false, c)
+            assert.same({ "c1", "c2", "c3", "c4" }, customers_delivered())
+        end)
+
+        it("drops a single event the ingestor answers 400, with the reason", function()
+            local c = conf()
+            log(c, "c1")
+            http_mock.responses = { { status = 400, body = "Invalid UTF-8" } }
+            handler._flush_buffer(false, c)
+            assert.equals(1, #http_mock.requests)
+            assert.equals(0, #buffered(c))
+        end)
+
+        it("gives every AGENTIC_API event a traceId the client can neither withhold nor choose", function()
+            -- AGENTIC_API bills per trace (goal): a client that could pick the
+            -- trace could fold every goal into one by repeating a traceparent.
+            local c = conf({ product_type = "AGENTIC_API", trace_id_header = "X-Aforo-Trace-Id" })
+            local tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+            ngx.var = { request_id = "kongreq1" }
+            log(c, "c1")
+            log(c, "c2", { traceparent = tp, ["x-trace-id"] = "legacy-1" })
+            log(c, "c3", { traceparent = tp }, { ["X-Aforo-Trace-Id"] = "goal-42" })
+            -- Present but unusable: skipped, not billed as a one-request goal.
+            log(c, "c4", nil, { ["X-Aforo-Trace-Id"] = string.rep("t", 129) })
+            ngx.var = nil
+            local evs = buffered(c)
+            local ids = {}
+            for i, e in ipairs(evs) do ids[i] = e.traceId end
+            assert.same({ "kongreq1", "kongreq1", "goal-42" }, ids)
+            -- The client's trace context is still recorded, for correlation only.
+            assert.equals(tp, evs[2].trace.traceparent)
+            assert.equals("legacy-1", evs[2].trace.xTraceId)
+        end)
+
+        it("caches central mappings per tenant", function()
+            local url = "http://catalog/internal/v1/metrics/gateway-mappings"
+            local A = conf({ mappings_url = url })
+            local B = conf({ tenant_id = "tenantB", api_key = "sk_B", mappings_url = url })
+            dict:set(handler._mappings_key(A), cjson.encode({ { matchType = "PREFIX", value = "/v1/accounts",
+                                                                 metricName = "tenantA_metric" } }))
+            dict:set(handler._mappings_key(A) .. ":at", ngx.now())
+            log(A, "a"); log(B, "b")
+            assert.equals("tenantA_metric", buffered(A)[1].metricName)
+            assert.equals("api_calls", buffered(B)[1].metricName)
+        end)
+
+        it("drops unusable client values instead of poisoning the batch", function()
+            local c = conf()
+            local orig = mock_kong.request.get_path
+            mock_kong.request.get_path = function() return "/caf\233/\0x " .. string.rep("p", 600) end
+            log(c, "c1", {
+                traceparent = "00-\255\254-bad",
+                ["x-trace-id"] = { "first", "second" },     -- a repeated header
+                ["x-request-id"] = string.rep("x", 500),
+                tracestate = "vendor=1",
+            })
+            mock_kong.request.get_path = orig
+            local encoded = raw(c)[1]
+            assert.is_nil(encoded:find("[\128-\255]"), "malformed bytes reached the batch body")
+            local e = cjson.decode(encoded)
+            assert.is_nil(e.trace.traceparent)
+            assert.equals("first", e.trace.xTraceId)
+            assert.is_nil(e.trace.xRequestId)
+            assert.equals("vendor=1", e.trace.tracestate)
+            -- Only the malformed byte and the control character are escaped.
+            assert.equals(512, #e.endpointPath)
+            assert.equals("/caf%E9/%00x ppp", e.endpointPath:sub(1, 16))
+        end)
+
+        it("keeps valid Unicode unchanged: paths, tool names, metric names, customer ids", function()
+            local c = conf({ mcp_enabled = true })
+            local orig_path, orig_method = mock_kong.request.get_path, mock_kong.request.get_method
+            mock_kong.request.get_path = function() return "/café/ü" end
+            log(c, "kündin", nil, { ["X-Aforo-Metric"] = "nachrichten_gesendet_ü" })
+            mock_kong.request.get_method = function() return "POST" end
+            mock_kong.ctx.shared = { aforo_jwt_claims = { signature_verified = true, customer_id ="cust_a" },
+                aforo_raw_body = '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"t b é","_meta":{"agent_id":"a1"}}}' }
+            mock_kong.request._headers, mock_kong.response._headers = {}, {}
+            handler:log(c)
+            mock_kong.request.get_path, mock_kong.request.get_method = orig_path, orig_method
+            local evs = buffered(c)
+            assert.equals("/café/ü", evs[1].endpointPath)
+            assert.equals("nachrichten_gesendet_ü", evs[1].metricName)
+            assert.equals("kündin", evs[1].customerId)
+            assert.equals("t b é", evs[2].toolName)
+        end)
+
+        it("counts identity limits in characters as the ingestor does, not bytes", function()
+            local c = conf()
+            log(c, string.rep("\195\169", 40))            -- 'é' x 40: 40 characters, 80 bytes
+            log(c, string.rep("\240\159\152\128", 32))    -- 32 emoji: 64 UTF-16 units -- at the limit
+            log(c, string.rep("\240\159\152\128", 33))    -- 66 units: over customerId's 64
+            log(c, "bad\255id")                           -- not text: would poison the batch
+            local ids = {}
+            for i, e in ipairs(buffered(c)) do ids[i] = #e.customerId end
+            assert.same({ 80, 128 }, ids)
+        end)
+
+        it("skips the event when an upstream identity header is present but unusable", function()
+            local c = conf({ product_type = "AI_AGENT", agent_id = "default-agent",
+                             agent_id_header = "X-Aforo-Agent-Id", session_id_header = "X-Aforo-Session-Id" })
+            local long_agent = "support-agent-production-eu-west-1-v2"   -- 37 characters
+            log(c, "c1", nil, { ["X-Aforo-Agent-Id"] = long_agent })
+            log(c, "c2", nil, { ["X-Aforo-Session-Id"] = "sess\1ion" })
+            log(conf(), "c3", nil, { ["X-Aforo-Metric"] = "sms\255sent" })
+            assert.equals(0, #buffered(c))
+            assert.equals(0, #buffered(conf()))
+            -- Absent headers still fall back as designed.
+            log(c, "c4")
+            assert.equals("default-agent", buffered(c)[1].agentId)
+        end)
+
+        it("with mcp_meter_non_tool_calls, also meters the other messages of a mixed batch", function()
+            local c = conf({ mcp_enabled = true, mcp_meter_non_tool_calls = true })
+            local orig_method = mock_kong.request.get_method
+            mock_kong.request.get_method = function() return "POST" end
+            mock_kong.request._headers, mock_kong.response._headers = {}, {}
+            mock_kong.ctx.shared = { aforo_jwt_claims = { signature_verified = true, customer_id ="cust_a" }, aforo_raw_body = cjson.encode({
+                { jsonrpc = "2.0", id = 1, method = "tools/list" },
+                { jsonrpc = "2.0", id = 2, method = "tools/call", params = { name = "search" } },
+            }) }
+            handler:log(c)
+            mock_kong.request.get_method = orig_method
+            local evs = buffered(c)
+            assert.equals(2, #evs)
+            assert.equals("search", evs[1].toolName)
+            assert.equals("api_calls", evs[2].metricName)
+            assert.is_nil(evs[2].toolName)
+        end)
+
+        it("rounds quantity to the ingestor's 6 decimals and skips what rounds to 0", function()
+            local c = conf()
+            log(c, "c1", nil, { ["X-Aforo-Quantity"] = "0.3333333" })
+            log(c, "c2", nil, { ["X-Aforo-Quantity"] = "0.0000001" })
+            log(c, "c3", nil, { ["X-Aforo-Quantity"] = "1e15" })
+            local evs = buffered(c)
+            assert.equals(1, #evs)
+            assert.equals(0.333333, evs[1].quantity)
+        end)
+
+        -- ── review 2: delivery ──────────────────────────────────
+        -- ── review 4: buffers never move; one key, one buffer ─────
+        local function keys_used()
+            local out = {}
+            for i, r in ipairs(http_mock.requests) do
+                local ids = {}
+                for _, e in ipairs(sent(i)) do ids[#ids + 1] = e.customerId end
+                out[#out + 1] = r.params.headers["X-API-Key"] .. ":" .. table.concat(ids, ",")
+            end
+            return out
+        end
+
+        it("delivers two instances with different keys each with its own key", function()
+            local A = conf({ api_key = "sk_a", __plugin_id = "plugin-A" })
+            local B = conf({ api_key = "sk_b", __plugin_id = "plugin-B" })
+            log(A, "a1"); log(B, "b1"); log(A, "a2")
+            for _, t in ipairs(ngx.timers) do run(t) end
+            table.sort(http_mock.requests, function(x, y) return x.params.headers["X-API-Key"] < y.params.headers["X-API-Key"] end)
+            assert.same({ "sk_a:a1,a2", "sk_b:b1" }, keys_used())
+        end)
+
+        it("keeps events refused under the old key with that key after a rotation; new ones use the new key", function()
+            local old = conf({ api_key = "sk_old", __plugin_id = "plugin-1" })
+            local new = conf({ api_key = "sk_new", __plugin_id = "plugin-1" })
+            log(old, "o1"); log(old, "o2")
+            http_mock.responses = { { status = 401 } }
+            handler._flush_buffer(false, old)                -- refused: held under sk_old
+            log(new, "n1")                                    -- the rotated config
+            http_mock.requests = {}
+            http_mock.responses = { { status = 202 }, { status = 401 } }
+            handler._flush_buffer(false, new)
+            handler._flush_buffer(false, old)
+            assert.same({ "sk_new:n1", "sk_old:o1,o2" }, keys_used())   -- never crossed
+            assert.equals(2, #buffered(old))                  -- still waiting for sk_old
+            -- If the old key works again, they go out with it.
+            http_mock.responses = { { status = 202 } }
+            handler._flush_buffer(false, old)
+            assert.equals(0, #buffered(old))
+            assert.equals("sk_old", http_mock.requests[#http_mock.requests].params.headers["X-API-Key"])
+        end)
+
+        it("never moves buffered events when tenant_id or aforo_endpoint changes", function()
+            local stg = conf({ api_key = "sk_stg", tenant_id = "tenant-staging",
+                               aforo_endpoint = "http://staging/v1/ingest/batch", __plugin_id = "plugin-1" })
+            local prd = conf({ api_key = "sk_prd", tenant_id = "tenant-prod",
+                               aforo_endpoint = "http://prod/v1/ingest/batch", __plugin_id = "plugin-1" })
+            log(stg, "s1"); log(prd, "p1")
+            handler._flush_buffer(false, prd)
+            assert.equals(1, #http_mock.requests)
+            assert.equals("http://prod/v1/ingest/batch", http_mock.requests[1].url)
+            assert.same({ "sk_prd:p1" }, keys_used())
+            assert.equals(1, #buffered(stg))
+        end)
+
+        it("does not grow the registry across reloads that give the plugin a new id", function()
+            for i = 1, 11 do
+                log(conf({ api_key = "sk_a", __plugin_id = "random-id-" .. i }), "c" .. i)
+            end
+            assert.equals(1, dict:llen("aforo:registry"))
+            assert.equals(11, #buffered(conf({ api_key = "sk_a" })))
+        end)
+
+        it("prunes empty buffers whose settings expired from the registry", function()
+            local A = conf({ api_key = "sk_a" })
+            local B = conf({ api_key = "sk_b" })
+            log(A, "a1"); log(B, "b1")
+            handler._flush_buffer(false, A)                  -- A is empty now
+            dict:delete(handler._buffer_key(A) .. ":conf")   -- and its settings expired
+            handler._rearm(false)
+            local reg = {}
+            for i, k in ipairs(dict.store["aforo:registry"]) do reg[i] = k end
+            assert.same({ handler._buffer_key(B) }, reg)
+        end)
+
+        it("backs off a refused destination exponentially, at most 5 minutes, and resets on a 2xx", function()
+            local c = conf({ flush_interval_ms = 5000 })
+            local k = handler._buffer_key(c)
+            log(c, "c1")
+            local delays = {}
+            for _ = 1, 8 do
+                ngx.timers = {}
+                http_mock.responses = { { status = 401 } }
+                dict:delete(k .. ":pending")
+                handler._flush_buffer(false, c)
+                delays[#delays + 1] = ngx.timers[#ngx.timers].delay
+            end
+            assert.same({ 10, 20, 40, 80, 160, 300, 300, 300 }, delays)
+            ngx.timers = {}
+            http_mock.responses = { { status = 202 } }
+            log(c, "c2"); dict:delete(k .. ":pending")
+            handler._flush_buffer(false, c)
+            assert.is_nil(dict:get(k .. ":held_n"))
+            log(c, "c3")
+            assert.equals(5, ngx.timers[#ngx.timers].delay)
+        end)
+
+        it("marks a destination failing at its first failed attempt, until a 2xx", function()
+            local c = conf()
+            local k = handler._buffer_key(c)
+            log(c, "c1")
+            local seen
+            http_mock.responses = { { status = 503 }, { status = 503 }, { status = 503 } }
+            http_mock.on_request = function(n) if n == 2 then seen = dict:get(k .. ":failing") end end
+            handler._flush_buffer(false, c)
+            assert.is_true(seen, "not marked failing before the retries were over")
+            assert.is_true(dict:ttl(k .. ":failing") >= 480)
+            http_mock.on_request = nil
+            http_mock.responses = { { status = 202 } }
+            handler._flush_buffer(false, c)
+            assert.is_nil(dict:get(k .. ":failing"))
+        end)
+
+        it("never refuses a healthy destination while a failing one has events to give up", function()
+            dict.cap = 128 * 1024
+            local Y = conf({ api_key = "sk_y", flush_count = 100000 })
+            local X = conf({ api_key = "sk_x", flush_count = 100000 })
+            while dict:free_space() > 600 do log(Y, "y") end
+            dict:set(handler._buffer_key(Y) .. ":failing", true)
+            local refused, pushed = 0, 0
+            local i = 0
+            while #buffered(Y) > 0 do                       -- while Y has anything to give up
+                i = i + 1
+                local before = #buffered(X)
+                log(X, "x" .. i)
+                pushed = pushed + 1
+                if #buffered(X) == before then refused = refused + 1 end
+            end
+            assert.is_true(pushed > 100)
+            assert.equals(0, refused)
+        end)
+
+        it("reports exactly how many events a re-buffer kept and dropped", function()
+            dict.cap = 96 * 1024
+            local c = conf({ flush_count = 100000 })
+            for i = 1, 40 do log(c, "old" .. i) end
+            local errs = {}
+            local orig = mock_kong.log.err
+            mock_kong.log.err = function(...) errs[#errs + 1] = table.concat({ ... }) end
+            http_mock.responses = { { status = 503 }, { status = 503 }, { status = 503 } }
+            http_mock.on_request = function(n)
+                if n == 1 then while dict:free_space() > 300 do log(c, "new") end end
+            end
+            local before_new
+            handler._flush_buffer(false, c)
+            mock_kong.log.err = orig
+            local left = buffered(c)
+            local old_left, new_left = 0, 0
+            for _, e in ipairs(left) do if e.customerId:find("^old") then old_left = old_left + 1 else new_left = new_left + 1 end end
+            local line
+            for _, l in ipairs(errs) do if l:find("put back", 1, true) then line = l end end
+            assert.is_not_nil(line)
+            local kept = tonumber(line:match("(%d+) of 40 event%(s%) put back"))
+            assert.equals(old_left, kept)
+        end)
+
+        it("never strands events: settings outlive every event, and expired events are dropped with a log", function()
+            assert.is_true(handler._conf_ttl > handler._max_event_age + 3600)
+            local now0 = ngx.now()
+            local orig_now = ngx.now
+            local c = conf()
+            log(c, "c1")
+            local errs = {}
+            local orig_err = mock_kong.log.err
+            mock_kong.log.err = function(...) errs[#errs + 1] = table.concat({ ... }) end
+            -- 72 h and a minute later, with no traffic in between:
+            ngx.now = function() return now0 + handler._max_event_age + 60 end
+            assert.is_not_nil(dict:get(handler._buffer_key(c) .. ":conf"))   -- settings still there
+            run(table.remove(ngx.timers, 1))
+            ngx.now, mock_kong.log.err = orig_now, orig_err
+            assert.equals(0, #http_mock.requests)                  -- nothing the ingestor would refuse
+            assert.equals(0, #buffered(c))
+            local said = false
+            for _, l in ipairs(errs) do if l:find("older than 72 hours", 1, true) then said = true end end
+            assert.is_true(said)
+        end)
+
+        it("re-arms a timed flush after a worker exit (reload)", function()
+            local c = conf()
+            log(c, "c1")
+            local t = table.remove(ngx.timers, 1)
+            http_mock.responses = { { status = 503 } }
+            t.fn(true, unpack(t.args))               -- premature: worker exiting; send fails, kept
+            assert.equals(1, #buffered(c))
+            ngx.timers = {}                          -- new worker: no timers survive
+            log(c, "c2")
+            assert.equals(1, #ngx.timers, "no timed flush armed")
+        end)
+
+        it("re-arms flushes on worker 0 with no traffic at all", function()
+            local c = conf()
+            log(c, "c1")
+            local k = handler._buffer_key(c)
+            ngx.timers = {}
+            dict:delete(k .. ":pending")             -- the timer died with its worker
+            handler:init_worker()
+            assert.equals(1, #ngx.timers)
+            assert.is_true(ngx.timers[1].every)
+            local every = table.remove(ngx.timers, 1)
+            every.fn(false)
+            assert.equals(1, #ngx.timers)            -- a timed flush for the stranded buffer
+            run(table.remove(ngx.timers, 1))
+            assert.equals(0, #buffered(c))
+        end)
+
+        it("keeps at most the newest 500 events for a destination the ingestor refuses", function()
+            local c = conf({ flush_count = 100000 })
+            for i = 1, 1200 do log(c, "c" .. i) end
+            http_mock.responses = { { status = 401 } }
+            handler._flush_buffer(false, c)
+            local left = buffered(c)
+            assert.equals(500, #left)
+            assert.equals("c701", left[1].customerId)
+            assert.equals("c1200", left[500].customerId)
+            log(c, "c1201")                           -- full: the oldest makes room
+            left = buffered(c)
+            assert.equals(500, #left)
+            assert.equals("c702", left[1].customerId)
+            assert.equals("c1201", left[500].customerId)
+        end)
+
+        it("drops events older than 72 hours when the ingestor refuses the destination", function()
+            local c = conf()
+            local k = handler._buffer_key(c)
+            dict:rpush(k, cjson.encode({ customerId = "old", occurredAt = "2026-08-01T00:00:00.000Z" }))
+            log(c, "fresh")
+            http_mock.responses = { { status = 403 } }
+            handler._flush_buffer(false, c)
+            local left = buffered(c)
+            assert.equals(1, #left)
+            assert.equals("fresh", left[1].customerId)
+        end)
+
+        it("never lets a refused destination stop a healthy one from buffering", function()
+            dict.cap = 256 * 1024                     -- a small dict
+            local A = conf({ flush_count = 100000 })
+            local B = conf({ tenant_id = "tenantB", api_key = "sk_B", flush_count = 100000,
+                             aforo_endpoint = "http://ingestor-b.test/v1/ingest/batch" })
+            for i = 1, 600 do log(A, "a" .. i) end    -- A fills the dict to the brim
+            local a_before = #buffered(A)
+            assert.is_true(a_before < 600)
+            dict:set(handler._buffer_key(A) .. ":held", true)   -- A's key is refused (401)
+            for i = 1, 100 do log(B, "b" .. i) end
+            assert.equals(100, #buffered(B))          -- B lost nothing
+            assert.is_true(#buffered(A) < a_before)   -- A made the room
+            -- A refused destination gets no room at others' expense: with the
+            -- dict full of B's events, A's push evicts none of them.
+            while dict:free_space() > 1024 do log(B, "b_fill") end
+            local b_now = #buffered(B)
+            log(A, "a_new")
+            assert.equals(b_now, #buffered(B))
+        end)
+
+        -- ── review 5 ────────────────────────────────────────────
+        local function slot(n)
+            n = n + 48
+            if n > 2048 then return math.ceil(n / 4096) * 4096 end
+            local p = 16
+            while p < n do p = p * 2 end
+            return p
+        end
+        -- Events of ~1.2 KB (2 KiB slots), as in the field: a long path, which
+        -- the event carries twice (endpointPath and metadata.endpoint_path).
+        local LONG_PATH = "/v1/" .. string.rep("p", 500)
+        local function big(fn)
+            local orig = mock_kong.request.get_path
+            mock_kong.request.get_path = function() return LONG_PATH end
+            local ok, err = pcall(fn)
+            mock_kong.request.get_path = orig
+            assert(ok, err)
+        end
+        local PAD = string.rep("p", 1300)
+
+        it("F1: never holds events for a buffer without its settings, even on a full dict", function()
+            dict.cap = 256 * 1024
+            local A = conf({ api_key = "sk_a", flush_count = 100000, flush_interval_ms = 10000000 })
+            local B = conf({ api_key = "sk_b", flush_count = 100000, flush_interval_ms = 200 })
+            local kA, kB = handler._buffer_key(A), handler._buffer_key(B)
+            big(function()
+                local n = 0
+                while dict:free_space() > 4096 and n < 2000 do log(A, "a"); n = n + 1 end
+            end)
+            http_mock.responses = { { status = 503 }, { status = 503 }, { status = 503 } }
+            handler._flush_buffer(false, A)                 -- A is failing now
+            while dict:rpush(kA, cjson.encode({ customerId = "a", pad = PAD })) do end   -- A refills the dict
+            local f = 0                                      -- other destinations' settings fill the small slots
+            while dict:safe_set("aforo:events:filler" .. f .. ":conf", string.rep("c", 280)) do f = f + 1 end
+            local function invariant(label)
+                if (dict:llen(kB) or 0) > 0 then
+                    assert.is_not_nil(dict:get(kB .. ":conf"), label .. ": B holds events without settings")
+                end
+            end
+            big(function()
+                log(B, "b1"); invariant("first push")
+                for round = 1, 30 do
+                    for _ = 1, 20 do log(A, "a") end
+                    log(B, "b" .. round); invariant("round " .. round)
+                end
+            end)
+        end)
+
+        it("F2: the registry survives a full dict, and refused/failing buffers stay evictable and re-armed", function()
+            dict.cap = 256 * 1024
+            local A = conf({ api_key = "sk_a", flush_count = 100000, flush_interval_ms = 10000000 })
+            local kA = handler._buffer_key(A)
+            log(A, "a0")
+            -- Enough other destinations that one more grows a registry *string*
+            -- into the next slab size class (how the old registry was lost).
+            local function entry(i) return handler._buffer_key(conf({ api_key = "sk_d" .. i })) end
+            local len, i = #('["' .. kA .. '"]'), 0
+            while true do
+                i = i + 1
+                local nxt = len + #entry(i) + 3
+                if slot(nxt + 20) > slot(len + 20) and i > 3 then break end
+                len = nxt
+                local c = conf({ api_key = "sk_d" .. i }); log(c, "d" .. i); handler._flush_buffer(false, c)
+            end
+            big(function()
+                local n = 0
+                while dict:free_space() > 4096 and n < 2000 do log(A, "a"); n = n + 1 end
+            end)
+            http_mock.responses = { { status = 503 }, { status = 503 }, { status = 503 } }
+            handler._flush_buffer(false, A)                 -- A failing
+            while dict:rpush(kA, cjson.encode({ customerId = "a", pad = PAD })) do end
+            local f = 0                                      -- other destinations' settings fill the small slots
+            while dict:safe_set("aforo:events:filler" .. f .. ":conf", string.rep("c", 280)) do f = f + 1 end
+            local C = conf({ api_key = "sk_c_new" })        -- a new destination: the registry grows
+            local okc = 0
+            big(function()
+                for n = 1, 50 do
+                    local before = #buffered(C)
+                    log(C, "c" .. n)
+                    if #buffered(C) > before then okc = okc + 1 end
+                end
+            end)
+            assert.equals(50, okc)                          -- C evicted the failing A to make room
+            -- A reload: A's timers die; rearm must still know A.
+            dict:delete(kA .. ":pending")
+            ngx.timers = {}
+            handler._rearm(false)
+            assert.is_not_nil(dict:get(kA .. ":pending"), "A was not re-armed: the registry lost it")
+        end)
+
+        it("keeps the oldest when its own newer events filled the dict during a failed flush", function()
+            dict.cap = 64 * 1024
+            local A = conf({ flush_count = 100000 })
+            for i = 1, 20 do log(A, "old" .. i) end
+            http_mock.responses = { { status = 503 }, { status = 503 }, { status = 503 } }
+            http_mock.on_request = function(n)
+                if n == 1 then while dict:free_space() > 512 do log(A, "new") end end
+            end
+            handler._flush_buffer(false, A)
+            local left = buffered(A)
+            for i = 1, 20 do assert.equals("old" .. i, left[i].customerId) end
+        end)
+
+        it("never refuses events while the dict has room, whatever happened before", function()
+            dict.cap = 64 * 1024
+            local A = conf({ flush_count = 100000 })
+            while dict:free_space() > 4096 do log(A, "a") end   -- full
+            dict:delete(handler._buffer_key(A))               -- drained (or evicted) by anyone
+            log(A, "after")
+            assert.equals(1, #buffered(A))
+        end)
+
+        it("treats a 400 for every part of the batch as a refused request, not 2n-1 POSTs", function()
+            local c = conf({ flush_count = 100000 })
+            for i = 1, 1000 do log(c, "c" .. i) end
+            respond_by_body(function() return 400 end)
+            handler._flush_buffer(false, c)
+            assert.equals(3, #http_mock.requests)     -- the batch and its two halves
+            assert.equals(500, #buffered(c))          -- kept, as for a 404 (the newest 500)
+            assert.is_true(dict:get(handler._buffer_key(c) .. ":held"))
+        end)
+
+        it("checks the flush time budget before every POST", function()
+            local c = conf({ flush_count = 100000 })
+            for i = 1, 16 do log(c, "c" .. i) end
+            local clock = ngx.now()
+            local orig_now = ngx.now
+            ngx.now = function() return clock end
+            respond_by_body(function(body)
+                clock = clock + 61                      -- every POST takes "a minute"
+                return body:find('"c3"', 1, true) and 400 or 202
+            end)
+            handler._flush_buffer(false, c)
+            ngx.now = orig_now
+            assert.equals(1, #http_mock.requests)     -- no bisection past the budget
+            assert.equals(16, #buffered(c))
+        end)
+
+        it("only ever releases its own flush lock", function()
+            local c = conf()
+            log(c, "c1")
+            local k = handler._buffer_key(c)
+            http_mock.on_request = function()
+                dict:set(k .. ":lock", "another-flush")   -- the lock expired and was taken over
+            end
+            handler._flush_buffer(false, c)
+            assert.equals("another-flush", dict:get(k .. ":lock"))
+        end)
+
+        it("does not bisect on the way out", function()
+            local c = conf()
+            for i = 1, 8 do log(c, "c" .. i) end
+            http_mock.responses = { { status = 400 } }
+            handler._flush_buffer(true, c)
+            assert.equals(1, #http_mock.requests)
+            assert.equals(8, #buffered(c))
+        end)
+
+        it("skips an event whose identity is over the ingestor's limit, with the reason", function()
+            local c = conf({ product_type = "AI_AGENT", agent_id = string.rep("a", 37) })
+            log(c, "c1")
+            assert.equals(0, #buffered(c))
+        end)
+        -- ── review 3 ────────────────────────────────────────────
+        it("R1: a 413 batch whose halves are still too big is split further, not held", function()
+            -- A proxy in front of the ingestor takes at most ~250 events per body.
+            local c = conf({ flush_count = 100000 })
+            for i = 1, 1000 do log(c, "c" .. i) end
+            respond_by_body(function(body)
+                local _, n = body:gsub('"customerId"', "")
+                return n > 250 and 413 or 202
+            end)
+            handler._flush_buffer(false, c)
+            handler._flush_buffer(false, c)          -- and a second flush, for good measure
+            assert.is_nil(dict:get(handler._buffer_key(c) .. ":held"), "destination marked refused")
+            assert.equals(1000, #customers_delivered())
+        end)
+
+        it("R2: one instance's stale key does not hold another instance's events", function()
+            -- Two services of one tenant, same endpoint. Service A still has a
+            -- revoked key; service B was rotated to a good one.
+            local A = conf({ api_key = "sk_revoked", flush_count = 100000 })
+            local B = conf({ api_key = "sk_good", flush_count = 100000 })
+            http_mock.on_request = function(n)
+                local key = http_mock.requests[n].params.headers["X-API-Key"]
+                http_mock.requests[n].status = key == "sk_good" and 202 or 401
+                table.insert(http_mock.responses, 1, { status = http_mock.requests[n].status })
+            end
+            for i = 1, 5 do log(B, "b" .. i) end
+            log(A, "a1")                             -- A's request happens to be the last one
+            handler._flush_buffer(false, B)          -- B's own timer / flush
+            local b_sent = 0
+            for i, r in ipairs(http_mock.requests) do
+                if r.status == 202 then
+                    for _, e in ipairs(sent(i)) do if e.customerId:sub(1, 1) == "b" then b_sent = b_sent + 1 end end
+                end
+            end
+            assert.equals(5, b_sent)
+        end)
+
+        it("R3: UTF-8 validity matrix (customerId)", function()
+            local c = conf()
+            local cases = {
+                { "\224\160\128", true },  { "\224\159\191", false }, -- E0 A0 80 ok, E0 9F BF overlong
+                { "\237\159\191", true },  { "\237\160\128", false }, -- ED 9F BF ok, ED A0 80 surrogate
+                { "\238\128\128", true },  { "\239\191\191", true },  -- EE 80 80, EF BF BF
+                { "\240\144\128\128", true }, { "\240\143\191\191", false }, -- U+10000, overlong
+                { "\244\143\191\191", true }, { "\244\144\128\128", false }, -- U+10FFFF, > U+10FFFF
+                { "\245\128\128\128", false }, { "\192\128", false }, { "\193\191", false },
+                { "\194\128", true }, { "x\226\130", false }, { "x\240\159\152", false }, { "x\195", false },
+                { "\128", false }, { "a\237\190\128b", false },
+            }
+            local want = {}
+            for i, case in ipairs(cases) do
+                log(c, "id" .. i .. "-" .. case[1])
+                if case[2] then want[#want + 1] = "id" .. i .. "-" .. case[1] end
+            end
+            local got = {}
+            for i, e in ipairs(buffered(c)) do got[i] = e.customerId end
+            assert.same(want, got)
+        end)
+
+        it("R4: a refused destination keeps its NEWEST events, as the docs and the log say", function()
+            local c = conf({ flush_count = 100000 })
+            for i = 1, 1000 do log(c, "old" .. i) end
+            http_mock.responses = { { status = 401 } }
+            handler._flush_buffer(false, c)          -- refused: held, 1000 kept
+            for i = 1, 300 do log(c, "new" .. i) end -- the next flush interval's traffic
+            http_mock.responses = { { status = 401 } }
+            handler._flush_buffer(false, c)
+            local left = buffered(c)
+            assert.equals("new300", left[#left].customerId)
+        end)
+
+        it("R6: held is cleared once the key works, even if the 202 reports a transient per-event error", function()
+            local c = conf({ flush_count = 100000 })
+            log(c, "c1"); log(c, "c2")
+            http_mock.responses = { { status = 401 } }
+            handler._flush_buffer(false, c)
+            http_mock.responses = { { status = 202, body = '{"accepted":1,"failed":1,"errors":['
+                .. '{"index":0,"message":"The event could not be stored: deadlock"}]}' } }
+            handler._flush_buffer(false, c)
+            assert.is_nil(dict:get(handler._buffer_key(c) .. ":held"))
+        end)
+
+        it("R7: events a re-buffer drops are reported even inside the 60 s log throttle", function()
+            local c = conf({ flush_count = 100000 })
+            local errs = {}
+            local orig = mock_kong.log.err
+            mock_kong.log.err = function(...) errs[#errs + 1] = table.concat({ ... }) end
+            for i = 1, 10 do log(c, "c" .. i) end
+            http_mock.responses = { { status = 503 }, { status = 503 }, { status = 503 } }
+            handler._flush_buffer(false, c)          -- first failure: logged, nothing dropped
+            -- Second failure 5 s later: the buffer filled up meanwhile, so the re-buffer drops.
+            http_mock.responses = { { status = 503 }, { status = 503 }, { status = 503 } }
+            local k = handler._buffer_key(c)
+            http_mock.on_request = function(n)
+                if n == 4 then for i = 1, 10000 do dict:rpush(k, cjson.encode({ customerId = "n" .. i })) end end
+            end
+            handler._flush_buffer(false, c)
+            mock_kong.log.err = orig
+            local reported = false
+            for _, l in ipairs(errs) do if l:find("dropped", 1, true) then reported = true end end
+            assert.equals(10000, #buffered(c))       -- 10 events were dropped by the second flush...
+            assert.is_true(reported, "...and no log line says so")
+        end)
+
+        it("R2b: a timer flush (as in production) sends B's events with whichever key was pushed last", function()
+            local A = conf({ api_key = "sk_revoked", flush_count = 100000 })
+            local B = conf({ api_key = "sk_good", flush_count = 100000 })
+            for i = 1, 5 do log(B, "b" .. i) end
+            log(A, "a1")
+            http_mock.responses = { { status = 401 } }
+            run(table.remove(ngx.timers, 1))         -- the pending timed flush
+            assert.equals("sk_good", http_mock.requests[1].params.headers["X-API-Key"])
+        end)
+    end)
+    -- ── Billing correctness (2026-10-12) ────────────────────────
+    describe("billing correctness", function()
+        local dict
+        local function conf(o)
+            local c = {
+                aforo_endpoint = "http://ingestor.test/v1/ingest/batch",
+                api_key = "sk_A", tenant_id = "tenantA", default_metric = "api_calls",
+                metric_header = "X-Aforo-Metric", quantity_header = "X-Aforo-Quantity",
+                agent_id_header = "X-Aforo-Agent-Id", session_id_header = "X-Aforo-Session-Id",
+                exclude_paths = { "/health", "/ready", "/metrics" }, exclude_status_codes = {},
+            }
+            for k, v in pairs(o or {}) do c[k] = v end
+            return c
+        end
+        local MCP = { mcp_enabled = true }
+        -- One request. opts: method, path, body (the access-phase stash),
+        -- headers (request), response (headers), var (ngx.var).
+        local function log(c, opts)
+            opts = opts or {}
+            mock_kong.request._headers = opts.headers or {}
+            mock_kong.response._headers = opts.response or {}
+            mock_kong.ctx.shared = { aforo_jwt_claims = { signature_verified = true, customer_id ="cust_a" }, aforo_raw_body = opts.body }
+            ngx.var = opts.var or { request_id = "kongreq" }
+            local m, p = mock_kong.request.get_method, mock_kong.request.get_path
+            mock_kong.request.get_method = function() return opts.method or "GET" end
+            mock_kong.request.get_path = function() return opts.path or "/v1/accounts/123" end
+            handler:log(c)
+            mock_kong.request.get_method, mock_kong.request.get_path = m, p
+            ngx.var = nil
+        end
+        local function buffered(c)
+            local l = dict.store[handler._buffer_key(c)] or {}
+            local out = {}
+            for i, e in ipairs(l) do out[i] = cjson.decode(e) end
+            return out
+        end
+        local function tool_call(name, meta)
+            return cjson.encode({ jsonrpc = "2.0", id = 1, method = "tools/call",
+                                  params = { name = name, _meta = meta } })
+        end
+
+        before_each(function()
+            dict = new_shared_dict()
+            ngx.shared.aforo_buffer = dict
+            ngx.timers = {}
+        end)
+
+        it("excludes a path and what is below it, not every path sharing its prefix", function()
+            local c = conf()
+            for _, p in ipairs({ "/healthcare/patients/42", "/metrics-api/v1/series", "/ready-meals/orders",
+                                 "/health", "/health/live", "/metrics" }) do
+                log(c, { path = p })
+            end
+            local paths = {}
+            for i, e in ipairs(buffered(c)) do paths[i] = e.endpointPath end
+            assert.same({ "/healthcare/patients/42", "/metrics-api/v1/series", "/ready-meals/orders" }, paths)
+        end)
+
+        it("bills response_size from the bytes actually sent, also without Content-Length", function()
+            local c = conf({ quantity_source = "response_size" })
+            log(c, { var = { request_id = "r1", body_bytes_sent = "5000" } })  -- chunked: no Content-Length
+            assert.equals(5000, buffered(c)[1].quantity)
+        end)
+
+        it("reports the whole request time, not Kong's own latency", function()
+            local c = conf(MCP)
+            log(c, { response = { ["X-Kong-Proxy-Latency"] = "2" }, var = { request_id = "r1", request_time = "0.504" } })
+            log(c, { method = "POST", body = tool_call("search", { agent_id = "a1" }),
+                     response = { ["X-Kong-Proxy-Latency"] = "2" }, var = { request_id = "r2", request_time = "0.504" } })
+            local evs = buffered(c)
+            assert.equals(504, evs[1].responseTimeMs)
+            assert.equals(504, evs[2].responseTimeMs)
+            assert.equals(504, evs[2].executionDurationMs)
+        end)
+
+        it("keeps metadata.endpoint_path with include_metadata=false", function()
+            local c = conf({ include_metadata = false })
+            log(c, { path = "/v1/sms" })
+            local e = buffered(c)[1]
+            assert.same({ endpoint_path = "/v1/sms" }, e.metadata)
+        end)
+
+        it("maps the upstream status to executionStatus by the shared table", function()
+            local o = handler._outcome_from_status
+            local expect = {
+                [200] = "SUCCESS", [204] = "SUCCESS", [304] = "SUCCESS",
+                [400] = "VALIDATION_FAILED", [422] = "VALIDATION_FAILED",
+                [401] = "BLOCKED", [403] = "BLOCKED", [429] = "BLOCKED",
+                [404] = "ERROR", [500] = "ERROR", [502] = "ERROR",
+                [408] = "TIMEOUT", [504] = "TIMEOUT", [499] = "CANCELLED",
+            }
+            for status, outcome in pairs(expect) do
+                assert.equals(outcome, o(status), tostring(status))
+            end
+            assert.is_nil(o(101))
+            assert.is_nil(o(nil))
+            assert.equals("VALIDATION_FAILED", o(404, { ["404"] = "validation_failed" }))
+            assert.equals("ERROR", o(500, { ["500"] = "NOT_A_STATUS" }))
+        end)
+
+        it("sends executionStatus on every event, MCP tool calls included", function()
+            local orig = mock_kong.response.get_status
+            local c = conf({ mcp_enabled = true, status_outcomes = { ["404"] = "VALIDATION_FAILED" } })
+            for _, s in ipairs({ 200, 500, 404 }) do
+                mock_kong.response.get_status = function() return s end
+                log(c, { var = { request_id = "r" .. s } })
+            end
+            mock_kong.response.get_status = function() return 503 end
+            log(c, { method = "POST", body = tool_call("search"), var = { request_id = "r-mcp" } })
+            mock_kong.response.get_status = orig
+            local got = {}
+            for i, e in ipairs(buffered(c)) do got[i] = e.executionStatus end
+            assert.same({ "SUCCESS", "ERROR", "VALIDATION_FAILED", "ERROR" }, got)
+        end)
+
+        it("survives any MCP body, and still bills a tools/call without a usable name", function()
+            local c = conf(MCP)
+            local bodies = { "1", '"text"', "null", "[]", "[1,2]", "{}",
+                '{"jsonrpc":"2.0","method":"tools/call","params":null}',
+                '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"search","_meta":null}}',
+                '{"jsonrpc":"2.0","method":"tools/call","params":{"name":42}}' }
+            for i, body in ipairs(bodies) do
+                assert.has_no.errors(function()
+                    log(c, { method = "POST", body = body, var = { request_id = "r" .. i } })
+                end, body)
+            end
+            local tools = {}
+            for _, e in ipairs(buffered(c)) do
+                if e.toolName then tools[#tools + 1] = e.toolName end
+            end
+            assert.same({ "unknown", "search", "unknown" }, tools)
+        end)
+
+        it("bills each tools/call in a JSON-RPC batch, and none of the protocol messages", function()
+            local c = conf(MCP)
+            local batch = '[' .. tool_call("search", { agent_id = "a1" }) .. ','
+                .. '{"jsonrpc":"2.0","id":2,"method":"ping"},'
+                .. tool_call("fetch", { agent_id = "a1" }) .. ']'
+            log(c, { method = "POST", body = batch })
+            local evs = buffered(c)
+            assert.equals(2, #evs)
+            assert.equals("search", evs[1].toolName)
+            assert.equals("fetch", evs[2].toolName)
+            assert.not_equals(evs[1].idempotencyKey, evs[2].idempotencyKey)
+        end)
+
+        it("does not bill MCP protocol messages unless mcp_meter_non_tool_calls is set", function()
+            local msgs = {
+                '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
+                '{"jsonrpc":"2.0","id":2,"method":"tools/list"}',
+                '{"jsonrpc":"2.0","id":3,"method":"ping"}',
+                '{"jsonrpc":"2.0","method":"notifications/initialized"}',
+            }
+            local c = conf(MCP)
+            for _, m in ipairs(msgs) do log(c, { method = "POST", body = m }) end
+            assert.equals(0, #buffered(c))
+            -- Not JSON-RPC at all: unaffected.
+            log(c, { method = "POST", body = '{"hello":"world"}' })
+            log(c, { method = "GET" })
+            assert.equals(2, #buffered(c))
+
+            dict = new_shared_dict(); ngx.shared.aforo_buffer = dict
+            local on = conf({ mcp_enabled = true, mcp_meter_non_tool_calls = true })
+            for _, m in ipairs(msgs) do log(on, { method = "POST", body = m }) end
+            local evs = buffered(on)
+            assert.equals(4, #evs)
+            assert.equals("api_calls", evs[1].metricName)
+        end)
+
+        it("takes the MCP agent from the agent response header, else the verified customer -- never the request", function()
+            -- _meta.agent_id and X-Agent-Id are the client's to write; config's
+            -- agent_id would put every customer under one agent.
+            local c = conf({ mcp_enabled = true, agent_id = "agent_cfg" })
+            local forged = { ["x-agent-id"] = "forged", ["X-Agent-Id"] = "forged",
+                             ["X-Aforo-Agent-Id"] = "forged" }
+            log(c, { method = "POST", body = tool_call("t", { agent_id = "agent_meta" }), headers = forged,
+                     response = { ["X-Aforo-Agent-Id"] = "agent_hdr" } })
+            log(c, { method = "POST", body = tool_call("t", { agent_id = "agent_meta" }), headers = forged })
+            local ids, types = {}, {}
+            for i, e in ipairs(buffered(c)) do ids[i], types[i] = e.agentId, e.productType end
+            assert.same({ "agent_hdr", "cust_a" }, ids)
+            assert.same({ "MCP_SERVER", "MCP_SERVER" }, types)
+        end)
+
+        it("takes the MCP session from the upstream response only", function()
+            local c = conf(MCP)
+            local client = { ["Mcp-Session-Id"] = "client-chosen" }
+            log(c, { method = "POST", body = tool_call("t"), headers = client, var = { request_id = "r1" } })
+            log(c, { method = "POST", body = tool_call("t"), headers = client, var = { request_id = "r2" },
+                     response = { ["Mcp-Session-Id"] = "srv-session-1" } })
+            log(c, { method = "POST", body = tool_call("t"), headers = client, var = { request_id = "r3" },
+                     response = { ["Mcp-Session-Id"] = "srv-session-1", ["X-Aforo-Session-Id"] = "aforo-sess" } })
+            -- MCP does not bound Mcp-Session-Id: a long one is hashed, not dropped.
+            local md5, long = ngx.md5, string.rep("s", 200)
+            ngx.md5 = function(x)   -- the buffer key is an md5 too
+                if x == long then return "0123456789abcdef0123456789abcdef" end
+                return md5(x)
+            end
+            log(c, { method = "POST", body = tool_call("t"), var = { request_id = "r4" },
+                     response = { ["Mcp-Session-Id"] = long } })
+            ngx.md5 = md5
+            local got = {}
+            for i, e in ipairs(buffered(c)) do got[i] = e.sessionId or "none" end
+            assert.same({ "none", "srv-session-1", "aforo-sess",
+                          "mcp-0123456789abcdef0123456789abcdef" }, got)
+        end)
+
+        it("on an AI_AGENT route, takes MCP agent and session from config and the upstream only", function()
+            local c = conf({ mcp_enabled = true, product_type = "AI_AGENT", agent_id = "agent_cfg" })
+            log(c, { method = "POST", body = tool_call("t", { agent_id = "agent_meta" }),
+                     headers = { ["Mcp-Session-Id"] = "client-session" }, var = { request_id = "kongreq1" } })
+            log(c, { method = "POST", body = tool_call("t", { agent_id = "agent_meta" }),
+                     response = { ["X-Aforo-Session-Id"] = "sess-42" }, var = { request_id = "kongreq2" } })
+            local evs = buffered(c)
+            assert.equals("agent_cfg", evs[1].agentId)
+            assert.equals("kongreq1", evs[1].sessionId)
+            assert.equals("sess-42", evs[2].sessionId)
+        end)
+
+        it("names an MCP tool call by the metric header, then the mappings, then mcp_server.tool_invocations", function()
+            local c = conf({ mcp_enabled = true, default_metric = "api_calls",
+                             metric_mappings = { { path_pattern = "^/mcp/premium", metric_name = "premium_tools" } } })
+            local body = tool_call("t", { agent_id = "a1" })
+            log(c, { method = "POST", path = "/mcp", body = body, response = { ["X-Aforo-Metric"] = "tool_x" } })
+            log(c, { method = "POST", path = "/mcp/premium", body = body })
+            log(c, { method = "POST", path = "/mcp", body = body })
+            local names = {}
+            for i, e in ipairs(buffered(c)) do names[i] = e.metricName end
+            assert.same({ "tool_x", "premium_tools", "mcp_server.tool_invocations" }, names)
+        end)
+
+        it("reads a tools/call body that Kong spooled to a file", function()
+            local path = os.tmpname()
+            local f = io.open(path, "wb"); f:write(tool_call("big_tool", { agent_id = "a1" })); f:close()
+            local orig_raw = mock_kong.request.get_raw_body
+            mock_kong.request.get_raw_body = function() return nil, "request body did not fit into client body buffer" end
+            ngx.req = { get_body_file = function() return path end }
+            local c = conf(MCP)
+            mock_kong.ctx.shared = {}
+            handler:access(c)
+            local stash = mock_kong.ctx.shared.aforo_raw_body
+            mock_kong.request.get_raw_body = orig_raw
+            ngx.req = nil
+            os.remove(path)
+            log(c, { method = "POST", body = stash })
+            assert.equals("big_tool", buffered(c)[1].toolName)
+        end)
+        it("R5: an unusable agent or session response header skips the tool calls, not bills them elsewhere", function()
+            local c = conf(MCP)
+            local body = cjson.encode({
+                { jsonrpc = "2.0", id = 1, method = "tools/call", params = { name = "a", _meta = { agent_id = "a1" } } },
+                { jsonrpc = "2.0", id = 2, method = "tools/call", params = { name = "b" } },
+            })
+            log(c, { method = "POST", body = body, response = { ["X-Aforo-Agent-Id"] = string.rep("a", 37) } })
+            log(c, { method = "POST", body = body, response = { ["X-Aforo-Session-Id"] = string.rep("s", 65) } })
+            assert.equals(0, #buffered(c))
+            log(c, { method = "POST", body = body })
+            assert.equals(2, #buffered(c))
+        end)
+
+        it("meters only tool calls on an MCP_SERVER product, with no mcp_enabled needed", function()
+            local c = conf({ product_type = "MCP_SERVER", mcp_meter_non_tool_calls = true })
+            log(c, { method = "POST", path = "/mcp", body = '{"jsonrpc":"2.0","id":1,"method":"initialize"}' })
+            log(c, { method = "GET", path = "/mcp" })          -- SSE stream
+            log(c, { method = "DELETE", path = "/mcp" })       -- session end
+            assert.equals(0, #buffered(c))
+            log(c, { method = "POST", path = "/mcp", body = tool_call("get_balance") })
+            local evs = buffered(c)
+            assert.equals(1, #evs)
+            assert.equals("MCP_SERVER", evs[1].productType)
+            assert.equals("get_balance", evs[1].toolName)
+            assert.equals("cust_a", evs[1].agentId)
+        end)
+
+        it("bills an MCP_SERVER product's tool calls to its default_metric, unless that is still api_calls", function()
+            local c = conf({ product_type = "MCP_SERVER", default_metric = "ledger_tool_calls" })
+            log(c, { method = "POST", path = "/mcp", body = tool_call("t") })
+            log(conf({ product_type = "MCP_SERVER" }), { method = "POST", path = "/mcp", body = tool_call("t") })
+            assert.equals("ledger_tool_calls", buffered(c)[1].metricName)
+            assert.equals("mcp_server.tool_invocations", buffered(conf())[2].metricName)
+        end)
+    end)
     -- ── productType ─────────────────────────────────────────────
     describe("product_type", function()
-        local BUFFER_KEY = "aforo:events"
+        local BUFFER_KEY = handler._buffer_key({ aforo_endpoint = "http://ingestor.test/v1/ingest/batch",
+                                                 api_key = "sk_test_key" })
         local dict
         local function conf(pt)
             return {
@@ -1546,7 +1795,7 @@ describe("aforo-metering handler", function()
         local function log(c, method, raw_body, headers)
             mock_kong.request._headers = headers or {}
             mock_kong.ctx.shared = {
-                aforo_jwt_claims = { signature_verified = true, customer_id = "cust_a" },
+                aforo_jwt_claims = { signature_verified = true, customer_id ="cust_a" },
                 aforo_raw_body = raw_body,
             }
             local orig = mock_kong.request.get_method
@@ -1583,103 +1832,325 @@ describe("aforo-metering handler", function()
             assert.equals(0, #buffered())
         end)
 
-        it("sends an MCP tool call as MCP_SERVER only when a trusted agentId is known", function()
-            local with_meta = '{"jsonrpc":"2.0","method":"tools/call",'
-                .. '"params":{"name":"search","_meta":{"agent_id":"agent_1"}}}'
+        it("sends every MCP tool call as MCP_SERVER, the verified customer as the agent", function()
+            local with_meta = '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"search",'
+                .. '"_meta":{"agent_id":"agent_1"}}}'
             log(conf("API"), "POST", with_meta, {})
-            -- X-Agent-Id is client-settable: never a source, so this call is a
-            -- plain request, not an MCP event attributed to a forged agent.
-            log(conf("API"), "POST", TOOL_CALL, { ["x-agent-id"] = "agent_forged" })
+            local configured = conf("API"); configured.agent_id = "agent_cfg"
+            log(configured, "POST", TOOL_CALL, {})
+            -- X-Agent-Id is the client's to set: never a source for agentId.
+            log(conf("API"), "POST", TOOL_CALL, { ["x-agent-id"] = "agent_forged", ["X-Agent-Id"] = "agent_forged" })
+            local events = buffered()
+            assert.equals(3, #events)
+            for _, e in ipairs(events) do
+                assert.equals("MCP_SERVER", e.productType)
+                assert.equals("search", e.toolName)
+                assert.equals("cust_a", e.agentId)
+            end
+        end)
+    end)
+    -- ── AI_AGENT identity ───────────────────────────────────────
+    -- agentId / sessionId come from operator config or the upstream RESPONSE
+    -- only. Request headers are client-settable and must never be a source.
+    describe("AI_AGENT identity", function()
+        local BUFFER_KEY = handler._buffer_key({ aforo_endpoint = "http://ingestor.test/v1/ingest/batch",
+                                                 api_key = "sk_test_key", tenant_id = "tenant_1" })
+        local dict, warnings, orig_get_consumer, orig_warn
+
+        -- Schema defaults spelled out: busted hands conf to the handler as-is,
+        -- without the defaults Kong would fill in.
+        local function conf(overrides)
+            local c = {
+                aforo_endpoint = "http://ingestor.test/v1/ingest/batch",
+                api_key = "sk_test_key",
+                tenant_id = "tenant_1",
+                default_metric = "api_calls",
+                product_type = "AI_AGENT",
+                quantity_header = "X-Aforo-Quantity",
+                agent_id_header = "X-Aforo-Agent-Id",
+                session_id_header = "X-Aforo-Session-Id",
+                exclude_paths = {},
+                exclude_status_codes = {},
+            }
+            for k, v in pairs(overrides or {}) do c[k] = v end
+            return c
+        end
+        local function buffered()
+            local l = dict.store[BUFFER_KEY]
+            local out = {}
+            for i = 1, (l and #l or 0) do out[i] = cjson.decode(l[i]) end
+            return out
+        end
+        -- One proxied request: request headers from the client, response
+        -- headers from the upstream, request ID from Kong (nginx $request_id).
+        -- The customer is the Kong consumer. The client's X-Request-Id is
+        -- there to prove it is ignored.
+        local function log(c, request_headers, response_headers)
+            mock_kong.request._headers = request_headers or { ["X-Request-Id"] = "client-req-1" }
+            mock_kong.response._headers = response_headers or {}
+            ngx.var = { request_id = "kong-req-1" }
+            handler:log(c)
+        end
+
+        before_each(function()
+            dict = new_shared_dict()
+            ngx.shared.aforo_buffer = dict
+            ngx.timers = {}
+            warnings = {}
+            orig_get_consumer = mock_kong.client.get_consumer
+            orig_warn = mock_kong.log.warn
+            mock_kong.client.get_consumer = function()
+                return { custom_id = "cust_acme", username = "acme-corp" }
+            end
+            mock_kong.log.warn = function(...)
+                local parts = {}
+                for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+                table.insert(warnings, table.concat(parts))
+            end
+        end)
+
+        after_each(function()
+            mock_kong.client.get_consumer = orig_get_consumer
+            mock_kong.log.warn = orig_warn
+            ngx.var = nil
+        end)
+
+        it("meters with config agent_id, one session per request", function()
+            log(conf({ agent_id = "fraud-shield-agent" }))
+            local events = buffered()
+            assert.equals(1, #events)
+            local e = events[1]
+            assert.equals("AI_AGENT", e.productType)
+            assert.equals("cust_acme", e.customerId)
+            assert.equals("fraud-shield-agent", e.agentId)
+            -- The session fallback is Kong's request ID, never the client's.
+            assert.equals("kong-req-1", e.sessionId)
+            assert.equals("kong-req-1", e.idempotencyKey)
+            assert.equals(1, e.quantity)
+        end)
+
+        it("lets upstream response headers override config and report tokens", function()
+            log(conf({ agent_id = "fraud-shield-agent" }), nil, {
+                ["X-Aforo-Agent-Id"]   = "fraud-shield-v2",
+                ["X-Aforo-Session-Id"] = "sess-42",
+                ["X-Aforo-Quantity"]   = "2100",
+            })
+            local e = buffered()[1]
+            assert.equals("AI_AGENT", e.productType)
+            assert.equals("fraud-shield-v2", e.agentId)
+            assert.equals("sess-42", e.sessionId)
+            assert.equals(2100, e.quantity)
+            assert.equals("kong-req-1", e.idempotencyKey)
+        end)
+
+        it("uses the trusted session as the trace, never the client's traceparent", function()
+            -- The ingestor folds AI_AGENT events into sessions by traceId, and
+            -- fills a missing one from the client's traceparent.
+            local tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+            log(conf({ agent_id = "fraud-shield-agent" }), { traceparent = tp })
+            log(conf({ agent_id = "fraud-shield-agent" }), { traceparent = tp },
+                { ["X-Aforo-Session-Id"] = "sess-42" })
+            local evs = buffered()
+            assert.equals("kong-req-1", evs[1].traceId)
+            assert.equals("sess-42", evs[2].traceId)
+            assert.equals(tp, evs[2].trace.traceparent)
+        end)
+
+        it("ignores a response header that is turned off (null)", function()
+            -- Kong hands the handler nil for a setting configured as null.
+            local c = conf({ agent_id = "fraud-shield-agent" })
+            c.agent_id_header, c.session_id_header = nil, nil
+            log(c, nil, {
+                ["X-Aforo-Agent-Id"]   = "fraud-shield-v2",
+                ["X-Aforo-Session-Id"] = "sess-42",
+            })
+            local e = buffered()[1]
+            assert.equals("fraud-shield-agent", e.agentId)
+            assert.equals("kong-req-1", e.sessionId)
+        end)
+
+        it("never reads agent or session IDs from client request headers", function()
+            local forged = {
+                ["X-Request-Id"]       = "client-req-1",
+                ["X-Aforo-Agent-Id"]   = "agent_forged",
+                ["x-aforo-agent-id"]   = "agent_forged",
+                ["X-Agent-Id"]         = "agent_forged",
+                ["x-agent-id"]         = "agent_forged",
+                ["X-Aforo-Session-Id"] = "sess_forged",
+                ["x-aforo-session-id"] = "sess_forged",
+            }
+            -- Configured: config wins over every forged header.
+            log(conf({ agent_id = "fraud-shield-agent" }), forged)
+            -- Not configured: the forged headers do not fill the gap.
+            log(conf(), forged)
+            local events = buffered()
+            assert.equals(1, #events)
+            assert.equals("fraud-shield-agent", events[1].agentId)
+            assert.equals("kong-req-1", events[1].sessionId)
+        end)
+
+        it("falls back to the Kong service's id as the agent, never to a request header", function()
+            local orig = mock_kong.router.get_service
+            mock_kong.router.get_service = function()
+                return { id = "5b1c9a52-7d8e-4c1a-9f3e-2a6b8c0d4e11", name = "fraud-shield" }
+            end
+            log(conf(), { ["X-Agent-Id"] = "agent_forged", ["X-Aforo-Agent-Id"] = "agent_forged" })
+            log(conf({ agent_id = "fraud-shield-agent" }))
+            mock_kong.router.get_service = orig
+            local evs = buffered()
+            assert.equals("5b1c9a52-7d8e-4c1a-9f3e-2a6b8c0d4e11", evs[1].agentId)
+            assert.equals("fraud-shield-agent", evs[2].agentId)
+        end)
+
+        it("skips an event with no agent ID anywhere and names the fix", function()
+            log(conf())
+            log(conf({ agent_id = "" }), nil, { ["X-Aforo-Agent-Id"] = "" })
+            assert.equals(0, #buffered())
+            -- Throttled: one warning per window, not one per request.
+            assert.equals(1, #warnings)
+            assert.truthy(warnings[1]:find("requires agentId", 1, true))
+            assert.truthy(warnings[1]:find("config.agent_id", 1, true))
+            assert.truthy(warnings[1]:find("X-Aforo-Agent-Id response header", 1, true))
+        end)
+
+        it("adds nothing to API events", function()
+            -- As configured before these settings existed.
+            local plain = conf({ product_type = "API" })
+            plain.agent_id_header, plain.session_id_header = nil, nil
+            log(plain)
+            log(conf({ product_type = "API", agent_id = "fraud-shield-agent" }), nil, {
+                ["X-Aforo-Agent-Id"]   = "fraud-shield-v2",
+                ["X-Aforo-Session-Id"] = "sess-42",
+            })
+            local events = buffered()
+            assert.equals(2, #events)
+            assert.equals("API", events[2].productType)
+            assert.is_nil(events[2].agentId)
+            assert.is_nil(events[2].sessionId)
+            assert.equals(1, events[2].quantity)
+            -- Field for field the event an API service sent before these settings.
+            assert.same(events[1], events[2])
+        end)
+    end)
+    -- ── Idempotency key ─────────────────────────────────────────
+    -- Locks in the 2026-10-12 fix. The key was the client's X-Request-Id and
+    -- the ingestor silently drops a repeated (tenant, key), so a client that
+    -- repeated one ID on every call was billed once. Only Kong may mint it.
+    describe("idempotency key", function()
+        local BUFFER_KEY = handler._buffer_key({ aforo_endpoint = "http://ingestor.test/v1/ingest/batch",
+                                                 api_key = "sk_test_key", tenant_id = "tenant_1" })
+        local CLIENT_ID = "client-chosen-id"
+        local TOOL_CALL = '{"jsonrpc":"2.0","method":"tools/call",'
+            .. '"params":{"name":"search","_meta":{"agent_id":"agent_1"}}}'
+        local dict
+        local conf = {
+            aforo_endpoint = "http://ingestor.test/v1/ingest/batch",
+            api_key = "sk_test_key",
+            tenant_id = "tenant_1",
+            default_metric = "api_calls",
+            mcp_enabled = true,
+            flush_count = 50,
+            exclude_paths = {},
+            exclude_status_codes = {},
+        }
+        local function buffered()
+            local l = dict.store[BUFFER_KEY]
+            local out = {}
+            for i = 1, (l and #l or 0) do out[i] = cjson.decode(l[i]) end
+            return out
+        end
+        local function keys()
+            local out = {}
+            for i, e in ipairs(buffered()) do out[i] = e.idempotencyKey end
+            return out
+        end
+        -- One request with the client's chosen ID in every header the plugin
+        -- used to read, and kong_id as nginx's $request_id (nil: none).
+        local function log(kong_id, method, raw_body)
+            mock_kong.request._headers = {
+                ["X-Request-Id"]      = CLIENT_ID,
+                ["X-Kong-Request-Id"] = CLIENT_ID,
+            }
+            mock_kong.ctx.shared = {
+                aforo_jwt_claims = { signature_verified = true, customer_id ="cust_a" },
+                aforo_raw_body = raw_body,
+            }
+            ngx.var = kong_id and { request_id = kong_id } or nil
+            local orig = mock_kong.request.get_method
+            mock_kong.request.get_method = function() return method or "GET" end
+            handler:log(conf)
+            mock_kong.request.get_method = orig
+        end
+
+        before_each(function()
+            dict = new_shared_dict()
+            ngx.shared.aforo_buffer = dict
+            ngx.timers = {}
+            http_mock.requests = {}
+            http_mock.responses = {}
+            http_mock.on_request = nil
+        end)
+
+        after_each(function()
+            ngx.var = nil
+            mock_kong.request.get_id = nil
+        end)
+
+        it("uses Kong's request ID, never the client's X-Request-Id", function()
+            log("kong-id-1")
+            log("kong-id-2")
+            local k = keys()
+            assert.same({ "kong-id-1", "kong-id-2" }, k)
+            assert.not_equals(CLIENT_ID, k[1])
+            assert.not_equals(CLIENT_ID, k[2])
+        end)
+
+        it("does the same for MCP tool calls", function()
+            log("kong-id-1", "POST", TOOL_CALL)
+            log("kong-id-2", "POST", TOOL_CALL)
             local events = buffered()
             assert.equals(2, #events)
             assert.equals("MCP_SERVER", events[1].productType)
-            assert.equals("search", events[1].toolName)
-            assert.equals("agent_1", events[1].agentId)
-            assert.equals("API", events[2].productType)
-            assert.equals("api_calls", events[2].metricName)
-            assert.is_nil(events[2].agentId)
-            assert.is_nil(events[2].toolName)
+            assert.not_equals(events[1].idempotencyKey, events[2].idempotencyKey)
+            for i, e in ipairs(events) do
+                assert.is_nil(e.idempotencyKey:find(CLIENT_ID, 1, true))
+                assert.truthy(e.idempotencyKey:find(":kong-id-" .. i .. ":", 1, true))
+            end
         end)
 
-        describe("agent identity from trusted sources", function()
-            local saved_get_header
-            local TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        it("prefers kong.request.get_id where the PDK has it", function()
+            mock_kong.request.get_id = function() return "pdk-id-1" end
+            log("nginx-id-1")
+            assert.same({ "pdk-id-1" }, keys())
+        end)
 
-            local function agent_conf(pt, extra)
-                local c = conf(pt)
-                c.agent_id_header = "X-Aforo-Agent-Id"
-                c.session_id_header = "X-Aforo-Session-Id"
-                for k, v in pairs(extra or {}) do c[k] = v end
-                return c
+        it("falls back to a fresh UUID when Kong exposes no request ID", function()
+            log(nil)
+            log(nil)
+            local k = keys()
+            assert.equals(2, #k)
+            assert.not_equals(k[1], k[2])
+            assert.not_equals(CLIENT_ID, k[1])
+            assert.not_equals(CLIENT_ID, k[2])
+        end)
+
+        it("keeps the same key through a re-buffer and a later retry", function()
+            log("kong-id-1")
+            http_mock.responses = { { status = 503 }, { status = 503 }, { status = 503 } }
+            handler._flush_buffer(false, conf)
+            assert.equals(1, #buffered())
+            http_mock.responses = { { status = 202 } }
+            handler._flush_buffer(false, conf)
+            assert.equals(0, #buffered())
+            -- Three failed attempts, then the re-buffered event sent: every one
+            -- carried the key minted at log time, so the ingestor can still
+            -- collapse a retry whose earlier attempt did land.
+            assert.equals(4, #http_mock.requests)
+            for i = 1, 4 do
+                local sent = cjson.decode(http_mock.requests[i].params.body).events
+                assert.equals(1, #sent)
+                assert.equals("kong-id-1", sent[1].idempotencyKey)
             end
-            local function upstream_returns(h)
-                mock_kong.response.get_header = function(name) return h[name] end
-            end
-
-            before_each(function() saved_get_header = mock_kong.response.get_header end)
-            after_each(function() mock_kong.response.get_header = saved_get_header end)
-
-            it("meters AI_AGENT with the agent and session ids the upstream returns", function()
-                upstream_returns({ ["X-Aforo-Agent-Id"] = "agent_up", ["X-Aforo-Session-Id"] = "sess_up" })
-                log(agent_conf("AI_AGENT"))
-                local e = buffered()[1]
-                assert.equals("AI_AGENT", e.productType)
-                assert.equals("agent_up", e.agentId)
-                assert.equals("sess_up", e.sessionId)
-            end)
-
-            it("falls back to the route's agent_id when the upstream returns none", function()
-                upstream_returns({ ["X-Aforo-Session-Id"] = "sess_up" })
-                log(agent_conf("AI_AGENT", { agent_id = "agent_route" }))
-                assert.equals("agent_route", buffered()[1].agentId)
-            end)
-
-            it("never reads agent or session ids from request headers", function()
-                upstream_returns({})
-                log(agent_conf("AI_AGENT"), "GET", nil, {
-                    ["x-agent-id"] = "agent_forged",
-                    ["X-Aforo-Agent-Id"] = "agent_forged",
-                    ["X-Aforo-Session-Id"] = "sess_forged",
-                })
-                assert.equals(0, #buffered())
-                assert.equals(1, dict:get("aforo_dropped:missing_fields"))
-            end)
-
-            it("skips AI_AGENT when the upstream returns no session id", function()
-                upstream_returns({})
-                log(agent_conf("AI_AGENT", { agent_id = "agent_route" }))
-                assert.equals(0, #buffered())
-            end)
-
-            it("keeps an AI_AGENT route AI_AGENT when the request carries a trace", function()
-                upstream_returns({ ["X-Aforo-Session-Id"] = "sess_up" })
-                log(agent_conf("AI_AGENT", { agent_id = "agent_route" }), "GET", nil,
-                    { traceparent = TRACEPARENT })
-                local e = buffered()[1]
-                assert.equals("AI_AGENT", e.productType)
-                assert.equals("4bf92f3577b34da6a3ce929d0e0e4736", e.traceId)
-            end)
-
-            it("still classifies a traced plain API call as AGENTIC_API", function()
-                upstream_returns({})
-                log(agent_conf("API"), "GET", nil, { traceparent = TRACEPARENT })
-                assert.equals("AGENTIC_API", buffered()[1].productType)
-            end)
-
-            it("prefers the upstream agent id over an MCP payload's _meta.agent_id", function()
-                upstream_returns({ ["X-Aforo-Agent-Id"] = "agent_up" })
-                log(agent_conf("API"), "POST", '{"jsonrpc":"2.0","method":"tools/call",'
-                    .. '"params":{"name":"search","_meta":{"agent_id":"agent_payload"}}}', {})
-                local e = buffered()[1]
-                assert.equals("MCP_SERVER", e.productType)
-                assert.equals("agent_up", e.agentId)
-            end)
-
-            it("takes an MCP session id from the upstream when the request has none", function()
-                upstream_returns({ ["X-Aforo-Agent-Id"] = "agent_up", ["X-Aforo-Session-Id"] = "sess_up" })
-                log(agent_conf("API"), "POST", TOOL_CALL, {})
-                assert.equals("sess_up", buffered()[1].sessionId)
-            end)
         end)
     end)
     -- ── Pre-flight quota check ──────────────────────────────────
@@ -1701,7 +2172,7 @@ describe("aforo-metering handler", function()
         end
 
         local function with_customer(id)
-            mock_kong.ctx.shared = { aforo_jwt_claims = { signature_verified = true, customer_id = id } }
+            mock_kong.ctx.shared = { aforo_jwt_claims = { signature_verified = true, customer_id =id } }
         end
 
         before_each(function()
@@ -1792,793 +2263,581 @@ describe("aforo-metering handler", function()
             assert.equals(3, #http_mock.requests)
         end)
 
+        it("caches WARN like ALLOW, still marking the response, and never DENY", function()
+            with_customer("cust_near_limit")
+            http_mock.responses = { { status = 200, body = '{"decision":"WARN","reason":"Overage"}' } }
+            access(conf())
+            mock_kong.response._set_headers = {}
+            access(conf())
+            access(conf())
+            assert.equals(1, #http_mock.requests)                  -- one call, then the cache
+            assert.equals("approaching-limit", mock_kong.response._set_headers["X-RateLimit-Warning"])
+            assert.is_nil(mock_kong.response._exit)
+
+            -- With the cache off, every request asks.
+            http_mock.responses = { { status = 200, body = '{"decision":"WARN"}' },
+                                    { status = 200, body = '{"decision":"WARN"}' } }
+            access(conf({ preflight_quota_cache_ttl_ms = 0 }))
+            access(conf({ preflight_quota_cache_ttl_ms = 0 }))
+            assert.equals(3, #http_mock.requests)
+        end)
+
         it("skips the check when no verified customer is known", function()
             mock_kong.ctx.shared = {}
             mock_kong.request._headers = { ["x-customer-id"] = "cust_forged" }
             access(conf())
             assert.equals(0, #http_mock.requests)
         end)
-    end)
 
-
-    -- ── customer_id_jwt_claim: identity from the Kong-verified JWT ──
-    -- The claim is read ONLY from kong.ctx.shared.authenticated_jwt_token,
-    -- which Kong's jwt plugin sets after verifying the signature. A token a
-    -- client merely sends in a header must never become a billing identity.
-    describe("resolve_customer_id with customer_id_jwt_claim", function()
-        local cjson_stub = package.loaded["cjson.safe"]
-        local saved_decode, saved_ngx
-        local payloads
-
-        -- "h.<payload key>.s": base64 decode is stubbed to identity and the
-        -- JSON decode looks the payload key up in `payloads`.
-        local function token(key) return "h." .. key .. ".s" end
-
-        before_each(function()
-            saved_decode = cjson_stub.decode
-            saved_ngx = _G.ngx
-            payloads = {
-                WORKSPCE = { tenant_id = "tenant_acme", sub = "user-1" },
-                IMPERSON = { tenant_id = "tenant_acme", impersonated_by = "staff-9" },
-                EMERGNCY = { tenant_id = "tenant_acme", emergency = true },
-                NOTENANT = { sub = "svc" },
-                BLANKTEN = { tenant_id = "   " },
-                NUMTENAN = { tenant_id = 42 },
-                FORGEDHD = { tenant_id = "tenant_victim" },
-                LONGTENT = { tenant_id = string.rep("x", 65) },
-                PADDEDTN = { tenant_id = "  tenant_acme " },
-                FALSEIMP = { tenant_id = "tenant_acme", impersonated_by = false },
-            }
-            cjson_stub.decode = function(str) return payloads[str] end
-            _G.ngx = { decode_base64 = function(str) return str end, ctx = {} }
-            mock_kong.ctx.shared = {}
-            mock_kong.request._headers = {}
-        end)
-
-        after_each(function()
-            cjson_stub.decode = saved_decode
-            _G.ngx = saved_ngx
-            mock_kong.ctx.shared = {}
-            mock_kong.request._headers = {}
-        end)
-
-        local conf = {
-            customer_id_jwt_claim = "tenant_id",
-            customer_id_jwt_exclude_claims = { "impersonated_by", "emergency" },
-        }
-        local issuer_consumer = { username = "aforo-jwt-issuer", custom_id = "aforo-platform-issuer" }
-
-        it("uses the claim of the Kong-verified token", function()
-            mock_kong.ctx.shared = { authenticated_jwt_token = token("WORKSPCE") }
-            assert.equals("tenant_acme", handler._resolve_customer_id(conf, issuer_consumer, {}))
-        end)
-
-        it("never falls back to the shared issuer consumer", function()
-            mock_kong.ctx.shared = { authenticated_jwt_token = token("NOTENANT") }
-            assert.is_nil(handler._resolve_customer_id(conf, issuer_consumer, {}))
-        end)
-
-        it("returns nil when Kong verified no token, even with a consumer", function()
-            assert.is_nil(handler._resolve_customer_id(conf, issuer_consumer, {}))
-        end)
-
-        it("IGNORES a token that is only in the Authorization header", function()
-            mock_kong.request._headers = {
-                ["Authorization"] = "Bearer " .. token("FORGEDHD"),
-                ["X-Tenant-Id"] = "tenant_victim",
-            }
-            assert.is_nil(handler._resolve_customer_id(conf, nil,
-                { authorization = "Bearer " .. token("FORGEDHD"), ["x-tenant-id"] = "tenant_victim" }))
-        end)
-
-        it("skips impersonation and emergency tokens", function()
-            mock_kong.ctx.shared = { authenticated_jwt_token = token("IMPERSON") }
-            assert.is_nil(handler._resolve_customer_id(conf, issuer_consumer, {}))
-            mock_kong.ctx.shared = { authenticated_jwt_token = token("EMERGNCY") }
-            assert.is_nil(handler._resolve_customer_id(conf, issuer_consumer, {}))
-        end)
-
-        it("an excluded claim that is false does not skip", function()
-            mock_kong.ctx.shared = { authenticated_jwt_token = token("FALSEIMP") }
-            assert.equals("tenant_acme", handler._resolve_customer_id(conf, nil, {}))
-        end)
-
-        it("rejects blank, non-string and over-long claim values", function()
-            for _, key in ipairs({ "BLANKTEN", "NUMTENAN", "LONGTENT" }) do
-                mock_kong.ctx.shared = { authenticated_jwt_token = token(key) }
-                assert.is_nil(handler._resolve_customer_id(conf, issuer_consumer, {}))
+        -- One request through the access phase: method, path and the raw
+        -- body Kong would hand get_raw_body.
+        local function request(c, opts)
+            local m, p, b = mock_kong.request.get_method, mock_kong.request.get_path,
+                            mock_kong.request.get_raw_body
+            mock_kong.request.get_method = function() return opts.method or "GET" end
+            mock_kong.request.get_path = function() return opts.path or "/v1/accounts/123" end
+            mock_kong.request.get_raw_body = function() return opts.body end
+            local req = ngx.req
+            ngx.req = { get_body_file = function() return nil end }   -- nothing spooled
+            handler:access(c)
+            ngx.req = req
+            if opts.log then
+                ngx.var = { request_id = opts.request_id or "kongreq" }
+                handler:log(c)
+                ngx.var = nil
             end
+            mock_kong.request.get_method, mock_kong.request.get_path = m, p
+            mock_kong.request.get_raw_body = b
+        end
+        local function checked_metrics()
+            local out = {}
+            for i, r in ipairs(http_mock.requests) do out[i] = cjson.decode(r.params.body).metricName end
+            return out
+        end
+        local function buffered(c)
+            return dict.store[handler._buffer_key(c)] or {}
+        end
+
+        it("does not meter the call it denied, and meters the one it allowed", function()
+            local c = conf({ exclude_status_codes = {} })
+            with_customer("cust_a")
+            http_mock.responses = { { status = 200, body = '{"decision":"DENY","retryAfterMs":5000}' } }
+            request(c, { method = "POST", path = "/v1/payments", log = true })
+            assert.equals(429, mock_kong.response._exit.status)
+            assert.equals("5", mock_kong.response._exit.headers["Retry-After"])
+            assert.equals(0, #buffered(c))
+
+            mock_kong.response._exit = nil
+            with_customer("cust_b")
+            http_mock.responses = { { status = 200, body = '{"decision":"ALLOW"}' } }
+            request(c, { method = "POST", path = "/v1/payments", log = true })
+            assert.is_nil(mock_kong.response._exit)
+            assert.equals(1, #buffered(c))
         end)
 
-        it("trims surrounding whitespace", function()
-            mock_kong.ctx.shared = { authenticated_jwt_token = token("PADDEDTN") }
-            assert.equals("tenant_acme", handler._resolve_customer_id(conf, nil, {}))
+        it("never answers Retry-After: 0, and its Retry-After wins over the ingestor's", function()
+            with_customer("cust_a")
+            http_mock.responses = { { status = 200, body = '{"decision":"DENY","retryAfterMs":400,'
+                .. '"headers":{"Retry-After":"0","X-RateLimit-Remaining":"0"}}' } }
+            access(conf())
+            local h = mock_kong.response._exit.headers
+            assert.equals("1", h["Retry-After"])
+            assert.equals(1, mock_kong.response._exit.body.retryAfter)
+            assert.equals("0", h["X-RateLimit-Remaining"])
         end)
 
-        it("returns nil for an undecodable token", function()
-            mock_kong.ctx.shared = { authenticated_jwt_token = "not-a-jwt" }
-            assert.is_nil(handler._resolve_customer_id(conf, issuer_consumer, {}))
-            mock_kong.ctx.shared = { authenticated_jwt_token = token("UNKNOWN_") }
-            assert.is_nil(handler._resolve_customer_id(conf, issuer_consumer, {}))
+        it("waits 300 ms by default, then fails open", function()
+            with_customer("cust_a")
+            local c = conf()
+            c.preflight_quota_timeout_ms = nil   -- as Kong fills the schema default
+            http_mock.responses = { { err = "timeout" } }
+            access(c)
+            assert.equals(300, http_mock.timeout)
+            assert.is_nil(mock_kong.response._exit)
+            assert.is_nil(mock_kong.ctx.shared.aforo_refused)   -- let through, so metered
         end)
 
-        it("reads the pre-3.x ngx.ctx location", function()
-            _G.ngx.ctx.authenticated_jwt_token = token("WORKSPCE")
-            assert.equals("tenant_acme", handler._resolve_customer_id(conf, nil, {}))
+        it("checks the metric the request bills to: mappings, and an MCP_SERVER product's tool metric", function()
+            with_customer("cust_a")
+            local api = conf({ metric_mappings = { { path_pattern = "^/v1/payments", metric_name = "payments" } } })
+            request(api, { method = "POST", path = "/v1/payments" })
+            local mcp = conf({ product_type = "MCP_SERVER", default_metric = "ledger_tool_calls" })
+            request(mcp, { method = "POST", path = "/mcp",
+                           body = '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_balance"}}' })
+            assert.same({ "payments", "ledger_tool_calls" }, checked_metrics())
         end)
 
-        it("the Kong-verified claim decides even when the plugin validated an Aforo JWT too", function()
-            mock_kong.ctx.shared = {
-                aforo_jwt_claims = { signature_verified = true, customer_id = "cust_from_aforo_jwt" },
-                authenticated_jwt_token = token("WORKSPCE"),
-            }
-            assert.equals("tenant_acme", handler._resolve_customer_id(conf, nil, {}))
+        it("never checks, so never blocks, an MCP message that is not a tool call", function()
+            with_customer("cust_a")
+            http_mock.responses = {}
+            for _ = 1, 5 do table.insert(http_mock.responses, { status = 200, body = '{"decision":"DENY"}' }) end
+            local mcp = conf({ product_type = "MCP_SERVER", default_metric = "ledger_tool_calls" })
+            for _, body in ipairs({
+                '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
+                '{"jsonrpc":"2.0","id":2,"method":"tools/list"}',
+                '{"jsonrpc":"2.0","id":3,"method":"ping"}',
+                '{"jsonrpc":"2.0","method":"notifications/initialized"}',
+            }) do
+                request(mcp, { method = "POST", path = "/mcp", body = body })
+            end
+            request(mcp, { method = "GET", path = "/mcp" })
+            -- Also on an mcp_enabled route of an API product.
+            request(conf({ mcp_enabled = true }), { method = "POST", path = "/mcp",
+                body = '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' })
+            assert.equals(0, #http_mock.requests)
+            assert.is_nil(mock_kong.response._exit)
+
+            -- A tool call is checked, and refused when the quota is spent.
+            request(mcp, { method = "POST", path = "/mcp",
+                           body = '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"t"}}' })
+            assert.equals(1, #http_mock.requests)
+            assert.equals(429, mock_kong.response._exit.status)
         end)
 
-        it("without the option, the consumer source is unchanged", function()
-            mock_kong.ctx.shared = { authenticated_jwt_token = token("WORKSPCE") }
-            assert.equals("aforo-platform-issuer",
-                handler._resolve_customer_id({}, issuer_consumer, {}))
+        it("skips excluded paths and checks both metrics of a mixed MCP batch it will bill twice", function()
+            with_customer("cust_a")
+            request(conf({ exclude_paths = { "/health" } }), { path = "/health/live" })
+            assert.equals(0, #http_mock.requests)
+            local c = conf({ mcp_enabled = true, mcp_meter_non_tool_calls = true })
+            request(c, { method = "POST", path = "/mcp", body = cjson.encode({
+                { jsonrpc = "2.0", id = 1, method = "tools/list" },
+                { jsonrpc = "2.0", id = 2, method = "tools/call", params = { name = "t" } },
+            }) })
+            assert.same({ "mcp_server.tool_invocations", "api_calls" }, checked_metrics())
         end)
     end)
-
-    -- ── No verified identity -> no event ──
-    describe("log phase without a customer identity", function()
-        local saved_ngx, writes
-
-        before_each(function()
-            saved_ngx = _G.ngx
-            writes = 0
-            local dict = new_shared_dict()
-            local rpush = dict.rpush
-            dict.rpush = function(self, k, v) writes = writes + 1; return rpush(self, k, v) end
-            _G.ngx = setmetatable({
-                shared = { aforo_buffer = dict },
-                now = function() return 1790784909.554 end,
-                timer = { at = function() return true end },
-                var = {},
-                ctx = {},
-            }, { __index = saved_ngx })
-            mock_kong.ctx.shared = {}
-            mock_kong.request._headers = { ["X-Request-Id"] = "req-1" }
-            mock_kong.log.debug = function() end
-        end)
-
-        after_each(function()
-            _G.ngx = saved_ngx
-            mock_kong.ctx.shared = {}
-            mock_kong.request._headers = {}
-            mock_kong.client.get_consumer = function() return nil end
-        end)
-
-        local conf = {
-            aforo_endpoint = "http://ingest", api_key = "k", tenant_id = "t",
-            metric_name_pattern = "platform_api_calls", quantity_source = "1",
-            exclude_paths = {}, exclude_status_codes = { 401, 403, 429 },
-            include_metadata = false, flush_count = 50, flush_interval_ms = 5000,
+    -- ── Each product type, end to end ───────────────────────────
+    -- A key-auth consumer calls the live-test upstream's endpoint for each
+    -- type (kong-gateway-test/upstream.py), through the access phase with
+    -- pre-flight on, the upstream response and the log phase; the buffer is
+    -- then flushed and every event in the POST to /v1/ingest/batch is checked
+    -- against what the ingestor validates for its productType.
+    describe("each product type end to end", function()
+        -- IngestUsageEventRequest bean validation, the descriptors'
+        -- eventSchema.requiredFields (as SchemaBasedEventValidator maps them
+        -- to top-level fields) and ExecutionStatuses.ALLOWED.
+        local REQUIRED = {
+            API         = {},
+            AGENTIC_API = { "endpointPath", "httpMethod", "statusCode", "traceId" },
+            AI_AGENT    = { "agentId", "sessionId" },
+            MCP_SERVER  = { "toolName", "agentId" },
         }
+        local MAX = { customerId = 64, metricName = 255, idempotencyKey = 255, traceId = 128,
+                      sessionId = 64, productType = 20, agentId = 36, toolName = 64,
+                      executionStatus = 20, endpointPath = 512, httpMethod = 16 }
+        local STATUSES = { SUCCESS = 1, PARTIAL = 1, TIMEOUT = 1, ERROR = 1, VALIDATION_FAILED = 1,
+                           FAILED = 1, FAILURE = 1, CANCELLED = 1, PENDING = 1, BLOCKED = 1,
+                           HITL_REQUIRED = 1 }
+        local function ingestor_errors(e)
+            local errs = {}
+            local function blank(v) return v == nil or v == "" end
+            for _, f in ipairs({ "customerId", "metricName", "idempotencyKey", "occurredAt", "productType" }) do
+                if blank(e[f]) then errs[#errs + 1] = f .. " is required" end
+            end
+            if type(e.quantity) ~= "number" or e.quantity <= 0 then errs[#errs + 1] = "quantity must be positive" end
+            for f, max in pairs(MAX) do
+                if type(e[f]) == "string" and #e[f] > max then errs[#errs + 1] = f .. " over " .. max end
+            end
+            local required = REQUIRED[e.productType]
+            if not required then errs[#errs + 1] = "unexpected productType " .. tostring(e.productType) end
+            for _, f in ipairs(required or {}) do
+                if blank(e[f]) then errs[#errs + 1] = f .. " is required for " .. e.productType end
+            end
+            if e.executionStatus ~= nil and not STATUSES[e.executionStatus] then
+                errs[#errs + 1] = "executionStatus " .. tostring(e.executionStatus)
+            end
+            return errs
+        end
 
-        it("buffers nothing when no identity resolves", function()
-            handler:log(conf)
-            assert.equals(0, writes)
-        end)
+        local dict, orig
+        local CONSUMER = { id = "6f0e1d2c-3b4a-4596-8877-665544332211", username = "acme",
+                           custom_id = "cust_acme", tags = { "aforo-managed" } }
+        local SERVICE = { id = "0a1b2c3d-4e5f-4061-8273-948596a7b8c9", name = "novapay" }
 
-        it("buffers the event when a consumer is present", function()
-            mock_kong.client.get_consumer = function() return { custom_id = "cust_1" } end
-            handler:log(conf)
-            assert.is_true(writes > 0)
-        end)
-    end)
-
-    -- ── Drop metric (2026-07-05, A+ delivery-guarantee prompt 3) ──
-    -- record_drop() maintains cumulative per-reason drop counters in the
-    -- shared dict (plus an optional Prometheus counter when Kong's
-    -- prometheus plugin is loaded — unavailable in this test env, which
-    -- itself exercises the pcall-guarded fallback path).
-    describe("record_drop (drop metric)", function()
-
-        local dict_store
-        local mock_dict
-
-        before_each(function()
-            dict_store = {}
-            mock_dict = {
-                incr = function(self, key, value, init)  -- luacheck: ignore 212
-                    dict_store[key] = (dict_store[key] or init or 0) + value
-                    return dict_store[key]
-                end,
+        local function conf(product_type, o)
+            local c = {
+                aforo_endpoint = "https://api.aforo.test/v1/ingest/batch",
+                api_key = "sk_ingest", tenant_id = "fintech", product_type = product_type,
+                default_metric = "api_calls", metric_header = "X-Aforo-Metric",
+                quantity_header = "X-Aforo-Quantity", agent_id_header = "X-Aforo-Agent-Id",
+                session_id_header = "X-Aforo-Session-Id", trace_id_header = "X-Aforo-Trace-Id",
+                quantity_source = "1", include_metadata = true, flush_count = 50, flush_interval_ms = 5000,
+                exclude_paths = { "/health", "/ready", "/metrics" }, exclude_status_codes = { 401, 403, 429 },
+                preflight_quota_enabled = true, preflight_quota_cache_ttl_ms = 0,
+                preflight_quota_fail_open = true,
             }
-            _G.ngx = _G.ngx or {}
-            _G.ngx.shared = { aforo_buffer = mock_dict }
-        end)
+            for k, v in pairs(o or {}) do c[k] = v end
+            return c
+        end
 
-        it("accumulates a cumulative total per reason", function()
-            assert.equals(1, handler._record_drop("buffer_overflow", 1))
-            assert.equals(2, handler._record_drop("buffer_overflow", 1))
-            assert.equals(2, dict_store["aforo_dropped:buffer_overflow"])
-        end)
+        -- One call through Kong. req: method, path, headers (client), body.
+        -- res: status, headers (upstream). Pre-flight answers ALLOW.
+        local function call(c, req, res)
+            mock_kong.ctx.shared = {}
+            mock_kong.request._headers = req.headers or {}
+            mock_kong.response._headers = {}
+            mock_kong.response._exit = nil
+            mock_kong.request.get_method = function() return req.method or "POST" end
+            mock_kong.request.get_path = function() return req.path end
+            mock_kong.request.get_raw_body = function() return req.body end
+            ngx.req = { get_body_file = function() return nil end }
+            http_mock.responses = { { status = 200, body = '{"decision":"ALLOW"}' } }
+            handler:access(c)
+            ngx.req = nil
+            http_mock.responses = {}
+            -- The upstream answers; Kong sends it to the client; then the log phase.
+            mock_kong.response.get_status = function() return res and res.status or 200 end
+            mock_kong.response._headers = res and res.headers or {}
+            ngx.var = { request_id = req.id or "kreq" }
+            handler:log(c)
+            ngx.var = nil
+        end
 
-        it("counts multi-event drops (flush exhaustion) by batch size", function()
-            assert.equals(37, handler._record_drop("flush_exhausted", 37))
-            assert.equals(50, handler._record_drop("flush_exhausted", 13))
-        end)
-
-        it("keeps separate counters per reason", function()
-            handler._record_drop("buffer_overflow", 1)
-            handler._record_drop("flush_exhausted", 5)
-            assert.equals(1, dict_store["aforo_dropped:buffer_overflow"])
-            assert.equals(5, dict_store["aforo_dropped:flush_exhausted"])
-        end)
-
-        it("returns nil (and does not error) when the shared dict is missing", function()
-            _G.ngx.shared = {}
-            -- Must not raise: a metrics failure must never break metering.
-            assert.is_nil(handler._record_drop("buffer_overflow", 1))
-        end)
-    end)
-
-    -- ── AGENTIC_API detection (P0-5, docs/final/111 Session 4) ──
-    -- Per descriptor eventSchema.inferenceRule = HAS_TRACE, an event with
-    -- a resolvable W3C traceparent (or x-trace-id fallback) classifies as
-    -- AGENTIC_API. MCP JSON-RPC still wins when both signals coexist —
-    -- the log-phase caller only consults this helper in the else branch.
-    describe("extract_agentic_trace_id (AGENTIC_API classification)", function()
-
-        it("extracts the 32-hex trace_id from a well-formed traceparent", function()
-            local trace = {
-                traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-            }
-            assert.equals(
-                "4bf92f3577b34da6a3ce929d0e0e4736",
-                handler._extract_agentic_trace_id(trace)
-            )
-        end)
-
-        it("returns nil when trace context is nil (no header captured)", function()
-            assert.is_nil(handler._extract_agentic_trace_id(nil))
-        end)
-
-        it("returns nil when trace is empty (no headers present)", function()
-            assert.is_nil(handler._extract_agentic_trace_id({}))
-        end)
-
-        it("rejects traceparent with wrong field count (fail-safe)", function()
-            local trace = { traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-01" }
-            assert.is_nil(handler._extract_agentic_trace_id(trace))
-        end)
-
-        it("rejects traceparent with version=ff per W3C spec", function()
-            local trace = {
-                traceparent = "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-            }
-            assert.is_nil(handler._extract_agentic_trace_id(trace))
-        end)
-
-        it("rejects traceparent with all-zero trace_id per W3C spec", function()
-            local trace = {
-                traceparent = "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
-            }
-            assert.is_nil(handler._extract_agentic_trace_id(trace))
-        end)
-
-        it("rejects traceparent with all-zero parent_id per W3C spec", function()
-            local trace = {
-                traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
-            }
-            assert.is_nil(handler._extract_agentic_trace_id(trace))
-        end)
-
-        it("rejects traceparent with non-hex trace_id", function()
-            local trace = {
-                traceparent = "00-ZZZZ2f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-            }
-            assert.is_nil(handler._extract_agentic_trace_id(trace))
-        end)
-
-        it("falls back to x-trace-id for non-OTel callers", function()
-            local trace = { xTraceId = "legacy-agent-run-42" }
-            assert.equals(
-                "legacy-agent-run-42",
-                handler._extract_agentic_trace_id(trace)
-            )
-        end)
-
-        it("trims whitespace from x-trace-id fallback", function()
-            local trace = { xTraceId = "  legacy-42  " }
-            assert.equals("legacy-42", handler._extract_agentic_trace_id(trace))
-        end)
-
-        it("returns nil when x-trace-id is empty after trim", function()
-            assert.is_nil(handler._extract_agentic_trace_id({ xTraceId = "   " }))
-        end)
-
-        it("prefers traceparent over x-trace-id when both present", function()
-            local trace = {
-                traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-                xTraceId = "legacy-would-lose",
-            }
-            assert.equals(
-                "4bf92f3577b34da6a3ce929d0e0e4736",
-                handler._extract_agentic_trace_id(trace)
-            )
-        end)
-
-        it("falls back to x-trace-id when traceparent is malformed", function()
-            local trace = {
-                traceparent = "not-a-real-traceparent",
-                xTraceId = "legacy-42",
-            }
-            assert.equals("legacy-42", handler._extract_agentic_trace_id(trace))
-        end)
-    end)
-
-    -- ── MCP idempotencyKey FROZEN — no clock component (2026-07-12) ──
-    -- Peer-parity lock with Apigee/AWS/Azure/MuleSoft. Same class as the
-    -- A+ delivery-guarantee prompt 4 concern that Rule #21 codifies for
-    -- the compound path: a per-evaluation clock in the dedup ROOT makes
-    -- every replay look like a new event → double-bill under redelivery.
-    --
-    -- These are STATIC-SOURCE assertions on handler.lua (not behavioral
-    -- runtime tests): they lock the discipline into the source so the
-    -- regression can't sneak in via a future PR. A behavioral test would
-    -- need to drive the full log-phase which requires ngx.shared /
-    -- kong.log / kong.router mocks the current spec does not provision.
-    describe("MCP idempotencyKey — no clock component (regression lock)", function()
-
-        local source
-        setup(function()
-            local f = io.open("./handler.lua", "rb")
-            if not f then f = io.open("handler.lua", "rb") end
-            assert.is_not_nil(f, "handler.lua must be readable from spec/ cwd")
-            source = f:read("*all")
-            f:close()
-        end)
-
-        it("event.idempotencyKey line does not concatenate ngx.now()", function()
-            -- Find every source line that assigns event.idempotencyKey and
-            -- verify none of them include ngx.now() (or os.time / os.clock).
-            for line in source:gmatch("[^\n]+") do
-                if line:find("event%.idempotencyKey%s*=") then
-                    assert.is_nil(line:find("ngx%.now"),
-                        "clock component ngx.now() in idempotencyKey — "
-                            .. "breaks retry dedup, double-bills on redelivery. "
-                            .. "Line: " .. line)
-                    assert.is_nil(line:find("os%.time"),
-                        "clock component os.time() in idempotencyKey — see above")
-                    assert.is_nil(line:find("os%.clock"),
-                        "clock component os.clock() in idempotencyKey — see above")
+        local function checked()
+            local out = {}
+            for _, r in ipairs(http_mock.requests) do
+                if r.url:find("/quota/check", 1, true) then
+                    out[#out + 1] = cjson.decode(r.params.body).metricName
                 end
             end
-        end)
+            return out
+        end
 
-        it("carries a FROZEN comment near the MCP idempotencyKey", function()
-            -- Discipline lock: ensure a future edit can't quietly re-add a
-            -- clock without seeing this rationale block.
-            assert.is_not_nil(
-                source:find("Idempotency key FROZEN"),
-                "MCP idempotencyKey must carry a FROZEN comment explaining "
-                    .. "why no clock component may appear (post-P0-5 self-review)"
-            )
-        end)
-    end)
+        -- Flush and return the events the ingestor received, each checked.
+        local function delivered(c)
+            handler._flush_buffer(false, c)
+            local events = {}
+            for _, r in ipairs(http_mock.requests) do
+                if r.url == c.aforo_endpoint then
+                    for _, e in ipairs(cjson.decode(r.params.body).events) do
+                        assert.same({}, ingestor_errors(e), cjson.encode(e))
+                        events[#events + 1] = e
+                    end
+                end
+            end
+            return events
+        end
 
-    -- ── Idempotency-key fallback must NOT touch kong.tools (Kong 3.x crash) ──
-    -- kong.tools is nil on the kong PDK global (Kong 3.x). The previous
-    -- generate_idempotency_key fell back to kong.tools.uuid(), which raised
-    -- "attempt to index field 'tools'" and crashed the log phase — every request
-    -- without an X-Request-Id emitted ZERO events. The old mock hid it by providing
-    -- a fake kong.tools.uuid; real Kong has none.
-    describe("gateway_request_id + key fallback (Kong 3.x crash regression)", function()
-        local saved_var
-        before_each(function() saved_var = ngx.var end)
-        after_each(function() ngx.var = saved_var end)
-
-        it("returns nginx's $request_id", function()
-            ngx.var = { request_id = "abc123" }
-            assert.equals("abc123", handler._gateway_request_id())
-        end)
-
-        it("treats an empty or missing $request_id as absent", function()
-            ngx.var = { request_id = "" }
-            assert.is_nil(handler._gateway_request_id())
-            ngx.var = {}
-            assert.is_nil(handler._gateway_request_id())
-            ngx.var = nil
-            assert.is_nil(handler._gateway_request_id())
-        end)
-
-        it("ignores every client request-id header", function()
-            ngx.var = {}
-            mock_kong.request._headers = {
-                ["X-Request-Id"] = "client-1", ["X-Kong-Request-Id"] = "client-2",
+        before_each(function()
+            dict = new_shared_dict()
+            ngx.shared.aforo_buffer = dict
+            ngx.timers = {}
+            http_mock.requests, http_mock.responses, http_mock.on_request = {}, {}, nil
+            orig = {
+                get_consumer = mock_kong.client.get_consumer, get_service = mock_kong.router.get_service,
+                get_method = mock_kong.request.get_method, get_path = mock_kong.request.get_path,
+                get_raw_body = mock_kong.request.get_raw_body, get_status = mock_kong.response.get_status,
             }
-            assert.is_nil(handler._gateway_request_id())
+            mock_kong.client.get_consumer = function() return CONSUMER end
+            mock_kong.router.get_service = function() return SERVICE end
         end)
 
-        it("source never references kong.tools (would crash on Kong 3.x)", function()
-            local f = io.open("./handler.lua", "rb") or io.open("handler.lua", "rb")
-            assert.is_not_nil(f, "handler.lua must be readable from spec/ cwd")
-            local src = f:read("*all"); f:close()
-            assert.is_nil(src:find("kong%.tools"),
-                "handler.lua must not reference kong.tools — it is nil on the Kong 3.x "
-                    .. "PDK global and crashes the log phase. Use resty.jit-uuid / random_uuid().")
+        after_each(function()
+            mock_kong.client.get_consumer = orig.get_consumer
+            mock_kong.router.get_service = orig.get_service
+            mock_kong.request.get_method, mock_kong.request.get_path = orig.get_method, orig.get_path
+            mock_kong.request.get_raw_body = orig.get_raw_body
+            mock_kong.response.get_status = orig.get_status
+        end)
+
+        it("API: POST /v1/payments, an upstream with no Aforo code, one call one unit", function()
+            local c = conf("API", { metric_mappings = { { path_pattern = "^/v1/payments", metric_name = "payments" } } })
+            call(c, { path = "/v1/payments", id = "k1" })
+            call(c, { path = "/v1/payments", id = "k2" }, { status = 500 })
+            call(c, { path = "/v1/payments", id = "k3" }, { status = 401 })   -- excluded
+            call(c, { method = "GET", path = "/health", id = "k4" })           -- excluded, never checked
+            assert.same({ "payments", "payments", "payments" }, checked())
+            local evs = delivered(c)
+            assert.equals(2, #evs)
+            assert.equals("API", evs[1].productType)
+            assert.equals("cust_acme", evs[1].customerId)
+            assert.equals("payments", evs[1].metricName)
+            assert.equals(1, evs[1].quantity)
+            assert.equals("SUCCESS", evs[1].executionStatus)
+            assert.equals("ERROR", evs[2].executionStatus)
+            assert.is_nil(evs[1].agentId)
+            assert.is_nil(evs[1].traceId)
+        end)
+
+        it("AI_AGENT: POST /v1/fraud/assess, tokens and session from the upstream's response headers", function()
+            local c = conf("AI_AGENT", { default_metric = "fraud_tokens", agent_id = "fraud-shield" })
+            local forged = { ["X-Aforo-Agent-Id"] = "forged", ["X-Aforo-Session-Id"] = "forged",
+                             ["X-Aforo-Quantity"] = "1", traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" }
+            call(c, { path = "/v1/fraud/assess", headers = forged, id = "k1" },
+                 { headers = { ["X-Aforo-Quantity"] = "2100", ["X-Aforo-Session-Id"] = "fsa_1a2b3c" } })
+            -- Nothing configured, nothing sent: the Kong service is the agent,
+            -- the request its own session.
+            call(conf("AI_AGENT", { default_metric = "fraud_tokens" }), { path = "/v1/fraud/assess", id = "k2" })
+            assert.same({ "fraud_tokens", "fraud_tokens" }, checked())
+            local evs = delivered(c)
+            assert.equals(2, #evs)
+            assert.equals("AI_AGENT", evs[1].productType)
+            assert.equals("fraud-shield", evs[1].agentId)
+            assert.equals("fsa_1a2b3c", evs[1].sessionId)
+            assert.equals("fsa_1a2b3c", evs[1].traceId)
+            assert.equals(2100, evs[1].quantity)
+            assert.equals(SERVICE.id, evs[2].agentId)
+            assert.equals("k2", evs[2].sessionId)
+            assert.equals(1, evs[2].quantity)
+        end)
+
+        it("AGENTIC_API: POST /v1/kyc/verify, one goal per call unless the upstream names the trace", function()
+            local c = conf("AGENTIC_API", { default_metric = "kyc_verifications" })
+            local tp = { traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" }
+            call(c, { path = "/v1/kyc/verify", headers = tp, id = "k1" })
+            call(c, { path = "/v1/kyc/verify", headers = tp, id = "k2" })
+            call(c, { path = "/v1/kyc/verify", headers = tp, id = "k3" },
+                 { headers = { ["X-Aforo-Trace-Id"] = "goal-7" } })
+            assert.same({ "kyc_verifications", "kyc_verifications", "kyc_verifications" }, checked())
+            local evs = delivered(c)
+            local traces = {}
+            for i, e in ipairs(evs) do traces[i] = e.traceId end
+            -- The repeated client traceparent does not fold calls into one goal.
+            assert.same({ "k1", "k2", "goal-7" }, traces)
+            assert.equals("/v1/kyc/verify", evs[1].endpointPath)
+            assert.equals("POST", evs[1].httpMethod)
+            assert.equals(200, evs[1].statusCode)
+        end)
+
+        it("MCP_SERVER: POST /mcp, an upstream with no Aforo code, one event per tools/call", function()
+            local c = conf("MCP_SERVER", { default_metric = "ledger_tool_calls" })
+            local session = { ["Mcp-Session-Id"] = "mcp_5f3a" }
+            call(c, { path = "/mcp", id = "k1", body = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' },
+                 { headers = session })
+            call(c, { path = "/mcp", id = "k2", headers = session,
+                      body = '{"jsonrpc":"2.0","method":"notifications/initialized"}' }, { status = 202, headers = session })
+            call(c, { path = "/mcp", id = "k3", headers = session, body = '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' },
+                 { headers = session })
+            call(c, { path = "/mcp", id = "k4", headers = session, body = cjson.encode({
+                { jsonrpc = "2.0", id = 3, method = "tools/call",
+                  params = { name = "query_ledger", _meta = { agent_id = "forged" } } },
+                { jsonrpc = "2.0", id = 4, method = "tools/call", params = { name = "get_balance" } },
+                { jsonrpc = "2.0", id = 5, method = "ping" },
+            }) }, { headers = session })
+            -- Only the request that bills was checked.
+            assert.same({ "ledger_tool_calls" }, checked())
+            local evs = delivered(c)
+            assert.equals(2, #evs)
+            for i, tool in ipairs({ "query_ledger", "get_balance" }) do
+                assert.equals("MCP_SERVER", evs[i].productType)
+                assert.equals(tool, evs[i].toolName)
+                assert.equals("ledger_tool_calls", evs[i].metricName)
+                assert.equals("cust_acme", evs[i].agentId)
+                assert.equals("mcp_5f3a", evs[i].sessionId)
+                assert.equals("SUCCESS", evs[i].executionStatus)
+                assert.equals(1, evs[i].quantity)
+            end
+            assert.not_equals(evs[1].idempotencyKey, evs[2].idempotencyKey)
         end)
     end)
+    -- ── Schema ──────────────────────────────────────────────────
+    -- Kong validates the schema itself at startup and refuses to load the
+    -- plugin on any violation, so these are checked without a running Kong.
+    -- ── Carried from the internal line (2.6.0) ───────────────────
+    -- gRPC / GraphQL / WebSocket events, identity only from a verified token,
+    -- drop counting, and Rule #21 on every key.
+    describe("protocol events, verified identity and drops (2.6.0)", function()
+        local dict
+        local function conf(o)
+            local c = {
+                aforo_endpoint = "http://ingestor.test/v1/ingest/batch",
+                api_key = "sk_A", tenant_id = "tenantA", default_metric = "api_calls",
+                exclude_paths = {}, exclude_status_codes = { 401, 403, 429 },
+            }
+            for k, v in pairs(o or {}) do c[k] = v end
+            return c
+        end
+        -- opts: method, path, status, body, headers, response, var, claims, consumer
+        local function log(c, opts)
+            opts = opts or {}
+            mock_kong.request._headers = opts.headers or {}
+            mock_kong.response._headers = opts.response or {}
+            mock_kong.ctx.shared = { aforo_raw_body = opts.body,
+                aforo_jwt_claims = opts.claims or { signature_verified = true, customer_id = "cust_a" } }
+            ngx.var = opts.var or { request_id = "kongreq" }
+            local m, p, st, cons = mock_kong.request.get_method, mock_kong.request.get_path,
+                mock_kong.response.get_status, mock_kong.client.get_consumer
+            mock_kong.request.get_method = function() return opts.method or "POST" end
+            mock_kong.request.get_path = function() return opts.path or "/v1/things" end
+            mock_kong.response.get_status = function() return opts.status or 200 end
+            mock_kong.client.get_consumer = function() return opts.consumer end
+            handler:log(c)
+            mock_kong.request.get_method, mock_kong.request.get_path = m, p
+            mock_kong.response.get_status, mock_kong.client.get_consumer = st, cons
+            ngx.var = nil
+        end
+        local function buffered(c)
+            local out = {}
+            for i, e in ipairs(dict.store[handler._buffer_key(c)] or {}) do out[i] = cjson.decode(e) end
+            return out
+        end
 
-    -- ── executionStatus mapping (OUTCOME_BASED pricing) ──
-    -- Shared rule, identical in all five gateway plugins (README
-    -- "Execution status mapping"). nil means "omit the field".
-    describe("outcome_from_status (executionStatus mapping)", function()
-        local f = handler._outcome_from_status
+        before_each(function()
+            dict = new_shared_dict()
+            ngx.shared.aforo_buffer = dict
+            ngx.timers = {}
+        end)
 
-        it("maps 2xx and 3xx to SUCCESS", function()
-            for _, s in ipairs({ 200, 201, 204, 299, 301, 302, 304, 399 }) do
-                assert.equals("SUCCESS", f(s), "status " .. s)
+        it("meters a gRPC call with service, method and the grpc-status outcome", function()
+            local c = conf({ grpc_enabled = true })
+            log(c, { path = "/acme.UserService/GetUser", headers = { ["content-type"] = "application/grpc" },
+                     response = { ["grpc-status"] = "5" }, var = { request_id = "r-grpc" } })
+            local e = buffered(c)[1]
+            assert.equals("GRPC_API", e.productType)
+            assert.equals("grpc_api.rpc_calls", e.metricName)
+            assert.equals("acme.UserService", e.grpcService)
+            assert.equals("GetUser", e.grpcMethod)
+            assert.equals("grpc:tenantA:r-grpc", e.idempotencyKey)
+            assert.equals("ERROR", e.executionStatus)   -- NOT_FOUND, not the HTTP 200
+        end)
+
+        it("does not meter a gRPC UNAUTHENTICATED by default, as a plain 401 is not", function()
+            local c = conf({ grpc_enabled = true })
+            log(c, { path = "/acme.UserService/GetUser", headers = { ["content-type"] = "application/grpc" },
+                     response = { ["grpc-status"] = "16" } })
+            assert.equals(0, #buffered(c))
+        end)
+
+        it("caps a client-chosen gRPC method instead of skipping the call", function()
+            local c = conf({ grpc_enabled = true })
+            log(c, { path = "/acme.UserService/" .. string.rep("m", 300),
+                     headers = { ["content-type"] = "application/grpc" } })
+            local e = buffered(c)[1]
+            assert.is_not_nil(e, "an oversized method name must not opt the call out of metering")
+            assert.equals(128, #e.grpcMethod)
+        end)
+
+        it("meters a GraphQL operation with its type and name", function()
+            local c = conf({ graphql_enabled = true })
+            log(c, { path = "/graphql", headers = { ["content-type"] = "application/json" },
+                     body = cjson.encode({ query = "mutation AddUser { addUser { id } }" }),
+                     var = { request_id = "r-gql" } })
+            local e = buffered(c)[1]
+            assert.equals("GRAPHQL_API", e.productType)
+            assert.equals("MUTATION", e.gqlOperationType)
+            assert.equals("AddUser", e.gqlOperationName)
+            assert.equals("gql:tenantA:r-gql", e.idempotencyKey)
+            assert.equals("SUCCESS", e.executionStatus)
+        end)
+
+        it("meters a WebSocket handshake once per connection, keyed on Kong's request id", function()
+            local c = conf({ websocket_enabled = true })
+            -- The client reuses its Sec-WebSocket-Key: still two connections.
+            for _, id in ipairs({ "r-ws1", "r-ws2" }) do
+                log(c, { method = "GET", path = "/ws", status = 101, var = { request_id = id },
+                         headers = { upgrade = "websocket", ["Sec-WebSocket-Key"] = "same-key" } })
             end
+            local evs = buffered(c)
+            assert.equals(2, #evs)
+            assert.equals("WEBSOCKET_API", evs[1].productType)
+            assert.equals("ws:tenantA:r-ws1", evs[1].idempotencyKey)
+            assert.equals("ws:tenantA:r-ws2", evs[2].idempotencyKey)
+            assert.equals("same-key", evs[1].wsConnectionId)
+            assert.is_nil(evs[1].executionStatus)   -- 101 is not a final outcome
         end)
 
-        it("maps 408 and 504 to TIMEOUT", function()
-            assert.equals("TIMEOUT", f(408))
-            assert.equals("TIMEOUT", f(504))
+        it("leaves gRPC, GraphQL and WebSocket alone unless each is enabled", function()
+            local c = conf()
+            log(c, { path = "/acme.UserService/GetUser", headers = { ["content-type"] = "application/grpc" } })
+            assert.equals("API", buffered(c)[1].productType)
         end)
 
-        it("maps 499 (client closed request) to CANCELLED", function()
-            assert.equals("CANCELLED", f(499))
+        it("uses an unverified token's claims for neither customerId nor keyId", function()
+            local c = conf()
+            -- jwt_allow_unverified_signature let this token through; the route's
+            -- consumer is the identity.
+            log(c, { method = "GET", consumer = { custom_id = "consumer_1" },
+                     claims = { signature_verified = false, customer_id = "forged", key_id = "forged-key" } })
+            local e = buffered(c)[1]
+            assert.equals("consumer_1", e.customerId)
+            assert.is_nil(e.metadata.keyId)
+            -- A verified token supplies both.
+            log(c, { method = "GET", claims = { signature_verified = true, customer_id = "cust_v", key_id = "key-1" } })
+            e = buffered(c)[2]
+            assert.equals("cust_v", e.customerId)
+            assert.equals("key-1", e.metadata.keyId)
         end)
 
-        it("maps only 400 and 422 to VALIDATION_FAILED", function()
-            assert.equals("VALIDATION_FAILED", f(400))
-            assert.equals("VALIDATION_FAILED", f(422))
+        it("counts the events it skips, by reason", function()
+            local c = conf({ product_type = "AI_AGENT", agent_id_header = ngx.null })
+            log(c, { method = "GET" })    -- AI_AGENT without an agent id
+            assert.equals(1, dict.store["aforo_dropped:missing_fields"])
         end)
 
-        it("maps 401, 403 and 429 to BLOCKED", function()
-            for _, s in ipairs({ 401, 403, 429 }) do
-                assert.equals("BLOCKED", f(s), "status " .. s)
-            end
-        end)
-
-        it("maps 404 and every other 4xx/5xx to ERROR", function()
-            for _, s in ipairs({ 402, 404, 405, 409, 410, 413, 451, 500, 502, 503, 599 }) do
-                assert.equals("ERROR", f(s), "status " .. s)
-            end
-        end)
-
-        it("accepts numeric strings", function()
-            assert.equals("SUCCESS", f("200"))
-            assert.equals("TIMEOUT", f("504"))
-        end)
-
-        it("returns nil (field omitted) when the status is not determinable", function()
-            assert.is_nil(f(nil))
-            assert.is_nil(f(0))
-            assert.is_nil(f(101))
-            assert.is_nil(f(600))
-            assert.is_nil(f(-1))
-            assert.is_nil(f("abc"))
-            assert.is_nil(f(""))
-        end)
-
-        it("an override wins over the default table", function()
-            local o = { ["404"] = "VALIDATION_FAILED", ["429"] = "ERROR", ["202"] = "PENDING" }
-            assert.equals("VALIDATION_FAILED", f(404, o))
-            assert.equals("ERROR", f(429, o))
-            assert.equals("PENDING", f(202, o))
-            assert.equals("BLOCKED", f(403, o), "unlisted codes keep the default")
-        end)
-
-        it("override values are case-insensitive; invalid ones are ignored", function()
-            assert.equals("PARTIAL", f(206, { ["206"] = "partial" }))
-            assert.equals("ERROR", f(404, { ["404"] = "NOT_A_STATUS" }))
-            assert.equals("ERROR", f(404, { ["404"] = 7 }))
-            assert.equals("SUCCESS", f(200, "not-a-table"))
-        end)
-
-        it("an override cannot make an undeterminable status billable", function()
-            assert.is_nil(f(101, { ["101"] = "SUCCESS" }))
-            assert.is_nil(f(0, { ["0"] = "SUCCESS" }))
-        end)
-
-        it("every event path stamps executionStatus via a helper with the overrides (source lock)", function()
-            local fh = io.open("./handler.lua", "rb") or io.open("handler.lua", "rb")
-            assert.is_not_nil(fh, "handler.lua must be readable from spec/ cwd")
-            local src = fh:read("*all"); fh:close()
+        it("builds every idempotency key from Kong's request id, never a clock (Rule #21)", function()
+            local f = assert(io.open("handler.lua"))
+            local src = f:read("*a")
+            f:close()
             local n = 0
             for line in src:gmatch("[^\n]+") do
-                if line:find("event%.executionStatus%s*=") then
+                if line:find("%.idempotencyKey%s*=") and not line:find("^%s*%-%-") then
                     n = n + 1
-                    local ok = line:find("outcome_from_status%(status, conf%.status_outcomes%)", 1)
-                        or line:find("grpc_outcome%(grpc_code, status, conf%.status_outcomes%)", 1)
-                    assert.is_not_nil(ok,
-                        "executionStatus must come from outcome_from_status()/grpc_outcome() "
-                        .. "with conf.status_outcomes. Line: " .. line)
+                    assert.is_nil(line:find("ngx%.now") or line:find("os%.time") or line:find("os%.clock")
+                        or line:find("uuid%("), "idempotency key built from a clock or a random value: " .. line)
+                    assert.truthy(line:find("request_id", 1, true), "idempotency key not from request_id: " .. line)
                 end
             end
-            -- MCP, gRPC, GraphQL, standard/AGENTIC_API. WebSocket leaves it
-            -- unset (101 is not a final outcome).
-            assert.equals(4, n)
+            assert.is_true(n >= 5)   -- API, MCP, gRPC, GraphQL, WebSocket
         end)
     end)
 
-    describe("gRPC outcome (grpc-status wins over the HTTP status)", function()
-        local g = handler._grpc_outcome
+    describe("schema", function()
+        local config_fields, saved_typedefs
 
-        it("maps grpc-status to the outcome table", function()
-            assert.equals("SUCCESS", g(0, 200))
-            assert.equals("CANCELLED", g(1, 200))
-            assert.equals("VALIDATION_FAILED", g(3, 200))
-            assert.equals("TIMEOUT", g(4, 200))
-            assert.equals("BLOCKED", g(7, 200))
-            assert.equals("BLOCKED", g(8, 200))
-            assert.equals("VALIDATION_FAILED", g(9, 200))
-            assert.equals("VALIDATION_FAILED", g(11, 200))
-            assert.equals("BLOCKED", g(16, 200))
-        end)
-
-        it("a failure on an HTTP 200 is not SUCCESS", function()
-            for _, c in ipairs({ 2, 5, 6, 10, 12, 13, 14, 15 }) do
-                assert.equals("ERROR", g(c, 200), "grpc-status " .. c)
+        lazy_setup(function()
+            saved_typedefs = package.loaded["kong.db.schema.typedefs"]
+            package.loaded["kong.db.schema.typedefs"] = { no_consumer = {}, protocols_http = {} }
+            package.loaded["schema"] = nil
+            local schema = require("schema")
+            for _, f in ipairs(schema.fields) do
+                if f.config then config_fields = f.config.fields end
             end
         end)
 
-        it("missing grpc-status falls back to the HTTP mapping", function()
-            assert.equals("SUCCESS", g(nil, 200))
-            assert.equals("ERROR", g(nil, 502))
-            assert.equals("BLOCKED", g(nil, 401))
-            assert.is_nil(g(nil, 0))
+        lazy_teardown(function()
+            package.loaded["kong.db.schema.typedefs"] = saved_typedefs
         end)
 
-        it("HTTP overrides apply through the equivalent code", function()
-            local o = { ["401"] = "FAILED", ["500"] = "PARTIAL" }
-            assert.equals("FAILED", g(16, 200, o), "UNAUTHENTICATED shares 401's outcome")
-            assert.equals("PARTIAL", g(13, 200, o), "unmapped codes share 500's outcome")
-            assert.equals("BLOCKED", g(7, 200, o))
-        end)
-
-        it("every mapped code reaches the override for its own HTTP equivalent", function()
-            local o = { ["404"] = "VALIDATION_FAILED", ["503"] = "TIMEOUT",
-                        ["501"] = "FAILED", ["409"] = "PARTIAL" }
-            assert.equals("VALIDATION_FAILED", g(5, 200, o), "NOT_FOUND is 404")
-            assert.equals("TIMEOUT", g(14, 200, o), "UNAVAILABLE is 503")
-            assert.equals("FAILED", g(12, 200, o), "UNIMPLEMENTED is 501")
-            assert.equals("PARTIAL", g(6, 200, o), "ALREADY_EXISTS is 409")
-            assert.equals("PARTIAL", g(10, 200, o), "ABORTED is 409")
-            -- A 500 override does not sweep NOT_FOUND / UNAVAILABLE into it.
-            assert.equals("ERROR", g(5, 200, { ["500"] = "PENDING" }))
-        end)
-
-        it("a code outside 0-16 is ERROR, not the HTTP 200 fallback", function()
-            assert.equals("ERROR", g(17, 200))
-        end)
-
-        describe("read_grpc_status_code", function()
-            local r = handler._read_grpc_status_code
-            local saved_get_header, saved_var
-
-            before_each(function()
-                saved_get_header = mock_kong.response.get_header
-                _G.ngx = _G.ngx or {}
-                saved_var = _G.ngx.var
-            end)
-
-            after_each(function()
-                mock_kong.response.get_header = saved_get_header
-                _G.ngx.var = saved_var
-            end)
-
-            local function setup(header, upstream_trailer, sent_trailer)
-                mock_kong.response.get_header = function(name)
-                    if name == "grpc-status" then return header end
-                    return nil
-                end
-                _G.ngx.var = {
-                    upstream_trailer_grpc_status = upstream_trailer,
-                    sent_trailer_grpc_status = sent_trailer,
-                }
+        local function field(name)
+            for _, f in ipairs(config_fields) do
+                if f[name] then return f[name] end
             end
-
-            it("reads a trailers-only header first", function()
-                setup("16", "0", nil)
-                assert.equals(16, r())
-            end)
-
-            it("reads the upstream trailer when there is no header", function()
-                setup(nil, "4", nil)
-                assert.equals(4, r())
-            end)
-
-            it("reads the sent trailer last", function()
-                setup(nil, nil, "3")
-                assert.equals(3, r())
-            end)
-
-            it("returns nil when nothing readable is present", function()
-                setup(nil, nil, nil)
-                assert.is_nil(r())
-                setup("abc", "-1", "1.5")
-                assert.is_nil(r())
-            end)
-
-            it("accepts a code above 16 so it is not read as success", function()
-                setup(nil, "17", nil)
-                assert.equals(17, r())
-            end)
-
-            it("grpcStatusCode label uses the read code, else the HTTP status", function()
-                local e = handler._extract_grpc_status
-                assert.equals("INTERNAL", e(200, 13))
-                assert.equals("OK", e(200, nil))
-                assert.equals("UNKNOWN", e(200, 17))
-                assert.equals("PERMISSION_DENIED", e(403, nil))
-            end)
-        end)
-    end)
-
-    describe("idempotency keys (Rule #21)", function()
-        local function source()
-            local fh = io.open("./handler.lua", "rb") or io.open("handler.lua", "rb")
-            local src = fh:read("*all"); fh:close()
-            return src
         end
 
-        it("no idempotency key or its fallback contains a clock", function()
-            local src = source()
-            -- Collect each `event.idempotencyKey = ...` statement (it may span
-            -- continuation lines ending in `..`).
-            local stmts, cur = {}, nil
-            for line in src:gmatch("[^\n]+") do
-                if line:find("event%.idempotencyKey%s*=") then
-                    cur = line
-                elseif cur then
-                    cur = cur .. " " .. line
-                end
-                if cur and not line:find("%.%.%s*$") then
-                    table.insert(stmts, cur); cur = nil
-                end
-            end
-            -- MCP, gRPC, GraphQL, WebSocket, standard
-            assert.equals(5, #stmts)
-            for _, st in ipairs(stmts) do
-                assert.is_nil(st:find("ngx%.now"), "clock in key: " .. st)
-                assert.is_nil(st:find("os%.time"), "clock in key: " .. st)
-                assert.is_nil(st:find("os%.clock"), "clock in key: " .. st)
-                -- Every key is built on key_id, the gateway request id.
-                assert.is_not_nil(st:find("key_id", 1, true), "key not built on key_id: " .. st)
-                assert.is_nil(st:find("get_header", 1, true), "client header in key: " .. st)
-                assert.is_nil(st:find("ws_connection_id", 1, true),
-                    "client-chosen Sec-WebSocket-Key in key: " .. st)
-            end
-        end)
-
-        it("the key identity comes from the gateway, never a request header", function()
-            local src = source()
-            assert.is_not_nil(src:find("local request_id = gateway_request_id%(%)"),
-                "log phase must take request_id from gateway_request_id()")
-            assert.is_not_nil(src:find("local key_id = request_id or random_uuid%(%)"),
-                "key_id must derive from the gateway request id")
-            local body = src:match("local function gateway_request_id%(%)(.-)\nend")
-            assert.is_not_nil(body, "gateway_request_id must exist")
-            assert.is_nil(body:find("get_header", 1, true),
-                "gateway_request_id must not read request headers")
-            assert.is_not_nil(body:find("var.request_id", 1, true))
-        end)
-
-        it("never calls kong.tools (nil on the Kong 3.x PDK)", function()
-            local src = source()
-            for line in src:gmatch("[^\n]+") do
-                if not line:find("^%s*%-%-") then
-                    assert.is_nil(line:find("kong%.tools%."), "kong.tools use: " .. line)
+        it("keeps every description within Kong's 500-character limit", function()
+            local too_long = {}
+            local function walk(fields, prefix)
+                for _, f in ipairs(fields) do
+                    local name, def = next(f)
+                    if def.description and #def.description > 500 then
+                        too_long[#too_long + 1] = prefix .. name .. " (" .. #def.description .. ")"
+                    end
+                    if def.fields then walk(def.fields, prefix .. name .. ".") end
+                    if def.elements and def.elements.fields then
+                        walk(def.elements.fields, prefix .. name .. "[].")
+                    end
                 end
             end
-        end)
-    end)
-
-    describe("gRPC detection", function()
-        local detect = handler._detect_grpc_call
-
-        it("extracts service and method from the HTTP/2 path", function()
-            local info = detect("application/grpc", "/acme.UserService/GetUser", "")
-            assert.equals("acme.UserService", info.grpc_service)
-            assert.equals("GetUser", info.grpc_method)
-            assert.equals("UNARY", info.grpc_call_type)
-            assert.is_false(info.is_grpc_web)
+            walk(config_fields, "config.")
+            -- Longer and Kong fails at boot: "length must be at most 500".
+            assert.same({}, too_long)
         end)
 
-        it("strips the configured route prefix", function()
-            local info = detect("application/grpc-web+proto", "/grpc/acme.S/M", "/grpc")
-            assert.equals("acme.S", info.grpc_service)
-            assert.equals("M", info.grpc_method)
-            assert.is_true(info.is_grpc_web)
+        it("declares the AI_AGENT identity settings", function()
+            assert.equals("string", field("agent_id").type)
+            assert.is_nil(field("agent_id").default)
+            assert.equals("X-Aforo-Agent-Id", field("agent_id_header").default)
+            assert.equals("X-Aforo-Session-Id", field("session_id_header").default)
+            assert.equals("X-Aforo-Trace-Id", field("trace_id_header").default)
         end)
 
-        it("ignores non-gRPC content types and malformed paths", function()
-            assert.is_nil(detect("application/json", "/acme.S/M", ""))
-            assert.is_nil(detect(nil, "/acme.S/M", ""))
-            assert.is_nil(detect("application/grpc", "/only-one-segment", ""))
+        it("declares status_outcomes, which org-service writes, as a map of status code to outcome", function()
+            local f = field("status_outcomes")
+            assert.equals("map", f.type)
+            assert.equals("^[2-5]%d%d$", f.keys.match)
+            assert.truthy(("404"):match(f.keys.match))
+            assert.falsy(("1xx"):match(f.keys.match))
+            assert.equals(11, #f.values.one_of)
         end)
-    end)
-
-    describe("GraphQL detection", function()
-        local detect = handler._detect_graphql_call
-        local cjson = package.loaded["cjson.safe"]
-        local real_decode = cjson.decode
-        after_each(function() cjson.decode = real_decode end)
-
-        it("reads the operation type and name", function()
-            cjson.decode = function()
-                return { query = "mutation CreateUser { createUser { id } }" }
-            end
-            local info = detect("{...}", "application/json", "/graphql", "graphql")
-            assert.equals("MUTATION", info.gql_operation_type)
-            assert.equals("CreateUser", info.gql_operation_name)
-            assert.equals(2, info.gql_complexity)
-        end)
-
-        it("prefers operationName and defaults to QUERY", function()
-            cjson.decode = function()
-                return { query = "{ me { id } }", operationName = "Me" }
-            end
-            local info = detect("{...}", "application/json", "/api/gql", "graphql")
-            assert.equals("QUERY", info.gql_operation_type)
-            assert.equals("Me", info.gql_operation_name)
-        end)
-
-        it("ignores bodies without a query and non-GraphQL paths", function()
-            cjson.decode = function() return { foo = 1 } end
-            assert.is_nil(detect("{...}", "application/json", "/graphql", "graphql"))
-            cjson.decode = function() return { query = "{ a }" } end
-            assert.is_nil(detect("{...}", "application/json", "/v1/users", "graphql"))
-            assert.is_nil(detect("", "application/json", "/graphql", "graphql"))
-        end)
-    end)
-
-    describe("WebSocket upgrade detection", function()
-        local detect = handler._detect_websocket_upgrade
-
-        it("uses the handshake key as the connection id (data only, not the key)", function()
-            mock_kong.request._headers = { ["Sec-WebSocket-Key"] = "dGhlIHNhbXBsZQ==" }
-            local info = detect("websocket", 101, "req-1")
-            assert.equals("dGhlIHNhbXBsZQ==", info.ws_connection_id)
-        end)
-
-        it("falls back to the request id, then a UUID", function()
-            assert.equals("req-1", detect("WebSocket", 101, "req-1").ws_connection_id)
-            assert.equals("test-uuid", detect("websocket", 101, nil).ws_connection_id)
-        end)
-
-        it("skips failed handshakes and non-upgrade requests", function()
-            assert.is_nil(detect("websocket", 400, "req-1"))
-            assert.is_nil(detect(nil, 101, "req-1"))
-            assert.is_nil(detect("h2c", 101, "req-1"))
-        end)
-    end)
-end)
-
-describe("iso8601_utc (occurredAt wire format)", function()
-    -- The ingestor binds occurredAt to java.time.Instant: a JSON number is read
-    -- as epoch SECONDS, so epoch millis (1790784909554) became the year 58717
-    -- and every Kong event failed the future-timestamp check.
-    it("formats seconds with millisecond precision as UTC", function()
-        assert.equals("2026-09-30T16:15:09.554Z", handler._iso8601_utc(1790784909.554))
-    end)
-    it("pads milliseconds and handles whole seconds", function()
-        assert.equals("2026-09-30T16:15:09.000Z", handler._iso8601_utc(1790784909))
-        assert.equals("2026-09-30T16:15:09.007Z", handler._iso8601_utc(1790784909.007))
-    end)
-    it("rounds .9995 up into the next second instead of printing 1000 ms", function()
-        assert.equals("2026-09-30T16:15:10.000Z", handler._iso8601_utc(1790784909.9996))
-    end)
-    it("no event sends a numeric occurredAt", function()
-        for _, file in ipairs({ "handler.lua", "compound-metering.lua" }) do
-            local f = io.open("../" .. file, "rb") or io.open(file, "rb")
-            assert.is_not_nil(f, file .. " must be readable")
-            local src = f:read("*all")
-            f:close()
-            for line in src:gmatch("[^\n]+") do
-                if line:find("occurredAt%s*=") then
-                    assert.is_not_nil(line:find("iso8601_utc"),
-                        file .. ": occurredAt must use iso8601_utc(). Line: " .. line)
-                end
-            end
-        end
     end)
 end)

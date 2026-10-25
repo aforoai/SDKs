@@ -1,221 +1,166 @@
-# Aforo metering for Apigee
+# Aforo for Apigee X (shared flows)
 
-A shared flow (`sharedflowbundle/`) that sends one usage event per API call to the Aforo usage ingestor.
+Two Apigee shared flows that meter every call to your API in Aforo, enforce your end customers' hard limits, and need no code in your API:
 
-**Version:** 2.2.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+- **`aforo-access`** on the environment's **PreProxyFlowHook**: verifies the end customer's API key, works out which Aforo customer is calling and what the call bills to, and answers **429** when that customer's quota is used up.
+- **`aforo-metering`** on the environment's **PostProxyFlowHook**: builds the call's usage events and sends them to Aforo.
 
-Apigee bundles have no manifest version field, so the version lives in the [`VERSION`](VERSION) file.
+**Version:** 3.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
-Per call, the flow reads its config from the KVM, builds the event once in `resources/jsc/aforo-metering.js`, sends it, and retries once if the send could not connect or got a 5xx or 408. Both attempts send the same payload and the same `idempotencyKey`, so the retry never bills twice. A metering failure never fails the API call, and adds at most about 4 seconds to it (see [When Aforo ingest is unreachable](#when-aforo-ingest-is-unreachable)).
+Target: **Apigee X and hybrid** (`apigee.googleapis.com/v1/organizations/{org}`). The bundles use only policies Apigee Edge also has, but they are built and documented for X. Apigee bundles have no version field, so the version lives in [`VERSION`](VERSION).
 
-## Install
+> **Not verified on a live Apigee org yet.** The scripts are unit-tested, both flows run end to end in a Node model of the Apigee runtime ([`tests/`](tests)), and the XML is checked statically. See [What only a live org can prove](#what-only-a-live-org-can-prove).
 
-**From Aforo (one click).** In Aforo, open the Apigee connection and deploy metering. Aforo imports this bundle as the shared flow `aforo-metering`, deploys it to the connection's environment, writes the KVM entries below, and attaches the flow to that environment's `PostProxyFlowHook`. Deploying again refreshes the KVM every time and imports a new revision only when the bundle changed. Removing it detaches the hook, undeploys the flow and deletes the KVM entries Aforo wrote; the shared flow itself is deleted once no environment has it deployed.
+## What Aforo deploys
 
-The connection's credential needs permission to manage shared flows, deployments, flow hooks and key value maps (the `Apigee Environment Admin` plus `Apigee API Admin` roles cover it).
+Normally Aforo's organization service does all of this when you connect your Apigee org and deploy an Aforo product to it. You can also do it by hand: see the [user guide](USER_GUIDE.md).
 
-Aforo will not replace a shared flow that is already attached to `PostProxyFlowHook` — an environment has one slot. In that case the deploy stops and tells you which flow holds it. Set `meteringAttachMode` to `none` on the connection and call `aforo-metering` yourself with a FlowCallout (from that flow, or from the response PostFlow of the proxies you bill).
+| What | Where | Notes |
+|---|---|---|
+| Shared flow `aforo-access` | bundle [`aforo-access/sharedflowbundle/`](aforo-access/sharedflowbundle) | attached to the **PreProxyFlowHook** of each environment |
+| Shared flow `aforo-metering` | bundle [`sharedflowbundle/`](sharedflowbundle) (path kept from 2.x) | attached to the **PostProxyFlowHook** of each environment |
+| KVM `aforo-metering-config` | **organization** scope, encrypted | global settings, `managed_proxy__{proxy}` per proxy, settings per API product (below) |
+| One developer + one developer app per Aforo end customer | app name `aforo-{customerId}` | both carry the custom attribute **`aforo_customer_id`** = the Aforo customer id (AC1) |
+| The end customer's key | the app's credential **consumerKey** | the `sk_live_…` key from the storefront, or the client secret of an agent credential (AI_AGENT, MCP); consumerSecret is random; the app gets the API products of the Aforo products the customer subscribed to, approved (AC4) |
 
-**By hand.**
+Each bundle imports as a zip whose top-level folder is `sharedflowbundle/`.
 
-```bash
-ORG=my-org; ENV=prod; TOKEN=$(gcloud auth print-access-token)
-API=https://apigee.googleapis.com/v1/organizations/$ORG
+A flow hook runs for **every** proxy in the environment. Both flows do nothing on a proxy unless the KVM says `managed_proxy__{proxyName} = true`; an unmanaged proxy costs one cached KVM read.
 
-# 1. Import and deploy the shared flow
-(cd apigee && zip -r /tmp/aforo-metering.zip sharedflowbundle)
-REV=$(curl -s -X POST "$API/sharedflows?action=import&name=aforo-metering" \
-  -H "Authorization: Bearer $TOKEN" -F "file=@/tmp/aforo-metering.zip" | jq -r .revision)
-curl -X POST "$API/environments/$ENV/sharedflows/aforo-metering/revisions/$REV/deployments?override=true" \
-  -H "Authorization: Bearer $TOKEN"
+## How a call is handled
 
-# 2. Create the organization-scoped KVM and its entries
-curl -X POST "$API/keyvaluemaps" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"name":"aforo-metering-config","encrypted":true}'
-for kv in "aforo_endpoint=https://api.aforo.ai/v1/ingest/batch" "api_key=$AFORO_API_KEY" "default_metric=api_calls"; do
-  curl -X POST "$API/keyvaluemaps/aforo-metering-config/entries" -H "Authorization: Bearer $TOKEN" \
-    -H "Content-Type: application/json" -d "{\"name\":\"${kv%%=*}\",\"value\":\"${kv#*=}\"}"
-done
+1. **`aforo-access`** (managed proxies only)
+   1. Reads the key from header `x-api-key`, header `apikey` or query parameter `apikey`, and runs **VerifyAPIKey**. A missing, unknown or revoked key, or a key whose API products do not include this proxy, gets Apigee's standard **401**. That is the per-product access control Kong's ACL gives (Apigee answers 401 where Kong answers 403).
+   2. **Strips the key** (`x-api-key`, `apikey` header and query parameter), so your upstream never receives the end customer's Aforo key (Kong's `hide_credentials`).
+   3. **Customer** = the `aforo_customer_id` attribute of the verified key's **app**, else of its **developer**, read from VerifyAPIKey's own flow variables (`verifyapikey.AforoVerifyApiKey.app.aforo_customer_id`, `…developer.aforo_customer_id`). These come from the same lookup that verified the key, so no extra AccessEntity call is needed and nothing the client sends can reach them. The flow never uses the request, the app's name or display name, or the developer's email. A verified app without the attribute (one of your own apps, not Aforo's) is let through **unmetered and unchecked**.
+   4. **API product** = the product VerifyAPIKey matched (`verifyapikey.AforoVerifyApiKey.apiproduct.name`); its settings are read from the KVM.
+   5. **Pre-flight quota check**, when `enforce_quota__{product}` is `true`: `POST {quota_check_url}` with `{customerId, metricName}` for **the metric this call bills to** (the same code as the metering flow). It does not check MCP messages that are not `tools/call`, excluded paths, or CORS preflights.
+      - **DENY**: **429**, `Retry-After: max(1, ceil(retryAfterMs/1000))` (60 when none is given), body `{"message": reason, "retryAfter": seconds}`. The upstream is not called and the call is not metered. DENY is never cached.
+      - **ALLOW / WARN**: let through, cached about 1 s (`quota_cache_ttl_ms`). WARN adds `X-RateLimit-Warning: approaching-limit` to the response.
+      - **No answer within 1500 ms**, or an error: **fail open**, not cached. With `quota_fail_open = false`, **503** instead.
+   6. Hands the verified customer to the metering flow in `aforo.verified.*` flow variables. A client can only reach `request.*` variables, so it cannot set these.
+2. Your proxy and upstream run as usual.
+3. **`aforo-metering`**: builds the events and sends them to `aforo_endpoint` with `X-API-Key: {api_key}` (see [Delivery](#delivery-latency-and-loss)).
 
-# 3. Attach it
-curl -X PUT "$API/environments/$ENV/flowhooks/PostProxyFlowHook" -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" -d '{"sharedFlow":"aforo-metering","continueOnError":true}'
+## Product types
+
+Trusted sources only: your config, Apigee's own values, and your upstream's **response** headers. A client cannot set a response header. A header that is present but unusable (control characters, or longer than the ingestor allows) skips the event; it never falls back to another identity.
+
+| Type (`product_type__{p}`) | Events per call | Type-specific fields |
+|---|---|---|
+| `API` (default) | 1 | none |
+| `AGENTIC_API` | 1 | `traceId` = upstream `X-Aforo-Trace-Id` (name: `trace_id_header__{p}`), else Apigee's `messageid` (one call, one goal). The client's `traceparent` only goes into `event.trace`: it never names the trace and never turns an API call into an agentic one. |
+| `AI_AGENT` | 1 | `agentId` = upstream `X-Aforo-Agent-Id`, else `agent_id__{p}`, else the proxy name (as Kong uses the service). `sessionId` = upstream `X-Aforo-Session-Id`, else `messageid`. `traceId` = `sessionId`. Request headers such as `X-Agent-Id` are never read. |
+| `MCP_SERVER` | 1 per JSON-RPC `tools/call`, inside batches too; **0** for `initialize`, `tools/list`, `ping` and notifications, which are also never refused | `toolName` from the body (`unknown` when missing); `agentId` = upstream `X-Aforo-Agent-Id`, else the customer (never `params._meta.agent_id`); `sessionId` = upstream `X-Aforo-Session-Id`, else the upstream's `Mcp-Session-Id` **response** header (hashed when longer than 64 characters). A JSON-RPC error inside a 2xx answer makes that call `ERROR`. |
+
+Every event carries `customerId`, `metricName`, `quantity`, `idempotencyKey` (Apigee's `messageid`; for MCP `mcp:{tenant}:{messageid}:{n}:{tool}`; never a client header), `occurredAt`, `productType`, `executionStatus`, `endpointPath`, `httpMethod`, `statusCode`, `responseTimeMs`, `trace` (the client's trace headers, for correlation only) and `metadata`.
+
+- **Metric**: upstream `X-Aforo-Metric`, else the first matching `metric_mappings__{p}` rule, else (MCP) the product's `default_metric__{p}`, else `default_metric__{p}`, else `api_calls`.
+- **Quantity**: upstream `X-Aforo-Quantity` (name: `quantity_header__{p}`; a positive number, rounded to 6 decimals), else `quantity_source`: `1` (default), a fixed number, or `response_size`. `response_size` uses `Content-Length`, else the body's bytes, so chunked responses are billed too.
+- **`executionStatus`**, the table every Aforo gateway uses: 2xx/3xx `SUCCESS`, 408/504 `TIMEOUT`, 499 `CANCELLED`, 400/422 `VALIDATION_FAILED`, 401/403/429 `BLOCKED`, any other 4xx/5xx `ERROR`. `status_outcomes__{p}` overrides it per code.
+
+### Optional upstream response headers
+
+| Header | Effect |
+|---|---|
+| `X-Aforo-Quantity` | quantity of this call (e.g. tokens, minutes) |
+| `X-Aforo-Metric` | metric of this call |
+| `X-Aforo-Agent-Id` | agent (AI_AGENT, MCP_SERVER), at most 36 characters |
+| `X-Aforo-Session-Id` | session (AI_AGENT, MCP_SERVER), at most 64 characters |
+| `X-Aforo-Trace-Id` | goal / trace (AGENTIC_API), at most 128 characters |
+| `Mcp-Session-Id` | MCP's own session header; the MCP session when `X-Aforo-Session-Id` is absent |
+
+## Configuration: KVM `aforo-metering-config`
+
+Organization scope. Apigee X encrypts it, and the flows read every value into `private.*` variables, so the values are masked in Debug sessions. Values are cached for 60 s, so a change takes up to a minute to apply.
+
+**Global keys**
+
+| Key | Default | What it does |
+|---|---|---|
+| `aforo_endpoint` | required | ingest URL, `https://api.aforo.ai/v1/ingest/batch` |
+| `api_key` | required | your Aforo API key, scope `usage:ingest`; sent as `X-API-Key` |
+| `tenant_id` | required for quota | sent as `X-Tenant-Id` on the quota check; also the JWT tenant binding |
+| `quota_check_url` | origin of `aforo_endpoint` + `/api/v1/quota/check` | the pre-flight endpoint |
+| `quota_timeout_ms` | `1500` | informational: Apigee takes only literal ServiceCallout timeouts, so the check always waits at most 1500 ms. Change the bundle to change it. |
+| `quota_fail_open` | `true` | `false`: no answer means 503 instead of letting the call through |
+| `quota_cache_ttl_ms` | `1000` | how long ALLOW/WARN is cached, rounded up to whole seconds; `0` turns the cache off |
+| `delivery_mode` | `async` | `async` or `sync`, see [Delivery](#delivery-latency-and-loss) |
+| `max_retries` | `1` | `sync` only: `0` turns the one retry off |
+| `exclude_paths` | `/health,/ready,/metrics` | path prefixes never metered or checked (a prefix matches itself and the paths below it, against the full path and the proxy path suffix); `none` excludes nothing |
+| `exclude_status_codes` | `401,403,429` | statuses never metered; `none` excludes nothing |
+| `include_metadata` | `true` | `false` keeps only `metadata.endpoint_path` |
+| `quantity_source` | `1` | `1`, a fixed number, or `response_size` |
+| `jwt_validation_enabled` | off | `true`: also require an Aforo JWT (`Authorization: Bearer`), checked against `aforo_jwks_uri` and `aforo_jwt_issuer` (both required), issued for `tenant_id`. Claims go upstream as `X-Customer-Id`, `X-Tenant-Id`, `X-Key-Id`, `X-Scopes`, `X-Environment`, and `key_id` goes into `metadata.keyId`. The billed customer stays the app attribute. |
+
+**Per proxy**: `managed_proxy__{proxyName}` = `true`.
+
+**Per API product** (`{p}` is the raw `apiproduct.name`; Apigee joins composite KVM keys with `__`):
+
+| Key | What it does |
+|---|---|
+| `product_type__{p}` | `API`, `AGENTIC_API`, `AI_AGENT` or `MCP_SERVER` (default `API`) |
+| `default_metric__{p}` | the product's catalog metric |
+| `metric_mappings__{p}` | JSON array `[{"pathPattern": "^/v1/sms", "method": "POST", "metricName": "sms_sent"}]`, first match wins. `pathPattern` is a **Lua pattern**, as in the Kong plugin (`^` anchors, `%d`, `%w`, `%.` for a literal dot, `-` is a lazy quantifier), matched against base path + path suffix. `%b`, `%f` and back-references are not supported: such a rule is skipped. `method` is optional. |
+| `agent_id__{p}` | AI_AGENT: the agent when the upstream sends none |
+| `quantity_header__{p}` | default `X-Aforo-Quantity` |
+| `trace_id_header__{p}` | default `X-Aforo-Trace-Id` |
+| `enforce_quota__{p}` | `true` runs the pre-flight quota check |
+| `aforo_product_id__{p}` | the Aforo product id, sent as `metadata.productId` |
+| `status_outcomes__{p}` | JSON `{"404": "VALIDATION_FAILED"}` |
+
+An API product with none of `product_type__`, `default_metric__` and `metric_mappings__` is not Aforo's: its calls go through unmetered.
+
+## Delivery: latency and loss
+
+The PostProxyFlowHook runs **before** the response goes to the client, so how the events are sent decides what the client waits for. We considered three options:
+
+- **JavaScript `httpClient` without waiting** is not reliable on Apigee X. Per Google's Apigee team, a request sent without a callback may never go out once the script ends. With a callback, the policy waits for it, which adds the same latency as waiting.
+- **ServiceCallout without a `<Response>` element** is Apigee's documented fire-and-forget: the flow does not wait and cannot see the answer.
+- **ServiceCallout with a response and short timeouts**: the client waits for the ingestor.
+
+The flows offer the last two:
+
+| `delivery_mode` | Client waits for Aforo | What can be lost |
+|---|---|---|
+| `async` (default) | no | Any event the ingestor does not store is lost, and nothing logs it: Aforo unreachable, a 5xx, a refused key, or a per-event "could not be stored". |
+| `sync` | yes: the ingestor's response time, at most about 4 s (1 s connect + 2 s answer, plus one retry only when the first failure was quick) | Only what still fails after one retry. The 202's per-event `errors` are read: "The event could not be stored…" is re-sent once (just those events, same `idempotencyKey`, so a copy that did land is deduplicated), other errors are dropped. No answer, a 5xx or a 408 re-sends the batch. 429 and other 4xx are not re-sent. Every loss is `print`ed (visible in Debug). |
+
+Kong avoids this choice by buffering in shared memory and flushing in the background. Apigee has no such place: anything after the response leaves (PostClientFlow) must be in the proxy itself, cannot be attached by a flow hook, and cannot run JavaScript.
+
+## Upstream errors (4xx/5xx)
+
+By default Apigee treats a target's 4xx/5xx as a fault and switches to the **error flow**, which skips the PostProxyFlowHook. Those calls are then **not metered**. A flow hook cannot change this: `success.codes` is a literal TargetEndpoint property with no flow-variable form. To bill them, add one step to the proxy (one-time configuration, no code; see the [user guide](USER_GUIDE.md#metering-upstream-errors)):
+
+```xml
+<DefaultFaultRule name="aforo">
+    <AlwaysEnforce>true</AlwaysEnforce>
+    <Step><Name>FC-aforo-metering</Name></Step>
+</DefaultFaultRule>
 ```
 
-`apigeecli sharedflows create bundle -n aforo-metering -f apigee/sharedflowbundle` does the same import. [USER_GUIDE.md](USER_GUIDE.md) walks through it step by step.
-
-## Where it runs
-
-Attach the flow on the response path: `PostProxyFlowHook` for every proxy in an environment, or a FlowCallout in a proxy's response PostFlow for one proxy.
-
-It can't run in `PostClientFlow` on Apigee X or hybrid. That flow accepts only FlowCallout, MessageLogging and ServiceCallout, and a shared flow called from it may contain only those; this one reads a KVM and runs JavaScript. So the event is sent before the client gets its response. A healthy ingestor answers in tens of milliseconds, and that is the delay each call sees.
-
-## Who is billed
-
-`customerId` comes from an identity Apigee verified. It is never an API key, a client id, a token or a client IP. Sources, in order:
-
-1. `aforo.customer_id` — the `customer_id` claim of an Aforo JWT that `AforoJwtValidation` verified. Present only when [JWT validation](#jwt-validation) ran.
-2. Depending on KVM `customer_id_source`:
-
-| `customer_id_source` | Customer |
-|---|---|
-| absent, or `consumer` | `developer.app.name`, then `developer.email`, as your `VerifyAPIKey` / `OAuthV2` policy resolved them. The value has to be the customer's id in Aforo. |
-| `flow_variable:<name>` | That flow variable, and nothing else. Use one a verified policy fills, e.g. `verifyapikey.VerifyKey.app.aforo_customer_id` (a developer-app custom attribute holding the Aforo customer id). |
-| `jwt` | Nothing beyond source 1. |
-
-A `flow_variable:` name is refused when it starts with `request.`, `message.` or `response.` (the client controls those), when it is a client IP, or when its last segment is `client_id`, `consumerkey`, `client_secret`, `apikey`, `access_token`, `password` or similar.
-
-No identity, or one longer than 64 characters: no event is built and no call is made. `aforo.skipReason` is `no customerId`. The ingestor rejects an event for a customer id it does not know.
-
-## Which metric
-
-The first rule that applies:
-
-1. The first `metric_mappings` rule whose `value` matches the path. `matchType` is `EXACT`, `PREFIX` or `CONTAINS`.
-2. `metric_name_pattern`, when the KVM has one. Placeholders: `{method}`, `{path}`, `{basepath}`, `{pathsuffix}`.
-3. `default_metric`.
-4. `api_calls`.
-
-The path is the proxy base path plus the path suffix (`/sms/v1` + `/send`). A name that comes out empty or longer than 255 characters is not sent (`aforo.skipReason`, and a `WARN` line in the debug session).
-
-The ingestor rejects an event whose metric name is not in your Aforo catalog. The flow cannot check that; a rejected event shows up as `USAGE EVENT DROPPED … reason=rejected` with the ingestor's message.
-
-An MCP `tools/call` always uses `mcp_server.tool_invocations`.
-
-## When Aforo ingest is unreachable
-
-The API call still succeeds and its response is unchanged. Every step on the metering path has `continueOnError="true"`, and so does the flow hook. The usage event for that call is not delivered.
-
-The wait is bounded. Each attempt waits at most 1 second to connect and 2 seconds for the response. There is one retry, and only when the first attempt failed to connect or got a 5xx or 408, and failed within 1.2 seconds. Any other 4xx is the ingestor's answer and is not re-sent. A 429 is not re-sent either: waiting for its `Retry-After` would hold the API response, and re-sending at once would ignore it. A response timeout is not retried: an ingestor that accepted the connection and went silent would do the same again.
-
-| Ingest state | Attempts | Delay added to the API call |
-|---|---|---|
-| Healthy | 1 | tens of milliseconds |
-| Unreachable (connect times out) | 2 | about 2 s |
-| Unreachable, `max_retries` = `0` | 1 | about 1 s |
-| Answers 5xx immediately | 2 | two round trips |
-| Accepts the connection, never answers | 1 | about 3 s |
-| Upper limit (first attempt fails at 1.2 s, the retry then uses its full 3 s) | 2 | about 4 s |
-
-**The timeouts are fixed.** Apigee accepts only literal values for a ServiceCallout's `connect.timeout.millis`, `io.timeout.millis` and `<Timeout>`; a flow variable is not read there, so they cannot come from the KVM. To change them, edit the two values in `policies/AforoMeteringSendEvent.xml` and `policies/AforoMeteringSendEventRetry1.xml` and redeploy the shared flow. The retry count is configurable: KVM `max_retries`, `0` or `1`.
-
-**The dropped event is recorded.** `AforoMeteringLogDeliveryFailure` prints one line to the debug session (`[aforo-metering] USAGE EVENT DROPPED: messageid=… reason=… last status=… attempts=…`, plus the first 500 characters of the ingestor's response for a 4xx) and sets these flow variables, which a MessageLogging or DataCapture policy in your own flow can read:
-
-| Variable | Value |
-|---|---|
-| `aforo.meteringDeliveryFailed` | `true` when the event was not delivered |
-| `aforo.meteringDeliveryReason` | `unreachable`, `server_error`, `timeout` (408) or `rejected` (any other 4xx) |
-| `aforo.meteringDeliveryLastStatus` | last HTTP status, or `no-response` |
-| `aforo.meteringDeliveryAttempts` | `1` or `2` |
-| `aforo.meteringDeliveryRetryAfter` | the `Retry-After` header of a 429, when there was one |
-
-The flow does not store the event and does not send it later. Usage during an ingest outage is not billed unless you replay it yourself; the `idempotencyKey` is the Apigee `messageid`, so a replay of the same call is deduplicated.
-
-If the KVM is missing or has no `aforo_endpoint`, the flow makes no outbound call and the API call is unaffected.
-
-## Configuration
-
-All settings are entries in the organization-scoped KVM `aforo-metering-config`. The flow caches KVM reads for 300 seconds, so a changed entry takes up to five minutes to apply.
-
-| KVM key | Required | Default | What it does |
-|---|---|---|---|
-| `aforo_endpoint` | yes | — | Ingest URL the event is posted to: `https://api.aforo.ai/v1/ingest/batch`. |
-| `api_key` | yes | — | Aforo API key with scope `usage:ingest`. Sent as `X-API-Key` and nothing else; the ingestor takes the tenant from it. |
-| `metric_mappings` | no | — | JSON array `[{"matchType":"EXACT\|PREFIX\|CONTAINS","value":"/path","metricName":"m"}]`. First match wins. See [Which metric](#which-metric). |
-| `metric_name_pattern` | no | — | Metric name template, e.g. `{method} {path}`. Used when no mapping matches. The one-click install writes `{method} {path}`. |
-| `default_metric` | no | `api_calls` | Metric when no mapping matches and there is no pattern. |
-| `customer_id_source` | no | `consumer` | `consumer`, `jwt` or `flow_variable:<name>`. See [Who is billed](#who-is-billed). |
-| `product_type` | no | `API` | `productType` on every event, trimmed and upper-cased. See [Product type](#product-type). |
-| `quantity_source` | no | `1` | `1` per call, or `response_size` (the response `Content-Length`). Quantity 0 or less is not sent. |
-| `include_metadata` | no | `true` | `false` leaves `metadata` off standard events. |
-| `exclude_status_codes` | no | `401,403,429` | Comma-separated HTTP status codes that are not metered. |
-| `exclude_paths` | no | `/health,/ready,/metrics` | Comma-separated path prefixes that are not metered. |
-| `status_outcomes` | no | — | `executionStatus` overrides, e.g. `404=VALIDATION_FAILED,429=ERROR`. See the root README, "Execution status mapping". |
-| `max_retries` | no | `1` | Retries after a send that could not connect or got a 5xx or 408: `0` or `1`. A value above 1 is treated as 1, below 0 as 0, anything else as 1. |
-| `mcp_enabled` | no | off | `true` turns on MCP `tools/call` detection. |
-| `mcp_product_id` | no | — | Recorded as `metadata.productId` on MCP events. |
-| `jwt_validation_enabled` | no | — | `true` turns JWT validation on, `false` off. See [JWT validation](#jwt-validation). |
-| `aforo_jwks_uri`, `aforo_jwt_issuer` | no | — | JWKS URL and expected `iss` for JWT validation. |
-| `margin_guard_enabled`, `margin_guard_url` | no | off | Margin-guard check against the pricing service. Uses the customer and tenant of the verified JWT. |
-| `tenant_id` | no | — | Margin guard only, when the JWT has no `tenant_id`. Not sent to the ingestor. |
-
-The flow reads every entry into a `private.aforo.*` variable. Apigee X and hybrid encrypt all KVMs and reject a read into a variable without the `private.` prefix; it also keeps the API key out of debug sessions. For each setting the build script also reads the non-private `aforo.<name>` variable when the KVM has no value, so one proxy can override a setting with an AssignMessage placed before the FlowCallout (`aforo.productType`, `aforo.defaultMetric`, `aforo.mcpEnabled`, …).
-
-`flush_interval_ms` and `flush_count`, which the one-click install also writes, are not read: the flow sends one event per call.
-
-### Product type
-
-Every event carries a top-level `productType`.
-
-| Request | `productType` |
-|---|---|
-| Any call | KVM `product_type`, default `API` |
-| A call with a valid `traceparent` header (or `x-trace-id`), when the configured type is `API` | `AGENTIC_API`, with `traceId` |
-| MCP `tools/call` with a tool name and `params._meta.agent_id` | `MCP_SERVER` |
-| MCP `tools/call` without `params._meta.agent_id` | the configured type; the ingestor rejects `MCP_SERVER` without an agent |
-
-An event that lacks a field its type requires is not sent, and `aforo.skipReason` names the field. `AI_AGENT` needs an agent id, which has no trusted source outside an MCP payload (`X-Agent-Id` is a client header and is not read). `GRPC_API`, `GRAPHQL_API`, `WEBSOCKET_API` and `MQTT_BROKER` need fields this flow does not see, so setting `product_type` to one of them meters nothing.
-
-### JWT validation
-
-Off unless you turn it on. `AforoJwtValidation` (VerifyJWT, RS256, keys from your JWKS URL, `iss` and `exp` checked) and `AforoJwtAssignHeaders` run when
-
-- `jwt_validation_enabled` is `true`, or
-- `aforo_jwks_uri` is set and `jwt_validation_enabled` is not `false`.
-
-With it on, a request without a valid Aforo JWT is rejected with 401, so turn it on only where every caller carries one. It validates the request: attach the flow on the request path (`PreProxyFlowHook` or a request-side FlowCallout), not `PostProxyFlowHook`. Metering needs the response, so that deployment calls the flow twice or splits it; see [What this does not cover](#what-this-does-not-cover).
-
-## Requests that are not metered
-
-A skipped request produces no event and no call to Aforo. The script sets the flow variable `aforo.skip` to `"true"` and `aforo.skipReason` to the reason, builds no payload, and the send, retry and failure-log steps are skipped.
-
-Always skipped: `OPTIONS` requests (CORS preflights), requests with no customer identity, a quantity of 0 or less.
-
-**Status codes.** With no `exclude_status_codes` entry, 401, 403 and 429 are not metered — the same default as Kong and AWS Lambda. A value replaces the default; it does not add to it:
-
-| `exclude_status_codes` | Not metered |
-|---|---|
-| absent or blank | 401, 403, 429 |
-| `404,500` | 404 and 500 only — 401, 403 and 429 are now metered |
-| `none` | nothing — every status is metered |
-
-A 401, 403 or 429 that you choose to meter carries `executionStatus: BLOCKED` unless `status_outcomes` says otherwise.
-
-**Paths.** A request is excluded when its path equals an entry or starts with it, so `/health` also excludes `/health/live` (and `/healthz`). The check runs against the proxy path suffix, the base path plus suffix, and the full request path, so an entry may be written with or without the proxy base path. A value replaces the default; `none` excludes nothing.
-
-**Why `none`.** Kong takes an empty array and AWS Lambda an empty environment variable to mean "exclude nothing". An Apigee KVM entry can't be stored empty, and an absent entry has to mean "use the default", so Apigee uses the word `none`.
-
-**Malformed values.** Spaces and empty entries are ignored. A status entry that isn't a whole number from 100 to 599 is ignored. A list with no valid code in it (`abc`) excludes nothing.
-
-MCP tool calls and AGENTIC_API calls follow the same rules as plain API calls.
-
-## What this does not cover
-
-- **Request-phase and response-phase steps share one flow.** JWT validation and margin guard act on the request; metering needs the response. On `PostProxyFlowHook` the first two run after the backend already served the call. If you use them, put those steps in a request-side shared flow of your own and keep this one for metering.
-- `aforo-compound-metering.js`, `aforo-preflight-quota.js` and `aforo-jwt-jti-check.js` are in the bundle directory but no policy runs them. The Redis jti blocklist (`aforo_redis_host`, `aforo_redis_port`) is therefore not checked.
-- No store-and-forward. An event that could not be delivered after the one retry is logged and dropped.
-- **Not yet confirmed on a live org.** The flow assumes `developer.app.name` (and `developer.email`) are set once `VerifyAPIKey` / `OAuthV2` has run, and reads latency from `target.latency`. Both are from the unit mocks, not from a live Apigee X debug session. If `target.latency` is unset, `executionDurationMs` and `responseTimeMs` are sent as 0; if the developer variables are unset, nothing is metered (no customer).
-- With response streaming enabled, Apigee does not expose the response body, so an MCP call that returns a JSON-RPC `error` inside a 2xx is classified from the status alone.
+Calls that `aforo-access` refused (401/429/503) are never billed this way, because the flow marks them refused.
 
 ## Tests
 
 ```bash
-node tests/unit-tests.cjs
+cd aforo-gateway-plugins
+node apigee/tests/run-all.cjs      # Node 18+, no npm install
 ```
 
-## Troubleshooting
+- `static-check.cjs`: the XML is well-formed; manifests, files and Steps agree; every `jsc://` exists; conditions parse; KVM reads are `private.*`; every KVM key is documented; the two copies of `aforo-billing.js` are identical; the scripts are ES5.
+- `unit-tests.cjs`: the shared rules (Lua patterns, metric precedence, JSON-RPC, exclusions, status table).
+- `flow-tests.cjs`: both flows run end to end in a model of the Apigee runtime, covering keys and identity, quota ALLOW/WARN/DENY/timeout/fail-closed/cache, all four product types, delivery modes, error-flow metering and the JWT option.
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| Nothing is metered; `aforo.skipReason` is `no customerId` | No verified identity: no Aforo JWT, no developer app, or `customer_id_source` names a variable that is empty or refused. | Put `VerifyAPIKey` before the flow, or set `customer_id_source` to the flow variable that holds the Aforo customer id. |
-| `USAGE EVENT DROPPED … reason=rejected last status=400` | The metric name is not in the Aforo catalog, or the customer id is not an Aforo customer. The line carries the ingestor's message. | Register the metric, fix `metric_mappings` / `default_metric`, or map the app to the right customer id. |
-| `USAGE EVENT DROPPED … last status=401` | Wrong `api_key`, or the key lacks scope `usage:ingest`. | Replace the KVM `api_key`. |
-| Metric is `GET /orders/42` instead of a catalog metric | `metric_name_pattern` is set and no mapping matched. | Add a `metric_mappings` rule, or delete `metric_name_pattern` so `default_metric` applies. |
-| Every request gets 401 | JWT validation is on for callers that send no Aforo JWT. | Set `jwt_validation_enabled` to `false`, or remove `aforo_jwks_uri`. |
-| 401/403/429 calls no longer appear in usage | They are excluded by default. | Set `exclude_status_codes` to `none`, or to a list without those codes. |
-| Health checks still metered | The path isn't a prefix match for any entry, or a custom `exclude_paths` replaced the default. | Add the path to `exclude_paths`; include `/health` again if you set your own list. |
-| API calls are slow while Aforo is down | Each call waits for the send to time out: about 2 s when ingest is unreachable. | Set `max_retries` to `0` to halve it. For less, lower the two timeouts in the send policies and redeploy. |
-| Usage is missing for a period | Ingest was unreachable or answered 5xx; those events were dropped. | Look for `USAGE EVENT DROPPED` in a debug session, or log `aforo.meteringDeliveryFailed` from your own flow. |
-| A KVM change has no effect | KVM reads are cached for 300 seconds. | Wait five minutes or redeploy the shared flow. |
-| No outbound call at all | `aforo_endpoint` or `api_key` is missing, the shared flow isn't deployed to the environment, or it isn't attached. | Check the KVM entries, `GET .../environments/$ENV/sharedflows/aforo-metering/deployments` and `GET .../environments/$ENV/flowhooks/PostProxyFlowHook`; open a debug session and look for `aforo.eventPayload` and `aforo.skipReason`. |
-| One-click deploy says the flow hook is taken | Another shared flow is attached to `PostProxyFlowHook`. | Call `aforo-metering` from that flow with a FlowCallout and set `meteringAttachMode` to `none` on the connection. |
+CI runs them in the `apigee` job.
+
+`aforo-billing.js` exists twice, once in each bundle, because Apigee resolves `jsc://` inside a bundle. Edit `sharedflowbundle/resources/jsc/aforo-billing.js` and copy it to `aforo-access/sharedflowbundle/resources/jsc/`. The static check fails if the two differ.
+
+## What only a live org can prove
+
+- That VerifyAPIKey exposes the custom attributes as `verifyapikey.AforoVerifyApiKey.app.aforo_customer_id` / `.developer.aforo_customer_id` (as documented), and which product it picks when a key has several products for the same proxy.
+- That a ServiceCallout without `<Response>` adds no measurable latency, and how often its requests are lost.
+- That the PostProxyFlowHook really is skipped on a target 4xx/5xx (the docs do not say), that a DefaultFaultRule FlowCallout sees the target's status in `response.status.code`, and that a RaiseFault from the PreProxyFlowHook reaches the client unchanged, or is reshaped by the proxy's own FaultRules.
+- That Apigee joins composite KVM keys exactly as `managed_proxy__{proxy}`, and how a KVM `Get` behaves when its key is missing.
+- Rhino quirks the Node model cannot show, the `crypto` object, and JavaScript `timeLimit` under load.
+- That a JavaScript policy can set `aforo.access.clientKey` early enough for VerifyAPIKey's `ref`.

@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  aforo-access: attach to the environment's PreProxyFlowHook.
+
+  A flow hook runs for every proxy in the environment, so everything after
+  the first step runs only on a proxy Aforo manages (KVM
+  managed_proxy__{apiproxy.name} = "true"). On any other proxy this flow
+  reads one KVM key and does nothing else.
+
+  Faults this flow raises reach the client as they are: 401 from
+  AforoVerifyApiKey (missing key, invalid key, or a key whose API products do
+  not cover this proxy), 401 from AforoJwtValidation / AforoJwtRejected
+  (opt-in), 429 from AforoQuotaExceeded, 503 from AforoQuotaUnavailable
+  (only with quota_fail_open = "false"). Every other step has
+  continueOnError="true": an Aforo outage or a bug here lets the call through
+  (fail open) rather than taking the customer's API down.
+-->
+<SharedFlow name="default">
+    <Step>
+        <Name>AforoAccessReadManaged</Name>
+    </Step>
+    <Step>
+        <Name>AforoAccessPrepare</Name>
+        <Condition>private.aforo.managedProxy = "true"</Condition>
+    </Step>
+    <Step>
+        <Name>AforoVerifyApiKey</Name>
+        <Condition>private.aforo.managedProxy = "true"</Condition>
+    </Step>
+    <!-- The upstream never sees the end customer's key (Kong's
+         hide_credentials). Runs only after the key was accepted: a failed
+         VerifyAPIKey has already ended the flow with 401. -->
+    <Step>
+        <Name>AforoAccessHideCredentials</Name>
+        <Condition>private.aforo.managedProxy = "true"</Condition>
+    </Step>
+    <Step>
+        <Name>AforoAccessReadConfig</Name>
+        <Condition>private.aforo.managedProxy = "true"</Condition>
+    </Step>
+
+    <!-- Optional Aforo JWT (KVM jwt_validation_enabled = "true"), in
+         addition to the API key: signature, issuer and expiry, then the
+         token must be for this tenant. -->
+    <Step>
+        <Name>AforoJwtValidation</Name>
+        <Condition>(private.aforo.managedProxy = "true") and (private.aforo.jwtValidationEnabled = "true")</Condition>
+    </Step>
+    <Step>
+        <Name>AforoJwtAssignClaims</Name>
+        <Condition>(private.aforo.managedProxy = "true") and (private.aforo.jwtValidationEnabled = "true")</Condition>
+    </Step>
+
+    <Step>
+        <Name>AforoAccessDecide</Name>
+        <Condition>private.aforo.managedProxy = "true"</Condition>
+    </Step>
+    <Step>
+        <Name>AforoJwtRejected</Name>
+        <Condition>(private.aforo.managedProxy = "true") and (aforo.access.jwtRejected = "true")</Condition>
+    </Step>
+
+    <!-- Pre-flight quota check (enforce_quota__{apiproduct} = "true").
+         ALLOW and WARN are cached for quota_cache_ttl_ms; DENY never is. -->
+    <Step>
+        <Name>AforoQuotaLookupCache</Name>
+        <Condition>(aforo.access.checkQuota = "true") and (aforo.access.quotaCacheEnabled = "true")</Condition>
+    </Step>
+    <Step>
+        <Name>AforoQuotaCheck</Name>
+        <Condition>(aforo.access.checkQuota = "true") and (aforo.access.cachedDecision != "ALLOW") and (aforo.access.cachedDecision != "WARN")</Condition>
+    </Step>
+    <Step>
+        <Name>AforoQuotaDecide</Name>
+        <Condition>(aforo.access.checkQuota = "true") and (aforo.access.cachedDecision != "ALLOW") and (aforo.access.cachedDecision != "WARN")</Condition>
+    </Step>
+    <Step>
+        <Name>AforoQuotaPopulateCache</Name>
+        <Condition>aforo.access.quotaCacheable = "true"</Condition>
+    </Step>
+    <Step>
+        <Name>AforoQuotaExceeded</Name>
+        <Condition>aforo.access.quotaDecision = "DENY"</Condition>
+    </Step>
+    <Step>
+        <Name>AforoQuotaUnavailable</Name>
+        <Condition>aforo.access.quotaFailClosed = "true"</Condition>
+    </Step>
+
+    <!-- Reached only when nothing above refused the call: lowers
+         aforo.access.refused, so aforo-metering bills it. -->
+    <Step>
+        <Name>AforoAccessComplete</Name>
+        <Condition>private.aforo.managedProxy = "true"</Condition>
+    </Step>
+</SharedFlow>
