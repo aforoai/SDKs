@@ -2322,7 +2322,10 @@ function AforoMeteringHandler:log(conf)
     -- The path is client-chosen: escaped and cut to the ingestor's 512 limit.
     local event_path = escaped_string(path, 512) or "/"
 
-    for _, event in ipairs(events) do
+    -- One event per call; returning skips it. Written as a function because
+    -- Lua 5.1 has no goto (Kong runs LuaJIT, but the busted suite runs on 5.1).
+    -- Returns "stop" when no later event can be metered either.
+    local function meter_event(event)
         -- quantity must be > 0 (e.g. quantity_source=response_size with an empty
         -- body) after rounding to the ingestor's 6 decimals, and below its 14
         -- integer digits; such an event would only be refused.
@@ -2332,7 +2335,7 @@ function AforoMeteringHandler:log(conf)
         if type(event.quantity) ~= "number" or event.quantity <= 0 or event.quantity >= 1e14 then
             kong.log.debug("[aforo-metering] Skipping ", method, " ", path,
                 " -- quantity is not > 0 (after rounding to 6 decimals) or is too large.")
-            goto continue
+            return
         end
 
         -- AGENTIC_API: always a traceId, never the client's (see
@@ -2342,7 +2345,7 @@ function AforoMeteringHandler:log(conf)
             event.traceId, bad_trace = agentic_trace_id(conf, request_id)
             if bad_trace then
                 skip_unusable(bad_trace)
-                goto continue
+                return
             end
         end
         -- AI_AGENT: the ingestor aggregates an agent's sessions by traceId,
@@ -2431,7 +2434,7 @@ function AforoMeteringHandler:log(conf)
                 " -- no customer identity resolved. With jwt_validation_enabled the ",
                 "customer_id claim supplies this; otherwise set customer_id_source to a ",
                 "Kong consumer. Event not metered. Repeats suppressed for 60s.")
-            return
+            return "stop"
         end
 
         local field, why = identity_problem(event)
@@ -2440,7 +2443,7 @@ function AforoMeteringHandler:log(conf)
             warn_throttled("identity_" .. field, 300,
                 "[aforo-metering] Skipping events: ", field, " ", why, " (e.g. ", method, " ",
                 event_path, "). Event not metered. Repeats suppressed for 300s.")
-            goto continue
+            return
         end
 
         -- Refuse to buffer an event its productType makes invalid, for the same
@@ -2464,7 +2467,7 @@ function AforoMeteringHandler:log(conf)
                     "[aforo-metering] Skipping events: product_type ", event.productType,
                     " requires ", table.concat(missing, ", "), ", which this request did not ",
                     "supply (e.g. ", method, " ", path, ").", fix, " Repeats suppressed for 300s.")
-                goto continue
+                return
             end
         end
 
@@ -2473,12 +2476,14 @@ function AforoMeteringHandler:log(conf)
             if not encoded then
                 kong.log.err("[aforo-metering] Could not encode event for ", method, " ", path,
                     ": ", enc_err, ". Event not metered.")
-                goto continue
+                return
             end
             event_buffer.push(conf, encoded)
         end
+    end
 
-        ::continue::
+    for _, event in ipairs(events) do
+        if meter_event(event) == "stop" then return end
     end
 end
 
