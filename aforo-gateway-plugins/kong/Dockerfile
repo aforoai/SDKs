@@ -36,7 +36,7 @@ USER root
 # rockspec passed as a path.
 COPY . /tmp/aforo-plugin/
 RUN cd /tmp/aforo-plugin \
-    && luarocks make kong-plugin-aforo-metering-2.2.0-1.rockspec \
+    && luarocks make kong-plugin-aforo-metering-2.5.0-1.rockspec \
     && rm -rf /tmp/aforo-plugin
 
 USER kong
@@ -45,7 +45,7 @@ ENV KONG_PLUGINS=bundled,aforo-metering
 
 # handler.lua buffers events in ngx.shared.aforo_buffer. Without this dict the
 # plugin loads and proxies traffic but silently meters nothing -- every log-phase
-# call bails out with "Shared dict 'aforo_buffer' not found".
+# call bails out with "Shared dict 'aforo_buffer' not available".
 ENV KONG_NGINX_HTTP_LUA_SHARED_DICT="aforo_buffer 10m"
 
 # Required for an https aforo_endpoint -- i.e. every production deployment.

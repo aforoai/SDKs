@@ -1,6 +1,6 @@
 # Aforo Gateway Metering Plugins
 
-**Current version**: 2.2.0 for all five plugins (2026-10-02). Each plugin directory has its own `VERSION` / `CHANGELOG.md` / `USER_GUIDE.md`; `CHANGELOG.md` here is the cross-plugin history. 2.2.0 merges the public 2.1.0 release (Gowtham, Eswar) with this repository's line.
+**Current versions**: Kong 2.3.0 (2026-10-15), AWS Lambda 2.3.0 (2026-10-16); Apigee, Azure APIM and MuleSoft 2.2.0 (2026-10-02). Each plugin directory has its own `VERSION` / `CHANGELOG.md` / `USER_GUIDE.md`; `CHANGELOG.md` here is the cross-plugin history. 2.2.0 merges the public 2.1.0 release (Gowtham, Eswar) with this repository's line.
 
 Gateway plugins that capture API usage events at the edge and forward them to the Aforo usage ingestor service. Each plugin supports Standard API metering, MCP Server tool invocation detection, and W3C Trace Context capture.
 
@@ -15,7 +15,7 @@ A request with no verified customer produces no event, on every plugin. None of 
 | Gateway | `customerId` comes from |
 |---|---|
 | Kong | `customer_id_jwt_claim` (claim of the JWT Kong's `jwt` plugin verified; exclusive when set), else the `customer_id` claim of the Aforo JWT the plugin verified itself (`jwt_validation_enabled` + `jwt_public_key`), else the Kong consumer. See `kong/README.md` "Customer identity". |
-| AWS Lambda | `$context.authorizer.customerId` in the access log (set by `authorizer.js` from the verified JWT), else the IAM caller. |
+| AWS Lambda | `$context.authorizer.customerId` in the access log (set by `authorizer.js` from a verified Aforo JWT, or by `key-authorizer.js` from the customer's Aforo key as introspected by Aforo), else the IAM caller. |
 | Apigee | The verified JWT claim, else a configured `flow_variable:<name>`, else `developer.app.name` / `developer.email`. |
 | Azure APIM | Context variable `aforo-customer-id` (set by the `aforo-context` fragment from the validated JWT or the subscription→customer map), else the subscription id. |
 | MuleSoft | `authentication.properties.claims` (MuleSoft's JWT Validation policy), claim named by `customer-id-claim`. |
@@ -25,7 +25,7 @@ A request with no verified customer produces no event, on every plugin. None of 
 | Plugin | Directory | Gateway | Phase | Tests |
 |--------|-----------|---------|-------|-------|
 | **Kong** | `kong/` | Kong Gateway | access (optional checks) + log (metering) | `cd kong && busted spec/` |
-| **Apigee** | `apigee/` | Google Apigee | PostClientFlow (JavaScript callout) | `node tests/unit-tests.cjs` |
+| **Apigee** | `apigee/` | Google Apigee | Shared flow on `PostProxyFlowHook` (JavaScript + ServiceCallout; sends before the response returns) | `node apigee/tests/unit-tests.cjs` |
 | **AWS** | `aws-lambda/` | AWS API Gateway | CloudWatch Logs (Lambda subscriber) | `cd aws-lambda && npm test` |
 | **Azure APIM** | `azure-apim/` | Azure API Management | Outbound policy fragment | `node azure-apim/tests/policy.test.cjs` (runs the policy expressions against a mock context; no APIM runtime) |
 | **MuleSoft** | `mulesoft/aforo-metering/` (Mule 4 custom policy, `mvn clean package`) | MuleSoft Anypoint, Mule 4.4+ runtime | After the flow, async (DataWeave) | `node mulesoft/tests/policy.test.cjs` (structure only; DataWeave is not executed) + `mvn clean package` + `tests/policy-contract.md` |

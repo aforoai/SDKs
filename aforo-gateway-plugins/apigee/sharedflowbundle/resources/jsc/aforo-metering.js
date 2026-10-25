@@ -416,12 +416,15 @@ if (!skipReason && mcpEnabled && method === 'POST') {
 // NEVER put a clock component (Date.now()) back into the key: a
 // per-evaluation clock makes every replay look like a new event, which
 // is exactly the double-billing this program exists to prevent.
-// Identity preference: Apigee 'messageid' (platform-generated, unique
-// and stable per transaction) > client 'x-request-id' header > one-time
-// random fallback (dedup opt-out for that single event; random rather
-// than clock so two same-millisecond keyless events cannot collide into
-// a false dedup — same rationale as usage-ingestor V31).
-var requestIdentity = requestId || trace.xRequestId ||
+// Identity: Apigee 'messageid' (platform-generated, unique and stable per
+// transaction) > one-time random fallback (dedup opt-out for that single
+// event; random rather than clock so two same-millisecond keyless events
+// cannot collide into a false dedup — same rationale as usage-ingestor
+// V31). NEVER fall back to a request header such as x-request-id: the
+// client sets it, and a caller repeating one value would have every
+// repeat deduplicated by the ingestor (billed once for many calls). The
+// header is still forwarded as trace.xRequestId.
+var requestIdentity = requestId ||
     ('apigee-norid-' + Math.floor(Math.random() * 0xFFFFFFFF).toString(16) +
      '-' + Math.floor(Math.random() * 0xFFFFFFFF).toString(16));
 

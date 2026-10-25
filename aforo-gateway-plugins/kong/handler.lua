@@ -112,42 +112,113 @@ local function warn_throttled(key, ttl, ...)
     end
 end
 
--- Check jti blocklist in Redis.  Fail-open: returns false on any Redis error.
-local function is_jti_blocked(jti, redis_host, redis_port)
-    if not jti or jti == "" then return false end
-    local red = require("resty.redis"):new()
-    red:set_timeout(500)
-    local ok, err = red:connect(redis_host or "127.0.0.1", redis_port or 6379)
-    if not ok then
-        warn_throttled("redis_jti", 60,
-            "[aforo-metering] Redis unreachable for jti-blocklist check at ",
-            redis_host or "127.0.0.1", ":", redis_port or 6379, " (", err, "). ",
-            "Failing OPEN -- revoked tokens are NOT being rejected. ",
-            "Set jwt_redis_host/jwt_redis_port. Repeats suppressed for 60s.")
-        return false  -- fail-open: do not block legitimate requests on Redis failure
+-- ────────────────────────────────────────────────────────────
+-- Revocation checks (jti blocklist + client revocation) in Redis
+-- ────────────────────────────────────────────────────────────
+--
+-- FAIL-CLOSED by default (w2-2-kong-jti-fail-open, 2026-10-24). Before 2.4.0
+-- an unreachable Redis let every request through, so a revoked token or a
+-- revoked API key kept working for as long as Redis was down -- exactly the
+-- window an attacker holding a stolen token would wait for. organization-service
+-- already answers 503 for the same check; the gateway now does too.
+--
+-- jti_redis_fail_mode = "open" restores the old behaviour for deployments that
+-- prefer availability. Every fail-open is logged (throttled) and counted, so
+-- the gap is visible instead of silent.
+--
+-- "Unavailable" covers both a failed connect and a failed GET: a GET that
+-- times out after connecting proves nothing about revocation.
+--
+-- Counted in two places, as record_drop does for events:
+--   1. shared dict "aforo_revocation_unavailable:<check>:<outcome>"
+--   2. Prometheus aforo_metering_revocation_check_unavailable_total{check,outcome}
+--      when Kong's prometheus plugin is loaded. Every touch is pcall-guarded.
+-- check = "jti" | "client", outcome = "closed" (refused) | "open" (let through).
+
+local REVOCATION_UNAVAILABLE_PREFIX = "aforo_revocation_unavailable:"
+local prometheus_revocation_counter  -- nil = not yet resolved; false = unavailable
+
+local function get_prometheus_revocation_counter()
+    if prometheus_revocation_counter ~= nil then
+        return prometheus_revocation_counter or nil
     end
-    local val = red:get("jti:blocked:" .. jti)
-    red:set_keepalive(10000, 10)
-    return val ~= nil and val ~= ngx.null
+    local ok, exporter = pcall(require, "kong.plugins.prometheus.exporter")
+    if ok and type(exporter) == "table" and type(exporter.get_prometheus) == "function" then
+        local got, prom = pcall(exporter.get_prometheus)
+        if got and prom and type(prom.counter) == "function" then
+            local reg, counter = pcall(prom.counter, prom,
+                "aforo_metering_revocation_check_unavailable_total",
+                "Token revocation checks that could not reach Redis, by check and outcome",
+                { "check", "outcome" })
+            if reg and counter then
+                prometheus_revocation_counter = counter
+                return counter
+            end
+        end
+    end
+    prometheus_revocation_counter = false
+    return nil
 end
 
--- Check client-level revocation via key_id.  Fail-open.
-local function is_client_revoked(key_id, redis_host, redis_port)
-    if not key_id or key_id == "" then return false end
+local function record_revocation_unavailable(check, outcome)
+    local dict = ngx.shared[BUFFER_DICT]
+    if dict then
+        dict:incr(REVOCATION_UNAVAILABLE_PREFIX .. check .. ":" .. outcome, 1, 0)
+    end
+    local counter = get_prometheus_revocation_counter()
+    if counter then
+        pcall(counter.inc, counter, 1, { check, outcome })
+    end
+end
+
+local function revocation_fails_open(conf)
+    return conf.jti_redis_fail_mode == "open"
+end
+
+-- Looks up `key` in Redis. Returns (present, nil) or (nil, err) when Redis
+-- could not answer.
+local function redis_key_present(key, redis_host, redis_port)
     local red = require("resty.redis"):new()
     red:set_timeout(500)
-    local ok, err = red:connect(redis_host or "127.0.0.1", redis_port or 6379)
+    local ok, err = red:connect(redis_host, redis_port)
     if not ok then
-        warn_throttled("redis_revocation", 60,
-            "[aforo-metering] Redis unreachable for client-revocation check at ",
-            redis_host or "127.0.0.1", ":", redis_port or 6379, " (", err, "). ",
-            "Failing OPEN -- revoked API keys are NOT being rejected. ",
-            "Set jwt_redis_host/jwt_redis_port. Repeats suppressed for 60s.")
-        return false
+        return nil, "connect: " .. tostring(err)
     end
-    local val = red:get("jti:client:" .. key_id)
+    local val, get_err = red:get(key)
+    if val == nil then
+        -- Do not put a connection in an unknown state back into the pool.
+        if red.close then pcall(red.close, red) end
+        return nil, "get: " .. tostring(get_err)
+    end
     red:set_keepalive(10000, 10)
-    return val ~= nil and val ~= ngx.null
+    return val ~= ngx.null, nil
+end
+
+-- Returns "revoked", "ok" or "unavailable" (Redis could not answer and the
+-- configured mode is closed). A fail-open is logged, counted and returns "ok".
+local function revocation_status(check, key, conf, redis_host, redis_port)
+    local present, err = redis_key_present(key, redis_host, redis_port)
+    if present ~= nil then
+        return present and "revoked" or "ok"
+    end
+    local what = check == "jti" and "revoked tokens" or "revoked API keys"
+    if revocation_fails_open(conf) then
+        record_revocation_unavailable(check, "open")
+        warn_throttled("redis_" .. check .. "_open", 60,
+            "[aforo-metering] Redis could not answer the ", check, " revocation check at ",
+            redis_host, ":", redis_port, " (", err, "). ",
+            "jti_redis_fail_mode=open: Failing OPEN -- ", what, " are NOT being rejected. ",
+            "Repeats suppressed for 60s.")
+        return "ok"
+    end
+    record_revocation_unavailable(check, "closed")
+    warn_throttled("redis_" .. check .. "_closed", 60,
+        "[aforo-metering] Redis could not answer the ", check, " revocation check at ",
+        redis_host, ":", redis_port, " (", err, "). ",
+        "Refusing requests with 503 (jti_redis_fail_mode=closed). ",
+        "Set jwt_redis_host/jwt_redis_port, or jti_redis_fail_mode=open to let them through. ",
+        "Repeats suppressed for 60s.")
+    return "unavailable"
 end
 
 -- ────────────────────────────────────────────────────────────
@@ -170,15 +241,22 @@ end
 --      RSA-SHA256 against the configured key, so an alg=none / HS256 token can
 --      never verify; the explicit check makes that a named rejection instead
 --      of a signature failure and keeps it true if the verifier ever changes.
---   3. RS256 signature against conf.jwt_public_key (PEM, public key only)
+--   3. RS256 signature against the issuer's key: from conf.jwt_jwks_uri by
+--      the token's kid (W3.7), else conf.jwt_public_key (PEM, public key only)
 --   4. exp (required, numeric) and nbf (when present), with
 --      JWT_CLOCK_SKEW_SECONDS of leeway
 --   5. iss, when conf.jwt_issuer is set
---   6. jti / key_id revocation (Redis, fail-open, as before)
+--   6. jti / key_id revocation (Redis). When Redis cannot answer the token is
+--      refused with 503, unless jti_redis_fail_mode = "open" (since 2.4.0)
 --
--- Keys come from config only. jwt_jwks_uri is accepted by the schema for
--- compatibility but no JWKS fetch is implemented, so nothing here makes a
--- network call for key material.
+-- Keys (W3.7): with jwt_jwks_uri set, the issuer's JWKS is fetched over https
+-- in the access phase and cached per worker for jwt_jwks_cache_ttl seconds
+-- (default 600). A token whose kid is not in the cached set triggers a refresh,
+-- at most once per JWKS_MIN_REFRESH seconds, so a key rotation needs no Kong
+-- config change. When a refresh fails the last good set keeps working for up
+-- to JWKS_MAX_STALE seconds. jwt_public_key, when also set, verifies tokens the
+-- JWKS has no key for. A JWKS that cannot be fetched or parsed never opens the
+-- gate, jwt_allow_unverified_signature included.
 --
 -- jwt_allow_unverified_signature = true (2.1.0 opt-out) keeps its meaning for
 -- ACCESS: a token this plugin cannot verify is let through, for deployments
@@ -226,6 +304,148 @@ local function load_public_key(pem)
     return pk
 end
 
+-- ── JWKS (jwt_jwks_uri) ─────────────────────────────────────────
+local JWKS_DEFAULT_TTL = 600
+local JWKS_MIN_REFRESH = 30
+-- A worker that has never fetched the set retries sooner, so a failed first fetch
+-- (Kong reload, issuer briefly down) costs seconds of 401s, not half a minute.
+local JWKS_MIN_REFRESH_COLD = 5
+-- Requests that arrive while this worker's first fetch is in flight wait for it.
+local JWKS_WAIT_STEP = 0.05
+local JWKS_MAX_STALE = 86400
+local JWKS_MAX_BYTES = 262144
+local JWKS_TIMEOUT_MS = 3000
+-- Whole fetch (connect, TLS, request, every body chunk) must finish inside this.
+-- Requests waiting on a worker's first fetch wait this long; a fetch flagged in
+-- flight for longer than this (its coroutine was aborted) no longer blocks refreshes.
+local JWKS_FETCH_BUDGET = 8
+local jwks_cache = {}   -- uri -> { keys = {kid -> pkey}, single = pkey|nil, fetched_at, expires_at, last_attempt }
+
+-- RSA signing keys of a JWKS body, by kid. Keys that are not RSA, not for
+-- signing, not RS256, have no kid, or carry private parts are skipped.
+local function parse_jwks(body)
+    local ok, doc = pcall(cjson.decode, body)
+    if not ok or type(doc) ~= "table" or type(doc.keys) ~= "table" then
+        return nil, "not a JWKS document"
+    end
+    local okp, pkey = pcall(require, "resty.openssl.pkey")
+    if not okp then return nil, "resty.openssl unavailable: " .. tostring(pkey) end
+    local keys, count, only = {}, 0, nil
+    for _, k in ipairs(doc.keys) do
+        if type(k) == "table" and k.kty == "RSA" and type(k.kid) == "string" and k.kid ~= ""
+                and (k.use == nil or k.use == "sig") and (k.alg == nil or k.alg == "RS256")
+                and type(k.n) == "string" and type(k.e) == "string" and k.d == nil then
+            local pk = pkey.new(cjson.encode({ kty = "RSA", n = k.n, e = k.e }), { format = "JWK" })
+            if pk then
+                keys[k.kid] = pk
+                count = count + 1
+                only = pk
+            end
+        end
+    end
+    if count == 0 then return nil, "JWKS has no usable RS256 key" end
+    return keys, nil, count == 1 and only or nil
+end
+
+local function fetch_jwks(uri)
+    if type(uri) ~= "string" or not uri:match("^https://") then
+        return nil, "jwt_jwks_uri must be an https URL"
+    end
+    local started = ngx.now()
+    local httpc = http.new()
+    httpc:set_timeout(JWKS_TIMEOUT_MS)
+    local parsed, uerr = httpc:parse_uri(uri, false)
+    if not parsed then return nil, "jwt_jwks_uri could not be parsed: " .. tostring(uerr) end
+    local host, port, path, query = parsed[2], parsed[3], parsed[4], parsed[5]
+    local okc, cerr = httpc:connect({
+        scheme = "https", host = host, port = port, ssl_verify = true, ssl_server_name = host,
+    })
+    if not okc then return nil, "JWKS fetch failed: " .. tostring(cerr) end
+    -- The body is read in chunks and abandoned past JWKS_MAX_BYTES, so an oversized
+    -- (or endless) response never sits in worker memory; request_uri would read it all.
+    local res, err = httpc:request({
+        method = "GET",
+        path = (query and query ~= "") and (path .. "?" .. query) or path,
+        headers = {
+            ["Host"] = (port == 443 or port == nil) and host or (host .. ":" .. port),
+            ["Accept"] = "application/json",
+        },
+    })
+    if not res then httpc:close() return nil, "JWKS fetch failed: " .. tostring(err) end
+    if res.status ~= 200 then httpc:close() return nil, "JWKS fetch answered " .. tostring(res.status) end
+    local too_big = "JWKS body larger than " .. JWKS_MAX_BYTES .. " bytes"
+    local declared = res.headers and tonumber(res.headers["Content-Length"])
+    if declared and declared > JWKS_MAX_BYTES then httpc:close() return nil, too_big end
+    if type(res.body_reader) ~= "function" then httpc:close() return nil, "JWKS body missing" end
+    local parts, size = {}, 0
+    while true do
+        local chunk, berr = res.body_reader(8192)
+        if berr then httpc:close() return nil, "JWKS body read failed: " .. tostring(berr) end
+        if not chunk then break end
+        if ngx.now() - started > JWKS_FETCH_BUDGET then
+            httpc:close() return nil, "JWKS fetch took longer than " .. JWKS_FETCH_BUDGET .. " s"
+        end
+        size = size + #chunk
+        if size > JWKS_MAX_BYTES then httpc:close() return nil, too_big end
+        parts[#parts + 1] = chunk
+    end
+    httpc:close()
+    local keys, perr, single = parse_jwks(table.concat(parts))
+    if not keys then return nil, perr end
+    return keys, nil, single
+end
+
+-- The JWKS key for kid (or the only key when the token names none), or nil.
+local function jwks_key(conf, kid)
+    local uri = conf.jwt_jwks_uri
+    local now = ngx.now()
+    local ttl = tonumber(conf.jwt_jwks_cache_ttl) or JWKS_DEFAULT_TTL
+    local entry = jwks_cache[uri]
+    local missing = not entry or now >= entry.expires_at or (kid ~= nil and entry.keys[kid] == nil)
+    local function in_flight(e, at)
+        return e ~= nil and e.fetching == true and at - (e.fetch_started or 0) < JWKS_FETCH_BUDGET + 1
+    end
+    -- Another request in this worker is fetching the first set: wait for it (yields).
+    if in_flight(entry, now) and entry.fetched_at == 0 and ngx.sleep then
+        local waited = 0
+        while in_flight(entry, ngx.now()) and waited < JWKS_FETCH_BUDGET + 1 do
+            ngx.sleep(JWKS_WAIT_STEP)
+            waited = waited + JWKS_WAIT_STEP
+            entry = jwks_cache[uri]
+        end
+        now = ngx.now()
+        missing = not entry or entry.fetched_at == 0 or (kid ~= nil and entry.keys[kid] == nil)
+    end
+    local min_refresh = (entry and entry.fetched_at > 0) and JWKS_MIN_REFRESH or JWKS_MIN_REFRESH_COLD
+    if missing and (not entry or (not in_flight(entry, now) and now - entry.last_attempt >= min_refresh)) then
+        -- Mark the attempt first: requests in this worker that arrive while the
+        -- fetch yields use what is cached instead of fetching too.
+        if entry then
+            entry.last_attempt = now
+        else
+            entry = { keys = {}, single = nil, fetched_at = 0, expires_at = 0, last_attempt = now }
+            jwks_cache[uri] = entry
+        end
+        entry.fetching = true
+        entry.fetch_started = now
+        local okf, keys, err, single = pcall(fetch_jwks, uri)
+        entry.fetching = false
+        if not okf then keys, err = nil, tostring(keys) end
+        if keys then
+            jwks_cache[uri] = { keys = keys, single = single, fetched_at = now,
+                                expires_at = now + ttl, last_attempt = now }
+            entry = jwks_cache[uri]
+        else
+            warn_throttled("jwks_fetch", 60, "[aforo-metering] ", err,
+                (entry.fetched_at > 0) and " -- using the keys fetched earlier" or "")
+        end
+    end
+    if not entry or entry.fetched_at == 0 then return nil, "no JWKS keys available" end
+    if now - entry.fetched_at > JWKS_MAX_STALE then return nil, "JWKS keys too old" end
+    if kid ~= nil then return entry.keys[kid], "kid not in JWKS" end
+    return entry.single, "token names no kid and the JWKS has several keys"
+end
+
 -- Header of a compact JWS, or nil.
 local function parse_jwt_header(token)
     local dot = string.find(token, ".", 1, true)
@@ -253,13 +473,15 @@ end
 -- out with jwt_allow_unverified_signature, or (false, reason).
 local function verify_rs256_signature(token, conf)
     local allow_unverified = conf.jwt_allow_unverified_signature == true
+    local has_static = conf.jwt_public_key ~= nil and conf.jwt_public_key ~= ""
+    local has_jwks = conf.jwt_jwks_uri ~= nil and conf.jwt_jwks_uri ~= ""
 
-    if not conf.jwt_public_key or conf.jwt_public_key == "" then
+    if not has_static and not has_jwks then
         if allow_unverified then return true, "unverified" end
-        kong.log.err("[aforo-metering] No jwt_public_key configured -- RS256 signature CANNOT ",
-            "be verified (jwt_jwks_uri is accepted but not implemented). Set jwt_public_key ",
-            "to the issuer's PEM public key, or verify the token with Kong's jwt plugin and ",
-            "use customer_id_jwt_claim.")
+        kong.log.err("[aforo-metering] No jwt_jwks_uri or jwt_public_key configured -- RS256 ",
+            "signature CANNOT be verified. Set jwt_jwks_uri to the issuer's JWKS, or ",
+            "jwt_public_key to its PEM public key, or verify the token with Kong's jwt plugin ",
+            "and use customer_id_jwt_claim.")
         return false, "INVALID_SIGNATURE"
     end
 
@@ -270,11 +492,23 @@ local function verify_rs256_signature(token, conf)
         return false, "UNSUPPORTED_ALGORITHM"
     end
 
-    local pk, kerr = load_public_key(conf.jwt_public_key)
+    local pk, kerr
+    if has_jwks then
+        pk, kerr = jwks_key(conf, type(header.kid) == "string" and header.kid ~= "" and header.kid or nil)
+    end
+    if not pk and has_static then
+        pk, kerr = load_public_key(conf.jwt_public_key)
+    end
     if not pk then
         -- A broken key or library is an operator error. Never honour
         -- allow_unverified here: a typo in the PEM must not open the gate.
-        kong.log.err("[aforo-metering] RS256 signature CANNOT be verified: ", kerr)
+        if has_jwks then
+            -- A caller controls the kid, so this is throttled, not logged per request.
+            warn_throttled("jwks_no_key", 60, "[aforo-metering] RS256 signature CANNOT be verified: ",
+                tostring(kerr))
+        else
+            kong.log.err("[aforo-metering] RS256 signature CANNOT be verified: ", kerr)
+        end
         return false, "INVALID_SIGNATURE"
     end
 
@@ -363,14 +597,24 @@ local function validate_jwt(token, conf)
 
     -- 5. jti blocklist (revoked individual token)
     local jti = string_claim(claims.jti)
-    if is_jti_blocked(jti, redis_host, redis_port) then
-        return { valid = false, reason = "TOKEN_REVOKED" }
+    if jti ~= "" then
+        local status = revocation_status("jti", "jti:blocked:" .. jti, conf, redis_host, redis_port)
+        if status == "revoked" then
+            return { valid = false, reason = "TOKEN_REVOKED" }
+        elseif status == "unavailable" then
+            return { valid = false, reason = "REVOCATION_CHECK_UNAVAILABLE", status = 503 }
+        end
     end
 
     -- 6. Client-level revocation (all tokens for this key_id revoked)
     local key_id = string_claim(claims.key_id)
-    if is_client_revoked(key_id, redis_host, redis_port) then
-        return { valid = false, reason = "CLIENT_REVOKED" }
+    if key_id ~= "" then
+        local status = revocation_status("client", "jti:client:" .. key_id, conf, redis_host, redis_port)
+        if status == "revoked" then
+            return { valid = false, reason = "CLIENT_REVOKED" }
+        elseif status == "unavailable" then
+            return { valid = false, reason = "REVOCATION_CHECK_UNAVAILABLE", status = 503 }
+        end
     end
 
     -- 7. Return validated claims
@@ -394,7 +638,7 @@ end
 
 local AforoMeteringHandler = {
     PRIORITY = 5,    -- Run after most other plugins
-    VERSION  = "2.2.0",
+    VERSION  = "2.5.0",
 }
 
 -- Shared memory buffer (kong.conf: lua_shared_dict aforo_buffer 10m).
@@ -512,7 +756,7 @@ end
 
 -- Records `count` permanently-dropped events under `reason`
 -- ("buffer_overflow" | "rejected" | "ingestor_rejected" | "invalid_metric" |
--- "missing_fields"). Returns the new cumulative
+-- "missing_fields" | "no_request_identity"). Returns the new cumulative
 -- total for that reason, or nil when the shared dict is unavailable.
 -- Safe in both request (log phase) and timer (flush) contexts.
 local function record_drop(reason, count)
@@ -941,8 +1185,24 @@ local function iso8601_utc(t)
     return os.date("!%Y-%m-%dT%H:%M:%S", sec) .. string.format(".%03dZ", ms)
 end
 
-local function generate_idempotency_key(request_id)
-    return request_id or random_uuid()
+-- Gateway-generated per-request identity: nginx's $request_id (32 hex
+-- chars, minted by nginx for every request; Kong 3.5+ derives
+-- X-Kong-Request-Id from it). The client cannot set or influence it.
+--
+-- Idempotency keys MUST come from here, never from a request header. A
+-- caller who repeats the same X-Request-Id (or X-Kong-Request-Id, or any
+-- other header) on every call would otherwise get every repeat
+-- deduplicated by the ingestor as a replay -- billed once for many calls.
+-- The client's X-Request-Id is still forwarded as trace.xRequestId
+-- (metadata), but it is never part of a key.
+--
+-- Stable for the whole request, and the key is materialized into the
+-- buffered event, so flush_buffer's retries re-send the same bytes
+-- (Rule #21).
+local function gateway_request_id()
+    local var = ngx.var
+    if not var then return nil end
+    return nonempty(var.request_id)
 end
 
 -- ────────────────────────────────────────────────────────────
@@ -1058,8 +1318,9 @@ local function send_batch(conf, batch)
         local res, err = httpc:request_uri(conf.aforo_endpoint, {
             method  = "POST",
             body    = body,
-            -- X-API-Key alone, never Authorization: Bearer. An API key in a
-            -- Bearer header is parsed as a JWT and refused 401.
+            -- X-API-Key is the ingest standard (all five gateways send it).
+            -- The ingestor also accepts an sk_ key as Bearer (aforo-common
+            -- 1.3.84+); X-API-Key keeps one header for every key format.
             headers = {
                 ["Content-Type"]  = "application/json",
                 ["X-API-Key"]     = conf.api_key or "",
@@ -1486,6 +1747,11 @@ local function detect_websocket_upgrade(upgrade_header, status, request_id)
     -- Successful handshake = HTTP 101. Other statuses = failed upgrade → skip.
     if status ~= 101 then return nil end
 
+    -- The connection id is reported as data (wsConnectionId) so frames
+    -- metered by @aforo/ws-metering can be correlated with the handshake.
+    -- The client chooses Sec-WebSocket-Key, so it is never the
+    -- idempotency key -- the log phase keys this event on the gateway
+    -- request id.
     local connection_id = nonempty(kong.request.get_header("Sec-WebSocket-Key"))
         or request_id
         or random_uuid()
@@ -1567,6 +1833,14 @@ function AforoMeteringHandler:access(conf)
         end
 
         local result = validate_jwt(token, conf)
+        if not result.valid and result.status == 503 then
+            -- Revocation could not be checked (Redis down, fail mode closed).
+            -- Not the caller's fault, so not 401; Retry-After as preflight-quota does.
+            return kong.response.exit(503, {
+                error             = "temporarily_unavailable",
+                error_description = result.reason,
+            }, { ["Retry-After"] = "1" })
+        end
         if not result.valid then
             kong.log.warn("[aforo-metering] JWT rejected (", result.reason, ")")
             return kong.response.exit(401, {
@@ -1620,6 +1894,24 @@ end
 -- Log phase handler (runs after response is sent to client)
 -- ────────────────────────────────────────────────────────────
 
+-- Agent identity for AI_AGENT and MCP_SERVER events, taken only from sources
+-- a client cannot set: the upstream RESPONSE header (agent_id_header), then
+-- the route's static agent_id. Never a request header -- X-Agent-Id is
+-- client-settable (IDOR finding #11), so it would let a caller bill usage to
+-- any agent.
+local function trusted_agent_id(conf)
+    local header = nonempty(conf.agent_id_header)
+    local from_upstream = header and nonempty(kong.response.get_header(header))
+    return from_upstream or nonempty(conf.agent_id)
+end
+
+-- Session id the upstream reported for this call (session_id_header on the
+-- RESPONSE), or nil.
+local function upstream_session_id(conf)
+    local header = nonempty(conf.session_id_header)
+    return header and nonempty(kong.response.get_header(header)) or nil
+end
+
 function AforoMeteringHandler:log(conf)
     local method = kong.request.get_method()
     local path = kong.request.get_path()
@@ -1650,8 +1942,9 @@ function AforoMeteringHandler:log(conf)
         or tonumber(kong.request.get_header("Content-Length"))
         or 0
     local response_size = tonumber(kong.response.get_header("Content-Length")) or 0
-    local request_id = nonempty(kong.request.get_header("X-Request-Id"))
-        or nonempty(kong.request.get_header("X-Kong-Request-Id"))
+    -- Gateway-generated identity only -- see gateway_request_id(). The
+    -- client's X-Request-Id travels as trace.xRequestId, never as a key.
+    local request_id = gateway_request_id()
     local session_id = kong.request.get_header("Mcp-Session-Id")
 
     local service_name = service and service.name or ""
@@ -1688,6 +1981,20 @@ function AforoMeteringHandler:log(conf)
     if conf.mcp_enabled and method == "POST" then
         mcp_info = detect_mcp_tool_call(raw_body)
     end
+    -- MCP_SERVER requires toolName AND agentId. The upstream / route-config
+    -- agent id wins over the payload's params._meta.agent_id. A tool call with
+    -- neither is metered as a plain request (configured product_type and
+    -- metric) instead of an MCP metric under a non-MCP type.
+    local mcp_agent_id = nil
+    if mcp_info then
+        mcp_agent_id = trusted_agent_id(conf) or nonempty(mcp_info.agent_id)
+        if not mcp_agent_id then
+            kong.log.debug("[aforo-metering] MCP tools/call '", mcp_info.tool_name,
+                "' has no agent id (payload _meta.agent_id, ", tostring(conf.agent_id_header),
+                " response header or agent_id config); metering it as a plain request")
+            mcp_info = nil
+        end
+    end
 
     -- gRPC Detection
     local grpc_info = nil
@@ -1711,13 +2018,25 @@ function AforoMeteringHandler:log(conf)
 
     -- Build usage event
     --
-    -- Idempotency keys on EVERY branch are built from stable per-request
-    -- identity only (Rule #21): X-Request-Id / X-Kong-Request-Id, the
-    -- WebSocket handshake key, or — when the request carries none — one
-    -- random UUID materialized into the buffered event and re-sent
-    -- verbatim by flush_buffer's retry loop. NEVER add a clock
-    -- (ngx.now / os.time / os.clock) to a key: a re-evaluation would mint
-    -- a new key, defeat ingest dedup and bill the request twice.
+    -- Idempotency keys on EVERY branch are built from one gateway-generated
+    -- request identity (Rule #21): nginx's $request_id, which the client
+    -- cannot set. NEVER build a key from a request header (X-Request-Id,
+    -- X-Kong-Request-Id, Sec-WebSocket-Key, ...): a caller who repeats it
+    -- is billed once for many calls. NEVER add a clock (ngx.now / os.time
+    -- / os.clock): a re-evaluation would mint a new key and bill twice.
+    -- The identity is materialized once here and re-sent verbatim by
+    -- flush_buffer's retry loop. The random fallback is unreachable under
+    -- nginx ($request_id always exists); it keeps a key unique if it ever
+    -- fires, at the cost of dedup for that one event.
+    local key_id = request_id or random_uuid()
+    if not key_id then
+        local total = record_drop("no_request_identity", 1)
+        warn_throttled("no_request_identity", 300,
+            "[aforo-metering] Skipping ", method, " ", path, " -- no gateway request id ",
+            "(ngx.var.request_id) and no UUID generator. Event not metered. ",
+            "Cumulative: ", total or "?", ". Repeats suppressed for 300s.")
+        return
+    end
     local event = {}
 
     if mcp_info then
@@ -1732,27 +2051,20 @@ function AforoMeteringHandler:log(conf)
         -- would make any log-phase re-evaluation for the same request
         -- produce a different key. Under a hypothetical redelivery
         -- path (Kong-level retry, higher-layer replay), the drifted
-        -- key would defeat ingest dedup and double-bill. request_id
-        -- comes from a stable header (X-Request-Id or X-Kong-Request-Id);
-        -- the generated-uuid fallback is materialized once into the
-        -- flush buffer and re-sent verbatim by flush_buffer's 3-retry
-        -- loop, so within-invocation retries are byte-identical. NEVER
-        -- reintroduce a clock (ngx.now / os.time / os.clock) here.
+        -- key would defeat ingest dedup and double-bill. key_id is the
+        -- gateway request id (never a client header), materialized once
+        -- into the flush buffer and re-sent verbatim by flush_buffer's
+        -- 3-retry loop, so within-invocation retries are byte-identical.
+        -- NEVER reintroduce a clock (ngx.now / os.time / os.clock) here.
         event.idempotencyKey = "mcp:" .. (conf.tenant_id or "") .. ":" ..
-                               (request_id or random_uuid()) .. ":" ..
+                               key_id .. ":" ..
                                mcp_info.tool_name
         event.occurredAt     = iso8601_utc(ngx.now())
         event.toolName       = mcp_info.tool_name
-        event.agentId        = mcp_info.agent_id or headers["x-agent-id"]
-        event.sessionId      = session_id
-        -- MCP_SERVER requires toolName AND agentId. A tool call with no agent
-        -- id keeps the configured product_type rather than being sent as an
-        -- MCP_SERVER event the ingestor must refuse.
-        if nonempty(event.toolName) and nonempty(event.agentId) then
-            event.productType = "MCP_SERVER"
-        else
-            event.productType = normalize_product_type(conf.product_type)
-        end
+        -- Resolved above from trusted sources only; never X-Agent-Id.
+        event.agentId        = mcp_agent_id
+        event.sessionId      = nonempty(session_id) or upstream_session_id(conf)
+        event.productType    = "MCP_SERVER"
         -- Shared outcome table: 2xx stays SUCCESS; non-2xx now follows
         -- the table (504 -> TIMEOUT instead of ERROR). Kong does not
         -- buffer the upstream response body, so a JSON-RPC `error`
@@ -1764,7 +2076,7 @@ function AforoMeteringHandler:log(conf)
         event.metricName     = "grpc_api.rpc_calls"
         event.quantity       = 1
         event.idempotencyKey = "grpc:" .. (conf.tenant_id or "") .. ":" ..
-                               (request_id or random_uuid()) .. ":" ..
+                               key_id .. ":" ..
                                grpc_info.grpc_service .. "/" .. grpc_info.grpc_method
         event.occurredAt     = iso8601_utc(ngx.now())
         event.productType    = "GRPC_API"
@@ -1790,7 +2102,7 @@ function AforoMeteringHandler:log(conf)
         event.metricName     = "graphql_api.operations"
         event.quantity       = 1
         event.idempotencyKey = "gql:" .. (conf.tenant_id or "") .. ":" ..
-                               (request_id or random_uuid()) .. ":" ..
+                               key_id .. ":" ..
                                gql_info.gql_operation_name
         event.occurredAt     = iso8601_utc(ngx.now())
         event.productType    = "GRAPHQL_API"
@@ -1802,12 +2114,14 @@ function AforoMeteringHandler:log(conf)
         event.executionStatus = outcome_from_status(status, conf.status_outcomes)
         event.executionDurationMs = tonumber(latency) or 0
     elseif ws_info then
-        -- One event per successful handshake. The handshake key is unique per
-        -- connection, so the key needs no other component.
+        -- One event per successful handshake, keyed on the gateway request
+        -- id. Sec-WebSocket-Key is client-chosen, so a client reusing it
+        -- would have every later connection deduplicated; it is kept only
+        -- as wsConnectionId.
         event.customerId     = customer_id
         event.metricName     = "websocket_api.connection_opened"
         event.quantity       = 1
-        event.idempotencyKey = "ws:" .. (conf.tenant_id or "") .. ":" .. ws_info.ws_connection_id
+        event.idempotencyKey = "ws:" .. (conf.tenant_id or "") .. ":" .. key_id
         event.occurredAt     = iso8601_utc(ngx.now())
         event.productType    = "WEBSOCKET_API"
         event.wsConnectionId = ws_info.ws_connection_id
@@ -1832,7 +2146,7 @@ function AforoMeteringHandler:log(conf)
         event.metricName     = resolve_metric_name(conf, method, path, service_name,
                                                    route_name, consumer_name, header_metric)
         event.quantity       = resolve_quantity(conf, response_size, header_quantity)
-        event.idempotencyKey = generate_idempotency_key(request_id)
+        event.idempotencyKey = key_id
         event.occurredAt     = iso8601_utc(ngx.now())
 
         -- AGENTIC_API classification — stamped only when a trace id is
@@ -1843,8 +2157,20 @@ function AforoMeteringHandler:log(conf)
         -- status_code/trace_id).
         local agentic_trace_id = extract_agentic_trace_id(trace)
         if agentic_trace_id then
-            event.productType = "AGENTIC_API"
-            event.traceId     = agentic_trace_id
+            event.traceId = agentic_trace_id
+            -- An agent's calls carry traces too; a route configured as
+            -- AI_AGENT stays AI_AGENT.
+            if event.productType ~= "AI_AGENT" then
+                event.productType = "AGENTIC_API"
+            end
+        end
+
+        -- AI_AGENT requires agentId + sessionId. Both come from the upstream
+        -- agent's RESPONSE headers (agent id may instead be fixed per route
+        -- via agent_id); a request header would let a caller choose them.
+        if event.productType == "AI_AGENT" then
+            event.agentId   = trusted_agent_id(conf)
+            event.sessionId = upstream_session_id(conf)
         end
 
         -- Outcome for OUTCOME_BASED pricing (standard API + AGENTIC_API).
@@ -1984,7 +2310,7 @@ end
 AforoMeteringHandler._resolve_customer_id = resolve_customer_id
 AforoMeteringHandler._record_drop = record_drop
 AforoMeteringHandler._extract_agentic_trace_id = extract_agentic_trace_id
-AforoMeteringHandler._generate_idempotency_key = generate_idempotency_key
+AforoMeteringHandler._gateway_request_id = gateway_request_id
 AforoMeteringHandler._outcome_from_status = outcome_from_status
 AforoMeteringHandler._detect_grpc_call = detect_grpc_call
 AforoMeteringHandler._grpc_outcome = grpc_outcome
@@ -1996,6 +2322,8 @@ AforoMeteringHandler._iso8601_utc = iso8601_utc
 AforoMeteringHandler._flush_buffer = flush_buffer
 AforoMeteringHandler._send_batch = send_batch
 AforoMeteringHandler._validate_jwt = validate_jwt
+AforoMeteringHandler._jwks_reset = function() jwks_cache = {} end
+AforoMeteringHandler._jwks_cache = function() return jwks_cache end
 AforoMeteringHandler._resolve_metric_name = resolve_metric_name
 AforoMeteringHandler._resolve_quantity = resolve_quantity
 AforoMeteringHandler._normalize_product_type = normalize_product_type

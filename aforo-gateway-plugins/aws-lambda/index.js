@@ -49,6 +49,19 @@
  *                          MCP idempotency key (kept so keys do not change
  *                          shape across an upgrade) and a property on the
  *                          EMF metrics.
+ *   MCP_METRIC           — Metric for MCP tools/call events no METRIC_MAPPINGS
+ *                          rule names (default DEFAULT_METRIC). Set it to
+ *                          "mcp_server.tool_invocations" to keep the 2.3.0
+ *                          name.
+ *   TOKEN_METRIC         — AI_AGENT only: metric for the per-call token event
+ *                          (input + output tokens) when the record carries
+ *                          token usage (default "Tokens Consumed"; "" turns
+ *                          the token event off).
+ *
+ * Input lines: API Gateway access-log entries (JSON), and usage records
+ * written by metering-proxy.js ({"aforoUsage":1,...}), which add what an
+ * access log cannot see: MCP tool calls, token usage, session id / end. A
+ * line with a Lambda log prefix is parsed from its first "{".
  *
  * Customer identity: the access-log entry's `customerId` field, which the
  * stage's access-log format populates from `$context.authorizer.customerId`
@@ -75,6 +88,7 @@
 const https = require('https');
 const http = require('http');
 const zlib = require('zlib');
+const crypto = require('crypto');
 
 const AFORO_ENDPOINT = process.env.AFORO_ENDPOINT || '';
 const AFORO_API_KEY = process.env.AFORO_API_KEY || '';
@@ -97,12 +111,15 @@ const INCLUDE_METADATA = process.env.INCLUDE_METADATA !== 'false';
 const MCP_ENABLED = process.env.MCP_ENABLED === 'true';
 const PRODUCT_TYPE = normalizeProductType(process.env.PRODUCT_TYPE);
 const CUSTOMER_ID_SOURCE = normalizeCustomerIdSource(process.env.CUSTOMER_ID_SOURCE);
+const MCP_METRIC = (process.env.MCP_METRIC || '').trim();
+const TOKEN_METRIC = process.env.TOKEN_METRIC === undefined ? 'Tokens Consumed' : process.env.TOKEN_METRIC.trim();
 
 // Fields each productType must carry. An event missing them is rejected by
-// the ingestor, so it is skipped here instead. An AI_AGENT agentId
-// (X-Agent-Id is client-settable, never trusted) and gRPC / GraphQL /
-// WebSocket / MQTT fields are not in an API Gateway access log, so those types
-// are listed only so the check refuses them. Unknown types pass unchecked.
+// the ingestor, so it is skipped here instead. An AI_AGENT agentId comes only
+// from the authorizer context (X-Agent-Id is client-settable, never trusted);
+// gRPC / GraphQL / WebSocket / MQTT fields are not in an API Gateway log, so
+// those types are listed only so the check refuses them. Unknown types pass
+// unchecked.
 const PRODUCT_TYPE_REQUIRED_FIELDS = {
     API: [],
     AGENTIC_API: [],
@@ -139,6 +156,13 @@ function parseStatusCodeList(raw, fallback) {
 // BLOCKED unless STATUS_OUTCOMES says otherwise).
 const EXCLUDE_STATUS_CODES = parseStatusCodeList(process.env.EXCLUDE_STATUS_CODES, [401, 403, 429]);
 const MAX_CUSTOMER_ID_LENGTH = 64;
+// IngestUsageEventRequest.subscriptionId is @Size(max = 64).
+const MAX_SUBSCRIPTION_ID_LENGTH = 64;
+// IngestUsageEventRequest @Size limits.
+const MAX_AGENT_ID_LENGTH = 36;
+const MAX_SESSION_ID_LENGTH = 64;
+const MAX_TRACE_ID_LENGTH = 128;
+const MAX_TOOL_NAME_LENGTH = 64;
 
 // Per-attempt HTTP timeout, and how much of the Lambda's remaining time is
 // held back so the handler can return (and report failure) before the
@@ -328,8 +352,9 @@ function extractAgenticTraceId(trace) {
 
     if (trace.xTraceId) {
         // Non-OTel fallback. Descriptor types trace_id as String, not UUID —
-        // no shape check beyond non-empty after trim.
-        const trimmed = String(trace.xTraceId).trim();
+        // no shape check beyond non-empty after trim. An AWS X-Ray header
+        // value ("Root=1-abc-def;Parent=...;Sampled=1") keeps only the root id.
+        const trimmed = stripXRayRoot(trace.xTraceId);
         if (trimmed.length > 0) {
             return trimmed;
         }
@@ -338,8 +363,37 @@ function extractAgenticTraceId(trace) {
     return null;
 }
 
+/** "Root=1-5759e988-bd862e3f;Parent=53995c3f;Sampled=1" → "1-5759e988-bd862e3f"; other values trimmed. */
+function stripXRayRoot(value) {
+    let v = String(value).trim();
+    const m = /^Root=([^;]*)/i.exec(v);
+    if (m) v = m[1].trim();
+    return v;
+}
+
+/** A client-influenced id longer than the ingestor allows is hashed, never dropped (dropping would skip billing). */
+function fitId(value, max) {
+    const v = String(value);
+    if (v.length <= max) return v;
+    return crypto.createHash('sha256').update(v).digest('hex').slice(0, max);
+}
+
 /**
- * Build a usage event from a parsed log entry, or return { skip: reason }.
+ * Metric for an MCP tools/call: METRIC_MAPPINGS (first match) → MCP_METRIC →
+ * DEFAULT_METRIC. No name is hard-coded: the ingestor rejects a metric that
+ * is not in the tenant's catalog.
+ */
+function resolveMcpMetricName(parsed, mappings = METRIC_MAPPINGS, mcpMetric = MCP_METRIC, defaultMetric = DEFAULT_METRIC) {
+    for (const rule of mappings) {
+        if (mappingMatches(parsed.path, rule)) return rule.metricName;
+    }
+    return mcpMetric || defaultMetric;
+}
+
+/**
+ * Build the usage events for a parsed log entry: { event, events } (event is
+ * events[0]) or { skip: reason }. Usually one event; an MCP batch gives one
+ * per tool call, and an AI_AGENT call with token usage adds a token event.
  * Everything in the event — idempotencyKey included — is derived from the
  * log entry alone, so a redelivered log payload rebuilds identical events.
  */
@@ -402,70 +456,159 @@ function buildUsageEvent(parsed, logEvent) {
         usageEvent.metadata = usageEvent.metadata || {};
         usageEvent.metadata.keyId = parsed.keyId;
     }
+    if (parsed.subscriptionId && parsed.subscriptionId.length <= MAX_SUBSCRIPTION_ID_LENGTH) {
+        // Top-level field the ingestor reads; it outranks hierarchy enrichment.
+        usageEvent.subscriptionId = parsed.subscriptionId;
+    }
 
-    let isMcp = false;
-    if (MCP_ENABLED && parsed.method === 'POST' && parsed.requestBody) {
+    // MCP tools/call: from a proxy record (record.mcp, always honoured) or,
+    // legacy, from a requestBody in the access log when MCP_ENABLED.
+    let mcpCalls = [];
+    let legacyMcp = false;
+    if (Array.isArray(parsed.mcp) && parsed.mcp.length > 0) {
+        mcpCalls = parsed.mcp;
+    } else if (MCP_ENABLED && parsed.method === 'POST' && parsed.requestBody) {
         const mcpInfo = detectMcpToolCall(parsed.requestBody);
-        if (mcpInfo) {
-            isMcp = true;
-            usageEvent.metricName = 'mcp_server.tool_invocations';
-            usageEvent.quantity = 1;
-            usageEvent.toolName = mcpInfo.toolName;
-            usageEvent.agentId = mcpInfo.agentId;
+        if (mcpInfo) { mcpCalls = [mcpInfo]; legacyMcp = true; }
+    }
+
+    let candidates;
+    if (mcpCalls.length > 0) {
+        const mcpMetricName = resolveMcpMetricName(parsed);
+        candidates = mcpCalls.map((call, index) => {
+            const ev = { ...usageEvent };
+            if (usageEvent.metadata) ev.metadata = { ...usageEvent.metadata };
+            ev.metricName = mcpMetricName;
+            ev.quantity = 1;
+            ev.toolName = typeof call.toolName === 'string' ? call.toolName.slice(0, MAX_TOOL_NAME_LENGTH) : call.toolName;
+            // A verified agent id (authorizer) wins over params._meta.agent_id.
+            const agentId = parsed.agentId || call.agentId || null;
+            ev.agentId = agentId && String(agentId).length <= MAX_AGENT_ID_LENGTH ? agentId : null;
             // MCP_SERVER requires toolName AND agentId: classify as MCP_SERVER
             // only when both are known, otherwise keep PRODUCT_TYPE rather
             // than send an event the ingestor must reject.
-            if (usageEvent.toolName && usageEvent.agentId) usageEvent.productType = 'MCP_SERVER';
-            usageEvent.executionDurationMs = parsed.latency || 0;
-            // FROZEN key shape (log data + the static tenant setting only).
-            // Changing it would double-bill retries in flight across an
-            // upgrade. The CloudWatch event id stands in when the log format
-            // has no requestId, so two such entries never share a key.
-            usageEvent.idempotencyKey =
-                `mcp:${AFORO_TENANT_ID}:${parsed.requestId || logEvent.id}:${mcpInfo.toolName}:${logEvent.timestamp}`;
-        }
-    }
-
-    // AGENTIC_API classification — only when a trace id is resolvable
-    // (descriptor eventSchema.inferenceRule = HAS_TRACE), MCP has not claimed
-    // the event, and the configured type is the baseline API: an operator who
-    // set PRODUCT_TYPE to anything else has already said what these calls
-    // are. traceId goes top-level (the ingestor reads descriptor
-    // requiredFields from the top level, not from metadata).
-    if (!isMcp && usageEvent.productType === 'API') {
-        const agenticTraceId = extractAgenticTraceId(trace);
-        if (agenticTraceId) {
-            usageEvent.productType = 'AGENTIC_API';
-            usageEvent.traceId = agenticTraceId;
+            if (ev.toolName && ev.agentId) ev.productType = 'MCP_SERVER';
+            ev.executionDurationMs = parsed.latency || 0;
+            ev.idempotencyKey = legacyMcp
+                // FROZEN key shape (log data + the static tenant setting
+                // only). Changing it would double-bill retries in flight
+                // across an upgrade. The CloudWatch event id stands in when
+                // the log format has no requestId.
+                ? `mcp:${AFORO_TENANT_ID}:${parsed.requestId || logEvent.id}:${call.toolName}:${logEvent.timestamp}`
+                : `${parsed.requestId || logEvent.id}:mcp:${index}`;
+            return ev;
+        });
+    } else {
+        candidates = [usageEvent];
+        // AGENTIC_API classification — only when a trace id is resolvable
+        // (descriptor eventSchema.inferenceRule = HAS_TRACE), MCP has not
+        // claimed the event, and the configured type is the baseline API: an
+        // operator who set PRODUCT_TYPE to anything else has already said what
+        // these calls are. traceId goes top-level (the ingestor reads
+        // descriptor requiredFields from the top level, not from metadata).
+        if (usageEvent.productType === 'API') {
+            const agenticTraceId = extractAgenticTraceId(trace);
+            if (agenticTraceId) {
+                usageEvent.productType = 'AGENTIC_API';
+                usageEvent.traceId = agenticTraceId.slice(0, MAX_TRACE_ID_LENGTH);
+            }
         }
     }
 
     // Outcome for OUTCOME_BASED pricing — every event path (standard API,
-    // AGENTIC_API, MCP). Omitted when the status is not determinable.
-    // CloudWatch access logs carry no response body, so a JSON-RPC `error`
-    // inside a 2xx cannot be detected here.
+    // AGENTIC_API, AI_AGENT, MCP). Omitted when the status is not
+    // determinable. A JSON-RPC `error` inside a 2xx is not detected.
     const executionStatus = outcomeFromStatus(parsed.status);
-    if (executionStatus) usageEvent.executionStatus = executionStatus;
 
-    // The Lambda cannot know the catalog, but a blank or oversized name can
-    // never be a metric: drop it here rather than have the ingestor reject it.
-    const metricName = typeof usageEvent.metricName === 'string' ? usageEvent.metricName.trim() : '';
-    if (!metricName || metricName.length > MAX_METRIC_NAME_LENGTH) {
-        console.warn(`[aforo-metering] dropping event for ${parsed.method} ${parsed.path}: ` +
-            `metric name is ${metricName ? 'longer than 255 chars' : 'empty'}`);
-        return { skip: 'invalid metricName' };
+    const events = [];
+    for (const ev of candidates) {
+        if (executionStatus) ev.executionStatus = executionStatus;
+
+        if (ev.productType === 'AI_AGENT') {
+            // agentId ONLY from the authorizer context (a verified
+            // credential), never from a client header.
+            const agentId = parsed.agentId || '';
+            if (!agentId) return { skip: 'productType AI_AGENT missing agentId (authorizer context agentId)' };
+            if (agentId.length > MAX_AGENT_ID_LENGTH) return { skip: 'agentId longer than 36 chars' };
+            ev.agentId = agentId;
+            const sessionId = parsed.sessionId || parsed.requestId || '';
+            if (sessionId) ev.sessionId = fitId(sessionId, MAX_SESSION_ID_LENGTH);
+            const traceId = extractAgenticTraceId(trace);
+            if (traceId) {
+                ev.traceId = traceId.slice(0, MAX_TRACE_ID_LENGTH);
+            } else if (sessionId) {
+                // The ingestor builds agentic_sessions only from events with a
+                // traceId. Without a client trace, derive a stable one from the
+                // verified customer + agent and the session, so every call of a
+                // session aggregates into one session row (the SDK does the same).
+                ev.traceId = sessionTraceId(parsed.customerId, agentId, sessionId);
+            }
+            if (parsed.sessionBoundary === 'SESSION_END') ev.sessionBoundary = 'SESSION_END';
+        }
+
+        // The Lambda cannot know the catalog, but a blank or oversized name can
+        // never be a metric: drop it here rather than have the ingestor reject it.
+        const metricName = typeof ev.metricName === 'string' ? ev.metricName.trim() : '';
+        if (!metricName || metricName.length > MAX_METRIC_NAME_LENGTH) {
+            console.warn(`[aforo-metering] dropping event for ${parsed.method} ${parsed.path}: ` +
+                `metric name is ${metricName ? 'longer than 255 chars' : 'empty'}`);
+            return { skip: 'invalid metricName' };
+        }
+        ev.metricName = metricName;
+
+        // The ingestor requires quantity > 0 (e.g. a 204 with
+        // QUANTITY_SOURCE=response_size has none).
+        if (!(Number.isFinite(ev.quantity) && ev.quantity > 0)) return { skip: 'quantity <= 0' };
+
+        const required = PRODUCT_TYPE_REQUIRED_FIELDS[ev.productType] || [];
+        const missing = required.filter(f => ev[f] === undefined || ev[f] === null || ev[f] === '');
+        if (missing.length > 0) return { skip: `productType ${ev.productType} missing ${missing.join('+')}` };
+
+        events.push(ev);
     }
-    usageEvent.metricName = metricName;
 
-    // The ingestor requires quantity > 0 (e.g. a 204 with
-    // QUANTITY_SOURCE=response_size has none).
-    if (!(Number.isFinite(usageEvent.quantity) && usageEvent.quantity > 0)) return { skip: 'quantity <= 0' };
+    // AI_AGENT token event: one per call (input + output tokens) when the
+    // record carries token usage and TOKEN_METRIC is configured.
+    const callEvent = events[0];
+    const tokens = parsed.tokens;
+    if (callEvent && callEvent.productType === 'AI_AGENT' && TOKEN_METRIC && tokens && typeof tokens === 'object') {
+        const input = positiveCount(tokens.input);
+        const output = positiveCount(tokens.output);
+        if (input + output > 0) {
+            const tokenEvent = {
+                ...callEvent,
+                metricName: TOKEN_METRIC,
+                quantity: input + output,
+                idempotencyKey: `${parsed.requestId || logEvent.id}:tokens`,
+                metadata: { ...(callEvent.metadata || {}), input_tokens: input, output_tokens: output },
+            };
+            if (tokens.model) tokenEvent.metadata.model_name = String(tokens.model);
+            if (tokens.provider) tokenEvent.metadata.model_provider = String(tokens.provider);
+            // The token event is sent after the call event, so it carries the
+            // session boundary: closing on the call event would leave this
+            // call's tokens to a session that has already ended.
+            if (callEvent.sessionBoundary) {
+                delete callEvent.sessionBoundary;
+                tokenEvent.sessionBoundary = 'SESSION_END';
+            }
+            events.push(tokenEvent);
+        }
+    }
 
-    const required = PRODUCT_TYPE_REQUIRED_FIELDS[usageEvent.productType] || [];
-    const missing = required.filter(f => usageEvent[f] === undefined || usageEvent[f] === null || usageEvent[f] === '');
-    if (missing.length > 0) return { skip: `productType ${usageEvent.productType} missing ${missing.join('+')}` };
+    return { event: events[0], events };
+}
 
-    return { event: usageEvent };
+/** 32 lowercase hex chars, stable per (customer, agent, session). */
+function sessionTraceId(customerId, agentId, sessionId) {
+    return crypto.createHash('sha256')
+        .update(`${customerId || ''}:${agentId}:${sessionId}`)
+        .digest('hex')
+        .slice(0, 32);
+}
+
+function positiveCount(v) {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
 }
 
 /**
@@ -498,13 +641,18 @@ async function handler(event, context) {
             skipped[result.skip] = (skipped[result.skip] || 0) + 1;
             continue;
         }
-        usageEvents.push(result.event);
+        usageEvents.push(...result.events);
     }
 
     if (skipped['no customerId']) {
         console.warn(`Skipped ${skipped['no customerId']} entries with no customerId. The stage's access-log format ` +
             'must include "customerId":"$context.authorizer.customerId" and the route must use the Aforo authorizer ' +
             '(or, for IAM-authorized routes, "caller":"$context.identity.caller").');
+    }
+    const noAgent = Object.keys(skipped).find((k) => k.startsWith('productType AI_AGENT missing agentId'));
+    if (noAgent) {
+        console.warn(`Skipped ${skipped[noAgent]} AI_AGENT entries with no agentId. agentId is taken only from the ` +
+            'authorizer context (the JWT agent_id claim via key-authorizer.js), never from a client header.');
     }
     if (skipped['invalid metricName']) {
         emitMetric('EventsDroppedInvalidMetric', skipped['invalid metricName'], logEvents.length);
@@ -623,15 +771,52 @@ function emitMetric(name, count, totalCount) {
  * Parse an API Gateway access log entry (JSON format required for billing;
  * the CLF fallback carries no customer identity and so never produces events).
  */
+function parseLogJson(message) {
+    try {
+        return JSON.parse(message);
+    } catch {
+        // A Lambda log prefix ("<ts>\t<requestId>\tINFO\t{...}"): parse from the first "{".
+        const i = message.indexOf('{');
+        if (i <= 0) return undefined;
+        try { return JSON.parse(message.slice(i)); } catch { return undefined; }
+    }
+}
+
+/** A metering-proxy record, also when wrapped by Lambda's JSON log format ({"message": ...}). */
+function unwrapProxyRecord(json) {
+    if (!json || typeof json !== 'object') return null;
+    if (json.aforoUsage === 1) return json;
+    const m = json.message;
+    if (m && typeof m === 'object' && m.aforoUsage === 1) return m;
+    if (typeof m === 'string' && m.includes('aforoUsage')) {
+        const inner = parseLogJson(m);
+        if (inner && typeof inner === 'object' && inner.aforoUsage === 1) return inner;
+    }
+    return null;
+}
+
+function normalizeMcp(mcp) {
+    const list = Array.isArray(mcp) ? mcp : (mcp && typeof mcp === 'object' ? [mcp] : []);
+    return list
+        .filter((m) => m && typeof m.toolName === 'string' && m.toolName.trim())
+        .map((m) => ({ toolName: m.toolName.trim(), agentId: cleanContextValue(m.agentId) || null }));
+}
+
 function parseAccessLog(message) {
     if (!message) return null;
 
-    try {
-        const json = JSON.parse(message);
+    const parsedJson = parseLogJson(message);
+    if (parsedJson && typeof parsedJson === 'object') {
+        const json = unwrapProxyRecord(parsedJson) || parsedJson;
+        const isProxyRecord = json.aforoUsage === 1;
+        const boundary = typeof json.sessionBoundary === 'string' ? json.sessionBoundary.trim().toUpperCase() : '';
         return {
             requestId: json.requestId || json.extendedRequestId,
             method: json.httpMethod || json.method,
-            path: json.resourcePath || json.path,
+            // Access logs conventionally log the resource template as resourcePath;
+            // a proxy record's resourcePath is often /{proxy+}, so its real path
+            // is what METRIC_MAPPINGS should match.
+            path: isProxyRecord ? (json.path || json.resourcePath) : (json.resourcePath || json.path),
             status: parseInt(json.status || json.statusCode || '0', 10),
             latency: parseInt(json.responseLatency || json.integrationLatency || '0', 10),
             responseLength: parseInt(json.responseLength || '0', 10),
@@ -640,16 +825,24 @@ function parseAccessLog(message) {
             // "-" is what API Gateway logs for an unset $context variable.
             customerId: cleanContextValue(json.customerId ?? json['authorizer.customerId']),
             keyId: cleanContextValue(json.keyId ?? json['authorizer.keyId']),
+            // Set by key-authorizer.js from Aforo's key introspection. Lets
+            // billing pick the subscription when a customer has several.
+            subscriptionId: cleanContextValue(json.subscriptionId ?? json['authorizer.subscriptionId']),
             // $context.identity.caller — the IAM principal API Gateway
             // verified (SigV4). $context.identity.apiKey (the key VALUE, a
             // secret) and $context.authorizer.principalId (a placeholder
             // when the token has no customer) are deliberately not read.
             caller: cleanContextValue(json.caller ?? json['identity.caller']),
+            // Set by key-authorizer.js from the JWT's agent_id claim (trusted).
+            agentId: cleanContextValue(json.agentId ?? json['authorizer.agentId']),
             headers: json.requestHeaders || {},
             requestBody: json.requestBody || null,
+            isProxyRecord,
+            sessionId: cleanContextValue(json.sessionId),
+            sessionBoundary: boundary === 'SESSION_END' ? 'SESSION_END' : '',
+            mcp: normalizeMcp(json.mcp),
+            tokens: json.tokens && typeof json.tokens === 'object' ? json.tokens : null,
         };
-    } catch {
-        // Not JSON
     }
 
     const clfMatch = message.match(
@@ -668,9 +861,16 @@ function parseAccessLog(message) {
             // CLF's first field is the client IP — never a customer id.
             customerId: '',
             keyId: '',
+            subscriptionId: '',
             caller: '',
+            agentId: '',
             headers: {},
             requestBody: null,
+            isProxyRecord: false,
+            sessionId: '',
+            sessionBoundary: '',
+            mcp: [],
+            tokens: null,
         };
     }
 
@@ -848,6 +1048,8 @@ module.exports = {
     detectMcpToolCall,
     buildUsageEvent,
     resolveMetricName,
+    resolveMcpMetricName,
+    stripXRayRoot,
     resolveCustomerId,
     parseMetricMappings,
     isPermanentRejection,

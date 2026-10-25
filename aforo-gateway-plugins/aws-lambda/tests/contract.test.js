@@ -190,6 +190,18 @@ async function handlerTests() {
     assert(evs.every(e => e.quantity > 0 && !isNaN(Date.parse(e.occurredAt))), 'quantity > 0 and ISO occurredAt');
     assert(evs.every(e => e.productType === 'API'), 'productType defaults to API on every event');
 
+    console.log('\nTest 8b: subscriptionId from the authorizer context is sent top-level');
+    captured.length = 0;
+    await handler(cwEvent([
+        { requestId: 's1', httpMethod: 'GET', resourcePath: '/a', status: '200', customerId: 'c', subscriptionId: 'sub_1' },
+        { requestId: 's2', httpMethod: 'GET', resourcePath: '/a', status: '200', customerId: 'c', subscriptionId: '-' },
+        { requestId: 's3', httpMethod: 'GET', resourcePath: '/a', status: '200', customerId: 'c', subscriptionId: 'x'.repeat(65) },
+    ]), ctx);
+    const subEvs = captured[0].body.events;
+    assertEquals(subEvs[0].subscriptionId, 'sub_1', 'subscriptionId forwarded');
+    assertEquals(subEvs[1].subscriptionId, undefined, 'unset ("-") subscriptionId omitted');
+    assertEquals(subEvs[2].subscriptionId, undefined, 'subscriptionId over 64 chars omitted, event still sent');
+
     console.log('\nTest 9: 400 is dropped without retry (no poison pill, no throw)');
     captured.length = 0; nextStatuses = [400];
     const r400 = await handler(cwEvent([{ requestId: 'b1', httpMethod: 'GET', resourcePath: '/a', status: '200', customerId: 'c' }]), ctx);

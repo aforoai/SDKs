@@ -42,12 +42,11 @@ return {
                         product_type = {
                             type = "string",
                             default = "API",
-                            description = "productType sent on plain HTTP events (trimmed, upper-cased; default API). "
-                                .. "Protocol events set their own: MCP tools/call is MCP_SERVER when toolName and agentId are known, "
-                                .. "gRPC / GraphQL / WebSocket detection set GRPC_API / GRAPHQL_API / WEBSOCKET_API, and a request "
-                                .. "carrying a trace id is AGENTIC_API. The ingestor requires the field. An event missing the fields "
-                                .. "its type requires (e.g. AI_AGENT needs agentId + sessionId, which an HTTP gateway cannot observe) "
-                                .. "is skipped and counted, not sent.",
+                            description = "productType for plain HTTP events (default API). MCP tools/call is MCP_SERVER when "
+                                .. "toolName and agentId are known; gRPC/GraphQL/WebSocket detection set their own type; a "
+                                .. "trace id makes it AGENTIC_API (not on an AI_AGENT route). AI_AGENT needs agentId "
+                                .. "(agent_id or agent_id_header) and sessionId (session_id_header). Events missing "
+                                .. "required fields are skipped and counted.",
                         },
                     },
                     -- Metric configuration
@@ -112,6 +111,28 @@ return {
                             type = "string",
                             default = "X-Aforo-Quantity",
                             description = "Upstream RESPONSE header supplying the quantity for a single request. Needed for metrics whose value only the backend knows -- call_minutes, tokens, bytes processed -- which a gateway cannot observe. Ignored unless it parses to a positive number. Set empty to disable.",
+                        },
+                    },
+                    -- Agent identity (AI_AGENT / MCP_SERVER). Never read from a
+                    -- request header: X-Agent-Id is client-settable.
+                    {
+                        agent_id = {
+                            type = "string",
+                            description = "Fixed agent id for every AI_AGENT / MCP_SERVER event on this route or service, for a route that fronts one agent. The agent_id_header response header overrides it per call.",
+                        },
+                    },
+                    {
+                        agent_id_header = {
+                            type = "string",
+                            default = "X-Aforo-Agent-Id",
+                            description = "Upstream RESPONSE header carrying the agent id for AI_AGENT and MCP_SERVER events. Read from the response, so clients cannot forge it. Wins over agent_id and over an MCP payload's params._meta.agent_id.",
+                        },
+                    },
+                    {
+                        session_id_header = {
+                            type = "string",
+                            default = "X-Aforo-Session-Id",
+                            description = "Upstream RESPONSE header carrying the session id AI_AGENT events require (and MCP_SERVER events when the request has no Mcp-Session-Id). An AI_AGENT call whose upstream returns no session id is skipped and counted.",
                         },
                     },
                     {
@@ -290,7 +311,7 @@ return {
                         jwt_validation_enabled = {
                             type = "boolean",
                             default = false,
-                            description = "Verify the Aforo RS256 JWT in the access phase (signature against jwt_public_key, exp, nbf, iss, revocation) and answer 401 when it fails. Its customer_id claim then identifies the customer.",
+                            description = "Verify the Aforo RS256 JWT in the access phase (signature against the key from jwt_jwks_uri or jwt_public_key, exp, nbf, iss, revocation) and answer 401 when it fails. Its customer_id claim then identifies the customer.",
                         },
                     },
                     {
@@ -303,21 +324,29 @@ return {
                     {
                         jwt_jwks_uri = {
                             type = "string",
-                            description = "Accepted for compatibility; NOT used. No JWKS fetch is implemented, so a JWKS-only configuration verifies nothing and tokens are rejected. Set jwt_public_key, or verify tokens with Kong's jwt plugin and set customer_id_jwt_claim.",
+                            description = "https URL of the token issuer's JWKS (organization-service: /.well-known/jwks.json). The RS256 key is chosen by the token's kid, so a key rotation needs no config change. Cached per worker for jwt_jwks_cache_ttl seconds; an unknown kid refreshes it at most every 30 s; the last good set is used for up to 24 h while the JWKS cannot be fetched. jwt_public_key, when also set, verifies tokens the JWKS has no key for.",
+                        },
+                    },
+                    {
+                        jwt_jwks_cache_ttl = {
+                            type = "integer",
+                            default = 600,
+                            between = { 30, 86400 },
+                            description = "Seconds a fetched JWKS is used before it is fetched again.",
                         },
                     },
                     {
                         jwt_public_key = {
                             type = "string",
                             encrypted = true,
-                            description = "PEM-encoded RSA PUBLIC key of the token issuer. With jwt_validation_enabled the plugin verifies the RS256 signature against it (resty.openssl) before reading any claim. A private key is refused.",
+                            description = "PEM-encoded RSA PUBLIC key of the token issuer. With jwt_validation_enabled the plugin verifies the RS256 signature against it (resty.openssl) before reading any claim -- for tokens jwt_jwks_uri has no key for, when both are set. A private key is refused.",
                         },
                     },
                     {
                         jwt_allow_unverified_signature = {
                             type = "boolean",
                             default = false,
-                            description = "DANGEROUS. Let a JWT through when this plugin cannot verify its signature (no jwt_public_key). For deployments that verify the token before it reaches this plugin. Since 2.2.0 such a token grants ACCESS only: its claims are not used for customerId or keyId unless Kong's jwt plugin verified the same token. With this true and nothing verifying upstream, any caller can mint a token.",
+                            description = "DANGEROUS. Let a JWT through when this plugin cannot verify its signature (no jwt_public_key and no jwt_jwks_uri). For deployments that verify the token before it reaches this plugin. Since 2.2.0 such a token grants ACCESS only: its claims are not used for customerId or keyId unless Kong's jwt plugin verified the same token. With this true and nothing verifying upstream, any caller can mint a token.",
                         },
                     },
                     -- Redis host/port are shared with rate-limit enforcement above.
@@ -334,6 +363,14 @@ return {
                         jwt_redis_port = {
                             type = "integer",
                             description = "Redis port for jti blocklist (defaults to rate_limit_redis_port if not set)",
+                        },
+                    },
+                    {
+                        jti_redis_fail_mode = {
+                            type = "string",
+                            default = "closed",
+                            one_of = { "closed", "open" },
+                            description = "What the jti blocklist and client-revocation checks do when Redis cannot answer (connect or GET fails). closed (default): refuse the request with 503. open: let it through, log a throttled warning and count it in aforo_metering_revocation_check_unavailable_total. Before 2.4.0 the behaviour was always open.",
                         },
                     },
                     -- Rate limit enforcement (reads policies from Redis)

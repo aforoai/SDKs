@@ -452,17 +452,24 @@ console.log('\nTest 6: MCP idempotency key is stable request identity (no clock)
         'MCP key identical across re-evaluation — retry re-send dedups');
 })();
 
-// Test 7: Key fallback chain — x-request-id used when messageid is absent
-console.log('\nTest 7: Key falls back to x-request-id when messageid is absent');
+// Test 7: Client x-request-id is never the key (a caller repeating it
+// would be billed once for many calls)
+console.log('\nTest 7: Key never comes from the client x-request-id header');
 (function() {
-    const ctx = createMockContext({
-        'messageid': '',
-        'request.header.x-request-id': 'client-req-789'
-    });
-    runPolicy(ctx);
-    const event = JSON.parse(ctx.getStoredPayload()).events[0];
-    assertEquals(event.idempotencyKey, 'client-req-789',
-        'fallback key is the stable x-request-id header, not a clock value');
+    const a = createMockContext({ 'request.header.x-request-id': 'client-req-789' });
+    runPolicy(a);
+    const ea = JSON.parse(a.getStoredPayload()).events[0];
+    assertEquals(ea.idempotencyKey, 'msg-001', 'key is messageid even when x-request-id is sent');
+    assertEquals(ea.trace.xRequestId, 'client-req-789', 'x-request-id still forwarded as trace');
+
+    const b = createMockContext({ 'messageid': '', 'request.header.x-request-id': 'client-req-789' });
+    runPolicy(b);
+    const c = createMockContext({ 'messageid': '', 'request.header.x-request-id': 'client-req-789' });
+    runPolicy(c);
+    const kb = JSON.parse(b.getStoredPayload()).events[0].idempotencyKey;
+    const kc = JSON.parse(c.getStoredPayload()).events[0].idempotencyKey;
+    assert(kb !== 'client-req-789', 'messageid-less fallback is not the client header');
+    assert(kb !== kc, 'two requests repeating one x-request-id get different keys');
 })();
 
 // Test 8: The retry re-sends the FROZEN payload variable — same key both attempts
@@ -704,17 +711,24 @@ console.log('\nTest C2: compound correlationId frozen to messageid (stable + UUI
     assertEquals(evt1.measurements.length, 2, 'both LLM measurements extracted');
 })();
 
-// Test C3: x-request-id fallback when messageid is absent
-console.log('\nTest C3: compound correlationId falls back to x-request-id');
+// Test C3: client x-request-id never seeds the correlationId
+console.log('\nTest C3: compound correlationId never derives from x-request-id');
 (function() {
-    const ctx = createMockContext(compoundVars({
-        'messageid': '',
-        'request.header.x-request-id': 'client-req-789',
-    }));
-    runCompoundPolicy(ctx);
-    const evt = JSON.parse(ctx.getVariable('aforo.compound_event'));
-    assertEquals(evt.correlationId, expectedCorrelationId('client-req-789'),
-        'fallback correlationId derived from the stable x-request-id header');
+    const withHeader = createMockContext(compoundVars({ 'request.header.x-request-id': 'client-req-789' }));
+    runCompoundPolicy(withHeader);
+    assertEquals(JSON.parse(withHeader.getVariable('aforo.compound_event')).correlationId,
+        expectedCorrelationId('rrt-045d5d40ec4338cf9-b-ho-24818-42246656-1'),
+        'correlationId comes from messageid even when x-request-id is sent');
+
+    const b = createMockContext(compoundVars({ 'messageid': '', 'request.header.x-request-id': 'client-req-789' }));
+    runCompoundPolicy(b);
+    const c = createMockContext(compoundVars({ 'messageid': '', 'request.header.x-request-id': 'client-req-789' }));
+    runCompoundPolicy(c);
+    const ib = JSON.parse(b.getVariable('aforo.compound_event')).correlationId;
+    const ic = JSON.parse(c.getVariable('aforo.compound_event')).correlationId;
+    assert(ib !== expectedCorrelationId('client-req-789'), 'messageid-less fallback is not header-derived');
+    assert(ib !== ic, 'two requests repeating one x-request-id get different correlationIds');
+    assert(UUID_ANY_RE.test(ib), 'fallback correlationId is UUID-shaped');
 })();
 
 // Test C4: random last resort is UUID-shaped (dedup opt-out, never a 400)

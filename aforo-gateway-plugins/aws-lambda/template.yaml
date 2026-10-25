@@ -4,6 +4,10 @@ Description: >
   Aforo Usage Metering Lambda — processes API Gateway CloudWatch access logs
   and forwards usage events to Aforo's ingestor service. The stage's access-log
   format must include "customerId":"$context.authorizer.customerId" (see README).
+  Optional: the aforo-metering-proxy Lambda integration for AI_AGENT /
+  MCP_SERVER products (set UpstreamUrl or UpstreamFunction) and the
+  aforo-key-authorizer (DeployKeyAuthorizer=true), which accepts both customer
+  keys (sk_live_/sk_test_) and Aforo client-credential JWTs.
 
 Parameters:
   AforoEndpoint:
@@ -83,6 +87,77 @@ Parameters:
       tenant is derived from the API key). It is part of the MCP idempotency
       key and a property on the EMF metrics; keep the value you already use.
     Default: ''
+  McpMetric:
+    Type: String
+    Description: >-
+      Metric for MCP tools/call events no MetricMappings rule names. Empty
+      uses DefaultMetric. Must be a catalog metric (set
+      mcp_server.tool_invocations to keep the 2.3.0 name).
+    Default: ''
+  TokenMetric:
+    Type: String
+    Description: >-
+      AI_AGENT only. Metric for the per-call token event (input + output
+      tokens) when the metering proxy saw token usage. Empty turns it off.
+    Default: Tokens Consumed
+
+  # ── aforo-metering-proxy (AI_AGENT / MCP_SERVER) ──
+  UpstreamUrl:
+    Type: String
+    Description: >-
+      HTTP(S) base URL of your upstream API. Setting this (or
+      UpstreamFunction) deploys aforo-metering-proxy, which API Gateway uses
+      as its Lambda proxy integration. The request path is appended.
+    Default: ''
+  UpstreamFunction:
+    Type: String
+    Description: >-
+      Name of an upstream Lambda in this account and region, invoked with the
+      API Gateway proxy event. Used when UpstreamUrl is empty.
+    Default: ''
+  UpstreamTimeoutMs:
+    Type: String
+    Description: Upstream timeout in ms (API Gateway's own limit is 29 s).
+    Default: '25000'
+  UpstreamForwardAuth:
+    Type: String
+    Description: Forward the client's Authorization header to the upstream.
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+
+  # ── aforo-key-authorizer ──
+  DeployKeyAuthorizer:
+    Type: String
+    Description: Deploy aforo-key-authorizer (key-authorizer.js).
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  AforoTenantKey:
+    Type: String
+    Description: >-
+      Authorizer: the provider's Aforo tenant key, used to introspect
+      sk_live_/sk_test_ customer keys. Leave empty to accept JWTs only.
+    NoEcho: true
+    Default: ''
+  AuthorizerTenantId:
+    Type: String
+    Description: >-
+      Authorizer: your Aforo tenant id. Required for client-credential JWTs
+      (their tenant_id claim must equal it); empty refuses every JWT.
+    Default: ''
+  AforoJwksUrl:
+    Type: String
+    Description: 'Authorizer - JWKS used to verify client-credential JWTs.'
+    Default: https://org.aforo.ai/.well-known/jwks.json
+  AforoJwtIssuer:
+    Type: String
+    Description: 'Authorizer - required iss claim.'
+    Default: https://auth.aforo.ai
+
+Conditions:
+  HasUpstreamUrl: !Not [!Equals [!Ref UpstreamUrl, '']]
+  HasUpstreamFunction: !Not [!Equals [!Ref UpstreamFunction, '']]
+  DeployProxy: !Or [!Condition HasUpstreamUrl, !Condition HasUpstreamFunction]
+  DeployAuthorizer: !Equals [!Ref DeployKeyAuthorizer, 'true']
 
 Resources:
   AforoMeteringFunction:
@@ -107,6 +182,8 @@ Resources:
           EXCLUDE_STATUS_CODES: !Ref ExcludeStatusCodes
           STATUS_OUTCOMES: !Ref StatusOutcomes
           AFORO_TENANT_ID: !Ref AforoTenantId
+          MCP_METRIC: !Ref McpMetric
+          TOKEN_METRIC: !Ref TokenMetric
           FLUSH_COUNT: '50'
           INCLUDE_METADATA: 'true'
       # Delivery guarantee: when a batch fails transiently (network, 5xx,
@@ -163,6 +240,110 @@ Resources:
       FilterPattern: ''
       DestinationArn: !GetAtt AforoMeteringFunction.Arn
 
+  # ── aforo-metering-proxy: API Gateway Lambda proxy integration ──
+  # Forwards each call to the upstream and writes one {"aforoUsage":1,...}
+  # line per call to its log group, which is subscribed to aforo-metering.
+  # Do not also subscribe an access log of the same stage: both carry the
+  # same requestId, so the ingestor would keep only the first.
+  AforoMeteringProxyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DeployProxy
+    Properties:
+      LogGroupName: /aws/lambda/aforo-metering-proxy
+      RetentionInDays: 14
+
+  AforoMeteringProxyFunction:
+    Type: AWS::Serverless::Function
+    Condition: DeployProxy
+    DependsOn: AforoMeteringProxyLogGroup
+    Properties:
+      FunctionName: aforo-metering-proxy
+      Handler: metering-proxy.handler
+      Runtime: nodejs20.x
+      Timeout: 29
+      MemorySize: 256
+      Description: Aforo metering proxy - forwards to the upstream and logs one usage record per call
+      Environment:
+        Variables:
+          UPSTREAM_URL: !Ref UpstreamUrl
+          UPSTREAM_FUNCTION: !Ref UpstreamFunction
+          UPSTREAM_TIMEOUT_MS: !Ref UpstreamTimeoutMs
+          UPSTREAM_FORWARD_AUTH: !Ref UpstreamForwardAuth
+      Policies:
+        - !If
+          - HasUpstreamFunction
+          - Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${UpstreamFunction}
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${UpstreamFunction}:*
+          - !Ref AWS::NoValue
+      Tags:
+        aforo-managed: 'true'
+        purpose: metering-proxy
+
+  # Lets any API Gateway API in this account invoke the proxy. Narrow the
+  # SourceArn to arn:aws:execute-api:<region>:<account>:<api-id>/* if needed.
+  AforoMeteringProxyApiPermission:
+    Type: AWS::Lambda::Permission
+    Condition: DeployProxy
+    Properties:
+      FunctionName: !GetAtt AforoMeteringProxyFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:*
+
+  AforoMeteringProxyLogPermission:
+    Type: AWS::Lambda::Permission
+    Condition: DeployProxy
+    Properties:
+      FunctionName: !GetAtt AforoMeteringFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: !Sub logs.${AWS::Region}.amazonaws.com
+      SourceArn: !GetAtt AforoMeteringProxyLogGroup.Arn
+
+  AforoMeteringProxySubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Condition: DeployProxy
+    DependsOn: AforoMeteringProxyLogPermission
+    Properties:
+      LogGroupName: !Ref AforoMeteringProxyLogGroup
+      FilterName: aforo-metering-proxy-filter
+      # A term match (not a JSON pattern) so prefixed lines match too.
+      FilterPattern: '"aforoUsage"'
+      DestinationArn: !GetAtt AforoMeteringFunction.Arn
+
+  # ── aforo-key-authorizer: TOKEN authorizer (customer keys + client-credential JWTs) ──
+  AforoKeyAuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Condition: DeployAuthorizer
+    Properties:
+      FunctionName: aforo-key-authorizer
+      Handler: key-authorizer.handler
+      Runtime: nodejs20.x
+      Timeout: 10
+      MemorySize: 256
+      Description: Aforo authorizer - customer keys (introspection) and client-credential JWTs (JWKS)
+      Environment:
+        Variables:
+          AFORO_TENANT_KEY: !Ref AforoTenantKey
+          AFORO_TENANT_ID: !Ref AuthorizerTenantId
+          AFORO_JWKS_URL: !Ref AforoJwksUrl
+          AFORO_JWT_ISSUER: !Ref AforoJwtIssuer
+      Tags:
+        aforo-managed: 'true'
+        purpose: authorizer
+
+  AforoKeyAuthorizerApiPermission:
+    Type: AWS::Lambda::Permission
+    Condition: DeployAuthorizer
+    Properties:
+      FunctionName: !GetAtt AforoKeyAuthorizerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:*
+
 Outputs:
   FunctionArn:
     Description: ARN of the Aforo metering Lambda function
@@ -180,3 +361,11 @@ Outputs:
   FailureQueueArn:
     Description: ARN of the failure queue
     Value: !GetAtt AforoMeteringFailureQueue.Arn
+  MeteringProxyFunctionArn:
+    Condition: DeployProxy
+    Description: Use as the API Gateway Lambda proxy integration (AWS_PROXY)
+    Value: !GetAtt AforoMeteringProxyFunction.Arn
+  KeyAuthorizerFunctionArn:
+    Condition: DeployAuthorizer
+    Description: Use as the API Gateway TOKEN authorizer (identity source method.request.header.Authorization)
+    Value: !GetAtt AforoKeyAuthorizerFunction.Arn

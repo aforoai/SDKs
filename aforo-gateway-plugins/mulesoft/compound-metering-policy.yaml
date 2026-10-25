@@ -93,32 +93,38 @@ configuration:
 # ── correlationId (FROZEN — A+ compound-key freeze, 2026-07-05) ──
 #
 # MANDATORY: the compound event's `correlationId` MUST be derived
-# deterministically from Mule's stable per-event `correlationId`
-# attribute — the SAME identity the standard metering policy's
-# idempotencyKey was frozen to (see template.xml: "idempotencyKey":
-# correlationId, stable across <until-successful> retries — no clock).
+# deterministically from a request id the POLICY mints once per request,
+# before the flow runs — the SAME identity the standard metering policy's
+# idempotencyKey uses (aforo-metering/src/main/mule/template.xml:
+# `requestId: uuid()` captured in vars.aforoRequest before
+# <http-policy:execute-next/>). Build the compound event from that
+# variable after the response.
+#
+# NEVER seed from Mule's event `correlationId` or any request header
+# (X-Correlation-ID, X-Request-Id, ...): Mule takes correlationId from a
+# client X-Correlation-ID header when one is sent, so a caller repeating
+# one value would collapse every call into one correlationId and the
+# ingestor would bill many calls once.
 #
 # Dedup-safety basis: the Aforo ingestor types `correlationId` as a UUID
 # and derives EVERY per-metric dedup key from it
 # (correlationId:metricName[:dimensionKey]:index — CompoundEventDecomposer),
 # so the correlationId is the dedup ROOT for the whole compound event.
-# A redelivery (until-successful retry re-driving the flow, ObjectStore
-# replay after restart) MUST re-send the identical correlationId so the
-# ingest dedups instead of double-billing.
+# A redelivery (until-successful retry, ObjectStore replay after restart)
+# MUST re-send the identical correlationId so the ingest dedups instead
+# of double-billing.
 #
-# NEVER use uuid(), now(), randomBytes(), or any per-evaluation value —
-# a fresh id per attempt makes every replay look like a new event, which
-# is exactly the double-billing the A+ program exists to prevent.
+# NEVER evaluate uuid(), now(), randomBytes(), or any per-evaluation value
+# at send time — a fresh id per attempt makes every replay look like a new
+# event. The one uuid() is minted at request arrival and then only read.
 #
-# Because Mule's correlationId is not guaranteed UUID-shaped (it may be
-# taken from a client X-Correlation-ID header), hash it into a v3-style
-# UUID the ingestor's UUID-typed field can parse. Build the event ONCE
-# per Mule event and buffer THAT object; the derivation below is also
-# safe to re-evaluate (it is a pure function of the stable identity):
+# Hash the request id into a v3-style UUID (pure function of the stable
+# identity, safe to re-evaluate). Build the event ONCE per request and
+# buffer THAT object:
 #
 #   %dw 2.0
 #   import dw::Crypto
-#   var h = lower(Crypto::MD5(("aforo-compound:" ++ correlationId)
+#   var h = lower(Crypto::MD5(("aforo-compound:" ++ vars.aforoRequest.requestId)
 #             as Binary {encoding: "UTF-8"}))
 #   var variantNibble = ['8', '9', 'a', 'b'][(dw::core::Numbers::fromHex(h[16]) mod 4)]
 #   ---

@@ -30,7 +30,7 @@ In Aforo, open Integrations → your MuleSoft connection → Metering and choose
 
 You need JDK 17 or later, Maven 3.9, your Anypoint organization id (Access Management → Organization), and a connected app or user with the Exchange Contributor role.
 
-1. Get the sources: clone this repository, or download `aforo-metering-2.2.0-mule-policy.jar` and `aforo-metering.yaml` from the GitHub release if you only want to inspect what will be installed. Publishing with Maven needs the sources.
+1. Get the sources: clone this repository. The GitHub release for a `mulesoft-v*` tag carries no built files; to inspect the jar, build it with `mvn clean package` (step 3).
 
 2. Add your Exchange credentials to `~/.m2/settings.xml`. For a connected app:
 
@@ -50,6 +50,8 @@ You need JDK 17 or later, Maven 3.9, your Anypoint organization id (Access Manag
    cd mulesoft/aforo-metering
    mvn clean deploy -Danypoint.org.id=YOUR_ORG_ID
    ```
+
+   On the EU control plane, add `-Dexchange.url=https://maven.eu1.anypoint.mulesoft.com/api/v3/organizations/YOUR_ORG_ID/maven`; the default in `pom.xml` is the US host `maven.anypoint.mulesoft.com`.
 
    `mvn clean package` alone builds `target/aforo-metering-2.2.0-mule-policy.jar` without publishing. An Exchange version is immutable: to publish a change, raise `<version>` in `pom.xml` first.
 

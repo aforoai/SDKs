@@ -7,6 +7,10 @@
   Publish:  mvn clean deploy -Danypoint.org.id=<your Anypoint organization id>
             (credentials: server id "exchange-server" in ~/.m2/settings.xml)
 
+  Region:   exchange.url defaults to the US control plane. For the EU
+            control plane add
+            -Dexchange.url=https://maven.eu1.anypoint.mulesoft.com/api/v3/organizations/<org id>/maven
+
   Exchange requires the groupId of a published asset to be the organization
   id, so groupId is a property. The default is a placeholder: a jar built
   without -Danypoint.org.id is fine for inspection and for publishing

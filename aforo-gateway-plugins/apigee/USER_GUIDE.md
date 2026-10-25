@@ -24,12 +24,12 @@ cd SDKs/aforo-gateway-plugins/apigee
 
 apigeecli sharedflows create bundle \
   --name aforo-metering \
-  --folder sharedflowbundle \
+  --sf-folder sharedflowbundle \
   --org "$APIGEE_ORG" \
   --token "$(gcloud auth print-access-token)"
 ```
 
-`--folder sharedflowbundle` is the bundle root: the folder that holds `aforo-metering.xml`, `policies/`, `resources/` and `sharedflows/`. The command prints the revision it created.
+`--sf-folder sharedflowbundle` (short form `-f`) is the bundle root: the folder that holds `aforo-metering.xml`, `policies/`, `resources/` and `sharedflows/`. The command prints the revision it created.
 
 ## Step 2 — Deploy it to your environment
 

@@ -4,7 +4,51 @@ This monorepo ships five gateway metering plugins (Kong, Apigee, AWS Lambda, Azu
 
 ## Unreleased
 
-_Nothing yet._
+### AWS Lambda: AI_AGENT and MCP_SERVER through API Gateway
+
+- **`key-authorizer.js` accepts Aforo client-credential JWTs** (`POST /oauth/token`). RS256 only, verified with Node's `crypto` against the JWKS at `AFORO_JWKS_URL` (cached 1 h, one rate-limited refetch on an unknown `kid`); `exp` / `nbf` / `iat` with 30 s leeway; `iss` == `AFORO_JWT_ISSUER`; `tenant_id` == the new `AFORO_TENANT_ID` (required; unset refuses every JWT). A JWKS failure fails closed (500) and is not cached. The context adds `subscriptionIds`, `agentId` (from the `agent_id` claim) and `authType`. The `sk_live_` / `sk_test_` path is unchanged apart from `authType: "key"`.
+- **New `metering-proxy.js`**: a Lambda proxy integration that forwards to `UPSTREAM_URL` or `UPSTREAM_FUNCTION`, returns the upstream response unchanged (502 on error or timeout), and writes one `{"aforoUsage":1,...}` record per call: identity from the authorizer context, trace and session headers, MCP `tools/call` names (single or batch), token usage (`x-aforo-*` headers, else an Anthropic / OpenAI `usage` object in the body). Bodies and `Authorization` are never logged.
+- **`index.js`** reads proxy records, also behind a Lambda log prefix or inside Lambda's JSON log format. `AI_AGENT`: `agentId` only from the authorizer, `sessionId` from the record else `requestId`, plus a `TOKEN_METRIC` event (default `Tokens Consumed`) keyed `<requestId>:tokens`. MCP: one event per tool call keyed `<requestId>:mcp:<i>`; access-log MCP keeps its frozen key. An X-Ray `Root=…;Parent=…` `x-trace-id` is reduced to the root id.
+- **Behaviour change:** the MCP metric is no longer hard-coded `mcp_server.tool_invocations`. It is `METRIC_MAPPINGS` → `MCP_METRIC` → `DEFAULT_METRIC`; set `MCP_METRIC=mcp_server.tool_invocations` to keep the old name.
+- SAM template: optional proxy function, log group and subscription filter (`UpstreamUrl` / `UpstreamFunction`); optional key authorizer (`DeployKeyAuthorizer`, `AuthorizerTenantId`); `McpMetric`, `TokenMetric`.
+- Tested locally only (stubbed JWKS, local upstream server); not yet run on AWS.
+
+### Billing fix (no version bump yet)
+
+- **Kong: idempotency keys no longer come from a client header.** The key on every event (standard, MCP, gRPC, GraphQL, WebSocket) was the caller's `X-Request-Id` (else `X-Kong-Request-Id`, also a request header), and WebSocket events were keyed on the client-chosen `Sec-WebSocket-Key`. A caller who repeated one value on every request had every repeat deduplicated by the ingestor — billed once for many calls. Keys are now built from nginx's `$request_id` (`ngx.var.request_id`, gateway-generated; Kong 3.5+ derives `X-Kong-Request-Id` from it; available on the Kong 3.4 the image targets). It is read once per request and stored in the buffered event, so the plugin's send retries keep the same key (Rule #21). The client's `X-Request-Id` is still sent as `trace.xRequestId`; `Sec-WebSocket-Key` is still sent as `wsConnectionId`. If nginx has no request id (not expected) the event gets one generated UUID; with no UUID generator either, the event is skipped and counted under the new drop reason `no_request_identity`. `compound-metering.lua` seeds its `correlationId` from `ngx.var.request_id` only (still hashed to a v3-style UUID). Tests: `kong/spec/handler_spec.lua` (repeated `X-Request-Id`, MCP and WebSocket behaviour, source lock that every key is built on the gateway id), `kong/spec/compound_metering_spec.lua`.
+- **Apigee: the client `x-request-id` fallback is gone** from both the standard/MCP key (`aforo-metering.js`) and the compound `correlationId` (`aforo-compound-metering.js`). `messageid` is always set, so this fallback was not reachable in practice; when `messageid` is missing the key is now random rather than the client's header.
+- **MuleSoft compound spec** (`mulesoft/compound-metering-policy.yaml`, documentation, not an installable policy) told implementers to seed the `correlationId` from Mule's event `correlationId`, which Mule takes from a client `X-Correlation-ID` header. It now seeds from the request id the policy mints (`vars.aforoRequest.requestId`), as the installable policy already does.
+- Checked, no change: Azure APIM (`context.RequestId`), MuleSoft installable policy (`uuid()` minted at request arrival), AWS Lambda (`$context.requestId` from the access log, else the CloudWatch log-event id).
+- Comments: Kong's flush comment no longer says a Bearer API key is refused (the ingestor accepts `sk_` keys as Bearer since aforo-common 1.3.84); Apigee compound script says it runs on `PostProxyFlowHook`, not PostClientFlow.
+- **Deploy copy is behind:** `aforo-nextgen-docker/kong/plugins/aforo-metering/` still has the old `handler.lua` and `compound-metering.lua`. Sync it at release with `aforo-nextgen-docker/kong/scripts/check-plugin-sync.sh --sync` (it rewrites the `UPSTREAM` manifest).
+
+### Documentation
+
+- Root README: Apigee runs on `PostProxyFlowHook` (not PostClientFlow) and sends before the response returns; current versions listed per plugin; AWS identity row names `key-authorizer.js`.
+- Kong: the ingestor accepts an `sk_live_`/`sk_test_` key as Bearer (the plugin still sends `X-API-Key`); the `Flushed N events` line is logged at `info`, hidden at Kong's default `notice`; Dockerfile quotes the real log text (`not available`); live-run status updated to what the 2.3.0 commit records.
+- Apigee: `apigeecli sharedflows create bundle` takes `--sf-folder` (`-f`), not `--folder`; `developer.app.name` and `target.latency` marked as not yet confirmed on a live org.
+- AWS Lambda: `Skipped:` log line shown as the code prints it; to match concrete paths log `$context.path` and remove `resourcePath`; live-run status updated to what the 2.3.0 changelog records.
+- MuleSoft: how to publish to the EU control plane (`-Dexchange.url=…eu1…`); GitHub releases carry no built jar.
+
+## AWS Lambda v2.3.0 — 2026-10-16
+
+AWS Lambda only. Tag: `aws-lambda-v2.3.0`.
+
+- New `key-authorizer.js`: customers call AWS API Gateway with the Aforo key they got at subscription (`Bearer sk_live_…`); the authorizer checks it with Aforo and hands `customerId` / `keyId` / `subscriptionId` to the metering function. Verified live in production.
+- `subscriptionId` from the authorizer context is sent on each event.
+- Docs: the API Gateway account CloudWatch Logs role is a prerequisite for access logging.
+
+Details: `aws-lambda/CHANGELOG.md`.
+
+## Kong v2.3.0 — 2026-10-15
+
+Kong only; the other four plugins stay 2.2.0. Tag: `kong-v2.3.0`.
+
+- `AI_AGENT` is metered through Kong, with `agentId` / `sessionId` from upstream response headers (`X-Aforo-Agent-Id`, `X-Aforo-Session-Id`) or a per-route `agent_id`. Previously every AI_AGENT event was skipped.
+- Security: MCP `agentId` is no longer taken from the client-settable `X-Agent-Id` request header.
+- An MCP tool call with no agent id is metered as a plain request instead of an MCP metric under a non-MCP type.
+
+Details: `kong/CHANGELOG.md`.
 
 ## v2.2.0 — 2026-10-02
 

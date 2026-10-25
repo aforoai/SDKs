@@ -91,19 +91,21 @@ end
 -- rebuilding it any number of times within the same request — including
 -- across handler.lua's 3 flush retries — yields a byte-identical
 -- correlationId and the ingest dedups instead of double-billing.
--- Identity preference mirrors handler.lua's frozen standard key:
--- client X-Request-Id header (caller-controlled dedup contract) >
--- ngx.var.request_id (nginx per-request id, stable through the log
+-- Identity mirrors handler.lua's standard key: ngx.var.request_id (the
+-- nginx per-request id, gateway-generated and stable through the log
 -- phase) > one-time random LAST RESORT (dedup opt-out for that single
 -- event; effectively unreachable — ngx.var.request_id always exists
--- under nginx). NEVER put a clock or per-call random back in here.
+-- under nginx). NEVER seed from a request header (X-Request-Id etc.):
+-- the client controls it, so repeating it would collapse every call into
+-- one correlationId and bill many calls once. NEVER put a clock or
+-- per-call random back in here.
 -- ────────────────────────────────────────────────────────────
 
--- Lua gotcha: "" is TRUTHY. An empty client-supplied X-Request-Id must
--- never become the seed — every such request would derive the SAME
--- correlationId, and the server would silently dedup real events as
--- replays (revenue loss, undetectable because the shared id is a valid
--- UUID). Normalize empty to nil so the identity chain falls through.
+-- Lua gotcha: "" is TRUTHY. An empty request id must never become the
+-- seed — every such request would derive the SAME correlationId, and the
+-- server would silently dedup real events as replays (revenue loss,
+-- undetectable because the shared id is a valid UUID). Normalize empty
+-- to nil so the chain falls through to the last resort.
 local function nonempty(v)
     if v == nil or v == "" then return nil end
     return v
@@ -159,8 +161,7 @@ end
 function M.build_compound_event(customer_id, measurements, metadata, product_type)
     if not measurements or #measurements == 0 then return nil end
 
-    local seed = nonempty(kong.request.get_header("X-Request-Id"))
-        or nonempty(ngx.var.request_id)
+    local seed = ngx.var and nonempty(ngx.var.request_id) or nil
     local correlation_id
     if seed then
         correlation_id = derive_correlation_id(seed)

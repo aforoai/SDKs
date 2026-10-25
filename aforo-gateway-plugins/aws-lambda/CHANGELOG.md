@@ -6,6 +6,27 @@ This function ships on the Aforo gateway-plugins line; the whole repo is version
 
 ## [Unreleased]
 
+### AWS Lambda: AI_AGENT and MCP_SERVER through API Gateway
+
+- **`key-authorizer.js` accepts Aforo client-credential JWTs** (`POST /oauth/token`). RS256 only, verified with Node's `crypto` against the JWKS at `AFORO_JWKS_URL` (cached 1 h, one rate-limited refetch on an unknown `kid`); `exp` / `nbf` / `iat` with 30 s leeway; `iss` == `AFORO_JWT_ISSUER`; `tenant_id` == the new `AFORO_TENANT_ID` (required; unset refuses every JWT). A JWKS failure fails closed (500) and is not cached. The context adds `subscriptionIds`, `agentId` (from the `agent_id` claim) and `authType`. The `sk_live_` / `sk_test_` path is unchanged apart from `authType: "key"`.
+- **New `metering-proxy.js`**: a Lambda proxy integration that forwards to `UPSTREAM_URL` or `UPSTREAM_FUNCTION`, returns the upstream response unchanged (502 on error or timeout), and writes one `{"aforoUsage":1,...}` record per call: identity from the authorizer context, trace and session headers, MCP `tools/call` names (single or batch), token usage (`x-aforo-*` headers, else an Anthropic / OpenAI `usage` object in the body). Bodies and `Authorization` are never logged.
+- **`index.js`** reads proxy records, also behind a Lambda log prefix or inside Lambda's JSON log format. `AI_AGENT`: `agentId` only from the authorizer, `sessionId` from the record else `requestId`, plus a `TOKEN_METRIC` event (default `Tokens Consumed`) keyed `<requestId>:tokens`. MCP: one event per tool call keyed `<requestId>:mcp:<i>`; access-log MCP keeps its frozen key. An X-Ray `Root=…;Parent=…` `x-trace-id` is reduced to the root id.
+- **Behaviour change:** the MCP metric is no longer hard-coded `mcp_server.tool_invocations`. It is `METRIC_MAPPINGS` → `MCP_METRIC` → `DEFAULT_METRIC`; set `MCP_METRIC=mcp_server.tool_invocations` to keep the old name.
+- SAM template: optional proxy function, log group and subscription filter (`UpstreamUrl` / `UpstreamFunction`); optional key authorizer (`DeployKeyAuthorizer`, `AuthorizerTenantId`); `McpMetric`, `TokenMetric`.
+- Tested locally only (stubbed JWKS, local upstream server); not yet run on AWS.
+
+## [2.3.0] - 2026-10-16
+
+### Added
+- `key-authorizer.js`: API Gateway TOKEN authorizer for the customer's Aforo key (`Authorization: Bearer sk_live_…`, issued at subscription). Checks the key with Aforo's `POST /api/v1/customer-keys/introspect` using the tenant key, caches answers per container, fails closed, never logs the key. Sets `customerId`, `keyId`, `subscriptionId`, `productType`. Before this, a customer's subscription key could not be used at AWS: `authorizer.js` accepts only JWTs. See AUTHORIZER.md.
+- `subscriptionId` from `$context.authorizer.subscriptionId` is sent as the event's top-level `subscriptionId`. Add it to the access-log format.
+
+### Docs
+- The account-level API Gateway CloudWatch Logs role is a prerequisite for access logging.
+
+### Verified
+- Live in production on 2026-10-16: API Gateway REST stage → `key-authorizer.js` → access log → `index.js` → ingestor. Calls with the customer's key were stored under that customer; unknown or missing keys got 401 and were not metered.
+
 ## [2.2.0] - 2026-10-02
 
 Merges the two lines of this function: the public 2.1.0 release (mirror work by Gowtham and Eswar) and the working repository's delivery, outcome and detection work. Every setting either line read still works.

@@ -201,11 +201,13 @@ function md5hex(s) {
 // rejected it with a 400, silently dropping the event; hashing it into
 // a v3-style UUID keeps it deterministic AND parseable. (2) the
 // java.util.UUID fallback does not exist in Apigee's sandboxed Rhino.
-// Identity preference mirrors aforo-metering.js's frozen standard key:
-// 'messageid' (platform-generated, unique + stable per transaction) >
-// client 'x-request-id' header > one-time random LAST RESORT (dedup
-// opt-out for that single event; effectively unreachable — messageid is
-// always set). NEVER put a clock component back into this derivation.
+// Identity mirrors aforo-metering.js's frozen standard key: 'messageid'
+// (platform-generated, unique + stable per transaction) > one-time random
+// LAST RESORT (dedup opt-out for that single event; effectively
+// unreachable — messageid is always set). NEVER seed from a request
+// header such as x-request-id: the client sets it, so repeating one
+// value would collapse many calls into one correlationId. NEVER put a
+// clock component back into this derivation.
 
 function formatUuidV3(hex) {
     var hexChr = '0123456789abcdef';
@@ -234,7 +236,7 @@ function randomUuidV4() {
            '-' + s.substring(20, 32);
 }
 
-// ── Main: PostClientFlow execution ───────────────────────
+// ── Main: runs in the shared flow on the PostProxyFlowHook ──
 
 var enabled = context.getVariable('aforo.compound_metering_enabled');
 if (enabled !== 'true') {
@@ -252,8 +254,7 @@ if (enabled !== 'true') {
         var customerId = context.getVariable('aforo.customer_id') ||
                          context.getVariable('developer.app.name') ||
                          context.getVariable('developer.email') || '';
-        var seedIdentity = context.getVariable('messageid') ||
-                           context.getVariable('request.header.x-request-id');
+        var seedIdentity = context.getVariable('messageid');
         var correlationId = seedIdentity ?
             deriveCorrelationId(seedIdentity) : randomUuidV4();
 

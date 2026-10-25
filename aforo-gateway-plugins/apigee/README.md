@@ -194,6 +194,7 @@ MCP tool calls and AGENTIC_API calls follow the same rules as plain API calls.
 - **Request-phase and response-phase steps share one flow.** JWT validation and margin guard act on the request; metering needs the response. On `PostProxyFlowHook` the first two run after the backend already served the call. If you use them, put those steps in a request-side shared flow of your own and keep this one for metering.
 - `aforo-compound-metering.js`, `aforo-preflight-quota.js` and `aforo-jwt-jti-check.js` are in the bundle directory but no policy runs them. The Redis jti blocklist (`aforo_redis_host`, `aforo_redis_port`) is therefore not checked.
 - No store-and-forward. An event that could not be delivered after the one retry is logged and dropped.
+- **Not yet confirmed on a live org.** The flow assumes `developer.app.name` (and `developer.email`) are set once `VerifyAPIKey` / `OAuthV2` has run, and reads latency from `target.latency`. Both are from the unit mocks, not from a live Apigee X debug session. If `target.latency` is unset, `executionDurationMs` and `responseTimeMs` are sent as 0; if the developer variables are unset, nothing is metered (no customer).
 - With response streaming enabled, Apigee does not expose the response body, so an MCP call that returns a JSON-RPC `error` inside a 2xx is classified from the status alone.
 
 ## Tests

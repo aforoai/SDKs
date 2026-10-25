@@ -42,6 +42,8 @@ Yourself:
    mvn clean deploy -Danypoint.org.id=YOUR_ORG_ID
    ```
 
+   EU control plane: add `-Dexchange.url=https://maven.eu1.anypoint.mulesoft.com/api/v3/organizations/YOUR_ORG_ID/maven` (the `pom.xml` default is the US host).
+
 > Exchange versions are immutable. If 2.2.0 is already in your Exchange, `mvn deploy` returns 409; raise `<version>` in `pom.xml` (and `VERSION`) to publish a change.
 
 ## Step 2 — Apply JWT Validation

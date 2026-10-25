@@ -6,6 +6,50 @@ The Kong plugin has one version: the rockspec's. `handler.lua`'s `VERSION` const
 
 ## [Unreleased]
 
+## [2.5.0] — 2026-10-25
+
+### Added
+- `jwt_jwks_uri` is implemented. The RS256 key comes from the issuer's JWKS (https only, TLS verified, 3 s timeout, 256 KiB cap) and is chosen by the token's `kid`, so organization-service can rotate its OAuth signing key without a Kong config change. The set is cached per worker for the new `jwt_jwks_cache_ttl` (default 600 s, 30–86400). A token whose `kid` is not cached refreshes the set at most once every 30 s per worker. When a refresh fails the last good set is used for up to 24 h; after that, and before the first successful fetch, tokens are rejected (401) unless `jwt_public_key` verifies them. Keys that are private, not RSA, not for signing or not RS256 are ignored. A token without a `kid` is verified only when the JWKS has exactly one key.
+- `jwt_public_key` and `jwt_jwks_uri` can be set together: the static key verifies tokens the JWKS has no key for.
+- Cold start: requests that arrive while a worker's first JWKS fetch is in flight wait for it (up to the 8 s fetch budget) instead of being rejected, and a worker whose first fetch failed tries again after 5 s instead of 30 s.
+- The JWKS body is read in 8 KiB chunks: a `Content-Length` over 256 KiB is refused before reading, and a body without one is dropped as soon as it passes 256 KiB. The whole fetch (connect, request, body) must finish within 8 s. A fetch left marked in flight for longer (its request was aborted) no longer blocks later refreshes.
+- Only RS256 keys and tokens are supported; EC (ES256) keys in the JWKS are ignored.
+
+### Security
+- A JWKS that cannot be fetched or parsed never lets a token through, `jwt_allow_unverified_signature` included. Missing-key log lines are throttled when JWKS is in use (the caller controls `kid`).
+
+## [2.4.0] — 2026-10-24
+
+### Security
+- Revocation checks fail closed. When Redis cannot answer the jti-blocklist or client-revocation lookup (connect fails, or the GET errors or times out), the request is refused with **503** `{"error":"temporarily_unavailable","error_description":"REVOCATION_CHECK_UNAVAILABLE"}` and `Retry-After: 1`. Before, it was let through, so a revoked token or API key kept working for as long as Redis was down. organization-service already refuses (503) for the same check.
+
+### Added
+- Config `jti_redis_fail_mode` (`closed` default, `open`). `open` restores the old behaviour; each fail-open logs a warning (once per 60s) and is counted.
+- Counter `aforo_metering_revocation_check_unavailable_total{check,outcome}` (when Kong's prometheus plugin is loaded) and shared-dict keys `aforo_revocation_unavailable:<check>:<outcome>` in `aforo_buffer`.
+
+### Changed
+- A GET error after a successful connect is now treated as "Redis could not answer". It used to read as "not revoked".
+- **Upgrade note:** with `jwt_validation_enabled = true` and no reachable Redis (the default host is `127.0.0.1:6379`), every token carrying a `jti` or `key_id` claim now gets 503. Point `jwt_redis_host`/`jwt_redis_port` at Redis, or set `jti_redis_fail_mode = open`.
+
+### Fixed
+- Billing: idempotency keys (standard, MCP, gRPC, GraphQL, WebSocket) are built from `ngx.var.request_id` instead of the client's `X-Request-Id` / `X-Kong-Request-Id` / `Sec-WebSocket-Key`. A caller repeating one header value was billed once for many calls. The client's `X-Request-Id` is still sent as `trace.xRequestId`. New drop reason `no_request_identity` (not expected to fire). `compound-metering.lua` seeds `correlationId` from `ngx.var.request_id` only.
+- Flush comment: Bearer `sk_` keys are accepted by the ingestor (aforo-common 1.3.84+); the plugin still sends `X-API-Key`.
+
+## [2.3.0] — 2026-10-15
+
+### Added
+- `AI_AGENT` metering. A route with `product_type = AI_AGENT` now sends events: `agentId` comes from the upstream **response** header `agent_id_header` (default `X-Aforo-Agent-Id`) or, failing that, the new per-route `agent_id`; `sessionId` from the response header `session_id_header` (default `X-Aforo-Session-Id`). Before, every AI_AGENT event was skipped, because nothing could supply those fields.
+- Config: `agent_id`, `agent_id_header`, `session_id_header`.
+- MCP events take `sessionId` from `session_id_header` when the request has no `Mcp-Session-Id`.
+
+### Changed
+- MCP `agentId` precedence: `agent_id_header` response header, then `agent_id`, then the payload's `params._meta.agent_id`.
+- An MCP `tools/call` with no agent id is metered as a plain request (configured `product_type` and metric). It was sent as `mcp_server.tool_invocations` under the configured type, a metric/type mismatch.
+- A traced request on an `AI_AGENT` route stays `AI_AGENT` (with `traceId`); only other routes become `AGENTIC_API`.
+
+### Security
+- MCP `agentId` is no longer read from the `X-Agent-Id` request header. The header is client-settable, so a caller could attribute tool calls (and agent budgets, limits and analytics) to any agent. Apigee closed the same fallback in 2026-04 (IDOR finding #11). Agent and session ids are never read from request headers.
+
 ## [2.2.0] — 2026-10-02
 
 Merges two lines that had diverged since 2026-06-29: the public 2.1.0 release (Gowtham and Eswar) and the internal handler line 1.4.0–1.4.4. Every config key of either line is still accepted.

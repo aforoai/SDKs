@@ -27,7 +27,7 @@ cd SDKs/aforo-gateway-plugins/kong
 luarocks install lua-resty-http
 
 # 3. Build + install the plugin from the rockspec in this folder
-luarocks make kong-plugin-aforo-metering-2.2.0-1.rockspec
+luarocks make kong-plugin-aforo-metering-2.5.0-1.rockspec
 ```
 
 Then tell Kong to load it and reserve the shared-memory buffer the log phase writes to. In `kong.conf`:
@@ -65,7 +65,7 @@ plugins:
       tenant_id: ${AFORO_TENANT_ID}
 ```
 
-Send a request through Kong, then check the proxy logs for `[aforo-metering] Flushed N events to Aforo (status=2xx)`.
+Send a request through Kong, then check the proxy logs for `[aforo-metering] Flushed N events to Aforo (status=2xx)`. That line is logged at `info`; Kong's default `log_level` is `notice`, so set `KONG_LOG_LEVEL=info` (or `log_level = info` in `kong.conf`) to see it. Failed flushes log at `warn` and show at the default level.
 
 ## Configuration
 
@@ -74,9 +74,9 @@ Every option lives under `config.*`. `aforo_endpoint`, `api_key`, and `tenant_id
 | Option | Type | Default | What it does |
 |--------|------|---------|--------------|
 | `aforo_endpoint` | string | — (required) | Aforo ingestor batch URL. Use `https://api.aforo.ai/v1/ingest/batch`. |
-| `api_key` | string | — (required) | Aforo API key, scoped `usage:ingest`. Sent as `X-API-Key` on the flush — never as `Authorization: Bearer`, which the ingestor rejects with 401. Stored encrypted. |
+| `api_key` | string | — (required) | Aforo API key, scoped `usage:ingest`. Sent as `X-API-Key` on the flush. (The ingestor also accepts an Aforo key — `sk_live_…` / `sk_test_…` — as `Authorization: Bearer`; this plugin does not use that form.) Stored encrypted. |
 | `tenant_id` | string | — (required) | Aforo tenant identifier. Sent as the `X-Tenant-Id` header on the flush. |
-| `product_type` | string | `API` | `productType` sent on every event (trimmed, upper-cased; unknown values passed through). MCP `tools/call` (with `mcp_enabled`) is sent as `MCP_SERVER` when both `toolName` and `agentId` are known, otherwise keeps this value. Events missing the fields their type requires are skipped, not sent (one invalid event fails the whole batch): `AI_AGENT`/`GRPC_API`/`GRAPHQL_API`/`WEBSOCKET_API`/`MQTT_BROKER` need fields an HTTP gateway cannot observe or trust (an agentId from `X-Agent-Id` would be client-settable), so use them only where every event is otherwise supplied. |
+| `product_type` | string | `API` | `productType` sent on every event (trimmed, upper-cased; unknown values passed through). MCP `tools/call` (with `mcp_enabled`) is sent as `MCP_SERVER` when both `toolName` and `agentId` are known, otherwise it is metered as a plain request. `AI_AGENT` takes `agentId` from `agent_id_header` / `agent_id` and `sessionId` from `session_id_header`. Events missing the fields their type requires are skipped and counted, not sent. Agent and session ids are never read from request headers (`X-Agent-Id` is client-settable). `GRPC_API`/`GRAPHQL_API`/`WEBSOCKET_API` come from detection (`grpc_enabled` etc.), not from this setting; `MQTT_BROKER` is not proxied by Kong. |
 | `default_metric` | string | `api_calls` | Metric used when nothing below matches. Must exist in your Aforo catalog. |
 | `metric_mappings` | array | — | Ordered `{path_pattern, method?, metric_name}` rules; first match wins. `path_pattern` is a Lua pattern (anchor with `^`). |
 | `mappings_url` | string | — | Aforo catalog gateway-mappings endpoint. When set, EXACT / PREFIX / CONTAINS rules are fetched in a background timer and cached; a failed refresh keeps the last table. |
@@ -84,6 +84,9 @@ Every option lives under `config.*`. `aforo_endpoint`, `api_key`, and `tenant_id
 | `mappings_timeout_ms` | number | `3000` | Timeout of the background fetch. Never on the request path. |
 | `metric_header` | string | `X-Aforo-Metric` | Upstream **response** header that names the metric for one request. Empty disables. |
 | `quantity_header` | string | `X-Aforo-Quantity` | Upstream **response** header that supplies the quantity for one request. Empty disables. |
+| `agent_id` | string | — | Fixed `agentId` for `AI_AGENT` / `MCP_SERVER` events on this route or service, for a route that fronts one agent. `agent_id_header` overrides it per call. |
+| `agent_id_header` | string | `X-Aforo-Agent-Id` | Upstream **response** header carrying `agentId`. Wins over `agent_id` and an MCP payload's `params._meta.agent_id`. |
+| `session_id_header` | string | `X-Aforo-Session-Id` | Upstream **response** header carrying `sessionId`. Required for `AI_AGENT`; used by MCP when the request has no `Mcp-Session-Id`. |
 | `metric_name_pattern` | string | `{method} {path}` | Fixed metric name or template (`{method}`, `{path}`, `{service}`, `{route}`, `{consumer}`). Used only when set to something other than the default; the default produces one metric per endpoint, which the ingestor refuses. |
 | `quantity_source` | string | `1` | `1` = one unit per request, `response_size` = response bytes, or a literal number. |
 | `customer_id_source` | string | `consumer` | Only `consumer` is accepted. See [Customer identity](#customer-identity). Request headers / query params are never read. |
@@ -96,13 +99,15 @@ Every option lives under `config.*`. `aforo_endpoint`, `api_key`, and `tenant_id
 | `include_metadata` | boolean | `true` | Include request metadata (method, path, status, latency, sizes) in the event. |
 | `mcp_enabled` | boolean | `false` | Detect MCP JSON-RPC `tools/call` POST bodies and emit `mcp_server.tool_invocations` events. |
 | `mcp_product_id` | string | — | Aforo product ID for MCP metering (set when `mcp_enabled=true`). |
-| `jwt_validation_enabled` | boolean | `false` | Verify an Aforo RS256 JWT in the access phase: signature against `jwt_public_key`, then `exp`, `nbf`, `iss`, jti blocklist, client revocation. 401 on failure. |
+| `jwt_validation_enabled` | boolean | `false` | Verify an Aforo RS256 JWT in the access phase: signature against the key from `jwt_jwks_uri` (by `kid`) or `jwt_public_key`, then `exp`, `nbf`, `iss`, jti blocklist, client revocation. 401 on failure. |
 | `jwt_issuer` | string | `https://auth.aforo.ai` | Expected `iss` claim. Empty string skips the issuer check. |
-| `jwt_jwks_uri` | string | — | Accepted, not used: no JWKS fetch is implemented. Set `jwt_public_key`. |
-| `jwt_public_key` | string | — | PEM RSA **public** key of the issuer. Required for in-plugin verification; a private key is refused. Stored encrypted. |
-| `jwt_allow_unverified_signature` | boolean | `false` | Let a token through when the plugin cannot verify it (no `jwt_public_key`). Access only: such a token supplies no `customerId`. |
+| `jwt_jwks_uri` | string | — | https URL of the issuer's JWKS (organization-service serves it at `/.well-known/jwks.json`). The key is chosen by the token's `kid`, so a key rotation needs no config change. An unknown `kid` refreshes the set at most every 30 s; while the JWKS cannot be fetched the last good set is used for up to 24 h. Since 2.5.0. |
+| `jwt_jwks_cache_ttl` | integer | `600` | Seconds a fetched JWKS is used before it is fetched again (30–86400). |
+| `jwt_public_key` | string | — | PEM RSA **public** key of the issuer. Needed when `jwt_jwks_uri` is not set; with both set it verifies tokens the JWKS has no key for. A private key is refused. Stored encrypted. |
+| `jwt_allow_unverified_signature` | boolean | `false` | Let a token through when the plugin cannot verify it (no `jwt_jwks_uri` and no `jwt_public_key`). Access only: such a token supplies no `customerId`. |
 | `jwt_redis_host` | string | — | Redis host for the jti blocklist. Falls back to `rate_limit_redis_host`. |
 | `jwt_redis_port` | integer | — | Redis port for the jti blocklist. Falls back to `rate_limit_redis_port`. |
+| `jti_redis_fail_mode` | string | `closed` | What the jti-blocklist and client-revocation checks do when Redis cannot answer (connect or GET fails). `closed`: refuse with **503** `{"error":"temporarily_unavailable","error_description":"REVOCATION_CHECK_UNAVAILABLE"}` and `Retry-After: 1`. `open`: let the request through, log a warning (once per 60s) and count it. Before 2.4.0 the plugin always failed open. With `jwt_validation_enabled` and no reachable Redis, every request with a `jti` or `key_id` claim now gets 503 — point `jwt_redis_host`/`jwt_redis_port` at Redis, or set `open`. Counted in `aforo_metering_revocation_check_unavailable_total{check="jti"\|"client",outcome="closed"\|"open"}` (when Kong's prometheus plugin is loaded) and in the `aforo_buffer` shared dict under `aforo_revocation_unavailable:<check>:<outcome>`. |
 | `rate_limit_enabled` | boolean | `false` | Enforce rate limits in the access phase (returns 429 on a HARD breach). |
 | `rate_limit_redis_host` | string | `127.0.0.1` | Redis host for rate-limit counters and policy cache. |
 | `rate_limit_redis_port` | integer | `6379` | Redis port for rate-limit counters. |
@@ -150,7 +155,7 @@ Step-by-step from install to a verified event in Aforo: see [USER_GUIDE.md](USER
 
 ## What this doesn't cover
 
-- **No JWKS fetch.** In-plugin verification reads one PEM public key from `jwt_public_key`. For rotating keys, verify tokens with Kong's `jwt` plugin and set `customer_id_jwt_claim`.
+- **JWKS needs https and a reachable issuer.** Without `jwt_public_key` as a fallback, a token signed before the first successful JWKS fetch is rejected (401), and so is every token once the last good set is more than 24 h old.
 - **An unknown metric name is only detected by the ingestor.** The plugin cannot see your catalog. Those events come back refused in the batch response and are counted as `ingestor_rejected`; they are not retried.
 - **No durable buffer.** Events live in the `aforo_buffer` shared dict until flush. A batch that fails transiently (5xx, timeout, 408, 429) is put back and retried on a later flush; a batch the ingestor rejects with any other 4xx is dropped with the reason logged. Past 10,000 buffered events the newest are dropped, and a Kong restart loses whatever is buffered — this is best-effort metering, not a guaranteed-delivery queue.
-- **Rate-limit, margin-guard and pre-flight quota enforcement need Redis / pricing-service / the ingestor reachable.** All fail open: a timeout or an unreachable dependency lets the request through rather than blocking it (the quota check can be made fail-closed with `preflight_quota_fail_open=false`).
+- **Rate-limit, margin-guard and pre-flight quota enforcement need Redis / pricing-service / the ingestor reachable.** All fail open: a timeout or an unreachable dependency lets the request through rather than blocking it (the quota check can be made fail-closed with `preflight_quota_fail_open=false`). The JWT revocation checks are the exception: since 2.4.0 they refuse with 503 when Redis cannot answer (`jti_redis_fail_mode`, default `closed`).

@@ -52,19 +52,22 @@ The one-click install does not create the SQS failure queue. For that, use the S
 
 > ⚠ This Lambda parses **API Gateway access logs**, not the request itself. An entry it cannot attribute to a customer is skipped.
 
+> ⚠ API Gateway can only write access logs once the account has a CloudWatch Logs role (API Gateway → Settings → *CloudWatch log role ARN*, one per account and region, policy `AmazonAPIGatewayPushToCloudWatchLogs`). Without it, enabling access logging on the stage fails.
+
 ```json
-{"requestId":"$context.requestId","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","responseLatency":"$context.responseLatency","responseLength":"$context.responseLength","stage":"$context.stage","customerId":"$context.authorizer.customerId","keyId":"$context.authorizer.keyId","caller":"$context.identity.caller"}
+{"requestId":"$context.requestId","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","responseLatency":"$context.responseLatency","responseLength":"$context.responseLength","stage":"$context.stage","customerId":"$context.authorizer.customerId","keyId":"$context.authorizer.keyId","subscriptionId":"$context.authorizer.subscriptionId","caller":"$context.identity.caller"}
 ```
 
 Where the customer comes from, in order:
 
 | Field | Source | When |
 |---|---|---|
-| `customerId` | `$context.authorizer.customerId` — set by the Aforo Lambda Authorizer (`authorizer.js`) from the verified JWT's `customer_id` claim. See [AUTHORIZER.md](AUTHORIZER.md). | Routes behind the Aforo authorizer. |
+| `customerId` | `$context.authorizer.customerId` — set by an Aforo authorizer: `key-authorizer.js` from the customer's Aforo key (`sk_live_…`, issued at subscription), or `authorizer.js` from a verified Aforo JWT. See [AUTHORIZER.md](AUTHORIZER.md). | Routes behind an Aforo authorizer. |
 | `caller` | `$context.identity.caller` — the IAM principal API Gateway verified from the SigV4 signature. | IAM-authorized routes. Used only when `customerId` is absent and `CUSTOMER_ID_SOURCE` is `consumer` (the default). The value must be the customer's id in Aforo. |
 
 Never used, even if your format logs them: `$context.identity.apiKey` (the API key **value** — a secret; remove it from your log format), `$context.authorizer.principalId`, request headers, and the client IP. An entry with no identity, or with one longer than 64 characters, is skipped and counted in the Lambda log as `no customerId` — it is never sent with a null or placeholder customer.
 
+- `subscriptionId` (`$context.authorizer.subscriptionId`, set by `key-authorizer.js`) is sent as the event's `subscriptionId`, so billing picks the right subscription when a customer has several pricing the same metric. Optional; omitted when unset or longer than 64 characters.
 - HTTP APIs with a native JWT authorizer: `"customerId":"$context.authorizer.claims.customer_id"` (not verified on a live stage — test against yours).
 - CLF-format entries parse, but carry no customer, so they are never metered.
 - Metric mappings match the logged `resourcePath` (for REST APIs the resource template, e.g. `/v1/users/{id}`). To match concrete paths, log `$context.path` as `path` and drop `resourcePath`.
@@ -101,7 +104,9 @@ The function reads everything from environment variables.
 | `CUSTOMER_ID_SOURCE` | `CustomerIdSource` | `consumer` | `consumer`: authorizer `customerId`, then IAM `caller`. `authorizer`: authorizer `customerId` only. Any other value (the long-removed `header` included) behaves as `authorizer` and logs a warning. |
 | `FLUSH_COUNT` | — (`50` in template) | `50` | Max events per POST. Capped at 1000: the ingestor rejects a larger batch with 400. |
 | `INCLUDE_METADATA` | — (`true` in template) | `true` | Include request metadata in the event. `false` omits it. |
-| `MCP_ENABLED` | — | `false` | Detect MCP JSON-RPC `tools/call` in the logged request body and emit `mcp_server.tool_invocations`. |
+| `MCP_ENABLED` | — | `false` | Detect MCP JSON-RPC `tools/call` in a `requestBody` field of an access-log line. Records from `metering-proxy.js` carry their tool calls already and need no flag. |
+| `MCP_METRIC` | `McpMetric` | *(empty → `DEFAULT_METRIC`)* | Metric for MCP tool-call events that no `METRIC_MAPPINGS` rule names. Up to 2.3.0 this was hard-coded `mcp_server.tool_invocations`; set that value to keep it. |
+| `TOKEN_METRIC` | `TokenMetric` | `Tokens Consumed` | `AI_AGENT` only: metric of the second, per-call token event (quantity = input + output tokens) when a proxy record carries token usage. Empty turns it off. |
 | `AFORO_TENANT_ID` | `AforoTenantId` | *(empty)* | Optional. Not sent to Aforo. It is part of the MCP idempotency key and a property on the EMF metrics; if you set it before 2.2.0, keep the same value. |
 
 **Metric name precedence:** `METRIC_MAPPINGS` match → `METRIC_NAME_PATTERN` (if set) → `DEFAULT_METRIC`. The Lambda cannot see your catalog: a name that is empty or longer than 255 characters is dropped here (WARN log, EMF metric `EventsDroppedInvalidMetric`); any other name is sent, and the ingestor rejects an event whose metric is not registered — that event only, not the batch it travelled in. Rejected events show up in the log and in `EventsRejected`.
@@ -111,6 +116,8 @@ The function reads everything from environment variables.
 **Never metered:** `OPTIONS` (CORS preflights); entries with no customer identity; quantity ≤ 0; paths starting `/health`, `/ready`, `/metrics`, `/favicon.ico`; the status codes in `EXCLUDE_STATUS_CODES`.
 
 `MCP_PRODUCT_ID` and `MARGIN_GUARD_*` are not read by `index.js`.
+
+For `AI_AGENT` and `MCP_SERVER` products, see [USER_GUIDE.md](USER_GUIDE.md#ai-agent-and-mcp-server-metering-proxy): the `metering-proxy.js` integration logs the tool calls, tokens and sessions an access log cannot see.
 
 ## Delivery
 
@@ -175,10 +182,10 @@ Step by step from `sam deploy` to a verified event in Aforo: [USER_GUIDE.md](USE
 ## What this doesn't cover
 
 - **Blocking a request.** This Lambda runs after the response was served. For quota or margin enforcement, deploy `authorizer.js` / `margin-guard.js` as an API Gateway Lambda Authorizer (see [AUTHORIZER.md](AUTHORIZER.md)).
-- **Routes with only an API Gateway API key.** A usage-plan key alone gives no customer identity this function will use (the key value is a secret). Put the Aforo authorizer on the route, or use IAM authorization.
+- **Routes with only an API Gateway API key.** A usage-plan key alone gives no customer identity this function will use (the key value is a secret). Put an Aforo authorizer on the route (`key-authorizer.js` accepts the customer's Aforo key directly), or use IAM authorization.
 - **Outages longer than the retry window.** `MaximumEventAgeInSeconds: 21600` bounds async retries at 6 hours; past that the record goes to the failure queue (SAM deploy) or is lost (one-click deploy, which has no queue).
 - **gRPC, GraphQL, WebSocket.** An access log does not carry the fields those product types need.
-- **A live API Gateway run of 2.2.0.** The suites run against a stubbed transport and a local HTTP server; the `$context` variables and the async-retry behaviour of this version have not been exercised on a real stage.
+- **A live run of the failure paths.** The suites run against a stubbed transport and a local HTTP server. The 2.3.0 changelog records one live production run of the happy path on 2026-10-16 (REST stage → `key-authorizer.js` → access log → `index.js` → ingestor); retries on a 5xx from the ingestor, the 6-hour async-retry window and the failure queue have not been exercised on a real stage.
 
 ## Tests
 
@@ -186,4 +193,4 @@ Step by step from `sam deploy` to a verified event in Aforo: [USER_GUIDE.md](USE
 npm test
 ```
 
-Runs `tests/handler.test.js` (delivery, EMF metrics, key stability across redelivery, AGENTIC_API detection, compound `correlationId`, execution status) and `tests/contract.test.js` (wire contract against a local capture server: auth header, identity, metric mappings and precedence, `PRODUCT_TYPE`, `Retry-After`, deadline).
+Runs `tests/agent-mcp.test.js` (AI_AGENT / MCP events from proxy records), `tests/metering-proxy.test.js`, `tests/key-authorizer.test.js`, `tests/key-authorizer-jwt.test.js`, `tests/handler.test.js` (delivery, EMF metrics, key stability across redelivery, AGENTIC_API detection, compound `correlationId`, execution status) and `tests/contract.test.js` (wire contract against a local capture server: auth header, identity, metric mappings and precedence, `PRODUCT_TYPE`, `Retry-After`, deadline).

@@ -124,6 +124,42 @@ package.loaded["resty.http"] = {
                 if r.err then return nil, r.err end
                 return { status = r.status, body = r.body or "", headers = r.headers or {} }
             end,
+            -- Streaming API (JWKS fetch): parse_uri + connect + request + body_reader.
+            parse_uri = function(_, uri)
+                local host, port, path, query = uri:match("^https://([^/:?#]+):?(%d*)([^?#]*)%??([^#]*)")
+                if not host then return nil, "bad uri" end
+                return { "https", host, tonumber(port) or 443, path ~= "" and path or "/", query }
+            end,
+            connect = function(self, opts)
+                self._conn = opts
+                return true
+            end,
+            request = function(self, params)
+                local c = self._conn
+                local port = c.port == 443 and "" or (":" .. c.port)
+                table.insert(http_mock.requests, {
+                    url = "https://" .. c.host .. port .. params.path,
+                    params = { ssl_verify = c.ssl_verify, ssl_server_name = c.ssl_server_name,
+                               headers = params.headers },
+                })
+                local r = table.remove(http_mock.responses, 1) or { status = 202 }
+                if r.err then return nil, r.err end
+                local body, pos = r.body or "", 1
+                http_mock.bytes_read = 0
+                return {
+                    status = r.status, headers = r.headers or {},
+                    body_reader = function(n)
+                        if http_mock.on_read then http_mock.on_read() end
+                        if r.read_err then return nil, r.read_err end
+                        if pos > #body then return nil end
+                        local chunk = body:sub(pos, pos + n - 1)
+                        pos = pos + #chunk
+                        http_mock.bytes_read = http_mock.bytes_read + #chunk
+                        return chunk
+                    end,
+                }
+            end,
+            close = function() http_mock.closed = (http_mock.closed or 0) + 1 return true end,
         }
     end,
 }
@@ -304,6 +340,10 @@ describe("aforo-metering handler", function()
             return c
         end
         local RS = { alg = "RS256", typ = "JWT" }
+        local redis_state
+        -- W3.7: JWK modulus (base64url) -> PEM path, so the shim can verify JWKS keys with openssl.
+        local jwk_pems = {}
+        local jwk_n = {}
 
         setup(function()
             assert(sh("mkdir -p " .. tmp))
@@ -314,9 +354,21 @@ describe("aforo-metering handler", function()
             pub_pem = slurp(tmp .. "/k1.pub")
             other_pub_pem = slurp(tmp .. "/k2.pub")
             priv_pem = slurp(tmp .. "/k1.pem")
+            for _, name in ipairs({ "k1", "k2" }) do
+                local out = io.popen("openssl rsa -pubin -in " .. tmp .. "/" .. name .. ".pub -modulus -noout")
+                local hex = out:read("*a"):match("Modulus=(%x+)"); out:close()
+                local bytes = hex:gsub("%x%x", function(h) return string.char(tonumber(h, 16)) end)
+                jwk_n[name] = b64url(bytes)
+                jwk_pems[jwk_n[name]] = slurp(tmp .. "/" .. name .. ".pub")
+            end
 
             package.loaded["resty.openssl.pkey"] = {
-                new = function(pem)
+                new = function(pem, opts)
+                    if opts and opts.format == "JWK" then
+                        local jwk = cjson.decode(pem)
+                        pem = jwk and jwk.e == "AQAB" and jwk_pems[jwk.n]
+                        if not pem then return nil, "unknown JWK" end
+                    end
                     if type(pem) ~= "string" or not pem:find("-----BEGIN", 1, true) then
                         return nil, "not a PEM"
                     end
@@ -334,11 +386,24 @@ describe("aforo-metering handler", function()
                     }
                 end,
             }
-            -- Redis is unreachable in unit tests: revocation checks fail open.
+            -- Redis mock, driven per test through redis_state. Default: reachable,
+            -- nothing revoked. connect_err / get_err simulate an outage;
+            -- revoked lists the keys that hold a value.
             package.loaded["resty.redis"] = {
                 new = function()
-                    return { set_timeout = function() end,
-                             connect = function() return nil, "refused" end }
+                    return {
+                        set_timeout = function() end,
+                        connect = function()
+                            if redis_state.connect_err then return nil, redis_state.connect_err end
+                            return true
+                        end,
+                        get = function(_, key)
+                            if redis_state.get_err then return nil, redis_state.get_err end
+                            if redis_state.revoked[key] then return "1" end
+                            return ngx.null
+                        end,
+                        set_keepalive = function() return true end,
+                    }
                 end,
             }
         end)
@@ -352,6 +417,8 @@ describe("aforo-metering handler", function()
         before_each(function()
             ngx.shared.aforo_buffer = new_shared_dict()
             mock_kong.ctx.shared = {}
+            redis_state = { revoked = {} }
+            handler._jwks_reset()
         end)
 
         local function conf(extra)
@@ -426,7 +493,7 @@ describe("aforo-metering handler", function()
             assert.equals("INVALID_ISSUER", r.reason)
         end)
 
-        it("fails closed with no jwt_public_key (jwt_jwks_uri alone verifies nothing)", function()
+        it("fails closed with no jwt_public_key when the JWKS cannot be fetched", function()
             local r = handler._validate_jwt(sign(RS, claims()),
                 conf({ jwt_public_key = "", jwt_jwks_uri = "https://auth.aforo.ai/.well-known/jwks.json" }))
             assert.is_false(r.valid)
@@ -479,10 +546,286 @@ describe("aforo-metering handler", function()
             mock_kong.response._exit = nil
         end)
 
+        -- ── W3.7: keys from jwt_jwks_uri, chosen by kid ──────────────
+        describe("jwt_jwks_uri", function()
+            local URI = "https://auth.aforo.ai/.well-known/jwks.json"
+            local saved_now
+            local clock = 1788268682.221
+
+            local function jwks(...)
+                local keys = {}
+                for _, name in ipairs({ ... }) do
+                    keys[#keys + 1] = { kty = "RSA", kid = name, use = "sig", alg = "RS256", n = jwk_n[name], e = "AQAB" }
+                end
+                return cjson.encode({ keys = keys })
+            end
+            local function serve(...)
+                http_mock.responses[#http_mock.responses + 1] = { status = 200, body = jwks(...) }
+            end
+            local function jconf(extra)
+                local c = conf({ jwt_public_key = "", jwt_jwks_uri = URI })
+                for k, v in pairs(extra or {}) do c[k] = v end
+                return c
+            end
+            local function kid_token(kid, key)
+                return sign({ alg = "RS256", typ = "JWT", kid = kid }, claims(), key)
+            end
+
+            before_each(function()
+                http_mock.requests = {}
+                http_mock.responses = {}
+                saved_now = ngx.now
+                clock = 1788268682.221
+                ngx.now = function() return clock end
+            end)
+            after_each(function()
+                ngx.now = saved_now
+                http_mock.responses = {}
+            end)
+
+            it("verifies with the key named by kid and caches the set", function()
+                serve("k1")
+                assert.is_true(handler._validate_jwt(kid_token("k1"), jconf()).valid)
+                assert.is_true(handler._validate_jwt(kid_token("k1"), jconf()).valid)
+                assert.equals(1, #http_mock.requests)
+                assert.equals(URI, http_mock.requests[1].url)
+                assert.is_true(http_mock.requests[1].params.ssl_verify)
+            end)
+
+            it("a rotated key is picked up without a config change, at most one refresh per 30 s", function()
+                serve("k1")
+                assert.is_true(handler._validate_jwt(kid_token("k1"), jconf()).valid)
+                -- The issuer rotates to k2. An unknown kid inside 30 s does not fetch again.
+                clock = clock + 5
+                assert.is_false(handler._validate_jwt(kid_token("k2", "k2"), jconf()).valid)
+                assert.equals(1, #http_mock.requests)
+                clock = clock + 30
+                serve("k1", "k2")
+                assert.is_true(handler._validate_jwt(kid_token("k2", "k2"), jconf()).valid)
+                assert.equals(2, #http_mock.requests)
+                -- A forged kid cannot make it fetch on every request.
+                for _ = 1, 5 do
+                    assert.is_false(handler._validate_jwt(kid_token("forged", "k2"), jconf()).valid)
+                end
+                assert.equals(2, #http_mock.requests)
+            end)
+
+            it("the token is still checked against the kid's own key", function()
+                serve("k1", "k2")
+                local r = handler._validate_jwt(kid_token("k1", "k2"), jconf())
+                assert.is_false(r.valid)
+                assert.equals("INVALID_SIGNATURE", r.reason)
+            end)
+
+            it("keeps the last good keys while the JWKS is down, then fails closed", function()
+                serve("k1")
+                assert.is_true(handler._validate_jwt(kid_token("k1"), jconf()).valid)
+                clock = clock + 601
+                http_mock.responses[1] = { status = 503 }
+                assert.is_true(handler._validate_jwt(kid_token("k1"), jconf()).valid)
+                assert.equals(2, #http_mock.requests)
+                clock = clock + 86400
+                http_mock.responses[1] = { err = "timeout" }
+                local r = handler._validate_jwt(kid_token("k1"),
+                    jconf({ jwt_allow_unverified_signature = true }))
+                assert.is_false(r.valid)
+                assert.equals("INVALID_SIGNATURE", r.reason)
+            end)
+
+            it("a worker whose first fetch failed retries after 5 s, not 30", function()
+                http_mock.responses[1] = { status = 503 }
+                assert.is_false(handler._validate_jwt(kid_token("k1"), jconf()).valid)
+                clock = clock + 2
+                assert.is_false(handler._validate_jwt(kid_token("k1"), jconf()).valid)
+                assert.equals(1, #http_mock.requests)
+                clock = clock + 4
+                serve("k1")
+                assert.is_true(handler._validate_jwt(kid_token("k1"), jconf()).valid)
+                assert.equals(2, #http_mock.requests)
+            end)
+
+            it("refuses a JWKS URL that is not https, without fetching", function()
+                local r = handler._validate_jwt(kid_token("k1"),
+                    jconf({ jwt_jwks_uri = "http://auth.aforo.ai/.well-known/jwks.json" }))
+                assert.is_false(r.valid)
+                assert.equals(0, #http_mock.requests)
+            end)
+
+            it("refuses a JWKS whose Content-Length is over 256 KiB without reading the body", function()
+                http_mock.responses[1] = { status = 200, body = jwks("k1"),
+                    headers = { ["Content-Length"] = tostring(262145) } }
+                assert.is_false(handler._validate_jwt(kid_token("k1"), jconf()).valid)
+                assert.equals(0, http_mock.bytes_read)
+            end)
+
+            it("stops reading an undeclared-length JWKS once it passes 256 KiB", function()
+                local huge = '{"keys":[],"pad":"' .. string.rep("x", 300000) .. '"}'
+                http_mock.responses[1] = { status = 200, body = huge }
+                assert.is_false(handler._validate_jwt(kid_token("k1"), jconf()).valid)
+                assert.is_true(http_mock.bytes_read <= 262144 + 8192)
+                assert.is_true(http_mock.bytes_read > 262144)
+            end)
+
+            it("a JWKS body that fails mid-read is not used", function()
+                http_mock.responses[1] = { status = 200, body = jwks("k1"), read_err = "closed" }
+                assert.is_false(handler._validate_jwt(kid_token("k1"), jconf()).valid)
+            end)
+
+            it("gives up on a JWKS body that trickles in past the 8 s fetch budget", function()
+                local body = jwks("k1") .. string.rep(" ", 40000)
+                http_mock.responses[1] = { status = 200, body = body }
+                http_mock.on_read = function() clock = clock + 2 end
+                assert.is_false(handler._validate_jwt(kid_token("k1"), jconf()).valid)
+                http_mock.on_read = nil
+            end)
+
+            it("a fetch left flagged in flight (aborted coroutine) stops blocking refreshes after the budget", function()
+                serve("k1")
+                assert.is_true(handler._validate_jwt(kid_token("k1"), jconf()).valid)
+                local entry = handler._jwks_cache()[URI]
+                entry.fetching = true
+                entry.fetch_started = clock
+                entry.last_attempt = clock - 100  -- the 30 s refresh limit is not what holds it back
+                -- An unknown kid while the flag is fresh: no second fetch.
+                clock = clock + 2
+                assert.is_false(handler._validate_jwt(kid_token("k2", "k2"), jconf()).valid)
+                assert.equals(1, #http_mock.requests)
+                -- Past the budget the stale flag is ignored and the set is refreshed.
+                clock = clock + 8
+                serve("k1", "k2")
+                assert.is_true(handler._validate_jwt(kid_token("k2", "k2"), jconf()).valid)
+                assert.equals(2, #http_mock.requests)
+            end)
+
+            it("connects with TLS verification and SNI for the JWKS host", function()
+                serve("k1")
+                assert.is_true(handler._validate_jwt(kid_token("k1"), jconf()).valid)
+                assert.equals("auth.aforo.ai", http_mock.requests[1].params.ssl_server_name)
+                assert.equals("auth.aforo.ai", http_mock.requests[1].params.headers["Host"])
+            end)
+
+            it("a token without kid uses the only key; with several keys it needs a kid", function()
+                serve("k1")
+                assert.is_true(handler._validate_jwt(sign(RS, claims()), jconf()).valid)
+                handler._jwks_reset()
+                serve("k1", "k2")
+                assert.is_false(handler._validate_jwt(sign(RS, claims()), jconf()).valid)
+            end)
+
+            it("jwt_public_key verifies tokens the JWKS has no key for", function()
+                serve("k2")
+                assert.is_true(handler._validate_jwt(kid_token("old-kid"), jconf({ jwt_public_key = pub_pem })).valid)
+            end)
+
+            it("ignores keys that are private, not RSA, or not RS256", function()
+                http_mock.responses[1] = { status = 200, body = cjson.encode({ keys = {
+                    { kty = "RSA", kid = "k1", n = jwk_n.k1, e = "AQAB", d = "secret" },
+                    { kty = "EC", kid = "k1", crv = "P-256", x = "a", y = "b" },
+                    { kty = "RSA", kid = "k1", alg = "RS512", n = jwk_n.k1, e = "AQAB" },
+                } }) }
+                assert.is_false(handler._validate_jwt(kid_token("k1"), jconf()).valid)
+            end)
+        end)
+
         it("a different configured key is a different verifier (no stale key cache hit)", function()
             local t = sign(RS, claims())
             assert.is_true(handler._validate_jwt(t, conf()).valid)
             assert.is_false(handler._validate_jwt(t, conf({ jwt_public_key = other_pub_pem })).valid)
+        end)
+
+        -- w2-2-kong-jti-fail-open (2026-10-24): the revocation checks refuse
+        -- when Redis cannot answer, unless jti_redis_fail_mode = "open".
+        describe("revocation checks when Redis cannot answer", function()
+            local function warns()
+                local seen = {}
+                local saved = mock_kong.log.warn
+                mock_kong.log.warn = function(...)
+                    seen[#seen + 1] = table.concat({ ... }, "")
+                end
+                return seen, function() mock_kong.log.warn = saved end
+            end
+
+            it("rejects a revoked jti and a revoked key_id when Redis answers", function()
+                redis_state.revoked["jti:blocked:j1"] = true
+                local r = handler._validate_jwt(sign(RS, claims({ jti = "j1" })), conf())
+                assert.is_false(r.valid)
+                assert.equals("TOKEN_REVOKED", r.reason)
+
+                redis_state.revoked = { ["jti:client:key_1"] = true }
+                r = handler._validate_jwt(sign(RS, claims({ jti = "j2" })), conf())
+                assert.is_false(r.valid)
+                assert.equals("CLIENT_REVOKED", r.reason)
+            end)
+
+            it("refuses by default when Redis is unreachable (jti check)", function()
+                redis_state.connect_err = "connection refused"
+                local r = handler._validate_jwt(sign(RS, claims({ jti = "j1" })), conf())
+                assert.is_false(r.valid)
+                assert.equals("REVOCATION_CHECK_UNAVAILABLE", r.reason)
+                assert.equals(503, r.status)
+            end)
+
+            it("refuses by default when Redis is unreachable (key_id check, no jti)", function()
+                redis_state.connect_err = "connection refused"
+                local r = handler._validate_jwt(sign(RS, claims()), conf())
+                assert.is_false(r.valid)
+                assert.equals("REVOCATION_CHECK_UNAVAILABLE", r.reason)
+                assert.equals(503, r.status)
+            end)
+
+            it("refuses when the GET itself errors after connecting", function()
+                redis_state.get_err = "timeout"
+                local r = handler._validate_jwt(sign(RS, claims({ jti = "j1" })), conf())
+                assert.is_false(r.valid)
+                assert.equals("REVOCATION_CHECK_UNAVAILABLE", r.reason)
+            end)
+
+            it("an explicit jti_redis_fail_mode = closed behaves like the default", function()
+                redis_state.connect_err = "connection refused"
+                local r = handler._validate_jwt(sign(RS, claims({ jti = "j1" })),
+                    conf({ jti_redis_fail_mode = "closed" }))
+                assert.equals("REVOCATION_CHECK_UNAVAILABLE", r.reason)
+                local dict = ngx.shared.aforo_buffer
+                assert.equals(1, dict:get("aforo_revocation_unavailable:jti:closed"))
+            end)
+
+            it("fail-open lets the token through, warns, and counts it", function()
+                redis_state.connect_err = "connection refused"
+                local seen, restore = warns()
+                local r = handler._validate_jwt(sign(RS, claims({ jti = "j1" })),
+                    conf({ jti_redis_fail_mode = "open" }))
+                restore()
+                assert.is_true(r.valid)
+                local dict = ngx.shared.aforo_buffer
+                assert.equals(1, dict:get("aforo_revocation_unavailable:jti:open"))
+                assert.equals(1, dict:get("aforo_revocation_unavailable:client:open"))
+                local joined = table.concat(seen, "\n")
+                assert.truthy(joined:find("Failing OPEN", 1, true))
+            end)
+
+            it("access phase answers 503 with a JSON error body and stashes nothing", function()
+                redis_state.connect_err = "connection refused"
+                mock_kong.request._headers = { ["Authorization"] = "Bearer " .. sign(RS, claims({ jti = "j1" })) }
+                mock_kong.response._exit = nil
+                handler:access(conf())
+                local exit = mock_kong.response._exit
+                assert.equals(503, exit.status)
+                assert.equals("temporarily_unavailable", exit.body.error)
+                assert.equals("REVOCATION_CHECK_UNAVAILABLE", exit.body.error_description)
+                assert.equals("1", exit.headers["Retry-After"])
+                assert.is_nil(mock_kong.ctx.shared.aforo_jwt_claims)
+                mock_kong.response._exit = nil
+            end)
+
+            it("access phase still answers 401 for a revoked token", function()
+                redis_state.revoked["jti:blocked:j1"] = true
+                mock_kong.request._headers = { ["Authorization"] = "Bearer " .. sign(RS, claims({ jti = "j1" })) }
+                mock_kong.response._exit = nil
+                handler:access(conf())
+                assert.equals(401, mock_kong.response._exit.status)
+                assert.equals("TOKEN_REVOKED", mock_kong.response._exit.body.error_description)
+                mock_kong.response._exit = nil
+            end)
         end)
     end)
 
@@ -673,9 +1016,11 @@ describe("aforo-metering handler", function()
             mock_kong.ctx.shared = {}
             mock_kong.request._headers = { ["X-Request-Id"] = "req-1" }
             mock_kong.client.get_consumer = function() return { custom_id = "cust_1" } end
+            ngx.var.request_id = "0f3c9d6e2b8a4c1d9e7f5a3b1c2d4e6f"
         end)
 
         after_each(function()
+            ngx.var.request_id = nil
             mock_kong.client.get_consumer = function() return nil end
             mock_kong.response.get_header = function() return nil end
             mock_kong.request.get_method = function() return "GET" end
@@ -688,8 +1033,67 @@ describe("aforo-metering handler", function()
             local e = buffered()[1]
             assert.equals("account_reads", e.metricName)
             assert.equals("AGENTIC_API", e.productType)
-            assert.equals("req-1", e.idempotencyKey)
+            assert.equals("0f3c9d6e2b8a4c1d9e7f5a3b1c2d4e6f", e.idempotencyKey)
             assert.equals("SUCCESS", e.executionStatus)
+        end)
+
+        it("keys on the gateway request id, never the client's X-Request-Id", function()
+            -- A caller repeating one X-Request-Id on every call must still be
+            -- billed per call: each request gets its own nginx $request_id.
+            mock_kong.request._headers["X-Kong-Request-Id"] = "forged-kong-id"
+            -- (Kong header lookup is case-insensitive; the mock is not.)
+            mock_kong.request._headers["x-request-id"] = "req-1"
+            handler:log(conf())
+            ngx.var.request_id = "1a2b3c4d5e6f708192a3b4c5d6e7f809"
+            handler:log(conf())
+            local events = buffered()
+            assert.equals(2, #events)
+            assert.equals("0f3c9d6e2b8a4c1d9e7f5a3b1c2d4e6f", events[1].idempotencyKey)
+            assert.equals("1a2b3c4d5e6f708192a3b4c5d6e7f809", events[2].idempotencyKey)
+            -- The client's id is still forwarded, as trace metadata only.
+            assert.equals("req-1", events[1].trace.xRequestId)
+            assert.equals("req-1", events[2].trace.xRequestId)
+        end)
+
+        it("MCP: a repeated client X-Request-Id still yields one key per call", function()
+            local saved_method = mock_kong.request.get_method
+            mock_kong.request.get_method = function() return "POST" end
+            mock_kong.ctx.shared.aforo_raw_body =
+                '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_web"}}'
+            local c = conf({ mcp_enabled = true, agent_id = "agent-1" })
+            handler:log(c)
+            ngx.var.request_id = "1a2b3c4d5e6f708192a3b4c5d6e7f809"
+            handler:log(c)
+            mock_kong.request.get_method = saved_method
+            local events = buffered()
+            assert.equals("MCP_SERVER", events[1].productType)
+            assert.equals("mcp:t1:0f3c9d6e2b8a4c1d9e7f5a3b1c2d4e6f:search_web", events[1].idempotencyKey)
+            assert.equals("mcp:t1:1a2b3c4d5e6f708192a3b4c5d6e7f809:search_web", events[2].idempotencyKey)
+        end)
+
+        it("WebSocket: a reused Sec-WebSocket-Key does not collapse connections", function()
+            local saved_status = mock_kong.response.get_status
+            mock_kong.response.get_status = function() return 101 end
+            mock_kong.request._headers = {
+                ["upgrade"] = "websocket", ["Sec-WebSocket-Key"] = "dGhlIHNhbXBsZQ==",
+            }
+            local c = conf({ websocket_enabled = true })
+            handler:log(c)
+            ngx.var.request_id = "1a2b3c4d5e6f708192a3b4c5d6e7f809"
+            handler:log(c)
+            mock_kong.response.get_status = saved_status
+            local events = buffered()
+            assert.equals(2, #events)
+            assert.equals("ws:t1:0f3c9d6e2b8a4c1d9e7f5a3b1c2d4e6f", events[1].idempotencyKey)
+            assert.equals("ws:t1:1a2b3c4d5e6f708192a3b4c5d6e7f809", events[2].idempotencyKey)
+            -- The handshake key is still reported, as data.
+            assert.equals("dGhlIHNhbXBsZQ==", events[1].wsConnectionId)
+        end)
+
+        it("falls back to one generated UUID when nginx has no request id", function()
+            ngx.var.request_id = ""
+            handler:log(conf())
+            assert.equals("test-uuid", buffered()[1].idempotencyKey)
         end)
 
         it("takes metric and quantity from the upstream RESPONSE headers, never from the request", function()
@@ -1179,14 +1583,103 @@ describe("aforo-metering handler", function()
             assert.equals(0, #buffered())
         end)
 
-        it("sends an MCP tool call as MCP_SERVER only when agentId is known", function()
-            log(conf("API"), "POST", TOOL_CALL, { ["x-agent-id"] = "agent_1" })
-            log(conf("API"), "POST", TOOL_CALL, {})
+        it("sends an MCP tool call as MCP_SERVER only when a trusted agentId is known", function()
+            local with_meta = '{"jsonrpc":"2.0","method":"tools/call",'
+                .. '"params":{"name":"search","_meta":{"agent_id":"agent_1"}}}'
+            log(conf("API"), "POST", with_meta, {})
+            -- X-Agent-Id is client-settable: never a source, so this call is a
+            -- plain request, not an MCP event attributed to a forged agent.
+            log(conf("API"), "POST", TOOL_CALL, { ["x-agent-id"] = "agent_forged" })
             local events = buffered()
             assert.equals(2, #events)
             assert.equals("MCP_SERVER", events[1].productType)
             assert.equals("search", events[1].toolName)
+            assert.equals("agent_1", events[1].agentId)
             assert.equals("API", events[2].productType)
+            assert.equals("api_calls", events[2].metricName)
+            assert.is_nil(events[2].agentId)
+            assert.is_nil(events[2].toolName)
+        end)
+
+        describe("agent identity from trusted sources", function()
+            local saved_get_header
+            local TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+
+            local function agent_conf(pt, extra)
+                local c = conf(pt)
+                c.agent_id_header = "X-Aforo-Agent-Id"
+                c.session_id_header = "X-Aforo-Session-Id"
+                for k, v in pairs(extra or {}) do c[k] = v end
+                return c
+            end
+            local function upstream_returns(h)
+                mock_kong.response.get_header = function(name) return h[name] end
+            end
+
+            before_each(function() saved_get_header = mock_kong.response.get_header end)
+            after_each(function() mock_kong.response.get_header = saved_get_header end)
+
+            it("meters AI_AGENT with the agent and session ids the upstream returns", function()
+                upstream_returns({ ["X-Aforo-Agent-Id"] = "agent_up", ["X-Aforo-Session-Id"] = "sess_up" })
+                log(agent_conf("AI_AGENT"))
+                local e = buffered()[1]
+                assert.equals("AI_AGENT", e.productType)
+                assert.equals("agent_up", e.agentId)
+                assert.equals("sess_up", e.sessionId)
+            end)
+
+            it("falls back to the route's agent_id when the upstream returns none", function()
+                upstream_returns({ ["X-Aforo-Session-Id"] = "sess_up" })
+                log(agent_conf("AI_AGENT", { agent_id = "agent_route" }))
+                assert.equals("agent_route", buffered()[1].agentId)
+            end)
+
+            it("never reads agent or session ids from request headers", function()
+                upstream_returns({})
+                log(agent_conf("AI_AGENT"), "GET", nil, {
+                    ["x-agent-id"] = "agent_forged",
+                    ["X-Aforo-Agent-Id"] = "agent_forged",
+                    ["X-Aforo-Session-Id"] = "sess_forged",
+                })
+                assert.equals(0, #buffered())
+                assert.equals(1, dict:get("aforo_dropped:missing_fields"))
+            end)
+
+            it("skips AI_AGENT when the upstream returns no session id", function()
+                upstream_returns({})
+                log(agent_conf("AI_AGENT", { agent_id = "agent_route" }))
+                assert.equals(0, #buffered())
+            end)
+
+            it("keeps an AI_AGENT route AI_AGENT when the request carries a trace", function()
+                upstream_returns({ ["X-Aforo-Session-Id"] = "sess_up" })
+                log(agent_conf("AI_AGENT", { agent_id = "agent_route" }), "GET", nil,
+                    { traceparent = TRACEPARENT })
+                local e = buffered()[1]
+                assert.equals("AI_AGENT", e.productType)
+                assert.equals("4bf92f3577b34da6a3ce929d0e0e4736", e.traceId)
+            end)
+
+            it("still classifies a traced plain API call as AGENTIC_API", function()
+                upstream_returns({})
+                log(agent_conf("API"), "GET", nil, { traceparent = TRACEPARENT })
+                assert.equals("AGENTIC_API", buffered()[1].productType)
+            end)
+
+            it("prefers the upstream agent id over an MCP payload's _meta.agent_id", function()
+                upstream_returns({ ["X-Aforo-Agent-Id"] = "agent_up" })
+                log(agent_conf("API"), "POST", '{"jsonrpc":"2.0","method":"tools/call",'
+                    .. '"params":{"name":"search","_meta":{"agent_id":"agent_payload"}}}', {})
+                local e = buffered()[1]
+                assert.equals("MCP_SERVER", e.productType)
+                assert.equals("agent_up", e.agentId)
+            end)
+
+            it("takes an MCP session id from the upstream when the request has none", function()
+                upstream_returns({ ["X-Aforo-Agent-Id"] = "agent_up", ["X-Aforo-Session-Id"] = "sess_up" })
+                log(agent_conf("API"), "POST", TOOL_CALL, {})
+                assert.equals("sess_up", buffered()[1].sessionId)
+            end)
         end)
     end)
     -- ── Pre-flight quota check ──────────────────────────────────
@@ -1675,14 +2168,31 @@ describe("aforo-metering handler", function()
     -- "attempt to index field 'tools'" and crashed the log phase — every request
     -- without an X-Request-Id emitted ZERO events. The old mock hid it by providing
     -- a fake kong.tools.uuid; real Kong has none.
-    describe("generate_idempotency_key (Kong 3.x crash regression)", function()
+    describe("gateway_request_id + key fallback (Kong 3.x crash regression)", function()
+        local saved_var
+        before_each(function() saved_var = ngx.var end)
+        after_each(function() ngx.var = saved_var end)
 
-        it("uses the request id verbatim when present", function()
-            assert.equals("req-123", handler._generate_idempotency_key("req-123"))
+        it("returns nginx's $request_id", function()
+            ngx.var = { request_id = "abc123" }
+            assert.equals("abc123", handler._gateway_request_id())
         end)
 
-        it("falls back to a generated uuid when no request id is present", function()
-            assert.equals("test-uuid", handler._generate_idempotency_key(nil))
+        it("treats an empty or missing $request_id as absent", function()
+            ngx.var = { request_id = "" }
+            assert.is_nil(handler._gateway_request_id())
+            ngx.var = {}
+            assert.is_nil(handler._gateway_request_id())
+            ngx.var = nil
+            assert.is_nil(handler._gateway_request_id())
+        end)
+
+        it("ignores every client request-id header", function()
+            ngx.var = {}
+            mock_kong.request._headers = {
+                ["X-Request-Id"] = "client-1", ["X-Kong-Request-Id"] = "client-2",
+            }
+            assert.is_nil(handler._gateway_request_id())
         end)
 
         it("source never references kong.tools (would crash on Kong 3.x)", function()
@@ -1931,7 +2441,25 @@ describe("aforo-metering handler", function()
                 assert.is_nil(st:find("ngx%.now"), "clock in key: " .. st)
                 assert.is_nil(st:find("os%.time"), "clock in key: " .. st)
                 assert.is_nil(st:find("os%.clock"), "clock in key: " .. st)
+                -- Every key is built on key_id, the gateway request id.
+                assert.is_not_nil(st:find("key_id", 1, true), "key not built on key_id: " .. st)
+                assert.is_nil(st:find("get_header", 1, true), "client header in key: " .. st)
+                assert.is_nil(st:find("ws_connection_id", 1, true),
+                    "client-chosen Sec-WebSocket-Key in key: " .. st)
             end
+        end)
+
+        it("the key identity comes from the gateway, never a request header", function()
+            local src = source()
+            assert.is_not_nil(src:find("local request_id = gateway_request_id%(%)"),
+                "log phase must take request_id from gateway_request_id()")
+            assert.is_not_nil(src:find("local key_id = request_id or random_uuid%(%)"),
+                "key_id must derive from the gateway request id")
+            local body = src:match("local function gateway_request_id%(%)(.-)\nend")
+            assert.is_not_nil(body, "gateway_request_id must exist")
+            assert.is_nil(body:find("get_header", 1, true),
+                "gateway_request_id must not read request headers")
+            assert.is_not_nil(body:find("var.request_id", 1, true))
         end)
 
         it("never calls kong.tools (nil on the Kong 3.x PDK)", function()
@@ -2006,7 +2534,7 @@ describe("aforo-metering handler", function()
     describe("WebSocket upgrade detection", function()
         local detect = handler._detect_websocket_upgrade
 
-        it("uses the handshake key as the connection id", function()
+        it("uses the handshake key as the connection id (data only, not the key)", function()
             mock_kong.request._headers = { ["Sec-WebSocket-Key"] = "dGhlIHNhbXBsZQ==" }
             local info = detect("websocket", 101, "req-1")
             assert.equals("dGhlIHNhbXBsZQ==", info.ws_connection_id)
