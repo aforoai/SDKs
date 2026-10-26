@@ -1,71 +1,80 @@
 <!--
     Aforo Margin Guard Pre-Flight Check — Azure API Management Policy Fragment
+    (fragment id: aforo-margin-guard)
 
-    Calls pricing-service /internal/v1/margin-guard/quick-check to determine
-    whether a request should be allowed, throttled (L2), or blocked (L3).
+    Calls pricing-service /internal/v1/margin-guard/quick-check to decide
+    whether a request is allowed, throttled (L2) or blocked (L3).
 
     Fail-open: if the pricing-service call fails or times out, the request
-    proceeds. Fail-CLOSED on identity: if customerId can't be resolved from
-    an authenticated source, the margin-guard check is SKIPPED (treated as
-    anonymous / public endpoint) — never fall back to reading a
-    client-settable request header.
+    proceeds. Fail-CLOSED on identity: if the customer can't be resolved from
+    an authenticated source, the check is SKIPPED (anonymous / public
+    endpoint). A client-settable request header is never read.
 
-    Prerequisites:
-      - aforo-context MUST be included before this fragment (it resolves
-        aforo-customer-id from the verified JWT or the subscription map).
-        aforo-jwt-validation, if used, goes before aforo-context.
-      - Named values (read with double-brace syntax; Named Values are not context
-        variables, so the previous context.Variables lookups never resolved and
-        the ["aforo-margin-guard-url"] indexer threw):
-          aforo-margin-guard-url     (pricing-service base URL)
-          aforo-margin-guard-enabled ("true" to enable)
-          aforo-tenant-id            (tenant id — margin-guard only; used when
-                                      the JWT carries no tenant_id. The ingestor
-                                      fragments do not use it.)
+    A fragment holds statements only. Include it in the inbound section,
+    after aforo-jwt-validation and aforo-context when you use them:
+      <include-fragment fragment-id="aforo-margin-guard" />
 
-    Usage: Include in the inbound section, AFTER aforo-context.
-    <include-fragment fragment-id="aforo-margin-guard" />
+    Settings are CONTEXT VARIABLES, set with set-variable before the include.
+    A Named Value is not a context variable: to use one, pass it through
+    set-variable, value = the Named Value in double braces. Release 2.1.0
+    read the same names as Named Values directly; see CHANGELOG 2.2.0 for
+    the lines to add.
 
-    Security history:
-      v1.x read X-Customer-Id and X-Tenant-Id from the request as
-      primary sources (client-settable, therefore spoofable). Closed
-      2026-04-23 — now sources exclusively from:
-        customerId: JWT customer_id claim, else APIM subscription id
-        tenantId:   JWT tenant_id claim, else admin-pinned Named Value
+      aforo-margin-guard-enabled  "true" to switch this fragment on
+      aforo-margin-guard-url      pricing-service base URL reachable from APIM
+      aforo-tenant-id             tenant id, used when the JWT carries no
+                                  tenant_id claim. Only this fragment uses it;
+                                  nothing is sent to the ingestor with it.
+
+    Identity, authenticated sources only:
+      customer: aforo-customer-id when that variable exists (set by you or by
+                aforo-context); else the verified JWT's customer_id claim,
+                else its sub claim (aforo-jwt-payload, which only
+                aforo-jwt-validation sets); else the APIM subscription id.
+      tenant:   the verified JWT's tenant_id claim, else aforo-tenant-id.
+
+    Skipped for OPTIONS, when customer or tenant is empty, and when
+    aforo-margin-guard-url is empty.
+
+    Security history: v1.x read X-Customer-Id and X-Tenant-Id from the
+    request (client-settable, spoofable). Closed 2026-04-23.
 -->
 <fragment>
     <choose>
-        <when condition="@(&quot;{{aforo-margin-guard-enabled}}&quot; == &quot;true&quot; &amp;&amp; context.Request.Method != &quot;OPTIONS&quot;)">
-            <!--
-                Resolve customer / tenant identity from authenticated sources only.
-                Customer: aforo-customer-id from aforo-context (JWT customer_id,
-                else the admin-configured subscription→customer map).
-                Tenant: JWT tenant_id claim, else the admin-pinned Named Value.
-                NEVER read X-Customer-Id / X-Tenant-Id from the request headers.
-            -->
-            <set-variable name="mgCustomerId" value="@(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-customer-id&quot;, &quot;&quot;))" />
-            <set-variable name="mgTenantId" value="@{
-                var payload = (Newtonsoft.Json.Linq.JObject)context.Variables.GetValueOrDefault&lt;object&gt;(&quot;aforo-jwt-payload&quot;, null);
-                var fromJwt = payload?[&quot;tenant_id&quot;]?.ToString();
+        <when condition="@(context.Variables.GetValueOrDefault<string>("aforo-margin-guard-enabled", "false") == "true" && context.Request.Method != "OPTIONS" && context.Variables.GetValueOrDefault<string>("aforo-margin-guard-url", "").Trim().Length > 0)">
+            <set-variable name="mgCustomerId" value="@{
+                if (context.Variables.ContainsKey("aforo-customer-id")) {
+                    return (Convert.ToString(context.Variables["aforo-customer-id"]) ?? "").Trim();
+                }
+                var payload = context.Variables.GetValueOrDefault<object>("aforo-jwt-payload", null) as JObject;
+                var fromJwt = payload == null ? null
+                    : (payload["customer_id"]?.ToString() ?? payload["sub"]?.ToString());
                 if (!string.IsNullOrEmpty(fromJwt)) return fromJwt;
-                return &quot;{{aforo-tenant-id}}&quot;;
+                return context.Subscription != null ? context.Subscription.Id : "";
+            }" />
+            <set-variable name="mgTenantId" value="@{
+                var payload = context.Variables.GetValueOrDefault<object>("aforo-jwt-payload", null) as JObject;
+                var fromJwt = payload?["tenant_id"]?.ToString();
+                if (!string.IsNullOrEmpty(fromJwt)) return fromJwt;
+                /* Fallback: admin-pinned context variable. */
+                return context.Variables.GetValueOrDefault<string>("aforo-tenant-id", "");
             }" />
 
             <choose>
-                <when condition="@(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;mgCustomerId&quot;, &quot;&quot;) != &quot;&quot; &amp;&amp; context.Variables.GetValueOrDefault&lt;string&gt;(&quot;mgTenantId&quot;, &quot;&quot;) != &quot;&quot;)">
+                <when condition="@(context.Variables.GetValueOrDefault<string>("mgCustomerId", "") != "" && context.Variables.GetValueOrDefault<string>("mgTenantId", "") != "")">
 
                     <!-- Check cache first (Azure APIM internal cache, 30s TTL) -->
-                    <cache-lookup-value key="@($&quot;mg:{context.Variables[&quot;mgTenantId&quot;]}:{context.Variables[&quot;mgCustomerId&quot;]}&quot;)" variable-name="mgCachedResult" />
+                    <cache-lookup-value key="@($"mg:{context.Variables["mgTenantId"]}:{context.Variables["mgCustomerId"]}")" variable-name="mgCachedResult" />
 
                     <choose>
-                        <when condition="@(context.Variables.ContainsKey(&quot;mgCachedResult&quot;))">
+                        <when condition="@(context.Variables.ContainsKey("mgCachedResult"))">
                             <!-- Use cached result -->
-                            <set-variable name="mgResult" value="@((string)context.Variables[&quot;mgCachedResult&quot;])" />
+                            <set-variable name="mgResult" value="@((string)context.Variables["mgCachedResult"])" />
                         </when>
                         <otherwise>
                             <!-- Call pricing-service quick-check -->
                             <send-request mode="new" response-variable-name="mgResponse" timeout="1" ignore-error="true">
-                                <set-url>@($"{{aforo-margin-guard-url}}/internal/v1/margin-guard/quick-check?tenantId={context.Variables["mgTenantId"]}&amp;scopeType=CUSTOMER&amp;scopeId={context.Variables["mgCustomerId"]}")</set-url>
+                                <set-url>@(context.Variables.GetValueOrDefault<string>("aforo-margin-guard-url", "").Trim().TrimEnd('/') + "/internal/v1/margin-guard/quick-check?tenantId=" + Uri.EscapeDataString((string)context.Variables["mgTenantId"]) + "&scopeType=CUSTOMER&scopeId=" + Uri.EscapeDataString((string)context.Variables["mgCustomerId"]))</set-url>
                                 <set-method>GET</set-method>
                                 <set-header name="Content-Type" exists-action="override">
                                     <value>application/json</value>
@@ -76,10 +85,10 @@
                             </send-request>
 
                             <choose>
-                                <when condition="@(context.Variables.ContainsKey(&quot;mgResponse&quot;) &amp;&amp; ((IResponse)context.Variables[&quot;mgResponse&quot;]).StatusCode == 200)">
-                                    <set-variable name="mgResult" value="@(((IResponse)context.Variables[&quot;mgResponse&quot;]).Body.As&lt;string&gt;())" />
+                                <when condition="@(context.Variables.ContainsKey("mgResponse") && ((IResponse)context.Variables["mgResponse"]).StatusCode == 200)">
+                                    <set-variable name="mgResult" value="@(((IResponse)context.Variables["mgResponse"]).Body.As<string>())" />
                                     <!-- Cache for 30 seconds -->
-                                    <cache-store-value key="@($&quot;mg:{context.Variables[&quot;mgTenantId&quot;]}:{context.Variables[&quot;mgCustomerId&quot;]}&quot;)" value="@((string)context.Variables[&quot;mgResult&quot;])" duration="30" />
+                                    <cache-store-value key="@($"mg:{context.Variables["mgTenantId"]}:{context.Variables["mgCustomerId"]}")" value="@((string)context.Variables["mgResult"])" duration="30" />
                                 </when>
                                 <otherwise>
                                     <!-- Fail-open: pricing-service unreachable, allow request -->
@@ -93,8 +102,8 @@
                     <choose>
                         <!-- L3 BLOCK -->
                         <when condition="@{
-                            var json = JObject.Parse((string)context.Variables[&quot;mgResult&quot;]);
-                            return json.Value&lt;bool&gt;(&quot;allowed&quot;) == false &amp;&amp; json.Value&lt;string&gt;(&quot;level&quot;) == &quot;L3_BLOCK&quot;;
+                            var json = JObject.Parse((string)context.Variables["mgResult"]);
+                            return json.Value<bool>("allowed") == false && json.Value<string>("level") == "L3_BLOCK";
                         }">
                             <return-response>
                                 <set-status code="429" reason="Margin Guard - Blocked" />
@@ -108,12 +117,12 @@
                                     <value>L3</value>
                                 </set-header>
                                 <set-header name="Retry-After" exists-action="override">
-                                    <value><![CDATA[@{
+                                    <value>@{
                                         var json = JObject.Parse((string)context.Variables["mgResult"]);
                                         return json.Value<int?>("retryAfterSeconds")?.ToString() ?? "1800";
-                                    }]]></value>
+                                    }</value>
                                 </set-header>
-                                <set-body><![CDATA[@{
+                                <set-body>@{
                                     var json = JObject.Parse((string)context.Variables["mgResult"]);
                                     var retryAfter = json.Value<int?>("retryAfterSeconds") ?? 1800;
                                     return new JObject(
@@ -124,17 +133,17 @@
                                             new JProperty("supportUrl", "/portal/support")
                                         ))
                                     ).ToString();
-                                }]]></set-body>
+                                }</set-body>
                             </return-response>
                         </when>
 
                         <!-- L2 THROTTLE (probabilistic) -->
                         <when condition="@{
-                            var json = JObject.Parse((string)context.Variables[&quot;mgResult&quot;]);
-                            if (json.Value&lt;bool&gt;(&quot;allowed&quot;) == false &amp;&amp; json.Value&lt;string&gt;(&quot;level&quot;) == &quot;L2_THROTTLE&quot;) {
-                                var throttleRate = json.Value&lt;int?&gt;(&quot;throttleRate&quot;) ?? 50;
+                            var json = JObject.Parse((string)context.Variables["mgResult"]);
+                            if (json.Value<bool>("allowed") == false && json.Value<string>("level") == "L2_THROTTLE") {
+                                var throttleRate = json.Value<int?>("throttleRate") ?? 50;
                                 var roll = new Random().Next(100);
-                                return roll &gt;= throttleRate;
+                                return roll >= throttleRate;
                             }
                             return false;
                         }">

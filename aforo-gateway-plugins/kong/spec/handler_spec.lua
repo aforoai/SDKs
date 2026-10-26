@@ -298,7 +298,7 @@ describe("aforo-metering handler", function()
 
         it("prefers JWT customer_id over consumer identity", function()
             mock_kong.ctx.shared = {
-                aforo_jwt_claims = { customer_id = "cust_from_jwt" }
+                aforo_jwt_claims = { signature_verified = true, customer_id ="cust_from_jwt" }
             }
             local consumer = { username = "cust_from_consumer" }
             local headers = { ["x-customer-id"] = "cust_forged_header" }
@@ -372,7 +372,7 @@ describe("aforo-metering handler", function()
         local BUFFER_KEY = handler._buffer_key(conf)
 
         local function log_request(customer_id)
-            mock_kong.ctx.shared = { aforo_jwt_claims = { customer_id = customer_id } }
+            mock_kong.ctx.shared = { aforo_jwt_claims = { signature_verified = true, customer_id =customer_id } }
             handler:log(conf)
         end
 
@@ -570,7 +570,7 @@ describe("aforo-metering handler", function()
         local function log(c, cust, headers, response_headers)
             mock_kong.request._headers = headers or {}
             mock_kong.response._headers = response_headers or {}
-            mock_kong.ctx.shared = { aforo_jwt_claims = { customer_id = cust or "cust_a" } }
+            mock_kong.ctx.shared = { aforo_jwt_claims = { signature_verified = true, customer_id =cust or "cust_a" } }
             handler:log(c)
         end
         local function raw(c)
@@ -894,7 +894,7 @@ describe("aforo-metering handler", function()
             mock_kong.request.get_path = function() return "/café/ü" end
             log(c, "kündin", nil, { ["X-Aforo-Metric"] = "nachrichten_gesendet_ü" })
             mock_kong.request.get_method = function() return "POST" end
-            mock_kong.ctx.shared = { aforo_jwt_claims = { customer_id = "cust_a" },
+            mock_kong.ctx.shared = { aforo_jwt_claims = { signature_verified = true, customer_id ="cust_a" },
                 aforo_raw_body = '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"t b é","_meta":{"agent_id":"a1"}}}' }
             mock_kong.request._headers, mock_kong.response._headers = {}, {}
             handler:log(c)
@@ -936,7 +936,7 @@ describe("aforo-metering handler", function()
             local orig_method = mock_kong.request.get_method
             mock_kong.request.get_method = function() return "POST" end
             mock_kong.request._headers, mock_kong.response._headers = {}, {}
-            mock_kong.ctx.shared = { aforo_jwt_claims = { customer_id = "cust_a" }, aforo_raw_body = cjson.encode({
+            mock_kong.ctx.shared = { aforo_jwt_claims = { signature_verified = true, customer_id ="cust_a" }, aforo_raw_body = cjson.encode({
                 { jsonrpc = "2.0", id = 1, method = "tools/list" },
                 { jsonrpc = "2.0", id = 2, method = "tools/call", params = { name = "search" } },
             }) }
@@ -1509,7 +1509,7 @@ describe("aforo-metering handler", function()
             opts = opts or {}
             mock_kong.request._headers = opts.headers or {}
             mock_kong.response._headers = opts.response or {}
-            mock_kong.ctx.shared = { aforo_jwt_claims = { customer_id = "cust_a" }, aforo_raw_body = opts.body }
+            mock_kong.ctx.shared = { aforo_jwt_claims = { signature_verified = true, customer_id ="cust_a" }, aforo_raw_body = opts.body }
             ngx.var = opts.var or { request_id = "kongreq" }
             local m, p = mock_kong.request.get_method, mock_kong.request.get_path
             mock_kong.request.get_method = function() return opts.method or "GET" end
@@ -1795,7 +1795,7 @@ describe("aforo-metering handler", function()
         local function log(c, method, raw_body, headers)
             mock_kong.request._headers = headers or {}
             mock_kong.ctx.shared = {
-                aforo_jwt_claims = { customer_id = "cust_a" },
+                aforo_jwt_claims = { signature_verified = true, customer_id ="cust_a" },
                 aforo_raw_body = raw_body,
             }
             local orig = mock_kong.request.get_method
@@ -2072,7 +2072,7 @@ describe("aforo-metering handler", function()
                 ["X-Kong-Request-Id"] = CLIENT_ID,
             }
             mock_kong.ctx.shared = {
-                aforo_jwt_claims = { customer_id = "cust_a" },
+                aforo_jwt_claims = { signature_verified = true, customer_id ="cust_a" },
                 aforo_raw_body = raw_body,
             }
             ngx.var = kong_id and { request_id = kong_id } or nil
@@ -2172,7 +2172,7 @@ describe("aforo-metering handler", function()
         end
 
         local function with_customer(id)
-            mock_kong.ctx.shared = { aforo_jwt_claims = { customer_id = id } }
+            mock_kong.ctx.shared = { aforo_jwt_claims = { signature_verified = true, customer_id =id } }
         end
 
         before_each(function()
@@ -2633,6 +2633,154 @@ describe("aforo-metering handler", function()
     -- ── Schema ──────────────────────────────────────────────────
     -- Kong validates the schema itself at startup and refuses to load the
     -- plugin on any violation, so these are checked without a running Kong.
+    -- ── Carried from the internal line (2.6.0) ───────────────────
+    -- gRPC / GraphQL / WebSocket events, identity only from a verified token,
+    -- drop counting, and Rule #21 on every key.
+    describe("protocol events, verified identity and drops (2.6.0)", function()
+        local dict
+        local function conf(o)
+            local c = {
+                aforo_endpoint = "http://ingestor.test/v1/ingest/batch",
+                api_key = "sk_A", tenant_id = "tenantA", default_metric = "api_calls",
+                exclude_paths = {}, exclude_status_codes = { 401, 403, 429 },
+            }
+            for k, v in pairs(o or {}) do c[k] = v end
+            return c
+        end
+        -- opts: method, path, status, body, headers, response, var, claims, consumer
+        local function log(c, opts)
+            opts = opts or {}
+            mock_kong.request._headers = opts.headers or {}
+            mock_kong.response._headers = opts.response or {}
+            mock_kong.ctx.shared = { aforo_raw_body = opts.body,
+                aforo_jwt_claims = opts.claims or { signature_verified = true, customer_id = "cust_a" } }
+            ngx.var = opts.var or { request_id = "kongreq" }
+            local m, p, st, cons = mock_kong.request.get_method, mock_kong.request.get_path,
+                mock_kong.response.get_status, mock_kong.client.get_consumer
+            mock_kong.request.get_method = function() return opts.method or "POST" end
+            mock_kong.request.get_path = function() return opts.path or "/v1/things" end
+            mock_kong.response.get_status = function() return opts.status or 200 end
+            mock_kong.client.get_consumer = function() return opts.consumer end
+            handler:log(c)
+            mock_kong.request.get_method, mock_kong.request.get_path = m, p
+            mock_kong.response.get_status, mock_kong.client.get_consumer = st, cons
+            ngx.var = nil
+        end
+        local function buffered(c)
+            local out = {}
+            for i, e in ipairs(dict.store[handler._buffer_key(c)] or {}) do out[i] = cjson.decode(e) end
+            return out
+        end
+
+        before_each(function()
+            dict = new_shared_dict()
+            ngx.shared.aforo_buffer = dict
+            ngx.timers = {}
+        end)
+
+        it("meters a gRPC call with service, method and the grpc-status outcome", function()
+            local c = conf({ grpc_enabled = true })
+            log(c, { path = "/acme.UserService/GetUser", headers = { ["content-type"] = "application/grpc" },
+                     response = { ["grpc-status"] = "5" }, var = { request_id = "r-grpc" } })
+            local e = buffered(c)[1]
+            assert.equals("GRPC_API", e.productType)
+            assert.equals("grpc_api.rpc_calls", e.metricName)
+            assert.equals("acme.UserService", e.grpcService)
+            assert.equals("GetUser", e.grpcMethod)
+            assert.equals("grpc:tenantA:r-grpc", e.idempotencyKey)
+            assert.equals("ERROR", e.executionStatus)   -- NOT_FOUND, not the HTTP 200
+        end)
+
+        it("does not meter a gRPC UNAUTHENTICATED by default, as a plain 401 is not", function()
+            local c = conf({ grpc_enabled = true })
+            log(c, { path = "/acme.UserService/GetUser", headers = { ["content-type"] = "application/grpc" },
+                     response = { ["grpc-status"] = "16" } })
+            assert.equals(0, #buffered(c))
+        end)
+
+        it("caps a client-chosen gRPC method instead of skipping the call", function()
+            local c = conf({ grpc_enabled = true })
+            log(c, { path = "/acme.UserService/" .. string.rep("m", 300),
+                     headers = { ["content-type"] = "application/grpc" } })
+            local e = buffered(c)[1]
+            assert.is_not_nil(e, "an oversized method name must not opt the call out of metering")
+            assert.equals(128, #e.grpcMethod)
+        end)
+
+        it("meters a GraphQL operation with its type and name", function()
+            local c = conf({ graphql_enabled = true })
+            log(c, { path = "/graphql", headers = { ["content-type"] = "application/json" },
+                     body = cjson.encode({ query = "mutation AddUser { addUser { id } }" }),
+                     var = { request_id = "r-gql" } })
+            local e = buffered(c)[1]
+            assert.equals("GRAPHQL_API", e.productType)
+            assert.equals("MUTATION", e.gqlOperationType)
+            assert.equals("AddUser", e.gqlOperationName)
+            assert.equals("gql:tenantA:r-gql", e.idempotencyKey)
+            assert.equals("SUCCESS", e.executionStatus)
+        end)
+
+        it("meters a WebSocket handshake once per connection, keyed on Kong's request id", function()
+            local c = conf({ websocket_enabled = true })
+            -- The client reuses its Sec-WebSocket-Key: still two connections.
+            for _, id in ipairs({ "r-ws1", "r-ws2" }) do
+                log(c, { method = "GET", path = "/ws", status = 101, var = { request_id = id },
+                         headers = { upgrade = "websocket", ["Sec-WebSocket-Key"] = "same-key" } })
+            end
+            local evs = buffered(c)
+            assert.equals(2, #evs)
+            assert.equals("WEBSOCKET_API", evs[1].productType)
+            assert.equals("ws:tenantA:r-ws1", evs[1].idempotencyKey)
+            assert.equals("ws:tenantA:r-ws2", evs[2].idempotencyKey)
+            assert.equals("same-key", evs[1].wsConnectionId)
+            assert.is_nil(evs[1].executionStatus)   -- 101 is not a final outcome
+        end)
+
+        it("leaves gRPC, GraphQL and WebSocket alone unless each is enabled", function()
+            local c = conf()
+            log(c, { path = "/acme.UserService/GetUser", headers = { ["content-type"] = "application/grpc" } })
+            assert.equals("API", buffered(c)[1].productType)
+        end)
+
+        it("uses an unverified token's claims for neither customerId nor keyId", function()
+            local c = conf()
+            -- jwt_allow_unverified_signature let this token through; the route's
+            -- consumer is the identity.
+            log(c, { method = "GET", consumer = { custom_id = "consumer_1" },
+                     claims = { signature_verified = false, customer_id = "forged", key_id = "forged-key" } })
+            local e = buffered(c)[1]
+            assert.equals("consumer_1", e.customerId)
+            assert.is_nil(e.metadata.keyId)
+            -- A verified token supplies both.
+            log(c, { method = "GET", claims = { signature_verified = true, customer_id = "cust_v", key_id = "key-1" } })
+            e = buffered(c)[2]
+            assert.equals("cust_v", e.customerId)
+            assert.equals("key-1", e.metadata.keyId)
+        end)
+
+        it("counts the events it skips, by reason", function()
+            local c = conf({ product_type = "AI_AGENT", agent_id_header = ngx.null })
+            log(c, { method = "GET" })    -- AI_AGENT without an agent id
+            assert.equals(1, dict.store["aforo_dropped:missing_fields"])
+        end)
+
+        it("builds every idempotency key from Kong's request id, never a clock (Rule #21)", function()
+            local f = assert(io.open("handler.lua"))
+            local src = f:read("*a")
+            f:close()
+            local n = 0
+            for line in src:gmatch("[^\n]+") do
+                if line:find("%.idempotencyKey%s*=") and not line:find("^%s*%-%-") then
+                    n = n + 1
+                    assert.is_nil(line:find("ngx%.now") or line:find("os%.time") or line:find("os%.clock")
+                        or line:find("uuid%("), "idempotency key built from a clock or a random value: " .. line)
+                    assert.truthy(line:find("request_id", 1, true), "idempotency key not from request_id: " .. line)
+                end
+            end
+            assert.is_true(n >= 5)   -- API, MCP, gRPC, GraphQL, WebSocket
+        end)
+    end)
+
     describe("schema", function()
         local config_fields, saved_typedefs
 

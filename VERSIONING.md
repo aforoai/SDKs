@@ -10,8 +10,8 @@ Every artifact in this repo carries its own version, recorded in **both code and
 | Python SDKs | `pyproject.toml` / `setup.py` `version` | PyPI, on a git tag |
 | Java SDKs | `pom.xml` `<version>` | Maven Central, on a git tag |
 | Go SDKs | a `VERSION` file (Go has no manifest version field) | tag `aforo-metering-sdks/<pkg>/vX.Y.Z` (the module's repo subpath); import path is `github.com/aforoai/SDKs/aforo-metering-sdks/<pkg>` |
-| Kong plugin | `*.rockspec` version | LuaRocks + GitHub Release |
-| Other gateway plugins (Apigee/AWS/Azure/MuleSoft) | `package.json` (AWS) or a `VERSION` file | GitHub Release |
+| Kong plugin | `*.rockspec` version (the `VERSION` constant in `handler.lua` carries the same number) | LuaRocks + GitHub Release |
+| Other gateway plugins (Apigee/AWS/Azure/MuleSoft) | `package.json` (AWS) or a `VERSION` file (MuleSoft: also `aforo-metering/pom.xml`) | GitHub Release |
 | EMQX plugin | `src/aforo_metering.app.src` `{vsn, ...}` | GitHub Release |
 | IaC templates | a `VERSION` file | GitHub Release |
 
@@ -41,11 +41,11 @@ Each artifact versions independently. A Kong-plugin patch does not bump the Node
 | `node-agent` | `1.2.0` | `1.0.0` |
 | `python-agent` | `0.3.2` | none |
 | `mcp-test-server`, `agent-test-server` (internal, not published) | `0.1.0` | — |
-| `aforo-gateway-plugins/` — `kong`, `aws-lambda`, `apigee`, `azure-apim`, `mulesoft` | `2.1.0` | GitHub Releases `2.1.0` |
+| `aforo-gateway-plugins/` — `kong`, `aws-lambda`, `apigee`, `azure-apim`, `mulesoft` | `2.2.0` | GitHub Releases `2.1.0` (`2.2.0` after the release tags are pushed) |
 | `aforo-emqx-plugin/` | `0.1.0` (experimental) | — |
 | `aforo-gateway-plugins/aws-cloudformation`, `aforo-gateway-plugins/azure-arm-templates` | `1.0.0` | — |
 
-The published `1.0.0` SDK artifacts predate the first sync from the working repo and must not be used; a published version can never be reused, so each module's next release is the version in the middle column. The gateway plugins, the SDKs and the EMQX plugin are independent lines, not a single repo-wide version.
+The published `1.0.0` SDK artifacts predate the first sync from the working repo and must not be used; a published version can never be reused, so each module's next release is the version in the middle column. The gateway plugins sit at `2.2.0` here (`2.0.0` was their security-hardened release; `2.2.0` merges the internal line into `2.1.0`). The gateway plugins, the SDKs and the EMQX plugin are independent lines, not a single repo-wide version.
 
 ## Releasing
 

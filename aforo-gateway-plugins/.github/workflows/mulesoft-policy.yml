@@ -1,0 +1,104 @@
+# Builds the MuleSoft metering policy jar. On a version tag the jar and the
+# policy definition are attached to the GitHub release. Publishing to an
+# Anypoint Exchange happens only on a manual run, and only when the three
+# ANYPOINT_* secrets are set.
+name: mulesoft-policy
+
+on:
+  push:
+    branches: [main]
+    paths: ['mulesoft/**', '.github/workflows/mulesoft-policy.yml']
+    tags: ['v*']
+  pull_request:
+    paths: ['mulesoft/**', '.github/workflows/mulesoft-policy.yml']
+  workflow_dispatch:
+    inputs:
+      publish_to_exchange:
+        description: 'Publish to the Exchange of ANYPOINT_ORG_ID (needs the ANYPOINT_* secrets)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Structural checks
+        run: node mulesoft/tests/policy.test.cjs
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Package the policy
+        working-directory: mulesoft/aforo-metering
+        run: mvn -B -ntp clean package
+      - name: Collect release files
+        run: |
+          mkdir -p dist
+          cp mulesoft/aforo-metering/target/aforo-metering-*-mule-policy.jar dist/
+          cp mulesoft/aforo-metering/aforo-metering.yaml dist/
+          (cd dist && sha256sum * > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aforo-metering-mule-policy
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: aforo-metering-mule-policy
+          path: dist
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "See CHANGELOG.md."
+          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+
+  publish-exchange:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_to_exchange
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      ANYPOINT_ORG_ID: ${{ secrets.ANYPOINT_ORG_ID }}
+      ANYPOINT_CLIENT_ID: ${{ secrets.ANYPOINT_CLIENT_ID }}
+      ANYPOINT_CLIENT_SECRET: ${{ secrets.ANYPOINT_CLIENT_SECRET }}
+    steps:
+      - name: Require the Anypoint secrets
+        run: |
+          if [ -z "$ANYPOINT_ORG_ID" ] || [ -z "$ANYPOINT_CLIENT_ID" ] || [ -z "$ANYPOINT_CLIENT_SECRET" ]; then
+            echo "ANYPOINT_ORG_ID, ANYPOINT_CLIENT_ID and ANYPOINT_CLIENT_SECRET must all be set. Nothing was published."
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          server-id: exchange-server
+          server-username: EXCHANGE_USERNAME
+          server-password: EXCHANGE_PASSWORD
+      - name: Publish to Exchange
+        working-directory: mulesoft/aforo-metering
+        env:
+          # Connected-app form documented by MuleSoft for the Exchange Maven facade.
+          EXCHANGE_USERNAME: '~~~Client~~~'
+          EXCHANGE_PASSWORD: ${{ secrets.ANYPOINT_CLIENT_ID }}~?~${{ secrets.ANYPOINT_CLIENT_SECRET }}
+        run: mvn -B -ntp clean deploy -Danypoint.org.id="$ANYPOINT_ORG_ID"

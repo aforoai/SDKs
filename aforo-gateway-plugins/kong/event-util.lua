@@ -71,4 +71,64 @@ end
 
 M.iso8601_utc = iso8601_utc
 
+-- ────────────────────────────────────────────────────────────
+-- Drop metric (2026-07-05, delivery guarantee; carried into 2.6.0)
+--
+-- Permanent event loss is counted, not only logged:
+--   1. per-reason counters in the shared dict ("aforo_dropped:<reason>" in
+--      lua_shared_dict aforo_buffer) -- always on, readable from any worker
+--   2. Prometheus aforo_metering_dropped_events_total{reason} when Kong's
+--      prometheus plugin is loaded. Every touch is pcall-guarded: a metrics
+--      failure never breaks metering or request handling.
+-- Reasons: buffer_overflow, rejected (the ingestor refused a batch or a
+-- lone event), ingestor_rejected (per-event errors in a 2xx answer),
+-- expired (too old for the ingestor), too_large, missing_fields,
+-- invalid_field. Returns the cumulative count for the reason, or nil.
+-- Safe in request (log phase) and timer (flush) contexts.
+-- ────────────────────────────────────────────────────────────
+local DROP_DICT = "aforo_buffer"
+local DROP_KEY_PREFIX = "aforo_dropped:"
+local prometheus_drop_counter  -- nil = not yet resolved; false = unavailable
+
+local function get_prometheus_drop_counter()
+    if prometheus_drop_counter ~= nil then
+        return prometheus_drop_counter or nil
+    end
+    local ok, exporter = pcall(require, "kong.plugins.prometheus.exporter")
+    if ok and type(exporter) == "table" and type(exporter.get_prometheus) == "function" then
+        local got, prom = pcall(exporter.get_prometheus)
+        if got and prom and type(prom.counter) == "function" then
+            local reg, counter = pcall(prom.counter, prom,
+                "aforo_metering_dropped_events_total",
+                "Usage events permanently dropped by the aforo-metering plugin",
+                { "reason" })
+            if reg and counter then
+                prometheus_drop_counter = counter
+                return counter
+            end
+        end
+    end
+    prometheus_drop_counter = false
+    return nil
+end
+
+function M.record_drop(reason, count)
+    count = tonumber(count) or 0
+    if count <= 0 then return nil end
+    local total
+    local dict = ngx.shared and ngx.shared[DROP_DICT]
+    if dict then
+        total = dict:incr(DROP_KEY_PREFIX .. reason, count, 0)
+    end
+    local counter = get_prometheus_drop_counter()
+    if counter then
+        pcall(counter.inc, counter, count, { reason })
+    end
+    return total
+end
+
+function M._reset_drop_counter()
+    prometheus_drop_counter = nil
+end
+
 return M

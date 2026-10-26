@@ -1,6 +1,6 @@
 # kong-plugin-aforo-metering — User Guide
 
-**Version:** 2.1.0 · **Updated:** 2026-10-22 · **Audience:** engineers running Kong Gateway (OSS, Enterprise or Kong Konnect data planes) who want API usage metered into Aforo.
+**Version:** 2.6.0 · **Updated:** 2026-10-25 · **Audience:** engineers running Kong Gateway (OSS, Enterprise or Kong Konnect data planes) who want API usage metered into Aforo.
 
 ## What you'll build
 
@@ -21,10 +21,10 @@ Not yet on LuaRocks, so build it from the rockspec in this folder:
 git clone https://github.com/aforoai/SDKs.git
 cd SDKs/aforo-gateway-plugins/kong
 luarocks install lua-resty-http
-luarocks make kong-plugin-aforo-metering-2.1.0-1.rockspec
+luarocks make kong-plugin-aforo-metering-2.6.0-1.rockspec
 ```
 
-`luarocks make` reads `kong-plugin-aforo-metering-2.1.0-1.rockspec` and installs the `handler`, `schema`, `rate-limit-enforce`, `margin-guard`, `preflight-quota`, `compound-metering`, `event-buffer` and `event-util` modules under `kong.plugins.aforo-metering.*`.
+`luarocks make` reads `kong-plugin-aforo-metering-2.6.0-1.rockspec` and installs the `handler`, `schema`, `rate-limit-enforce`, `margin-guard`, `preflight-quota`, `compound-metering`, `event-buffer` and `event-util` modules under `kong.plugins.aforo-metering.*`.
 
 Two things that will bite you if you skip them:
 
@@ -80,9 +80,11 @@ Still based on `kong-aforo:3.4`, because the mount only replaces the plugin's co
 
 ## Choosing what each endpoint bills as
 
-The plugin's legacy default, `metric_name_pattern = "{method} {path}"`, produces one
-metric per endpoint — `GET /api/products`, `POST /api/sms/v2/send`. Aforo rejects any
-metric not registered in the catalog, so out of the box every event fails.
+Out of the box every event is sent as `default_metric` (`api_calls`), which must exist in
+your catalog. The old default template, `metric_name_pattern = "{method} {path}"`, produced
+one metric per endpoint (`GET /api/products`, `POST /api/sms/v2/send`); the ingestor refuses
+any metric that is not in the catalog, so the template is now used only when you set it to
+something else.
 
 Registering one metric per endpoint is not the fix. It makes the catalog track URL
 structure instead of business meaning, puts a line item per endpoint on the invoice, and
@@ -147,6 +149,17 @@ Configurable via `metric_header` / `quantity_header`; set either to `null` to di
 The pre-flight quota check, when on, checks the metric from steps 2-6: the response header does not exist yet when it runs.
 
 Existing deployments that set a custom `metric_name_pattern` keep working unchanged.
+
+MCP tool calls use the metric above; gRPC, GraphQL and WebSocket events (`grpc_enabled`, `graphql_enabled`, `websocket_enabled`) use fixed names (`grpc_api.rpc_calls`, `graphql_api.operations`, `websocket_api.connection_opened`). The mappings apply to plain HTTP events.
+
+### Fetching the rules from Aforo
+
+Set `mappings_url` to your catalog's gateway-mappings endpoint and the plugin reads the rules you declared on each metric, so a new metric needs no gateway change. The fetch runs in a background timer with `mappings_timeout_ms` (3 s); requests only read the cached table. One worker fetches at a time, a failed fetch is retried after `mappings_refresh_seconds`, and the last good table keeps being used.
+
+
+### What happens to a metric name Aforo does not know
+
+The plugin cannot see your catalog. A name that is not valid text or longer than 255 characters is dropped at the gateway and counted (`aforo_dropped:invalid_field`). A well-formed name that is not a catalog metric is sent, refused by the ingestor for that event only, and counted as `ingestor_rejected` with the ingestor's message in the Kong log. Neither is retried. Watch `aforo_dropped:ingestor_rejected` after changing mappings.
 
 ### Metering an AI agent
 
@@ -294,26 +307,61 @@ plugins:
       product_type: API        # optional; default API
 ```
 
-> ⚠ `api_key` is sent as the `X-API-Key` header (never `Authorization: Bearer`, which the ingestor rejects 401) and `tenant_id` as the `X-Tenant-Id` header **only on the flush to Aforo** — neither is read from inbound client requests. Customer identity comes from the Kong consumer (or a validated JWT claim), never from a request header.
+> ⚠ `api_key` is sent as the `X-API-Key` header (the ingestor would also accept an `sk_live_…` / `sk_test_…` key as `Authorization: Bearer`, but this plugin always uses `X-API-Key`) and `tenant_id` as the `X-Tenant-Id` header **only on the flush to Aforo** — neither is read from inbound client requests. Customer identity comes from the Kong consumer (or a validated JWT claim), never from a request header.
 
 ## Step 4 — Attach a customer identity
 
-`customer_id_source` is `consumer` and accepts only that. To attribute usage to a customer, bind a Kong consumer to the request credential (key-auth, JWT, etc.) so `kong.client.get_consumer()` resolves. Example with key-auth:
+A request with no verified customer produces no event. Pick the model that matches how the route authenticates.
+
+### A. Kong consumers (key-auth, basic-auth, …)
+
+Nothing to configure. Bind a consumer to the credential:
 
 ```bash
-# Create a consumer and a key
 curl -X POST http://localhost:8001/consumers --data "username=acme-corp" --data "custom_id=cust_acme"
 curl -X POST http://localhost:8001/consumers/acme-corp/key-auth --data "key=acme-secret-key"
-
-# Enable key-auth on the same service
 curl -X POST http://localhost:8001/services/my-service/plugins --data "name=key-auth"
 ```
 
-The event's `customerId` becomes the consumer's `custom_id` (`cust_acme`), falling back to `username`, then `id`.
+`customerId` is the consumer's `custom_id` (`cust_acme`), else `username`, else `id`.
 
 > ⚠ If neither a JWT claim nor a Kong consumer resolves, the request has no customer and is not metered: the plugin skips it and logs `no customer identity resolved`. Bind a consumer (or enable JWT validation) before relying on the data.
 
-To use a validated JWT claim instead, set `config.jwt_validation_enabled=true`, `config.jwt_issuer`, and the key that verifies the signature: `config.jwt_public_key` (a PEM) or `config.jwt_jwks_uri` (the issuer's JWKS URL, keys picked by `kid`). The JWT's `customer_id` claim then wins over the consumer identity. The token's `tenant_id` must equal `config.tenant_id`; a token issued for another tenant is rejected with 401 `TENANT_MISMATCH`. If the revocation Redis needs a password, set `config.jwt_redis_password`. See the Configuration reference for the JWT options.
+### B. Kong's `jwt` plugin verifies the token (`customer_id_jwt_claim`)
+
+Use this when the route already carries Kong's `jwt` plugin and one issuer signs tokens for every caller. On such a route the Kong consumer is the issuer, so billing by consumer would bill all callers as one customer.
+
+```yaml
+config:
+  customer_id_jwt_claim: tenant_id
+  customer_id_jwt_exclude_claims: [impersonated_by]   # optional: tokens not to meter
+```
+
+The claim is read from the token Kong's `jwt` plugin stored after verifying the signature. The `Authorization` header is never parsed. In this mode the claim is the only source: no verified token, or no such claim, means no event.
+
+### C. This plugin verifies an Aforo JWT (`jwt_validation_enabled`)
+
+Use this when no Kong auth plugin is on the route and callers present an Aforo-issued RS256 token.
+
+```yaml
+config:
+  jwt_validation_enabled: true
+  jwt_issuer: https://auth.aforo.ai
+  jwt_public_key: |
+    -----BEGIN PUBLIC KEY-----
+    ...
+    -----END PUBLIC KEY-----
+```
+
+In the access phase the plugin checks, in order: the token is RS256, the signature verifies against the key from `jwt_jwks_uri` (chosen by the token's `kid`) or `jwt_public_key`, `exp` (required) and `nbf`, `iss`, the token's `tenant_id` equals `config.tenant_id`, then revocation. A failure answers 401 (`TENANT_MISMATCH` for a token issued for another tenant). `X-Tenant-Id` sent upstream is always `config.tenant_id`. `customerId` is the token's `customer_id` claim (else `sub`); if the token names neither, the Kong consumer is used.
+
+> `jwt_jwks_uri` works: set it to organization-service's `https://<org host>/.well-known/jwks.json` instead of (or as well as) `jwt_public_key`, and organization-service can rotate its signing key without a Kong config change. The set is cached per worker for `jwt_jwks_cache_ttl` seconds (default 600). A token with an unknown `kid`, or one whose cached key no longer verifies (organization-service makes a new key pair on every start and keeps the `kid`), refreshes it at most every 30 s. While the JWKS cannot be fetched the last good set is used for up to 24 h. With both set, the JWKS key is used first and `jwt_public_key` verifies tokens the JWKS has no key for.
+
+> ⚠ The revocation checks (jti blocklist, revoked `client_id` / `key_id`) refuse the request with 503 when Redis cannot answer, including an error reply such as `NOAUTH`. If the blocklist Redis needs a password, set `jwt_redis_password` (it defaults to `rate_limit_redis_password` on the same Redis). Set `jwt_redis_host`/`jwt_redis_port` to a reachable Redis, or `jti_redis_fail_mode: open` to let requests through (logged and counted) as before.
+
+> ⚠ `jwt_allow_unverified_signature: true` lets a token through when the plugin has no key to verify it with. Since 2.2.0 that token grants access only. Its claims are not used for `customerId` or `keyId` unless Kong's `jwt` plugin verified the same token. If you relied on this flag for identity, move to model B.
+
+If you configure both B and C, B decides the customer.
 
 ## Step 5 — Send a request and trigger a flush
 
@@ -344,6 +392,8 @@ A successful flush logs:
 ```
 [aforo-metering] Flushed 1 events to Aforo (status=200)
 ```
+
+> ⚠ That line is logged at `info`. Kong's default `log_level` is `notice`, which hides it: set `KONG_LOG_LEVEL=info` (or `log_level = info` in `kong.conf`) while you verify. Flush failures are logged at `warn` and are visible at the default level.
 
 A failure logs each attempt, then says what happened to the events. They are kept and retried every `flush_interval_ms`:
 
@@ -403,8 +453,10 @@ See the full option table in [README.md](README.md#configuration). The three you
 | Flush logs `status=401` | Wrong `api_key` or `tenant_id` | Re-check the Aforo API key and tenant; both are sent on the flush (`X-API-Key` + `X-Tenant-Id`). |
 | Events land in Aforo with empty/missing customer | No Kong consumer bound and no JWT claim | Add an auth plugin (key-auth/JWT) with a consumer, or enable `jwt_validation_enabled`. |
 | 401 `TENANT_MISMATCH` | The token was issued for a different Aforo tenant than this plugin's `tenant_id` | Use a token for this tenant, or correct `tenant_id`. |
+| 503 `REVOCATION_CHECK_UNAVAILABLE` with `jwt_validation_enabled` | Kong cannot reach the blocklist Redis, AUTH failed, or Redis answered an error (`NOAUTH`, `LOADING`, `MOVED`) | The Kong log says which (`Redis could not answer the jti revocation check at ...`). Set `jwt_redis_host` / `jwt_redis_port` / `jwt_redis_password`; or set `jti_redis_fail_mode: open` to let requests through (logged and counted). |
+| 401 `UNSUPPORTED_ALGORITHM` | Token is not RS256 | Issue RS256 tokens, or verify with Kong's `jwt` plugin and use `customer_id_jwt_claim`. |
+| No events for a route with `customer_id_jwt_claim` | No verified token on the request, or no such claim | Confirm Kong's `jwt` plugin runs on the route and the token carries the claim. In this mode the claim is the only identity source. |
 | 401 `INVALID_SIGNATURE`, log says `No JWKS key to verify a token` | `jwt_jwks_uri` unreachable from Kong, or the token's `kid` is not in the JWKS | Check that Kong can reach `jwt_jwks_uri` and that it serves the issuer's current key. |
-| Log says `Redis answered the JWT revocation lookup with an error (NOAUTH ...)` | The blocklist Redis needs a password | Set `jwt_redis_password`. Until then, revoked tokens are not rejected. |
 | `Delivery to … failed: N event(s) kept for retry` | Ingestor unreachable or returning 5xx | Check `aforo_endpoint` reachability and Aforo status. The events are retried every `flush_interval_ms`, up to 10,000 per buffer (fewer if the shared dict fills up first). A line that says `dropped` means events were lost: the buffer or the dict was full. |
 | `The ingestor answered 401` (or 403 / 404) | Wrong or revoked `api_key`, a key without `usage-events:ingest`, or a wrong `aforo_endpoint` | Fix the setting. The newest 500 events refused under the old key stay with that key: they are delivered if it works again, and dropped after 72 hours. New events use the new setting. |
 | `Could not buffer an event: shared dict 'aforo_buffer' is full` | The ingestor has been failing for a while, or the dict is small for your traffic | Fix delivery first (see the other flush errors); raise `lua_shared_dict aforo_buffer` if it recurs with a healthy ingestor. |
@@ -414,4 +466,6 @@ See the full option table in [README.md](README.md#configuration). The three you
 ## What this guide does NOT cover
 
 - **The rate-limit and margin-guard access-phase modules** (`rate-limit-enforce.lua`, `margin-guard.lua`, `preflight-quota.lua`) ship in this folder and are wired into the handler, but their Redis policy schema and pricing-service contract are documented with the Aforo platform, not here. This guide covers metering.
-- **Guaranteed delivery.** This is fire-and-forget metering. For exactly-once accounting, reconcile against your upstream's own logs.
+- **JWKS against a live issuer.** The JWKS path is tested with mocked HTTP; it has not been run against organization-service's live JWKS.
+- **A live run of the failure paths.** The unit suites (busted, 315 tests in 2.6.0) run against mocks of the Kong PDK. The 2.3.0 commit (`35b2ff3`) records one live run on Kong 3.9 against usage-ingestor `main` in which API, AGENTIC_API, MCP_SERVER, AI_AGENT, GRAPHQL_API, GRPC_API and WEBSOCKET_API events were stored; re-buffering on a 5xx, behaviour with the ingestor unreachable, and buffer loss on restart have not been exercised live.
+- **Guaranteed delivery.** Events are buffered in shared memory and lost on a Kong restart. For exactly-once accounting, reconcile against your upstream's own logs.

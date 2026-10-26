@@ -47,7 +47,7 @@ return {
                         product_type = {
                             type = "string",
                             default = "API",
-                            description = "Aforo productType sent on every event (trimmed, upper-cased): API, AGENTIC_API, AI_AGENT, MCP_SERVER, GRPC_API, GRAPHQL_API, WEBSOCKET_API or MQTT_BROKER. MCP tools/call is sent as MCP_SERVER; on an MCP_SERVER product only tool calls are metered. Events missing their type's required fields are skipped, as one invalid event fails the whole batch. AI_AGENT takes agentId from agent_id_header or agent_id. GRPC_API, GRAPHQL_API, WEBSOCKET_API and MQTT_BROKER need fields a gateway cannot observe.",
+                            description = "Aforo productType sent on every event (trimmed, upper-cased): API, AGENTIC_API, AI_AGENT, MCP_SERVER, GRPC_API, GRAPHQL_API, WEBSOCKET_API or MQTT_BROKER. MCP tools/call is sent as MCP_SERVER; on an MCP_SERVER product only tool calls are metered. Events missing their type's required fields are skipped, as one invalid event fails the whole batch. AI_AGENT takes agentId from agent_id_header or agent_id. gRPC/GraphQL/WebSocket detection (grpc_enabled etc.) sets its own type.",
                         },
                     },
                     -- Metric configuration
@@ -171,7 +171,23 @@ return {
                             -- the JWT's customer_id claim takes precedence over
                             -- the consumer source — see handler.lua.
                             one_of = { "consumer" },
-                            description = "Customer ID source. Only Kong consumer identity is accepted (JWT claim takes precedence when JWT validation is enabled).",
+                            description = "Kong consumer identity (custom_id, else username, else id). The only accepted value. A verified JWT takes precedence when configured: customer_id_jwt_claim (JWT verified by Kong's jwt plugin; exclusive), else jwt_validation_enabled (JWT verified by this plugin). No identity, no event.",
+                        },
+                    },
+                    {
+                        customer_id_jwt_claim = {
+                            type = "string",
+                            required = false,
+                            len_min = 1,
+                            description = "Claim of the Kong-verified JWT to use as customerId (e.g. 'tenant_id'). Requires Kong's jwt plugin on the same route or service.",
+                        },
+                    },
+                    {
+                        customer_id_jwt_exclude_claims = {
+                            type = "array",
+                            elements = { type = "string", len_min = 1 },
+                            default = {},
+                            description = "With customer_id_jwt_claim: a verified token carrying any of these claims (present and not false/empty) is not metered. Example: staff impersonation tokens.",
                         },
                     },
                     -- Batching
@@ -220,6 +236,61 @@ return {
                             description = "Aforo product ID for MCP server metering (required when mcp_enabled=true)",
                         },
                     },
+                    -- gRPC / GraphQL / WebSocket detection (opt-in, each off by default)
+                    {
+                        grpc_enabled = {
+                            type = "boolean",
+                            default = false,
+                            description = "Enable gRPC detection (via Content-Type: application/grpc) for per-method billing",
+                        },
+                    },
+                    {
+                        grpc_product_id = {
+                            type = "string",
+                            description = "Aforo product ID for gRPC metering (required when grpc_enabled=true)",
+                        },
+                    },
+                    {
+                        grpc_path_prefix = {
+                            type = "string",
+                            -- No default: Kong rejects "" as a string default
+                            -- ("length must be at least 1"). Unset = no prefix.
+                            description = "Optional Kong route prefix to strip before parsing gRPC service/method. Leave empty if gRPC is routed at /. Example: '/grpc' for paths like /grpc/acme.UserService/GetUser",
+                        },
+                    },
+                    {
+                        graphql_enabled = {
+                            type = "boolean",
+                            default = false,
+                            description = "Enable GraphQL detection (HTTP POST with application/json containing {query}) for per-operation billing",
+                        },
+                    },
+                    {
+                        graphql_product_id = {
+                            type = "string",
+                            description = "Aforo product ID for GraphQL metering (required when graphql_enabled=true)",
+                        },
+                    },
+                    {
+                        graphql_path_pattern = {
+                            type = "string",
+                            default = "graphql",
+                            description = "Substring required in the request path to consider an HTTP POST a GraphQL operation. Default: 'graphql' (also matches 'gql').",
+                        },
+                    },
+                    {
+                        websocket_enabled = {
+                            type = "boolean",
+                            default = false,
+                            description = "Enable WebSocket detection. Emits one CONNECTION_OPENED event per successful 101 handshake. Frame-level metering requires @aforo/ws-metering SDK.",
+                        },
+                    },
+                    {
+                        websocket_product_id = {
+                            type = "string",
+                            description = "Aforo product ID for WebSocket metering (required when websocket_enabled=true)",
+                        },
+                    },
                     -- executionStatus overrides (OUTCOME_BASED pricing): an
                     -- exact upstream status code -> one of the ingestor's
                     -- execution statuses. Wins over the default table (README
@@ -251,7 +322,7 @@ return {
                         jwt_validation_enabled = {
                             type = "boolean",
                             default = false,
-                            description = "Validate Aforo JWT in the access phase before metering",
+                            description = "Verify the Aforo RS256 JWT in the access phase (signature against the key from jwt_jwks_uri or jwt_public_key, exp, nbf, iss, revocation) and answer 401 when it fails. Its customer_id claim then identifies the customer.",
                         },
                     },
                     {
@@ -264,21 +335,29 @@ return {
                     {
                         jwt_jwks_uri = {
                             type = "string",
-                            description = "The token issuer's JWKS URL, e.g. https://<issuer>/.well-known/jwks.json. The key is chosen by the token's kid. Keys are cached for an hour and refreshed in the background; an unknown kid triggers a refetch at most every 30 s. Ignored when jwt_public_key is set.",
+                            description = "https URL of the token issuer's JWKS (organization-service: /.well-known/jwks.json). The RS256 key is chosen by the token's kid, so a key rotation needs no config change. Cached per worker for jwt_jwks_cache_ttl seconds; an unknown kid refreshes it at most every 30 s; the last good set is used for up to 24 h while the JWKS cannot be fetched. jwt_public_key, when also set, verifies tokens the JWKS has no key for.",
+                        },
+                    },
+                    {
+                        jwt_jwks_cache_ttl = {
+                            type = "integer",
+                            default = 600,
+                            between = { 30, 86400 },
+                            description = "Seconds a fetched JWKS is used before it is fetched again.",
                         },
                     },
                     {
                         jwt_public_key = {
                             type = "string",
                             encrypted = true,
-                            description = "PEM-encoded RSA public key for offline RS256 verification. Takes precedence over jwt_jwks_uri.",
+                            description = "PEM-encoded RSA PUBLIC key of the token issuer. With jwt_validation_enabled the plugin verifies the RS256 signature against it (resty.openssl) before reading any claim -- for tokens jwt_jwks_uri has no key for, when both are set. A private key is refused.",
                         },
                     },
                     {
                         jwt_allow_unverified_signature = {
                             type = "boolean",
                             default = false,
-                            description = "DANGEROUS. Accept JWTs without verifying the signature, only when no key is configured (neither jwt_public_key nor jwt_jwks_uri) or resty.openssl cannot load. With a key configured, a token that does not verify, or names a kid the JWKS lacks, is always rejected. Enable ONLY when signatures are verified upstream; otherwise any caller can mint a token naming any customer_id.",
+                            description = "DANGEROUS. Let a JWT through when this plugin cannot verify its signature (no jwt_public_key and no jwt_jwks_uri). For deployments that verify the token before it reaches this plugin. Since 2.2.0 such a token grants ACCESS only: its claims are not used for customerId or keyId unless Kong's jwt plugin verified the same token. With this true and nothing verifying upstream, any caller can mint a token.",
                         },
                     },
                     -- Redis host/port/password are shared with rate-limit enforcement
@@ -302,6 +381,14 @@ return {
                             type = "string",
                             encrypted = true,
                             description = "Redis password for the jti blocklist. Defaults to rate_limit_redis_password when the blocklist uses the same Redis host and port as rate limiting.",
+                        },
+                    },
+                    {
+                        jti_redis_fail_mode = {
+                            type = "string",
+                            default = "closed",
+                            one_of = { "closed", "open" },
+                            description = "What the jti blocklist and client-revocation checks do when Redis cannot answer (connect or GET fails). closed (default): refuse the request with 503. open: let it through, log a throttled warning and count it in aforo_metering_revocation_check_unavailable_total. Before 2.4.0 the behaviour was always open.",
                         },
                     },
                     -- Rate limit enforcement (reads policies from Redis)

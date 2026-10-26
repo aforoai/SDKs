@@ -2,11 +2,11 @@
     Aforo Compound Metering Policy Fragment for Azure APIM
     (fragment id: aforo-compound-metering)
 
-    Extracts multiple metric measurements from API response bodies and
-    emits compound usage events to the Aforo ingestor (async, zero latency).
+    Extracts several measurements from the API response body and sends one
+    compound usage event to the Aforo ingestor (fire-and-forget; the client
+    response is not delayed).
 
-    A policy fragment cannot contain section elements. Include this in
-    <outbound>, with aforo-context in <inbound> (it resolves aforo-customer-id):
+    A fragment holds statements only. Include it in the outbound section:
 
       <outbound>
           <base />
@@ -14,47 +14,91 @@
           <include-fragment fragment-id="aforo-compound-metering" />
       </outbound>
 
-    Not sent for OPTIONS or when no Aforo customer was resolved.
+    Settings are CONTEXT VARIABLES, set with set-variable before the include.
+    A Named Value is not a context variable: to use one, pass it through
+    set-variable, value = the Named Value in double braces. Release 2.1.0
+    read the same names as Named Values directly; see CHANGELOG 2.2.0 for
+    the lines to add.
 
-    Named Values (read with double-brace syntax — Named Values are NOT context
-    variables, so context.Variables lookups of them never resolve):
-      aforo-compound-enabled:          "true" | "false"
-      aforo-compound-extraction-paths: "jsonPath=metricName" pairs separated
-                                       by ";", e.g.
-                                       "$.usage.prompt_tokens=input-tokens;$.usage.completion_tokens=output-tokens"
-      aforo-compound-dimension-paths:  "jsonPath=dimensionKey" pairs, or "none"
-      aforo-ingestor-url:              Aforo usage ingestor base URL (origin only)
-      aforo-api-key:                   Aforo API key (Secret), sent as X-API-Key
-    Values must not contain double quotes or backslashes.
+      aforo-compound-enabled           "true" to switch this fragment on
+      aforo-compound-extraction-paths  which numbers to read. Either a JSON
+                                       object mapping JSONPath to metric name,
+                                       or "jsonPath=metricName" pairs separated
+                                       by ";", for example
+                                       $.usage.prompt_tokens=input-tokens;$.usage.completion_tokens=output-tokens
+      aforo-compound-dimension-paths   optional, same two formats, JSONPath to
+                                       dimension key; "none" or absent = no dimension
+      aforo-ingestor-url               ingestor origin, https://api.aforo.ai
+      aforo-api-key                    optional. When the variable is absent the
+                                       Named Value aforo-api-key is used (it must
+                                       exist; aforo-metering needs it too).
+                                       Sent as X-API-Key.
+      aforo-customer-id                the Aforo customer. Absent: the APIM
+                                       subscription id. Empty, over 64
+                                       characters, or no subscription: nothing
+                                       is sent. Never the subscription key.
+      aforo-product-type               productType on the event (default API)
+
+    Not sent for OPTIONS, when no customer resolves, when no measurement was
+    extracted, or when aforo-ingestor-url is empty.
+
+    correlationId is FROZEN (Rule 21): context.RequestId, APIM's per-request
+    GUID. The ingestor types correlationId as a UUID and derives every
+    per-metric dedup key from it, so it must be identical on every
+    re-evaluation or redelivery of the same request. Never put Guid.NewGuid()
+    or a clock value in that field.
+
+    Extraction: a configured path that is missing from the response is
+    skipped. The condition is written token != null AND (Integer OR Float);
+    without the parentheses a missing path threw and dropped the whole event.
 -->
 <fragment>
+    <set-variable name="aforo-compound-customer" value="@{
+        var c = "";
+        if (context.Variables.ContainsKey("aforo-customer-id")) { c = Convert.ToString(context.Variables["aforo-customer-id"]); }
+        else if (context.Subscription != null) { c = context.Subscription.Id; }
+        if (c == null) { c = ""; }
+        c = c.Trim();
+        return c.Length > 64 ? "" : c;
+    }" />
     <choose>
-        <when condition="@(&quot;{{aforo-compound-enabled}}&quot; == &quot;true&quot; &amp;&amp; context.Request.Method != &quot;OPTIONS&quot; &amp;&amp; !string.IsNullOrEmpty(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;aforo-customer-id&quot;, &quot;&quot;)))">
-            <!-- Extract measurements from response body -->
+        <when condition="@(context.Variables.GetValueOrDefault<string>("aforo-compound-enabled", "false") == "true" && context.Request.Method != "OPTIONS" && Convert.ToString(context.Variables["aforo-compound-customer"]).Length > 0 && context.Variables.GetValueOrDefault<string>("aforo-ingestor-url", "").Trim().Length > 0)">
             <set-variable name="compoundMeasurements" value="@{
                 try {
-                    var body = context.Response.Body.As&lt;JObject&gt;(preserveContent: true);
-                    if (body == null) { return &quot;[]&quot;; }
+                    var body = context.Response.Body.As<JObject>(preserveContent: true);
+                    if (body == null) { return "[]"; }
+
+                    /* Each setting is a JSON object or path=name pairs separated by a semicolon. */
+                    var raws = new[] {
+                        context.Variables.GetValueOrDefault<string>("aforo-compound-extraction-paths", ""),
+                        context.Variables.GetValueOrDefault<string>("aforo-compound-dimension-paths", "")
+                    };
+                    var maps = new[] { new JObject(), new JObject() };
+                    for (var i = 0; i < 2; i++) {
+                        var raw = (raws[i] ?? "").Trim();
+                        if (raw.StartsWith("{", StringComparison.Ordinal)) { maps[i] = JObject.Parse(raw); continue; }
+                        foreach (var pair in raw.Split(';')) {
+                            var idx = pair.LastIndexOf("=");
+                            if (idx <= 0) { continue; }
+                            var key = pair.Substring(0, idx).Trim();
+                            var name = pair.Substring(idx + 1).Trim();
+                            if (key.Length > 0 && name.Length > 0) { maps[i][key] = name; }
+                        }
+                    }
 
                     var measurements = new JArray();
-                    foreach (var pair in &quot;{{aforo-compound-extraction-paths}}&quot;.Split(new[] { &quot;;&quot; }, StringSplitOptions.RemoveEmptyEntries)) {
-                        var idx = pair.LastIndexOf(&quot;=&quot;);
-                        if (idx &lt;= 0) { continue; }
-                        var jsonPath = pair.Substring(0, idx).Trim();
-                        var metricName = pair.Substring(idx + 1).Trim();
-                        var token = body.SelectToken(jsonPath);
-                        if (token != null &amp;&amp; (token.Type == JTokenType.Integer || token.Type == JTokenType.Float)) {
+                    foreach (var kv in maps[0]) {
+                        var token = body.SelectToken(kv.Key);
+                        if (token != null && (token.Type == JTokenType.Integer || token.Type == JTokenType.Float)) {
                             var val = (double)token;
-                            if (val &gt; 0) {
+                            if (val > 0) {
                                 var m = new JObject();
-                                m[&quot;metricName&quot;] = metricName;
-                                m[&quot;quantity&quot;] = val;
-                                foreach (var dpair in &quot;{{aforo-compound-dimension-paths}}&quot;.Split(new[] { &quot;;&quot; }, StringSplitOptions.RemoveEmptyEntries)) {
-                                    var didx = dpair.LastIndexOf(&quot;=&quot;);
-                                    if (didx &lt;= 0) { continue; }
-                                    var dimToken = body.SelectToken(dpair.Substring(0, didx).Trim());
-                                    if (dimToken != null &amp;&amp; dimToken.Type == JTokenType.String) {
-                                        m[&quot;dimensionKey&quot;] = dimToken.ToString();
+                                m["metricName"] = kv.Value.ToString();
+                                m["quantity"] = val;
+                                foreach (var dk in maps[1]) {
+                                    var dimToken = body.SelectToken(dk.Key);
+                                    if (dimToken != null && dimToken.Type == JTokenType.String) {
+                                        m["dimensionKey"] = dimToken.ToString();
                                         break;
                                     }
                                 }
@@ -64,29 +108,31 @@
                     }
                     return measurements.ToString(Newtonsoft.Json.Formatting.None);
                 } catch (Exception) {
-                    return &quot;[]&quot;;
+                    return "[]";
                 }
             }" />
 
-            <!-- Only emit if measurements were extracted -->
             <choose>
-                <when condition="@(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;compoundMeasurements&quot;, &quot;[]&quot;) != &quot;[]&quot;)">
+                <when condition="@(context.Variables.GetValueOrDefault<string>("compoundMeasurements", "[]") != "[]")">
                     <send-one-way-request mode="new">
-                        <set-url>{{aforo-ingestor-url}}/api/v1/ingest/compound</set-url>
+                        <set-url>@(context.Variables.GetValueOrDefault<string>("aforo-ingestor-url", "").Trim().TrimEnd('/') + "/api/v1/ingest/compound")</set-url>
                         <set-method>POST</set-method>
                         <set-header name="Content-Type" exists-action="override">
                             <value>application/json</value>
                         </set-header>
                         <set-header name="X-API-Key" exists-action="override">
-                            <value>{{aforo-api-key}}</value>
+                            <value>@(context.Variables.ContainsKey("aforo-api-key") ? Convert.ToString(context.Variables["aforo-api-key"]) : "{{aforo-api-key}}")</value>
                         </set-header>
-                        <set-body><![CDATA[@{
+                        <set-body>@{
                             var measurements = context.Variables.GetValueOrDefault<string>("compoundMeasurements");
+                            var productType = (context.Variables.ContainsKey("aforo-product-type")
+                                ? Convert.ToString(context.Variables["aforo-product-type"]) ?? "" : "").Trim().ToUpperInvariant();
+                            if (productType.Length == 0 || productType == "NONE") { productType = "API"; }
                             var evt = new JObject();
                             evt["correlationId"] = context.RequestId.ToString();
-                            evt["customerId"] = context.Variables.GetValueOrDefault<string>("aforo-customer-id", "");
+                            evt["customerId"] = Convert.ToString(context.Variables["aforo-compound-customer"]);
                             evt["occurredAt"] = DateTime.UtcNow.ToString("o");
-                            evt["productType"] = context.Variables.GetValueOrDefault<string>("aforo-product-type", "API");
+                            evt["productType"] = productType;
                             evt["measurements"] = JArray.Parse(measurements);
                             evt["metadata"] = new JObject {
                                 ["gateway"] = "azure-apim",
@@ -95,7 +141,7 @@
                                 ["statusCode"] = context.Response.StatusCode.ToString()
                             };
                             return evt.ToString(Newtonsoft.Json.Formatting.None);
-                        }]]></set-body>
+                        }</set-body>
                     </send-one-way-request>
                 </when>
             </choose>

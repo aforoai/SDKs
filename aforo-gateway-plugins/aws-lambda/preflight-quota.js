@@ -33,6 +33,7 @@ async function checkPreFlightQuota(config, customerId, metricName) {
         headers: {
             'Content-Type': 'application/json',
             // X-API-Key alone: Bearer is parsed as a JWT and rejected 401.
+            // The tenant comes from the key, so no X-Tenant-Id is sent.
             'X-API-Key': config.apiKey,
             'Content-Length': Buffer.byteLength(payload),
         },

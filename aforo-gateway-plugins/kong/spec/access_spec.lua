@@ -141,6 +141,26 @@ package.loaded["resty.http"] = {
                 if r.err then return nil, r.err end
                 return { status = r.status, body = r.body or "", headers = {} }
             end,
+            -- The JWKS fetch streams the body (connect + request + body_reader)
+            -- so it can stop past its size cap; same script of responses.
+            parse_uri = function(_, uri)
+                local host, rest = uri:match("^https?://([^/]+)(.*)$")
+                return { "https", host, 443, (rest ~= "" and rest) or "/", nil }
+            end,
+            connect = function(self, opts) self._host = opts.host; return true end,
+            request = function(self, params)
+                table.insert(http_requests, { url = "https://" .. self._host .. params.path, params = params })
+                local r = table.remove(http_responses, 1) or { status = 202, body = "" }
+                if r.err then return nil, r.err end
+                local body, done = r.body or "", false
+                return { status = r.status, headers = r.headers or {},
+                         body_reader = function()
+                             if done then return nil end
+                             done = true
+                             return body
+                         end }
+            end,
+            close = function() return true end,
         }
     end,
 }
@@ -219,6 +239,7 @@ local function reset()
     http_requests, http_responses = {}, {}
     timers, warnings = {}, {}
     ngx.shared.aforo_buffer = new_dict()
+    handler._jwks_reset()
 end
 
 local BASE = { aforo_endpoint = "http://ingest/v1/ingest/batch", api_key = "k", tenant_id = "tenant-B",
@@ -302,25 +323,51 @@ describe("access phase", function()
             assert.equals("TOKEN_REVOKED", access_with(jwt(aforo_claims())).body.error_description)
         end)
 
-        it("fails OPEN on a Redis error reply (NOAUTH/LOADING/MOVED), never as TOKEN_REVOKED", function()
+        -- When Redis cannot answer, the check is refused with 503 unless
+        -- jti_redis_fail_mode = "open" (2.4.0; Jay, 2026-10-24). An error reply
+        -- is never read as TOKEN_REVOKED (Gowtham, 2026-10-12).
+        local function said(...)
+            local want = { ... }
+            for _, w in ipairs(warnings) do
+                local all = true
+                for _, frag in ipairs(want) do if not w:find(frag, 1, true) then all = false end end
+                if all then return true end
+            end
+            return false
+        end
+
+        it("refuses with 503 on a Redis error reply by default, never as TOKEN_REVOKED", function()
             redis_error_reply = "NOAUTH Authentication required."
             local exit = access_with(jwt(aforo_claims()))
-            assert.is_nil(exit and exit.body.error_description)
-            assert.is_not_nil(K.ctx.shared.aforo_jwt_claims)
-            -- ...and says so, rather than failing silently.
-            local said
-            for _, w in ipairs(warnings) do
-                if w:find("NOAUTH", 1, true) and w:find("Failing OPEN", 1, true) then said = true end
-            end
-            assert.is_true(said)
+            assert.equals(503, exit.status)
+            assert.equals("REVOCATION_CHECK_UNAVAILABLE", exit.body.error_description)
+            assert.equals("1", exit.headers["Retry-After"])
+            assert.is_nil(K.ctx.shared.aforo_jwt_claims)
+            assert.is_true(said("NOAUTH", "Refusing requests with 503"))
+            assert.equals(1, ngx.shared.aforo_buffer.store["aforo_revocation_unavailable:jti:closed"])
         end)
 
-        it("fails OPEN when AUTH is refused", function()
+        it("with jti_redis_fail_mode=open, fails OPEN on a Redis error reply and says so", function()
+            redis_error_reply = "NOAUTH Authentication required."
+            local exit = access_with(jwt(aforo_claims()), { jwt_validation_enabled = true,
+                jwt_public_key = "PEM", jti_redis_fail_mode = "open" })
+            assert.is_nil(exit and exit.body.error_description)
+            assert.is_not_nil(K.ctx.shared.aforo_jwt_claims)
+            assert.is_true(said("NOAUTH", "Failing OPEN"))
+            assert.equals(1, ngx.shared.aforo_buffer.store["aforo_revocation_unavailable:jti:open"])
+        end)
+
+        it("refuses with 503 when AUTH is refused, and lets through in open mode", function()
             redis_auth_ok = false
             redis_store["jti:blocked:jti-1"] = "1"
             local exit = access_with(jwt(aforo_claims()), { jwt_validation_enabled = true,
                 jwt_public_key = "PEM", jwt_redis_password = "wrong" })
-            assert.is_nil(exit)
+            assert.equals(503, exit.status)
+            reset()
+            redis_auth_ok = false
+            redis_store["jti:blocked:jti-1"] = "1"
+            assert.is_nil(access_with(jwt(aforo_claims()), { jwt_validation_enabled = true,
+                jwt_public_key = "PEM", jwt_redis_password = "wrong", jti_redis_fail_mode = "open" }))
         end)
 
         it("AUTHs with jwt_redis_password, or the rate-limit password on the same Redis", function()
@@ -374,6 +421,9 @@ describe("access phase", function()
     end)
 
     -- ── JWKS ────────────────────────────────────────────────────
+    -- Per-worker cache (jwt_jwks_cache_ttl, default 600 s), refreshed at most
+    -- once per 30 s (5 s before the first success). ngx.now() is fixed in
+    -- this spec, so "time passing" is done by ageing the cache entry.
     describe("JWKS", function()
         local URI = "https://auth.test/.well-known/jwks.json"
         local function jwks(...)
@@ -387,15 +437,36 @@ describe("access phase", function()
         local function token(kid)
             return jwt(aforo_claims(), { alg = "RS256", typ = "JWT", kid = kid })
         end
+        -- Move the cache entry `seconds` into the past.
+        local function age(seconds)
+            local e = handler._jwks_cache()[URI]
+            e.last_attempt = e.last_attempt - seconds
+            e.fetched_at = e.fetched_at - seconds
+            e.expires_at = e.expires_at - seconds
+        end
+        -- verify() succeeds only with the issuer's current key.
+        local function with_issuer_key(current, fn)
+            local mod = package.loaded["resty.openssl.pkey"]
+            local orig = mod.new
+            mod.new = function(key)
+                local n = key == "PEM" and "PEM" or cjson.decode(key).n
+                return { verify = function() return n == current.n end }
+            end
+            local ok, err = pcall(fn)
+            mod.new = orig
+            assert(ok, err)
+        end
 
         it("fetches the JWKS on first use and verifies with the key named by kid", function()
-            http_responses = { jwks("other", "aforo-v1") }
-            assert.is_nil(access_with(token("aforo-v1"), JWKS_CONF))
-            assert.equals(1, #http_requests)
-            assert.equals(URI, http_requests[1].url)
-            assert.equals(1, #pkey_loads)
-            assert.equals("JWK", pkey_loads[1].format)
-            assert.equals("n-aforo-v1", cjson.decode(pkey_loads[1].key).n)
+            with_issuer_key({ n = "n-aforo-v1" }, function()
+                http_responses = { jwks("other", "aforo-v1") }
+                assert.is_nil(access_with(token("aforo-v1"), JWKS_CONF))
+                assert.equals(1, #http_requests)
+                assert.equals(URI, http_requests[1].url)
+                K.response._exit = nil
+                -- The other key of the set does not verify this issuer's token.
+                assert.equals("INVALID_SIGNATURE", access_with(token("other"), JWKS_CONF).body.error_description)
+            end)
         end)
 
         it("serves later requests from the cache, without fetching", function()
@@ -411,9 +482,8 @@ describe("access phase", function()
         it("refetches for an unknown kid at most once per interval", function()
             http_responses = { jwks("aforo-v1"), jwks("aforo-v1", "aforo-v2") }
             access_with(token("aforo-v1"), JWKS_CONF)
+            age(31)
             -- The issuer rotated: the first token with the new kid triggers one refetch.
-            -- (Clear the first fetch's lock, as its 30 s would have elapsed.)
-            ngx.shared.aforo_buffer.store["aforo:jwks_fetch:" .. URI] = nil
             assert.is_nil(access_with(token("aforo-v2"), JWKS_CONF))
             assert.equals(2, #http_requests)
             -- A burst of made-up kids inside the interval costs no fetches.
@@ -432,11 +502,25 @@ describe("access phase", function()
             assert.equals("INVALID_SIGNATURE", exit.body.error_description)
         end)
 
-        it("prefers a static jwt_public_key and never fetches", function()
-            assert.is_nil(access_with(token("aforo-v1"), { jwt_validation_enabled = true,
-                jwt_jwks_uri = URI, jwt_public_key = "PEM" }))
+        it("only fetches over https", function()
+            local exit = access_with(token("aforo-v1"), { jwt_validation_enabled = true,
+                jwt_jwks_uri = "http://auth.test/.well-known/jwks.json" })
+            assert.equals("INVALID_SIGNATURE", exit.body.error_description)
             assert.equals(0, #http_requests)
-            assert.equals("PEM", pkey_loads[1].key)
+        end)
+
+        it("verifies with the JWKS first, and with jwt_public_key a kid the JWKS lacks", function()
+            local BOTH = { jwt_validation_enabled = true, jwt_jwks_uri = URI, jwt_public_key = "PEM" }
+            with_issuer_key({ n = "n-aforo-v1" }, function()
+                http_responses = { jwks("aforo-v1") }
+                assert.is_nil(access_with(token("aforo-v1"), BOTH))
+                assert.equals(1, #http_requests)
+            end)
+            with_issuer_key({ n = "PEM" }, function()
+                K.response._exit = nil
+                assert.is_nil(access_with(token("legacy"), BOTH))
+                assert.equals(1, #http_requests)   -- within the refetch interval
+            end)
         end)
 
         it("matches a kid-less token only when the JWKS has exactly one key", function()
@@ -447,29 +531,16 @@ describe("access phase", function()
             assert.equals("INVALID_SIGNATURE", access_with(jwt(aforo_claims()), JWKS_CONF).body.error_description)
         end)
 
-        -- org-service makes a new key pair on every start but keeps kid
-        -- "aforo-v1"; verify() here succeeds only with the issuer's current key.
-        local function with_issuer_key(current, fn)
-            local mod = package.loaded["resty.openssl.pkey"]
-            local orig = mod.new
-            mod.new = function(key)
-                local n = cjson.decode(key).n
-                return { verify = function() return n == current.n end }
-            end
-            local ok, err = pcall(fn)
-            mod.new = orig
-            assert(ok, err)
-        end
-
+        -- org-service makes a new key pair on every start but keeps kid "aforo-v1".
         it("refetches once when the issuer replaced the key under the same kid", function()
             local current = { n = "S1-OLD" }
             with_issuer_key(current, function()
                 http_responses = { { status = 200, body = cjson.encode({ keys = {
                     { kty = "RSA", use = "sig", kid = "aforo-v1", alg = "RS256", n = "S1-OLD", e = "AQAB" } } }) } }
                 assert.is_nil(access_with(token("aforo-v1"), JWKS_CONF))
-                -- The issuer restarts: new key, same kid. The fetch lock has long expired.
+                -- The issuer restarts: new key, same kid.
                 current.n = "S1-NEW"
-                ngx.shared.aforo_buffer.store["aforo:jwks_fetch:" .. URI] = nil
+                age(31)
                 http_responses = { { status = 200, body = cjson.encode({ keys = {
                     { kty = "RSA", use = "sig", kid = "aforo-v1", alg = "RS256", n = "S1-NEW", e = "AQAB" } } }) } }
                 for _ = 1, 5 do
@@ -487,7 +558,7 @@ describe("access phase", function()
                     { kty = "RSA", use = "sig", kid = "aforo-v1", alg = "RS256", n = "S1B-REAL", e = "AQAB" } } }) } }
                 access_with(token("aforo-v1"), JWKS_CONF)
                 current.n = "nobody"                  -- forged: verifies against no key
-                ngx.shared.aforo_buffer.store["aforo:jwks_fetch:" .. URI] = nil
+                age(31)
                 http_responses = { { err = "connection refused" } }
                 K.response._exit = nil
                 assert.equals("INVALID_SIGNATURE", access_with(token("aforo-v1"), JWKS_CONF).body.error_description)
@@ -516,14 +587,13 @@ describe("access phase", function()
         end)
 
         it("still waits for a cold fetch another request has in flight", function()
-            local key = "aforo:jwks:" .. URI
-            ngx.shared.aforo_buffer.store["aforo:jwks_fetch:" .. URI] = 1
-            ngx.shared.aforo_buffer.store["aforo:jwks_inflight:" .. URI] = true
+            local now = ngx.now()
+            handler._jwks_cache()[URI] = { keys = {}, fetched_at = 0, expires_at = 0,
+                                           last_attempt = now, fetching = true, fetch_started = now }
             local orig_sleep = ngx.sleep
             ngx.sleep = function()             -- the other request's fetch lands meanwhile
-                ngx.shared.aforo_buffer.store["aforo:jwks_inflight:" .. URI] = nil
-                ngx.shared.aforo_buffer.store[key] = cjson.encode({ fetched_at = ngx.now(), count = 1,
-                    keys = { ["aforo-v1"] = cjson.encode({ kty = "RSA", kid = "aforo-v1", n = "n-aforo-v1", e = "AQAB" }) } })
+                handler._jwks_cache()[URI] = { keys = { ["aforo-v1"] = { verify = function() return true end } },
+                    fetched_at = now, expires_at = now + 600, last_attempt = now }
             end
             local exit = access_with(token("aforo-v1"), JWKS_CONF)
             ngx.sleep = orig_sleep
@@ -552,17 +622,31 @@ describe("access phase", function()
             assert.equals(0, #http_requests)
         end)
 
-        it("refreshes a stale set in the background, still verifying from the cache", function()
+        it("after the cache TTL one request refreshes; a failed refresh keeps the cached keys", function()
             http_responses = { jwks("aforo-v1") }
             access_with(token("aforo-v1"), JWKS_CONF)
-            local key = "aforo:jwks:" .. URI
-            local entry = cjson.decode(ngx.shared.aforo_buffer.store[key])
-            entry.fetched_at = ngx.now() - 7200
-            ngx.shared.aforo_buffer.store[key] = cjson.encode(entry)
+            age(601)                               -- past jwt_jwks_cache_ttl
+            http_responses = { { err = "connection refused" } }
             K.response._exit = nil
             assert.is_nil(access_with(token("aforo-v1"), JWKS_CONF))
-            assert.equals(1, #http_requests)   -- not fetched in the request
-            assert.equals(1, #timers)          -- a refresh is scheduled instead
+            assert.equals(2, #http_requests)
+            -- The last good set is used for at most 24 h.
+            age(86400)
+            handler._jwks_cache()[URI].last_attempt = ngx.now()
+            K.response._exit = nil
+            assert.equals("INVALID_SIGNATURE", access_with(token("aforo-v1"), JWKS_CONF).body.error_description)
+        end)
+
+        it("refuses an oversized JWKS without reading it all", function()
+            http_responses = { { status = 200, headers = { ["Content-Length"] = "300000" }, body = "{}" } }
+            assert.equals("INVALID_SIGNATURE", access_with(token("aforo-v1"), JWKS_CONF).body.error_description)
+        end)
+
+        it("names a token whose alg is not RS256", function()
+            http_responses = { jwks("aforo-v1") }
+            local exit = access_with(jwt(aforo_claims(), { alg = "HS256", kid = "aforo-v1" }), JWKS_CONF)
+            assert.equals("UNSUPPORTED_ALGORITHM", exit.body.error_description)
+            assert.equals(0, #http_requests)
         end)
     end)
     -- ── Rate limiting ───────────────────────────────────────────

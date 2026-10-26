@@ -93,20 +93,79 @@ function M.extract_measurements(response_body, extraction_paths, dimension_paths
 end
 
 -- ────────────────────────────────────────────────────────────
+-- Deterministic correlationId (FROZEN — A+ compound-key freeze, 2026-07-05)
+--
+-- Dedup-safety basis: the ingestor types correlationId as a UUID and
+-- CompoundEventDecomposer derives EVERY per-metric dedup key from it —
+--   correlationId:metricName[:dimensionKey]:index
+-- — so the correlationId is the dedup ROOT for the whole compound event.
+-- The pre-freeze random-uuid call minted a NEW random id per build; any
+-- wiring that rebuilds the event per delivery attempt (or any future
+-- redelivery transport) would decompose to NEW keys → double-billing.
+-- Now the id is derived purely from the request's stable identity, so
+-- rebuilding it any number of times within the same request — including
+-- across handler.lua's 3 flush retries — yields a byte-identical
+-- correlationId and the ingest dedups instead of double-billing.
+-- Identity mirrors handler.lua's standard key: ngx.var.request_id (the
+-- nginx per-request id, gateway-generated and stable through the log
+-- phase) > one-time random LAST RESORT (dedup opt-out for that single
+-- event; effectively unreachable — ngx.var.request_id always exists
+-- under nginx). NEVER seed from a request header (X-Request-Id etc.):
+-- the client controls it, so repeating it would collapse every call into
+-- one correlationId and bill many calls once. NEVER put a clock or
+-- per-call random back in here.
+-- ────────────────────────────────────────────────────────────
+
+-- Lua gotcha: "" is TRUTHY. An empty request id must never become the
+-- seed — every such request would derive the SAME correlationId, and the
+-- server would silently dedup real events as replays (revenue loss,
+-- undetectable because the shared id is a valid UUID). Normalize empty
+-- to nil so the chain falls through to the last resort.
+local function nonempty(v)
+    if v == nil or v == "" then return nil end
+    return v
+end
+
+-- uuid() and iso8601_utc() come from event-util.lua, shared with handler.lua
+-- (Gowtham, 2026-10-12): one UUID source that works on every supported Kong,
+-- one occurredAt format. The uuid is only the LAST RESORT below.
+local random_uuid = event_util.uuid
+local iso8601_utc = event_util.iso8601_utc
+
+local function derive_correlation_id(seed)
+    local hex = ngx.md5("aforo-compound:" .. seed)
+    -- Format as an RFC-4122 v3-style UUID (version nibble 3, variant
+    -- 10xx) so the ingestor's UUID-typed correlationId field parses it.
+    -- (n % 4) + 8 == (n & 0x3) | 0x8 — arithmetic form, no bit library.
+    local variant = string.format("%x", (tonumber(hex:sub(17, 17), 16) % 4) + 8)
+    return hex:sub(1, 8) .. "-" .. hex:sub(9, 12) ..
+           "-3" .. hex:sub(14, 16) ..
+           "-" .. variant .. hex:sub(18, 20) ..
+           "-" .. hex:sub(21, 32)
+end
+
+-- ────────────────────────────────────────────────────────────
 -- Build CompoundUsageEventRequest from extracted measurements
 -- ────────────────────────────────────────────────────────────
 
 function M.build_compound_event(customer_id, measurements, metadata, product_type)
     if not measurements or #measurements == 0 then return nil end
 
-    -- 2026-10-12: kong.tools.uuid() does not exist in Kong 3.x (it raised), and
-    -- occurredAt was epoch MILLIseconds, which the ingestor reads as seconds
-    -- -- the same two faults handler.lua had, fixed the same way.
+    local seed = ngx.var and nonempty(ngx.var.request_id) or nil
+    local correlation_id
+    if seed then
+        correlation_id = derive_correlation_id(seed)
+    else
+        correlation_id = random_uuid() -- last resort: random v4, NOT retry-safe
+        kong.log.warn("[aforo-compound] no stable request identity — ",
+                      "random correlationId is a dedup opt-out for this event")
+    end
+
     return {
-        correlationId = event_util.uuid(),
+        correlationId = correlation_id,
         customerId    = customer_id,
         productType   = product_type or "API",
-        occurredAt    = event_util.iso8601_utc(ngx.now()),
+        occurredAt    = iso8601_utc(ngx.now()),
         metadata      = metadata,
         measurements  = measurements,
     }
@@ -143,5 +202,7 @@ M.DEFAULT_DIMENSION_PATHS = {
     ["$.model"]  = "model-name",
     ["$.region"] = "region",
 }
+
+M._iso8601_utc = iso8601_utc
 
 return M

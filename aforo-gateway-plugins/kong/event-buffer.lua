@@ -38,6 +38,14 @@
 local http = require("resty.http")
 local cjson = require("cjson.safe")
 
+-- record_drop lives in event-util.lua (installed path first, source tree second).
+local event_util
+do
+    local ok, mod = pcall(require, "kong.plugins.aforo-metering.event-util")
+    event_util = ok and mod or require("event-util")
+end
+local record_drop = event_util.record_drop
+
 local M = {}
 
 local BUFFER_DICT = "aforo_buffer"
@@ -329,6 +337,7 @@ local function evict_failing(dict, except_bkey, n)
         end)
     end
     if evicted > 0 then
+        record_drop("buffer_overflow", evicted)
         log_throttled("warn", "evict_failing", 10, "[aforo-metering] Shared dict '", BUFFER_DICT,
             "' is nearly full: dropped the oldest ", evicted, " event(s) of destinations the ingestor ",
             "is refusing or failing, to keep metering the others. Repeats suppressed for 10s.")
@@ -444,6 +453,7 @@ local function per_event_retries(batch, body)
     end
 
     if #rejected > 0 then
+        record_drop("ingestor_rejected", #rejected)
         local sample = {}
         for i = 1, math.min(3, #rejected) do sample[i] = rejected[i] end
         log_throttled("err", "ingest_event_rejected", 60,
@@ -549,6 +559,7 @@ local function send_batch(settings, batch, timeout_ms, attempts, on_fail)
         -- single event that still gets 400 or 413 is dropped, with the reason.
         if status == 400 or status == 413 then
             if #batch > 1 then return "split", resp_body, status end
+            record_drop("rejected", 1)
             log_throttled("err", "ingest_rejected_event_" .. status, 60,
                 "[aforo-metering] The ingestor rejected an event with ", status,
                 status == 413 and " (too large for the ingestor or a proxy in front of it)" or "",
@@ -559,6 +570,7 @@ local function send_batch(settings, batch, timeout_ms, attempts, on_fail)
         -- Any other 4xx except 408 / 429: the ingestor understood the batch and
         -- refused it; retrying sends the same bytes to the same judgement.
         if status and status >= 400 and status < 500 and status ~= 408 and status ~= 429 then
+            record_drop("rejected", #batch)
             kong.log.err("[aforo-metering] Ingestor rejected the batch with ", status,
                 " -- dropping ", #batch, " event(s) rather than retrying them forever. ",
                 "Response: ", resp_body)
@@ -718,6 +730,7 @@ local function drop_expired(dict, settings, batch)
         if too_old(e) then expired = expired + 1 else fresh[#fresh + 1] = e end
     end
     if expired > 0 then
+        record_drop("expired", expired)
         kong.log.err("[aforo-metering] Dropped ", expired, " event(s) for ", settings.aforo_endpoint,
             " older than ", MAX_EVENT_AGE_SECONDS / 3600, " hours: the ingestor no longer accepts them.")
     end
@@ -753,6 +766,7 @@ local function drain(dict, bkey, settings)
             local kept, dropped = rebuffer(dict, bkey, keep, ctx.held)
             local what = ctx.held and "refused" or "failed"
             if dropped > 0 then
+                record_drop("buffer_overflow", dropped)
                 -- Never throttled: these events are gone.
                 kong.log.err("[aforo-metering] Delivery to ", settings.aforo_endpoint, " ", what,
                     ": ", kept, " of ", #keep, " event(s) put back for retry; ", dropped,
@@ -874,6 +888,7 @@ function M.push(conf, encoded)
         return false
     end
     if #encoded > MAX_EVENT_BYTES then
+        record_drop("too_large", 1)
         log_throttled("err", "event_too_large", 60, "[aforo-metering] Not buffering an event of ",
             #encoded, " bytes (the limit is ", MAX_EVENT_BYTES, "). Repeats suppressed for 60s.")
         return false
@@ -887,13 +902,14 @@ function M.push(conf, encoded)
     if held then
         -- Refused: keep the newest -- a new event pushes out the oldest.
         if count >= HELD_MAX_EVENTS then
-            drop(dict, bkey, count - HELD_MAX_EVENTS + 1, "head")
+            record_drop("buffer_overflow", drop(dict, bkey, count - HELD_MAX_EVENTS + 1, "head"))
             log_throttled("warn", "buffer_full_held_" .. bkey, 60, "[aforo-metering] ",
                 settings.aforo_endpoint, " is refusing this key's events (401/403/404, or 400 for ",
                 "every request), and it keeps only its newest ", HELD_MAX_EVENTS, ": dropping the ",
                 "oldest. Fix api_key / aforo_endpoint; see the flush errors. Repeats suppressed for 60s.")
         end
     elseif count >= MAX_BUFFER_SIZE then
+        record_drop("buffer_overflow", 1)
         save_settings(dict, bkey, conf)
         log_throttled("warn", "buffer_full", 10, "[aforo-metering] Buffer full for ",
             settings.aforo_endpoint, " (", count, " events) -- dropping the newest event. The ",
@@ -923,6 +939,7 @@ function M.push(conf, encoded)
         has_settings = save_settings(dict, bkey, conf)
     end
     if not has_settings then
+        record_drop("buffer_overflow", 1)
         log_throttled("err", "dict_full", 10, "[aforo-metering] Could not buffer an event: ",
             "shared dict '", BUFFER_DICT, "' is full (no room for this destination's settings). The ",
             "ingestor is failing or unreachable -- see the flush errors -- or the dict is small for ",
@@ -936,6 +953,7 @@ function M.push(conf, encoded)
         n, push_err = dict:rpush(bkey, encoded)
     end
     if not n then
+        record_drop("buffer_overflow", 1)
         log_throttled("err", "dict_full", 10, "[aforo-metering] Could not buffer an event: ",
             "shared dict '", BUFFER_DICT, "' is full (", tostring(push_err), "). The ingestor is ",
             "failing or unreachable -- see the flush errors -- or the dict is small for this ",
