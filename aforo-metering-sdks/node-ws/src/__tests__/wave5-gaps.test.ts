@@ -12,7 +12,8 @@ global.fetch = mockFetch as any;
 
 class FakeWs extends EventEmitter {
   readyState = 1;
-  send(_data: any, _cb?: any) {}
+  // Like ws: the send callback runs once the frame is written.
+  send(_data: any, ...rest: any[]) { const cb = rest.find((a) => typeof a === 'function'); cb?.(); }
 }
 
 const ok = () => ({ ok: true, status: 202, headers: new Map(), text: async () => '{"success":true,"data":{"accepted":1,"failed":0,"errors":[]}}' });

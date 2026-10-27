@@ -2,6 +2,8 @@
 
 Per-connection (and optionally per-frame) WebSocket metering for Go. Framework-agnostic — `gorilla/websocket`, `nhooyr.io/websocket`, `gobwas/ws`, or a raw `net/http` upgrade. You call `Open`, `RecordFrame`, and `Close`; the SDK aggregates per-connection counters and emits a connection-opened + connection-closed event pair to Aforo.
 
+Record an outbound frame only after the write succeeds, so a frame the socket refused is not billed (the Node and Python SDKs, which wrap `send`, do this for you).
+
 **Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 Reach for this when you bill WebSocket usage by connection (with duration, frame count, and byte totals) and want one open/close event pair per connection — with a per-frame mode for the cases where every message is billable.
@@ -81,7 +83,9 @@ func main() {
 				break
 			}
 			billing.RecordFrame(connID, "CLIENT_TO_SERVER", "TEXT", int64(len(msg)))
-			conn.WriteMessage(mt, msg)
+			if err := conn.WriteMessage(mt, msg); err != nil {
+				break // not written, so not billed
+			}
 			billing.RecordFrame(connID, "SERVER_TO_CLIENT", "TEXT", int64(len(msg)))
 		}
 	})

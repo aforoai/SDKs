@@ -56,8 +56,11 @@ public class FeedSocket {
     @OnMessage
     public void incoming(String msg, Session s) {
         billing.recordFrame(connectionId, "CLIENT_TO_SERVER", "TEXT", msg.length());
-        s.getAsyncRemote().sendText("echo: " + msg);
-        billing.recordFrame(connectionId, "SERVER_TO_CLIENT", "TEXT", msg.length() + 6);
+        String reply = "echo: " + msg;
+        // Record the outbound frame once it was sent, so a refused frame is not billed.
+        s.getAsyncRemote().sendText(reply, result -> {
+            if (result.isOK()) billing.recordFrame(connectionId, "SERVER_TO_CLIENT", "TEXT", reply.length());
+        });
     }
 
     @OnClose

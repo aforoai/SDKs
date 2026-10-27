@@ -443,28 +443,40 @@ export class AforoWsBilling {
       }
     });
 
-    // Wrap send() to count outbound frames
+    // Wrap send() to count outbound frames. A frame is billed only once the
+    // socket has accepted it (ws calls the send callback without an error), so a
+    // send to a closing or broken socket is never billed. The caller's own
+    // callback, if any, still runs with the same error.
     const origSend = ws.send.bind(ws);
     ws.send = (data: any, ...rest: any[]) => {
       if (closed) return origSend(data, ...rest);
       conn.lastActivity = Date.now();
-      sentCount++;
+      const callerCb = typeof rest[rest.length - 1] === 'function' ? rest.pop() : undefined;
       const bytes = estimateBytes(data);
-      sentBytes += bytes;
-      if (this.perFrameEvents) {
-        this.push({
-          customerId: opts.customerId,
-          wsConnectionId: connectionId,
-          productType,
-          wsDirection: 'SERVER_TO_CLIENT',
-          wsFrameType: typeof data === 'string' ? 'TEXT' : 'BINARY',
-          messageCount: 1,
-          dataBytes: bytes,
-          executionDurationMs: Date.now() - start,
-          metadata: opts.metadata,
-        });
-      }
-      return origSend(data, ...rest);
+      const frameType = typeof data === 'string' ? 'TEXT' : 'BINARY';
+      const onSent = (err?: Error) => {
+        // A frame accepted after the connection was reported closed is not
+        // billed: the CONNECTION_CLOSED totals have already gone out.
+        if (!err && !closed) {
+          sentCount++;
+          sentBytes += bytes;
+          if (this.perFrameEvents) {
+            this.push({
+              customerId: opts.customerId,
+              wsConnectionId: connectionId,
+              productType,
+              wsDirection: 'SERVER_TO_CLIENT',
+              wsFrameType: frameType,
+              messageCount: 1,
+              dataBytes: bytes,
+              executionDurationMs: Date.now() - start,
+              metadata: opts.metadata,
+            });
+          }
+        }
+        if (callerCb) callerCb(err);
+      };
+      return origSend(data, ...rest, onSent);
     };
 
     // opts.executionStatus is the connection's outcome: only the closing events

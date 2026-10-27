@@ -595,9 +595,12 @@ async def track_websockets_connection(
 
             if self._orig_send is not None:
                 async def _send(data):
+                    # Billed only once the send returns without raising: a
+                    # frame the socket refuses is not counted.
+                    billing._touch(self.connection_id)
+                    result = await self._orig_send(data)
                     self.sent += 1
                     self.sent_bytes += _byte_len(data)
-                    billing._touch(self.connection_id)
                     if billing.per_frame_events:
                         billing.push({
                             "customerId": customer_id,
@@ -610,7 +613,7 @@ async def track_websockets_connection(
                             "executionDurationMs": int((time.monotonic() - self.start) * 1000),
                             "metadata": metadata,
                         })
-                    return await self._orig_send(data)
+                    return result
                 websocket.send = _send  # type: ignore[attr-defined]
 
             if self._orig_recv is not None:
@@ -728,9 +731,11 @@ async def track_starlette_websocket(
             continue
 
         async def _wrapped(data, _orig=orig, _attr=attr, _direction=direction):
+            # Billed only once the send returns without raising.
+            billing._touch(connection_id)
+            result = await _orig(data)
             counters["sent"] += 1
             counters["sent_bytes"] += _byte_len(data)
-            billing._touch(connection_id)
             if billing.per_frame_events:
                 billing.push({
                     "customerId": customer_id,
@@ -743,7 +748,7 @@ async def track_starlette_websocket(
                     "executionDurationMs": int((time.monotonic() - start) * 1000),
                     "metadata": metadata,
                 })
-            return await _orig(data)
+            return result
 
         setattr(websocket, attr, _wrapped)
 

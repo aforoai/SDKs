@@ -9,7 +9,8 @@ import { startMockIngestor, type MockIngestor } from '../../test-support/mock-in
 jest.setTimeout(30_000);
 
 class FakeWs extends EventEmitter {
-  send(_d: any, _cb?: any) {}
+  // Like ws: the send callback runs once the frame is written.
+  send(_data: any, ...rest: any[]) { const cb = rest.find((a) => typeof a === 'function'); cb?.(); }
 }
 
 let mock: MockIngestor;

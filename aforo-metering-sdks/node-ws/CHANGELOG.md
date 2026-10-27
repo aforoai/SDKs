@@ -6,6 +6,9 @@ All notable changes to `@aforoai/ws-metering` are documented here. Format follow
 
 Breaking. Migration: give `wrapServer` a `customerResolver` (or `trustCustomerHeader: true` behind a proxy you control), use an `https://` `ingestorUrl` (or `allowInsecureHttp: true`), and call `await billing.shutdown()` from your SIGTERM handler.
 
+### Changed (billing)
+- **An outbound frame is billed only once the socket accepts it.** The `send()` wrapper counts the frame (and emits its per-frame event) in `ws`'s send callback when it reports no error, so a frame sent to a closing or broken socket is no longer billed. Before, it was counted when `send()` was called. The caller's own callback still runs with the same error. A frame accepted after the connection was reported closed is not added to the totals already sent.
+
 ### Fixed (transport core, review of 2026-10-26)
 These come from the shared Node core (`src/transport-core/core.ts`) and follow contract/TRANSPORT-SPEC.md "Edge cases every core handles the same way".
 - **The request deadline covers reading the response body.** A server that sent headers and then stalled, or dripped the body a byte at a time, held `flush()` and `shutdown()` forever; the read is now inside `timeoutMs` and the batch is retried.

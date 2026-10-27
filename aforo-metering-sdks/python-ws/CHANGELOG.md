@@ -7,6 +7,7 @@ All notable changes to `aforo-ws-metering` are documented here. This project fol
 Breaking. Migration: keep passing `customer_id`, or switch to `customer_resolver=` / `trust_customer_header=True` (calling a helper with none of them now raises `ValueError`); use an `https://` `ingestor_url` (or `allow_insecure_http=True`); stop expecting `retry_exhausted` drops.
 
 ### Changed
+- **An outbound frame is billed only once the send returns.** `track_websockets_connection` and `track_starlette_websocket` count a frame (and emit its per-frame event) after the wrapped `send` / `send_text` / `send_bytes` returns without raising, so a frame the socket refuses is no longer billed. Before, it was counted before the send.
 - **Shared transport core** (`aforo_ws_metering/_transport`, a copy of the core SDK's; G271, G285): one bounded queue (`max_queue_size`, default 10 000; overflow drops the oldest as `overflow`) and one sender thread. `push()` no longer starts a thread when `flush_count` is reached, and the old unbounded list is gone.
 - **Outages keep events**: after 3 full-jitter retries, or on 401/403, the batch is requeued with the same idempotency keys and retried after a pause (G267, G268). `Retry-After` is read in both forms, capped at 60 s. `retry_exhausted` is no longer reported; new drop reasons `shutdown` and `closed`.
 - **`shutdown()` is bounded** by `shutdown_timeout_sec` (default 5) and runs at interpreter exit; one pooled HTTP client; default `flush_count` 500 (G269).

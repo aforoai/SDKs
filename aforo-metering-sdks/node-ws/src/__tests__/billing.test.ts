@@ -34,7 +34,8 @@ const config = () => ({
 // A tiny WebSocket stub that matches the SDK's MinimalWs surface.
 class FakeWs extends EventEmitter {
   readyState = 1;
-  send(_data: any, _cb?: any) { /* stubbed; billing rewrites this at trackConnection time */ }
+  // Like ws: the send callback runs once the frame is written.
+  send(_data: any, ...rest: any[]) { const cb = rest.find((a) => typeof a === 'function'); cb?.(); }
 }
 
 function eventsOfType(type: string) {

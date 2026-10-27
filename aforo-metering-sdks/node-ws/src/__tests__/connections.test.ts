@@ -9,7 +9,8 @@ import { AforoWsBilling, WsUsageEvent, DropReason } from '../index';
 
 class FakeWs extends EventEmitter {
   readyState = 1;
-  send(_data: any, _cb?: any) { /* replaced by trackConnection */ }
+  // Like ws: the send callback runs once the frame is written.
+  send(_data: any, ...rest: any[]) { const cb = rest.find((a) => typeof a === 'function'); cb?.(); }
 }
 
 let sent: WsUsageEvent[];
