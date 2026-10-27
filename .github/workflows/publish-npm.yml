@@ -113,6 +113,8 @@ jobs:
         with:
           subject-path: pack/*.tgz
       - name: Publish the attested tarball (public, with provenance)
-        run: npm publish pack/*.tgz --provenance --access public
+        # ./ is required: without it npm parses "pack/<name>.tgz" as the GitHub shorthand
+        # owner/repo and runs git ls-remote ssh://git@github.com/pack/... (wave 5 first run).
+        run: npm publish ./pack/*.tgz --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
