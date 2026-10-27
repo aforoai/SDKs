@@ -1,6 +1,6 @@
 # aforo-metering — User Guide
 
-**Version:** 1.1.2 · **Updated:** 2026-10-01 · **Audience:** Python backend engineers wiring usage metering into an existing service.
+**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Python backend engineers wiring usage metering into an existing service.
 
 ## What you'll build
 
@@ -16,7 +16,7 @@ A Python service that reports billable usage to Aforo — either by calling `cli
 ## Step 1 — Install the package
 
 ```bash
-pip install -e .                  # from the cloned SDK source (or: pip install "aforo-metering>=1.1.2")
+pip install -e .                  # from the cloned SDK source (or: pip install "aforo-metering>=2.0.0")
 # or, once published:  pip install aforo-metering
 ```
 
@@ -58,18 +58,18 @@ client.track(
 
 Every event carries a top-level `productType` — the client's `product_type` (default `"API"`) unless you pass `track(product_type="AI_AGENT")` for that event. The production ingestor requires it.
 
-> ⚠ `customer_id` and `metric_name` are both required and must not be blank, and `quantity` must be `> 0`. An event that breaks these rules, or exceeds one of the ingestor's field limits, is not sent: `track()` does not raise, it counts the event in `client.dropped_count`, logs a WARN naming the field, and passes it to `on_drop` with reason `"invalid"`. Calling `track()` after `shutdown()` raises `RuntimeError`.
+> ⚠ `customer_id` and `metric_name` are both required and must not be blank, and `quantity` must be `> 0`. An event that breaks these rules, or exceeds one of the ingestor's field limits, is not sent: `track()` does not raise, it counts the event in `client.dropped_count`, logs a WARN naming the field, and passes it to `on_drop` with reason `"invalid"`. Calling `track()` after `shutdown()` does not raise either: the event is dropped with reason `"closed"`.
 
 ## Step 4 — Make delivery happen (and confirm it)
 
-Three things flush the buffer: hitting `flush_count` (50 events), the background timer (`flush_interval`, 5 s), and `shutdown()` / interpreter exit. To force it now and read the result:
+One background thread per client sends the queue: when `flush_count` events are queued (500), every `flush_interval` (5 s), and on `shutdown()` / interpreter exit. To send now and read the result:
 
 ```python
 result = client.flush()
 print(result.sent, result.failed)   # e.g. 1 0
 ```
 
-`flush()` is synchronous and thread-safe. `FlushResult.failed > 0` means the batch hit a non-retryable 4xx or exhausted retries — the events are gone, not re-queued.
+`flush()` waits for the background thread; it never sends on your thread and is safe to call from any thread. `FlushResult.failed > 0` means the ingestor rejected events (non-retryable 4xx, or per-event errors) — those are gone. If the ingestor is unreachable, the batch goes back to the queue with its idempotency keys after `max_retries` and is retried after a pause (a random time up to 5 s, never under 250 ms, the ceiling growing to 5 min). A `flush()` while that pause is on makes one attempt and returns with the events still queued if it fails. `shutdown()` keeps retrying until `shutdown_timeout`. Nothing is lost unless the queue (`max_queue_size`) fills up.
 
 ## Step 5 — Verify it landed in Aforo
 
@@ -89,7 +89,7 @@ assert result.failed == 0 and result.sent >= 1
 client.shutdown()   # drains the buffer; safe to call once
 ```
 
-`shutdown()` is registered via `atexit`, so a clean exit flushes for you. Call it explicitly in long-lived processes (workers, request handlers that build per-request clients) where you can't rely on interpreter exit. A `SIGKILL` or hard crash skips `atexit` — buffered-but-unflushed events are lost.
+`shutdown()` also runs at interpreter exit (`atexit`), so a clean exit flushes for you. It flushes for at most `shutdown_timeout` seconds (default 5); each request in that window uses the time left, and events still queued at the deadline go to `on_drop` with reason `"shutdown"`. Call it explicitly in long-lived processes where you can't rely on interpreter exit. A `SIGKILL` or hard crash skips `atexit` — queued events are lost. A client created before `fork()` (gunicorn `--preload`, multiprocessing) works in each child: the child gets its own queue and sender.
 
 ## Step 7 (alternative) — Meter every request with middleware
 
@@ -106,15 +106,18 @@ from aforo.middleware.fastapi import AforoMeteringMiddleware
 
 app = FastAPI()
 app.add_middleware(AforoMeteringMiddleware, api_key=os.environ["AFORO_API_KEY"],
+                   customer_resolver=lambda scope: scope["user"].customer_id,  # required
                    product_type="API")  # optional; default "API"
 ```
 
 **Flask:**
 
 ```python
+from flask import g
 from aforo.middleware.flask import AforoMetering
-AforoMetering(app, api_key=os.environ["AFORO_API_KEY"], product_type="API")
-# or app.config["AFORO_API_KEY"] = "…" then AforoMetering(app)
+AforoMetering(app, api_key=os.environ["AFORO_API_KEY"], product_type="API",
+              customer_resolver=lambda req: g.current_user.customer_id)  # required
+# or set app.config["AFORO_API_KEY"] / ["AFORO_CUSTOMER_RESOLVER"], then AforoMetering(app)
 ```
 
 **Django** (`settings.py`):
@@ -122,12 +125,13 @@ AforoMetering(app, api_key=os.environ["AFORO_API_KEY"], product_type="API")
 ```python
 MIDDLEWARE = [..., "aforo.middleware.django.AforoMeteringMiddleware"]
 AFORO_API_KEY = os.environ["AFORO_API_KEY"]
+AFORO_CUSTOMER_RESOLVER = "aforo.middleware.django.user_id_resolver"  # required
 AFORO_PRODUCT_TYPE = "API"  # optional; default "API"
 ```
 
 Each request event carries top-level `productType`, `endpointPath` (path without query string), `httpMethod`, `statusCode` and `responseTimeMs`. `endpointPath` and `httpMethod` come from the incoming request: a value over the ingestor's limit (512 / 16 characters) is truncated to the limit and the event is still sent, with one WARNING per field per process. Fields you set yourself are never truncated; an over-long one drops the event with reason `invalid`.
 
-> ⚠ The middleware only meters requests it can attribute to a customer. Configure `customer_id` (keyword, or `AFORO_CUSTOMER_ID` in Flask config / Django settings); by default it reads `X-Customer-Id` (Django tries `request.user.id` first). The caller's `X-Api-Key` is never used — it is the end user's secret, not a customer id. **No customer ID → the request is silently not metered.** `OPTIONS` (CORS preflight) requests are never metered. Set that header at your gateway/auth layer; do not trust a value the end client can spoof for a customer it doesn't own.
+> ⚠ Every middleware needs to know which customer to bill, from identity **your service verified**. Pass `customer_resolver` (FastAPI/Flask keyword, or `AFORO_CUSTOMER_RESOLVER` in Flask config / Django settings — a callable or its dotted path; Django has `aforo.middleware.django.user_id_resolver`). Reading the `X-Customer-Id` header instead needs `trust_customer_header=True` (`AFORO_TRUST_CUSTOMER_HEADER = True`): the caller of your API sets that header, so anyone could bill another customer unless your gateway overwrites it. With neither, the middleware raises `ValueError` when your app starts. A request whose resolver returns nothing is served normally, not metered, and counted in `dropped_count` as `invalid`. The caller's `X-Api-Key` is never used. `OPTIONS` (CORS preflight) requests are never metered.
 
 > ⚠ Default `exclude_paths` skip health/metrics/docs routes (`/health`, `/ready`, `/metrics`, `/favicon.ico`, plus `/openapi.json` and `/docs` on FastAPI, `/admin` and `/static` on Django, `/static` on Flask). Override `exclude_paths` to change this.
 
@@ -140,15 +144,18 @@ Each request event carries top-level `productType`, `endpointPath` (path without
 | `api_key` | `str` | required | Aforo API key, sent to the ingestor as `X-API-Key`. |
 | `base_url` | `str` | `https://api.aforo.ai` | Host only; `/v1/ingest/batch` is appended. |
 | `product_type` | `str` | `"API"` | Top-level `productType` on every event; trimmed + upper-cased, unknown values passed through. Override per event with `track(product_type=...)`. |
-| `flush_count` | `int` | `50` | Buffer threshold + max batch size (clamped to 1..1000). |
+| `flush_count` | `int` | `500` | Events per request and the queue size that wakes the sender (clamped to 1..1000). |
 | `flush_interval` | `float` | `5.0` | Background flush cadence (seconds). |
-| `max_queue_size` | `int` | `10000` | Ring-buffer cap; oldest dropped on overflow. |
-| `max_retries` | `int` | `3` | Retries on 5xx/408/429. |
-| `retry_base_s` | `float` | `1.0` | Backoff base: `retry_base_s * 2**attempt`. |
-| `timeout` | `float` | `10.0` | Per-request timeout (seconds). |
-| `shutdown_timeout` | `float` | `5.0` | Drain budget on shutdown. |
+| `max_queue_size` | `int` | `10000` | Queue cap; oldest dropped on overflow (reason `overflow`). |
+| `max_retries` | `int` | `3` | Retries on network errors, timeouts, 5xx, 408, 429; then the batch is requeued. |
+| `retry_base_s` | `float` | `0.5` | Full-jitter backoff: `random(0, min(30, retry_base_s * 2**attempt))`; `Retry-After` (both forms) wins when larger, capped at 60 s. |
+| `timeout` | `float` | `10.0` | Total deadline per request (seconds). |
+| `shutdown_timeout` | `float` | `5.0` | `shutdown()` flushes for at most this long; leftovers are dropped as `shutdown`. |
+| `allow_insecure_http` | `bool` | `False` | Allow plain `http://` on a host other than localhost / 127.0.0.1 / ::1. |
 | `heartbeat_interval` | `float` | `30.0` | Seconds between session heartbeats. |
-| `on_drop` | `callable?` | `None` | `on_drop(events, reason)` for events the SDK loses; `reason` is `overflow`, `retry_exhausted`, `rejected` or `invalid`. `client.dropped_count` is the running total. |
+| `on_drop` | `callable?` | `None` | `on_drop(events, reason)` for events the SDK loses; `reason` is `overflow`, `rejected`, `invalid`, `shutdown` or `closed`. `client.dropped_count` is the running total. |
+| `on_error` | `callable?` | `None` | Opt-in hook for delivery problems. Receives an `aforo.TransportError`; branch on `.kind`: `outage` / `auth` (still queued, retried), `rejected`, `shutdown`, `closed`. `.events` and `.status` carry the events and HTTP status. |
+| `on_accepted` | `callable?` | `None` | Opt-in hook `on_accepted(body, events)` after every accepted batch, with the ingestor's response `data` (for example `killedSessionIds`). |
 
 `track(...)` arguments:
 
@@ -165,7 +172,7 @@ Each request event carries top-level `productType`, `endpointPath` (path without
 | `extra_fields` | `dict?` | `None` | Optional top-level ingest fields by their camelCase wire name (`agentId`, `sessionId`, `endpointPath`, …). |
 | `event` | `TrackEvent?` | `None` | Pass a `TrackEvent` instead of keyword args. |
 
-`MiddlewareOptions` (extra knobs for the framework adapters): `product_type` (default `"API"`), `metric_name`, `quantity`, `customer_id`, `metadata` (each a constant or a callable over the request/scope), `exclude_paths` (`list[str]`), `exclude_status_codes` (`list[int]`), plus `flush_count` / `flush_interval` / `max_queue_size` forwarded to the client.
+`MiddlewareOptions` (extra knobs for the framework adapters): `customer_resolver` (required unless `trust_customer_header=True`; `customer_id` is its old name), `trust_customer_header`, `product_type` (default `"API"`), `metric_name`, `quantity`, `metadata` (each a constant or a callable over the request/scope), `exclude_paths` (`list[str]`), `exclude_status_codes` (`list[int]`), plus `flush_count` / `flush_interval` / `max_queue_size` / `allow_insecure_http` forwarded to the client.
 
 ### Session heartbeats
 
@@ -178,14 +185,16 @@ Each heartbeat has `quantity: 1` (never billed — the ingestor intercepts heart
 | Symptom | Cause | Fix |
 |---|---|---|
 | `flush()` returns `sent=0, failed=0` | Buffer was empty — `track()` was never called, or another flush already drained it. | Confirm `client.buffered_count` before flushing; check you're calling the same client instance. |
-| `FlushResult.failed > 0`, logs show "Ingestor returned 401/403 — not retrying" | Bad or unscoped API key. 4xx is non-retryable, so the batch is dropped. | Fix `AFORO_API_KEY`; verify the key belongs to the tenant you're sending for. |
+| ERROR "Ingestor answered HTTP 401/403: the API key is wrong or revoked" | Bad or unscoped API key. The events stay queued (bounded by `max_queue_size`) and are retried after a pause. | Fix `AFORO_API_KEY` and restart; verify the key belongs to the tenant you're sending for. |
 | `sent` is positive but nothing in the console | Right delivery, wrong target or unmapped metric. | Confirm `base_url` host; confirm `metric_name` is attached to a rate plan / metric definition in Aforo. |
-| Middleware never emits events | No `X-Customer-Id` on requests (and no `customer_id` resolver), or the path is excluded. | Set the customer header upstream; check your route isn't in `exclude_paths`. |
+| Middleware never emits events, `dropped_count` rises with `invalid` | Your `customer_resolver` returns `None` for those requests, or the path is excluded. | Check the resolver against an authenticated request; check your route isn't in `exclude_paths`. |
+| `ValueError: ... needs to know which customer to bill` at start-up | No `customer_resolver` and no `trust_customer_header`. | Pass a resolver (recommended) or opt in to the header. |
 | Events lost on process restart | `SIGKILL`/crash skips `atexit`; buffered events never flushed. | Call `client.shutdown()` in your shutdown hook; lower `flush_interval`/`flush_count` for tighter delivery. |
-| `RuntimeError: AforoClient is shut down` | `track()` called after `shutdown()`. | Build a fresh client, or don't shut down until you're done emitting. |
+| `on_drop` gets reason `closed` | `track()` called after `shutdown()`. | Build a fresh client, or don't shut down until you're done emitting. |
+| `ValueError: base_url must use https://` | Plain `http://` to a remote host. | Use `https://`, or pass `allow_insecure_http=True` for a trusted internal network. |
 | `client.dropped_count` rises, WARN "Invalid event not sent" | `track()` got a blank `customer_id` / `metric_name`, `quantity <= 0`, or a field over the ingestor's limit. | Read the WARN (it names the field and limit) or log the events your `on_drop` hook receives with reason `"invalid"`; fix the call site. |
 | `FlushResult.failed > 0` on a `202` | The ingestor rejected individual events (unknown metric, …); each `errors[].message` is logged. | Fix the event source. Those events are passed to `on_drop` with reason `"rejected"`. |
-| Sudden gaps under burst load | Ring buffer hit `max_queue_size`; oldest events dropped to make room. | Raise `max_queue_size`, or lower `flush_interval` so the buffer drains faster. |
+| `on_drop` gets reason `overflow` | The queue hit `max_queue_size` — usually a long ingest outage. | Raise `max_queue_size`, and persist what `on_drop` receives so you can replay it. |
 
 ## What this guide does NOT cover
 

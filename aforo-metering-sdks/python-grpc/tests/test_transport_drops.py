@@ -70,7 +70,7 @@ def _emit(b, customer_id="cust_1"):
 
 
 def test_terminal_4xx_is_not_retried_and_drops_as_rejected(http):
-    http.script = [(401, {}, b'{"errors":[{"message":"bad key"}]}')]
+    http.script = [(422, {}, b'{"errors":[{"message":"bad key"}]}')]
     drops, errors = [], []
     b = _make(drops, errors)
     _emit(b); _emit(b, "cust_2")
@@ -81,22 +81,34 @@ def test_terminal_4xx_is_not_retried_and_drops_as_rejected(http):
     assert b.dropped_count == 2
     assert [(len(e), r) for e, r in drops] == [(2, "rejected")]
     assert all(ev["idempotencyKey"] for ev in drops[0][0])
-    assert len(errors) == 1 and "HTTP 401" in str(errors[0]) and "bad key" in str(errors[0])
+    assert len(errors) == 1 and "HTTP 422" in str(errors[0]) and "bad key" in str(errors[0])
 
 
-def test_5xx_exhaustion_drops_as_retry_exhausted_with_stable_keys(http):
-    http.script = [(503, {}, b"")] * 3
+def test_401_keeps_the_events_queued_instead_of_dropping_them(http):
+    http.script = [(401, {}, b"")]
     drops, errors = [], []
     b = _make(drops, errors)
     _emit(b)
+    assert b.flush() == 1  # still queued; the breaker is open
+    assert b.dropped_count == 0 and drops == []
+    assert len(errors) == 1 and "401" in str(errors[0])
+    b.shutdown()
+    assert len(http.requests) == 2
+    assert b.dropped_count == 0
+
+
+def test_5xx_exhaustion_requeues_with_stable_keys(http):
+    http.script = [(503, {}, b"")] * 4
+    drops, errors = [], []
+    b = _make(drops, errors)
+    _emit(b)
+    b.flush()
     b.shutdown()
 
-    assert len(http.requests) == 3
+    assert len(http.requests) == 5  # 1 + 3 retries, then resent at shutdown
     keys = [r["body"]["events"][0]["idempotencyKey"] for r in http.requests]
     assert len(set(keys)) == 1
-    assert b.dropped_count == 1
-    assert drops[0][1] == "retry_exhausted"
-    assert drops[0][0][0]["idempotencyKey"] == keys[0]
+    assert b.dropped_count == 0 and drops == []
 
 
 def test_429_waits_for_retry_after_then_succeeds(http):
@@ -104,6 +116,7 @@ def test_429_waits_for_retry_after_then_succeeds(http):
     drops, errors = [], []
     b = _make(drops, errors)
     _emit(b)
+    b.flush()
     b.shutdown()
 
     assert len(http.requests) == 2
@@ -155,7 +168,7 @@ def test_invalid_event_is_dropped_without_raising(http, caplog):
     assert [r for _e, r in drops] == ["invalid"] * 3
     assert all(e[0]["idempotencyKey"] for e, _r in drops)
     # Same message three times -> one WARNING line.
-    assert len([r for r in caplog.records if "invalid event" in r.getMessage()]) == 1
+    assert len([r for r in caplog.records if "Invalid event not sent" in r.getMessage()]) == 1
     sent = [ev["customerId"] for r in http.requests for ev in r["body"]["events"]]
     assert sent == ["cust_ok"]
     assert "authorization" not in http.requests[0]["headers"]

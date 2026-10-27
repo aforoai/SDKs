@@ -237,7 +237,7 @@ class AforoWsIntegrationTest {
                 2000);
 
         Map<String, Object> open = events.stream()
-                .filter(e -> "PING".equals(e.get("wsFrameType")))
+                .filter(e -> "OPEN".equals(e.get("wsFrameType")))
                 .findFirst().orElseThrow();
         Map<String, Object> closed = events.stream()
                 .filter(e -> "CLOSE".equals(e.get("wsFrameType")))

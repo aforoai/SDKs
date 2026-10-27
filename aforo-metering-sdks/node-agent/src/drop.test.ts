@@ -1,166 +1,157 @@
 /**
- * Drop observability + onDrop hook (A+ delivery-guarantee prompt 6 —
- * transport-variant mirror of the core SDK's drop hardening).
- *
- * This SDK sends each event ONCE (no retries) as a single Apigee-format
- * POST to <ingestorUrl>/events, so the drop sites are the failed sends:
- * network error / 5xx → 'retry_exhausted', 4xx → 'rejected'. Events carry
- * idempotency keys stamped at creation → dedup-safe replay.
+ * Drop accounting and the deprecated `onDrop` hook. 2.0.0 (mirror PR #58)
+ * replaced the per-event sender these tests used to cover and deleted the
+ * file; this restores the same guarantees for the batch sender:
+ * every permanently lost event is counted, reported once with its reason,
+ * keeps its idempotency key, and a throwing hook never breaks delivery.
+ * Events kept for a retry are not drops.
  */
+import AforoAgent, { type AforoAgentConfig, type DropReason, type IngestEvent } from './index';
 
-import AforoAgent, { type UsageEvent, type DropReason } from './index';
+type Reply = { status: number; body?: unknown } | Error;
 
-describe('AforoAgent — drop observability + onDrop hook', () => {
-  let warnSpy: jest.SpyInstance;
-
-  beforeEach(() => {
-    warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+function scripted(script: Reply[]) {
+  const calls: Array<{ events: IngestEvent[] }> = [];
+  const fetchImpl = jest.fn(async (_url: unknown, init: any) => {
+    const body = JSON.parse(init.body);
+    calls.push(body);
+    const next = script.shift();
+    if (next instanceof Error) throw next;
+    const reply = next ?? { status: 202, body: { success: true, data: { accepted: body.events.length, duplicates: 0, failed: 0 } } };
+    return new Response(reply.body === undefined ? '' : JSON.stringify(reply.body), { status: reply.status });
   });
+  return { calls, fetchImpl: fetchImpl as unknown as typeof fetch };
+}
 
-  afterEach(() => {
-    warnSpy.mockRestore();
+function agentWith(fetchImpl: typeof fetch, extra: Partial<AforoAgentConfig> = {}) {
+  const drops: Array<{ events: IngestEvent[]; reason: DropReason }> = [];
+  const agent = new AforoAgent({
+    apiKey: 'sk_test', customerId: 'cust_1', agentId: 'agent_1', fetchImpl,
+    flushIntervalMs: 60_000, retryBaseDelayMs: 1, maxRetries: 1, logger: null,
+    onDrop: (events, reason) => drops.push({ events, reason }),
+    ...extra,
   });
+  return { agent, drops };
+}
 
-  function newAgent(fetchImpl: any, overrides: Record<string, unknown> = {}) {
-    return new AforoAgent({
-      tenantId: 'tenant-001',
-      productId: 'prod-agent-001',
-      apiKey: 'sk_agent_abc',
-      customerId: 'cust_drop',
-      maxRetries: 1, // single attempt: these tests are about drop accounting, not retries
-      fetchImpl,
-      ...overrides,
-    } as any);
-  }
-
-  async function emitOne(agent: AforoAgent, agentId = 'agent_1') {
-    await agent.emitEvent({
-      eventType: 'agent_step',
-      metricKey: 'step_count',
-      value: 1,
-      agentId,
-      sessionId: 'sess_1',
-      properties: {},
-    });
-  }
-
-  it('network failure drops the batch, counts it, warns, and fires onDrop', async () => {
-    const failingFetch = jest.fn(async () => {
-      throw new Error('ECONNREFUSED');
-    });
-    const drops: Array<{ events: UsageEvent[]; reason: DropReason }> = [];
-    const agent = newAgent(failingFetch, {
-      onDrop: (events: UsageEvent[], reason: DropReason) => drops.push({ events, reason }),
-    });
-
-    await emitOne(agent, 'agent_1');
-    await emitOne(agent, 'agent_2');
+describe('onDrop and droppedCount', () => {
+  test('a non-retryable rejection drops the batch with reason "rejected", keys intact', async () => {
+    const { fetchImpl } = scripted([{ status: 400, body: { message: 'bad metric' } }]);
+    const { agent, drops } = agentWith(fetchImpl);
+    const s = agent.startSession({ sessionId: 'r' });
+    await s.recordStep({});
+    await s.recordStep({});
     await agent.flush();
-
     expect(agent.droppedCount).toBe(2);
     expect(drops).toHaveLength(1);
-    expect(drops[0].reason).toBe('retry_exhausted');
-    expect(drops[0].events).toHaveLength(2);
-    expect(drops[0].events[0].agentId).toBe('agent_1');
-    // Events keep their keys — dedup-safe replay is possible
-    expect(drops[0].events[0].idempotencyKey).toMatch(/^agent:/);
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('retry_exhausted'));
-    expect(failingFetch).toHaveBeenCalledTimes(2); // one POST per event, still no retries
+    expect(drops[0].reason).toBe('rejected');
+    expect(drops[0].events.map((e) => e.idempotencyKey)).toEqual(['r:1', 'r:2']);
   });
 
-  it('partial failure drops ONLY the failed events (per-event fan-out)', async () => {
-    let call = 0;
-    const flakyFetch = jest.fn(async () => {
-      call++;
-      return call === 1 ? { ok: true, status: 202 } : { ok: false, status: 503 };
-    });
-    const drops: Array<{ events: UsageEvent[]; reason: DropReason }> = [];
-    const agent = newAgent(flakyFetch, {
-      onDrop: (events: UsageEvent[], reason: DropReason) => drops.push({ events, reason }),
-    });
-
-    await emitOne(agent, 'agent_ok');
-    await emitOne(agent, 'agent_lost');
-    await agent.flush();
-
-    expect(agent.droppedCount).toBe(1); // only the failed send is dropped
-    expect(drops).toHaveLength(1);
-    expect(drops[0].events).toHaveLength(1);
-    expect(drops[0].events[0].agentId).toBe('agent_lost');
-  });
-
-  it('4xx response fires onDrop with reason "rejected"', async () => {
-    const rejectingFetch = jest.fn(async () => ({ ok: false, status: 400 }));
-    const reasons: DropReason[] = [];
-    const agent = newAgent(rejectingFetch, {
-      onDrop: (_e: UsageEvent[], reason: DropReason) => reasons.push(reason),
-    });
-
-    await emitOne(agent);
-    await agent.flush();
-
-    expect(agent.droppedCount).toBe(1);
-    expect(reasons).toEqual(['rejected']);
-  });
-
-  it('5xx response fires onDrop with reason "retry_exhausted"', async () => {
-    const errFetch = jest.fn(async () => ({ ok: false, status: 503 }));
-    const reasons: DropReason[] = [];
-    const agent = newAgent(errFetch, {
-      onDrop: (_e: UsageEvent[], reason: DropReason) => reasons.push(reason),
-    });
-
-    await emitOne(agent);
-    await agent.flush();
-
-    expect(agent.droppedCount).toBe(1);
-    expect(reasons).toEqual(['retry_exhausted']);
-  });
-
-  it('default (no onDrop): drop is counted + warned, flush resolves normally', async () => {
-    const failingFetch = jest.fn(async () => {
-      throw new Error('ECONNREFUSED');
-    });
-    const agent = newAgent(failingFetch);
-
-    await emitOne(agent);
-    await expect(agent.flush()).resolves.toBeUndefined();
-
-    expect(agent.droppedCount).toBe(1);
-    expect(warnSpy).toHaveBeenCalled();
-  });
-
-  it('a throwing onDrop hook never breaks flushing', async () => {
-    const failingFetch = jest.fn(async () => {
-      throw new Error('ECONNREFUSED');
-    });
-    const agent = newAgent(failingFetch, {
-      onDrop: () => {
-        throw new Error('hook bug');
-      },
-    });
-
-    await emitOne(agent);
-    await expect(agent.flush()).resolves.toBeUndefined();
-    expect(agent.droppedCount).toBe(1);
-  });
-
-  it('happy path is unchanged: no drops, no warns, droppedCount stays 0', async () => {
-    const okFetch = jest.fn(async () => ({ ok: true, status: 200 }));
-    const onDrop = jest.fn();
-    const agent = newAgent(okFetch, { onDrop });
-
-    await emitOne(agent);
-    await agent.flush();
-
+  test('an outage is not a drop: events stay buffered and onDrop is not called', async () => {
+    const { fetchImpl } = scripted([new TypeError('fetch failed')]);
+    const { agent, drops } = agentWith(fetchImpl);
+    await agent.startSession().recordStep({});
+    const result = await agent.flush();
+    expect(result.pending).toBe(1);
     expect(agent.droppedCount).toBe(0);
-    expect(onDrop).not.toHaveBeenCalled();
-    expect(warnSpy).not.toHaveBeenCalled();
-    expect(okFetch).toHaveBeenCalledTimes(1); // one event → one POST
-    const [url, init] = (okFetch.mock.calls as unknown as [string, { body: string }][])[0];
-    const body = JSON.parse(init.body);
-    expect(body.idempotencyKey).toMatch(/^agent:/);
-    expect(body.properties.agentId).toBe('agent_1');
-    expect(String(url)).toContain('/events');
+    expect(drops).toEqual([]);
+  });
+
+  test('per-event rejections in a 2xx drop only the named events', async () => {
+    const { fetchImpl } = scripted([{
+      status: 202,
+      body: { success: true, data: { accepted: 1, duplicates: 0, failed: 1, errors: [{ index: 0, message: 'unknown metric' }] } },
+    }]);
+    const { agent, drops } = agentWith(fetchImpl);
+    const s = agent.startSession({ sessionId: 'p' });
+    await s.recordStep({});
+    await s.recordStep({});
+    await agent.flush();
+    expect(agent.droppedCount).toBe(1);
+    expect(drops).toEqual([{ events: [expect.objectContaining({ idempotencyKey: 'p:1' })], reason: 'rejected' }]);
+  });
+
+  test('failures the response does not name are counted, but no event is handed out as dropped', async () => {
+    const { fetchImpl } = scripted([{ status: 202, body: { success: true, data: { accepted: 1, duplicates: 0, failed: 1 } } }]);
+    const errors: any[] = [];
+    const { agent, drops } = agentWith(fetchImpl, { onError: (e) => errors.push(e) });
+    const s = agent.startSession();
+    await s.recordStep({});
+    await s.recordStep({});
+    await agent.flush();
+    expect(agent.droppedCount).toBe(1);
+    expect(drops).toEqual([]);
+    // The core counts unnamed failures but reports no events for them, so onError sees nothing to replay.
+    expect(errors.filter((e) => e.events.length > 0)).toEqual([]);
+  });
+
+  test('overflow drops the oldest events with reason "overflow"', async () => {
+    const { fetchImpl } = scripted([new Error('down'), new Error('down')]);
+    const { agent, drops } = agentWith(fetchImpl, { maxBatchSize: 2, maxBufferSize: 2 });
+    const s = agent.startSession({ sessionId: 'o' });
+    s.recordUsage('gpuHours', 1);
+    s.recordUsage('gpuHours', 1);
+    await agent.flush();
+    s.recordUsage('gpuHours', 1);
+    expect(drops).toEqual([{ events: [expect.objectContaining({ idempotencyKey: 'o:1' })], reason: 'overflow' }]);
+    expect(agent.droppedCount).toBe(1);
+  });
+
+  test('an invalid event is dropped with reason "invalid" and never sent', async () => {
+    const { calls, fetchImpl } = scripted([]);
+    const { agent, drops } = agentWith(fetchImpl, { customerId: undefined });
+    await agent.startSession().recordStep({});
+    await agent.flush();
+    expect(calls).toHaveLength(0);
+    expect(drops.map((d) => d.reason)).toEqual(['invalid']);
+  });
+
+  test('a throwing onDrop or onError never breaks flushing', async () => {
+    const { fetchImpl } = scripted([{ status: 400 }]);
+    const warn = jest.fn();
+    const agent = new AforoAgent({
+      apiKey: 'sk_test', customerId: 'cust_1', agentId: 'agent_1', fetchImpl, flushIntervalMs: 60_000, logger: { warn },
+      onDrop: () => { throw new Error('hook bug'); },
+      onError: () => { throw new Error('handler bug'); },
+    });
+    await agent.startSession().recordStep({});
+    await expect(agent.flush()).resolves.toMatchObject({ failed: 1 });
+    expect(agent.droppedCount).toBe(1);
+    // The hook failures are logged, not swallowed silently.
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('hook bug'));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('handler bug'));
+  });
+
+  test('happy path: nothing dropped, onDrop never called', async () => {
+    const { fetchImpl } = scripted([]);
+    const { agent, drops } = agentWith(fetchImpl);
+    await agent.startSession().recordStep({});
+    await agent.flush();
+    expect(agent.droppedCount).toBe(0);
+    expect(drops).toEqual([]);
+  });
+});
+
+describe('record calls never wait on the network (G298)', () => {
+  test('recordStep / recordTokens / recordUsage resolve while a full-batch flush is stuck', async () => {
+    let started = 0;
+    const fetchImpl = jest.fn(() => { started += 1; return new Promise<Response>(() => { /* never answers */ }); });
+    const agent = new AforoAgent({
+      apiKey: 'sk_test', customerId: 'cust_1', agentId: 'agent_1', fetchImpl: fetchImpl as unknown as typeof fetch,
+      maxBatchSize: 1, flushIntervalMs: 60_000, requestTimeoutMs: 50, logger: null,
+    });
+    const s = agent.startSession();
+    const settled = await Promise.race([
+      (async () => {
+        await s.recordStep({ inputTokens: 5 });
+        await s.recordTokens('m', 1, 1);
+        await s.recordUsage('gpuHours', 1);
+        return 'returned';
+      })(),
+      new Promise((r) => setTimeout(() => r('blocked'), 1000)),
+    ]);
+    expect(settled).toBe('returned');
+    expect(started).toBe(1); // one background flush, not one per record call
   });
 });

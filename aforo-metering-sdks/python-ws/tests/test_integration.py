@@ -145,7 +145,8 @@ async def test_CONNECTION_OPENED_and_CLOSED_on_real_websocket_roundtrip():
 
         assert opened["productType"] == "WEBSOCKET_API"
         assert opened["customerId"] == "cust_ws_lifecycle"
-        assert opened["wsFrameType"] == "PING"  # SDK uses PING as the lifecycle marker
+        assert opened["wsFrameType"] == "OPEN"  # the lifecycle frame type (was PING before 2.0.0)
+        assert opened["metricName"] == "websocket_api.connection_opened"
 
         assert closed["productType"] == "WEBSOCKET_API"
         assert closed["customerId"] == "cust_ws_lifecycle"

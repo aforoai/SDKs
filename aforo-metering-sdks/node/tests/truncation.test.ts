@@ -70,7 +70,7 @@ describe('request-derived labels in the middlewares', () => {
   }
 
   it('express: an over-long path is truncated to 512, the event is sent, and it warns once across two events', async () => {
-    const mw = expressMiddleware({ apiKey: 'k', clientOptions: CLIENT });
+    const mw = expressMiddleware({ apiKey: 'k', customerResolver: (req: any) => req.user?.id, clientOptions: CLIENT });
     expressCall(mw, '/' + 'a'.repeat(700));
     await settle();
     expressCall(mw, '/' + 'b'.repeat(900));
@@ -88,7 +88,7 @@ describe('request-derived labels in the middlewares', () => {
   });
 
   it('express: the cut never leaves half a surrogate pair', async () => {
-    const mw = expressMiddleware({ apiKey: 'k', clientOptions: CLIENT });
+    const mw = expressMiddleware({ apiKey: 'k', customerResolver: (req: any) => req.user?.id, clientOptions: CLIENT });
     // '/' + 510 'a' = 511 units, then an astral character straddling the 512 cut.
     expressCall(mw, '/' + 'a'.repeat(510) + '\u{1F600}' + 'tail');
     await settle();
@@ -100,7 +100,7 @@ describe('request-derived labels in the middlewares', () => {
   });
 
   it('express: an over-long method is truncated to 16 and the event is sent', async () => {
-    const mw = expressMiddleware({ apiKey: 'k', clientOptions: CLIENT });
+    const mw = expressMiddleware({ apiKey: 'k', customerResolver: (req: any) => req.user?.id, clientOptions: CLIENT });
     expressCall(mw, '/x', 'M'.repeat(40));
     await settle();
 
@@ -111,7 +111,7 @@ describe('request-derived labels in the middlewares', () => {
   });
 
   it('express: each event keeps its own idempotency key; two paths sharing the first 512 chars get different keys', async () => {
-    const mw = expressMiddleware({ apiKey: 'k', clientOptions: CLIENT });
+    const mw = expressMiddleware({ apiKey: 'k', customerResolver: (req: any) => req.user?.id, clientOptions: CLIENT });
     const shared = '/' + 'a'.repeat(600);
     expressCall(mw, shared + '/one');
     await settle();
@@ -125,7 +125,7 @@ describe('request-derived labels in the middlewares', () => {
   });
 
   it('koa: an over-long path is truncated and the event is sent', async () => {
-    const mw = koaMiddleware({ apiKey: 'k', clientOptions: CLIENT });
+    const mw = koaMiddleware({ apiKey: 'k', customerResolver: (ctx: any) => ctx.state.user?.id, clientOptions: CLIENT });
     const ctx: any = {
       path: '/' + 'k'.repeat(700), url: '/' + 'k'.repeat(700), method: 'GET', status: 200,
       state: { user: { id: 'cust_1' } }, get: () => '', request: {}, response: {},
@@ -139,7 +139,7 @@ describe('request-derived labels in the middlewares', () => {
 
   it('fastify: an over-long path is truncated and the event is sent', async () => {
     const hooks: Record<string, any> = {};
-    await fastifyPlugin({ addHook: (name: string, fn: any) => { hooks[name] = fn; } }, { apiKey: 'k', clientOptions: CLIENT });
+    await fastifyPlugin({ addHook: (name: string, fn: any) => { hooks[name] = fn; } }, { apiKey: 'k', customerResolver: (r: any) => r.user?.id, clientOptions: CLIENT });
     hooks.onResponse(
       { url: '/' + 'f'.repeat(700) + '?q=1', method: 'GET', user: { id: 'cust_1' }, headers: {} },
       { statusCode: 200 },
@@ -169,7 +169,7 @@ describe('request-derived labels in the middlewares', () => {
   it('a metricName returned by the caller\'s resolver is not altered: over-long still drops', async () => {
     const drops: string[] = [];
     const mw = expressMiddleware({
-      apiKey: 'k',
+      apiKey: 'k', trustCustomerHeader: true,
       metricName: (req: any) => `GET ${req.url}`,
       clientOptions: { ...CLIENT, onDrop: (_e, reason) => drops.push(reason) },
     });

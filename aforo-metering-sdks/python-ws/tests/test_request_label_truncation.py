@@ -14,22 +14,32 @@ from aforo_ws_metering.client import AforoWsBilling, _truncate_utf16, _utf16_len
 ASTRAL = "\U0001F600"
 
 
+_BATCHES: list = []
+
+
 @pytest.fixture
-def sent(monkeypatch):
-    batches: list = []
+def sent():
+    _BATCHES.clear()
+    return _BATCHES
 
-    def post(url, body, headers):
-        batches.append(body["events"])
-        return 202, None, b""
 
-    monkeypatch.setattr(mod, "_post_json", post)
-    return batches
+def _transport():
+    import json
+
+    import httpx
+
+    def handle(request):
+        _BATCHES.append(json.loads(request.content)["events"])
+        return httpx.Response(202, json={"data": {"failed": 0}})
+
+    return httpx.MockTransport(handle)
 
 
 def _billing(**kwargs):
     return AforoWsBilling(
         tenant_id="tenant-001", product_id="prod-ws-001", api_key="k",
-        ingestor_url="https://api.aforo.ai", flush_interval_sec=3600, flush_count=1000, **kwargs,
+        ingestor_url="https://api.aforo.ai", flush_interval_sec=3600, flush_count=1000,
+        http_transport=_transport(), **kwargs,
     )
 
 

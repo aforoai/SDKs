@@ -1,6 +1,6 @@
 # aforo-ws-metering — User Guide
 
-**Version:** 1.2.2 · **Updated:** 2026-10-01 · **Audience:** Python engineers serving WebSocket connections who need connection- or frame-level billing.
+**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Python engineers serving WebSocket connections who need connection- or frame-level billing.
 
 ## What you'll build
 
@@ -11,12 +11,12 @@ A WebSocket server that reports usage to Aforo — by default one connection-ope
 - Python **3.9+**.
 - An Aforo **API key**, **tenant id**, and **product id** from the Aforo console.
 - A WebSocket server: the `websockets` library, or FastAPI/Starlette.
-- A header your gateway/auth sets so the handler can resolve `customer_id` (the examples use `x-customer-id`).
+- A way to resolve `customer_id` from identity your service verified (a session or token checked during the handshake).
 
 ## Step 1 — Install
 
 ```bash
-pip install -e .                  # from python-ws/ (or: pip install "aforo-ws-metering>=1.2.2")
+pip install -e .                  # from python-ws/ (or: pip install "aforo-ws-metering>=2.0.0")
 pip install -e ".[fastapi]"       # or [websockets] / [httpx]
 ```
 
@@ -48,7 +48,7 @@ The tracker meters a connection only while it's wrapped in the `async with` bloc
 from aforo_ws_metering import track_websockets_connection
 
 async def handler(ws):
-    customer_id = dict(ws.request_headers).get("x-customer-id")
+    customer_id = customer_for_token(ws.request.headers.get("Authorization"))  # your verified auth
     if not customer_id:
         await ws.close(code=4401); return
     async with await track_websockets_connection(billing, ws, customer_id):
@@ -64,7 +64,7 @@ from aforo_ws_metering import track_starlette_websocket
 @app.websocket("/ws")
 async def ws_handler(ws: WebSocket):
     await ws.accept()
-    customer_id = ws.headers.get("x-customer-id")
+    customer_id = customer_for_token(ws.headers.get("authorization"))  # your verified auth
     if not customer_id:
         await ws.close(code=4401); return
     async with await track_starlette_websocket(billing, ws, customer_id):
@@ -73,7 +73,7 @@ async def ws_handler(ws: WebSocket):
             await ws.send_text(f"echo: {data}")
 ```
 
-> ⚠ The tracker wraps the connection's `send`/`recv` to count traffic. Resolve `customer_id` from a header your gateway controls — don't bill against a value the client can set freely. An unwrapped route emits nothing.
+> ⚠ The tracker wraps the connection's `send`/`recv` to count traffic. Resolve `customer_id` from identity you verified — don't bill against a value the client can set freely. `trust_customer_header=True` (instead of `customer_id`) reads `x-customer-id` from the handshake, only safe behind a gateway that sets it; `customer_resolver=callable(websocket)` is the other option. An unwrapped route emits nothing.
 
 ## Step 4 — Drive some frames and let the connection close
 
@@ -81,7 +81,7 @@ Send and receive normally inside the block. When the `async with` exits — clea
 
 ## Step 5 — Verify it landed in Aforo
 
-In the Aforo console, open the usage/events view for your tenant and filter by `metric_name = websocket_api.connection_closed` (and `websocket_api.message` if you enabled per-frame). You should see the close event carrying the aggregated counts and the mapped close reason. If nothing appears, check the `ingestor_url` host and that the connection was actually wrapped — see Troubleshooting.
+In the Aforo console, open the usage/events view for your tenant and filter by `metric_name = websocket_api.connection_closed` (opens arrive as `websocket_api.connection_opened` with frame type `OPEN`; `websocket_api.message` if you enabled per-frame). You should see the close event carrying the aggregated counts and the mapped close reason. If nothing appears, check the `ingestor_url` host and that the connection was actually wrapped — see Troubleshooting.
 
 ## Step 6 — Per-frame billing (optional, high volume)
 
@@ -91,7 +91,7 @@ For one event per inbound/outbound frame instead of open+close:
 billing = AforoWsBilling(..., per_frame_events=True)
 ```
 
-> ⚠ A busy socket can emit thousands of frames a second — `per_frame_events=True` multiplies your event volume accordingly. The buffer (100 events / 3 s) is sized for this, but make sure your rate plan and ingest budget expect it.
+> ⚠ A busy socket can emit thousands of frames a second — `per_frame_events=True` multiplies your event volume accordingly. The queue (10 000 events, sent in batches of up to 500 every 3 s) is sized for this, but make sure your rate plan and ingest budget expect it.
 
 ## Step 7 — Shut down cleanly
 
@@ -108,13 +108,19 @@ billing.shutdown()   # flushes the final batch before process exit
 | `api_key` | `str` | required | Aforo API key, sent as `X-API-Key`. |
 | `ingestor_url` | `str` | required | Host; `/v1/ingest/batch` appended. |
 | `flush_interval_sec` | `float` | `3.0` | Background flush cadence. |
-| `flush_count` | `int` | `100` | Buffer size that forces a flush. |
+| `flush_count` | `int` | `500` | Events per request, and the queue size that wakes the sender early (at most 1000). |
 | `per_frame_events` | `bool` | `False` | One event per frame vs. open + close. |
-| `on_error` | `Callable?` | logs | Called on permanent batch failure, and with the ingestor's `errors[].message` when it rejects events. |
-| `on_drop` | `Callable[[list[dict], str], None]?` | `None` | Called with events that will not be delivered and the reason (`invalid`, `rejected`, `retry_exhausted`). Pass by keyword. |
+| `on_error` | `Callable?` | logs | Receives a `TransportError`; branch on `.kind`: `outage` / `auth` (events still queued and retried), `rejected` (the ingestor refused them; message carries its `errors[].message`), `shutdown`, `closed`. `.events` and `.status` say which events and which HTTP status. |
+| `on_drop` | `Callable[[list[dict], str], None]?` | `None` | Called with events that will not be delivered and the reason (`overflow`, `rejected`, `invalid`, `shutdown`, `closed`). Pass by keyword. |
 | `product_type` | `str` | `"WEBSOCKET_API"` | Top-level `productType` sent on every event (trimmed and upper-cased; values the SDK does not know are passed through). Override per event with a `productType` key in `push({...})` or `product_type=` on `track_websockets_connection` / `track_starlette_websocket`. |
+| `max_queue_size` | `int` | `10000` | Queue capacity; the oldest event is dropped as `overflow` when full. Keyword-only. |
+| `timeout_sec` | `float` | `10.0` | Total deadline per HTTP request. Keyword-only. |
+| `shutdown_timeout_sec` | `float` | `5.0` | `shutdown()` flushes for at most this long; leftovers are dropped as `shutdown`. Keyword-only. |
+| `connection_idle_timeout_sec` | `float` | `3600.0` | A connection opened through a helper that sees no frames for this long is reported closed (`ABNORMAL_CLOSURE`, `closedBy: "sdk_idle_timeout"`) and forgotten. Connections still open at `shutdown()` are reported closed (`GOING_AWAY`, `closedBy: "sdk_shutdown"`). Keyword-only; negative raises `ValueError`. |
+| `allow_insecure_http` | `bool` | `False` | Allow plain `http://` to a host other than localhost. Keyword-only. |
+| `http_transport`, `transport_options` | | `None` | An `httpx` transport / extra transport-core settings, for tests and unusual networks. Keyword-only. |
 
-Exports: `AforoWsBilling`, `track_websockets_connection(billing, ws, customer_id)`, `track_starlette_websocket(billing, ws, customer_id)`, `WS_CLOSE_REASONS`. Each tracker helper returns an async context manager.
+Exports: `AforoWsBilling`, `track_websockets_connection(billing, ws, customer_id=..., *, customer_resolver=None, trust_customer_header=False)`, `track_starlette_websocket(...)` (same arguments), `WS_CLOSE_REASONS`. Each tracker helper returns an async context manager.
 
 Execution status (`executionStatus`, used by OUTCOME_BASED pricing) is described in the [README](README.md#execution-status-executionstatus).
 
@@ -124,9 +130,9 @@ Execution status (`executionStatus`, used by OUTCOME_BASED pricing) is described
 |---|---|---|
 | A route emits no events | The connection wasn't wrapped in `track_*`, or `customer_id` was falsy. | Wrap the connection in the `async with` block and resolve `customer_id` first. |
 | Close event missing / counts are zero | The `async with` block never exited cleanly, or the handler returned before entering it. | Ensure the block wraps the whole message loop; counts finalize on exit. |
-| `on_error` fires with "flush rejected with HTTP 401" (or 403) | Bad or unscoped API key. A 4xx other than 408 / 429 is not retried; the batch is dropped with reason `rejected`. | Fix `api_key`; confirm it matches `tenant_id`. Replay the batch from an `on_drop` hook if you keep one. |
-| `billing.dropped_count` is above 0 | Events were dropped: `invalid` (failed a client-side check), `rejected` (ingestor refused them) or `retry_exhausted`. | Read the WARNING log line for the reason; see [Dropped events](README.md#dropped-events). |
-| Events sent, none in console | Wrong `ingestor_url` host, or the metric isn't mapped to a rate plan. | Use `https://api.aforo.ai`; map `websocket_api.connection_closed` (and `.message`) in Aforo. |
+| ERROR log "Ingestor answered HTTP 401" (or 403) | Bad or revoked API key. The events stay queued (up to `max_queue_size`) and are retried after a pause. | Fix `api_key` and restart; confirm it matches `tenant_id`. |
+| `billing.dropped_count` is above 0 | Events were dropped: `invalid` (failed a client-side check, or no customer), `rejected` (ingestor refused them), `overflow` (queue full during an outage), `shutdown` (still queued at the shutdown deadline) or `closed` (sent after shutdown). An ingest outage alone does not drop events. | Read the WARNING log line for the reason; see [Dropped events](README.md#dropped-events). |
+| Events sent, none in console | Wrong `ingestor_url` host, or the metric isn't mapped to a rate plan. | Use `https://api.aforo.ai`; map `websocket_api.connection_closed` (and `websocket_api.connection_opened` / `.message` if you bill those) in Aforo. |
 | Event volume far higher than expected | `per_frame_events=True` emits one event per frame. | Switch back to default open+close unless you price per frame. |
 | `wsCloseReason` is `INTERNAL_ERROR` | An exception was raised inside the handler before a clean close. | Expected — fix the handler error; the close is still recorded. |
 

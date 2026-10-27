@@ -2,6 +2,41 @@
 
 All notable changes to this package are documented here. Format follows [Keep a Changelog](https://keepachangelog.com); versioning follows [SemVer](https://semver.org).
 
+## [2.0.0] - 2026-10-26
+
+Breaking. Migration: give every middleware a `customerResolver` (or `trustCustomerHeader: true` behind a proxy you control), call `await client.shutdown()` from your own SIGTERM handler, and use an `https://` `baseUrl` (or `allowInsecureHttp: true`).
+
+### Fixed (transport core, review of 2026-10-26)
+These come from the shared Node core (`src/transport-core/core.ts`) and follow contract/TRANSPORT-SPEC.md "Edge cases every core handles the same way".
+- **The request deadline covers reading the response body.** A server that sent headers and then stalled, or dripped the body a byte at a time, held `flush()` and `shutdown()` forever; the read is now inside `timeoutMs` and the batch is retried.
+- **Redirects are never followed.** Every request is sent with `redirect: 'manual'`, so the API key cannot reach the host a 3xx names. A 3xx keeps the batch queued, opens the breaker and is logged once at ERROR with the target host (never the key); fix the base URL and the queue drains without loss. `onError` gets `kind: 'outage'` with the 3xx `status`.
+- **Events are serialized when tracked.** An event JSON cannot represent (a `BigInt`, a cycle, `NaN` or `Infinity` in metadata) is dropped as `invalid` and counted at track time; before, it made the whole batch fail to serialize and every event in it was lost unreported. Later changes to a tracked object are no longer sent.
+- **Exit flush waits for the batch in flight.** On `beforeExit` the process stays alive (up to the shutdown deadline) until the queue and the batch being sent or retried are done. It used to exit during a retry and lose that batch.
+- **Per-event `retryable` failures back off and are capped.** They are re-sent after the normal jittered backoff, at most `maxRetries` times, then treated as an outage; a 2xx that hits the cap no longer resets the breaker, so its cooldown keeps growing instead of flapping.
+- **Breaker cooldown is `max(250 ms, random(0, ceiling))`** even when a small `breakerInitialMs` is configured.
+- The session heartbeat request is sent with `redirect: 'manual'` too; a 3xx is logged at debug and the heartbeat counts as not delivered.
+
+### Changed (breaking)
+- **Customer identity (G265).** Express, Koa and Fastify middleware throw at setup unless you pass `customerResolver` or `trustCustomerHeader: true`. The `X-Customer-Id` header and `req.user.id` are no longer read by default. A resolver that returns nothing drops that event with reason `invalid` (counted); the request is not blocked. `customerId` still works as a deprecated alias.
+- **No signal handlers (G293).** The client no longer adds `SIGTERM`/`SIGINT` listeners (they kept the process from exiting). It flushes on `beforeExit` within `shutdownTimeoutMs`; call `shutdown()` from your own handler.
+- **`track()` never throws.** After `shutdown()` the event is counted and reported with reason `closed`.
+- **https required (G270).** `baseUrl` must be `https://`; plain http only for localhost, 127.0.0.1, ::1 or with `allowInsecureHttp: true`.
+- **Defaults (G269).** `flushCount` 500 (was 50); `retryBaseMs` 500 (was 1000).
+- **Outages do not drop usage (G267).** After the retries — or on 401/403 — a batch goes back to the front of the queue with its keys and a breaker pauses sending (5 s doubling to 5 min). `retry_exhausted` is no longer produced. New drop reasons `shutdown` and `closed`.
+- **`flush()` result** is `{ sent, failed, requeued, queued }`.
+- **Middleware paths are normalized by default (G295)**: route template when the framework has one, else `/users/123` → `/users/:id`. `normalizePath: false` keeps the raw path.
+
+### Added
+- One transport core (`src/transport-core/core.ts`, copied into every Node variant — G271): bounded queue, a single background sender (one request in flight), full-jitter retries, `Retry-After` in seconds or HTTP-date (capped at 60 s), `AbortSignal.timeout` per request, 413 split, per-event `retryable` requeue, shutdown deadline (G266, G268).
+- The core has an `onAccepted(body, events)` hook (the parsed 2xx body, `{success, data}` unwrapped, after each accepted batch) and reports `onError` as a `CoreTransportError` with a `kind` (`outage`, `auth`, `rejected`, `shutdown`, `closed`) and the events concerned. Variants use them; the `@aforoai/metering` client API is unchanged.
+- Middleware `client` option: meter through an `AforoClient` your app owns; a middleware that creates its own exposes it as `.client` (G294).
+- Events still queued at the shutdown deadline are counted in `droppedCount` and reported with reason `shutdown` (G294).
+- `allowInsecureHttp`, `flushOnExit` options; `User-Agent: aforo-node/<version>`.
+- The API key is never shown by `inspect()` / `JSON.stringify` of the client.
+
+### Removed
+- Internal `RingBuffer` and `Transport` classes (replaced by the core; neither was exported).
+
 ## [1.1.2] - 2026-10-01
 
 ### Changed

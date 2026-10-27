@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import atexit
 import logging
 import threading
 import time
@@ -10,13 +9,12 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from .buffer import RingBuffer
+from ._transport import TransportCore
+from ._version import __version__
 from .idempotency import generate_random_key
 from .limits import describe_limit_violation
-from .transport import Transport
 from .types import (
     DEFAULT_PRODUCT_TYPE,
-    MAX_BATCH_SIZE,
     AforoOptions,
     DropReason,
     FlushResult,
@@ -71,15 +69,20 @@ def _normalize_product_type(product_type: Optional[str]) -> Optional[str]:
 class AforoClient:
     """Aforo usage metering client.
 
-    Enqueues events into a thread-safe ring buffer and flushes them
-    in batches to the Aforo ingestor via a background daemon thread.
+    ``track()`` puts events on a bounded queue and returns. One background
+    thread per client sends them in batches (every ``flush_interval`` seconds,
+    or as soon as ``flush_count`` events are queued). During an ingest outage
+    batches stay queued and are retried after a pause; nothing is dropped
+    unless the queue overflows. At interpreter exit (``atexit``), or on
+    ``shutdown()``, the queue is flushed for at most ``shutdown_timeout``
+    seconds. Safe to create before ``fork()`` (gunicorn ``--preload``): each
+    child gets its own queue and sender.
 
     Example::
 
         client = AforoClient(api_key="your-key", product_type="API")
         client.track(customer_id="cust_1", metric_name="api_calls", quantity=1)
-        # On shutdown (automatic via atexit):
-        client.shutdown()
+        client.shutdown()  # also runs automatically at interpreter exit
     """
 
     def __init__(
@@ -96,32 +99,27 @@ class AforoClient:
                 raise ValueError("api_key is required")
             opts = AforoOptions(api_key=api_key, **kwargs)
 
-        self._buffer = RingBuffer(opts.max_queue_size)
-        self._transport = Transport(
-            base_url=opts.base_url,
+        self._product_type = _normalize_product_type(opts.product_type) or DEFAULT_PRODUCT_TYPE
+        self._core = TransportCore(
             api_key=opts.api_key,
+            base_url=opts.base_url,
+            user_agent=f"aforo-python/{__version__}",
+            name="aforo",
+            logger=logger,
+            flush_count=opts.flush_count,
+            flush_interval=opts.flush_interval,
+            max_queue_size=opts.max_queue_size,
             timeout=opts.timeout,
             max_retries=opts.max_retries,
-            retry_base_s=opts.retry_base_s,
+            retry_base=opts.retry_base_s,
+            shutdown_timeout=opts.shutdown_timeout,
+            allow_insecure_http=opts.allow_insecure_http,
+            on_drop=opts.on_drop,
+            on_error=opts.on_error,
+            on_accepted=opts.on_accepted,
+            http_transport=opts.http_transport,
+            serialize=_serialize_event,
         )
-        # The ingestor rejects batches larger than 1000 events.
-        self._flush_count = max(1, min(int(opts.flush_count), MAX_BATCH_SIZE))
-        self._product_type = _normalize_product_type(opts.product_type) or DEFAULT_PRODUCT_TYPE
-        self._flush_interval = opts.flush_interval
-        self._shutdown_timeout = opts.shutdown_timeout
-        self._closed = False
-        # RLock (not Lock): _record_drop fires the customer's on_drop hook
-        # while _do_flush holds this lock — a hook that synchronously calls
-        # client.flush() would deadlock on a plain Lock. Reentry just drains
-        # the (already-empty) buffer and returns.
-        self._flush_lock = threading.RLock()
-
-        # Drop accounting — events permanently lost (overflow eviction or failed batch)
-        self._on_drop = opts.on_drop
-        self._dropped = 0
-        self._overflow_drops = 0
-        self._invalid_drops = 0
-        self._drop_lock = threading.Lock()
 
         # Session heartbeat state
         self._heartbeat_interval = opts.heartbeat_interval
@@ -133,14 +131,8 @@ class AforoClient:
         self._session_product_type = "AI_AGENT"
         self._session_started_at = 0.0
 
-        # Background flush timer (daemon so it doesn't block exit)
-        self._timer: Optional[threading.Timer] = None
-        self._schedule_flush()
-
-        # Register atexit handler for graceful shutdown (unregistered in
-        # shutdown() so repeated create/shutdown cycles don't accumulate
-        # handlers for the life of the interpreter).
-        atexit.register(self._atexit_flush)
+    def __repr__(self) -> str:
+        return f"AforoClient(url={self._core.url!r}, product_type={self._product_type!r})"
 
     # ─── Session lifecycle with heartbeats ─────────────────────────────
 
@@ -162,7 +154,7 @@ class AforoClient:
         ``"system"``). They are best-effort: failures are logged and never affect
         usage delivery.
         """
-        if self._closed or not session_id:
+        if self._core.closed or not session_id:
             return
         self._stop_heartbeat()
         stop = threading.Event()
@@ -224,7 +216,7 @@ class AforoClient:
                 resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
             )
         except Exception:
-            pass
+            logger.debug("process memory not available for the heartbeat", exc_info=True)
         return ResolvedEvent(
             customer_id=self._session_customer_id,
             metric_name=HEARTBEAT_METRIC,
@@ -237,12 +229,17 @@ class AforoClient:
             extra_fields={"sessionId": session_id, "sessionBoundary": boundary},
         )
 
-    def _send_heartbeat(self, session_id: str, boundary: str) -> None:
-        """Best-effort: build and POST one heartbeat on its own; never raises."""
+    def _send_heartbeat(self, session_id: str, boundary: str) -> Optional[dict]:
+        """Best-effort: build and POST one heartbeat on its own; never raises.
+
+        Returns the response ``data`` object (for ``killedSessionIds``) or None.
+        """
         try:
-            self._transport.send_heartbeat(self._build_heartbeat(session_id, boundary))
+            hb = self._build_heartbeat(session_id, boundary)
+            return self._core.post_single({"events": [hb.to_dict()]})
         except Exception:
             logger.debug("Heartbeat for session %s failed", session_id, exc_info=True)
+            return None
 
     # ─── Event tracking ──────────────────────────────────────────────
 
@@ -260,7 +257,8 @@ class AforoClient:
         extra_fields: Optional[dict] = None,
         event: Optional[TrackEvent] = None,
     ) -> None:
-        """Enqueue a usage event for batched delivery.
+        """Queue a usage event for batched delivery. Never sends and never
+        starts a thread on the calling thread.
 
         Can be called with keyword args or a ``TrackEvent`` dataclass.
 
@@ -272,16 +270,13 @@ class AforoClient:
         their exact camelCase wire names (e.g. ``agentId``, ``sessionId``,
         ``endpointPath``).
 
-        Never raises for event content. An event the ingestor would reject --
-        blank ``customer_id`` / ``metric_name``, ``quantity`` <= 0, or a field
-        over one of the ingestor's limits -- is not buffered and not sent: it is
-        counted in ``dropped_count``, WARN-logged with the field and limit, and
-        passed to the opt-in ``on_drop`` hook with reason ``"invalid"``.
-        Raises ``RuntimeError`` only when the client is already shut down.
+        Never raises. An event the ingestor would reject -- blank
+        ``customer_id`` / ``metric_name``, ``quantity`` <= 0, or a field over one
+        of the ingestor's limits (counted in UTF-16 units, as the ingestor does)
+        -- is not queued: it is counted in ``dropped_count``, WARN-logged with the
+        field and limit, and passed to ``on_drop`` with reason ``"invalid"``. An
+        event tracked after ``shutdown()`` is dropped with reason ``"closed"``.
         """
-        if self._closed:
-            raise RuntimeError("AforoClient is shut down — cannot track new events")
-
         if event:
             customer_id = event.customer_id
             metric_name = event.metric_name
@@ -299,10 +294,7 @@ class AforoClient:
         # Minted once, here, when the event is created -- never at flush/retry
         # time, so a retried batch (or an on_drop replay) carries the same key
         # and the ingestor deduplicates it. A caller-supplied key is passed
-        # through verbatim; otherwise each event gets its own random UUID. The
-        # previous content-hash fallback silently COLLAPSED legitimately
-        # distinct events recorded in the same instant -- the same bug Aforo's
-        # ingest fixed server-side in April 2026 (H4 fix).
+        # through verbatim; otherwise each event gets its own random UUID.
         if idempotency_key is None:
             idempotency_key = generate_random_key()
 
@@ -320,117 +312,51 @@ class AforoClient:
             extra_fields=dict(extra_fields) if extra_fields else None,
         )
 
-        # Checked before the event enters the buffer: an event that breaks one of
+        # Checked before the event enters the queue: an event that breaks one of
         # the ingestor's compiled-in constraints is rejected server-side and
         # never billed. It is dropped here (counter + WARN + on_drop "invalid")
         # rather than raised: track() sits on request hot paths, and an
         # exception there turns a metering problem into a failed request.
-        problem = _describe_invalid(resolved)
-        if problem:
-            self._record_drop([resolved], "invalid", detail=problem)
-            return
+        if not self._core.closed:
+            problem = _describe_invalid(resolved)
+            if problem:
+                self._core.report_drop([resolved], "invalid", detail=problem)
+                return
 
-        self._enqueue(resolved)
+        self._core.enqueue(resolved)
 
-        # Flush if buffer threshold reached
-        if self._buffer.size >= self._flush_count:
-            self._do_flush_async()
+    def report_invalid(self, detail: str, events: Optional[list] = None) -> None:
+        """Count an event an integration could not build (for example no
+        customer for a request) as an ``"invalid"`` drop. ``on_drop`` is called
+        only when ``events`` is given."""
+        self._core.report_drop(events or [], "invalid", count=None if events else 1, detail=detail)
 
-    def _enqueue(self, resolved: ResolvedEvent) -> None:
-        """Buffer an event; surface the evicted-oldest event on overflow."""
-        evicted = self._buffer.push_evict(resolved)
-        if evicted is not None:
-            self._record_drop([evicted], "overflow")
+    def flush(self, timeout: Optional[float] = None) -> FlushResult:
+        """Send everything queued now and wait for it (at most ``timeout``
+        seconds when given). The background thread does the sending; this call
+        only waits. While the ingestor is unreachable this makes one attempt;
+        if it fails the events stay queued and are retried after a pause."""
+        outcome = self._core.flush(timeout)
+        return FlushResult(sent=outcome.sent, failed=outcome.dropped)
 
-    def _record_drop(
-        self,
-        events: list[ResolvedEvent],
-        reason: DropReason,
-        *,
-        count: Optional[int] = None,
-        detail: Optional[str] = None,
-    ) -> None:
-        """Account for permanently lost events: bump the counter, WARN-log,
-        and invoke the opt-in on_drop hook. Overflow and invalid-event logs are
-        throttled (first, then every 1000th) so a tight loop can't storm the
-        log; failed-batch drops log every time (bounded by flush cadence).
-
-        ``count`` overrides ``len(events)`` when the ingestor reported rejected
-        events without saying which ones: they are counted, but no event is
-        handed to the hook as dropped that may in fact have been accepted.
-        """
-        n = len(events) if count is None else count
-        if n <= 0:
-            return
-        with self._drop_lock:
-            self._dropped += n
-            dropped_total = self._dropped
-            if reason == "overflow":
-                self._overflow_drops += n
-                should_log = self._overflow_drops == 1 or self._overflow_drops % 1000 == 0
-            elif reason == "invalid":
-                self._invalid_drops += n
-                should_log = self._invalid_drops == 1 or self._invalid_drops % 1000 == 0
-            else:
-                should_log = True
-
-        if reason == "overflow":
-            if should_log:
-                logger.warning(
-                    "[aforo] Buffer overflow: oldest event dropped (%d total dropped). "
-                    "Consider raising max_queue_size or checking ingest connectivity.",
-                    dropped_total,
-                )
-        elif reason == "invalid":
-            if should_log:
-                logger.warning(
-                    "[aforo] Invalid event not sent — %s (%d total dropped).",
-                    detail or "rejected by client-side validation", dropped_total,
-                )
-        else:
-            logger.warning(
-                "[aforo] Dropped %d event(s) — %s (%d total dropped).",
-                n, reason, dropped_total,
-            )
-
-        if self._on_drop is not None and events:
-            try:
-                self._on_drop(events, reason)
-            except Exception:
-                # A hook bug must never break tracking/flushing.
-                logger.debug("on_drop hook raised", exc_info=True)
-
-    def flush(self) -> FlushResult:
-        """Force-flush all buffered events synchronously."""
-        return self._do_flush()
-
-    def shutdown(self) -> None:
-        """Flush remaining events and stop the client."""
-        if self._closed:
-            return
-        self._closed = True
-
-        # Safe no-op if not registered (e.g. called FROM the atexit handler).
-        atexit.unregister(self._atexit_flush)
-
+    def shutdown(self, timeout: Optional[float] = None) -> None:
+        """Stop accepting events, flush for at most ``shutdown_timeout`` seconds
+        (or ``timeout``), report what is still queued as ``"shutdown"`` drops,
+        and release the HTTP client. Safe to call twice."""
         self._stop_heartbeat()
+        self._core.close(timeout)
 
-        if self._timer:
-            self._timer.cancel()
-            self._timer = None
-
-        self._do_flush()
+    close = shutdown
 
     @property
     def buffered_count(self) -> int:
-        return self._buffer.size
+        return self._core.queue_size
 
     @property
     def dropped_count(self) -> int:
-        """Total events permanently dropped (overflow, failed batches, events the
-        ingestor rejected, and events track() refused as invalid)."""
-        with self._drop_lock:
-            return self._dropped
+        """Total events permanently dropped (overflow, rejected by the ingestor,
+        refused as invalid, left at the shutdown deadline, tracked after shutdown)."""
+        return self._core.dropped_count
 
     @property
     def product_type(self) -> str:
@@ -439,66 +365,8 @@ class AforoClient:
 
     @property
     def is_shutdown(self) -> bool:
-        return self._closed
+        return self._core.closed
 
-    def _do_flush(self) -> FlushResult:
-        """Flush all buffered events (thread-safe)."""
-        with self._flush_lock:
-            total_sent = 0
-            total_failed = 0
 
-            while not self._buffer.is_empty:
-                batch = self._buffer.drain_up_to(self._flush_count)
-                if not batch:
-                    break
-                result = self._transport.send_sync(batch)
-                total_sent += result.sent
-                total_failed += result.failed
-
-                if result.failed > 0:
-                    # The batch was already drained from the buffer — without
-                    # this it vanishes silently. Surface it (counter + WARN +
-                    # opt-in hook).
-                    reason = result.reason or "retry_exhausted"
-                    if result.failed >= len(batch):
-                        self._record_drop(batch, reason)
-                    elif result.failed_indices:
-                        # Partial response naming the rejected events.
-                        self._record_drop([batch[i] for i in result.failed_indices], reason)
-                    else:
-                        # Partial response that does not say which events failed.
-                        self._record_drop([], reason, count=result.failed)
-
-            return FlushResult(sent=total_sent, failed=total_failed)
-
-    def _do_flush_async(self) -> None:
-        """Trigger flush in a background thread."""
-        t = threading.Thread(target=self._do_flush, daemon=True)
-        t.start()
-
-    def _schedule_flush(self) -> None:
-        """Schedule the next periodic flush."""
-        if self._closed:
-            return
-        self._timer = threading.Timer(self._flush_interval, self._periodic_flush)
-        self._timer.daemon = True
-        self._timer.start()
-
-    def _periodic_flush(self) -> None:
-        """Called by the timer — flush then reschedule."""
-        if self._closed:
-            return
-        try:
-            self._do_flush()
-        except Exception:
-            logger.exception("Periodic flush failed")
-        finally:
-            self._schedule_flush()
-
-    def _atexit_flush(self) -> None:
-        """atexit handler — best-effort flush on interpreter shutdown."""
-        try:
-            if not self._closed:
-                self.shutdown()
-        except Exception:
-            pass
+def _serialize_event(event: ResolvedEvent) -> dict:
+    return event.to_dict()

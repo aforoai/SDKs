@@ -9,14 +9,14 @@ import (
 )
 
 func TestClient_Track(t *testing.T) {
-	client := NewClient(Options{
+	client := mustNewClient(t, Options{
 		APIKey:        "test-key",
 		BaseURL:       "http://localhost:19999",
 		FlushCount:    100,
 		FlushInterval: time.Minute,
 		MaxRetries:    0,
 	})
-	defer client.Close()
+	defer closeNow(client)
 
 	err := client.Track(TrackEvent{
 		CustomerID: "cust_1",
@@ -34,14 +34,15 @@ func TestClient_AutoKeysUniquePerTrackCall(t *testing.T) {
 	// No caller key = dedup opt-out. Two same-instant identical events must
 	// get DISTINCT random keys (the old content-hash fallback collapsed
 	// them — the H4 bug Aforo ingest fixed server-side in April 2026).
-	client := NewClient(Options{
+	srv := &captureServer{}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	client := mustNewClient(t, Options{
 		APIKey:        "test-key",
-		BaseURL:       "http://localhost:19999",
+		BaseURL:       ts.URL,
 		FlushCount:    100,
 		FlushInterval: time.Minute,
-		MaxRetries:    0,
 	})
-	defer client.Close()
 
 	same := TrackEvent{CustomerID: "cust_1", MetricName: "api_calls", Quantity: 1, OccurredAt: "2026-07-05T00:00:00Z"}
 	a, b := same, same
@@ -51,22 +52,26 @@ func TestClient_AutoKeysUniquePerTrackCall(t *testing.T) {
 	if err := client.Track(b); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	events := client.buf.drainUpTo(10)
-	if len(events) != 2 {
-		t.Fatalf("expected 2 buffered events, got %d", len(events))
+	if client.BufferedCount() != 2 {
+		t.Fatalf("expected 2 buffered events, got %d", client.BufferedCount())
 	}
-	if events[0].IdempotencyKey == events[1].IdempotencyKey {
-		t.Fatalf("auto keys collapsed for identical same-instant events: %s", events[0].IdempotencyKey)
+	flushNow(client)
+	evs := srv.events()
+	if len(evs) != 2 {
+		t.Fatalf("expected 2 sent events, got %d", len(evs))
+	}
+	if evs[0]["idempotencyKey"] == evs[1]["idempotencyKey"] {
+		t.Fatalf("auto keys collapsed for identical same-instant events: %v", evs[0]["idempotencyKey"])
 	}
 }
 
 func TestClient_TrackAfterClose(t *testing.T) {
-	client := NewClient(Options{
+	client := mustNewClient(t, Options{
 		APIKey:        "test-key",
 		BaseURL:       "http://localhost:19999",
 		FlushInterval: time.Minute,
 	})
-	client.Close()
+	closeNow(client)
 
 	err := client.Track(TrackEvent{CustomerID: "cust_1", MetricName: "api_calls"})
 	if err != ErrClientClosed {
@@ -82,19 +87,19 @@ func TestClient_FlushSendsEvents(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(Options{
+	client := mustNewClient(t, Options{
 		APIKey:        "test-key",
 		BaseURL:       srv.URL,
 		FlushCount:    100,
 		FlushInterval: time.Minute,
 		MaxRetries:    0,
 	})
-	defer client.Close()
+	defer closeNow(client)
 
 	_ = client.Track(TrackEvent{CustomerID: "cust_1", MetricName: "api_calls"})
 	_ = client.Track(TrackEvent{CustomerID: "cust_2", MetricName: "api_calls"})
 
-	result := client.Flush()
+	result := flushNow(client)
 	if result.Sent != 2 {
 		t.Fatalf("expected 2 sent, got %d", result.Sent)
 	}
@@ -104,13 +109,13 @@ func TestClient_FlushSendsEvents(t *testing.T) {
 }
 
 func TestClient_DoubleCloseSafe(t *testing.T) {
-	client := NewClient(Options{
+	client := mustNewClient(t, Options{
 		APIKey:        "test-key",
 		BaseURL:       "http://localhost:19999",
 		FlushInterval: time.Minute,
 	})
-	client.Close()
-	client.Close() // Should not panic
+	closeNow(client)
+	closeNow(client) // Should not panic
 }
 
 // The ingestor authenticates the tenant key from X-API-Key only. A key sent as
@@ -126,11 +131,11 @@ func TestClient_SendsAPIKeyHeaderNotBearer(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(Options{APIKey: "test-key", BaseURL: srv.URL, FlushCount: 100, FlushInterval: time.Minute})
-	defer client.Close()
+	client := mustNewClient(t, Options{APIKey: "test-key", BaseURL: srv.URL, FlushCount: 100, FlushInterval: time.Minute})
+	defer closeNow(client)
 
 	_ = client.Track(TrackEvent{CustomerID: "cust_1", MetricName: "api_calls"})
-	client.Flush()
+	flushNow(client)
 
 	if gotPath != "/v1/ingest/batch" {
 		t.Errorf("path = %q, want /v1/ingest/batch", gotPath)

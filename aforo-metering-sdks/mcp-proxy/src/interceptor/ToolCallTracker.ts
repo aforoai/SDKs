@@ -3,15 +3,18 @@
  * On matching response, computes duration, detects errors, emits telemetry.
  */
 
-import type { InFlightCall, JsonRpcError, ProxyUsageEvent, ToolStatusResolver } from '../types.js';
+import type { CustomerResolver, InFlightCall, JsonRpcError, Principal, ProxyUsageEvent, ToolStatusResolver } from '../types.js';
 import type { EventBuffer } from '../telemetry/EventBuffer.js';
 import type { HeartbeatEmitter } from '../telemetry/HeartbeatEmitter.js';
 import type { ParsedToolCall, ParsedToolResponse } from './MessageInterceptor.js';
 import { generateIdempotencyKey, truncateToLimit } from '../util/idempotency.js';
 import { logger } from '../util/logger.js';
 import { PROXY_VERSION } from '../version.js';
+import { makeCustomerDecision, requireCustomerSource } from '../identity/customer.js';
 
 const STALE_CALL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+/** Most tool calls waiting for a response at once (G306). */
+export const DEFAULT_MAX_IN_FLIGHT = 10_000;
 /** Ingestor field limits (IngestUsageEventRequest). */
 const MAX_CUSTOMER_ID = 64;
 const MAX_AGENT_ID = 36;
@@ -64,8 +67,19 @@ export interface ToolCallTrackerConfig {
   /** How long a call may wait for its response before it is metered as
    * TIMEOUT (default 5 minutes). */
   staleCallTimeoutMs?: number;
-  /** Customer billed when a call carries no `_meta.customer_id` (else the agentId is billed). */
+  /** One customer billed for every call (see identity/customer.ts for the order). */
   customerId?: string;
+  /** Decides the customer per call from authenticated identity; wins over every other source. */
+  customerResolver?: CustomerResolver;
+  /** Bill `_meta.customer_id` as the client sent it. */
+  trustClientCustomerId?: boolean;
+  /** True when bearer tokens map to customers, so a principal can carry one. */
+  tokensMapCustomers?: boolean;
+  /**
+   * Most calls waiting for a response at once (default 10 000). Past it the
+   * oldest waiting call is metered as TIMEOUT and forgotten.
+   */
+  maxInFlight?: number;
   /** productType stamped on tool events (default MCP_SERVER). */
   productType?: string;
 }
@@ -82,8 +96,9 @@ export class ToolCallTracker {
   private readonly agentIdOverride?: string;
   private readonly statusResolver?: ToolStatusResolver;
   private readonly staleCallTimeoutMs: number;
-  private readonly customerId?: string;
+  private readonly decideCustomer: ReturnType<typeof makeCustomerDecision>;
   private readonly productType: string;
+  private readonly maxInFlight: number;
   private cleanupTimer: ReturnType<typeof setInterval>;
   /** Request-derived labels already reported as truncated (one WARN per label). */
   private readonly truncationWarned = new Set<string>();
@@ -102,7 +117,9 @@ export class ToolCallTracker {
     this.staleCallTimeoutMs = config.staleCallTimeoutMs && config.staleCallTimeoutMs > 0
       ? config.staleCallTimeoutMs
       : STALE_CALL_TIMEOUT_MS;
-    this.customerId = config.customerId?.trim() || undefined;
+    requireCustomerSource(config);
+    this.decideCustomer = makeCustomerDecision(config);
+    this.maxInFlight = config.maxInFlight && config.maxInFlight > 0 ? Math.floor(config.maxInFlight) : DEFAULT_MAX_IN_FLIGHT;
     this.productType = config.productType?.trim().toUpperCase() || 'MCP_SERVER';
 
     // Sweep often enough that a timed-out call is metered within ~10% of the
@@ -119,11 +136,21 @@ export class ToolCallTracker {
   }
 
   /**
-   * Customer billed for a call: `_meta.customer_id`, else the configured
-   * customerId, else the agent id.
+   * Customer billed for a call, or undefined when no configured source names
+   * one (the call then runs and its event is dropped as `invalid`). Order:
+   * customerResolver, the authenticated token's customer, `_meta.customer_id`
+   * when trusted, the fixed customerId.
    */
-  resolveCustomerId(call: { agentId: string; customerId?: string }): string {
-    return call.customerId || this.customerId || (this.agentIdOverride ?? call.agentId);
+  resolveCustomerId(call: ParsedToolCall, sessionId = '', principal?: Principal): string | undefined {
+    const meta = call.meta ?? (call.customerId ? { customer_id: call.customerId } : undefined);
+    return this.decideCustomer({
+      toolName: call.toolName,
+      agentId: this.agentIdOverride ?? call.agentId,
+      sessionId,
+      requestId: call.requestId,
+      ...(meta ? { meta } : {}),
+      ...(principal ? { principal } : {}),
+    });
   }
 
   /**
@@ -140,19 +167,22 @@ export class ToolCallTracker {
    * is not buffered or sent: it is counted as dropped, WARN-logged and passed
    * to onDrop with reason 'invalid'. Never throws.
    */
-  trackRequest(call: ParsedToolCall, sessionId: string): boolean {
+  trackRequest(call: ParsedToolCall, sessionId: string, principal?: Principal, resolvedCustomerId?: string): boolean {
     const agentId = this.agentIdOverride ?? call.agentId;
-    const customerId = this.resolveCustomerId(call);
+    const customerId = resolvedCustomerId ?? this.resolveCustomerId(call, sessionId, principal) ?? '';
 
     const toolName = this.requestLabel('toolName', call.toolName, MAX_TOOL_NAME);
 
     const problems: string[] = [];
+    if (!customerId) problems.push('no customer: the configured customer source named none for this call');
     if (agentId.length > MAX_AGENT_ID) problems.push(`agentId "${clip(agentId)}" exceeds ${MAX_AGENT_ID} chars`);
     if (customerId.length > MAX_CUSTOMER_ID) problems.push(`customerId "${clip(customerId)}" exceeds ${MAX_CUSTOMER_ID} chars`);
     if (sessionId.length > MAX_SESSION_ID) problems.push(`sessionId "${clip(sessionId)}" exceeds ${MAX_SESSION_ID} chars`);
     const invalid = problems.length > 0 ? problems.join(', ') : undefined;
 
-    this.inFlight.set(ToolCallTracker.key(sessionId, call.requestId), {
+    const key = ToolCallTracker.key(sessionId, call.requestId);
+    this.inFlight.delete(key);
+    this.inFlight.set(key, {
       toolName,
       keyToolName: call.toolName,
       agentId,
@@ -162,6 +192,7 @@ export class ToolCallTracker {
       sessionId,
       ...(invalid ? { invalid } : {}),
     });
+    this.enforceInFlightCap();
 
     if (invalid) {
       logger.debug('Tool call will not be metered', { toolName: clip(toolName), requestId: call.requestId, invalid });
@@ -175,6 +206,29 @@ export class ToolCallTracker {
 
     logger.debug('Tool call started', { toolName, requestId: call.requestId });
     return true;
+  }
+
+  /**
+   * Keep at most maxInFlight waiting calls: the oldest one past the cap is
+   * metered as TIMEOUT (it is not silently lost) and forgotten.
+   */
+  private enforceInFlightCap(now: number = Date.now()): void {
+    while (this.inFlight.size > this.maxInFlight) {
+      const oldest = this.inFlight.entries().next();
+      if (oldest.done) return;
+      const [key, call] = oldest.value;
+      this.inFlight.delete(key);
+      logger.warn('Too many tool calls waiting for a response; metering the oldest as TIMEOUT', {
+        maxInFlight: this.maxInFlight, requestId: call.requestId,
+      });
+      const marker: JsonRpcError = { code: MCP_REQUEST_TIMEOUT, message: 'evicted: too many calls waiting' };
+      this.emit(call, call.sessionId ?? '', this.resolveStatus(undefined, marker), now - call.startTime);
+    }
+  }
+
+  /** Calls currently waiting for a response. */
+  get inFlightCount(): number {
+    return this.inFlight.size;
   }
 
   /**

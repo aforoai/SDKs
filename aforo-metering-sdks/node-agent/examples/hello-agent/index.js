@@ -26,12 +26,9 @@
  *   node index.js
  *
  * Verify (against the target ingest URL — see .env.example):
- *   - usage_events row count: 12 (1 session_start, 10 capability steps
- *     matching agent_step, 1 session_end)
- *     Note: some steps ALSO emit a token_usage event for total tokens —
- *     the SDK emits this when inputTokens+outputTokens > 0. See the
- *     "Expected event count" section in this file's README for the
- *     exact per-run breakdown.
+ *   - 32 usage events: 10 "Agent Steps", 10 "Agent Tool Calls",
+ *     10 "Tokens Consumed", 1 "Tasks Completed", 1 "Agent Sessions"
+ *     (the last one carries sessionBoundary SESSION_END).
  *   - ai_agent_invocations ClickHouse row count: 10 (one per capability
  *     invocation, from analytics-service's McpEventConsumer sibling
  *     AiAgentEventConsumer — verify the "capability_name" column)
@@ -52,17 +49,14 @@ const { AforoAgent } = require('@aforoai/agent-metering');
 
 // ── Config ────────────────────────────────────────────────────────────────
 const config = {
-  tenantId: process.env.AFORO_TENANT_ID,
-  productId: process.env.AFORO_PRODUCT_ID,
+  productId: process.env.AFORO_PRODUCT_ID, // optional, sent as metadata.productId
   apiKey: process.env.AFORO_API_KEY,
   customerId: process.env.AFORO_CUSTOMER_ID,
-  ingestorUrl: process.env.AFORO_INGEST_URL || 'http://localhost:8084',
+  endpoint: process.env.AFORO_INGEST_URL || 'http://localhost:8084', // → /v1/ingest/batch
   agentId: process.env.AFORO_AGENT_ID || 'agent_hello_001',
 };
 
 const missing = [];
-if (!config.tenantId) missing.push('AFORO_TENANT_ID');
-if (!config.productId) missing.push('AFORO_PRODUCT_ID');
 if (!config.apiKey) missing.push('AFORO_API_KEY');
 if (!config.customerId) missing.push('AFORO_CUSTOMER_ID');
 if (missing.length > 0) {
@@ -90,8 +84,7 @@ const plan = [
 ];
 
 async function run() {
-  process.stderr.write(`[hello-agent] target: ${config.ingestorUrl}\n`);
-  process.stderr.write(`[hello-agent] tenant: ${config.tenantId}\n`);
+  process.stderr.write(`[hello-agent] target: ${config.endpoint}\n`);
   process.stderr.write(`[hello-agent] product: ${config.productId}\n`);
   process.stderr.write(`[hello-agent] customer: ${config.customerId}\n`);
   process.stderr.write(`[hello-agent] agent: ${config.agentId}\n`);
@@ -99,26 +92,24 @@ async function run() {
   const startedAt = Date.now();
 
   const agent = new AforoAgent({
-    tenantId: config.tenantId,
+    apiKey: config.apiKey, // sent as X-API-Key
+    customerId: config.customerId, // the customer billed for the run
+    agentId: config.agentId,
     productId: config.productId,
-    apiKey: config.apiKey,
-    // The customer billed for the run; /v1/ingest/events requires one.
-    customerId: config.customerId,
-    ingestorUrl: config.ingestorUrl,
+    endpoint: config.endpoint,
     // Tighten flush to see events land faster in the demo.
-    flushBatchSize: 3,
+    maxBatchSize: 10,
     flushIntervalMs: 1000,
-    // Print any drops so an operator noticing rows missing knows why.
-    onDrop: (events, reason) => {
+    // Print delivery problems so an operator noticing rows missing knows why.
+    onError: (err) => {
       process.stderr.write(
-        `[hello-agent] dropped ${events.length} event(s) — ${reason}\n` +
-        `  ${events.map((e) => e.idempotencyKey).join(', ')}\n`,
+        `[hello-agent] ${err.kind}: ${err.message}\n` +
+        `  ${err.events.map((e) => e.idempotencyKey).join(', ')}\n`,
       );
     },
   });
 
-  const session = await agent.startSession({
-    agentId: config.agentId,
+  const session = agent.startSession({
     framework: 'CLAUDE',
     modelProvider: 'ANTHROPIC',
     modelName: 'claude-sonnet-4-6',

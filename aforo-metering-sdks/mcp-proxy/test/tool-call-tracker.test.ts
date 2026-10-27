@@ -42,6 +42,7 @@ describe('ToolCallTracker', () => {
       tenantId: 'test_tenant',
       productId: 'prod_001',
       transport: 'stdio',
+      customerId: 'cust_test',
     });
   });
 
@@ -137,6 +138,7 @@ describe('ToolCallTracker', () => {
       tenantId: 'test',
       productId: 'prod',
       transport: 'stdio',
+      customerId: 'cust_test',
       agentIdOverride: 'override_agent',
     });
 
@@ -218,6 +220,7 @@ describe('ToolCallTracker', () => {
       tenantId: 'test_tenant',
       productId: 'prod_001',
       transport: 'stdio',
+      customerId: 'cust_test',
       staleCallTimeoutMs: 1000,
     });
     tracker.trackRequest({ requestId: 20, toolName: 'slow', agentId: 'a' }, 'sess_t');
@@ -241,6 +244,7 @@ describe('ToolCallTracker', () => {
       tenantId: 'test_tenant',
       productId: 'prod_001',
       transport: 'stdio',
+      customerId: 'cust_test',
       statusResolver: (result, error) => {
         calls.push([result, error]);
         const r = result as { mode?: string } | undefined;
@@ -301,6 +305,7 @@ describe('ToolCallTracker', () => {
         tenantId: 'test_tenant',
         productId: 'prod_001',
         transport: 'stdio',
+        customerId: 'cust_test',
         statusResolver: ((result: unknown) => {
           if ((result as { mode?: string }).mode === 'async') return Promise.reject(new Error('async bug'));
           return 'ok';
@@ -344,7 +349,8 @@ describe('ToolCallTracker attribution, productType and limits', () => {
   let heartbeat: StubHeartbeat & { customer?: string };
   const make = (extra: Record<string, unknown> = {}) => new ToolCallTracker({
     buffer: buffer as any, heartbeat: heartbeat as any,
-    tenantId: 't', productId: 'p', transport: 'stdio', ...extra,
+    tenantId: 't', productId: 'p', transport: 'stdio',
+    customerId: 'cust_default', trustClientCustomerId: true, ...extra,
   });
 
   beforeEach(() => {
@@ -355,21 +361,78 @@ describe('ToolCallTracker attribution, productType and limits', () => {
     };
   });
 
-  it('bills _meta.customer_id, then the customerId config, then the agentId', () => {
+  it('refuses to start without a customer source', () => {
+    assert.throws(() => new ToolCallTracker({
+      buffer: buffer as any, heartbeat: heartbeat as any, tenantId: 't', productId: 'p', transport: 'stdio',
+    }), /No customer source configured/);
+  });
+
+  it('ignores _meta.customer_id unless trustClientCustomerId is on; never bills the agent id', () => {
+    const untrusted = make({ trustClientCustomerId: false, customerId: 'cust_cfg' });
+    untrusted.trackRequest({ requestId: 1, toolName: 't', agentId: 'agent_x', customerId: 'cust_meta' }, 's');
+    untrusted.trackResponse({ requestId: 1, hasError: false, responseBytes: 1 }, 's');
+    untrusted.shutdown();
+
+    const trusted = make({ customerId: 'cust_cfg' });
+    trusted.trackRequest({ requestId: 2, toolName: 't', agentId: 'a', customerId: 'cust_meta' }, 's');
+    trusted.trackResponse({ requestId: 2, hasError: false, responseBytes: 1 }, 's');
+    trusted.trackRequest({ requestId: 3, toolName: 't', agentId: 'a' }, 's');
+    trusted.trackResponse({ requestId: 3, hasError: false, responseBytes: 1 }, 's');
+    trusted.shutdown();
+
+    assert.deepEqual(buffer.events.map((e) => e.customerId), ['cust_cfg', 'cust_meta', 'cust_cfg']);
+    assert.equal(heartbeat.customer, 'cust_cfg'); // session customer = first call's customer
+  });
+
+  it('drops the event as invalid when no source names a customer; the call is still tracked', () => {
+    const trustOnly = make({ customerId: undefined });
+    assert.equal(trustOnly.trackRequest({ requestId: 1, toolName: 't', agentId: 'agent_x' }, 's'), false);
+    trustOnly.trackResponse({ requestId: 1, hasError: false, responseBytes: 1 }, 's');
+    trustOnly.shutdown();
+    assert.equal(buffer.events.length, 0);
+    assert.equal(buffer.drops.length, 1);
+    assert.equal(buffer.drops[0].reason, 'invalid');
+    assert.match(buffer.drops[0].detail ?? '', /no customer/);
+    assert.notEqual(buffer.drops[0].events[0].customerId, 'agent_x');
+  });
+
+  it('the authenticated token\'s customer wins over _meta; a resolver decides alone', () => {
     const tracker = make({ customerId: 'cust_cfg' });
-    tracker.trackRequest({ requestId: 1, toolName: 't', agentId: 'a', customerId: 'cust_meta' }, 's');
+    tracker.trackRequest({ requestId: 1, toolName: 't', agentId: 'a', customerId: 'cust_meta' }, 's', { label: 'token#1', customerId: 'cust_token' });
     tracker.trackResponse({ requestId: 1, hasError: false, responseBytes: 1 }, 's');
-    tracker.trackRequest({ requestId: 2, toolName: 't', agentId: 'a' }, 's');
-    tracker.trackResponse({ requestId: 2, hasError: false, responseBytes: 1 }, 's');
     tracker.shutdown();
 
-    const plain = make();
-    plain.trackRequest({ requestId: 3, toolName: 't', agentId: 'agent_x' }, 's');
-    plain.trackResponse({ requestId: 3, hasError: false, responseBytes: 1 }, 's');
-    plain.shutdown();
+    const seen: unknown[] = [];
+    const resolved = make({
+      customerResolver: (ctx: any) => { seen.push(ctx); return ctx.toolName === 'free' ? undefined : `cust_${ctx.principal?.label ?? 'none'}`; },
+    });
+    resolved.trackRequest({ requestId: 2, toolName: 'paid', agentId: 'a', customerId: 'cust_meta', meta: { customer_id: 'cust_meta' } }, 's', { label: 'p1' });
+    resolved.trackResponse({ requestId: 2, hasError: false, responseBytes: 1 }, 's');
+    resolved.trackRequest({ requestId: 3, toolName: 'free', agentId: 'a' }, 's');
+    resolved.trackResponse({ requestId: 3, hasError: false, responseBytes: 1 }, 's');
+    const throwing = make({ customerResolver: () => { throw new Error('lookup failed'); } });
+    throwing.trackRequest({ requestId: 4, toolName: 'x', agentId: 'a' }, 's');
+    throwing.trackResponse({ requestId: 4, hasError: false, responseBytes: 1 }, 's');
+    resolved.shutdown();
+    throwing.shutdown();
 
-    assert.deepEqual(buffer.events.map((e) => e.customerId), ['cust_meta', 'cust_cfg', 'agent_x']);
-    assert.equal(heartbeat.customer, 'cust_meta'); // session customer = first call's customer
+    assert.deepEqual(buffer.events.map((e) => e.customerId), ['cust_token', 'cust_p1']);
+    assert.equal(buffer.drops.length, 2);
+    assert.ok(buffer.drops.every((d) => d.reason === 'invalid'));
+    assert.deepEqual((seen[0] as any).meta, { customer_id: 'cust_meta' });
+    assert.equal((seen[0] as any).sessionId, 's');
+  });
+
+  it('caps the calls waiting for a response: the oldest past the cap is metered as TIMEOUT', () => {
+    const tracker = make({ maxInFlight: 2 });
+    for (const id of [1, 2, 3]) tracker.trackRequest({ requestId: id, toolName: `t${id}`, agentId: 'a' }, 's');
+    assert.equal(tracker.inFlightCount, 2);
+    assert.equal(buffer.events.length, 1);
+    assert.equal(buffer.events[0].toolName, 't1');
+    assert.equal(buffer.events[0].executionStatus, 'TIMEOUT');
+    // The evicted call's late response is not metered again.
+    assert.equal(tracker.trackResponse({ requestId: 1, hasError: false, responseBytes: 1 }, 's'), false);
+    tracker.shutdown();
   });
 
   it('stamps the configured productType (default MCP_SERVER)', () => {

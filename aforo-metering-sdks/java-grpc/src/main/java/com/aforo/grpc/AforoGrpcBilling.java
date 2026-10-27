@@ -1,6 +1,8 @@
 package com.aforo.grpc;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.aforo.grpc.internal.transport.TransportConfig;
+import com.aforo.grpc.internal.transport.TransportCore;
 import io.grpc.ForwardingServerCall;
 import io.grpc.Metadata;
 import io.grpc.ServerCall;
@@ -8,21 +10,10 @@ import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
 import io.grpc.Status;
 
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
 import java.util.logging.Level;
@@ -34,7 +25,8 @@ import java.util.logging.Logger;
  * <p>Install as a {@code ServerInterceptor} on your gRPC server — every RPC call
  * (unary and streaming) emits one billing event with timing, status code, and
  * call type. Events are buffered and flushed to Aforo's usage ingestor in
- * batches with 3× exponential retry.</p>
+ * batches; an ingest outage keeps them queued and resends them with the same
+ * idempotency keys (see contract/TRANSPORT-SPEC.md).</p>
  *
  * <p>Usage:</p>
  * <pre>
@@ -44,6 +36,8 @@ import java.util.logging.Logger;
  *       .apiKey(System.getenv("AFORO_API_KEY"))
  *       .ingestorUrl("https://api.aforo.ai")
  *       .serviceName("acme.v1.UserService")
+ *       // Who is calling: read it from your authentication (mTLS peer, verified token).
+ *       .customerResolver((call, headers) -> customerFromVerifiedToken(headers))
  *       .build();
  *
  *   Server server = ServerBuilder.forPort(50051)
@@ -55,9 +49,7 @@ import java.util.logging.Logger;
 public final class AforoGrpcBilling implements AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(AforoGrpcBilling.class.getName());
-    private static final String SDK_VERSION = "1.2.2";
-    /** The ingestor rejects {@code /v1/ingest/batch} requests with more than 1000 events. */
-    static final int MAX_EVENTS_PER_REQUEST = 1000;
+    private static final String SDK_VERSION = "2.0.0";
     private static final int MAX_IDEMPOTENCY_KEY = 255;
     /** Ingestor limit on {@code grpcMethod}. */
     static final int MAX_GRPC_METHOD = 128;
@@ -67,42 +59,69 @@ public final class AforoGrpcBilling implements AutoCloseable {
     private final String tenantId;
     private final String productId;
     private final String apiKey;
-    private final URI ingestorUri;
     private final String productType;
     private final String serviceName;
-    private final int flushCount;
-    private final long flushIntervalMs;
-    private final Function<Metadata, String> customerIdExtractor;
+    private final CustomerResolver customerResolver;
 
-    private final ConcurrentLinkedQueue<Map<String, Object>> buffer = new ConcurrentLinkedQueue<>();
-    private final AtomicInteger bufferSize = new AtomicInteger();
-    private final AtomicLong dropped = new AtomicLong();
     private final BiConsumer<java.util.List<Map<String, Object>>, DropReason> onDrop;
-    /** Retry backoff base in ms — package-private so tests can skip real sleeps. */
-    long retryBackoffBaseMs = 1000L;
+    private final java.util.function.Consumer<MeteringError> onError;
+    private final BiConsumer<Map<String, Object>, java.util.List<Map<String, Object>>> onAccepted;
     private final ObjectMapper mapper = new ObjectMapper();
-    private final HttpClient http = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(5))
-            .build();
-    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-        Thread t = new Thread(r, "aforo-grpc-flush");
-        t.setDaemon(true);
-        return t;
-    });
+    private final TransportCore<Map<String, Object>> core;
 
     private AforoGrpcBilling(Builder b) {
         this.tenantId = require(b.tenantId, "tenantId");
         this.productId = require(b.productId, "productId");
         this.apiKey = require(b.apiKey, "apiKey");
         this.serviceName = require(b.serviceName, "serviceName");
-        this.ingestorUri = URI.create(stripTrailingSlash(require(b.ingestorUrl, "ingestorUrl")) + "/v1/ingest/batch");
         this.productType = normalizeProductType(b.productType, DEFAULT_PRODUCT_TYPE);
-        this.flushCount = b.flushCount;
-        this.flushIntervalMs = b.flushIntervalMs;
         this.onDrop = b.onDrop;
-        this.customerIdExtractor = b.customerIdExtractor != null ? b.customerIdExtractor : DEFAULT_CUSTOMER_EXTRACTOR;
-        scheduler.scheduleAtFixedRate(this::flushQuietly, flushIntervalMs, flushIntervalMs, TimeUnit.MILLISECONDS);
+        this.onError = b.onError;
+        this.onAccepted = b.onAccepted;
+        this.core = new TransportCore<>(TransportConfig.builder()
+                .baseUrl(require(b.ingestorUrl, "ingestorUrl"))
+                .apiKey(apiKey)
+                .allowInsecureHttp(b.allowInsecureHttp)
+                .header("X-Tenant-Id", tenantId)
+                .userAgent("aforo-java-grpc/" + SDK_VERSION)
+                .flushCount(b.flushCount)
+                .flushIntervalMs(b.flushIntervalMs)
+                .maxQueueSize(b.maxQueueSize)
+                .maxRetries(b.maxRetries)
+                .retryBaseMs(b.retryBaseMs)
+                .timeoutMs(b.timeoutMs)
+                .shutdownTimeoutMs(b.shutdownTimeoutMs)
+                .breakerInitialMs(b.breakerCooldownMs)
+                .threadName("aforo-grpc-flush")
+                .loggerName(AforoGrpcBilling.class.getName())
+                .logPrefix("[aforo-grpc]")
+                .build(),
+                mapper::writeValueAsString,
+                TransportCore.Listeners.<Map<String, Object>>builder()
+                        .onDrop((events, reason) -> { if (onDrop != null) onDrop.accept(events, map(reason)); })
+                        .onError(onError == null ? null : e -> onError.accept(
+                                new MeteringError(map(e.kind()), e.message(), e.events(), e.status())))
+                        .onAccepted(onAccepted == null ? null : (body, events) -> onAccepted.accept(asMap(body), events))
+                        .build());
+        this.customerResolver = b.customerResolver();
     }
+
+    /**
+     * Finds the Aforo customer id for an incoming call from an identity you have verified
+     * (mTLS peer certificate in {@code call.getAttributes()}, a verified token in the
+     * headers). Returning null/blank: the call is not metered and is counted as
+     * {@code INVALID}; the call itself is never affected.
+     */
+    @FunctionalInterface
+    public interface CustomerResolver {
+        String resolve(ServerCall<?, ?> call, Metadata headers);
+    }
+
+    /** Message for a builder without a customer source. */
+    static final String MISSING_CUSTOMER_SOURCE = "AforoGrpcBilling needs to know which customer each call"
+            + " belongs to. Set customerResolver(...) to read it from your authentication (mTLS peer, verified"
+            + " token), or trustCustomerHeader(true) to read the x-customer-id metadata; only do that when a"
+            + " proxy in front of the server sets it, because callers can otherwise bill usage to any customer.";
 
     /** Returns a {@link ServerInterceptor} that meters every call. */
     public ServerInterceptor interceptor() {
@@ -114,18 +133,22 @@ public final class AforoGrpcBilling implements AutoCloseable {
                 String fullMethod = call.getMethodDescriptor().getFullMethodName(); // pkg.Service/Method
                 String method = fullMethod.contains("/") ? fullMethod.substring(fullMethod.lastIndexOf('/') + 1) : fullMethod;
                 String callType = mapCallType(call.getMethodDescriptor().getType().name());
-                String customerId = customerIdExtractor.apply(headers);
+                String customerId = resolveCustomer(call, headers);
 
                 ForwardingServerCall.SimpleForwardingServerCall<ReqT, RespT> wrapped =
                         new ForwardingServerCall.SimpleForwardingServerCall<>(call) {
                             @Override
                             public void close(Status status, Metadata trailers) {
-                                if (customerId != null && !customerId.isBlank()) {
+                                try {
                                     record(method, callType, customerId, status.getCode().name(),
                                             System.currentTimeMillis() - start,
                                             outcomeFromGrpcStatus(status.getCode()));
+                                } catch (RuntimeException e) {
+                                    // Metering must never keep the call from closing.
+                                    LOG.log(Level.FINE, "[aforo-grpc] metering failed for " + method, e);
+                                } finally {
+                                    super.close(status, trailers);
                                 }
-                                super.close(status, trailers);
                             }
                         };
                 return next.startCall(wrapped, headers);
@@ -164,7 +187,7 @@ public final class AforoGrpcBilling implements AutoCloseable {
      * per-call {@code productType} override ({@code null}/blank → the client-level
      * {@link Builder#productType(String)}).
      *
-     * <p>A blank {@code customerId} is not metered. A blank {@code method}, or an
+     * <p>A blank {@code customerId} or {@code method}, or an
      * event that breaks an ingestor field limit on a caller-set field (customerId
      * over 64 characters, service over 255, productType over 20), is dropped with
      * {@link DropReason#INVALID}; this method never throws.</p>
@@ -176,7 +199,6 @@ public final class AforoGrpcBilling implements AutoCloseable {
      */
     public void record(String method, String callType, String customerId, String status, long durationMs,
                        String executionStatus, String productTypeOverride) {
-        if (customerId == null || customerId.isBlank()) return;
         String outcome = canonicalExecutionStatus(executionStatus);
         if (outcome == null) outcome = outcomeFromGrpcStatus(status);
 
@@ -190,7 +212,7 @@ public final class AforoGrpcBilling implements AutoCloseable {
         event.put("productType", normalizeProductType(productTypeOverride, productType));
         event.put("grpcService", serviceName);
         event.put("grpcMethod", boundedLabel("grpcMethod", method, MAX_GRPC_METHOD));
-        event.put("grpcCallType", mapCallType(callType == null ? "" : callType.toUpperCase()));
+        event.put("grpcCallType", mapCallType(callType == null ? "" : callType.toUpperCase(java.util.Locale.ROOT)));
         event.put("messageCount", 1);
         event.put("executionDurationMs", (int) Math.max(0, Math.min(durationMs, Integer.MAX_VALUE)));
         if (outcome != null) event.put("executionStatus", outcome);
@@ -198,7 +220,7 @@ public final class AforoGrpcBilling implements AutoCloseable {
         Map<String, Object> meta = new HashMap<>();
         // grpcStatusCode is enum-validated server-side; anything outside the gRPC code set
         // would get the event rejected, so keep it in metadata instead.
-        String statusCode = status == null ? null : status.toUpperCase();
+        String statusCode = status == null ? null : status.toUpperCase(java.util.Locale.ROOT);
         if (statusCode != null && GRPC_STATUS_CODES.contains(statusCode)) {
             event.put("grpcStatusCode", statusCode);
         } else if (status != null) {
@@ -208,6 +230,10 @@ public final class AforoGrpcBilling implements AutoCloseable {
         meta.put("productId", productId);
         event.put("metadata", meta);
 
+        if (customerId == null || customerId.isBlank()) {
+            recordInvalid(event, "customerId is required (the customer resolver found none for " + method + ")");
+            return;
+        }
         if (method == null || method.isBlank()) {
             recordInvalid(event, "grpcMethod is required (blank method)");
             return;
@@ -216,40 +242,96 @@ public final class AforoGrpcBilling implements AutoCloseable {
     }
 
     /**
-     * Why an event was permanently dropped. The buffer is unbounded (drained
-     * at flush start), so unlike the core SDK there is no OVERFLOW reason.
+     * Why events were permanently dropped. An ingest outage does not drop anything: the
+     * batch goes back to the queue with its idempotency keys and is resent after a
+     * cooldown.
      * <ul>
-     *   <li>{@code RETRY_EXHAUSTED} — the batch failed after all transport attempts</li>
-     *   <li>{@code REJECTED} — the ingestor refused the batch (non-retryable 4xx) or
-     *       refused this event individually in a partial response</li>
-     *   <li>{@code INVALID} — the event breaks an ingestor field limit; it was never
-     *       buffered or sent</li>
+     *   <li>{@code OVERFLOW} — the queue was full ({@link Builder#maxQueueSize(int)}); the oldest event was evicted</li>
+     *   <li>{@code REJECTED} — the ingestor refused the batch (non-retryable 4xx) or this event in a partial response</li>
+     *   <li>{@code INVALID} — the event breaks an ingestor field limit, or has no customer; it was never sent</li>
+     *   <li>{@code SHUTDOWN} — still queued when {@link #close()} reached its shutdown deadline</li>
+     *   <li>{@code CLOSED} — recorded after {@link #close()}</li>
+     *   <li>{@code RETRY_EXHAUSTED} — kept for compatibility; only reported when a requeue is impossible</li>
      * </ul>
      */
-    public enum DropReason { RETRY_EXHAUSTED, REJECTED, INVALID }
+    public enum DropReason { RETRY_EXHAUSTED, REJECTED, INVALID, OVERFLOW, SHUTDOWN, CLOSED }
 
-    /** Number of events permanently dropped since this instance was created. */
-    public long droppedCount() { return dropped.get(); }
+    /** What a {@link MeteringError} is about. Branch on this, never on the message. */
+    public enum ErrorKind {
+        /** Ingestor unreachable, 408/429/5xx or a redirect after every retry; the events stay queued and are resent. */
+        OUTAGE,
+        /** 401/403: the API key is wrong or revoked; the events stay queued and are resent. */
+        AUTH,
+        /** The ingestor refused the events; they are dropped. */
+        REJECTED,
+        /** Still queued at the shutdown deadline; dropped. */
+        SHUTDOWN,
+        /** Recorded after {@code close()}; dropped. */
+        CLOSED
+    }
 
-    /**
-     * Account for a permanently lost batch: bump the counter, WARN-log, and
-     * invoke the opt-in onDrop hook. The buffer is drained at flush start, so
-     * drops here are bounded by flush cadence — no log throttle needed.
-     */
-    private void recordDrop(java.util.List<Map<String, Object>> events, DropReason reason) {
-        long total = dropped.addAndGet(events.size());
-        LOG.warning("[aforo-grpc] Dropped " + events.size() + " event(s) — " + reason + " (" + total + " total dropped).");
-        if (onDrop != null) {
-            try {
-                onDrop.accept(events, reason);
-            } catch (Exception e) {
-                // A hook bug must never break flushing.
-                LOG.log(Level.FINE, "onDrop hook threw", e);
-            }
+    /** A delivery problem reported to {@code Builder.onError}. The message never contains the API key. */
+    public static final class MeteringError {
+        private final ErrorKind kind;
+        private final String message;
+        private final java.util.List<Map<String, Object>> events;
+        private final int status;
+
+        MeteringError(ErrorKind kind, String message, java.util.List<Map<String, Object>> events, int status) {
+            this.kind = kind;
+            this.message = message;
+            this.events = java.util.List.copyOf(events);
+            this.status = status;
+        }
+
+        public ErrorKind kind() { return kind; }
+        public String message() { return message; }
+        /** The events concerned: the queued ones for OUTAGE/AUTH, the dropped ones otherwise (may be empty). */
+        public java.util.List<Map<String, Object>> events() { return events; }
+        /** HTTP status of the answer that caused the report, or 0. */
+        public int status() { return status; }
+        /** True when the events are still queued and will be resent. */
+        public boolean willRetry() { return kind == ErrorKind.OUTAGE || kind == ErrorKind.AUTH; }
+
+        @Override
+        public String toString() {
+            return "MeteringError{kind=" + kind + ", status=" + status + ", events=" + events.size()
+                    + ", message=" + message + "}";
         }
     }
 
-    private final AtomicLong invalidDrops = new AtomicLong();
+    private static ErrorKind map(TransportCore.ErrorKind kind) {
+        return switch (kind) {
+            case OUTAGE -> ErrorKind.OUTAGE;
+            case AUTH -> ErrorKind.AUTH;
+            case REJECTED -> ErrorKind.REJECTED;
+            case SHUTDOWN -> ErrorKind.SHUTDOWN;
+            case CLOSED -> ErrorKind.CLOSED;
+        };
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> asMap(Object body) {
+        return body instanceof Map<?, ?> m ? java.util.Collections.unmodifiableMap((Map<String, Object>) m) : Map.of();
+    }
+
+    private static DropReason map(TransportCore.Reason reason) {
+        return switch (reason) {
+            case OVERFLOW -> DropReason.OVERFLOW;
+            case REJECTED -> DropReason.REJECTED;
+            case INVALID -> DropReason.INVALID;
+            case SHUTDOWN -> DropReason.SHUTDOWN;
+            case CLOSED -> DropReason.CLOSED;
+            case RETRY_EXHAUSTED -> DropReason.RETRY_EXHAUSTED;
+        };
+    }
+
+    /** Number of events permanently dropped (every {@link DropReason}) since this instance was created. */
+    public long droppedCount() { return core.droppedCount(); }
+
+    /** Events waiting to be sent. */
+    public int bufferedCount() { return core.size(); }
+
 
     /**
      * Ingestor field limits ({@code IngestUsageEventRequest} {@code @Size} constraints).
@@ -279,24 +361,12 @@ public final class AforoGrpcBilling implements AutoCloseable {
     }
 
     /**
-     * An event the ingestor would refuse: not buffered, not sent, counted in
-     * {@link #droppedCount()}, logged (first, then every 1000th, so a tight loop
-     * can't storm the log) and handed to the onDrop hook with {@link DropReason#INVALID}.
+     * An event the ingestor would refuse: not queued, not sent, counted in
+     * {@link #droppedCount()}, logged (first, then every 1000th) and handed to the
+     * onDrop hook with {@link DropReason#INVALID}.
      */
     private void recordInvalid(Map<String, Object> event, String violation) {
-        long total = dropped.incrementAndGet();
-        long invalids = invalidDrops.incrementAndGet();
-        if (invalids == 1 || invalids % 1000 == 0) {
-            LOG.warning("[aforo-grpc] Dropping invalid event: " + violation + " (" + invalids
-                    + " invalid, " + total + " total dropped).");
-        }
-        if (onDrop != null) {
-            try {
-                onDrop.accept(java.util.List.of(event), DropReason.INVALID);
-            } catch (Exception e) {
-                LOG.log(Level.FINE, "onDrop hook threw", e);
-            }
-        }
+        core.dropInvalid(event, violation);
     }
 
     /** Buffers an event, or drops it as {@link DropReason#INVALID} when it breaks a field limit. */
@@ -306,176 +376,17 @@ public final class AforoGrpcBilling implements AutoCloseable {
             recordInvalid(event, violation);
             return;
         }
-        buffer.offer(event);
-        if (bufferSize.incrementAndGet() >= flushCount) {
-            scheduler.execute(this::flushQuietly);
-        }
-    }
-
-    private final Object drainLock = new Object();
-
-    private void flushQuietly() {
-        try {
-            flush();
-        } catch (Exception e) {
-            LOG.log(Level.WARNING, "[aforo-grpc] flush failed", e);
-        }
-    }
-
-    private void flush() throws Exception {
-        if (bufferSize.get() == 0) return;
-        java.util.List<Map<String, Object>> batch = new java.util.ArrayList<>();
-        Map<String, Object> ev;
-        // One drain at a time: a size-triggered flush on the scheduler thread and
-        // close()'s flush on the caller thread would otherwise split one batch into
-        // two interleaved requests.
-        synchronized (drainLock) {
-            while ((ev = buffer.poll()) != null) { batch.add(ev); bufferSize.decrementAndGet(); }
-        }
-        if (batch.isEmpty()) return;
-
-        // Slice into requests of at most MAX_EVENTS_PER_REQUEST; a failed slice does
-        // not stop the remaining slices from being delivered.
-        Exception failure = null;
-        for (int from = 0; from < batch.size(); from += MAX_EVENTS_PER_REQUEST) {
-            try {
-                send(java.util.List.copyOf(batch.subList(from, Math.min(batch.size(), from + MAX_EVENTS_PER_REQUEST))));
-            } catch (Exception e) {
-                failure = e;
-            }
-        }
-        if (failure != null) throw failure;
+        core.track(event);
     }
 
     /**
-     * POSTs one slice. The body is serialized once, so every retry resends the same
-     * idempotency keys. Every way the slice can be lost goes through recordDrop.
+     * Sends what is queued until the shutdown deadline ({@link Builder#shutdownTimeoutMs(long)},
+     * default 5 s), then stops the background thread and the HTTP client. Events left at the
+     * deadline are reported as {@link DropReason#SHUTDOWN}. Idempotent.
      */
-    private void send(java.util.List<Map<String, Object>> events) throws Exception {
-        String body = mapper.writeValueAsString(Map.of("events", events));
-        HttpRequest req = HttpRequest.newBuilder(ingestorUri)
-                .timeout(Duration.ofSeconds(10))
-                .header("Content-Type", "application/json")
-                .header("X-API-Key", apiKey)
-                .header("X-Tenant-Id", tenantId)
-                .POST(HttpRequest.BodyPublishers.ofString(body))
-                .build();
-
-        for (int attempt = 1; attempt <= 3; attempt++) {
-            long delayMs = (long) Math.pow(2, attempt - 1) * retryBackoffBaseMs;
-            try {
-                HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-                int status = resp.statusCode();
-                if (status >= 200 && status < 300) {
-                    recordPartialRejections(events, resp.body());
-                    return;
-                }
-                // 4xx other than 408/429 (bad key, invalid event, unknown metric) cannot succeed on retry.
-                if (status >= 400 && status < 500 && status != 408 && status != 429) {
-                    LOG.warning("[aforo-grpc] ingestor returned " + status + " — not retrying"
-                            + errorMessages(resp.body()));
-                    recordDrop(events, DropReason.REJECTED);
-                    return;
-                }
-                if (status == 429) delayMs = retryAfterMs(resp, delayMs);
-            } catch (Exception e) {
-                if (attempt == 3) {
-                    recordDrop(events, DropReason.RETRY_EXHAUSTED);
-                    throw e;
-                }
-            }
-            if (attempt == 3) break;
-            try {
-                Thread.sleep(delayMs);
-            } catch (InterruptedException ie) {
-                // Interrupted mid-backoff (e.g. close() racing shutdownNow) — the
-                // batch is already drained and will never be retried; account for
-                // it before propagating, and restore the interrupt flag for the
-                // caller's subsequent blocking calls.
-                recordDrop(events, DropReason.RETRY_EXHAUSTED);
-                Thread.currentThread().interrupt();
-                throw ie;
-            }
-        }
-        recordDrop(events, DropReason.RETRY_EXHAUSTED);
-        LOG.warning("[aforo-grpc] flush exhausted retries — dropped " + events.size() + " events");
-    }
-
-    /**
-     * A 2xx batch response can still report events the ingestor refused individually
-     * ({@code failed} / {@code errors[{index,message}]}). Those events are dropped with
-     * {@link DropReason#REJECTED}; only events the response identifies by index are
-     * handed to the hook — any others are counted but not guessed at.
-     */
-    private void recordPartialRejections(java.util.List<Map<String, Object>> events, String body) {
-        if (body == null || body.isBlank()) return;
-        java.util.List<Map<String, Object>> rejected = new java.util.ArrayList<>();
-        int failed;
-        try {
-            com.fasterxml.jackson.databind.JsonNode root = unwrapEnvelope(mapper.readTree(body));
-            com.fasterxml.jackson.databind.JsonNode errors = root.path("errors");
-            java.util.Set<Integer> seen = new java.util.HashSet<>();
-            if (errors.isArray()) {
-                for (com.fasterxml.jackson.databind.JsonNode err : errors) {
-                    com.fasterxml.jackson.databind.JsonNode idx = err.get("index");
-                    if (idx != null && idx.isInt() && idx.asInt() >= 0 && idx.asInt() < events.size()
-                            && seen.add(idx.asInt())) {
-                        rejected.add(events.get(idx.asInt()));
-                    }
-                }
-            }
-            failed = Math.min(events.size(), Math.max(root.path("failed").asInt(0), rejected.size()));
-        } catch (Exception e) {
-            return; // not a batch-response body — treat as accepted
-        }
-        if (failed == 0) return;
-        LOG.warning("[aforo-grpc] ingestor rejected " + failed + " of " + events.size() + " event(s)"
-                + errorMessages(body));
-        if (!rejected.isEmpty()) recordDrop(rejected, DropReason.REJECTED);
-        int unidentified = failed - rejected.size();
-        if (unidentified > 0) dropped.addAndGet(unidentified);
-    }
-
-    /** {@code errors[].message} from an ingestor batch response, formatted for a log line; "" if none. */
-    private String errorMessages(String body) {
-        if (body == null || body.isBlank()) return "";
-        try {
-            com.fasterxml.jackson.databind.JsonNode errors = unwrapEnvelope(mapper.readTree(body)).path("errors");
-            if (!errors.isArray() || errors.isEmpty()) return "";
-            StringBuilder sb = new StringBuilder(":");
-            int shown = 0;
-            for (com.fasterxml.jackson.databind.JsonNode err : errors) {
-                if (shown++ == 10) { sb.append(" ..."); break; }
-                sb.append(" [");
-                if (err.has("index")) sb.append(err.get("index").asText()).append(": ");
-                sb.append(err.path("message").asText("")).append(']');
-            }
-            return sb.toString();
-        } catch (Exception e) {
-            return "";
-        }
-    }
-
-    /** Honours a delta-seconds {@code Retry-After} header on 429; otherwise keeps {@code fallbackMs}. */
-    private static long retryAfterMs(HttpResponse<String> resp, long fallbackMs) {
-        String retryAfter = resp.headers().firstValue("Retry-After").orElse(null);
-        if (retryAfter == null) return fallbackMs;
-        try {
-            return Math.max(0, Long.parseLong(retryAfter.trim())) * 1000;
-        } catch (NumberFormatException e) {
-            return fallbackMs;
-        }
-    }
-
     @Override
     public void close() {
-        scheduler.shutdown();
-        try {
-            flushQuietly();
-            if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) scheduler.shutdownNow();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        core.close();
     }
 
     /**
@@ -542,10 +453,19 @@ public final class AforoGrpcBilling implements AutoCloseable {
 
     // ── Helpers ──
 
-    private static final Function<Metadata, String> DEFAULT_CUSTOMER_EXTRACTOR = headers -> {
-        Metadata.Key<String> key = Metadata.Key.of("x-customer-id", Metadata.ASCII_STRING_MARSHALLER);
-        return headers.get(key);
-    };
+    private static final Metadata.Key<String> CUSTOMER_ID_KEY =
+            Metadata.Key.of("x-customer-id", Metadata.ASCII_STRING_MARSHALLER);
+
+    /** The resolver's answer; a resolver that throws counts as no customer and never fails the call. */
+    private String resolveCustomer(ServerCall<?, ?> call, Metadata headers) {
+        try {
+            String id = customerResolver.resolve(call, headers);
+            return id == null || id.isBlank() ? null : id.trim();
+        } catch (RuntimeException e) {
+            LOG.log(Level.FINE, "[aforo-grpc] customer resolver threw; the call is not metered", e);
+            return null;
+        }
+    }
 
     private static final java.util.Set<String> GRPC_STATUS_CODES = java.util.Set.of(
             "OK", "CANCELLED", "UNKNOWN", "INVALID_ARGUMENT", "DEADLINE_EXCEEDED", "NOT_FOUND",
@@ -636,9 +556,6 @@ public final class AforoGrpcBilling implements AutoCloseable {
         return s;
     }
 
-    private static String stripTrailingSlash(String s) {
-        return s.endsWith("/") ? s.substring(0, s.length() - 1) : s;
-    }
 
     /** The client-level {@code productType} stamped on events without a per-call override. */
     public String getProductType() { return productType; }
@@ -649,10 +566,20 @@ public final class AforoGrpcBilling implements AutoCloseable {
     public static final class Builder {
         private String productType;
         private String tenantId, productId, apiKey, ingestorUrl, serviceName;
-        private int flushCount = 50;
-        private long flushIntervalMs = 5_000L;
+        private int flushCount = TransportConfig.DEFAULT_FLUSH_COUNT;
+        private long flushIntervalMs = TransportConfig.DEFAULT_FLUSH_INTERVAL_MS;
+        private int maxQueueSize = TransportConfig.DEFAULT_QUEUE_CAPACITY;
+        private int maxRetries = TransportConfig.DEFAULT_MAX_RETRIES;
+        private long retryBaseMs = TransportConfig.DEFAULT_RETRY_BASE_MS;
+        private long timeoutMs = TransportConfig.DEFAULT_TIMEOUT_MS;
+        private long shutdownTimeoutMs = TransportConfig.DEFAULT_SHUTDOWN_TIMEOUT_MS;
+        private long breakerCooldownMs = TransportConfig.DEFAULT_BREAKER_INITIAL_MS;
+        private boolean allowInsecureHttp;
         private BiConsumer<java.util.List<Map<String, Object>>, DropReason> onDrop;
-        private Function<Metadata, String> customerIdExtractor;
+        private java.util.function.Consumer<MeteringError> onError;
+        private BiConsumer<Map<String, Object>, java.util.List<Map<String, Object>>> onAccepted;
+        private CustomerResolver customerResolver;
+        private boolean trustCustomerHeader;
 
         public Builder tenantId(String s)       { this.tenantId = s; return this; }
         public Builder productId(String s)      { this.productId = s; return this; }
@@ -664,8 +591,24 @@ public final class AforoGrpcBilling implements AutoCloseable {
         public Builder productType(String s) { this.productType = s; return this; }
         public Builder ingestorUrl(String s)    { this.ingestorUrl = s; return this; }
         public Builder serviceName(String s)    { this.serviceName = s; return this; }
-        public Builder flushCount(int n)        { this.flushCount = n; return this; }
-        public Builder flushIntervalMs(long n)  { this.flushIntervalMs = n; return this; }
+        /** Events per request (default 500, at most 1000). */
+        public Builder flushCount(int n) { this.flushCount = n; return this; }
+        /** How often queued events are sent when the batch is not full (default 5 s). */
+        public Builder flushIntervalMs(long n) { this.flushIntervalMs = n; return this; }
+        /** Queue capacity (default 10 000). When full, the oldest event is dropped as {@code OVERFLOW}. */
+        public Builder maxQueueSize(int n) { this.maxQueueSize = n; return this; }
+        /** Retries per request on a network error, timeout, 408, 429 or 5xx (default 3). */
+        public Builder maxRetries(int n) { this.maxRetries = n; return this; }
+        /** Base of the full-jitter retry backoff (default 500 ms). */
+        public Builder retryBaseMs(long n) { this.retryBaseMs = n; return this; }
+        /** Total deadline of one ingest request (default 10 s). */
+        public Builder timeoutMs(long n) { this.timeoutMs = n; return this; }
+        /** How long {@link #close()} keeps sending queued events (default 5 s). */
+        public Builder shutdownTimeoutMs(long n) { this.shutdownTimeoutMs = n; return this; }
+        /** First pause after the ingestor stays unreachable through every retry (default 5 s, doubling to 5 min). */
+        public Builder breakerCooldownMs(long n) { this.breakerCooldownMs = n; return this; }
+        /** Allow a plain http:// ingestor URL on a host other than localhost. Off by default: the API key is in every request. */
+        public Builder allowInsecureHttp(boolean b) { this.allowInsecureHttp = b; return this; }
         /**
          * Opt-in hook receiving events that were permanently dropped (retry
          * exhaustion, a terminal rejection, or an event that breaks an ingestor
@@ -675,19 +618,43 @@ public final class AforoGrpcBilling implements AutoCloseable {
          * none (drops are still counted in droppedCount() and WARN-logged).
          */
         public Builder onDrop(BiConsumer<java.util.List<Map<String, Object>>, DropReason> fn) { this.onDrop = fn; return this; }
-        public Builder customerIdExtractor(Function<Metadata, String> fn) { this.customerIdExtractor = fn; return this; }
-        public AforoGrpcBilling build()         { return new AforoGrpcBilling(this); }
-    }
+        /**
+         * Opt-in hook for delivery problems, typed by {@link MeteringError#kind()}. Runs on the
+         * background sender thread; it may call {@code close()}. Exceptions are caught and logged.
+         */
+        public Builder onError(java.util.function.Consumer<MeteringError> fn) { this.onError = fn; return this; }
+        /**
+         * Opt-in hook receiving the envelope-unwrapped body of every accepted (2xx) batch (empty
+         * when the body was not a JSON object). Runs on the sender thread; exceptions are caught and logged.
+         */
+        public Builder onAccepted(BiConsumer<Map<String, Object>, java.util.List<Map<String, Object>>> fn) { this.onAccepted = fn; return this; }
+        /** Reads the customer for each call from your authentication. Required unless {@link #trustCustomerHeader(boolean)}. */
+        public Builder customerResolver(CustomerResolver resolver) { this.customerResolver = resolver; return this; }
 
-    /**
-     * The ingestor wraps every 2xx JSON body in {@code {success, data, meta}}.
-     * Returns the inner {@code data} object when present, else the node itself
-     * (bare shape).
-     */
-    static com.fasterxml.jackson.databind.JsonNode unwrapEnvelope(com.fasterxml.jackson.databind.JsonNode root) {
-        if (root != null && root.isObject() && root.path("data").isObject()) {
-            return root.get("data");
+        /**
+         * A resolver that reads only the metadata. Kept for 1.x callers; prefer
+         * {@link #customerResolver(CustomerResolver)}.
+         */
+        @Deprecated
+        public Builder customerIdExtractor(Function<Metadata, String> fn) {
+            this.customerResolver = fn == null ? null : (call, headers) -> fn.apply(headers);
+            return this;
         }
-        return root;
+
+        /**
+         * Opt in to reading the {@code x-customer-id} metadata. Callers of your service control
+         * it; turn this on only when a proxy in front of the server authenticates the caller,
+         * sets it and strips any value the caller sent.
+         */
+        public Builder trustCustomerHeader(boolean trust) { this.trustCustomerHeader = trust; return this; }
+
+        CustomerResolver customerResolver() {
+            if (customerResolver != null) return customerResolver;
+            if (trustCustomerHeader) return (call, headers) -> headers.get(CUSTOMER_ID_KEY);
+            throw new IllegalStateException(MISSING_CUSTOMER_SOURCE);
+        }
+
+        /** @throws IllegalStateException without {@link #customerResolver} or {@link #trustCustomerHeader} */
+        public AforoGrpcBilling build()         { customerResolver(); return new AforoGrpcBilling(this); }
     }
 }

@@ -1,6 +1,6 @@
 # aforo-graphql-metering — User Guide
 
-**Version:** 1.2.2 · **Updated:** 2026-10-01 · **Audience:** Python engineers running a GraphQL server who need per-operation billing.
+**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Python engineers running a GraphQL server who need per-operation billing.
 
 ## What you'll build
 
@@ -11,12 +11,12 @@ A GraphQL server that reports one Aforo event per operation, with AST-derived co
 - Python **3.9+** and `graphql-core>=3.2` (the SDK's only hard dependency).
 - An Aforo **API key**, **tenant id**, and **product id** from the Aforo console.
 - A GraphQL server: Strawberry (extension path) or anything ASGI (middleware path).
-- A way to set `x-customer-id` on incoming requests, or a custom extractor.
+- A function that returns the customer for a request from identity your service verified.
 
 ## Step 1 — Install
 
 ```bash
-pip install -e .                    # from python-graphql/ (or: pip install "aforo-graphql-metering>=1.2.2")
+pip install -e .                    # from python-graphql/ (or: pip install "aforo-graphql-metering>=2.0.0")
 pip install -e ".[strawberry]"      # or [graphene] / [ariadne] / [httpx]
 ```
 
@@ -54,33 +54,28 @@ schema = strawberry.Schema(query=Query, extensions=[strawberry_extension(billing
 
 ```python
 from aforo_graphql_metering import asgi_middleware
-app = asgi_middleware(billing, path="/graphql")(app)
+app = asgi_middleware(billing, path="/graphql",
+                      customer_resolver=lambda scope: scope["user"].customer_id)(app)
 ```
 
 > ⚠ The middleware only meters POSTs to the `path` you give it (default `/graphql`). If your server mounts GraphQL elsewhere, set `path` accordingly or no events fire.
 
 ## Step 4 — Make sure the customer ID resolves
 
-By default the SDK reads `x-customer-id` from request headers (or the Strawberry context). An operation with no resolvable customer ID is dropped — not metered. Set that header at your gateway/auth layer:
-
-```
-x-customer-id: cust_acme_001
-```
-
-Or override resolution at construction:
+Every integration needs a customer resolver: `customer_resolver=` on `strawberry_extension` / `asgi_middleware`, or `customer_id_extractor=` on the client. Without one, building the integration raises `ValueError`. An operation whose resolver returns nothing still runs; it is not metered and is counted as an `invalid` drop.
 
 ```python
 billing = AforoGraphQlBilling(
     # ...
-    customer_id_extractor=lambda ctx: decode_jwt(ctx).get("sub"),
+    customer_id_extractor=lambda ctx: verify_jwt(ctx["request"].headers["authorization"])["sub"],
 )
 ```
 
-> ⚠ Resolve `customer_id` server-side from something you trust (a verified JWT, your gateway). Don't bill against a value the client can set to any customer it wants.
+> ⚠ Resolve `customer_id` server-side from something you trust (a verified JWT, your auth middleware). `trust_customer_header=True` bills the `x-customer-id` header as sent; any client can set it to any customer, so use it only behind a gateway that overwrites it.
 
 ## Step 5 — Run an operation and flush
 
-Execute any query/mutation against your server. Events buffer in memory and flush on `flush_count` (50) or every `flush_interval_sec` (5 s) via a daemon thread that starts at construction. To force delivery now:
+Execute any query/mutation against your server. `record()` only queues; one background thread sends batches of up to `flush_count` (500) events every `flush_interval_sec` (5 s), sooner when 500 are queued. If the ingestor is down, batches stay queued and are retried after a pause. To send now and wait (`flush()` returns how many events are still queued):
 
 ```python
 billing.flush()
@@ -121,11 +116,17 @@ billing.shutdown()   # stops the flush thread and drains remaining events
 | `ingestor_url` | `str` | required | Host; `/v1/ingest/batch` appended. |
 | `schema_version` | `str?` | `None` | Stamped on each event. |
 | `flush_interval_sec` | `float` | `5.0` | Background flush cadence. |
-| `flush_count` | `int` | `50` | Buffer size that forces a flush. |
-| `on_error` | `Callable?` | logs | Called on permanent batch failure, and with the ingestor's `errors[].message` when it rejects events. |
-| `on_drop` | `Callable[[list[dict], str], None]?` | `None` | Called with events that will not be delivered and the reason (`invalid`, `rejected`, `retry_exhausted`). Pass by keyword. |
+| `flush_count` | `int` | `500` | Events per request, and the queue size that wakes the sender early (at most 1000). |
+| `on_error` | `Callable?` | logs | Receives a `TransportError`; branch on `.kind`: `outage` / `auth` (events still queued and retried), `rejected` (the ingestor refused them; message carries its `errors[].message`), `shutdown`, `closed`. `.events` and `.status` say which events and which HTTP status. |
+| `on_drop` | `Callable[[list[dict], str], None]?` | `None` | Called with events that will not be delivered and the reason (`overflow`, `rejected`, `invalid`, `shutdown`, `closed`). Pass by keyword. |
 | `product_type` | `str` | `"GRAPHQL_API"` | Top-level `productType` sent on every event (trimmed and upper-cased; values the SDK does not know are passed through). Override per event with `record(..., product_type=...)`. |
-| `customer_id_extractor` | `Callable?` | reads `x-customer-id` | Resolve the billed customer. |
+| `max_queue_size` | `int` | `10000` | Queue capacity; the oldest event is dropped as `overflow` when full. Keyword-only. |
+| `timeout_sec` | `float` | `10.0` | Total deadline per HTTP request. Keyword-only. |
+| `shutdown_timeout_sec` | `float` | `5.0` | `shutdown()` flushes for at most this long; leftovers are dropped as `shutdown`. Keyword-only. |
+| `allow_insecure_http` | `bool` | `False` | Allow plain `http://` to a host other than localhost. Keyword-only. |
+| `http_transport`, `transport_options` | | `None` | An `httpx` transport / extra transport-core settings, for tests and unusual networks. Keyword-only. |
+| `customer_id_extractor` | `Callable?` | `None` | Customer resolver for the integrations; or pass `customer_resolver=` to them. |
+| `trust_customer_header` | `bool` | `False` | Bill the `x-customer-id` header as sent. |
 | `complexity_scorer` | `Callable?` | `field_count + 5 × max_depth` | Returns `(complexity, field_count)`. |
 
 Methods: `record(customer_id, query, operation_name, duration_ms, has_errors, response_bytes=0)`, `flush()`, `shutdown()`. Helpers: `strawberry_extension(billing)`, `asgi_middleware(billing, path="/graphql")`, `default_complexity_scorer(doc, operation_name=None)`.
@@ -137,9 +138,9 @@ Execution status (`executionStatus`, used by OUTCOME_BASED pricing) is described
 | Symptom | Cause | Fix |
 |---|---|---|
 | No events for any operation | `graphql-core` not installed, so `record()` no-ops; or the document failed to parse. | Install `graphql-core>=3.2`; confirm the query is valid GraphQL. |
-| Some operations never metered | Customer ID didn't resolve (no `x-customer-id`), or the ASGI `path` doesn't match. | Set the header upstream / fix the extractor; point `asgi_middleware(path=...)` at the real route. |
-| `on_error` fires with "flush rejected with HTTP 401" (or 403) | Bad or unscoped API key. A 4xx other than 408 / 429 is not retried; the batch is dropped with reason `rejected`. | Fix `api_key`; confirm it matches `tenant_id`. Replay the batch from an `on_drop` hook if you keep one. |
-| `billing.dropped_count` is above 0 | Events were dropped: `invalid` (failed a client-side check), `rejected` (ingestor refused them) or `retry_exhausted`. | Read the WARNING log line for the reason; see [Dropped events](README.md#dropped-events). |
+| Some operations never metered; `dropped_count` rises with `invalid` | The customer resolver returned nothing, the request body was over `max_request_body_bytes`, or the ASGI `path` doesn't match. | Fix the resolver; raise `max_request_body_bytes`; point `asgi_middleware(path=...)` at the real route. |
+| ERROR log "Ingestor answered HTTP 401" (or 403) | Bad or revoked API key. The events stay queued (up to `max_queue_size`) and are retried after a pause. | Fix `api_key` and restart; confirm it matches `tenant_id`. |
+| `billing.dropped_count` is above 0 | Events were dropped: `invalid` (failed a client-side check, or no customer), `rejected` (ingestor refused them), `overflow` (queue full during an outage), `shutdown` (still queued at the shutdown deadline) or `closed` (sent after shutdown). An ingest outage alone does not drop events. | Read the WARNING log line for the reason; see [Dropped events](README.md#dropped-events). |
 | Events sent, none in console | Wrong `ingestor_url` host, or `graphql_api.operations` isn't mapped to a rate plan. | Use `https://api.aforo.ai`; map the metric in Aforo. |
 | Complexity is always the default formula | No `complexity_scorer` supplied. | Pass `complexity_scorer=...` to match your pricing model. |
 | Subscriptions aren't billed | This SDK meters query/mutation operations, not long-lived subscription streams. | Use `aforo-ws-metering` for subscription/socket traffic. |

@@ -85,7 +85,7 @@ class AforoGraphQlIntegrationTest {
         captureServer.start();
         capturePort = captureServer.getAddress().getPort();
 
-        billing = AforoGraphQlBilling.newBuilder()
+        billing = AforoGraphQlBilling.newBuilder().trustCustomerHeader(true)
                 .tenantId("tenant-int-gql")
                 .productId("prod-int-gql")
                 .apiKey("sk_int_gql")

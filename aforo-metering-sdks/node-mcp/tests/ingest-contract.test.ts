@@ -71,6 +71,7 @@ describe('ingest contract guard (shared fixture)', () => {
       productId: 'prod_mcp_001',
       apiKey: 'sk_mcp_abc',
       ingestorUrl: 'https://ingest.test.aforo.ai',
+      customerId: 'cust_contract',
     });
 
     billing.recordToolInvocation('search_documents', 'agent_contract', 'sess_1', 'SUCCESS', 42);

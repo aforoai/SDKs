@@ -153,7 +153,7 @@ def fixture():
 
     # AforoGrpcInterceptor lives in the same module
     from aforo_grpc_metering.client import AforoGrpcInterceptor
-    interceptor = AforoGrpcInterceptor(billing)
+    interceptor = AforoGrpcInterceptor(billing, trust_customer_header=True)
 
     server = grpc.server(
         ThreadPoolExecutor(max_workers=4),

@@ -15,14 +15,14 @@ func testClient(t *testing.T) *AforoClient {
 	t.Helper()
 	// A closed port: these tests assert on what Track accepts, and no flush
 	// should ever reach a real ingestor.
-	c := NewClient(Options{
+	c := mustNewClient(t, Options{
 		APIKey:        "sk_test_limits",
 		BaseURL:       "http://127.0.0.1:1",
 		FlushCount:    1000000,
 		FlushInterval: time.Hour,
 		RetryBase:     time.Millisecond,
 	})
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { closeNow(c) })
 	return c
 }
 
@@ -114,12 +114,12 @@ func TestLengthLimitsCountCharactersNotBytes(t *testing.T) {
 // returning ErrInvalidEvent.
 func TestOverLimitEventIsCountedAndHandedToOnDrop(t *testing.T) {
 	var got []DropReason
-	c := NewClient(Options{
+	c := mustNewClient(t, Options{
 		APIKey: "sk_test_limits", BaseURL: "http://127.0.0.1:1",
 		FlushInterval: time.Hour, RetryBase: time.Millisecond,
 		OnDrop: func(_ []TrackEvent, r DropReason) { got = append(got, r) },
 	})
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { closeNow(c) })
 	over := validEvent()
 	over.MetricName = strings.Repeat("m", 256)
 	if err := c.Track(over); !errors.Is(err, ErrInvalidEvent) {

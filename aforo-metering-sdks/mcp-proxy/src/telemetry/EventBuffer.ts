@@ -1,159 +1,110 @@
 /**
- * @file Simple array event buffer with flush-on-count and flush-on-timer.
- * Not a ring buffer (proxy has bounded lifetime — no overflow concern).
+ * @file Usage-event queue for the proxy, on the shared Node transport core
+ * (`../transport-core/core.ts`, copied from `node/src/transport-core/` — edit
+ * it there and run `scripts/sync-transport.sh node`).
  *
- * Also owns drop accounting for the proxy: every usage event that is
- * permanently lost is counted (`droppedCount`), WARN-logged and handed to the
- * opt-in `onDrop` hook with a reason.
+ * The core gives the proxy one bounded queue (oldest evicted as 'overflow'),
+ * one flusher (`push()` never sends), full-jitter retries with Retry-After, a
+ * deadline on every request, re-queue plus a breaker during an outage (events
+ * keep their idempotency keys), and a shutdown deadline whose leftovers are
+ * reported as 'shutdown'.
+ *
+ * This class also owns drop accounting for the proxy: every usage event that
+ * is permanently lost is counted (`droppedCount`), WARN-logged and handed to
+ * the opt-in `onDrop` hook with a reason.
  */
 
-import type { BatchIngestResponse, DropReason, ProxyUsageEvent } from '../types.js';
-import type { IngestorClient } from './IngestorClient.js';
+import type { DropReason, ProxyUsageEvent } from '../types.js';
+import { TransportCore, type CoreFetch, type CoreFlushResult, type CoreShutdownResult } from '../transport-core/core.js';
 import { logger } from '../util/logger.js';
+import { PROXY_VERSION } from '../version.js';
 
 /** The ingestor's per-request cap on POST /v1/ingest/batch (IngestBatchRequest). */
 export const MAX_BATCH_EVENTS = 1000;
 
 export interface EventBufferConfig {
-  flushCount: number;
-  flushIntervalMs: number;
-  client: IngestorClient;
+  /** Ingestor base URL (https; http only for loopback or with allowInsecureHttp). */
+  baseUrl: string;
+  apiKey: string;
+  tenantId: string;
+  allowInsecureHttp?: boolean;
+  /** Events per request; reaching it wakes the flusher (default 500, max 1000). */
+  flushCount?: number;
+  /** Flush at least this often, in ms (default 5000). */
+  flushIntervalMs?: number;
+  /** Queue capacity (default 10 000). */
+  maxQueueSize?: number;
+  /** Retries per batch before the breaker opens (default 3). */
+  maxRetries?: number;
+  /** Total deadline per ingest request, in ms (default 10 000). */
+  timeoutMs?: number;
+  /** shutdown() deadline, in ms (default 5000). */
+  shutdownTimeoutMs?: number;
   /** Opt-in hook for permanently dropped usage events. */
   onDrop?: (events: ProxyUsageEvent[], reason: DropReason) => void;
+  /** Injectable for tests. */
+  fetch?: CoreFetch;
 }
 
 export class EventBuffer {
-  private buffer: ProxyUsageEvent[] = [];
-  private readonly flushCount: number;
-  private readonly client: IngestorClient;
-  private flushTimer: ReturnType<typeof setInterval> | null = null;
-  private flushing = false;
-  private readonly onDrop?: (events: ProxyUsageEvent[], reason: DropReason) => void;
-  private dropped = 0;
-  private invalidDrops = 0;
+  private readonly core: TransportCore<ProxyUsageEvent>;
 
   constructor(config: EventBufferConfig) {
-    this.flushCount = config.flushCount;
-    this.client = config.client;
-    this.onDrop = config.onDrop;
-    this.flushTimer = setInterval(() => this.flush(), config.flushIntervalMs);
-  }
-
-  push(event: ProxyUsageEvent): void {
-    this.buffer.push(event);
-    if (this.buffer.length >= this.flushCount) {
-      this.flush();
-    }
-  }
-
-  async flush(): Promise<void> {
-    if (this.buffer.length === 0 || this.flushing) return;
-
-    this.flushing = true;
-    const pending = this.buffer.splice(0);
-
-    // POST /v1/ingest/batch rejects more than MAX_BATCH_EVENTS events with 400
-    // (IngestBatchRequest @Size(max = 1000)), losing every event in the batch.
-    // Events pushed while a flush is in flight accumulate past flushCount, so
-    // the next flush can hold more than that -- send it in slices.
-    try {
-      for (let i = 0; i < pending.length; i += MAX_BATCH_EVENTS) {
-        await this.sendSlice(pending.slice(i, i + MAX_BATCH_EVENTS));
-      }
-    } finally {
-      this.flushing = false;
-    }
-  }
-
-  private async sendSlice(events: ProxyUsageEvent[]): Promise<void> {
-    try {
-      const outcome = typeof this.client.sendBatchDetailed === 'function'
-        ? await this.client.sendBatchDetailed(events)
-        : { result: await this.client.sendBatch(events) };
-      const result = outcome.result;
-      if (!result) {
-        this.recordDrop(events, outcome.reason ?? 'retry_exhausted', outcome.message);
-        return;
-      }
-      logger.debug('Flushed events', {
-        accepted: result.accepted,
-        duplicates: result.duplicates,
-        failed: result.failed,
-      });
-      this.recordPartialFailure(events, result);
-    } catch (err) {
-      this.recordDrop(events, 'retry_exhausted', (err as Error).message);
-    }
-  }
-
-  /**
-   * Events the ingestor rejected individually inside a 2xx batch: dropped with
-   * reason 'rejected' — by index when the response names them; otherwise they
-   * are counted and logged but not handed to onDrop (which ones is unknown).
-   */
-  private recordPartialFailure(events: ProxyUsageEvent[], result: BatchIngestResponse): void {
-    const seen = new Set<number>();
-    const errors = (Array.isArray(result.errors) ? result.errors : []).filter((e) => {
-      const index = Number(e?.index);
-      if (!Number.isInteger(index) || index < 0 || index >= events.length || seen.has(index)) return false;
-      seen.add(index);
-      return true;
+    const onDrop = config.onDrop;
+    this.core = new TransportCore<ProxyUsageEvent>({
+      baseUrl: config.baseUrl,
+      apiKey: config.apiKey,
+      allowInsecureHttp: config.allowInsecureHttp,
+      headers: { 'X-Tenant-Id': config.tenantId },
+      userAgent: `aforo-mcp-proxy/${PROXY_VERSION}`,
+      flushCount: config.flushCount,
+      flushIntervalMs: config.flushIntervalMs,
+      maxQueueSize: config.maxQueueSize,
+      maxRetries: config.maxRetries,
+      timeoutMs: config.timeoutMs,
+      shutdownTimeoutMs: config.shutdownTimeoutMs,
+      // The proxy flushes from its own shutdown path (SIGTERM/SIGINT, child exit).
+      flushOnExit: false,
+      ...(config.fetch ? { fetch: config.fetch } : {}),
+      logger: {
+        debug: (m) => logger.debug(m),
+        warn: (m) => logger.warn(m),
+        error: (m) => logger.error(m),
+      },
+      onDrop: onDrop ? (events, reason) => onDrop(events, reason) : undefined,
     });
-    const reported = typeof result.failed === 'number' && result.failed > 0 ? Math.floor(result.failed) : 0;
-    const count = Math.min(events.length, Math.max(reported, errors.length));
-    if (count === 0) return;
-    if (errors.length === count) {
-      this.recordDrop(errors.map((e) => events[Number(e.index)]), 'rejected', errors[0].message);
-    } else {
-      this.dropped += count;
-      logger.warn('Ingestor rejected events in a batch — dropped', {
-        count, batchSize: events.length, totalDropped: this.dropped,
-      });
-    }
+  }
+
+  /** Queue one event. Never sends and never throws. */
+  push(event: ProxyUsageEvent): void {
+    this.core.enqueue(event);
+  }
+
+  /** Send what is queued now and wait for it (on the single flusher). */
+  flush(): Promise<CoreFlushResult> {
+    return this.core.flush();
   }
 
   /**
-   * Account for permanently lost usage events: bump the counter, WARN-log and
-   * call the opt-in onDrop hook (its exceptions are swallowed). 'invalid'
-   * WARNs are throttled (first, then every 1000th) so a client that keeps
-   * sending a bad tool call can't storm the log.
+   * Account for usage events lost before they were queued (reason 'invalid'):
+   * counted, WARN-logged (throttled) and passed to onDrop.
    */
   recordDrop(events: ProxyUsageEvent[], reason: DropReason, detail?: string): void {
-    if (events.length === 0) return;
-    this.dropped += events.length;
-    let log = true;
-    if (reason === 'invalid') {
-      this.invalidDrops += events.length;
-      log = this.invalidDrops === 1 || this.invalidDrops % 1000 === 0;
-    }
-    if (log) {
-      logger.warn(reason === 'invalid' ? 'Tool call not metered — invalid event dropped' : 'Events dropped', {
-        count: events.length, reason, totalDropped: this.dropped, ...(detail ? { detail } : {}),
-      });
-    }
-    if (this.onDrop) {
-      try {
-        this.onDrop(events, reason);
-      } catch {
-        // A hook bug must never break metering.
-      }
-    }
+    this.core.reportDrop(events, reason, detail);
   }
 
   /** Usage events permanently dropped since the proxy started. */
   get droppedCount(): number {
-    return this.dropped;
+    return this.core.droppedCount;
   }
 
-  async shutdown(): Promise<void> {
-    if (this.flushTimer) {
-      clearInterval(this.flushTimer);
-      this.flushTimer = null;
-    }
-    await this.flush();
+  /** Stop accepting events and drain until the shutdown deadline. */
+  shutdown(): Promise<CoreShutdownResult> {
+    return this.core.shutdown();
   }
 
+  /** Events queued and not yet accepted. */
   get size(): number {
-    return this.buffer.length;
+    return this.core.queued;
   }
 }

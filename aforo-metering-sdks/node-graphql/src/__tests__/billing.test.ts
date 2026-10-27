@@ -33,6 +33,7 @@ const config = () => ({
   tenantId: 'tenant-001',
   productId: 'prod-gql-001',
   apiKey: 'sk_gql_abc',
+  customerResolver: (ctx: any) => ctx?.customerId, trustCustomerHeader: true,
   ingestorUrl: 'https://api.aforo.ai',
   schemaVersion: 'v2.1',
 });
@@ -303,12 +304,12 @@ describe('ingest batch contract', () => {
     });
     expect(() => {
       billing.record({ customerId: 'c'.repeat(65), query: '{ a }', durationMs: 1, hasErrors: false });
-      billing.record({ customerId: '   ', query: '{ a }', durationMs: 1, hasErrors: false }); // not billable, not a drop
+      billing.record({ customerId: '   ', query: '{ a }', durationMs: 1, hasErrors: false }); // no customer: one invalid drop
     }).not.toThrow();
     await billing.shutdown();
     expect(capturedRequests).toHaveLength(0);
-    expect(billing.droppedCount).toBe(1);
-    expect(drops.map((d) => d.reason)).toEqual(['invalid']);
+    expect(billing.droppedCount).toBe(2);
+    expect(drops.map((d) => d.reason)).toEqual(['invalid', 'invalid']);
     expect(drops[0].events[0].customerId).toBe('c'.repeat(65));
     expect(drops[0].events[0].idempotencyKey).toMatch(/:\d+:[a-z0-9]{8}$/);
     expect(onError).not.toHaveBeenCalled();
@@ -316,7 +317,7 @@ describe('ingest batch contract', () => {
     warn.mockRestore();
   });
 
-  test('invalid-event WARN is throttled per field: first, then every 1000th', async () => {
+  test('invalid-event WARN is throttled: first, then every 1000th', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     const billing = new AforoGraphQlBilling({ ...config(), flushCount: 5000 });
     for (let i = 0; i < 1001; i++) {

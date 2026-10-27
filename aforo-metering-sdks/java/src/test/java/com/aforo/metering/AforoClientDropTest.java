@@ -19,6 +19,7 @@ class AforoClientDropTest {
                 .baseUrl("http://localhost:19999") // No real server — send fails fast
                 .flushCount(100)
                 .flushIntervalMs(60_000) // Long to avoid background flushes
+                .shutdownTimeoutMs(200)  // close() gives up quickly on the absent server
                 .maxRetries(0);
     }
 
@@ -44,26 +45,31 @@ class AforoClientDropTest {
         }
     }
 
+    /**
+     * G267: an outage no longer drops the batch. It goes back to the queue with the
+     * same keys; only at the shutdown deadline is it reported (SHUTDOWN), keys intact.
+     */
     @Test
-    void sendFailureDropsBatchCountsAndFiresHook() {
-        List<ResolvedEvent> droppedEvents = new ArrayList<>();
-        List<DropReason> reasons = new ArrayList<>();
+    void sendFailureKeepsTheBatchAndReportsItOnlyAtShutdown() {
+        List<ResolvedEvent> droppedEvents = new CopyOnWriteArrayList<>();
+        List<DropReason> reasons = new CopyOnWriteArrayList<>();
 
-        try (var client = new AforoClient(options()
-                .onDrop((events, reason) -> { droppedEvents.addAll(events); reasons.add(reason); }))) {
+        var client = new AforoClient(options()
+                .onDrop((events, reason) -> { droppedEvents.addAll(events); reasons.add(reason); }));
+        client.track(TrackEvent.builder("cust_1", "api_calls").idempotencyKey("k1").build());
+        client.track(TrackEvent.builder("cust_2", "api_calls").idempotencyKey("k2").build());
 
-            client.track(TrackEvent.builder("cust_1", "api_calls").idempotencyKey("k1").build());
-            client.track(TrackEvent.builder("cust_2", "api_calls").idempotencyKey("k2").build());
+        FlushResult result = client.flush(); // connection refused, maxRetries=0
 
-            FlushResult result = client.flush(); // connection refused, maxRetries=0
+        assertThat(result.failed()).isZero();
+        assertThat(client.bufferedCount()).isEqualTo(2);
+        assertThat(client.droppedCount()).isZero();
+        assertThat(reasons).isEmpty();
 
-            assertThat(result.failed()).isEqualTo(2);
-            assertThat(client.droppedCount()).isEqualTo(2);
-            assertThat(reasons).containsExactly(DropReason.RETRY_EXHAUSTED);
-            assertThat(droppedEvents).hasSize(2);
-            assertThat(droppedEvents.get(0).toMap().get("idempotencyKey")).isEqualTo("k1");
-            assertThat(droppedEvents.get(1).toMap().get("idempotencyKey")).isEqualTo("k2");
-        }
+        client.close();
+        assertThat(reasons).containsExactly(DropReason.SHUTDOWN);
+        assertThat(droppedEvents).extracting(ResolvedEvent::getIdempotencyKey).containsExactly("k1", "k2");
+        assertThat(client.droppedCount()).isEqualTo(2);
     }
 
     @Test
@@ -94,28 +100,25 @@ class AforoClientDropTest {
     }
 
     @Test
-    void defaultNoHookCountsDropsAndResultUnchanged() {
-        try (var client = new AforoClient(options())) {
-            client.track(TrackEvent.builder("cust_1", "api_calls").build());
-            FlushResult result = client.flush();
-
-            // Same result values as before the hardening
-            assertThat(result.sent()).isEqualTo(0);
-            assertThat(result.failed()).isEqualTo(1);
-            assertThat(client.droppedCount()).isEqualTo(1);
-        }
+    void defaultNoHookStillCountsDrops() {
+        var client = new AforoClient(options().maxQueueSize(1));
+        client.track(TrackEvent.builder("cust_1", "api_calls").build());
+        client.track(TrackEvent.builder("cust_2", "api_calls").build());
+        assertThat(client.droppedCount()).isEqualTo(1);
+        client.close();
+        assertThat(client.droppedCount()).isEqualTo(2); // the survivor at the shutdown deadline
     }
 
     @Test
-    void throwingHookNeverBreaksFlush() {
-        try (var client = new AforoClient(options()
+    void throwingHookNeverBreaksTracking() {
+        try (var client = new AforoClient(options().maxQueueSize(1)
                 .onDrop((events, reason) -> { throw new RuntimeException("hook bug"); }))) {
 
             client.track(TrackEvent.builder("cust_1", "api_calls").build());
-            FlushResult result = client.flush();
+            client.track(TrackEvent.builder("cust_2", "api_calls").build());
 
-            assertThat(result.failed()).isEqualTo(1);
             assertThat(client.droppedCount()).isEqualTo(1);
+            assertThat(client.bufferedCount()).isEqualTo(1);
         }
     }
 

@@ -96,13 +96,34 @@ func statusFromContext(ctx context.Context) string {
 	return h.value
 }
 
-// meteredStream exposes the status-holder context to streaming handlers.
+// meteredStream exposes the status-holder context to streaming handlers and
+// counts the messages the stream carries.
 type meteredStream struct {
 	grpc.ServerStream
-	ctx context.Context
+	ctx      context.Context
+	received atomic.Int64
+	sent     atomic.Int64
 }
 
 func (s *meteredStream) Context() context.Context { return s.ctx }
+
+// RecvMsg counts each message received from the client.
+func (s *meteredStream) RecvMsg(m any) error {
+	err := s.ServerStream.RecvMsg(m)
+	if err == nil {
+		s.received.Add(1)
+	}
+	return err
+}
+
+// SendMsg counts each message sent to the client.
+func (s *meteredStream) SendMsg(m any) error {
+	err := s.ServerStream.SendMsg(m)
+	if err == nil {
+		s.sent.Add(1)
+	}
+	return err
+}
 
 // maxExecutionStatusLength mirrors the ingest contract's maxLength for
 // executionStatus.

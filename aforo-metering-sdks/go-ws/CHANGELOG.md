@@ -2,6 +2,31 @@
 
 All notable changes to `ws-metering-go` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [2.0.0] - 2026-10-26
+
+**Breaking.** New import path `github.com/aforoai/SDKs/aforo-metering-sdks/go-ws/v2`. Migration: `billing.Shutdown(ctx)` takes a context; add the metric `websocket_api.connection_opened` to your catalog if you bill connections opened.
+
+### Changed
+- **Transport edge cases (wave 5 review, contract/TRANSPORT-SPEC.md "Edge cases").** Redirects are never followed, also with a caller-supplied `HTTPClient` (a copy with redirects refused is used): a `3xx` is logged at ERROR with the target host and handled like an outage. Every `5xx` is retried (`501`/`505` were dropped). `Timeout` now also covers reading the response body; a `2xx` whose body is cut off is retried with the same keys instead of counted as sent. Events a `2xx` names in `errors[]` as `retryable` are resent after the normal backoff at most `MaxRetries` times, then handled as an outage; `errors[]` is used even when `failed` is missing or 0. The breaker pause is `max(250 ms, random(0, 5 s·2^n))`, capped at 5 min (it was 5 s plus jitter). Shutdown keeps retrying an unreachable ingestor until its deadline instead of stopping at the first outage. `Retry-After` accepts fractional seconds (`1.5`). A second close returns the first one's result.
+- **Callbacks may call Flush and Close.** Calling them from `OnDrop`, `OnError` or `OnAccepted` deadlocked the sender; `Flush` now returns at once there and close starts the shutdown and returns.
+- **Typed `OnError` and new `OnAccepted`.** Sending problems reach `OnError` as `*TransportError` (`errors.As`, branch on `Kind`: `KindOutage`, `KindAuth`, `KindRejected`, `KindShutdown`, `KindClosed`; `Events` holds the events). The signature stays `func(error)`; invalid events still arrive as a plain error. `Config.OnAccepted(body, events)` receives each `2xx` body (envelope removed, e.g. `killedSessionIds`).
+- **`ConnectionIdleTimeout` must not be negative.** `New` returns an error for a negative value (it switched the idle sweep off, so the connection map could grow without bound). Migration: drop a negative setting; 0 means the 1 h default.
+- **`Open` racing `Shutdown`.** An `Open` that ran while `Shutdown` was closing connections could be billed `CONNECTION_OPENED` with no `CONNECTION_CLOSED`. It is now either closed by `Shutdown` or refused as `closed` and not sent.
+- **OPEN has its own frame type (G279).** `CONNECTION_OPENED` is sent with `wsFrameType: "OPEN"` and metric `websocket_api.connection_opened` (it was `PING` / `websocket_api.message`).
+- **No leaked connections (G279).** `Shutdown` emits `CONNECTION_CLOSED` (`GOING_AWAY`, metadata `closedBy: "sdk_shutdown"`) for every connection still open, and a sweep closes connections idle longer than `ConnectionIdleTimeout` (default 1 h; `ABNORMAL_CLOSURE`, `closedBy: "sdk_idle_timeout"`). New `OpenConnections()`.
+- Identity: `Open` takes the customer id you resolved; there is no default identity source, so no resolver option is needed.
+
+### Changed (all Go variants)
+- **Bounded queue, one sender (G266, G276).** Recording appends to a bounded queue (`MaxQueueSize`, default 10 000; when full the oldest event is dropped as `overflow`) and wakes one long-lived sender. It no longer starts a goroutine per push or keeps an unbounded slice.
+- **Outages keep the events (G267).** After the retries, and on `401`/`403`, a batch goes back to the front of the queue with the same idempotency keys and the sender pauses (5 s, doubling to 5 min). `retry_exhausted` is no longer reported.
+- **Bounded shutdown.** `Shutdown(ctx)` sends until the earlier of `ctx`'s deadline and `ShutdownTimeout` (5 s), reports the rest as `shutdown` and returns an error wrapping `ErrShutdownIncomplete`. Recording after `Shutdown` reports `closed`. New `Flush(ctx)`.
+- **Retries (G268).** Full-jitter backoff (base 500 ms, cap 30 s); `Retry-After` in seconds or HTTP-date form, capped at 60 s; `413` splits the batch; per-event `retryable` failures are requeued.
+- **Batches and connections (G269).** Default `FlushCount` 500 (was 100 events / 3 s), `FlushInterval` 5 s. One pooled HTTP client. No gzip (the ingestor does not decode it).
+- **https only (G270).** `New` returns an error for an `http://` `IngestorURL` other than localhost unless `AllowInsecureHTTP` is set. `Config.String()` never prints the API key.
+- **One transport core (G271).** Sending is `internal/ingest`, a byte-identical copy of the Go core's (`scripts/sync-transport.sh`). New `Config` fields: `AllowInsecureHTTP`, `MaxQueueSize`, `MaxRetries`, `RetryBase`, `Timeout`, `ShutdownTimeout`. New drop reasons `DropOverflow`, `DropShutdown`, `DropClosed`. Requests send `User-Agent: aforo-go-ws/2.0.0`.
+- A blank customer id is no longer skipped silently: it is dropped as `invalid` and counted.
+- `VERSION`: 2.0.0.
+
 ## [1.2.1] - 2026-10-01
 
 ### Fixed

@@ -75,7 +75,7 @@ class IngestBatchContractTest {
     void stopServer() { server.stop(0); }
 
     private AforoGrpcBilling.Builder builder() {
-        return AforoGrpcBilling.newBuilder().tenantId("tenant-001").productId("prod-grpc")
+        return AforoGrpcBilling.newBuilder().trustCustomerHeader(true).tenantId("tenant-001").productId("prod-grpc")
                 .apiKey(API_KEY).ingestorUrl("http://127.0.0.1:" + port).serviceName("acme.v1.UserService")
                 .flushIntervalMs(60_000);
     }
@@ -131,7 +131,9 @@ class IngestBatchContractTest {
             }
         }
         waitFor(() -> captured.stream().mapToInt(c -> c.body().get("events").size()).sum() == 2500, 5000);
-        assertThat(captured).hasSize(3);
+        // flushCount is clamped to 1000, so the sender wakes while events are still arriving:
+        // at least 3 requests, none over the ingestor's 1000-event limit.
+        assertThat(captured.size()).isGreaterThanOrEqualTo(3);
         for (Captured c : captured) {
             assertThat(c.path()).isEqualTo("/v1/ingest/batch");
             assertThat(c.body().get("events").size()).isBetween(1, 1000);

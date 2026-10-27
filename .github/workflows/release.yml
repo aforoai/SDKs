@@ -8,7 +8,9 @@ name: Release
 #   Go modules:      aforo-metering-sdks/<pkg>/v<version>   (required by the Go proxy)
 #
 # After the release is cut, run the matching Publish workflow to push the
-# package to its registry (npm / PyPI / Maven). Go needs no publish step — the
+# package to its registry (npm / PyPI / Maven) from the same tag — the publish
+# workflows refuse any other ref (wave 5, G316). Actions are pinned to full
+# SHAs (G315). Go needs no publish step — the
 # tag itself is the release; `go get` fetches it via the module proxy.
 
 on:
@@ -22,13 +24,15 @@ permissions:
 
 jobs:
   github-release:
+    # Releases are cut in the public mirror only.
+    if: github.repository == 'aforoai/SDKs'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           name: ${{ github.ref_name }}
           generate_release_notes: true

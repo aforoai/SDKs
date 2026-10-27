@@ -225,7 +225,7 @@ def test_idempotency_keys_are_unique_across_rapid_calls(http_collector, billing_
 # ── Retry behaviour ──────────────────────────────────────────────────────
 
 
-def test_retry_3_times_then_onerror(billing_config, monkeypatch):
+def test_retries_then_reports_the_outage_and_keeps_the_event(billing_config, monkeypatch):
     """Simulate a hard failure on every attempt — expect 3 retries + onError."""
     from aforo_grpc_metering import client as client_mod
 
@@ -253,10 +253,10 @@ def test_retry_3_times_then_onerror(billing_config, monkeypatch):
         b.record("M", "UNARY", "cust_1", "OK", 1, 1)
         _wait_until(lambda: len(errors) >= 1, timeout=2.0)
 
-    assert call_count["n"] == 3
-    assert len(errors) == 1
-    assert "network down" in str(errors[0])
-    b.shutdown()
+    assert call_count["n"] >= 4  # 1 + 3 retries, then the outage pause
+    assert "network down" in str(errors[0]) and "unreachable" in str(errors[0])
+    assert b.dropped_count == 0  # an outage keeps the event queued
+    b.shutdown(timeout=0)
 
 
 # ── Helper ───────────────────────────────────────────────────────────────

@@ -24,7 +24,7 @@ python main.py
 Emits one AI_AGENT session against Aforo's usage-ingestor:
 
 1. `AforoAgentClient` construction with env-driven config
-2. `client.start()` kicks off the periodic-flush background task
+2. The client's background sender starts at construction (no `start()` call)
 3. Session id is caller-managed — the example mints
    `sess_<hex>` and passes it on every `record_capability` call so all
    10 invocations correlate as one session downstream
@@ -34,7 +34,7 @@ Emits one AI_AGENT session against Aforo's usage-ingestor:
    - `verify_claim` × 2 (one flagged as `HITL_REQUIRED`)
    - `rank_sources` × 2
    - `answer_question` × 1
-5. `client.shutdown()` stops the periodic flush and forces a final drain
+5. `client.shutdown()` sends what is still queued before exit
 
 The Python SDK's `record_capability` writes events with
 `metric_name = 'ai_agent.capability_invocations'` and stamps

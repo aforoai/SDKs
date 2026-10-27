@@ -2,6 +2,34 @@
 
 All notable changes to `aforo-ws-metering` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [2.0.0] - 2026-10-26
+
+Breaking. Migration: keep passing `customer_id`, or switch to `customer_resolver=` / `trust_customer_header=True` (calling a helper with none of them now raises `ValueError`); use an `https://` `ingestor_url` (or `allow_insecure_http=True`); stop expecting `retry_exhausted` drops.
+
+### Changed
+- **Shared transport core** (`aforo_ws_metering/_transport`, a copy of the core SDK's; G271, G285): one bounded queue (`max_queue_size`, default 10 000; overflow drops the oldest as `overflow`) and one sender thread. `push()` no longer starts a thread when `flush_count` is reached, and the old unbounded list is gone.
+- **Outages keep events**: after 3 full-jitter retries, or on 401/403, the batch is requeued with the same idempotency keys and retried after a pause (G267, G268). `Retry-After` is read in both forms, capped at 60 s. `retry_exhausted` is no longer reported; new drop reasons `shutdown` and `closed`.
+- **`shutdown()` is bounded** by `shutdown_timeout_sec` (default 5) and runs at interpreter exit; one pooled HTTP client; default `flush_count` 500 (G269).
+- **`ingestor_url` must be `https://`** (localhost excepted, or `allow_insecure_http=True`); the API key is no longer a public attribute and never in `repr()` (G270).
+- **Customer identity** (G265): `track_websockets_connection` / `track_starlette_websocket` accept `customer_resolver=callable(websocket)` or `trust_customer_header=True` (reads the `x-customer-id` handshake header) as alternatives to `customer_id`; with none of them they raise `ValueError`.
+- `customerId` and close-reason lengths are counted in UTF-16 units (G284). `httpx` is now a dependency. `__init__.__version__` matches the package (was 1.2.1).
+
+### Changed (transport core, review 2026-10-26)
+Settles the cases in `contract/TRANSPORT-SPEC.md` "Edge cases every core handles the same way". Migration: if your `on_error` hook matched on message text, branch on `error.kind` instead.
+- **`on_error` gets a typed `TransportError`** with `kind` (`outage`, `auth`, `rejected`, `shutdown`, `closed`), `events`, `status` and `will_retry`. It subclasses `RuntimeError`, so existing `Exception` hooks keep working. An outage is reported once per breaker opening, and events still queued at the shutdown deadline are reported as `shutdown`.
+- **The request timeout covers the whole exchange**, including reading the response body: a server that stalls or drips its answer one byte at a time is cut off at the deadline (httpx's own timeout is per read).
+- **Redirects are an outage**: a 3xx is never followed (the API key must not reach another host); the batch is requeued, the breaker opens, and one ERROR names the host it pointed to.
+- **Every 5xx is retried** (501, 505, ... too).
+- **Per-event `retryable` errors in a 2xx** are re-sent with the same keys after the normal backoff, at most `max_retries` times, then treated as an outage. They were re-sent at once, in a tight loop. `errors[]` is authoritative even when `failed` is missing or 0.
+- **Breaker pause** is `max(250 ms, random(0, min(5 min, 5 s * 2^n)))`; a per-event retry cap reached right after a 2xx does not reset `n`.
+- **`flush()` while the breaker is open makes one attempt** (it returned at once).
+- **Shutdown keeps retrying** with jittered backoff until `shutdown_timeout` after an outage (it stopped at the first one).
+- **Nothing taken off the queue is lost unreported at shutdown**: the unsent half of a split batch, and a batch requeued just after shutdown gave up on a hung request, are reported as `shutdown`. Pending `flush()` callers always return.
+- **An event that cannot be turned into JSON** (a cycle, `NaN`, an unknown object) is dropped as `invalid` when it is recorded, not when its batch is sent; it no longer goes to `on_error`.
+- **A second `shutdown()`** waits for the first one and never drains again; `shutdown()` called from a hook on the sender thread no longer makes a later `shutdown()` wait 7 s.
+- **CONNECTION_OPENED uses frame type `OPEN`** and metric `websocket_api.connection_opened` (it was `PING` / `websocket_api.message`), matching go-ws 2.0.0. Add `websocket_api.connection_opened` to your catalog if you bill connections opened. Migration: filters on `wsFrameType = "PING"` for opens must look for `OPEN`.
+- **No leaked connections**: `shutdown()` sends CONNECTION_CLOSED (`GOING_AWAY`, `closedBy: "sdk_shutdown"`) for every connection still open; a connection with no frames for `connection_idle_timeout_sec` (new, default 1 h; negative raises `ValueError`) is closed (`ABNORMAL_CLOSURE`, `closedBy: "sdk_idle_timeout"`) and forgotten. A connection opened while `shutdown()` runs is reported as `closed`, never billed without a close. New `open_connections`, `sweep_idle()`, `sweep_idle_if_due()`.
+
 ## [1.2.2] - 2026-10-01
 
 ### Changed

@@ -8,6 +8,8 @@
 package wsmetering
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -16,76 +18,94 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/aforoai/SDKs/aforo-metering-sdks/go-ws/v2/internal/ingest"
 )
 
-const sdkVersion = "1.2.1"
+const sdkVersion = "2.0.0"
 
-// DropReason describes why a buffered batch was permanently dropped.
-// The buffer is unbounded (drained at flush start), so unlike the core SDK
-// there is no overflow reason here.
-type DropReason string
+// DefaultConnectionIdleTimeout is how long a connection may go without Open,
+// RecordFrame or Close activity before the SDK closes it itself (see
+// Config.ConnectionIdleTimeout).
+const DefaultConnectionIdleTimeout = time.Hour
 
-const (
-	// DropRetryExhausted — the batch failed after all transport retries.
-	DropRetryExhausted DropReason = "retry_exhausted"
-	// DropRejected — the ingestor answered a non-retryable 4xx, refused the
-	// event individually in a 2xx partial-failure response, or the batch
-	// could not be serialized.
-	DropRejected DropReason = "rejected"
-	// DropInvalid — the event failed client-side validation (a required field
-	// was blank or a field exceeded the ingestor's limit) and was never
-	// buffered.
-	DropInvalid DropReason = "invalid"
-)
-
+// Config configures Billing. Sending defaults follow the shared transport
+// policy (contract/ingest-contract.json → transportPolicy).
 type Config struct {
 	TenantID       string
 	ProductID      string
-	APIKey         string
-	IngestorURL    string
-	ProductType    string        // default "WEBSOCKET_API"; sent as top-level productType on every event
-	PerFrameEvents bool          // off by default — emit only OPEN + CLOSE
-	FlushCount     int           // default 100
-	FlushInterval  time.Duration // default 3s
-	HTTPClient     *http.Client
-	OnError        func(error)
-	// OnDrop is an OPT-IN hook invoked with events the SDK is about to lose
-	// permanently (retry exhaustion, a rejection by the ingestor, or
-	// client-side validation — see DropReason). Events keep
-	// their idempotency keys, so re-submitting them after recovery is
-	// dedup-safe. Default: nil (drops are still counted in DroppedCount()
-	// and WARN-logged). Panics in the hook are recovered.
+	APIKey         string // sent only as X-API-Key; never logged or printed
+	IngestorURL    string // must be https (http only for localhost or with AllowInsecureHTTP)
+	ProductType    string // default "WEBSOCKET_API"; sent as top-level productType on every event
+	PerFrameEvents bool   // off by default — emit only OPEN + CLOSE
+
+	AllowInsecureHTTP bool          // allow http:// to a host other than localhost/127.0.0.1/::1
+	FlushCount        int           // events per request, default 500 (max 1000)
+	FlushInterval     time.Duration // default 5s
+	MaxQueueSize      int           // default 10000; when full the oldest event is dropped (DropOverflow)
+	MaxRetries        int           // default 3; negative disables retries
+	RetryBase         time.Duration // full-jitter backoff base, default 500ms
+	Timeout           time.Duration // total deadline per request, default 10s
+	ShutdownTimeout   time.Duration // how long Shutdown keeps sending, default 5s
+
+	// ConnectionIdleTimeout closes a tracked connection that saw no activity
+	// for this long (a CONNECTION_CLOSED event with close reason
+	// ABNORMAL_CLOSURE and metadata closedBy "sdk_idle_timeout"), so a
+	// connection your code never closed does not stay in memory. Default 1h.
+	// A negative value is refused by New: without the sweep the connection
+	// map could grow without bound.
+	ConnectionIdleTimeout time.Duration
+
+	HTTPClient *http.Client // optional; you keep ownership
+	// OnError is called for sending problems with a *TransportError (use
+	// errors.As and branch on Kind: outage, auth, rejected, shutdown,
+	// closed) and for events refused client-side with a plain error. It runs
+	// on the background sender and may call Flush or Shutdown. Never carries
+	// the API key.
+	OnError func(error)
+	// OnAccepted, when set, receives the body of every 2xx answer (the data
+	// object, envelope removed) and the events of that request. Same
+	// goroutine and panic rules as OnError.
+	OnAccepted func(body json.RawMessage, events []map[string]any)
+	// OnDrop is an OPT-IN hook invoked with events the SDK gives up on (see
+	// DropReason). Events keep their idempotency keys, so re-submitting them
+	// after recovery is dedup-safe. Default: nil (drops are still counted in
+	// DroppedCount() and WARN-logged). Panics in the hook are recovered.
 	OnDrop func(events []map[string]any, reason DropReason)
+
+	hooks ingest.Hooks // tests: clock, sleep and random source
 }
 
 type Billing struct {
-	cfg    Config
-	url    string
-	client *http.Client
+	cfg Config
+	tp  *ingest.Client
 
 	connections sync.Map // map[string]*ConnectionState
-	mu          sync.Mutex
-	buffer      []map[string]any
-	stop        chan struct{}
-	stopOnce    sync.Once
-	dropped     atomic.Int64
-	// invalidDrops throttles the DropInvalid WARN log.
-	invalidDrops atomic.Int64
-	// retryBackoffBase is the exponential-backoff base (default 1s) —
-	// package-private so tests can skip real sleeps.
-	retryBackoffBase time.Duration
-	wg               sync.WaitGroup
+	// lifecycle orders Open against Shutdown: Open holds it for reading while
+	// it registers a connection and queues its OPEN; Shutdown takes it for
+	// writing to set shuttingDown. An Open is therefore either finished
+	// before Shutdown closes the open connections (and gets its CLOSE) or
+	// sees shuttingDown and is refused as closed.
+	lifecycle    sync.RWMutex
+	shuttingDown bool
+	stopSweep    chan struct{}
+	sweepDone    chan struct{}
+	stopOnce     sync.Once
+	now          func() time.Time
 }
 
 type ConnectionState struct {
-	customerId  string
-	productType string
-	startMs     int64
-	frames      atomic.Int64
-	bytes       atomic.Int64
-	metadata    map[string]any
+	customerId   string
+	productType  string
+	startMs      int64
+	frames       atomic.Int64
+	bytes        atomic.Int64
+	lastActivity atomic.Int64 // unix millis
+	metadata     map[string]any
 }
 
+// New validates cfg and starts the background sender (and the idle-connection
+// sweep). Call Shutdown(ctx) when your server stops.
 func New(cfg Config) (*Billing, error) {
 	if cfg.TenantID == "" || cfg.ProductID == "" || cfg.APIKey == "" || cfg.IngestorURL == "" {
 		return nil, errors.New("wsmetering: TenantID, ProductID, APIKey, IngestorURL are required")
@@ -94,27 +114,24 @@ func New(cfg Config) (*Billing, error) {
 	if cfg.ProductType == "" {
 		cfg.ProductType = DefaultProductType
 	}
-	if cfg.FlushCount == 0 {
-		cfg.FlushCount = 100
-	}
-	if cfg.FlushInterval == 0 {
-		cfg.FlushInterval = 3 * time.Second
-	}
-	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = &http.Client{Timeout: 10 * time.Second}
-	}
 	if cfg.OnError == nil {
 		cfg.OnError = func(err error) {}
 	}
-	b := &Billing{
-		cfg:              cfg,
-		url:              strings.TrimRight(cfg.IngestorURL, "/") + "/v1/ingest/batch",
-		client:           cfg.HTTPClient,
-		stop:             make(chan struct{}),
-		retryBackoffBase: time.Second,
+	if cfg.ConnectionIdleTimeout < 0 {
+		return nil, errors.New("wsmetering: ConnectionIdleTimeout must not be negative (0 means the default, 1h)")
 	}
-	b.wg.Add(1)
-	go b.flushLoop()
+	if cfg.ConnectionIdleTimeout == 0 {
+		cfg.ConnectionIdleTimeout = DefaultConnectionIdleTimeout
+	}
+	tp, err := newTransport(cfg)
+	if err != nil {
+		return nil, err
+	}
+	b := &Billing{cfg: cfg, tp: tp, stopSweep: make(chan struct{}), sweepDone: make(chan struct{}), now: time.Now}
+	if cfg.hooks.Now != nil {
+		b.now = cfg.hooks.Now
+	}
+	go b.sweepLoop()
 	return b, nil
 }
 
@@ -128,10 +145,13 @@ func New(cfg Config) (*Billing, error) {
 // through DroppedCount() / OnDrop with DropInvalid.
 func (b *Billing) Open(customerID string, metadata map[string]any, opts ...EventOptions) string {
 	customerID = strings.TrimSpace(customerID)
+	productType := b.productTypeFor(opts)
 	if customerID == "" {
+		// Not billed, but counted: a connection without a customer is a
+		// resolution gap in the integration, not something to hide.
+		b.dropInvalid(map[string]any{"customerId": "", "productType": productType, "metadata": metadata}, "customerId is required; connection not metered")
 		return ""
 	}
-	productType := b.productTypeFor(opts)
 	for _, c := range []struct {
 		field, value string
 		max          int
@@ -145,15 +165,26 @@ func (b *Billing) Open(customerID string, metadata map[string]any, opts ...Event
 			return ""
 		}
 	}
-	connID := fmt.Sprintf("ws_%d_%s", time.Now().UnixNano(), randomSuffix())
+	now := b.now()
+	connID := fmt.Sprintf("ws_%d_%s", now.UnixNano(), randomSuffix())
 	state := &ConnectionState{
 		customerId:  customerID,
 		productType: productType,
-		startMs:     time.Now().UnixMilli(),
+		startMs:     now.UnixMilli(),
 		metadata:    metadata,
 	}
+	state.lastActivity.Store(now.UnixMilli())
+	b.lifecycle.RLock()
+	defer b.lifecycle.RUnlock()
+	if b.shuttingDown {
+		// During or after Shutdown: reported as DropClosed, never tracked or sent.
+		ev := b.connEvent(state, connID, "OPEN", "SERVER_TO_CLIENT", 0, 0, 0, "", metadata)
+		key, _ := ev["idempotencyKey"].(string)
+		b.tp.Report([]ingest.Event{{Key: key, Ref: ev}}, ingest.DropClosed)
+		return ""
+	}
 	b.connections.Store(connID, state)
-	b.push(withExecutionStatus(b.connEvent(state, connID, "PING", "SERVER_TO_CLIENT", 0, 0, 0, "", merge(metadata, map[string]any{"event": "CONNECTION_OPENED"})), executionStatusFor(opts)))
+	b.push(withExecutionStatus(b.connEvent(state, connID, "OPEN", "SERVER_TO_CLIENT", 0, 0, 0, "", merge(metadata, map[string]any{"event": "CONNECTION_OPENED"})), executionStatusFor(opts)))
 	return connID
 }
 
@@ -179,9 +210,11 @@ func (b *Billing) RecordFrameWithOptions(connID, direction, frameType string, by
 	s := v.(*ConnectionState)
 	s.frames.Add(1)
 	s.bytes.Add(bytes)
+	nowMs := b.now().UnixMilli()
+	s.lastActivity.Store(nowMs)
 	if b.cfg.PerFrameEvents {
 		b.push(withExecutionStatus(b.connEvent(s, connID, frameType, direction, 1, bytes,
-			time.Now().UnixMilli()-s.startMs, "", s.metadata), opts.ExecutionStatus))
+			nowMs-s.startMs, "", s.metadata), opts.ExecutionStatus))
 	}
 }
 
@@ -195,27 +228,40 @@ func (b *Billing) Close(connID string, closeCode int) {
 // CloseWithOptions is Close with optional fields for the CONNECTION_CLOSED
 // event.
 func (b *Billing) CloseWithOptions(connID string, closeCode int, opts EventOptions) {
+	b.closeConn(connID, closeCode, "", opts)
+}
+
+// closeConn emits CONNECTION_CLOSED once per connection; closedBy names an
+// SDK-initiated close ("sdk_shutdown", "sdk_idle_timeout").
+func (b *Billing) closeConn(connID string, closeCode int, closedBy string, opts EventOptions) {
 	v, loaded := b.connections.LoadAndDelete(connID)
 	if !loaded {
 		return
 	}
 	s := v.(*ConnectionState)
-	durationMs := time.Now().UnixMilli() - s.startMs
+	durationMs := b.now().UnixMilli() - s.startMs
 	reason := mapCloseReason(closeCode)
-	meta := merge(s.metadata, map[string]any{
+	extra := map[string]any{
 		"event":     "CONNECTION_CLOSED",
 		"frames":    s.frames.Load(),
 		"bytes":     s.bytes.Load(),
 		"closeCode": closeCode,
-	})
+	}
+	if closedBy != "" {
+		extra["closedBy"] = closedBy
+	}
+	meta := merge(s.metadata, extra)
 	b.push(withExecutionStatus(b.connEvent(s, connID, "CLOSE", "SERVER_TO_CLIENT",
 		int(s.frames.Load()), s.bytes.Load(), durationMs, reason, meta), opts.ExecutionStatus))
 }
 
 func (b *Billing) connEvent(s *ConnectionState, connID, frameType, direction string, frames int, bytesAmt, durationMs int64, closeReason string, metadata map[string]any) map[string]any {
-	now := time.Now().UTC()
+	now := b.now().UTC()
 	metricName := "websocket_api.message"
-	if frameType == "CLOSE" {
+	switch frameType {
+	case "OPEN":
+		metricName = "websocket_api.connection_opened"
+	case "CLOSE":
 		metricName = "websocket_api.connection_closed"
 	}
 	e := map[string]any{
@@ -238,7 +284,7 @@ func (b *Billing) connEvent(s *ConnectionState, connID, frameType, direction str
 		e["wsDirection"] = d
 	}
 	switch ft := strings.ToUpper(frameType); ft {
-	case "TEXT", "BINARY", "PING", "PONG", "CLOSE":
+	case "OPEN", "TEXT", "BINARY", "PING", "PONG", "CLOSE":
 		e["wsFrameType"] = ft
 	}
 	if closeReason != "" {
@@ -272,38 +318,67 @@ func mapCloseReason(code int) string {
 	}
 }
 
-func (b *Billing) push(event map[string]any) {
-	if event == nil {
-		return
-	}
-	b.mu.Lock()
-	b.buffer = append(b.buffer, event)
-	overflow := len(b.buffer) >= b.cfg.FlushCount
-	b.mu.Unlock()
-	if overflow {
-		go b.flush()
-	}
+// OpenConnections returns how many connections are tracked (opened and not
+// yet closed by you, the idle sweep or Shutdown).
+func (b *Billing) OpenConnections() int {
+	n := 0
+	b.connections.Range(func(_, _ any) bool { n++; return true })
+	return n
 }
 
-func (b *Billing) flushLoop() {
-	defer b.wg.Done()
-	ticker := time.NewTicker(b.cfg.FlushInterval)
-	defer ticker.Stop()
+func (b *Billing) sweepLoop() {
+	defer close(b.sweepDone)
+	every := b.cfg.ConnectionIdleTimeout / 4
+	if every > time.Minute {
+		every = time.Minute
+	}
+	if every < time.Second {
+		every = time.Second
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
 	for {
 		select {
-		case <-ticker.C:
-			b.flush()
-		case <-b.stop:
-			b.flush()
+		case <-t.C:
+			b.sweepIdle(b.now())
+		case <-b.stopSweep:
 			return
 		}
 	}
 }
 
-func (b *Billing) Shutdown() error {
-	b.stopOnce.Do(func() { close(b.stop) })
-	b.wg.Wait()
-	return nil
+// sweepIdle closes connections idle longer than ConnectionIdleTimeout.
+func (b *Billing) sweepIdle(now time.Time) int {
+	cutoff := now.Add(-b.cfg.ConnectionIdleTimeout).UnixMilli()
+	n := 0
+	b.connections.Range(func(k, v any) bool {
+		if v.(*ConnectionState).lastActivity.Load() <= cutoff {
+			b.closeConn(k.(string), 1006, "sdk_idle_timeout", EventOptions{})
+			n++
+		}
+		return true
+	})
+	return n
+}
+
+// Shutdown emits CONNECTION_CLOSED (close code 1001, GOING_AWAY, metadata
+// closedBy "sdk_shutdown") for every connection still open, then sends what
+// is queued until the earlier of ctx's deadline and Config.ShutdownTimeout.
+// Events still queued then are reported as DropShutdown and Shutdown returns
+// an error wrapping ErrShutdownIncomplete. Safe to call more than once.
+func (b *Billing) Shutdown(ctx context.Context) error {
+	b.stopOnce.Do(func() {
+		b.lifecycle.Lock()
+		b.shuttingDown = true
+		b.lifecycle.Unlock()
+		close(b.stopSweep)
+		<-b.sweepDone
+		b.connections.Range(func(k, _ any) bool {
+			b.closeConn(k.(string), 1001, "sdk_shutdown", EventOptions{})
+			return true
+		})
+	})
+	return b.shutdownTransport(ctx)
 }
 
 func merge(base, extra map[string]any) map[string]any {

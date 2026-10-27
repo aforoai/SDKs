@@ -25,11 +25,18 @@ ASTRAL = "\U0001F600"
 def sent(monkeypatch):
     batches: list = []
 
-    def post(url, body, headers):
-        batches.append(body["events"])
-        return 202, None, b""
+    import json as _json
 
-    monkeypatch.setattr(mod, "_post_json", post)
+    import httpx as _httpx
+
+    factory = mod.TransportCore
+
+    def handle(request):
+        batches.append(_json.loads(request.content)["events"])
+        return _httpx.Response(202, json={"data": {"failed": 0}})
+
+    monkeypatch.setattr(mod, "TransportCore",
+                        lambda *a, **k: factory(*a, **{**k, "http_transport": _httpx.MockTransport(handle)}))
     return batches
 
 
@@ -64,7 +71,7 @@ def _call(interceptor, method, ctx=None):
 def test_over_long_method_is_truncated_and_call_is_metered(sent, caplog):
     drops: list = []
     b = _billing(on_drop=lambda evs, reason: drops.append(reason))
-    interceptor = AforoGrpcInterceptor(b)
+    interceptor = AforoGrpcInterceptor(b, trust_customer_header=True)
     # 126 + a 2-unit character + more: a cut at 128 units fits the pair exactly;
     # the second name would split a pair at 128, so it is cut at 127.
     first = "M" * 126 + ASTRAL + "x" * 100
@@ -95,7 +102,7 @@ def test_over_long_method_is_truncated_and_call_is_metered(sent, caplog):
 
 def test_methods_sharing_the_first_128_characters_get_different_keys(sent):
     b = _billing()
-    interceptor = AforoGrpcInterceptor(b)
+    interceptor = AforoGrpcInterceptor(b, trust_customer_header=True)
     _call(interceptor, "M" * 128 + "a" * 150)
     _call(interceptor, "M" * 128 + "b" * 150)
     b.shutdown()
@@ -106,7 +113,7 @@ def test_methods_sharing_the_first_128_characters_get_different_keys(sent):
 
 def test_short_method_key_is_unchanged(sent):
     b = _billing()
-    _call(AforoGrpcInterceptor(b), "GetUser")
+    _call(AforoGrpcInterceptor(b, trust_customer_header=True), "GetUser")
     b.shutdown()
     event = sent[0][0]
     assert event["grpcMethod"] == "GetUser"
@@ -117,7 +124,7 @@ def test_short_method_key_is_unchanged(sent):
 def test_over_long_customer_id_still_dropped_as_invalid(sent):
     drops: list = []
     b = _billing(on_drop=lambda evs, reason: drops.append((evs, reason)))
-    _call(AforoGrpcInterceptor(b), "GetUser", _Ctx("c" * 65))
+    _call(AforoGrpcInterceptor(b, trust_customer_header=True), "GetUser", _Ctx("c" * 65))
     b.record(method="GetUser", call_type="UNARY", customer_id="c" * 65, status="OK",
              message_count=1, duration_ms=1)
     b.shutdown()

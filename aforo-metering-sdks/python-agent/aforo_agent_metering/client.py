@@ -1,8 +1,9 @@
 """
 Aforo AI Agent Metering SDK — client.
 
-One :class:`AforoAgentClient` instance per process is enough (thread-safe
-under asyncio; not thread-safe under threading — use one per event loop).
+One :class:`AforoAgentClient` instance per process is enough. It is
+thread-safe and works with or without a running event loop: ``record_*``
+only queue (bounded), and one background thread sends.
 Emits Aforo AI_AGENT events to ``/v1/ingest/batch`` (default host
 ``https://api.aforo.ai``, authenticated with ``X-API-Key``)
 using the shared ``IngestUsageEventRequest`` DTO shape. Per-capability
@@ -10,8 +11,9 @@ billing depends on ``metadata.capability_name`` (snake_case) — that's the
 key the ``ProductTypeEventExtractor`` in usage-ingestor reads to fan out
 per-capability line items for ``dimensionPricing``-driven rate plans.
 
-Drop observability mirrors ``@aforoai/agent-metering`` (Node) and
-``@aforoai/mcp-metering`` (Node + Python): failed / rejected batches are
+Delivery uses the shared transport core (``_transport``): an outage keeps
+batches queued with the same idempotency keys and retries after a pause.
+Events lost for good (overflow, rejected, invalid, shutdown, closed) are
 counted, WARN-logged, and handed to an OPT-IN ``on_drop`` hook. Dropped
 events keep their idempotency keys so re-submitting them after recovery
 is dedup-safe on the ingestor side.
@@ -20,24 +22,28 @@ is dedup-safe on the ingestor side.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Tuple
 
-from .buffer import EventBuffer
-from .transport import (
-    PostFn,
-    PostResult,
-    error_messages,
-    parse_partial_failure,
-    post_batch_with_retry,
+import httpx
+
+from ._transport import (
+    TransportCore,
+    clean_customer_id,
+    truncate_utf16,
+    utf16_length,
 )
+from ._transport import policy as _policy
 
-__version__ = "0.3.2"
+__version__ = "1.0.0"
+
+#: Async HTTP call signature accepted by ``post_fn``: (url, headers, body) ->
+#: (status, body_text) or (status, body_text, retry_after_header).
+PostFn = Callable[[str, Dict[str, str], str], Awaitable[Tuple[Any, ...]]]
 
 logger = logging.getLogger("aforo_agent_metering")
 
@@ -102,7 +108,7 @@ INGEST_PATH: str = "/v1/ingest/batch"
 DEFAULT_INGESTOR_URL = "https://api.aforo.ai"
 
 #: The ingestor's per-request cap on POST /v1/ingest/batch (IngestBatchRequest).
-MAX_BATCH_EVENTS = 1000
+MAX_BATCH_EVENTS = _policy.MAX_BATCH_EVENTS
 
 DEFAULT_PRODUCT_TYPE = "AI_AGENT"
 
@@ -122,7 +128,7 @@ MAX_LENGTHS: Dict[str, int] = {
     "capabilityName": 64,
 }
 
-DropReason = str  # 'retry_exhausted' | 'rejected' | 'invalid'
+DropReason = str  # 'overflow' | 'rejected' | 'invalid' | 'shutdown' | 'closed' | 'retry_exhausted'
 
 
 # ── Request-derived labels ───────────────────────────────────────
@@ -135,21 +141,8 @@ DropReason = str  # 'retry_exhausted' | 'rejected' | 'invalid'
 _truncation_lock = threading.Lock()
 
 
-def _utf16_length(text: str) -> int:
-    return sum(2 if ord(ch) > 0xFFFF else 1 for ch in text)
-
-
-def _truncate_utf16(text: str, limit: int) -> str:
-    """Longest prefix of ``text`` within ``limit`` UTF-16 code units. Cuts
-    between characters, so a surrogate pair is never split."""
-    if len(text) * 2 <= limit:
-        return text
-    units = 0
-    for index, ch in enumerate(text):
-        units += 2 if ord(ch) > 0xFFFF else 1
-        if units > limit:
-            return text[:index]
-    return text
+_utf16_length = utf16_length
+_truncate_utf16 = truncate_utf16
 
 
 def _truncate_label(field_name: str, value: Any, limit: int, warned: set) -> Any:
@@ -198,10 +191,11 @@ def _too_long(field_name: str, value: Any) -> Optional[str]:
         return None
     text = str(value)
     limit = MAX_LENGTHS[field_name]
-    if len(text) <= limit:
+    length = utf16_length(text)
+    if length <= limit:
         return None
     return (
-        f"{field_name} is {len(text)} characters, exceeding the ingestor's "
+        f"{field_name} is {length} characters (UTF-16 units), exceeding the ingestor's "
         f'{limit}-character limit (value starts "{text[:80]}")'
     )
 
@@ -215,47 +209,68 @@ def _utc_now_iso() -> str:
     )
 
 
+class _PostFnTransport(httpx.BaseTransport):
+    """httpx transport that calls an async ``post_fn(url, headers, body)``.
+
+    For tests and custom HTTP stacks. It runs on the SDK's sender thread, in
+    a private event loop, never on the application's loop.
+    """
+
+    def __init__(self, post_fn: PostFn) -> None:
+        self._post_fn = post_fn
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        headers = {k.decode(): v.decode() for k, v in request.headers.raw}
+        try:
+            result = asyncio.run(self._post_fn(str(request.url), headers, request.content.decode("utf-8")))
+        except (OSError, ConnectionError, TimeoutError) as exc:
+            raise httpx.ConnectError(str(exc), request=request) from exc
+        except Exception as exc:  # a failing custom transport is a network failure
+            raise httpx.TransportError(f"{type(exc).__name__}: {exc}", request=request) from exc
+        status, body = int(result[0]), result[1] or ""
+        extra = {"Retry-After": str(result[2])} if len(result) > 2 and result[2] is not None else {}
+        return httpx.Response(status, content=str(body).encode("utf-8"), headers=extra, request=request)
+
+
 class AforoAgentClient:
     """Aforo AI_AGENT metering client.
 
-    Buffers events and flushes them in batches of up to ``flush_count`` or
-    every ``flush_interval_sec`` seconds (whichever is first). Call
-    :meth:`start` to begin the periodic flush; call :meth:`shutdown`
-    before your process exits so the tail of the buffer lands in Aforo.
+    ``record_*`` put events on a bounded queue and return; they never block,
+    never need a running event loop and never start a thread. One background
+    thread sends batches of up to ``flush_count`` events every
+    ``flush_interval_sec`` seconds, or as soon as ``flush_count`` are queued.
+    Nothing has to be started; at interpreter exit (``atexit``) the queue is
+    flushed for at most ``shutdown_timeout_sec`` seconds.
 
     Args:
         tenant_id: Aforo tenant id. Sent as the ``X-Tenant-Id`` header.
         product_id: Aforo AI_AGENT product id.
-        api_key: Aforo API key. Sent as the ``X-API-Key`` header (no
-            ``Authorization`` header is sent).
+        api_key: Aforo API key. Sent only as the ``X-API-Key`` header; never
+            in ``repr()`` or logs.
         ingestor_url: Base URL events are POSTed to. Defaults to
-            ``https://api.aforo.ai``. Override for staging / local dev.
-        default_customer_id: Optional customer id used when a per-event
-            ``customer_id`` isn't supplied. If neither is set, the SDK
-            falls back to ``agent_id`` (matches the python-mcp shape and
-            keeps the required ``customerId`` field non-blank).
+            ``https://api.aforo.ai``. Must be ``https://`` (plain ``http://``
+            only for localhost, or with ``allow_insecure_http=True``).
+        default_customer_id: Customer billed when a ``record_*`` call passes
+            no ``customer_id`` (single-customer deployments). There is no
+            other fallback: without either, the event is dropped as
+            ``"invalid"``. The agent id is never used as the customer.
         product_type: Top-level ``productType`` on every event. Default
-            ``AI_AGENT``. Trimmed and upper-cased; override per event with
-            the ``product_type`` argument of the ``record_*`` methods.
-        flush_count: Max events buffered before a forced flush. Default
-            50 — matches ``@aforoai/agent-metering``. Clamped to 1000,
-            the ingestor's per-request batch limit.
-        flush_interval_sec: Max seconds an event can sit before a
-            periodic flush. Default 5s — matches Node SDK reliability.
-        max_retries: Retries per batch on 5xx / network error. Default 3.
-        on_error: Callback for otherwise-unhandled errors (mostly
-            transient POST failures during retry). Defaults to a WARN
-            log. Exceptions from this hook are swallowed.
-        on_drop: OPT-IN hook receiving events the SDK is about to lose
-            permanently. Reasons: ``"retry_exhausted"`` (5xx, 408, 429 or
-            network after 3 attempts), ``"rejected"`` (non-retryable 4xx,
-            or events the ingestor rejected individually in a 2xx
-            response), ``"invalid"`` (an event the ``record_*`` call
-            refused before buffering). Events retain their
-            idempotency keys so re-submitting them after recovery is
-            dedup-safe. Exceptions from this hook are swallowed.
-        post_fn: Pluggable HTTP transport for tests. Defaults to the
-            module's aiohttp/httpx/urllib chain.
+            ``AI_AGENT``.
+        flush_count: Events per request (default 500, at most 1000).
+        flush_interval_sec: Seconds between background sends. Default 5.
+        max_retries: Retries per batch on network errors, timeouts, 408,
+            429 and 5xx before the batch is requeued. Default 3.
+        on_error: Called with an exception describing an outage or a
+            rejection. Exceptions from this hook are caught.
+        on_drop: OPT-IN hook receiving events lost for good, with a reason:
+            ``"overflow"`` (queue full), ``"rejected"`` (the ingestor refused
+            them), ``"invalid"`` (refused before queueing), ``"shutdown"``
+            (still queued at the shutdown deadline), ``"closed"`` (recorded
+            after shutdown). Events keep their idempotency keys, so
+            re-submitting them is dedup-safe. Exceptions are caught.
+        post_fn: Optional async ``(url, headers, body) -> (status, body[,
+            retry_after])`` used instead of the built-in HTTP client (tests,
+            custom stacks). It runs on the sender thread.
     """
 
     def __init__(
@@ -267,12 +282,18 @@ class AforoAgentClient:
         *,
         default_customer_id: Optional[str] = None,
         product_type: str = DEFAULT_PRODUCT_TYPE,
-        flush_count: int = 50,
+        flush_count: int = _policy.DEFAULT_FLUSH_COUNT,
         flush_interval_sec: float = 5.0,
-        max_retries: int = 3,
+        max_retries: int = _policy.MAX_RETRIES,
         on_error: Optional[Callable[[Exception], None]] = None,
         on_drop: Optional[Callable[[List[Dict[str, Any]], DropReason], None]] = None,
         post_fn: Optional[PostFn] = None,
+        max_queue_size: int = _policy.DEFAULT_QUEUE_CAPACITY,
+        timeout_sec: float = _policy.REQUEST_TIMEOUT_S,
+        shutdown_timeout_sec: float = _policy.SHUTDOWN_TIMEOUT_S,
+        allow_insecure_http: bool = False,
+        http_transport: Any = None,
+        transport_options: Optional[Dict[str, Any]] = None,
     ) -> None:
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -287,25 +308,46 @@ class AforoAgentClient:
 
         self.tenant_id = tenant_id
         self.product_id = product_id
-        self.api_key = api_key
-        self.ingestor_url = ingestor_url.rstrip("/")
-        self.default_customer_id = default_customer_id
+        self.default_customer_id = clean_customer_id(default_customer_id)
         self.product_type = _normalize_product_type(product_type, DEFAULT_PRODUCT_TYPE)
-        # The ingestor rejects batches larger than 1000 events.
-        self.flush_count = min(int(flush_count), MAX_BATCH_EVENTS)
         self.flush_interval_sec = flush_interval_sec
         self.max_retries = max_retries
-        self.on_error = on_error or (
-            lambda e: logger.warning("[aforo-agent] %s", e)
+        self.on_error = on_error or (lambda e: logger.debug("[aforo-agent] %s", e))
+        if http_transport is None and post_fn is not None:
+            http_transport = _PostFnTransport(post_fn)
+        self._core = TransportCore(
+            api_key=api_key,
+            base_url=ingestor_url,
+            user_agent=f"aforo-agent-metering-python/{__version__}",
+            name="aforo-agent",
+            logger=logger,
+            path=INGEST_PATH,
+            flush_count=flush_count,
+            flush_interval=flush_interval_sec,
+            max_queue_size=max_queue_size,
+            timeout=timeout_sec,
+            max_retries=max_retries,
+            shutdown_timeout=shutdown_timeout_sec,
+            allow_insecure_http=allow_insecure_http,
+            on_drop=on_drop,
+            on_error=self._safe_on_error,
+            extra_headers={"X-Tenant-Id": tenant_id},
+            http_transport=http_transport,
+            **(transport_options or {}),
         )
-        self.on_drop = on_drop
-        self._post_fn = post_fn
+        self.ingestor_url = self._core.url[: -len(INGEST_PATH)]
+        self.flush_count = self._core.flush_count
 
-        self._buffer = EventBuffer(max_events=self.flush_count)
-        self._dropped = 0
-        self._invalid_drops = 0
-        self._flush_task: Optional[asyncio.Task[Any]] = None
-        self._running = False
+    def __repr__(self) -> str:
+        return f"AforoAgentClient(tenant_id={self.tenant_id!r}, ingestor_url={self.ingestor_url!r})"
+
+    @property
+    def on_drop(self) -> Optional[Callable[[List[Dict[str, Any]], DropReason], None]]:
+        return self._core._on_drop
+
+    @on_drop.setter
+    def on_drop(self, hook: Optional[Callable[[List[Dict[str, Any]], DropReason], None]]) -> None:
+        self._core._on_drop = hook
 
     # ────────────────────────────── public API ──────────────────────
 
@@ -329,15 +371,17 @@ class AforoAgentClient:
         wire — that's the key ``ProductTypeEventExtractor`` reads to
         derive the per-capability billing dimension.
 
+        ``customer_id`` (or the client's ``default_customer_id``) is the
+        customer billed; the agent id is never used in its place.
+
         Never raises for event content. An event the ingestor would reject
-        (blank ``capability_name`` / ``agent_id``, ``agent_id`` > 36 chars,
-        ``session_id`` / ``customer_id`` / ``capability_name`` > 64 chars)
-        is not buffered or sent: it is counted in :attr:`dropped_count`,
-        WARN-logged and passed to ``on_drop`` with reason ``"invalid"``.
+        (blank ``capability_name`` / ``agent_id`` / customer, ``agent_id`` > 36
+        UTF-16 units, ``session_id`` / ``customer_id`` / ``capability_name`` > 64)
+        is not queued: it is counted in :attr:`dropped_count`, WARN-logged and
+        passed to ``on_drop`` with reason ``"invalid"``.
         """
-        resolved_customer = customer_id or self.default_customer_id or agent_id
         event = self._build_event(
-            customer_id=resolved_customer,
+            customer_id=self._customer(customer_id),
             metric_name="ai_agent.capability_invocations",
             agent_id=agent_id,
             session_id=session_id,
@@ -377,15 +421,14 @@ class AforoAgentClient:
         the same way :meth:`record_capability` does.
 
         Never raises for event content: a blank ``agent_id`` /
-        ``session_id`` / ``step_type`` or an over-limit field is dropped
-        with reason ``"invalid"``, as in :meth:`record_capability`.
+        ``session_id`` / ``step_type`` / customer or an over-limit field is
+        dropped with reason ``"invalid"``, as in :meth:`record_capability`.
         """
-        resolved_customer = customer_id or self.default_customer_id or agent_id
         combined_meta: Dict[str, Any] = {"stepType": step_type}
         if metadata:
             combined_meta.update(metadata)
         event = self._build_event(
-            customer_id=resolved_customer,
+            customer_id=self._customer(customer_id),
             metric_name="ai_agent.steps",
             agent_id=agent_id,
             session_id=session_id,
@@ -404,125 +447,50 @@ class AforoAgentClient:
             problem = "step_type is required (got blank)"
         self._submit(event, problem or self._invalid_reason(event, capability_name))
 
-    async def flush(self) -> None:
-        """Force an immediate flush of the buffer to Aforo.
+    async def flush(self, timeout: Optional[float] = None) -> int:
+        """Send everything queued now and wait for it, in a worker thread so
+        the event loop keeps running. Returns how many events are still queued
+        (non-zero while the ingestor is unreachable; they are retried)."""
+        outcome = await asyncio.get_running_loop().run_in_executor(None, self._core.flush, timeout)
+        return outcome.pending
 
-        A buffer holding more than 1000 events (possible when events were
-        recorded with no running loop) is sent as several requests of at
-        most 1000 — the ingestor rejects larger batches.
-        """
-        events = self._buffer.drain()
-        for i in range(0, len(events), MAX_BATCH_EVENTS):
-            await self._send_batch(events[i : i + MAX_BATCH_EVENTS])
-
-    async def _send_batch(self, events: List[Dict[str, Any]]) -> None:
-        if not events:
-            return
-
-        url = f"{self.ingestor_url}{INGEST_PATH}"
-        headers = {
-            "Content-Type": "application/json",
-            "X-API-Key": self.api_key,
-            "X-Tenant-Id": self.tenant_id,
-        }
-        # JSON-encode INSIDE a try/except: an event whose metadata carries
-        # a non-serializable object (Decimal, uncoverted datetime, custom
-        # class) would otherwise raise TypeError HERE — after drain, before
-        # send — and vanish silently (bug fixed 2026-07-11: previously the
-        # entire drained batch was lost with no drop hook / no counter
-        # increment, so no observability signal to catch it). Classify as
-        # 'rejected' (client-side payload error — retry can't fix it).
-        try:
-            body = json.dumps({"events": events})
-        except (TypeError, ValueError) as e:
-            self._safe_on_error(
-                Exception(f"failed to JSON-encode {len(events)} event(s): {e}")
-            )
-            self._record_drop(events, "rejected")
-            return
-
-        try:
-            result: PostResult = await post_batch_with_retry(
-                url,
-                headers,
-                body,
-                post_fn=self._post_fn,
-                max_retries=self.max_retries,
-            )
-        except Exception as e:  # noqa: BLE001 — never let a transport bug break the loop
-            # The retry loop already catches per-attempt exceptions, so
-            # reaching here means something outside the loop failed
-            # (unlikely). Treat as retry_exhausted so we don't silently
-            # discard the batch.
-            self._safe_on_error(e)
-            self._record_drop(events, "retry_exhausted")
-            return
-
-        if result.reason == "success":
-            logger.debug("[aforo-agent] flushed %d event(s)", len(events))
-            # A 2xx can still reject individual events. They are lost (a
-            # retry would be rejected again): count them, and name them to
-            # on_drop only when the response identifies them by index.
-            partial = parse_partial_failure(result.response_body, len(events))
-            if partial is not None:
-                failed, indices = partial
-                for msg in error_messages(result.response_body)[:10]:
-                    logger.warning("[aforo-agent] ingestor rejected event %s", msg)
-                if failed >= len(events):
-                    self._record_drop(events, "rejected")
-                elif indices:
-                    self._record_drop([events[i] for i in indices], "rejected")
-                else:
-                    self._record_drop([], "rejected", count=failed)
-            return
-
-        # rejected (non-retryable 4xx) → on_error + on_drop with 'rejected'.
-        # retry_exhausted (5xx / 408 / 429 / network) → on_drop with 'retry_exhausted'.
-        if result.reason == "rejected":
-            details = "; ".join(error_messages(result.response_body)[:5])
-            self._safe_on_error(
-                Exception(
-                    f"Aforo returned {result.status_code} — not retrying: "
-                    f"{details or result.response_body[:200]}"
-                )
-            )
-        self._record_drop(events, result.reason)
+    def flush_sync(self, timeout: Optional[float] = None) -> int:
+        """:meth:`flush` for code with no running event loop."""
+        return self._core.flush(timeout).pending
 
     async def start(self) -> None:
-        """Start the periodic-flush background task.
+        """Kept for compatibility. The background sender runs from
+        construction; there is nothing to start."""
+        return None
 
-        Idempotent — calling this more than once is a no-op.
-        """
-        if self._running:
-            return
-        self._running = True
-        self._flush_task = asyncio.create_task(self._periodic_flush())
+    async def shutdown(self, timeout: Optional[float] = None) -> None:
+        """Stop accepting events and flush for at most ``shutdown_timeout_sec``
+        (or ``timeout``) seconds, in a worker thread. Events still queued then
+        are reported to ``on_drop`` as ``"shutdown"``. Runs at interpreter
+        exit too, so calling it is optional."""
+        await asyncio.get_running_loop().run_in_executor(None, self._core.close, timeout)
 
-    async def shutdown(self) -> None:
-        """Stop the periodic-flush task and force a final flush.
-
-        Call this before your process exits so buffered events land in
-        Aforo instead of being lost on shutdown.
-        """
-        self._running = False
-        if self._flush_task is not None:
-            self._flush_task.cancel()
-            try:
-                await self._flush_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._flush_task = None
-        await self.flush()
+    def shutdown_sync(self, timeout: Optional[float] = None) -> None:
+        """:meth:`shutdown` for code with no running event loop."""
+        self._core.close(timeout)
 
     @property
     def dropped_count(self) -> int:
-        """Total events permanently dropped since the client was created."""
-        return self._dropped
+        """Total events lost for good since the client was created."""
+        return self._core.dropped_count
 
     def __len__(self) -> int:
-        return len(self._buffer)
+        return self._core.queue_size
+
+    @property
+    def _buffer(self) -> List[Dict[str, Any]]:
+        """Snapshot of the queued events (for tests and debugging)."""
+        return self._core.queued_items()
 
     # ─────────────────────────── internals ──────────────────────────
+
+    def _customer(self, customer_id: Optional[str]) -> str:
+        return clean_customer_id(customer_id) or self.default_customer_id or ""
 
     def _build_event(
         self,
@@ -540,10 +508,8 @@ class AforoAgentClient:
         product_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         # Metadata carries both snake_case and camelCase capability_name.
-        # The usage-ingestor extractor reads snake_case (2026-07-11
-        # `ProductTypeEventExtractor.extractAiAgentFields`); camelCase is
-        # a courtesy for JS analytics consumers so the same event body
-        # reads sensibly on both sides.
+        # The usage-ingestor extractor reads snake_case; camelCase is a
+        # courtesy for JS analytics consumers.
         metadata: Dict[str, Any] = {
             "sdkLanguage": "python",
             "sdkVersion": __version__,
@@ -563,11 +529,8 @@ class AforoAgentClient:
             "metricName": metric_name,
             "quantity": 1,
             "occurredAt": _utc_now_iso(),
-            # 'agent:{uuid}' mirrors node-agent's key format. UUID is
-            # dense enough to make a same-millisecond collision
-            # astronomically unlikely (128 bits vs. the compound key
-            # python-mcp uses for legacy dedup reasons), and it survives
-            # replay after a drop-hook persist step.
+            # 'agent:{uuid}' mirrors node-agent's key format; minted once, so
+            # retries and on_drop replays are dedup-safe.
             "idempotencyKey": f"agent:{uuid.uuid4()}",
             "productType": _normalize_product_type(product_type, self.product_type),
             "agentId": agent_id,
@@ -588,7 +551,8 @@ class AforoAgentClient:
         if _blank(event.get("agentId")):
             return "agent_id is required for AI_AGENT (got blank)"
         if _blank(event.get("customerId")):
-            return "customer_id is required (got blank)"
+            return ("customer_id is required: pass customer_id or set default_customer_id "
+                    "(the agent id is not used as the customer)")
         return (
             _too_long("agentId", event.get("agentId"))
             or _too_long("customerId", event.get("customerId"))
@@ -600,102 +564,11 @@ class AforoAgentClient:
         )
 
     def _submit(self, event: Dict[str, Any], problem: Optional[str]) -> None:
-        """Buffer a valid event; drop an invalid one (never raises)."""
+        """Queue a valid event; drop an invalid one (never raises, never blocks)."""
         if problem:
-            self._record_drop([event], "invalid", detail=problem)
+            self._core.report_drop([event], "invalid", detail=problem)
             return
-        if self._buffer.add(event):
-            self._schedule_flush()
-
-    def _schedule_flush(self) -> None:
-        """Kick off a flush without blocking the caller.
-
-        Checks for a running loop FIRST so we don't create a coroutine
-        object we can't schedule — a bare
-        ``asyncio.ensure_future(self.flush())`` evaluates ``self.flush()``
-        (creating a coroutine) BEFORE ensure_future tries to schedule it,
-        so a missing loop leaves the coroutine dangling with a
-        'coroutine was never awaited' RuntimeWarning at GC. Bug fixed
-        2026-07-11.
-
-        Also attaches a done-callback that reads (and thereby "consumes")
-        any exception the scheduled flush raises — otherwise asyncio
-        emits 'Task exception was never retrieved' at GC even when
-        flush's own try/except already handled the error.
-        """
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # No running event loop — caller must await flush() manually.
-            logger.debug("[aforo-agent] no running loop; caller must flush()")
-            return
-        task = loop.create_task(self.flush())
-        task.add_done_callback(self._consume_task_exception)
-
-    @staticmethod
-    def _consume_task_exception(task: "asyncio.Task[Any]") -> None:
-        """Drain a task's exception so asyncio doesn't emit
-        'Task exception was never retrieved' at GC. Cancellation is
-        expected during shutdown and is silently absorbed."""
-        try:
-            exc = task.exception()
-        except asyncio.CancelledError:
-            return
-        if exc is not None:
-            logger.debug(
-                "[aforo-agent] scheduled flush raised (consumed)", exc_info=exc
-            )
-
-    async def _periodic_flush(self) -> None:
-        while self._running:
-            try:
-                await asyncio.sleep(self.flush_interval_sec)
-            except asyncio.CancelledError:
-                break
-            try:
-                await self.flush()
-            except Exception as e:  # noqa: BLE001
-                self._safe_on_error(e)
-
-    def _record_drop(
-        self,
-        events: List[Dict[str, Any]],
-        reason: DropReason,
-        *,
-        count: Optional[int] = None,
-        detail: Optional[str] = None,
-    ) -> None:
-        """Count + WARN + fire the optional ``on_drop`` hook. A hook bug
-        must never break flushing. ``"invalid"`` logs are throttled (first,
-        then every 1000th) so a tight loop can't storm the log. ``count``
-        overrides ``len(events)`` when the ingestor reported rejected events
-        without saying which ones."""
-        n = len(events) if count is None else count
-        if n <= 0:
-            return
-        self._dropped += n
-        if reason == "invalid":
-            self._invalid_drops += n
-            if self._invalid_drops == 1 or self._invalid_drops % 1000 == 0:
-                logger.warning(
-                    "[aforo-agent] invalid event not sent — %s (%d total dropped)",
-                    detail or "client-side validation",
-                    self._dropped,
-                )
-        else:
-            logger.warning(
-                "[aforo-agent] dropped %d event(s) — %s (%d total dropped)",
-                n,
-                reason,
-                self._dropped,
-            )
-        if self.on_drop is not None and events:
-            try:
-                self.on_drop(events, reason)
-            except Exception:
-                logger.debug(
-                    "[aforo-agent] on_drop hook raised", exc_info=True
-                )
+        self._core.enqueue(event)
 
     def _safe_on_error(self, e: Exception) -> None:
         try:

@@ -90,7 +90,7 @@ class AforoServletFilterTest {
 
     @Test
     void defaultMetricIsCatalogNameAndCustomerFromHeader() throws Exception {
-        List<JsonNode> events = run(new AforoServletFilter(client),
+        List<JsonNode> events = run(AforoServletFilter.builder(client).trustCustomerHeader(true).build(),
                 request("GET", "/users/42", Map.of("X-Customer-Id", "cust_1"), null));
 
         assertThat(events).hasSize(1);
@@ -100,18 +100,18 @@ class AforoServletFilterTest {
 
     @Test
     void neverUsesCallerApiKeyAsCustomer() throws Exception {
-        List<JsonNode> events = run(new AforoServletFilter(client),
+        List<JsonNode> events = run(AforoServletFilter.builder(client).trustCustomerHeader(true).build(),
                 request("GET", "/users/42", Map.of("X-Api-Key", "secret"), null));
         assertThat(events).isEmpty();
     }
 
     @Test
     void principalIsIgnoredUnlessOptedIn() throws Exception {
-        List<JsonNode> events = run(new AforoServletFilter(client),
+        List<JsonNode> events = run(AforoServletFilter.builder(client).trustCustomerHeader(true).build(),
                 request("GET", "/users/42", Map.of(), "alice@example.com"));
         assertThat(events).isEmpty();
 
-        events = run(new AforoServletFilter(client).usePrincipalAsCustomerId(true),
+        events = run(AforoServletFilter.builder(client).trustCustomerHeader(true).usePrincipalAsCustomerId(true).build(),
                 request("GET", "/users/42", Map.of("X-Customer-Id", "spoofed"), "cust_principal"));
         assertThat(events).hasSize(1);
         assertThat(events.get(0).get("customerId").asText()).isEqualTo("cust_principal");
@@ -119,7 +119,7 @@ class AforoServletFilterTest {
 
     @Test
     void skipsOptionsPreflight() throws Exception {
-        List<JsonNode> events = run(new AforoServletFilter(client),
+        List<JsonNode> events = run(AforoServletFilter.builder(client).trustCustomerHeader(true).build(),
                 request("OPTIONS", "/users/42",
                         Map.of("X-Customer-Id", "cust_1", "Access-Control-Request-Method", "POST"), null));
         assertThat(events).isEmpty();
@@ -127,18 +127,18 @@ class AforoServletFilterTest {
 
     @Test
     void metricAndCustomerAreConfigurable() throws Exception {
-        AforoServletFilter filter = new AforoServletFilter(client)
+        AforoServletFilter filter = AforoServletFilter.builder(client).trustCustomerHeader(true)
                 .metricName("sms_sent")
-                .customerIdHeader("X-Account");
+                .customerIdHeader("X-Account").build();
         List<JsonNode> events = run(filter, request("POST", "/send", Map.of("X-Account", "acct_1"), null));
         assertThat(events.get(0).get("metricName").asText()).isEqualTo("sms_sent");
         assertThat(events.get(0).get("customerId").asText()).isEqualTo("acct_1");
 
         received.clear();
-        filter = new AforoServletFilter(client)
+        filter = AforoServletFilter.builder(client)
                 .metricName("fallback_metric")
                 .metricNameResolver((req, res) -> req.getRequestURI().startsWith("/otp") ? "otp_delivered" : null)
-                .customerIdResolver(req -> "cust_resolved");
+                .customerIdResolver(req -> "cust_resolved").build();
         events = run(filter,
                 request("POST", "/otp/send", Map.of(), null),
                 request("GET", "/other", Map.of(), null));

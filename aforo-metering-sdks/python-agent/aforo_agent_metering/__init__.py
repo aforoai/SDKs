@@ -14,11 +14,16 @@ Usage:
         api_key=os.environ["AFORO_API_KEY"],
         ingestor_url="https://api.aforo.ai",
     )
-    await client.start()  # begin periodic flush
 
-    @wrap_capability_handler(client, capability_name="summarize_email")
-    async def summarize(text: str, *, agent_id: str, session_id: str, customer_id: str):
+    @wrap_capability_handler(
+        client,
+        capability_name="summarize_email",
+        customer_resolver=lambda args, kwargs: current_user().customer_id,
+    )
+    async def summarize(text: str, *, agent_id: str, session_id: str):
         ...
+
+    await client.shutdown()  # sends what is left; also runs at exit
 """
 
 from .client import (

@@ -1,6 +1,6 @@
 # @aforoai/mcp-metering — User Guide
 
-**Version:** 1.3.2 · **Updated:** 2026-10-01 · **Audience:** engineers who own an MCP server's source and want to meter `tools/call` invocations for Aforo billing.
+**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** engineers who own an MCP server's source and want to meter `tools/call` invocations for Aforo billing.
 
 ## What you'll build
 
@@ -20,19 +20,19 @@ Public install (once published):
 npm i @aforoai/mcp-metering
 ```
 
-Install `1.3.2` or later. `1.0.0` on npm was built from an older copy of this code and lacks the fixes listed in the changelog. If `1.3.2` is not on npm yet, install from source:
+Install `2.0.0` or later. `1.0.0` on npm was built from an older copy of this code and lacks the fixes listed in the changelog. If `2.0.0` is not on npm yet, install from source:
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
 cd SDKs/aforo-metering-sdks/node-mcp
 npm install && npm run build
-npm pack        # produces aforo-mcp-metering-1.3.2.tgz
+npm pack        # produces aforo-mcp-metering-2.0.0.tgz
 ```
 
 Then in your MCP server project:
 
 ```bash
-npm i /path/to/aforo-metering-sdks/node-mcp/aforo-mcp-metering-1.3.2.tgz
+npm i /path/to/aforo-metering-sdks/node-mcp/aforo-mcp-metering-2.0.0.tgz
 ```
 
 ## Step 2 — Create the billing client
@@ -46,11 +46,14 @@ const billing = new AforoMcpBilling({
   apiKey: process.env.AFORO_API_KEY!,
   ingestorUrl: 'https://api.aforo.ai',
   productType: 'MCP_SERVER',   // default; sent as top-level productType on every event
-  // customerId: 'cust_acme',  // optional: bill this customer instead of the agentId
+  // Pick ONE customer source (wrapToolHandler throws without one):
+  customerResolver: (request, extra: any) => extra?.authInfo?.extra?.aforoCustomerId, // from authenticated identity
+  // customerId: 'cust_acme',          // or: one customer for every call
+  // trustCustomerHeader: true,        // or: bill params._meta.customer_id (trusted clients only)
 });
 ```
 
-The constructor validates `tenantId`, `productId`, `apiKey`, and `ingestorUrl` and throws if any is missing — and it starts the periodic flush timer immediately.
+The constructor validates `tenantId`, `productId`, `apiKey`, and `ingestorUrl` and throws if any is missing or if `ingestorUrl` is not `https://` (plain http is accepted for localhost, 127.0.0.1 and ::1, or with `allowInsecureHttp: true`). It starts one background sender that posts queued events in batches.
 
 > ⚠ `ingestorUrl` is the **base** URL. The SDK appends `/v1/ingest/batch`. Pass `https://api.aforo.ai` — not the full batch path. A trailing slash is trimmed for you, so either form of the base works.
 
@@ -63,7 +66,7 @@ import { CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
 server.setRequestHandler(
   CallToolRequestSchema,
-  billing.wrapToolHandler(async (request) => {
+  billing.wrapToolHandler(async (request, extra) => {
     const { name, arguments: args } = request.params;
     // ... your tool logic ...
     return { content: [{ type: 'text', text: 'result' }] };
@@ -71,11 +74,11 @@ server.setRequestHandler(
 );
 ```
 
-> ⚠ The wrapper pulls `agent_id`, `session_id` and `customer_id` from `request.params._meta`. The customer is `_meta.customer_id`, else the `customerId` config, else the agentId. If the calling agent doesn't set `_meta.agent_id` and no `agentId` config is set, the event's `agentId` (and, without a customer, its `customerId`) fall back to the literal string `"unknown"` — your usage rolls up under one phantom customer. Make sure your agents stamp `_meta.agent_id`, or set `agentId` / `customerId` in the config.
+> ⚠ The customer comes from `customerResolver` (it decides alone when set), else `_meta.customer_id` when `trustCustomerHeader` is on, else `customerId`. With none of the three, `wrapToolHandler` throws. A call whose customer cannot be decided still runs; its event is dropped as `invalid` and counted. The wrapper reads `agent_id` and `session_id` from `request.params._meta`; without `_meta.agent_id` or an `agentId` config the event's `agentId` is `"unknown"` (the agent id is never used as the customer).
 
 The wrapper sets `executionStatus`: `SUCCESS` for a normal result, `ERROR` for a result with `isError: true` or a thrown error, `TIMEOUT` for a `TimeoutError` or MCP error code `-32001`. Pass `{ statusResolver }` as the second argument to decide it yourself (see the [README](README.md#execution-status-and-dropped-events)).
 
-A tool invocation the ingestor would reject (blank tool name, `agentId` over 36 characters, `customerId` or `sessionId` over 64) is not sent and does not throw: it is counted in `billing.droppedCount`, WARN-logged, and passed to `onDrop` with reason `'invalid'`. A tool name over 64 characters is cut to 64 and the event is still sent.
+A tool invocation the ingestor would reject (no customer, blank tool name, `agentId` over 36 characters, `customerId` or `sessionId` over 64) is not sent and does not throw: it is counted in `billing.droppedCount`, WARN-logged, and passed to `onDrop` with reason `'invalid'`. A tool name over 64 characters is cut to 64 and the event is still sent.
 
 ## Step 4 — Manage the session (optional but recommended)
 
@@ -91,7 +94,7 @@ Session heartbeats (`system.session.heartbeat`) are sent once when the session s
 
 ## Step 5 — React to a server kill signal
 
-The batch response can carry `killedSessionIds`. When the active session appears in that list, the SDK clears the session and calls your `onSessionKilled` callback. The ingestor computes `killedSessionIds` while processing heartbeats, so the signal arrives on heartbeat responses (every `heartbeatIntervalMs`) as well as on batch flushes:
+Heartbeat responses and usage-batch responses can both carry `killedSessionIds`. When the active session appears in that list, the SDK stops the session and its heartbeats and calls your `onSessionKilled` callback, so a kill is noticed at the next heartbeat (every `heartbeatIntervalMs`) or the next batch, whichever comes first:
 
 ```ts
 const billing = new AforoMcpBilling({
@@ -99,6 +102,7 @@ const billing = new AforoMcpBilling({
   productId: 'prod_mcp_001',
   apiKey: process.env.AFORO_API_KEY!,
   ingestorUrl: 'https://api.aforo.ai',
+  customerId: 'cust_acme',
   onSessionKilled: (sessionId, reason) => {
     console.warn(`Aforo killed session ${sessionId}: ${reason}`);
     // tear down the agent connection on your side
@@ -106,15 +110,17 @@ const billing = new AforoMcpBilling({
 });
 ```
 
-> ⚠ The kill signal is only seen when a heartbeat or batch response returns it. It is **not** a real-time interrupt — a session may run until the next heartbeat (≤ `heartbeatIntervalMs`) or flush before the kill is observed. If you need to gate a call *before* it executes, use the proxy's quota enforcement, not this SDK.
+> ⚠ The kill signal is only seen when a heartbeat response returns it. It is **not** a real-time interrupt — a session may run until the next heartbeat (≤ `heartbeatIntervalMs`) before the kill is observed. If you need to gate a call *before* it executes, use the proxy's quota enforcement, not this SDK.
 
 ## Step 6 — Flush on shutdown
 
-The periodic timer flushes on its own, but a process can exit mid-interval. Flush explicitly on shutdown:
+The sender runs on its own, and on the process `beforeExit` event it sends what is queued. A SIGTERM skips `beforeExit`, and the SDK installs no signal handlers, so call `shutdown()` from yours. It sends for at most `shutdownTimeoutMs` (5 s); what is left is dropped as `shutdown` and counted:
 
 ```ts
-process.on('SIGTERM', async () => {
-  await billing.shutdown(); // stops the flush timer, flushes remaining events
+process.once('SIGTERM', async () => {
+  await billing.endSession(); // optional: SESSION_END heartbeat
+  await billing.shutdown();   // sends queued events within the deadline
+  process.exit(0);
 });
 ```
 
@@ -132,7 +138,8 @@ const billing = new AforoMcpBilling({
   tenantId: 'tenant_smartai',
   productId: 'prod_mcp_001',
   apiKey: process.env.AFORO_API_KEY!,
-  ingestorUrl: 'http://localhost:8084',   // SDK appends /v1/ingest/batch
+  ingestorUrl: 'http://localhost:8084',   // SDK appends /v1/ingest/batch; http is allowed for localhost
+  customerId: 'cust_acme',
 });
 ```
 
@@ -140,7 +147,7 @@ Invoke a wrapped tool. The catcher prints `POST /v1/ingest/batch` with a body li
 
 ```json
 {"events":[
-  {"customerId":"agt_001","metricName":"mcp_server.tool_invocations","quantity":1,"productType":"MCP_SERVER","toolName":"web-search","agentId":"agt_001","sessionId":"sess_abc","executionStatus":"SUCCESS","executionDurationMs":42,"metadata":{"productId":"prod_mcp_001","sdk":"nodejs"}}
+  {"customerId":"cust_acme","metricName":"mcp_server.tool_invocations","quantity":1,"productType":"MCP_SERVER","toolName":"web-search","agentId":"agt_001","sessionId":"sess_abc","executionStatus":"SUCCESS","executionDurationMs":42,"metadata":{"productId":"prod_mcp_001","sdk":"nodejs"}}
 ]}
 ```
 
@@ -156,16 +163,24 @@ If you see that batch hit `/v1/ingest/batch`, the wrapper is wired correctly. Po
 | `ingestorUrl` | `string` | — (required) | Base URL; SDK appends `/v1/ingest/batch`. |
 | `entitlementMode` | `'SERVER_LEVEL' \| 'TOOL_LEVEL'` | unset | Reserved; accepted, not enforced client-side at this version. |
 | `sessionConfig.idleTimeoutSec` / `.maxDurationSec` | `number` | unset | Reserved; accepted, not enforced client-side at this version. |
-| `flushIntervalMs` | `number` | `5000` | Periodic flush cadence. |
-| `flushCount` | `number` | `50` | Force flush at this buffer size (capped at 1000). |
+| `flushIntervalMs` | `number` | `5000` | Queued events are sent at least this often. |
+| `flushCount` | `number` | `500` | Events per request; reaching it wakes the sender (capped at 1000). |
+| `maxQueueSize` | `number` | `10000` | Most events held during an outage; past it the oldest is dropped (`overflow`). |
+| `maxRetries` | `number` | `3` | Retries per request before the batch is re-queued and the sender pauses. |
+| `timeoutMs` | `number` | `10000` | Total deadline per ingest request. |
+| `shutdownTimeoutMs` | `number` | `5000` | How long `shutdown()` keeps sending. |
+| `flushOnExit` | `boolean` | `true` | Send what is queued on `beforeExit`. |
+| `allowInsecureHttp` | `boolean` | `false` | Allow plain http on a non-local host. |
 | `productType` | `string` | `MCP_SERVER` | Top-level `productType` on every event; per-call override via `recordToolInvocation(..., { productType })`. |
-| `customerId` | `string` | unset | Customer billed when a call has no `_meta.customer_id` (else the agentId); also the heartbeat customer. |
+| `customerResolver` | `(request, extra) => string \| undefined \| Promise<…>` | unset | Customer per call from authenticated identity. |
+| `customerId` | `string` | unset | One customer for every call; also the heartbeat customer. |
+| `trustCustomerHeader` | `boolean` | `false` | Bill `params._meta.customer_id` as the client sends it. |
 | `agentId` | `string` | `"unknown"` | Agent id when a call has no `_meta.agent_id`. |
 | `heartbeatIntervalMs` | `number` | `30000` | Interval between session heartbeats. |
 | `heartbeatEnabled` | `boolean` | `true` | Send session heartbeats while a session is active. |
-| `onError` | `(err) => void` | `console.error` | Called on non-retryable 4xx, after retries exhausted, on per-event rejections, a bad `statusResolver` and failed heartbeats. |
-| `onDrop` | `(events, reason) => void` | unset | Called with usage events the SDK is about to lose (`retry_exhausted`, `rejected`, `invalid`). Dropped events are also counted in `billing.droppedCount` and WARN-logged. |
-| `onSessionKilled` | `(sessionId, reason) => void` | unset | Fired when a flush or heartbeat response lists the active session as killed. |
+| `onError` | `(err) => void` | `console.error` | Called when the ingestor becomes unreachable (events kept), on rejected events, on a shutdown that left events behind, a bad `statusResolver` / `customerResolver`, and failed heartbeats. Delivery reports are a `CoreTransportError`: branch on `err.kind` (`outage`, `auth`, `rejected`, `shutdown`, `closed`) and read `err.events`, not the message. |
+| `onDrop` | `(events, reason) => void` | unset | Called with usage events the SDK is about to lose (`rejected`, `invalid`, `overflow`, `shutdown`, `closed`). Dropped events are also counted in `billing.droppedCount` and WARN-logged. |
+| `onSessionKilled` | `(sessionId, reason) => void` | unset | Fired when a heartbeat or usage-batch response lists the active session as killed. A throw goes to `onError`. |
 
 ## Troubleshooting
 
@@ -173,15 +188,16 @@ If you see that batch hit `/v1/ingest/batch`, the wrapper is wired correctly. Po
 |---|---|---|
 | `tenantId/productId/apiKey/ingestorUrl is required` thrown at construction | A required config value is empty | Provide all four. The constructor fails fast. |
 | Events POST to `…/v1/ingest/batch/v1/ingest/batch` (404) | Passed the full batch path as `ingestorUrl` | Pass only the base URL; the SDK appends `/v1/ingest/batch`. |
-| All usage rolls up under customer `"unknown"` | Agents don't set `request.params._meta.agent_id` | Have callers stamp `_meta.agent_id` (and `_meta.session_id` for sessions), or set `customerId` / `agentId` in the config. |
-| `Aforo ingestor returned 401/403 — not retrying` via `onError` | Bad API key or tenant mismatch | Check `AFORO_API_KEY` and that `tenantId` matches the product. 4xx (except 408/429) is not retried. |
+| `wrapToolHandler` throws `no customer source` | None of `customerResolver`, `customerId`, `trustCustomerHeader` is set | Set one (see Step 2). |
+| `Dropped N event(s) — invalid: no customer` | The resolver returned nothing for those calls | Return the customer id from the resolver for every authenticated caller. |
+| `Aforo ingestor answered HTTP 401` logged, `onError` says unavailable | Bad API key or tenant mismatch | Check `AFORO_API_KEY` and that `tenantId` matches the product. The usage stays queued and is sent once the key works. |
 | Dashboard empty though `onError` never fired | Unknown metric on the product, or wrong `productId` | Confirm `mcp_server.tool_invocations` exists on the MCP_SERVER product and `productId` is correct. |
-| Session kill is observed late | Kill signals only arrive on a batch flush or heartbeat response | Lower `heartbeatIntervalMs` / `flushIntervalMs`, or pre-gate calls with the proxy's quota enforcement for real-time blocking. |
-| `Dropped N event(s)` or `Invalid tool invocation dropped` WARN | A batch failed, was rejected, or an event failed a client-side check | Read the reason in the WARN; pass `onDrop` to capture the events (`retry_exhausted`, `rejected`, `invalid`). |
-| Process exits, last few events missing | Exited mid-flush-interval without `shutdown()` | `await billing.shutdown()` on SIGTERM/SIGINT before exit. |
+| Session kill is observed late | Kill signals only arrive on a heartbeat response | Lower `heartbeatIntervalMs`, or pre-gate calls with the proxy's quota enforcement for real-time blocking. |
+| `Dropped N event(s) — <reason>` WARN | Events were rejected, failed a client-side check, overflowed the queue during an outage, or were still queued at the shutdown deadline | Read the reason in the WARN; pass `onDrop` to capture the events. |
+| Process exits, last few events missing | Exited on SIGTERM without `shutdown()` | `await billing.shutdown()` in your SIGTERM/SIGINT handler before exit. |
 
 ## What this guide does NOT cover
 
-- **Pre-flight quota / blocking a call before it runs.** This SDK meters after the fact and only reacts to a kill signal on the next flush. Use `@aforoai/mcp-proxy --quota-enforcement` for a pre-flight gate.
+- **Pre-flight quota / blocking a call before it runs.** This SDK meters after the fact and only reacts to a kill signal on the next heartbeat. Use `@aforoai/mcp-proxy --quota-enforcement` for a pre-flight gate.
 - **Metering MCP servers you don't own the source of.** Use the proxy sidecar (`@aforoai/mcp-proxy`) for stdio/SSE/HTTP servers you can't modify.
 - **Product / metric / rate-plan setup.** Creating the MCP_SERVER product and its `mcp_server.tool_invocations` metric is done in the Aforo console.

@@ -1,22 +1,36 @@
+import type { AforoClient } from './client.js';
+
 /**
- * Why a buffered event was permanently dropped by the SDK.
- * - 'overflow': the ring buffer was full — the OLDEST event was evicted to make room.
- * - 'retry_exhausted': a batch failed after all transport retries (ingest outage).
- * - 'rejected': the ingestor rejected the batch with a non-retryable 4xx, or
- *   rejected this event individually in a partially accepted batch.
+ * Why events were permanently lost. Every dropped event keeps its
+ * idempotency key, so re-tracking it after recovery is dedup-safe.
+ * - 'overflow': the queue was full — the OLDEST event was evicted to make room.
+ * - 'rejected': the ingestor refused the event (a non-retryable 4xx, a
+ *   per-event rejection inside an accepted batch, or 413 on a single event).
  * - 'invalid': the event failed a client-side check at track() (blank
  *   customerId/metricName, quantity <= 0, a field over the ingestor's size
- *   limit, a malformed occurredAt) and was never buffered or sent.
+ *   limit, a malformed occurredAt), or a middleware customer resolver
+ *   returned nothing. It was never queued or sent.
+ * - 'shutdown': still queued when the shutdown deadline passed.
+ * - 'closed': track() was called after shutdown().
+ * - 'retry_exhausted': kept for compatibility; not produced by 2.x (an outage
+ *   requeues the batch behind a breaker instead of dropping it).
  */
-export type DropReason = 'overflow' | 'retry_exhausted' | 'rejected' | 'invalid';
+export type DropReason = 'overflow' | 'retry_exhausted' | 'rejected' | 'invalid' | 'shutdown' | 'closed';
 
 /** Options for creating an AforoClient instance. */
 export interface AforoOptions {
-  /** Aforo API key for authentication. */
+  /** Aforo API key, sent as X-API-Key. Never logged or shown by inspect(). */
   apiKey: string;
 
-  /** Base URL for the Aforo ingestor service. Defaults to https://api.aforo.ai */
+  /**
+   * Base URL for the Aforo ingestor. Default https://api.aforo.ai.
+   * Must be https:// — plain http:// is accepted only for localhost,
+   * 127.0.0.1 and ::1, or with `allowInsecureHttp: true`.
+   */
   baseUrl?: string;
+
+  /** Allow a plain http:// baseUrl on a non-local host. Default false. */
+  allowInsecureHttp?: boolean;
 
   /**
    * Default product type stamped on every event (top-level `productType`).
@@ -27,36 +41,42 @@ export interface AforoOptions {
    */
   productType?: string;
 
-  /** Maximum events to buffer before flushing (capped at 1000, the ingestor's batch limit). Default: 50 */
+  /** Events per request (capped at 1000, the ingestor's batch limit). Default: 500 */
   flushCount?: number;
 
-  /** Flush interval in milliseconds. Default: 5000 (5 seconds) */
+  /** Flush at least this often, in milliseconds. Default: 5000 */
   flushInterval?: number;
 
-  /** Maximum events in the ring buffer. Oldest dropped on overflow. Default: 10000 */
+  /** Queue capacity. The oldest event is dropped on overflow. Default: 10000 */
   maxQueueSize?: number;
 
-  /** Maximum retries on 5xx/timeout. Default: 3 */
+  /** Retries per batch on network errors, timeouts, 408, 429 and 5xx before the breaker opens. Default: 3 */
   maxRetries?: number;
 
-  /** Base delay in ms for exponential backoff. Default: 1000 */
+  /** Base delay in ms for full-jitter backoff. Default: 500 */
   retryBaseMs?: number;
 
-  /** Request timeout in milliseconds. Default: 10000 */
+  /** Total deadline per request, in milliseconds. Default: 10000 */
   timeout?: number;
 
-  /** Graceful shutdown timeout in milliseconds. Default: 5000 */
+  /** How long shutdown() keeps sending, in milliseconds. Default: 5000 */
   shutdownTimeoutMs?: number;
 
   /**
+   * Flush queued events when the process is about to exit naturally
+   * (`beforeExit`), within shutdownTimeoutMs. Default true. The SDK installs
+   * no signal handlers: call `await client.shutdown()` from your own SIGTERM
+   * handler before exiting.
+   */
+  flushOnExit?: boolean;
+
+  /**
    * OPT-IN hook invoked with events the SDK is about to lose permanently
-   * (buffer overflow, retry exhaustion, non-retryable rejection, or an event
-   * that failed client-side validation — reason 'invalid'), so the
-   * app can persist / alert / replay them. Dropped events keep their
-   * idempotency keys — re-submitting them via track() after recovery is
-   * dedup-safe. Default: none (drops are still counted in droppedCount and
-   * WARN-logged). Exceptions thrown by the hook are swallowed — a hook bug
-   * can never break flushing.
+   * (see DropReason), so the app can persist / alert / replay them. Dropped
+   * events keep their idempotency keys — re-submitting them via track() after
+   * recovery is dedup-safe. Default: none (drops are still counted in
+   * droppedCount and WARN-logged). An exception thrown by the hook is caught
+   * and logged; it never breaks flushing.
    */
   onDrop?: (events: ResolvedEvent[], reason: DropReason) => void;
 }
@@ -139,16 +159,24 @@ export interface BatchResponse {
   accepted: number;
   duplicates: number;
   failed: number;
-  errors: Array<{ index: number; message: string }>;
+  errors: Array<{ index: number; message: string; retryable?: boolean }>;
   killedSessionIds?: string[];
 }
 
 /** Options for Express/Koa/Fastify middleware. */
 export interface MiddlewareOptions {
-  /** Aforo API key. */
-  apiKey: string;
+  /**
+   * An AforoClient the app owns (recommended): the app can flush it, read
+   * droppedCount and call shutdown() from its SIGTERM handler. When omitted,
+   * the middleware creates one from apiKey/baseUrl/clientOptions and exposes
+   * it as `middleware.client`.
+   */
+  client?: AforoClient;
 
-  /** Base URL for the ingestor. */
+  /** Aforo API key (only when `client` is not given). */
+  apiKey?: string;
+
+  /** Base URL for the ingestor (only when `client` is not given). */
   baseUrl?: string;
 
   /**
@@ -162,7 +190,7 @@ export interface MiddlewareOptions {
    * request/response. Default: `"api_calls"` (DEFAULT_METRIC_NAME).
    *
    * Must name a metric that exists in your Aforo catalog. The ingestor rejects
-   * unknown metrics, and one rejected event fails the whole batch it is in.
+   * unknown metrics.
    */
   metricName?: string | ((req: any, res: any) => string);
 
@@ -170,12 +198,35 @@ export interface MiddlewareOptions {
   quantity?: number | ((req: any, res: any) => number);
 
   /**
-   * Aforo customer id: a fixed value, or a function of the request.
-   * Default: the authenticated user's id (`req.user.id` / `.sub`), then the
-   * `X-Customer-Id` header. Requests with no customer are not metered. The
-   * caller's `X-Api-Key` header is never used -- it is a secret, not an id.
+   * Who is billed for a request, from identity your app authenticated (the
+   * session, a verified JWT subject, an API-key lookup). Required unless
+   * `trustCustomerHeader` is true. Return null/undefined/'' when the request
+   * has no billable customer: the event is dropped as 'invalid' and counted;
+   * the request itself is never blocked.
    */
-  customerId?: string | ((req: any) => string | null);
+  customerResolver?: (req: any) => string | null | undefined;
+
+  /**
+   * @deprecated Use `customerResolver`. A function is used as the resolver; a
+   * fixed string bills every request to that customer.
+   */
+  customerId?: string | ((req: any) => string | null | undefined);
+
+  /**
+   * Read the customer from the `X-Customer-Id` request header. That header is
+   * set by whoever calls your API, so only turn this on when a trusted proxy
+   * in front of the app sets it and strips any client copy. Default false.
+   */
+  trustCustomerHeader?: boolean;
+
+  /**
+   * Collapse dynamic path segments before sending `endpointPath`
+   * (`/users/123` → `/users/:id`; the framework's route template wins when
+   * there is one). Default true, so per-id paths do not create unbounded
+   * label cardinality. Pass a function to normalize yourself, or false to send
+   * the raw path.
+   */
+  normalizePath?: boolean | ((path: string, req: any) => string);
 
   /** Paths to exclude from metering. Default: ["/health", "/ready", "/metrics", "/favicon.ico"] */
   excludePaths?: string[];
@@ -186,7 +237,7 @@ export interface MiddlewareOptions {
   /** Function to extract metadata from request/response. */
   metadata?: (req: any, res: any) => Record<string, string | number | boolean>;
 
-  /** AforoClient options (flushCount, flushInterval, etc.) */
+  /** AforoClient options (flushCount, flushInterval, etc.) when the middleware creates the client. */
   clientOptions?: Omit<AforoOptions, 'apiKey' | 'baseUrl'>;
 }
 
@@ -194,14 +245,8 @@ export interface MiddlewareOptions {
 export interface FlushResult {
   sent: number;
   failed: number;
-  /** Why the batch failed, when failed > 0. Absent on success. */
-  reason?: DropReason;
-  /**
-   * Events the ingestor rejected individually inside a batch it otherwise
-   * accepted (per-event `errors[]` in the response). `index` is the position
-   * in the sent batch. Present only when the response identified them.
-   */
-  rejected?: Array<{ index: number; message: string }>;
-  /** Server-provided explanation for a failed batch, when one was returned. */
-  message?: string;
+  /** Events put back on the queue (ingestor outage or a per-event retryable failure). */
+  requeued: number;
+  /** Events still queued after the flush. */
+  queued: number;
 }

@@ -2,9 +2,12 @@
  * @aforoai/ws-metering — Aforo WebSocket Metering SDK
  *
  * Wraps WebSocket server connections to emit three classes of billing events:
- *   - CONNECTION_OPENED  — once on upgrade completion
+ *   - CONNECTION_OPENED  — once on upgrade completion (wsFrameType OPEN,
+ *                          metric websocket_api.connection_opened)
  *   - MESSAGE            — one event per frame (direction + bytes + type)
- *   - CONNECTION_CLOSED  — once on close, carrying aggregated counters + duration
+ *   - CONNECTION_CLOSED  — once per connection, carrying aggregated counters +
+ *                          duration: on close, on a socket error, when an idle
+ *                          connection is swept, or at shutdown
  *
  * Works with the `ws` library out of the box (wrap WebSocketServer), or use
  * trackConnection() directly for Fastify-WebSocket, Socket.io, Deno, Bun, or
@@ -24,11 +27,19 @@
  *
  *   const wss = new WebSocketServer({ port: 8080 });
  *   billing.wrapServer(wss, {
- *     extractCustomerId: (req) => req.headers['x-customer-id'] as string,
+ *     // Who is billed, from identity your app verified at upgrade time.
+ *     customerResolver: (req) => sessionStore.customerFor(req),
  *   });
+ *
+ *   // The SDK installs no signal handlers. Flush from your own:
+ *   process.once('SIGTERM', async () => { await billing.shutdown(); process.exit(0); });
  */
 
 import { randomUUID } from 'node:crypto';
+import { TransportCore, CoreDropReason } from './transport-core/core';
+
+/** What onError receives for delivery problems: branch on `kind`, read `events`. */
+export { CoreTransportError, type CoreErrorKind } from './transport-core/core';
 
 export interface AforoWsConfig {
   tenantId: string;
@@ -40,18 +51,37 @@ export interface AforoWsConfig {
    * Default: `WEBSOCKET_API`. Override per integration via `wrapServer(wss, { productType })` / `trackConnection(ws, { productType })`.
    */
   productType?: string;
-  /** How many events to buffer before flushing (default 100 — WS is high-volume). */
+  /** Allow a plain http:// ingestorUrl on a non-local host. Default false (https required). */
+  allowInsecureHttp?: boolean;
+  /** Events per request (default 500, max 1000). Reaching it wakes the background sender. */
   flushCount?: number;
-  /** Max interval in ms before a partial batch is flushed (default 3000). */
+  /** The background sender also runs this often, in ms (default 5000). */
   flushIntervalMs?: number;
+  /** Queue capacity (default 10 000). The oldest event is dropped on overflow. */
+  maxQueueSize?: number;
+  /** Retries per batch before the breaker opens (default 3). */
+  maxRetries?: number;
+  /** Total deadline per request, in ms (default 10 000). */
+  timeoutMs?: number;
+  /** How long shutdown() keeps sending, in ms (default 5000). */
+  shutdownTimeoutMs?: number;
+  /** Send queued events on the process 'beforeExit' event (default true). */
+  flushOnExit?: boolean;
   /** If true, emit one MESSAGE event per frame. If false (default) only aggregate on close. */
   perFrameEvents?: boolean;
-  /** Callback for terminal flush failures. */
+  /**
+   * Close a tracked connection that saw no frame for this long, in ms
+   * (default 3 600 000 = 1 hour): it gets a CONNECTION_CLOSED with close
+   * reason ABNORMAL_CLOSURE and metadata `closedBy: "sdk_idle_timeout"`. This
+   * keeps the open-connection map bounded when a socket dies without a close
+   * event. Must be a positive number; 0 means the default.
+   */
+  connectionIdleTimeoutMs?: number;
+  /** Callback for delivery problems (rejected batches, ingestor outages) and bad executionStatus values. */
   onError?: (error: Error) => void;
   /**
-   * Opt-in hook receiving events that were permanently dropped (retry
-   * exhaustion, a rejection by the ingestor, or a failed client-side check —
-   * see DropReason). Events keep their idempotency keys,
+   * Opt-in hook receiving events that were permanently dropped (see
+   * DropReason). Events keep their idempotency keys,
    * so persisting and re-submitting them after recovery is dedup-safe.
    * Exceptions thrown by the hook are swallowed. Default: none (drops are
    * still counted in droppedCount and WARN-logged).
@@ -60,18 +90,32 @@ export interface AforoWsConfig {
 }
 
 /**
- * Why events were permanently dropped. `retry_exhausted`: the ingestor stayed
- * unreachable / kept answering 408, 429 or 5xx. `rejected`: the ingestor
- * refused the batch (non-retryable 4xx) or individual events of an accepted
- * batch. `invalid`: the event failed a client-side check and was never sent.
- * The buffer is unbounded (drained at flush start), so unlike the core SDK
- * there is no 'overflow' reason here.
+ * Why events were permanently dropped. `overflow`: the queue was full and the
+ * oldest event was evicted. `rejected`: the ingestor refused the batch
+ * (non-retryable 4xx) or individual events of an accepted batch. `invalid`:
+ * the event failed a client-side check, or the customer resolver returned no
+ * customer. `shutdown`: still queued when the shutdown deadline passed.
+ * `closed`: recorded after shutdown(). `retry_exhausted`: kept for
+ * compatibility, not produced by 2.x — an outage keeps events queued.
  */
-export type DropReason = 'retry_exhausted' | 'rejected' | 'invalid';
+export type DropReason = 'overflow' | 'retry_exhausted' | 'rejected' | 'invalid' | 'shutdown' | 'closed';
 
 export interface WrapServerOptions {
-  /** Extract Aforo customer ID from the upgrade request. */
-  extractCustomerId: (req: any) => string | undefined;
+  /**
+   * Who is billed for a connection, from identity your app verified on the
+   * upgrade request (session cookie, verified token). Required unless
+   * `trustCustomerHeader` is true. Returning nothing drops the connection's
+   * opening event as 'invalid' (counted); the connection is not affected.
+   */
+  customerResolver?: (req: any) => string | undefined | null;
+  /** @deprecated Use `customerResolver` (same signature). */
+  extractCustomerId?: (req: any) => string | undefined | null;
+  /**
+   * Bill the `x-customer-id` header of the upgrade request. Any client can
+   * set that header, so only turn this on behind a proxy you control that
+   * sets it. Default false.
+   */
+  trustCustomerHeader?: boolean;
   /** Optional per-connection metadata (product-defined tags). */
   extractMetadata?: (req: any) => Record<string, unknown> | undefined;
   /**
@@ -130,7 +174,8 @@ interface MinimalWs {
   on(event: 'message', fn: (data: any, isBinary?: boolean) => void): void;
   on(event: 'close', fn: (code: number, reason: Buffer | string) => void): void;
   on(event: 'error', fn: (err: Error) => void): void;
-  send(data: any, cb?: (err?: Error) => void): void;
+  /** `ws` takes (data, cb) or (data, options, cb); every argument is passed through. */
+  send(data: any, ...rest: any[]): void;
   readyState?: number;
 }
 
@@ -139,13 +184,18 @@ interface MinimalWss {
   on(event: 'connection', fn: (ws: MinimalWs, req: any) => void): void;
 }
 
-const SDK_VERSION = '1.2.1';
+const SDK_VERSION = '2.0.0';
+/** Default for AforoWsConfig.connectionIdleTimeoutMs: one hour. */
+export const DEFAULT_CONNECTION_IDLE_TIMEOUT_MS = 60 * 60 * 1000;
+
+/** One tracked connection: its counters and how to bill its close. */
+interface OpenConnection {
+  lastActivity: number;
+  /** Emit CONNECTION_CLOSED once; returns false when it was already closed. */
+  close(code: number, closedBy?: string): boolean;
+}
 /** Default top-level `productType` for this SDK. */
 export const DEFAULT_PRODUCT_TYPE = 'WEBSOCKET_API';
-/** Upper bound on a server-requested Retry-After wait. */
-const MAX_RETRY_AFTER_MS = 30_000;
-/** The ingestor rejects batch requests with more than 1000 events. */
-const MAX_BATCH_EVENTS = 1000;
 /** usage-ingestor limits (IngestUsageEventRequest). */
 const MAX_CUSTOMER_ID = 64;
 const MAX_IDEMPOTENCY_KEY = 255;
@@ -176,7 +226,7 @@ export interface WsUsageEvent {
   productType: string;
   wsConnectionId: string;
   wsDirection: 'CLIENT_TO_SERVER' | 'SERVER_TO_CLIENT';
-  wsFrameType: 'TEXT' | 'BINARY' | 'PING' | 'PONG' | 'CLOSE';
+  wsFrameType: 'OPEN' | 'TEXT' | 'BINARY' | 'PING' | 'PONG' | 'CLOSE';
   wsCloseReason?: string;
   messageCount: number;
   dataBytes: number;
@@ -187,48 +237,101 @@ export interface WsUsageEvent {
 }
 
 export class AforoWsBilling {
-  private readonly config: Required<
-    Pick<AforoWsConfig, 'tenantId' | 'productId' | 'apiKey' | 'ingestorUrl'>
-  >;
+  private readonly config: Required<Pick<AforoWsConfig, 'tenantId' | 'productId'>>;
   private readonly productType: string;
-  private readonly flushCount: number;
-  private readonly flushIntervalMs: number;
   private readonly perFrameEvents: boolean;
   private readonly onError: (error: Error) => void;
-
-  private readonly onDrop?: (events: WsUsageEvent[], reason: DropReason) => void;
-
-  private buffer: WsUsageEvent[] = [];
-  private flushTimer: ReturnType<typeof setInterval> | null = null;
-  private dropped = 0;
-  /** Invalid-event count per field, for WARN throttling. */
-  private readonly invalidSeen = new Map<string, number>();
+  private readonly core: TransportCore<WsUsageEvent>;
+  private readonly idleTimeoutMs: number;
+  private readonly connections = new Map<string, OpenConnection>();
+  private readonly sweepTimer: ReturnType<typeof setInterval>;
+  private shutdownPromise: Promise<void> | null = null;
 
   constructor(config: AforoWsConfig) {
+    const idle = config.connectionIdleTimeoutMs;
+    if (idle !== undefined && (typeof idle !== 'number' || !Number.isFinite(idle) || idle < 0)) {
+      throw new Error(
+        `[aforo-ws] connectionIdleTimeoutMs must be a positive number of milliseconds (got ${String(idle)}); ` +
+          'without it connections that die without a close event are never released.',
+      );
+    }
+    this.idleTimeoutMs = idle ? idle : DEFAULT_CONNECTION_IDLE_TIMEOUT_MS;
     this.config = {
       tenantId: config.tenantId,
       productId: config.productId,
-      apiKey: config.apiKey,
-      ingestorUrl: config.ingestorUrl,
     };
     this.productType = normalizeProductType(config.productType) ?? DEFAULT_PRODUCT_TYPE;
-    this.flushCount = config.flushCount ?? 100;
-    this.flushIntervalMs = config.flushIntervalMs ?? 3000;
     this.perFrameEvents = config.perFrameEvents ?? false;
     this.onError = config.onError ?? ((err) => console.error('[aforo-ws]', err.message));
-    this.onDrop = config.onDrop;
-    this.startTimer();
+    const onDrop = config.onDrop;
+    // The core is the only holder of the API key.
+    this.core = new TransportCore<WsUsageEvent>({
+      baseUrl: config.ingestorUrl,
+      apiKey: config.apiKey,
+      allowInsecureHttp: config.allowInsecureHttp,
+      headers: { 'X-Tenant-Id': config.tenantId },
+      userAgent: `aforo-ws-metering/${SDK_VERSION}`,
+      flushCount: config.flushCount,
+      flushIntervalMs: config.flushIntervalMs,
+      maxQueueSize: config.maxQueueSize,
+      maxRetries: config.maxRetries,
+      timeoutMs: config.timeoutMs,
+      shutdownTimeoutMs: config.shutdownTimeoutMs,
+      flushOnExit: config.flushOnExit,
+      logPrefix: '[aforo-ws]',
+      onError: (err) => this.reportError(err),
+      onDrop: onDrop ? (events, reason: CoreDropReason) => onDrop(events, reason as DropReason) : undefined,
+    });
+    const every = Math.min(60_000, Math.max(1_000, Math.floor(this.idleTimeoutMs / 4)));
+    this.sweepTimer = setInterval(() => this.sweepIdleConnections(), every);
+    this.sweepTimer.unref?.();
   }
 
-  /** Wrap a `ws` WebSocketServer (or any object emitting 'connection' events). */
+  /** Connections being tracked: opened and not yet closed by the socket, the idle sweep or shutdown(). */
+  get openConnections(): number {
+    return this.connections.size;
+  }
+
+  /**
+   * Close every tracked connection idle longer than `connectionIdleTimeoutMs`
+   * at `now` (CONNECTION_CLOSED, ABNORMAL_CLOSURE, `closedBy: "sdk_idle_timeout"`).
+   * Runs on a timer; callable directly. Returns how many it closed.
+   */
+  sweepIdleConnections(now: number = Date.now()): number {
+    const cutoff = now - this.idleTimeoutMs;
+    let closed = 0;
+    for (const conn of Array.from(this.connections.values())) {
+      if (conn.lastActivity <= cutoff && conn.close(1006, 'sdk_idle_timeout')) closed++;
+    }
+    return closed;
+  }
+
+  /**
+   * Wrap a `ws` WebSocketServer (or any object emitting 'connection' events).
+   * Throws when neither `customerResolver` nor `trustCustomerHeader: true` is given.
+   */
   wrapServer(wss: MinimalWss, options: WrapServerOptions): void {
+    const resolver = options?.customerResolver ?? options?.extractCustomerId;
+    const trustHeader = options?.trustCustomerHeader === true;
+    if (typeof resolver !== 'function' && !trustHeader) {
+      throw new Error(
+        '[aforo-ws] wrapServer needs a customerResolver: (req) => the Aforo customer id from identity your app ' +
+          'verified on the upgrade request. To bill the x-customer-id header instead — only safe behind a proxy ' +
+          'that sets it — pass trustCustomerHeader: true.',
+      );
+    }
     wss.on('connection', (ws, req) => {
-      const customerId = options.extractCustomerId(req);
-      if (!customerId || !customerId.trim()) return; // no customer resolved → skip metering
+      let customerId: string | undefined;
+      try {
+        customerId = textOrUndefined(typeof resolver === 'function' ? resolver(req) : undefined);
+        if (!customerId && trustHeader) customerId = textOrUndefined(headerValue(req?.headers?.['x-customer-id']));
+      } catch (err) {
+        this.reportError(new Error(`[aforo-ws] customerResolver threw: ${(err as Error)?.message ?? err}`));
+      }
       const metadata = options.extractMetadata?.(req);
       const status = options.executionStatus;
       this.trackConnection(ws, {
-        customerId,
+        customerId: customerId ?? '',
         metadata,
         executionStatus: typeof status === 'function' ? (event) => status(event, req) : status,
         productType: options.productType,
@@ -241,30 +344,87 @@ export class AforoWsBilling {
     ws: MinimalWs,
     opts: TrackConnectionOptions
   ): () => void {
-    // No customer resolved — the connection is not billable, not a drop.
-    if (typeof opts.customerId !== 'string' || !opts.customerId.trim()) return () => {};
     const connectionId = randomUUID();
     const productType = normalizeProductType(opts.productType) ?? this.productType;
+    if (typeof opts.customerId !== 'string' || !opts.customerId.trim()) {
+      // No customer: the connection is not metered. Counted as one 'invalid' drop.
+      this.core.reportDrop(
+        [this.buildEvent({
+          customerId: typeof opts.customerId === 'string' ? opts.customerId : '',
+          wsConnectionId: connectionId,
+          productType,
+          wsDirection: 'SERVER_TO_CLIENT',
+          wsFrameType: 'OPEN',
+          messageCount: 0,
+          dataBytes: 0,
+          executionDurationMs: 0,
+          metadata: { ...(opts.metadata ?? {}), event: 'CONNECTION_OPENED' },
+        })],
+        'invalid',
+        'customer resolver returned no customer; the connection is not metered',
+      );
+      return () => {};
+    }
+    const openEvent = {
+      customerId: opts.customerId,
+      wsConnectionId: connectionId,
+      productType,
+      wsDirection: 'SERVER_TO_CLIENT' as const,
+      wsFrameType: 'OPEN' as const, // handshake complete; not a frame on the wire
+      messageCount: 0,
+      dataBytes: 0,
+      executionDurationMs: 0,
+      metadata: { ...(opts.metadata ?? {}), event: 'CONNECTION_OPENED' },
+    };
+    if (this.shutdownPromise) {
+      // Shutting down: a connection opened now could never get its CONNECTION_CLOSED.
+      this.core.reportDrop([this.buildEvent(openEvent)], 'closed', 'connection opened after shutdown(); not metered');
+      return () => {};
+    }
     const start = Date.now();
     let sentCount = 0;
     let recvCount = 0;
     let sentBytes = 0;
     let recvBytes = 0;
+    let closed = false;
+    const conn: OpenConnection = {
+      lastActivity: start,
+      close: (code, closedBy) => {
+        if (closed) return false;
+        closed = true;
+        this.connections.delete(connectionId);
+        this.push({
+          customerId: opts.customerId,
+          wsConnectionId: connectionId,
+          productType,
+          wsDirection: 'SERVER_TO_CLIENT',
+          wsFrameType: 'CLOSE',
+          wsCloseReason: CLOSE_REASONS[code] ?? 'NORMAL_CLOSURE',
+          messageCount: sentCount + recvCount,
+          dataBytes: sentBytes + recvBytes,
+          executionDurationMs: Date.now() - start,
+          metadata: {
+            ...(opts.metadata ?? {}),
+            event: 'CONNECTION_CLOSED',
+            sentCount,
+            recvCount,
+            sentBytes,
+            recvBytes,
+            closeCode: code,
+            ...(closedBy ? { closedBy } : {}),
+          },
+        }, opts.executionStatus);
+        return true;
+      },
+    };
+    this.connections.set(connectionId, conn);
 
     // Emit CONNECTION_OPENED immediately
-    this.push({
-      customerId: opts.customerId,
-      wsConnectionId: connectionId,
-      productType,
-      wsDirection: 'SERVER_TO_CLIENT',
-      wsFrameType: 'PING', // "handshake complete" marker; not an actual frame
-      messageCount: 0,
-      dataBytes: 0,
-      executionDurationMs: 0,
-      metadata: { ...(opts.metadata ?? {}), event: 'CONNECTION_OPENED' },
-    });
+    this.push(openEvent);
 
     ws.on('message', (data: any, isBinary?: boolean) => {
+      if (closed) return;
+      conn.lastActivity = Date.now();
       recvCount++;
       const bytes = estimateBytes(data);
       recvBytes += bytes;
@@ -285,7 +445,9 @@ export class AforoWsBilling {
 
     // Wrap send() to count outbound frames
     const origSend = ws.send.bind(ws);
-    ws.send = (data: any, cb?: (err?: Error) => void) => {
+    ws.send = (data: any, ...rest: any[]) => {
+      if (closed) return origSend(data, ...rest);
+      conn.lastActivity = Date.now();
       sentCount++;
       const bytes = estimateBytes(data);
       sentBytes += bytes;
@@ -302,36 +464,22 @@ export class AforoWsBilling {
           metadata: opts.metadata,
         });
       }
-      return origSend(data, cb);
+      return origSend(data, ...rest);
     };
 
     // opts.executionStatus is the connection's outcome: only the closing events
     // below carry it (same as the Python SDK), never OPENED or per-frame events.
+    // 'error' is normally followed by 'close': bill the connection once,
+    // with whichever of the two arrives first (or the idle sweep / shutdown).
     ws.on('close', (code: number) => {
-      // Emit CONNECTION_CLOSED with aggregated counters — this is the billing anchor.
-      this.push({
-        customerId: opts.customerId,
-        wsConnectionId: connectionId,
-        productType,
-        wsDirection: 'SERVER_TO_CLIENT',
-        wsFrameType: 'CLOSE',
-        wsCloseReason: CLOSE_REASONS[code] ?? 'NORMAL_CLOSURE',
-        messageCount: sentCount + recvCount,
-        dataBytes: sentBytes + recvBytes,
-        executionDurationMs: Date.now() - start,
-        metadata: {
-          ...(opts.metadata ?? {}),
-          event: 'CONNECTION_CLOSED',
-          sentCount,
-          recvCount,
-          sentBytes,
-          recvBytes,
-          closeCode: code,
-        },
-      }, opts.executionStatus);
+      // CONNECTION_CLOSED with aggregated counters — this is the billing anchor.
+      conn.close(code);
     });
 
     ws.on('error', (err: Error) => {
+      if (closed) return;
+      closed = true;
+      this.connections.delete(connectionId);
       this.push({
         customerId: opts.customerId,
         wsConnectionId: connectionId,
@@ -342,25 +490,27 @@ export class AforoWsBilling {
         messageCount: sentCount + recvCount,
         dataBytes: sentBytes + recvBytes,
         executionDurationMs: Date.now() - start,
-        metadata: { ...(opts.metadata ?? {}), event: 'CONNECTION_ERROR', error: err.message },
+        metadata: { ...(opts.metadata ?? {}), event: 'CONNECTION_ERROR', error: String(err?.message ?? err).slice(0, 200) },
       }, opts.executionStatus);
     });
 
     return () => {
-      // Tracking lifetime is managed by the close handler — no manual cleanup needed.
+      // Tracking lifetime is managed by the close handler, the idle sweep and shutdown().
     };
   }
 
-  private push(
+  /** Fill in the fields every event carries. */
+  private buildEvent(
     partial: Omit<WsUsageEvent, 'metricName' | 'quantity' | 'occurredAt' | 'idempotencyKey' | 'executionStatus'>,
-    executionStatus?: ExecutionStatusOption
-  ): void {
+  ): WsUsageEvent {
     const now = new Date();
-    const event: WsUsageEvent = {
+    return {
       ...partial,
       metricName: partial.wsFrameType === 'CLOSE'
         ? 'websocket_api.connection_closed'
-        : 'websocket_api.message',
+        : partial.wsFrameType === 'OPEN'
+          ? 'websocket_api.connection_opened'
+          : 'websocket_api.message',
       quantity: 1,
       occurredAt: now.toISOString(),
       // Minted once, here. SDK-generated; tail-trimmed to the ingestor's limit,
@@ -372,6 +522,13 @@ export class AforoWsBilling {
         productId: this.config.productId,
       },
     };
+  }
+
+  private push(
+    partial: Omit<WsUsageEvent, 'metricName' | 'quantity' | 'occurredAt' | 'idempotencyKey' | 'executionStatus'>,
+    executionStatus?: ExecutionStatusOption
+  ): void {
+    const event = this.buildEvent(partial);
     const checked = checkExecutionStatus(resolveExecutionStatus(executionStatus, event));
     if (checked.problem) this.reportError(new Error(`[aforo-ws] ${checked.problem}`));
     if (checked.status) event.executionStatus = checked.status;
@@ -383,161 +540,64 @@ export class AforoWsBilling {
       tooLong('customerId', event.customerId, MAX_CUSTOMER_ID) ??
       tooLong('productType', event.productType, MAX_PRODUCT_TYPE);
     if (invalid) {
-      this.recordInvalid(event, invalid);
+      this.core.reportDrop([event], 'invalid', invalid.problem);
       return;
     }
 
-    this.buffer.push(event);
-    if (this.buffer.length >= this.flushCount) {
-      void this.flush();
-    }
-  }
-
-  private async flush(): Promise<void> {
-    if (this.buffer.length === 0) return;
-    const pending = this.buffer.splice(0, this.buffer.length);
-    // The ingestor accepts at most MAX_BATCH_EVENTS events per request.
-    for (let i = 0; i < pending.length; i += MAX_BATCH_EVENTS) {
-      await this.send(pending.slice(i, i + MAX_BATCH_EVENTS));
-    }
-  }
-
-  private async send(batch: WsUsageEvent[]): Promise<void> {
-    // Serialized once, so every retry re-sends the same idempotencyKeys.
-    const body = JSON.stringify({ events: batch });
-    const maxRetries = 3;
-
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      let delayMs = Math.pow(2, attempt - 1) * 1000; // 1s, 2s, 4s
-      let res: Response | undefined;
-      let networkError: Error | undefined;
-      try {
-        res = await fetch(this.config.ingestorUrl.replace(/\/$/, '') + '/v1/ingest/batch', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-API-Key': this.config.apiKey,
-            'X-Tenant-Id': this.config.tenantId,
-          },
-          body,
-        });
-      } catch (err) {
-        networkError = err as Error;
-      }
-
-      if (res) {
-        if (res.ok) {
-          await this.handlePartialFailures(res, batch);
-          return;
-        }
-        if (!isRetryableStatus(res.status)) {
-          // 4xx other than 408/429: the same body would be refused again.
-          const { details } = await readBatchResult(res, batch.length);
-          this.recordDrop(batch, 'rejected');
-          this.reportError(new Error(`WebSocket metering batch rejected with HTTP ${res.status}${details ? ` — ${details}` : ''} (dropped ${batch.length} events, not retried)`));
-          return;
-        }
-        delayMs = parseRetryAfter(res) ?? delayMs;
-      } else if (attempt === maxRetries) {
-        this.recordDrop(batch, 'retry_exhausted');
-        this.reportError(networkError ?? new Error('WebSocket metering request failed'));
-        return;
-      }
-      if (attempt < maxRetries) await sleep(delayMs);
-    }
-    // Not re-queued: dropping avoids unbounded memory growth.
-    this.recordDrop(batch, 'retry_exhausted');
-    this.reportError(new Error(`WebSocket metering flush failed after ${maxRetries} attempts (dropped ${batch.length} events)`));
-  }
-
-  /**
-   * A 2xx can still carry per-event rejections:
-   * `{accepted, duplicates, failed, errors:[{index, message}]}`. Events the
-   * response names by index are dropped with reason 'rejected'; a `failed`
-   * count the response does not attribute to an index is counted only.
-   */
-  private async handlePartialFailures(res: Response, batch: WsUsageEvent[]): Promise<void> {
-    const { failed, details, indexes } = await readBatchResult(res, batch.length);
-    if (failed <= 0) return;
-    if (indexes.length > 0) this.recordDrop(indexes.map((i) => batch[i]), 'rejected');
-    const unattributed = Math.min(failed, batch.length) - indexes.length;
-    if (unattributed > 0) {
-      this.dropped += unattributed;
-      console.warn(
-        `[aforo-ws] Dropped ${unattributed} event(s) — rejected, not identified by the ingestor (${this.dropped} total dropped).`,
-      );
-    }
-    this.reportError(new Error(`Aforo ingestor rejected ${failed} event(s)${details ? ` — ${details}` : ''}`));
+    // Queue only; the core's single background sender does the HTTP.
+    this.core.enqueue(event);
   }
 
   /** Invoke onError; a hook bug must never break metering or flushing. */
   private reportError(err: Error): void {
     try {
       this.onError(err);
-    } catch {
-      // ignore
+    } catch (hookErr) {
+      console.debug('[aforo-ws] onError hook threw', hookErr);
     }
   }
 
-  /** Number of events permanently dropped since this instance was created. */
+  /** Number of events permanently dropped since this instance was created (every DropReason). */
   get droppedCount(): number {
-    return this.dropped;
+    return this.core.droppedCount;
+  }
+
+  /** Number of events waiting to be sent. */
+  get queuedCount(): number {
+    return this.core.queued;
+  }
+
+  /** Send what is queued now and wait for it (one request at a time; never concurrent). */
+  async flush(): Promise<{ sent: number; failed: number; requeued: number; queued: number }> {
+    return this.core.flush();
   }
 
   /**
-   * Account for permanently lost events: bump the counter, WARN-log, and
-   * invoke the opt-in onDrop hook. The buffer is drained at flush start, so
-   * drops here are bounded by flush cadence — no log throttle needed.
+   * Bill every connection still open with a CONNECTION_CLOSED (close code
+   * 1001, GOING_AWAY, metadata `closedBy: "sdk_shutdown"`), stop accepting
+   * events and send what is queued, for at most `shutdownTimeoutMs`. Events
+   * still queued then are dropped with reason 'shutdown' (counted, passed to
+   * onDrop). A connection opened from now on is reported as 'closed' and not
+   * tracked. Calling it again returns the first call's promise. Call it from
+   * your SIGTERM handler.
    */
-  private recordDrop(events: WsUsageEvent[], reason: DropReason): void {
-    this.dropped += events.length;
-    console.warn(
-      `[aforo-ws] Dropped ${events.length} event(s) — ${reason} (${this.dropped} total dropped).`,
-    );
-    this.notifyDrop(events, reason);
-  }
-
-  /**
-   * Account for an event that failed a client-side check: never buffered,
-   * never sent. Runs on the hot path, so the WARN is throttled per field
-   * (first occurrence, then every 1000th).
-   */
-  private recordInvalid(event: WsUsageEvent, invalid: InvalidField): void {
-    this.dropped += 1;
-    const seen = (this.invalidSeen.get(invalid.field) ?? 0) + 1;
-    this.invalidSeen.set(invalid.field, seen);
-    if (seen === 1 || seen % 1000 === 0) {
-      console.warn(
-        `[aforo-ws] Dropped 1 event — invalid: ${invalid.problem} ` +
-          `(${seen} for ${invalid.field}, ${this.dropped} total dropped).`,
-      );
+  shutdown(): Promise<void> {
+    if (!this.shutdownPromise) {
+      this.shutdownPromise = (async () => {
+        clearInterval(this.sweepTimer);
+        for (const conn of Array.from(this.connections.values())) conn.close(1001, 'sdk_shutdown');
+        await this.core.shutdown();
+      })();
     }
-    this.notifyDrop([event], 'invalid');
+    return this.shutdownPromise;
   }
 
-  private notifyDrop(events: WsUsageEvent[], reason: DropReason): void {
-    if (!this.onDrop) return;
-    try {
-      this.onDrop(events, reason);
-    } catch {
-      // A hook bug must never break metering or flushing.
-    }
+  toJSON(): Record<string, unknown> {
+    return { tenantId: this.config.tenantId, productId: this.config.productId, queued: this.queuedCount, dropped: this.droppedCount };
   }
 
-  private startTimer(): void {
-    if (this.flushTimer) return;
-    this.flushTimer = setInterval(() => { void this.flush(); }, this.flushIntervalMs);
-    // Unref so the background timer never blocks host-process exit (final flush still needs shutdown()).
-    if (typeof (this.flushTimer as any).unref === 'function') (this.flushTimer as any).unref();
-  }
-
-  /** Flush any buffered events and stop the background timer. Call before process exit. */
-  async shutdown(): Promise<void> {
-    if (this.flushTimer) {
-      clearInterval(this.flushTimer);
-      this.flushTimer = null;
-    }
-    await this.flush();
+  [Symbol.for('nodejs.util.inspect.custom')](): string {
+    return `AforoWsBilling { tenantId: '${this.config.tenantId}', productId: '${this.config.productId}', queued: ${this.queuedCount}, dropped: ${this.droppedCount} }`;
   }
 }
 
@@ -622,67 +682,22 @@ function tooLong(field: string, value: unknown, max: number): InvalidField | und
   return { field, problem: `${field} is ${value.length} chars, limit ${max}: ${preview(value)}` };
 }
 
-/** Network errors, 408, 429 and 5xx are transient; every other 4xx (400/401/403/422...) is not. */
-function isRetryableStatus(status: number): boolean {
-  return status === 408 || status === 429 || status >= 500;
+
+
+
+function textOrUndefined(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  const text = String(value).trim();
+  return text ? text : undefined;
 }
 
-/** Retry-After (delta-seconds or HTTP date) in ms, capped at MAX_RETRY_AFTER_MS. */
-function parseRetryAfter(res: Response): number | undefined {
-  const raw = (res as any)?.headers?.get?.('retry-after');
-  if (!raw) return undefined;
-  const secs = Number(raw);
-  if (Number.isFinite(secs) && secs >= 0) return Math.min(secs * 1000, MAX_RETRY_AFTER_MS);
-  const date = Date.parse(raw);
-  if (!Number.isNaN(date)) return Math.min(Math.max(date - Date.now(), 0), MAX_RETRY_AFTER_MS);
-  return undefined;
-}
-
-/**
- * Reads the ingestor's batch response body, if any: the `failed` count, the
- * first 5 `errors[].message` entries, and the batch indexes `errors[]` names.
- */
-async function readBatchResult(
-  res: Response,
-  batchSize: number,
-): Promise<{ failed: number; details: string; indexes: number[] }> {
-  const none = { failed: 0, details: '', indexes: [] };
-  if (typeof (res as any)?.json !== 'function') return none;
-  try {
-    const body: any = unwrapEnvelope(await res.json());
-    const errors: any[] | undefined = Array.isArray(body?.errors) ? body.errors : undefined;
-    const details = errors
-      ? errors.slice(0, 5).map((e: any) => `#${e?.index}: ${e?.message}`).join('; ')
-      : typeof body?.message === 'string' ? body.message : '';
-    const indexes = [
-      ...new Set(
-        (errors ?? [])
-          .map((e: any) => e?.index)
-          .filter((i: unknown): i is number => Number.isInteger(i) && (i as number) >= 0 && (i as number) < batchSize),
-      ),
-    ].sort((a, b) => a - b);
-    const failed = typeof body?.failed === 'number' && body.failed > 0 ? body.failed : 0;
-    return { failed, details, indexes };
-  } catch {
-    return none; // Non-JSON or empty body — nothing to report.
-  }
+function headerValue(value: unknown): unknown {
+  return Array.isArray(value) ? value[0] : value;
 }
 
 function randomSuffix(): string {
   return Math.random().toString(36).slice(2, 10);
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
 
 export const WS_CLOSE_REASONS = CLOSE_REASONS;
-
-/**
- * The ingestor wraps every 2xx JSON body in `{success, data, meta}`. Returns
- * the inner `data` object when present, else the body unchanged (bare shape).
- */
-function unwrapEnvelope(body: any): any {
-  const data = body && typeof body === 'object' && !Array.isArray(body) ? body.data : undefined;
-  return data && typeof data === 'object' && !Array.isArray(data) ? data : body;
-}

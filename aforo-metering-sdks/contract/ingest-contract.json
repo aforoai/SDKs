@@ -1,32 +1,51 @@
 {
-  "version": 1,
+  "version": 2,
   "description": "AUTHORITATIVE Aforo usage-ingestor ingest contract. Derived from the REAL controllers + request DTOs in aforo-nextgen-usage-ingestor-service — never from any SDK's own constants. Every SDK test suite in this repo loads THIS file and asserts its observed wire request (endpoint path + body shape) against it. Guard purpose (A+ delivery-guarantee prompt 7): the 2026-07-05 D1 incident shipped 16 transport-variant SDKs that posted a BATCH body to /v1/ingest/events (a SINGLE-event endpoint) — every real flush 400'd, 100% event loss, hidden by 17 green suites that each asserted the SDK's OWN wrong constant. A test that validates the SDK against the SDK has zero contract coverage; this file is the independent source of truth.",
   "maintenance": "If an ingest endpoint or request DTO changes in aforo-nextgen-usage-ingestor-service, update this file FROM THE CONTROLLER/DTO CODE (re-verify the file:line references below) in the same change that updates the SDKs. Never edit this file to match an SDK — that inverts the guard.",
   "derivedFrom": {
-    "usageEventController": "aforo-nextgen-usage-ingestor-service/src/main/java/com/aforo/billing/ingestor/controller/UsageEventController.java (POST mappings: /v1/ingest L106, /v1/ingest/test L144, /v1/ingest/events L185, /v1/ingest/batch L245, /v1/ingest/async-batch L284; each also serves an /api/v1 alias for the Kong gateway route)",
-    "compoundIngestController": "aforo-nextgen-usage-ingestor-service/src/main/java/com/aforo/billing/ingestor/controller/CompoundIngestController.java (POST /api/v1/ingest/compound L61, POST /api/v1/ingest/compound/batch L179 — NOTE: compound has NO bare /v1 alias)",
+    "usageEventController": "aforo-nextgen-usage-ingestor-service/src/main/java/com/aforo/billing/ingestor/controller/UsageEventController.java (re-verified 2026-10-26 on origin/jayaforo/w4.4: POST /v1/ingest L152, /v1/ingest/test L199, /v1/ingest/events L240, /v1/ingest/batch L297, /v1/ingest/async-batch L410; each also serves an /api/v1 alias for the Kong gateway route)",
+    "compoundIngestController": "aforo-nextgen-usage-ingestor-service/src/main/java/com/aforo/billing/ingestor/controller/CompoundIngestController.java (POST /api/v1/ingest/compound L66, POST /api/v1/ingest/compound/batch L185 — compound has NO bare /v1 alias)",
     "dtos": {
-      "IngestUsageEventRequest": "dto/IngestUsageEventRequest.java (required: customerId @NotBlank L39, metricName @NotBlank L45, quantity @NotNull @Positive L51-52, occurredAt @NotNull L57, idempotencyKey @NotBlank L62)",
-      "IngestBatchRequest": "dto/IngestBatchRequest.java (events @NotEmpty @Size(max=1000) @Valid L16-20)",
+      "IngestUsageEventRequest": "dto/IngestUsageEventRequest.java (required: customerId @NotBlank @Size(max=64) L40-41, metricName @NotBlank @Size(max=255) L46-47, quantity @NotNull @Positive @Digits(14,6) L52-59, occurredAt @NotNull L65, idempotencyKey @NotBlank @Size(max=255) L70-71; every optional String field's @Size is in schemas.ingestEvent)",
+      "IngestBatchRequest": "dto/IngestBatchRequest.java (events @NotEmpty L27 @Size(max=1000) L28 @Valid)",
       "ApigeeEventRequest": "dto/ApigeeEventRequest.java (required: eventType @NotBlank L40, metricKey @NotBlank L45, value @NotNull L50, idempotencyKey @NotBlank — required since 2026-07-05 producer-edge audit #15, customerId @NotBlank @Size(max=64) — required since f37c1db)",
       "CompoundUsageEventRequest": "dto/CompoundUsageEventRequest.java (required: correlationId @NotNull UUID-TYPED L46-49, customerId @NotBlank L51, occurredAt @NotNull L57, measurements @NotEmpty @Size(max=50) L71-72)",
       "MetricMeasurement": "dto/MetricMeasurement.java (required: metricName @NotBlank L32, quantity @NotNull @Positive L38-39)",
       "BatchCompoundUsageEventRequest": "dto/BatchCompoundUsageEventRequest.java (events @NotEmpty @Size(max=500))"
-    }
+    },
+    "requestBodySizeLimitFilter": "config/RequestBodySizeLimitFilter.java L66 (aforo.ingestion.max-request-body-bytes default 16777216; over the limit → 413 problem JSON, chunked bodies counted as read). On origin/jayaforo/w4.4 (usage-ingestor PR #88), not on main b71d9a0 until it merges.",
+    "ingestorExceptionHandler": "exception/IngestorExceptionHandler.java (429 + Retry-After: fixed 60 at L67-68, fixed 30 at L272-273, ex.getRetryAfterSeconds() at L107-108 and L125-126; dependency unavailable → 503 + Retry-After 2 s (DATABASE_RETRY_AFTER L45) or 30 s (STORAGE_RETRY_AFTER L47)); UsageEventController.java L432 answers 503 on async-batch overload",
+    "ingestBatchResponse": "dto/IngestBatchResponse.java (errors[].index, errors[].message, errors[].retryable L41 — true = the event may pass on a second try; its key prevents a double count)"
   },
   "endpoints": {
     "/v1/ingest": {
       "cardinality": "single",
       "dto": "IngestUsageEventRequest",
-      "requiredFields": ["customerId", "metricName", "quantity", "occurredAt", "idempotencyKey"],
-      "forbiddenTopLevelKeys": ["events"],
+      "requiredFields": [
+        "customerId",
+        "metricName",
+        "quantity",
+        "occurredAt",
+        "idempotencyKey"
+      ],
+      "forbiddenTopLevelKeys": [
+        "events"
+      ],
       "notes": "Binds ONE event. Posting a batch wrapper {events:[...]} here 400s (customerId/metricName/... missing at top level). Per-event customerId is required — there is no header/tenant fallback on this DTO."
     },
     "/v1/ingest/events": {
       "cardinality": "single",
       "dto": "ApigeeEventRequest",
-      "requiredFields": ["eventType", "metricKey", "value", "idempotencyKey", "customerId"],
-      "forbiddenTopLevelKeys": ["events"],
+      "requiredFields": [
+        "eventType",
+        "metricKey",
+        "value",
+        "idempotencyKey",
+        "customerId"
+      ],
+      "forbiddenTopLevelKeys": [
+        "events"
+      ],
       "notes": "Apigee-format SINGLE event (this was the D1 bug: transport variants posted {events:[...]} here and every flush 400'd). customerId is @NotBlank @Size(max=64) since usage-ingestor f37c1db (re-verified 2026-10-01) — the old tenant fallback billed usage to a customer that was really the tenant. idempotencyKey is @NotBlank since 2026-07-05."
     },
     "/v1/ingest/batch": {
@@ -35,12 +54,30 @@
       "batchKey": "events",
       "maxEvents": 1000,
       "eventDto": "IngestUsageEventRequest",
-      "eventRequiredFields": ["customerId", "metricName", "quantity", "occurredAt", "idempotencyKey"],
+      "eventRequiredFields": [
+        "customerId",
+        "metricName",
+        "quantity",
+        "occurredAt",
+        "idempotencyKey"
+      ],
       "eventOptionalFields": {
         "executionStatus": {
           "type": "string",
           "maxLength": 20,
-          "values": ["SUCCESS", "PARTIAL", "TIMEOUT", "ERROR", "VALIDATION_FAILED", "FAILED", "FAILURE", "CANCELLED", "PENDING", "BLOCKED", "HITL_REQUIRED"],
+          "values": [
+            "SUCCESS",
+            "PARTIAL",
+            "TIMEOUT",
+            "ERROR",
+            "VALIDATION_FAILED",
+            "FAILED",
+            "FAILURE",
+            "CANCELLED",
+            "PENDING",
+            "BLOCKED",
+            "HITL_REQUIRED"
+          ],
           "derivedFrom": "IngestUsageEventRequest.java executionStatus + SchemaBasedEventValidator FALLBACK_ENUM_FIELD_VALUES"
         }
       },
@@ -50,17 +87,35 @@
       "cardinality": "bare-array",
       "dto": "List<IngestUsageEventRequest>",
       "maxEvents": 10000,
-      "eventRequiredFields": ["customerId", "metricName", "quantity", "occurredAt", "idempotencyKey"],
+      "eventRequiredFields": [
+        "customerId",
+        "metricName",
+        "quantity",
+        "occurredAt",
+        "idempotencyKey"
+      ],
       "notes": "Body is a BARE JSON ARRAY of events (no {events:} wrapper). No SDK in this repo targets it today; documented so the array-vs-wrapper distinction can't be guessed wrong."
     },
     "/api/v1/ingest/compound": {
       "cardinality": "single",
       "dto": "CompoundUsageEventRequest",
-      "requiredFields": ["correlationId", "customerId", "occurredAt", "measurements"],
-      "typeConstraints": { "correlationId": "uuid" },
-      "measurementRequiredFields": ["metricName", "quantity"],
+      "requiredFields": [
+        "correlationId",
+        "customerId",
+        "occurredAt",
+        "measurements"
+      ],
+      "typeConstraints": {
+        "correlationId": "uuid"
+      },
+      "measurementRequiredFields": [
+        "metricName",
+        "quantity"
+      ],
       "maxMeasurements": 50,
-      "forbiddenTopLevelKeys": ["events"],
+      "forbiddenTopLevelKeys": [
+        "events"
+      ],
       "notes": "correlationId is UUID-TYPED server-side — a non-UUID string 400s and silently drops the event (Rule #21 / 2026-07-05 gateway freeze). ONLY the /api-prefixed path exists; /v1/ingest/compound is NOT mapped. Used by gateway plugins, not by SDKs in this repo."
     },
     "/api/v1/ingest/compound/batch": {
@@ -69,7 +124,12 @@
       "batchKey": "events",
       "maxEvents": 500,
       "eventDto": "CompoundUsageEventRequest",
-      "eventRequiredFields": ["correlationId", "customerId", "occurredAt", "measurements"],
+      "eventRequiredFields": [
+        "correlationId",
+        "customerId",
+        "occurredAt",
+        "measurements"
+      ],
       "notes": "Batch of compound events. Same UUID correlationId constraint per element. No SDK in this repo targets it today."
     }
   },
@@ -80,57 +140,529 @@
       "quotaCheck": "aforo-nextgen-usage-ingestor-service preflight/PreFlightQuotaController.java (POST /api/v1/quota/check, always 200) + dto/PreFlightCheckRequest.java (customerId @NotBlank; metricName, estimatedQuantity optional) + dto/PreFlightCheckResponse.java (@JsonInclude NON_NULL)",
       "ingestBatch": "controller/UsageEventController.java ingestBatch (202) + dto/IngestBatchResponse.java"
     },
-    "envelope": { "dataKey": "data", "wrapperKeys": ["success", "data", "meta"], "bareShapeAccepted": true },
+    "envelope": {
+      "dataKey": "data",
+      "wrapperKeys": [
+        "success",
+        "data",
+        "meta"
+      ],
+      "bareShapeAccepted": true
+    },
     "/api/v1/quota/check": {
       "method": "POST",
       "status": 200,
-      "requestRequiredFields": ["customerId"],
-      "requestOptionalFields": ["metricName", "estimatedQuantity"],
+      "requestRequiredFields": [
+        "customerId"
+      ],
+      "requestOptionalFields": [
+        "metricName",
+        "estimatedQuantity"
+      ],
       "decisionField": "decision",
-      "decisions": ["ALLOW", "WARN", "DENY"],
-      "blockingDecisions": ["DENY"],
-      "dataFields": ["decision", "reason", "currentUsage", "limit", "retryAfterMs", "tierName", "headers"],
+      "decisions": [
+        "ALLOW",
+        "WARN",
+        "DENY"
+      ],
+      "blockingDecisions": [
+        "DENY"
+      ],
+      "dataFields": [
+        "decision",
+        "reason",
+        "currentUsage",
+        "limit",
+        "retryAfterMs",
+        "tierName",
+        "headers"
+      ],
       "examples": {
-        "deny": { "success": true, "data": { "decision": "DENY", "reason": "Rate limit exceeded", "currentUsage": 1000, "limit": 1000, "retryAfterMs": 60000, "headers": { "X-RateLimit-Limit": "1000", "X-RateLimit-Remaining": "0" } } },
-        "warn": { "success": true, "data": { "decision": "WARN", "reason": "Approaching limit", "currentUsage": 950, "limit": 1000 } },
-        "allow": { "success": true, "data": { "decision": "ALLOW", "reason": "Passed" } }
+        "deny": {
+          "success": true,
+          "data": {
+            "decision": "DENY",
+            "reason": "Rate limit exceeded",
+            "currentUsage": 1000,
+            "limit": 1000,
+            "retryAfterMs": 60000,
+            "headers": {
+              "X-RateLimit-Limit": "1000",
+              "X-RateLimit-Remaining": "0"
+            }
+          }
+        },
+        "warn": {
+          "success": true,
+          "data": {
+            "decision": "WARN",
+            "reason": "Approaching limit",
+            "currentUsage": 950,
+            "limit": 1000
+          }
+        },
+        "allow": {
+          "success": true,
+          "data": {
+            "decision": "ALLOW",
+            "reason": "Passed"
+          }
+        }
       },
       "notes": "Always HTTP 200 — the decision is in the body. The server fails open (ALLOW) on its own errors; clients fail open on timeout, non-200, or a body with no recognisable decision."
     },
     "/v1/ingest/batch": {
       "status": 202,
-      "dataFields": ["accepted", "duplicates", "failed", "errors", "killedSessionIds"],
+      "dataFields": [
+        "accepted",
+        "duplicates",
+        "failed",
+        "errors",
+        "killedSessionIds"
+      ],
       "examples": {
-        "partialFailure": { "success": true, "data": { "accepted": 0, "duplicates": 0, "failed": 1, "errors": [{ "index": 0, "message": "unknown metric" }] } },
-        "killedSession": { "success": true, "data": { "accepted": 0, "duplicates": 0, "failed": 0, "killedSessionIds": ["s1"] } }
+        "partialFailure": {
+          "success": true,
+          "data": {
+            "accepted": 0,
+            "duplicates": 0,
+            "failed": 1,
+            "errors": [
+              {
+                "index": 0,
+                "message": "unknown metric"
+              }
+            ]
+          }
+        },
+        "killedSession": {
+          "success": true,
+          "data": {
+            "accepted": 0,
+            "duplicates": 0,
+            "failed": 0,
+            "killedSessionIds": [
+              "s1"
+            ]
+          }
+        }
       }
     }
   },
   "sdks": {
-    "node": { "endpoint": "/v1/ingest/batch" },
-    "node-graphql": { "endpoint": "/v1/ingest/batch" },
-    "node-grpc": { "endpoint": "/v1/ingest/batch" },
-    "node-mqtt": { "endpoint": "/v1/ingest/batch" },
-    "node-ws": { "endpoint": "/v1/ingest/batch" },
-    "node-mcp": { "endpoint": "/v1/ingest/batch" },
-    "node-agent": { "endpoint": "/v1/ingest/events" },
-    "mcp-proxy": { "endpoint": "/v1/ingest/batch" },
-    "python": { "endpoint": "/v1/ingest/batch" },
-    "python-agent": { "endpoint": "/v1/ingest/batch" },
-    "python-graphql": { "endpoint": "/v1/ingest/batch" },
-    "python-grpc": { "endpoint": "/v1/ingest/batch" },
-    "python-mqtt": { "endpoint": "/v1/ingest/batch" },
-    "python-ws": { "endpoint": "/v1/ingest/batch" },
-    "python-mcp": { "endpoint": "/v1/ingest/batch" },
-    "java": { "endpoint": "/v1/ingest/batch" },
-    "java-graphql": { "endpoint": "/v1/ingest/batch" },
-    "java-grpc": { "endpoint": "/v1/ingest/batch" },
-    "java-mqtt": { "endpoint": "/v1/ingest/batch" },
-    "java-ws": { "endpoint": "/v1/ingest/batch" },
-    "go": { "endpoint": "/v1/ingest/batch" },
-    "go-graphql": { "endpoint": "/v1/ingest/batch" },
-    "go-grpc": { "endpoint": "/v1/ingest/batch" },
-    "go-mqtt": { "endpoint": "/v1/ingest/batch" },
-    "go-ws": { "endpoint": "/v1/ingest/batch" }
+    "node": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "node-graphql": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "node-grpc": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "node-mqtt": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "node-ws": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "node-mcp": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "node-agent": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "mcp-proxy": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "python": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "python-agent": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "python-graphql": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "python-grpc": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "python-mqtt": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "python-ws": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "python-mcp": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "java": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "java-graphql": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "java-grpc": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "java-mqtt": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "java-ws": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "go": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "go-graphql": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "go-grpc": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "go-mqtt": {
+      "endpoint": "/v1/ingest/batch"
+    },
+    "go-ws": {
+      "endpoint": "/v1/ingest/batch"
+    }
+  },
+  "schemas": {
+    "$comment": "JSON Schema (draft 2020-12) of the request bodies the SDKs send. maxLength = the ingestor's @Size(max) and counts UTF-16 code units (Java String.length()), not code points. Unknown properties are ignored by the server (@JsonIgnoreProperties(ignoreUnknown = true)). contract/verify-ingestor.mjs checks every maxLength and required field against the DTO source.",
+    "ingestEvent": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "required": [
+        "customerId",
+        "metricName",
+        "quantity",
+        "occurredAt",
+        "idempotencyKey"
+      ],
+      "properties": {
+        "customerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "metricName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "quantity": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "x-digits": {
+            "integer": 14,
+            "fraction": 6
+          }
+        },
+        "occurredAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "traceId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "spanId": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "sessionId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "stepNumber": {
+          "type": "integer"
+        },
+        "parentStepId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "metadata": {
+          "type": "object"
+        },
+        "subscriptionId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "productType": {
+          "type": "string",
+          "maxLength": 20
+        },
+        "agentId": {
+          "type": "string",
+          "maxLength": 36
+        },
+        "toolName": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "capabilityName": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "executionStatus": {
+          "type": "string",
+          "maxLength": 20,
+          "enum": [
+            "SUCCESS",
+            "PARTIAL",
+            "TIMEOUT",
+            "ERROR",
+            "VALIDATION_FAILED",
+            "FAILED",
+            "FAILURE",
+            "CANCELLED",
+            "PENDING",
+            "BLOCKED",
+            "HITL_REQUIRED"
+          ]
+        },
+        "executionDurationMs": {
+          "type": "integer"
+        },
+        "grpcService": {
+          "type": "string",
+          "maxLength": 255
+        },
+        "grpcMethod": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "grpcStatusCode": {
+          "type": "string",
+          "maxLength": 24
+        },
+        "grpcCallType": {
+          "type": "string",
+          "maxLength": 20
+        },
+        "messageCount": {
+          "type": "integer"
+        },
+        "dataBytes": {
+          "type": "integer"
+        },
+        "gqlOperationType": {
+          "type": "string",
+          "maxLength": 20
+        },
+        "gqlOperationName": {
+          "type": "string",
+          "maxLength": 255
+        },
+        "gqlComplexity": {
+          "type": "integer"
+        },
+        "gqlFieldCount": {
+          "type": "integer"
+        },
+        "gqlHasErrors": {
+          "type": "boolean"
+        },
+        "wsConnectionId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "wsDirection": {
+          "type": "string",
+          "maxLength": 24
+        },
+        "wsFrameType": {
+          "type": "string",
+          "maxLength": 16
+        },
+        "wsCloseReason": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "mqttTopic": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "mqttQos": {
+          "type": "integer"
+        },
+        "mqttRetained": {
+          "type": "boolean"
+        },
+        "mqttEventType": {
+          "type": "string",
+          "maxLength": 24
+        },
+        "mqttClientId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "sessionBoundary": {
+          "type": "string",
+          "maxLength": 20
+        },
+        "endpointPath": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "httpMethod": {
+          "type": "string",
+          "maxLength": 16
+        },
+        "statusCode": {
+          "type": "integer"
+        },
+        "responseTimeMs": {
+          "type": "integer"
+        },
+        "trace": {
+          "type": "object"
+        },
+        "teamId": {
+          "type": "string",
+          "maxLength": 36
+        },
+        "rateLimitRpm": {
+          "type": "integer"
+        },
+        "rateLimitRpd": {
+          "type": "integer"
+        },
+        "estimatedCostUsd": {
+          "type": "number"
+        }
+      },
+      "additionalProperties": true
+    },
+    "ingestBatch": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "required": [
+        "events"
+      ],
+      "properties": {
+        "events": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1000,
+          "items": {
+            "$ref": "#/schemas/ingestEvent"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "transportPolicy": {
+    "$comment": "Normative behaviour of every SDK's transport core (contract/TRANSPORT-SPEC.md explains each rule). Each SDK's contract test reads these numbers; a change here goes in before the SDK change.",
+    "endpoint": "/v1/ingest/batch",
+    "method": "POST",
+    "headers": {
+      "required": {
+        "Content-Type": "application/json",
+        "X-API-Key": "<tenant API key>"
+      },
+      "recommended": {
+        "User-Agent": "aforo-<module>/<version>"
+      },
+      "forbidden": [
+        "Content-Encoding"
+      ],
+      "notes": "The API key goes in X-API-Key only — never in the URL, the body, logs, repr/toString or error messages."
+    },
+    "batch": {
+      "maxEvents": 1000,
+      "defaultEvents": 500,
+      "maxRequestBodyBytes": 16777216,
+      "targetRequestBodyBytes": 4194304,
+      "notes": "A flush sends at most defaultEvents (configurable up to maxEvents) per request and splits a batch whose JSON body would exceed targetRequestBodyBytes. 413 splits the batch in half; a single event that still gets 413 is dropped as rejected."
+    },
+    "queue": {
+      "defaultCapacity": 10000,
+      "overflow": "evict-oldest",
+      "flusher": "single",
+      "notes": "One bounded queue and ONE long-lived flusher per client. track() never starts a thread/goroutine/task or sends; it enqueues and, at the flush threshold, wakes the flusher. Overflow evicts the oldest event and reports it through onDrop('overflow')."
+    },
+    "timeouts": {
+      "requestMs": 10000,
+      "connectMs": 5000,
+      "shutdownMs": 5000,
+      "notes": "requestMs is a TOTAL deadline for the whole exchange, including reading the response body. close/shutdown is bounded by shutdownMs: the flusher keeps retrying until the deadline, each request uses min(requestMs, time left), and events still queued or in flight at the deadline are reported through onDrop('shutdown')."
+    },
+    "retry": {
+      "maxRetries": 3,
+      "backoff": "full-jitter",
+      "baseMs": 500,
+      "maxDelayMs": 30000,
+      "formula": "delay = random(0, min(maxDelayMs, baseMs * 2^attempt)); with Retry-After: max(retryAfter, that delay), capped at retryAfter.maxMs",
+      "retryOnStatus": [
+        408,
+        429,
+        "5xx"
+      ],
+      "retryOnNetworkError": true,
+      "retryAfter": {
+        "forms": [
+          "delta-seconds",
+          "http-date"
+        ],
+        "maxMs": 60000,
+        "invalid": "ignored (use the jittered delay)"
+      },
+      "dropOnStatus": "any other 4xx (400, 404, 405, 409, 415, 422): the batch is rejected — onDrop('rejected'), never retried",
+      "splitOnStatus": [
+        413
+      ],
+      "authFailureStatus": [
+        401,
+        403
+      ],
+      "perEventRetryable": "2xx with errors[].retryable=true: those events go back to the queue (keys kept) and are re-sent after the jittered backoff, at most maxRetries times, then treated as an outage; retryable=false events are dropped as 'rejected'. errors[] is authoritative even when 'failed' is missing or 0.",
+      "redirects": "never followed; a 3xx is an outage like 401/403 (requeue + breaker, ERROR log naming the target host) so the API key never reaches another host"
+    },
+    "afterRetriesExhausted": {
+      "action": "requeue-and-open-breaker",
+      "breakerCooldownMs": {
+        "floor": 250,
+        "initial": 5000,
+        "max": 300000,
+        "multiplier": 2,
+        "jitter": "full",
+        "formula": "max(floor, random(0, min(max, initial * multiplier^n)))"
+      },
+      "notes": "A batch that still fails after maxRetries (network error, timeout, retryable status, 401/403) goes back to the FRONT of the queue with the same idempotency keys, and the flusher pauses for the breaker cooldown. Events keep arriving into the bounded queue; overflow is reported as 'overflow'. 401/403 log an ERROR naming the status (bad or revoked API key) once per breaker opening. The next successful send closes the breaker. Re-sends are dedup-safe because the ingestor deduplicates on idempotencyKey."
+    },
+    "dropReasons": [
+      "overflow",
+      "rejected",
+      "invalid",
+      "shutdown",
+      "closed",
+      "retry_exhausted"
+    ],
+    "dropReasonNotes": "retry_exhausted is kept for API compatibility; with requeue-and-open-breaker it is only reported when the client is closed and requeue is impossible. 'closed' = track() after close (no exception). 'shutdown' = still queued when the shutdown deadline passed.",
+    "compression": {
+      "gzip": false,
+      "reason": "The ingestor does not decode Content-Encoding: gzip request bodies (grep for GZIPInputStream / Content-Encoding on usage-ingestor main b71d9a0 and origin/jayaforo/w4.4 finds request decompression nowhere; only exports are gzipped). A gzip body would be read as JSON and rejected with 400. Turn this on only after the ingestor decodes it (docs/TODO.md: ingestor-gzip-request-bodies)."
+    },
+    "security": {
+      "baseUrlScheme": "https",
+      "plainHttpAllowedHosts": [
+        "localhost",
+        "127.0.0.1",
+        "::1"
+      ],
+      "plainHttpOptIn": "allowInsecureHttp (per-language spelling)",
+      "redactApiKey": true
+    },
+    "identity": {
+      "customerResolver": "required",
+      "notes": "Decision (Jay, 2026-10-26): every integration that meters an incoming request (HTTP middleware, gRPC/GraphQL/WS/MQTT interceptors, MCP servers, servlet filters) needs a customer resolver the caller supplies from authenticated identity. Reading a caller-controlled value (X-Customer-Id header, gRPC metadata, MCP _meta.customer_id, MQTT username) needs an explicit opt-in named trustCustomerHeader / trust_customer_header / TrustCustomerHeader (per language). With neither, construction fails with a configuration error. There is no fallback to 'unknown', 'anonymous' or the agent id. A resolver that returns nothing for a request: the event is dropped with reason 'invalid' and counted."
+    },
+    "connections": "One pooled HTTP client per SDK client, reused for every request; closed on close()."
   }
 }

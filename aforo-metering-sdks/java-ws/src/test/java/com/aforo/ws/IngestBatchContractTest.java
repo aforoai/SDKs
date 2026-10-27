@@ -104,7 +104,7 @@ class IngestBatchContractTest {
         assertThat(ev.get("productType").asText()).isEqualTo("WEBSOCKET_API");
         assertThat(ev.get("wsConnectionId").asText()).isNotBlank().hasSizeLessThanOrEqualTo(64);
         assertThat(ev.get("wsDirection").asText()).isIn("CLIENT_TO_SERVER", "SERVER_TO_CLIENT");
-        assertThat(ev.get("wsFrameType").asText()).isIn("TEXT", "BINARY", "PING", "PONG", "CLOSE");
+        assertThat(ev.get("wsFrameType").asText()).isIn("OPEN", "TEXT", "BINARY", "PING", "PONG", "CLOSE");
         assertThat(ev.has("executionDurationMs")).isTrue();
         assertThat(ev.has("durationMs")).isFalse();
     }
@@ -137,15 +137,18 @@ class IngestBatchContractTest {
                 b.openConnection("cust_001", null);
             }
         }
-        waitFor(() -> captured.stream().mapToInt(c -> c.body().get("events").size()).sum() == 2500, 5000);
-        assertThat(captured).hasSize(3);
+        // 2500 OPEN events, plus the CONNECTION_CLOSED close() emits for each connection left open.
+        waitFor(() -> captured.stream().mapToInt(c -> c.body().get("events").size()).sum() == 5000, 5000);
+        // flushCount is clamped to 1000, so the sender wakes while events are still arriving:
+        // at least 3 requests, none over the ingestor's 1000-event limit.
+        assertThat(captured.size()).isGreaterThanOrEqualTo(3);
         for (Captured c : captured) {
             assertThat(c.path()).isEqualTo("/v1/ingest/batch");
             assertThat(c.body().get("events").size()).isBetween(1, 1000);
         }
         Set<String> keys = new java.util.HashSet<>();
         captured.forEach(c -> c.body().get("events").forEach(e -> keys.add(e.get("idempotencyKey").asText())));
-        assertThat(keys).hasSize(2500);
+        assertThat(keys).hasSize(5000);
     }
 
     @Test
@@ -223,8 +226,12 @@ class IngestBatchContractTest {
             b.openConnection("cust_001", null);
             waitFor(() -> !captured.isEmpty(), 3000);
             Thread.sleep(1_500); // longer than the first backoff
+            assertThat(captured).hasSize(1);
         }
-        assertThat(captured).hasSize(1);
+        // close() then sends the CONNECTION_CLOSED of the open connection (also refused): two requests,
+        // and no body is ever sent twice.
+        assertThat(captured).hasSize(2);
+        assertThat(captured.get(0).rawBody()).isNotEqualTo(captured.get(1).rawBody());
     }
 
     @Test

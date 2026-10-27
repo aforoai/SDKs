@@ -10,6 +10,7 @@ package grpcmetering
 import (
 	"context"
 	"encoding/json"
+	"github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc/v2/internal/ingest"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -75,6 +76,9 @@ func newBilling(t *testing.T, server *httptest.Server, opts ...func(*Config)) *B
 		ServiceName:   "acme.v1.UserService",
 		FlushCount:    1, // flush on first event
 		FlushInterval: 100 * time.Millisecond,
+		hooks:         fastHooks(),
+		// The tests put the customer in incoming metadata.
+		TrustCustomerHeader: true,
 	}
 	for _, o := range opts {
 		o(&cfg)
@@ -264,8 +268,10 @@ func TestLargeBufferSplitsIntoBatchesOf1000(t *testing.T) {
 	b, err := New(Config{
 		TenantID: "tenant-001", ProductID: "prod-001", APIKey: "k",
 		IngestorURL: srv.URL, ServiceName: "svc",
-		FlushCount:    100000,
-		FlushInterval: 60 * time.Second,
+		hooks:               fastHooks(),
+		TrustCustomerHeader: true,
+		FlushCount:          100000,
+		FlushInterval:       60 * time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -278,8 +284,10 @@ func TestLargeBufferSplitsIntoBatchesOf1000(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := rec.got()
-	if len(got) != 3 {
-		t.Fatalf("requests = %d, want 3", len(got))
+	// At least 3 requests: the flusher sends whatever is queued when it wakes
+	// at the 1000-event threshold, so the split can be finer than 1000/1000/500.
+	if len(got) < 3 {
+		t.Fatalf("requests = %d, want at least 3", len(got))
 	}
 	total := 0
 	for _, r := range got {
@@ -350,8 +358,10 @@ func TestShutdownFlushesRemaining(t *testing.T) {
 	cfg := Config{
 		TenantID: "tenant-001", ProductID: "prod-001", APIKey: "k",
 		IngestorURL: srv.URL, ServiceName: "svc",
-		FlushCount:    100,
-		FlushInterval: 60 * time.Second,
+		hooks:               fastHooks(),
+		TrustCustomerHeader: true,
+		FlushCount:          100,
+		FlushInterval:       60 * time.Second,
 	}
 	b, err := New(cfg)
 	if err != nil {
@@ -420,7 +430,7 @@ func TestRetryUntilOnErrorFires(t *testing.T) {
 	ctx := ctxWith(metadata.Pairs("x-customer-id", "cust_001"))
 	b.Record(ctx, "M", "UNARY", 1, nil, 1)
 
-	// 3 retries × up to 4s backoff (1s+2s+4s) — give 8s
+	// Retries use fastHooks, so this resolves without real backoff.
 	waitFor(t, func() bool {
 		errMu.Lock()
 		defer errMu.Unlock()
@@ -428,8 +438,8 @@ func TestRetryUntilOnErrorFires(t *testing.T) {
 	}, 10*time.Second)
 
 	got := rec.got()
-	if len(got) != 3 {
-		t.Errorf("attempts = %d, want 3", len(got))
+	if len(got) != ingest.DefaultMaxRetries+1 {
+		t.Errorf("attempts = %d, want %d", len(got), ingest.DefaultMaxRetries+1)
 	}
 	// Retries must resend the same idempotencyKey.
 	keyOf := func(c captured) string {
@@ -441,7 +451,8 @@ func TestRetryUntilOnErrorFires(t *testing.T) {
 		}
 	}
 	errMu.Lock()
-	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "exhausted") {
+	// After the retries the event stays queued (outage), reported once.
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "unavailable") || !strings.Contains(errs[0].Error(), "kept in the queue") {
 		t.Errorf("onError invocations = %v", errs)
 	}
 	errMu.Unlock()

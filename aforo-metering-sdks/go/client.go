@@ -1,91 +1,116 @@
 package metering
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"math"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
+
+	"github.com/aforoai/SDKs/aforo-metering-sdks/go/v2/internal/ingest"
 )
+
+// sdkVersion is sent in the User-Agent header; keep it equal to VERSION.
+const sdkVersion = "2.0.0"
 
 // AforoClient is the main entry point for the Aforo metering SDK.
 //
-// Enqueues events into a thread-safe ring buffer and flushes them
-// in batches via a background goroutine.
+// Track appends to a bounded queue; one background goroutine sends batches.
+// Create one client per process and close it on shutdown:
 //
-//	client := metering.NewClient(metering.Options{APIKey: "your-key"})
-//	defer client.Close()
+//	client, err := metering.NewClient(metering.Options{APIKey: os.Getenv("AFORO_API_KEY")})
+//	if err != nil { log.Fatal(err) }
+//	defer client.Close(context.Background())
 //	client.Track(metering.TrackEvent{CustomerID: "cust_1", MetricName: "api_calls"})
 type AforoClient struct {
-	buf         *ringBuffer
-	tp          *transport
-	flushCount  int
+	tp          *ingest.Client
 	productType string
-	ticker      *time.Ticker
-	done        chan struct{}
-	closed      bool
-	mu          sync.Mutex
-
-	onDrop func(events []TrackEvent, reason DropReason)
-
-	// Drop accounting — events permanently lost (overflow eviction, failed
-	// batch, per-event server rejection, or client-side validation).
-	dropped       atomic.Int64
-	overflowDrops atomic.Int64
-	invalidDrops  atomic.Int64
 }
 
-// NewClient creates a new AforoClient with the given options.
-func NewClient(opts Options) *AforoClient {
+// NewClient validates opts and starts the background sender. It returns an
+// error when APIKey is blank or BaseURL is not https (http is allowed for
+// localhost, 127.0.0.1 and ::1, or with AllowInsecureHTTP).
+func NewClient(opts Options) (*AforoClient, error) {
 	opts.defaults()
-
-	c := &AforoClient{
-		buf:         newRingBuffer(opts.MaxQueueSize),
-		tp:          newTransport(opts.BaseURL, opts.APIKey, opts.Timeout, opts.MaxRetries, opts.RetryBase),
-		flushCount:  opts.FlushCount,
-		productType: opts.ProductType,
-		ticker:      time.NewTicker(opts.FlushInterval),
-		done:        make(chan struct{}),
-		onDrop:      opts.OnDrop,
+	onDrop := opts.OnDrop
+	cfg := ingest.Config{
+		BaseURL:           opts.BaseURL,
+		APIKey:            opts.APIKey,
+		UserAgent:         "aforo-go/" + sdkVersion,
+		AllowInsecureHTTP: opts.AllowInsecureHTTP,
+		HTTPClient:        opts.HTTPClient,
+		Timeout:           opts.Timeout,
+		FlushCount:        opts.FlushCount,
+		FlushInterval:     opts.FlushInterval,
+		MaxQueueSize:      opts.MaxQueueSize,
+		MaxRetries:        opts.MaxRetries,
+		RetryBase:         opts.RetryBase,
+		ShutdownTimeout:   opts.ShutdownTimeout,
+		LogPrefix:         "[aforo]",
+		Hooks:             opts.hooks,
 	}
-
-	// Background flush goroutine
-	go c.flushLoop()
-
-	return c
+	if onDrop != nil {
+		cfg.OnDrop = func(events []ingest.Event, reason ingest.DropReason) {
+			onDrop(trackEvents(events), DropReason(reason))
+		}
+	}
+	if onError := opts.OnError; onError != nil {
+		cfg.OnError = func(e *ingest.TransportError) {
+			onError(&TransportError{Kind: e.Kind, Status: e.Status, Message: e.Message, Events: trackEvents(e.Events)})
+		}
+	}
+	if onAccepted := opts.OnAccepted; onAccepted != nil {
+		cfg.OnAccepted = func(body json.RawMessage, events []ingest.Event) {
+			onAccepted(body, trackEvents(events))
+		}
+	}
+	tp, err := ingest.New(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &AforoClient{tp: tp, productType: opts.ProductType}, nil
 }
 
-// Track enqueues a usage event for batched delivery.
-// Non-blocking — returns immediately.
-func (c *AforoClient) Track(event TrackEvent) error {
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return ErrClientClosed
+// trackEvents hands callbacks the events as tracked (keys kept).
+func trackEvents(events []ingest.Event) []TrackEvent {
+	out := make([]TrackEvent, len(events))
+	for i, e := range events {
+		if te, ok := e.Ref.(TrackEvent); ok {
+			out[i] = te
+		} else {
+			out[i] = TrackEvent{IdempotencyKey: e.Key}
+		}
 	}
-	c.mu.Unlock()
+	return out
+}
 
+// String never prints the API key.
+func (c *AforoClient) String() string { return "metering.AforoClient{" + c.tp.String() + "}" }
+
+// Track enqueues a usage event for batched delivery. It never blocks on the
+// network and never starts a goroutine.
+//
+// It returns ErrInvalidEvent (wrapped) for an event the ingestor would refuse
+// and ErrClientClosed after Close; both are counted in DroppedCount() and
+// handed to OnDrop (DropInvalid / DropClosed).
+func (c *AforoClient) Track(event TrackEvent) error {
 	// Minted once, here, when the event is enqueued — never at flush/retry time,
 	// so a retried batch carries the same keys and the ingestor deduplicates it.
 	// A caller-supplied key is passed through verbatim; otherwise each event gets
-	// its own random UUID. (A content hash would make two distinct events that
-	// share a timestamp collide, and the ingestor would drop the second one.)
-	// Callers wanting logical retry-dedup supply their own stable key.
-	// Minted before validation so an event handed to OnDrop with reason
-	// DropInvalid still carries its key.
+	// its own random UUID. Minted before validation so an event handed to OnDrop
+	// still carries its key.
 	if event.IdempotencyKey == "" {
 		event.IdempotencyKey = generateRandomKey()
 	}
+	if c.tp.Closed() {
+		c.tp.Report([]ingest.Event{{Key: event.IdempotencyKey, Ref: event}}, ingest.DropClosed)
+		return ErrClientClosed
+	}
 
-	// Events the ingestor would refuse are dropped server-side and never
-	// billed, and because flushing happens in the background nobody would see
-	// that rejection. Such an event never enters the buffer: it is counted,
-	// WARN-logged, handed to OnDrop (DropInvalid) and reported to the caller.
 	if err := c.validate(&event); err != nil {
-		c.recordInvalid(event, err)
+		c.tp.ReportInvalid(ingest.Event{Key: event.IdempotencyKey, Ref: event}, err.Error())
 		return err
 	}
 
@@ -93,7 +118,6 @@ func (c *AforoClient) Track(event TrackEvent) error {
 	if productType == "" {
 		productType = c.productType
 	}
-
 	resolved := resolvedEvent{
 		CustomerID:      event.CustomerID,
 		MetricName:      event.MetricName,
@@ -108,15 +132,15 @@ func (c *AforoClient) Track(event TrackEvent) error {
 		StatusCode:      event.StatusCode,
 		ResponseTimeMs:  event.ResponseTimeMs,
 	}
-
-	if evicted, overflow := c.buf.pushEvict(resolved); overflow {
-		c.recordDrop([]resolvedEvent{evicted}, DropOverflow)
+	body, err := json.Marshal(resolved)
+	if err != nil {
+		cause := fmt.Errorf("%w: event cannot be serialized: %v", ErrInvalidEvent, err)
+		c.tp.ReportInvalid(ingest.Event{Key: event.IdempotencyKey, Ref: event}, cause.Error())
+		return cause
 	}
-
-	if c.buf.size() >= c.flushCount {
-		go c.Flush()
+	if err := c.tp.Enqueue(ingest.Event{Key: resolved.IdempotencyKey, Body: body, Ref: resolved.asTrackEvent()}); err != nil {
+		return ErrClientClosed
 	}
-
 	return nil
 }
 
@@ -148,155 +172,59 @@ func (c *AforoClient) validate(event *TrackEvent) error {
 	return checkFieldLimits(event)
 }
 
-// recordInvalid accounts for an event refused client-side: counter, throttled
-// WARN (first, then every 1000th, so a tight loop can't storm the log) and the
-// opt-in OnDrop hook with DropInvalid.
-func (c *AforoClient) recordInvalid(event TrackEvent, cause error) {
-	total := c.dropped.Add(1)
-	if n := c.invalidDrops.Add(1); n == 1 || n%1000 == 0 {
-		log.Printf("[aforo] WARN: invalid event dropped, not sent — %v (%d invalid, %d total dropped).", cause, n, total)
+// Flush hands the queued events to the background sender and waits until it
+// has tried to send them all, or ctx ends. During an ingest outage it returns
+// ErrIngestUnavailable; the events stay queued and are sent on recovery.
+func (c *AforoClient) Flush(ctx context.Context) (FlushResult, error) {
+	r, err := c.tp.Flush(ctx)
+	res := FlushResult{Sent: r.Sent, Rejected: r.Rejected, Pending: r.Pending}
+	switch {
+	case errors.Is(err, ingest.ErrClosed):
+		return res, ErrClientClosed
+	case errors.Is(err, ingest.ErrIngestUnavailable):
+		return res, ErrIngestUnavailable
 	}
-	c.callOnDrop([]TrackEvent{event}, DropInvalid)
+	return res, err
 }
 
-// callOnDrop invokes the opt-in hook. A hook bug must never break
-// tracking/flushing.
-func (c *AforoClient) callOnDrop(events []TrackEvent, reason DropReason) {
-	if c.onDrop == nil || len(events) == 0 {
-		return
+// Close stops accepting events and sends what is queued until the earlier of
+// ctx's deadline and Options.ShutdownTimeout. Events still queued then are
+// reported through OnDrop with DropShutdown and Close returns an error
+// wrapping ErrShutdownIncomplete. Safe to call more than once.
+func (c *AforoClient) Close(ctx context.Context) error {
+	err := c.tp.Close(ctx)
+	if errors.Is(err, ingest.ErrShutdownIncomplete) {
+		return fmt.Errorf("%w: %v", ErrShutdownIncomplete, err)
 	}
-	defer func() { _ = recover() }()
-	c.onDrop(events, reason)
+	return err
 }
 
-// recordDrop accounts for permanently lost events: bumps the counter,
-// WARN-logs, and invokes the opt-in OnDrop hook. Overflow logs are throttled
-// (first, then every 1000th eviction) so sustained overflow can't storm the
-// log; failed-batch drops log every time (bounded by flush cadence).
-func (c *AforoClient) recordDrop(events []resolvedEvent, reason DropReason) {
-	total := c.dropped.Add(int64(len(events)))
+// BufferedCount returns the number of queued events.
+func (c *AforoClient) BufferedCount() int { return c.tp.Len() }
 
-	if reason == DropOverflow {
-		overflows := c.overflowDrops.Add(int64(len(events)))
-		if overflows == 1 || overflows%1000 == 0 {
-			log.Printf("[aforo] WARN: buffer overflow: oldest event dropped (%d total dropped). Consider raising MaxQueueSize or checking ingest connectivity.", total)
-		}
-	} else {
-		log.Printf("[aforo] WARN: dropped %d event(s) — %s (%d total dropped).", len(events), reason, total)
-	}
-
-	if c.onDrop != nil {
-		dropped := make([]TrackEvent, len(events))
-		for i, e := range events {
-			dropped[i] = e.asTrackEvent()
-		}
-		c.callOnDrop(dropped, reason)
-	}
-}
-
-// Flush sends all buffered events to the ingestor.
-func (c *AforoClient) Flush() FlushResult {
-	var totalSent, totalFailed int
-
-	for !c.buf.isEmpty() {
-		batch := c.buf.drainUpTo(c.flushCount)
-		if len(batch) == 0 {
-			break
-		}
-		result := c.tp.send(batch)
-		totalSent += result.Sent
-		totalFailed += result.Failed
-
-		if result.Failed > 0 {
-			// The batch was already drained from the buffer — without this it
-			// vanishes silently. Surface it (counter + WARN + opt-in hook).
-			reason := result.Reason
-			if reason == "" {
-				reason = DropRetryExhausted
-			}
-			switch {
-			case result.Failed >= len(batch):
-				c.recordDrop(batch, reason)
-			case len(result.failedIndexes) > 0:
-				// 2xx partial failure: the ingestor named the events it refused.
-				rejected := make([]resolvedEvent, 0, len(result.failedIndexes))
-				for _, i := range result.failedIndexes {
-					rejected = append(rejected, batch[i])
-				}
-				c.recordDrop(rejected, reason)
-				if extra := result.Failed - len(rejected); extra > 0 {
-					c.recordUnidentifiedDrop(extra, reason)
-				}
-			default:
-				// Partial failure without usable indexes: count, but do not
-				// guess which events were refused.
-				c.recordUnidentifiedDrop(result.Failed, reason)
-			}
-		}
-	}
-
-	return FlushResult{Sent: totalSent, Failed: totalFailed}
-}
-
-// recordUnidentifiedDrop counts events the ingestor refused without saying
-// which ones; OnDrop is not called because the SDK cannot name them.
-func (c *AforoClient) recordUnidentifiedDrop(n int, reason DropReason) {
-	total := c.dropped.Add(int64(n))
-	log.Printf("[aforo] WARN: dropped %d event(s) — %s; the ingestor did not identify them (%d total dropped).", n, reason, total)
-}
-
-// Close flushes remaining events and stops the background goroutine.
-func (c *AforoClient) Close() {
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return
-	}
-	c.closed = true
-	c.mu.Unlock()
-
-	c.ticker.Stop()
-	close(c.done)
-	c.Flush()
-	c.tp.close()
-}
-
-// BufferedCount returns the number of events in the buffer.
-func (c *AforoClient) BufferedCount() int {
-	return c.buf.size()
-}
-
-// DroppedCount returns the total events permanently dropped (overflow +
-// failed batches + rejected + invalid events) since the client was created.
-func (c *AforoClient) DroppedCount() int64 {
-	return c.dropped.Load()
-}
+// DroppedCount returns the total events the SDK gave up on since the client
+// was created (every DropReason).
+func (c *AforoClient) DroppedCount() int64 { return c.tp.Dropped() }
 
 // IsClosed returns whether the client has been closed.
-func (c *AforoClient) IsClosed() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.closed
-}
-
-func (c *AforoClient) flushLoop() {
-	for {
-		select {
-		case <-c.ticker.C:
-			c.Flush()
-		case <-c.done:
-			return
-		}
-	}
-}
+func (c *AforoClient) IsClosed() bool { return c.tp.Closed() }
 
 // ErrInvalidEvent is returned (wrapped) by Track when an event is missing a
 // field the ingestor requires or breaks one of its field limits. The event is
-// not buffered or sent; it is counted in DroppedCount(), WARN-logged and
+// not queued or sent; it is counted in DroppedCount(), WARN-logged and
 // handed to Options.OnDrop with DropInvalid.
 var ErrInvalidEvent = errors.New("aforo: invalid event")
 
-// ErrClientClosed is returned when Track is called on a closed client.
+// ErrIngestUnavailable is returned by Flush when the ingestor could not be
+// reached (or refused the API key) after the retries. Nothing is lost: the
+// events stay queued and are sent when it recovers.
+var ErrIngestUnavailable = errors.New("aforo: ingestor unavailable; events kept in the queue")
+
+// ErrShutdownIncomplete is returned (wrapped) by Close when events were still
+// queued at the shutdown deadline.
+var ErrShutdownIncomplete = errors.New("aforo: shutdown deadline passed with events still queued")
+
+// ErrClientClosed is returned when Track or Flush is called on a closed client.
 var ErrClientClosed = &clientClosedError{}
 
 type clientClosedError struct{}

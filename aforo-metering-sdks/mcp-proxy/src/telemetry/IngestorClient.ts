@@ -1,11 +1,12 @@
 /**
- * @file HTTP client for sending batched usage events to Aforo ingestor.
- * POST /v1/ingest/batch with X-API-Key auth + X-Tenant-Id header.
- * 3x retry with exponential backoff (1s, 2s, 4s). 10s timeout.
- * Pattern reused from aforo-metering-sdks/node/src/transport.ts
+ * @file Single-event sender for session heartbeats.
+ * POST /v1/ingest/batch with `{"events":[event]}`, X-API-Key + X-Tenant-Id,
+ * 10 s timeout, sent once. Usage events go through the EventBuffer's
+ * transport core instead (queue, retries, breaker, shutdown deadline).
  */
 
 import type { ProxyUsageEvent, BatchIngestResponse } from '../types.js';
+import { checkBaseUrl } from '../transport-core/core.js';
 import { logger } from '../util/logger.js';
 
 export interface IngestorClientConfig {
@@ -13,132 +14,21 @@ export interface IngestorClientConfig {
   apiKey: string;
   tenantId: string;
   timeout?: number;
-  maxRetries?: number;
-}
-
-/** Outcome of {@link IngestorClient.sendBatchDetailed}. */
-export interface BatchSendOutcome {
-  result: BatchIngestResponse | null;
-  reason?: 'rejected' | 'retry_exhausted';
-  message?: string;
-}
-
-/** Best-effort server explanation for a rejected request. */
-async function readErrorMessage(response: { json?: () => Promise<unknown> }): Promise<string | undefined> {
-  try {
-    const body = (await response.json?.()) as Record<string, any> | undefined;
-    if (!body || typeof body !== 'object') return undefined;
-    const first = Array.isArray(body.errors) ? body.errors[0] : undefined;
-    const text = first?.message ?? body.detail ?? body.message ?? body.error ?? body.title;
-    return typeof text === 'string' && text ? text.slice(0, 500) : undefined;
-  } catch {
-    return undefined;
-  }
+  allowInsecureHttp?: boolean;
 }
 
 export class IngestorClient {
   private readonly baseUrl: string;
-  private readonly apiKey: string;
+  private readonly apiKey!: string;
   private readonly tenantId: string;
   private readonly timeout: number;
-  private readonly maxRetries: number;
 
   constructor(config: IngestorClientConfig) {
-    this.baseUrl = config.baseUrl.replace(/\/+$/, '');
-    this.apiKey = config.apiKey;
+    this.baseUrl = checkBaseUrl(config.baseUrl, config.allowInsecureHttp === true);
+    // Non-enumerable: the key never shows in inspect() or JSON.
+    Object.defineProperty(this, 'apiKey', { value: config.apiKey, enumerable: false });
     this.tenantId = config.tenantId;
     this.timeout = config.timeout ?? 10_000;
-    this.maxRetries = config.maxRetries ?? 3;
-  }
-
-  /** Send a batch. Resolves to the parsed response, or null when the batch was not delivered. */
-  async sendBatch(events: ProxyUsageEvent[]): Promise<BatchIngestResponse | null> {
-    return (await this.sendBatchDetailed(events)).result;
-  }
-
-  /**
-   * Send a batch and say why it failed. `result` is null when the batch was
-   * not delivered; `reason` is then 'rejected' (non-retryable 4xx) or
-   * 'retry_exhausted', and `message` carries the server's explanation when it
-   * gave one. The body is serialized once, so every retry re-sends the same
-   * idempotency keys.
-   */
-  async sendBatchDetailed(events: ProxyUsageEvent[]): Promise<BatchSendOutcome> {
-    if (events.length === 0) return { result: { accepted: 0, duplicates: 0, failed: 0 } };
-
-    const url = `${this.baseUrl}/v1/ingest/batch`;
-    const body = JSON.stringify({ events });
-
-    for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
-      try {
-        const response = await fetch(url, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-API-Key': this.apiKey,
-            'X-Tenant-Id': this.tenantId,
-          },
-          body,
-          signal: AbortSignal.timeout(this.timeout),
-        });
-
-        if (response.ok) {
-          try {
-            const result = unwrapEnvelope(await response.json()) as BatchIngestResponse;
-            if (result && result.failed > 0) {
-              logger.warn('Ingestor rejected some events', {
-                failed: result.failed,
-                errors: (result.errors ?? []).slice(0, 5).map(e => `#${e.index}: ${e.message}`),
-              });
-            }
-            return { result };
-          } catch {
-            // Old ingestor may return empty 202
-            return { result: { accepted: events.length, duplicates: 0, failed: 0 } };
-          }
-        }
-
-        // 4xx (except 408, 429) — bad input, don't retry
-        if (response.status >= 400 && response.status < 500
-            && response.status !== 408 && response.status !== 429) {
-          const message = await readErrorMessage(response);
-          logger.error('Ingestor returned non-retryable error', { status: response.status, attempt, ...(message ? { message } : {}) });
-          return { result: null, reason: 'rejected', message: `HTTP ${response.status}${message ? `: ${message}` : ''}` };
-        }
-
-        // 429 — respect Retry-After
-        if (response.status === 429) {
-          const retryAfter = response.headers.get('Retry-After');
-          const delayMs = retryAfter
-            ? (parseInt(retryAfter, 10) || 1) * 1000
-            : Math.pow(2, attempt - 1) * 1000;
-          if (attempt < this.maxRetries) {
-            await this.sleep(delayMs);
-            continue;
-          }
-        }
-
-        // 5xx or 408 — retry with backoff
-        if (attempt < this.maxRetries) {
-          await this.sleep(Math.pow(2, attempt - 1) * 1000);
-          continue;
-        }
-
-        logger.error('Ingestor exhausted retries', { status: response.status, attempts: this.maxRetries });
-        return { result: null, reason: 'retry_exhausted', message: `HTTP ${response.status}` };
-
-      } catch (err) {
-        if (attempt < this.maxRetries) {
-          logger.warn('Ingestor request failed, retrying', { attempt, error: (err as Error).message });
-          await this.sleep(Math.pow(2, attempt - 1) * 1000);
-          continue;
-        }
-        logger.error('Ingestor request failed after all retries', { error: (err as Error).message });
-        return { result: null, reason: 'retry_exhausted', message: (err as Error).message };
-      }
-    }
-
-    return { result: null, reason: 'retry_exhausted' };
   }
 
   /**
@@ -161,9 +51,17 @@ export class IngestorClient {
         },
         body: JSON.stringify({ events: [event] }),
         signal: AbortSignal.timeout(this.timeout),
+        // Never follow a redirect: it would send the API key to another host.
+        redirect: 'manual',
       });
       if (!response.ok) {
-        logger.debug('Single-event send rejected', { status: response.status });
+        if (response.status === 0 || (response.status >= 300 && response.status < 400)) {
+          logger.warn('Ingestor answered a redirect for a heartbeat; redirects are not followed, check --ingestor-url', {
+            status: response.status,
+          });
+        } else {
+          logger.debug('Single-event send rejected', { status: response.status });
+        }
         return null;
       }
       try {
@@ -177,9 +75,6 @@ export class IngestorClient {
     }
   }
 
-  private sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
 }
 
 /**

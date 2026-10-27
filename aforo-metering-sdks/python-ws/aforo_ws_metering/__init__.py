@@ -15,4 +15,4 @@ __all__ = [
     "WS_CLOSE_REASONS",
     "normalize_execution_status",
 ]
-__version__ = "1.2.1"
+__version__ = "2.0.0"

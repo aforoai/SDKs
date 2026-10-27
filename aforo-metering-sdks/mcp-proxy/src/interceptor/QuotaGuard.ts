@@ -1,31 +1,46 @@
 /**
- * @file Pre-flight quota check with fail-open semantics.
- * - 50ms timeout on pre-flight call (latency budget)
- * - In-process deny cache (5s TTL) to avoid hammering endpoint
- * - Returns JSON-RPC error -32000 on DENY
- * - Reads the ingestor's {success, data: {decision}} envelope (bare {decision} also accepted)
- * - WARN is allowed and logged once per minute per customer + metric
- * - Fail-open on any error (network, timeout, unexpected response)
+ * @file Pre-flight quota check.
+ * - Default timeout 1000 ms (`quotaTimeoutMs`); 50 ms was shorter than a
+ *   normal round trip, so the check almost always timed out and let the call
+ *   through (G304).
+ * - DENY answers are reused for 5 s, ALLOW answers for `quotaAllowCacheMs`
+ *   (default 1 s, 0 = off); WARN answers are never reused. Every cache is
+ *   capped and expires (G306).
+ * - Returns JSON-RPC error -32000 on DENY.
+ * - Reads the ingestor's {success, data: {decision}} envelope (bare {decision} also accepted).
+ * - WARN is allowed and logged once per minute per customer + metric.
+ * - When the check cannot answer: `quotaFailMode: 'open'` (default) lets the
+ *   call through; `'closed'` refuses it with -32000.
  */
 
 import type { QuotaCheckResponse, JsonRpcResponse } from '../types.js';
+import { BoundedMap } from '../util/BoundedMap.js';
 import { logger } from '../util/logger.js';
 
 const DENY_CACHE_TTL_MS = 5000;
-const PREFLIGHT_TIMEOUT_MS = 50;
+export const DEFAULT_QUOTA_TIMEOUT_MS = 1000;
+export const DEFAULT_QUOTA_ALLOW_CACHE_MS = 1000;
 const QUOTA_ERROR_CODE = -32000;
 const WARN_LOG_WINDOW_MS = 60000;
+const MAX_CACHE_ENTRIES = 10_000;
 
-interface DenyCacheEntry {
-  response: QuotaCheckResponse;
-  expiresAt: number;
-}
+export type QuotaFailMode = 'open' | 'closed';
 
 export interface QuotaGuardConfig {
   ingestorUrl: string;
   tenantId: string;
   apiKey: string;
   enabled: boolean;
+  /** Deadline for one quota check in ms (default 1000). */
+  timeoutMs?: number;
+  /** How long an ALLOW answer is reused, in ms (default 1000; 0 = never). */
+  allowCacheMs?: number;
+  /** What to do when the check cannot answer (default 'open'). */
+  failMode?: QuotaFailMode;
+  /** Most entries in each cache (default 10 000). */
+  maxCacheEntries?: number;
+  /** Clock, for tests. */
+  now?: () => number;
 }
 
 export class QuotaGuard {
@@ -33,14 +48,32 @@ export class QuotaGuard {
   private readonly tenantId: string;
   private readonly apiKey: string;
   private readonly enabled: boolean;
-  private readonly denyCache = new Map<string, DenyCacheEntry>();
-  private readonly warnedUntil = new Map<string, number>();
+  private readonly timeoutMs: number;
+  private readonly allowCacheMs: number;
+  private readonly failMode: QuotaFailMode;
+  private readonly now: () => number;
+  private readonly denyCache: BoundedMap<string, QuotaCheckResponse>;
+  private readonly allowCache: BoundedMap<string, true>;
+  private readonly warnedUntil: BoundedMap<string, true>;
 
   constructor(config: QuotaGuardConfig) {
     this.ingestorUrl = config.ingestorUrl.replace(/\/+$/, '');
     this.tenantId = config.tenantId;
     this.apiKey = config.apiKey;
     this.enabled = config.enabled;
+    this.timeoutMs = positiveOr(config.timeoutMs, DEFAULT_QUOTA_TIMEOUT_MS);
+    this.allowCacheMs = config.allowCacheMs !== undefined && Number.isFinite(config.allowCacheMs) && config.allowCacheMs >= 0
+      ? config.allowCacheMs
+      : DEFAULT_QUOTA_ALLOW_CACHE_MS;
+    if (config.failMode !== undefined && config.failMode !== 'open' && config.failMode !== 'closed') {
+      throw new Error(`quotaFailMode must be "open" or "closed" (got ${String(config.failMode)})`);
+    }
+    this.failMode = config.failMode ?? 'open';
+    this.now = config.now ?? Date.now;
+    const maxEntries = positiveOr(config.maxCacheEntries, MAX_CACHE_ENTRIES);
+    this.denyCache = new BoundedMap({ maxEntries });
+    this.allowCache = new BoundedMap({ maxEntries });
+    this.warnedUntil = new BoundedMap({ maxEntries });
   }
 
   /**
@@ -54,20 +87,17 @@ export class QuotaGuard {
   ): Promise<JsonRpcResponse | null> {
     if (!this.enabled) return null;
 
-    const cacheKey = `${customerId}:${metricName}`;
+    const cacheKey = `${customerId}\u0000${metricName}`;
+    const now = this.now();
 
-    // Check deny cache first
-    const cached = this.denyCache.get(cacheKey);
-    if (cached && cached.expiresAt > Date.now()) {
+    const denied = this.denyCache.get(cacheKey, now);
+    if (denied) {
       logger.debug('Quota denied (cached)', { customerId, metricName });
-      return this.buildDenyResponse(requestId, cached.response);
+      return this.buildDenyResponse(requestId, denied);
     }
+    if (this.allowCache.get(cacheKey, now)) return null;
 
-    // Expired cache entry — remove it
-    if (cached) {
-      this.denyCache.delete(cacheKey);
-    }
-
+    let result: QuotaCheckResponse | null;
     try {
       const url = `${this.ingestorUrl}/api/v1/quota/check`;
       const response = await fetch(url, {
@@ -82,49 +112,66 @@ export class QuotaGuard {
           metricName,
           estimatedQuantity: 1,
         }),
-        signal: AbortSignal.timeout(PREFLIGHT_TIMEOUT_MS),
+        signal: AbortSignal.timeout(this.timeoutMs),
+        // Never follow a redirect: it would send the API key to another host.
+        redirect: 'manual',
       });
 
       if (!response.ok) {
-        // Fail-open on non-200
-        logger.debug('Quota check returned non-OK, fail-open', { status: response.status });
-        return null;
+        const redirected = response.status === 0 || (response.status >= 300 && response.status < 400);
+        return this.unavailable(
+          requestId,
+          redirected ? `HTTP ${response.status} redirect (not followed; check the ingestor URL)` : `HTTP ${response.status}`,
+        );
       }
-
-      const result = parseQuotaResponse(await response.json());
-      if (!result) {
-        // Body is not a quota decision (malformed, unknown shape) — fail-open
-        logger.debug('Quota check returned an unrecognised body, fail-open');
-        return null;
-      }
-
-      if (result.decision === 'DENY') {
-        // Cache the deny decision
-        this.denyCache.set(cacheKey, {
-          response: result,
-          expiresAt: Date.now() + DENY_CACHE_TTL_MS,
-        });
-        logger.info('Quota denied', { customerId, metricName, reason: result.reason, currentUsage: result.currentUsage, limit: result.limit });
-        return this.buildDenyResponse(requestId, result);
-      }
-
-      if (result.decision === 'WARN') {
-        // Allowed, but close to the limit — log once per window, not per call
-        const warnedUntil = this.warnedUntil.get(cacheKey) ?? 0;
-        if (warnedUntil <= Date.now()) {
-          this.warnedUntil.set(cacheKey, Date.now() + WARN_LOG_WINDOW_MS);
-          logger.warn('Quota warning — approaching limit', { customerId, metricName, reason: result.reason, currentUsage: result.currentUsage, limit: result.limit });
-        }
-      }
-
-      // ALLOW or WARN — let it through
-      return null;
-
+      result = parseQuotaResponse(await response.json());
     } catch (err) {
-      // Fail-open on timeout, network error, etc.
-      logger.debug('Quota check failed, fail-open', { error: (err as Error).message });
+      return this.unavailable(requestId, (err as Error).message);
+    }
+    if (!result) {
+      return this.unavailable(requestId, 'the answer had no recognisable decision');
+    }
+
+    if (result.decision === 'DENY') {
+      this.denyCache.set(cacheKey, result, DENY_CACHE_TTL_MS, this.now());
+      logger.info('Quota denied', { customerId, metricName, reason: result.reason, currentUsage: result.currentUsage, limit: result.limit });
+      return this.buildDenyResponse(requestId, result);
+    }
+
+    if (result.decision === 'WARN') {
+      // Allowed, but close to the limit — log once per window, not per call.
+      if (!this.warnedUntil.get(cacheKey, this.now())) {
+        this.warnedUntil.set(cacheKey, true, WARN_LOG_WINDOW_MS, this.now());
+        logger.warn('Quota warning — approaching limit', { customerId, metricName, reason: result.reason, currentUsage: result.currentUsage, limit: result.limit });
+      }
       return null;
     }
+
+    if (this.allowCacheMs > 0) this.allowCache.set(cacheKey, true, this.allowCacheMs, this.now());
+    return null;
+  }
+
+  /** The check could not answer: allow (fail-open) or refuse (fail-closed). */
+  private unavailable(requestId: string | number, detail: string): JsonRpcResponse | null {
+    if (this.failMode === 'open') {
+      logger.debug('Quota check unavailable, fail-open', { detail });
+      return null;
+    }
+    logger.warn('Quota check unavailable, refusing the call (fail-closed)', { detail });
+    return {
+      jsonrpc: '2.0',
+      id: requestId,
+      error: {
+        code: QUOTA_ERROR_CODE,
+        message: 'Quota check unavailable; the call was refused',
+        data: { reason: 'QUOTA_CHECK_UNAVAILABLE' },
+      },
+    };
+  }
+
+  /** Entries held in the deny, allow and warn caches (for tests and diagnostics). */
+  get cacheSizes(): { deny: number; allow: number; warn: number } {
+    return { deny: this.denyCache.size, allow: this.allowCache.size, warn: this.warnedUntil.size };
   }
 
   private buildDenyResponse(requestId: string | number, quota: QuotaCheckResponse): JsonRpcResponse {
@@ -146,6 +193,10 @@ export class QuotaGuard {
       },
     };
   }
+}
+
+function positiveOr(value: number | undefined, fallback: number): number {
+  return value !== undefined && Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
 function finiteNumber(value: unknown): number | undefined {

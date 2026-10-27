@@ -59,6 +59,7 @@ def _billing() -> AforoGraphQlBilling:
         ingestor_url="https://api.aforo.ai",
         flush_count=1000,
         flush_interval_sec=60,
+        trust_customer_header=True,  # these tests send x-customer-id
     )
 
 

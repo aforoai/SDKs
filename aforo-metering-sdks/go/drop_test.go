@@ -1,6 +1,8 @@
 package metering
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -10,13 +12,14 @@ import (
 
 func dropTestOptions(baseURL string) Options {
 	return Options{
-		APIKey:        "test-key",
-		BaseURL:       baseURL,
-		FlushCount:    100,
-		FlushInterval: time.Minute, // long — control flushing manually
-		MaxRetries:    1,           // defaults() floors 0 to 3; keep the retry envelope tiny
-		RetryBase:     time.Millisecond,
-		Timeout:       time.Second,
+		APIKey:          "test-key",
+		BaseURL:         baseURL,
+		FlushCount:      100,
+		FlushInterval:   time.Minute, // tests flush explicitly
+		MaxRetries:      1,
+		Timeout:         time.Second,
+		ShutdownTimeout: time.Second,
+		hooks:           fastHooks(),
 	}
 }
 
@@ -39,8 +42,7 @@ func TestOverflowEvictsOldestCountsAndFiresHook(t *testing.T) {
 	opts.MaxQueueSize = 2
 	opts.OnDrop = rec.hook
 
-	c := NewClient(opts)
-	defer func() { c.closed = true }() // avoid network flush on Close
+	c := mustNewClient(t, opts)
 
 	_ = c.Track(TrackEvent{CustomerID: "cust_1", MetricName: "api_calls", IdempotencyKey: "k1"})
 	_ = c.Track(TrackEvent{CustomerID: "cust_2", MetricName: "api_calls", IdempotencyKey: "k2"})
@@ -62,30 +64,37 @@ func TestOverflowEvictsOldestCountsAndFiresHook(t *testing.T) {
 	}
 }
 
-func TestSendFailureDropsBatchCountsAndFiresHook(t *testing.T) {
+// An outage no longer loses the batch: it stays queued with its keys. When
+// Close's deadline passes with the ingestor still down, the events are
+// reported as DropShutdown — keys intact, so a replay is dedup-safe.
+func TestOutageKeepsEventsThenCloseReportsShutdownWithKeys(t *testing.T) {
 	rec := &dropRecorder{}
 	opts := dropTestOptions("http://localhost:1") // connection refused
 	opts.OnDrop = rec.hook
+	opts.ShutdownTimeout = 200 * time.Millisecond
 
-	c := NewClient(opts)
-	defer func() { c.closed = true }()
-
+	c, err := NewClient(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
 	_ = c.Track(TrackEvent{CustomerID: "cust_1", MetricName: "api_calls", IdempotencyKey: "k1"})
 	_ = c.Track(TrackEvent{CustomerID: "cust_2", MetricName: "api_calls", IdempotencyKey: "k2"})
 
-	result := c.Flush()
-	if result.Failed != 2 {
-		t.Fatalf("Flush().Failed = %d, want 2", result.Failed)
+	result, err := c.Flush(context.Background())
+	if !errors.Is(err, ErrIngestUnavailable) || result.Pending != 2 {
+		t.Fatalf("Flush() = %+v, %v; want Pending=2 and ErrIngestUnavailable", result, err)
 	}
-	if got := c.DroppedCount(); got != 2 {
-		t.Fatalf("DroppedCount = %d, want 2", got)
+	if got := c.DroppedCount(); got != 0 {
+		t.Fatalf("DroppedCount = %d during an outage, want 0", got)
+	}
+	if err := c.Close(context.Background()); !errors.Is(err, ErrShutdownIncomplete) {
+		t.Fatalf("Close = %v, want ErrShutdownIncomplete", err)
 	}
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
-	if len(rec.reasons) != 1 || rec.reasons[0] != DropRetryExhausted {
-		t.Fatalf("reasons = %v, want [retry_exhausted]", rec.reasons)
+	if len(rec.reasons) != 1 || rec.reasons[0] != DropShutdown {
+		t.Fatalf("reasons = %v, want [shutdown]", rec.reasons)
 	}
-	// Events keep their keys — dedup-safe replay via Track() is possible
 	if len(rec.events) != 2 || rec.events[0].IdempotencyKey != "k1" || rec.events[1].IdempotencyKey != "k2" {
 		t.Fatalf("dropped events = %v, want [k1 k2]", rec.events)
 	}
@@ -101,14 +110,12 @@ func TestRejected4xxFiresHookWithRejectedReason(t *testing.T) {
 	opts := dropTestOptions(srv.URL)
 	opts.OnDrop = rec.hook
 
-	c := NewClient(opts)
-	defer func() { c.closed = true }()
-
+	c := mustNewClient(t, opts)
 	_ = c.Track(TrackEvent{CustomerID: "cust_1", MetricName: "api_calls"})
-	result := c.Flush()
+	result := flushNow(c)
 
-	if result.Failed != 1 {
-		t.Fatalf("Flush().Failed = %d, want 1", result.Failed)
+	if result.Rejected != 1 {
+		t.Fatalf("Flush().Rejected = %d, want 1", result.Rejected)
 	}
 	if got := c.DroppedCount(); got != 1 {
 		t.Fatalf("DroppedCount = %d, want 1", got)
@@ -120,36 +127,36 @@ func TestRejected4xxFiresHookWithRejectedReason(t *testing.T) {
 	}
 }
 
-func TestDefaultNoHookCountsDropsAndResultUnchanged(t *testing.T) {
-	c := NewClient(dropTestOptions("http://localhost:1"))
-	defer func() { c.closed = true }()
+func TestDefaultNoHookOutageKeepsEventQueued(t *testing.T) {
+	c := mustNewClient(t, dropTestOptions("http://localhost:1"))
 
 	_ = c.Track(TrackEvent{CustomerID: "cust_1", MetricName: "api_calls"})
-	result := c.Flush()
+	result := flushNow(c)
 
-	// Same result values as before the hardening
-	if result.Sent != 0 || result.Failed != 1 {
-		t.Fatalf("Flush() = %+v, want Sent=0 Failed=1", result)
+	if result.Sent != 0 || result.Pending != 1 {
+		t.Fatalf("Flush() = %+v, want Sent=0 Pending=1", result)
 	}
-	if got := c.DroppedCount(); got != 1 {
-		t.Fatalf("DroppedCount = %d, want 1", got)
+	if got := c.DroppedCount(); got != 0 {
+		t.Fatalf("DroppedCount = %d, want 0", got)
 	}
 }
 
 func TestPanickingHookNeverBreaksFlush(t *testing.T) {
-	opts := dropTestOptions("http://localhost:1")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+	}))
+	defer srv.Close()
+	opts := dropTestOptions(srv.URL)
 	opts.OnDrop = func(events []TrackEvent, reason DropReason) {
 		panic("hook bug")
 	}
 
-	c := NewClient(opts)
-	defer func() { c.closed = true }()
-
+	c := mustNewClient(t, opts)
 	_ = c.Track(TrackEvent{CustomerID: "cust_1", MetricName: "api_calls"})
-	result := c.Flush() // must not panic
+	result := flushNow(c) // must not panic
 
-	if result.Failed != 1 {
-		t.Fatalf("Flush().Failed = %d, want 1", result.Failed)
+	if result.Rejected != 1 {
+		t.Fatalf("Flush().Rejected = %d, want 1", result.Rejected)
 	}
 	if got := c.DroppedCount(); got != 1 {
 		t.Fatalf("DroppedCount = %d, want 1", got)
@@ -166,14 +173,12 @@ func TestHappyPathUnchangedNoDrops(t *testing.T) {
 	opts := dropTestOptions(srv.URL)
 	opts.OnDrop = rec.hook
 
-	c := NewClient(opts)
-	defer c.Close()
-
+	c := mustNewClient(t, opts)
 	_ = c.Track(TrackEvent{CustomerID: "cust_1", MetricName: "api_calls"})
-	result := c.Flush()
+	result := flushNow(c)
 
-	if result.Sent != 1 || result.Failed != 0 {
-		t.Fatalf("Flush() = %+v, want Sent=1 Failed=0", result)
+	if result.Sent != 1 || result.Rejected != 0 || result.Pending != 0 {
+		t.Fatalf("Flush() = %+v, want Sent=1", result)
 	}
 	if got := c.DroppedCount(); got != 0 {
 		t.Fatalf("DroppedCount = %d, want 0", got)
@@ -182,5 +187,26 @@ func TestHappyPathUnchangedNoDrops(t *testing.T) {
 	defer rec.mu.Unlock()
 	if len(rec.reasons) != 0 {
 		t.Fatalf("hook fired on happy path: %v", rec.reasons)
+	}
+}
+
+// Track after Close does not panic: it returns ErrClientClosed and reports
+// the event as DropClosed (counted, key kept).
+func TestTrackAfterCloseReportsClosed(t *testing.T) {
+	rec := &dropRecorder{}
+	opts := dropTestOptions("http://localhost:1")
+	opts.OnDrop = rec.hook
+	c := mustNewClient(t, opts)
+	closeNow(c)
+	if err := c.Track(TrackEvent{CustomerID: "c", MetricName: "m", IdempotencyKey: "late"}); err != ErrClientClosed {
+		t.Fatalf("Track after Close = %v, want ErrClientClosed", err)
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.reasons) != 1 || rec.reasons[0] != DropClosed || rec.events[0].IdempotencyKey != "late" {
+		t.Fatalf("drops = %v %v, want one DropClosed with key late", rec.reasons, rec.events)
+	}
+	if c.DroppedCount() != 1 {
+		t.Fatalf("DroppedCount = %d", c.DroppedCount())
 	}
 }

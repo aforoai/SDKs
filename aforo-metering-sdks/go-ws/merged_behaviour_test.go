@@ -1,11 +1,14 @@
 package wsmetering
 
 import (
+	"context"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/aforoai/SDKs/aforo-metering-sdks/go-ws/v2/internal/ingest"
 )
 
 // Merged-behaviour tests: the transport rules (no retry on a non-retryable
@@ -53,22 +56,25 @@ func TestMergedNonRetryable4xxDropsBatchAsRejected(t *testing.T) {
 	}
 }
 
-func TestMergedRetryableFailureDropsAsRetryExhausted(t *testing.T) {
+func TestMergedRetryableFailureKeptUntilShutdown(t *testing.T) {
 	srv := &scriptedServer{replies: []scriptedReply{{status: 503}}}
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 	drops := &dropSink{}
 	b := newContractBilling(t, ts.URL, &errSink{}, func(c *Config) { c.OnDrop = drops.hook; c.FlushCount = 100 })
-	b.retryBackoffBase = time.Millisecond
 	emit(b)
-	_ = shutdown(b)
+	// Shutdown keeps retrying until its deadline (contract/TRANSPORT-SPEC.md,
+	// "Shutdown after an outage"); a short deadline keeps the test fast.
+	ctx, cancel := context.WithTimeout(bg, 200*time.Millisecond)
+	defer cancel()
+	_ = b.Shutdown(ctx)
 
-	if n := srv.callCount(); n != maxSendAttempts {
-		t.Errorf("attempts = %d, want %d", n, maxSendAttempts)
+	if n := srv.callCount(); n < ingest.DefaultMaxRetries+1 {
+		t.Errorf("attempts = %d, want at least %d (retries continue until the shutdown deadline)", n, ingest.DefaultMaxRetries+1)
 	}
 	_, reasons := drops.snapshot()
-	if b.DroppedCount() != 1 || len(reasons) != 1 || reasons[0] != DropRetryExhausted {
-		t.Fatalf("DroppedCount=%d reasons=%v, want 1 / [retry_exhausted]", b.DroppedCount(), reasons)
+	if b.DroppedCount() != 1 || len(reasons) != 1 || reasons[0] != DropShutdown {
+		t.Fatalf("DroppedCount=%d reasons=%v, want 1 / [shutdown]", b.DroppedCount(), reasons)
 	}
 }
 
@@ -78,7 +84,6 @@ func TestMergedRetriesReuseIdempotencyKeys(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 	b := newContractBilling(t, ts.URL, &errSink{}, func(c *Config) { c.FlushCount = 100 })
-	b.retryBackoffBase = time.Millisecond
 	emit(b)
 	_ = shutdown(b)
 

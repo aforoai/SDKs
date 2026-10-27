@@ -1,59 +1,65 @@
 import { AforoOptions, TrackEvent, ResolvedEvent, FlushResult, DropReason } from './types.js';
-import { RingBuffer } from './buffer.js';
-import { Transport } from './transport.js';
+import { TransportCore, checkBaseUrl, CoreDropReason } from './transport-core/core.js';
 import { generateRandomKey } from './idempotency.js';
 import { describeLimitViolation } from './limits.js';
 
+/** Package version, sent in User-Agent. Keep in step with package.json. */
+export const SDK_VERSION = '2.0.0';
 const DEFAULT_BASE_URL = 'https://api.aforo.ai';
 const DEFAULT_PRODUCT_TYPE = 'API';
 const DEFAULT_SESSION_PRODUCT_TYPE = 'AI_AGENT';
-/** Ingestor hard limit on events per batch request (IngestBatchRequest @Size(max = 1000)). */
-const MAX_BATCH_SIZE = 1000;
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const HEARTBEAT_METRIC = 'system.session.heartbeat';
 /** Heartbeats carry no billable customer; the ingestor intercepts them before billing. */
 const HEARTBEAT_CUSTOMER_ID = 'system';
-const DEFAULT_FLUSH_COUNT = 50;
-const DEFAULT_FLUSH_INTERVAL = 5_000;
-const DEFAULT_MAX_QUEUE_SIZE = 10_000;
-const DEFAULT_MAX_RETRIES = 3;
-const DEFAULT_RETRY_BASE_MS = 1_000;
 const DEFAULT_TIMEOUT = 10_000;
-const DEFAULT_SHUTDOWN_TIMEOUT = 5_000;
+
+/** Sends one heartbeat in its own request, once. Holds the API key in a closure, never on the client. */
+type HeartbeatSender = (event: ResolvedEvent) => Promise<boolean>;
+
+function makeHeartbeatSender(baseUrl: string, apiKey: string, timeoutMs: number): HeartbeatSender {
+  const url = `${baseUrl}/v1/ingest/batch`;
+  return async (event) => {
+    try {
+      const response = await (globalThis as any).fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey, 'User-Agent': `aforo-node/${SDK_VERSION}` },
+        body: JSON.stringify({ events: [event] }),
+        signal: AbortSignal.timeout(timeoutMs),
+        // Never follow a redirect: it would send the API key to another host.
+        redirect: 'manual',
+      });
+      const status = Number(response?.status);
+      if (status === 0 || (status >= 300 && status < 400)) {
+        console.debug(`[aforo] heartbeat not delivered: the ingestor answered HTTP ${status} (redirects are not followed; check baseUrl)`);
+        return false;
+      }
+      return Boolean(response?.ok);
+    } catch (err) {
+      console.debug(`[aforo] heartbeat not delivered: ${(err as Error)?.message ?? err}`);
+      return false;
+    }
+  };
+}
 
 /**
  * Aforo metering client.
  *
- * Enqueues usage events into a ring buffer, flushes them in batches
- * to the Aforo ingestor service via HTTP. Non-blocking — `track()`
- * returns immediately, flushing happens in the background.
+ * `track()` validates the event and puts it on a bounded queue; one background
+ * flusher sends batches to the ingestor. If the ingestor is down, batches go
+ * back on the queue (same idempotency keys) and are sent when it recovers.
  *
  * ```typescript
- * const client = new AforoClient({ apiKey: 'your-key', productType: 'API' });
+ * const client = new AforoClient({ apiKey: process.env.AFORO_API_KEY!, productType: 'API' });
  * await client.track({ customerId: 'cust_1', metricName: 'api_calls', quantity: 1 });
- * // On shutdown:
- * await client.shutdown();
+ * // The SDK installs no signal handlers. Flush from your own:
+ * process.once('SIGTERM', async () => { await client.shutdown(); process.exit(0); });
  * ```
  */
 export class AforoClient {
-  private readonly buffer: RingBuffer;
-  private readonly transport: Transport;
-  private readonly flushCount: number;
-  private readonly flushInterval: number;
-  private readonly shutdownTimeoutMs: number;
+  private readonly core: TransportCore<ResolvedEvent>;
+  private readonly sendHeartbeat!: HeartbeatSender;
   private readonly productType: string;
-  private readonly onDrop?: (events: ResolvedEvent[], reason: DropReason) => void;
-
-  // Drop accounting — events permanently lost (overflow eviction, failed
-  // batch, or an event that failed client-side validation)
-  private dropped = 0;
-  private overflowDrops = 0;
-  private invalidDrops = 0;
-
-  private flushTimer: ReturnType<typeof setInterval> | null = null;
-  private flushing = false;
-  private closed = false;
-  private pendingFlush: Promise<FlushResult> | null = null;
 
   // Session heartbeat state
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -61,45 +67,34 @@ export class AforoClient {
   private sessionStartedAt: number | null = null;
   private sessionProductType: string = DEFAULT_SESSION_PRODUCT_TYPE;
 
-  // Kept so shutdown() can deregister — otherwise every client leaks a
-  // SIGTERM/SIGINT once-listener for the life of the process.
-  private readonly signalHandler: () => void;
-
   constructor(options: AforoOptions) {
-    if (!options.apiKey) throw new Error('apiKey is required');
+    if (!options || !options.apiKey) throw new Error('apiKey is required');
+    const baseUrl = checkBaseUrl(options.baseUrl ?? DEFAULT_BASE_URL, options.allowInsecureHttp === true);
+    const timeout = options.timeout ?? DEFAULT_TIMEOUT;
 
-    this.flushCount = Math.max(1, Math.min(options.flushCount ?? DEFAULT_FLUSH_COUNT, MAX_BATCH_SIZE));
     this.productType = normalizeProductType(options.productType) ?? DEFAULT_PRODUCT_TYPE;
-    this.flushInterval = options.flushInterval ?? DEFAULT_FLUSH_INTERVAL;
-    this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT;
-    this.onDrop = options.onDrop;
-
-    this.buffer = new RingBuffer(options.maxQueueSize ?? DEFAULT_MAX_QUEUE_SIZE);
-
-    this.transport = new Transport({
-      baseUrl: options.baseUrl ?? DEFAULT_BASE_URL,
+    const onDrop = options.onDrop;
+    this.core = new TransportCore<ResolvedEvent>({
+      baseUrl,
       apiKey: options.apiKey,
-      timeout: options.timeout ?? DEFAULT_TIMEOUT,
-      maxRetries: options.maxRetries ?? DEFAULT_MAX_RETRIES,
-      retryBaseMs: options.retryBaseMs ?? DEFAULT_RETRY_BASE_MS,
+      allowInsecureHttp: options.allowInsecureHttp,
+      userAgent: `aforo-node/${SDK_VERSION}`,
+      flushCount: options.flushCount,
+      flushIntervalMs: options.flushInterval,
+      maxQueueSize: options.maxQueueSize,
+      maxRetries: options.maxRetries,
+      retryBaseMs: options.retryBaseMs,
+      timeoutMs: timeout,
+      shutdownTimeoutMs: options.shutdownTimeoutMs,
+      flushOnExit: options.flushOnExit,
+      logPrefix: '[aforo]',
+      onDrop: onDrop ? (events, reason: CoreDropReason) => onDrop(events, reason as DropReason) : undefined,
     });
-
-    // Start periodic flush timer
-    this.flushTimer = setInterval(() => {
-      this.flush().catch(() => {});
-    }, this.flushInterval);
-
-    // Unref the timer so it doesn't prevent Node from exiting
-    if (this.flushTimer && typeof this.flushTimer === 'object' && 'unref' in this.flushTimer) {
-      this.flushTimer.unref();
-    }
-
-    // Register graceful shutdown handlers (deregistered in shutdown())
-    this.signalHandler = () => {
-      this.shutdown().catch(() => {});
-    };
-    process.once('SIGTERM', this.signalHandler);
-    process.once('SIGINT', this.signalHandler);
+    // Non-enumerable, so inspect()/JSON never walk into the closure's owner.
+    Object.defineProperty(this, 'sendHeartbeat', {
+      value: makeHeartbeatSender(baseUrl, options.apiKey, timeout),
+      enumerable: false,
+    });
   }
 
   // ─── Session lifecycle with heartbeat ─────────────────────────────
@@ -118,7 +113,7 @@ export class AforoClient {
    * @param productType - Product type for the session (default AI_AGENT)
    */
   startSession(sessionId: string, productType: string = DEFAULT_SESSION_PRODUCT_TYPE): void {
-    if (this.closed || !sessionId || !String(sessionId).trim()) return;
+    if (this.core.closed || !sessionId || !String(sessionId).trim()) return;
     this.stopHeartbeatTimer();
     this.activeSessionId = String(sessionId);
     this.sessionStartedAt = Date.now();
@@ -153,7 +148,7 @@ export class AforoClient {
 
   private emitSessionHeartbeat(boundary: 'HEARTBEAT' | 'SESSION_END'): Promise<void> {
     const sessionId = this.activeSessionId;
-    if (!sessionId || (this.closed && boundary === 'HEARTBEAT')) return Promise.resolve();
+    if (!sessionId || (this.core.closed && boundary === 'HEARTBEAT')) return Promise.resolve();
 
     const now = Date.now();
     const occurredAt = new Date(now).toISOString();
@@ -178,34 +173,27 @@ export class AforoClient {
       },
     };
 
-    // Sent alone and outside the usage buffer; a failed heartbeat is not a
+    // Sent alone and outside the usage queue; a failed heartbeat is not a
     // usage drop, so it is never counted in droppedCount or handed to onDrop.
-    return this.transport.sendSingleBestEffort(heartbeat).then(() => undefined, () => undefined);
+    return this.sendHeartbeat(heartbeat).then(() => undefined, () => undefined);
   }
 
   // ─── Event tracking ──────────────────────────────────────────────
 
   /**
-   * Enqueue a usage event for batched delivery.
-   * Returns immediately — does not await HTTP.
-   * Triggers a flush if the buffer reaches flushCount.
+   * Queue a usage event. Returns at once — it never waits on HTTP and never
+   * starts a request (the background flusher sends batches).
    *
-   * Throws only when the client is shut down. An event the ingestor would
-   * reject — a blank or over-long `customerId` / `metricName` /
-   * `idempotencyKey`, a `quantity` that is not positive or carries more than
-   * 14 integer digits / 6 decimal places, an `occurredAt` that is not an
-   * ISO-8601 instant, or any other capped field that is too long — is NOT
-   * buffered and NOT sent. It is counted in `droppedCount`, WARN-logged with
-   * the field, the limit and the offending value, and passed to the opt-in
-   * `onDrop` hook with reason `'invalid'`. Limits the server makes
-   * configurable (event age, clock skew, metadata size) are left to the
-   * server. See `limits.ts` for the limits and where each one comes from.
+   * Never throws. An event the ingestor would reject — a blank or over-long
+   * `customerId` / `metricName` / `idempotencyKey`, a `quantity` that is not
+   * positive or carries more than 14 integer digits / 6 decimal places, an
+   * `occurredAt` that is not an ISO-8601 instant, or any other capped field
+   * that is too long — is NOT queued and NOT sent. It is counted in
+   * `droppedCount`, WARN-logged with the field and the limit, and passed to
+   * the opt-in `onDrop` hook with reason `'invalid'`. After `shutdown()` the
+   * event is counted and reported with reason `'closed'`.
    */
   async track(event: TrackEvent): Promise<void> {
-    if (this.closed) {
-      throw new Error('AforoClient is shut down — cannot track new events');
-    }
-
     // A missing event object is reported as an invalid event, not a TypeError.
     event = (event ?? {}) as TrackEvent;
 
@@ -213,13 +201,9 @@ export class AforoClient {
     const quantity = event.quantity ?? 1;
     const productType = normalizeProductType(event.productType) ?? this.productType;
     // Minted once, here, when the event is enqueued — never at flush/retry
-    // time, so a retried batch carries the same keys and the ingestor
-    // deduplicates it. A caller-supplied key is passed through verbatim;
-    // otherwise each event gets its own random UUID (no caller key = dedup
-    // opt-out). A deterministic hash of the event fields would make two
-    // genuinely distinct events in the same millisecond collide, and the
-    // ingestor would silently drop the second. Minted before the validity
-    // check so a dropped event reaches onDrop with its key.
+    // time, so a retried or requeued batch carries the same keys and the
+    // ingestor deduplicates it. A caller-supplied key is passed through
+    // verbatim; otherwise each event gets its own random UUID.
     const idempotencyKey = event.idempotencyKey ?? generateRandomKey();
 
     const resolved: ResolvedEvent = {
@@ -247,183 +231,66 @@ export class AforoClient {
       }
     }
 
-    const violation = describeInvalidEvent(event, resolved);
-    if (violation) {
-      // Not buffered, not sent, never thrown: an un-awaited rejected track()
-      // would crash the process on the hot path. Same shape as every other drop.
-      this.recordDrop([resolved], 'invalid', violation);
+    if (this.core.closed) {
+      this.core.enqueue(resolved); // reported as 'closed'
       return;
     }
 
-    this.enqueue(resolved);
-
-    // Trigger flush if buffer threshold reached
-    if (this.buffer.size >= this.flushCount) {
-      this.flush().catch(() => {});
+    const violation = describeInvalidEvent(event, resolved);
+    if (violation) {
+      this.core.reportDrop([resolved], 'invalid', violation);
+      return;
     }
+
+    this.core.enqueue(resolved);
   }
 
-  /** Buffer an event; surface the evicted-oldest event if the push overflowed. */
-  private enqueue(resolved: ResolvedEvent): void {
-    const evicted = this.buffer.pushEvict(resolved);
-    if (evicted) {
-      this.recordDrop([evicted], 'overflow');
-    }
-  }
-
-  /**
-   * Account for permanently lost events: bump the counter, WARN-log, and
-   * invoke the opt-in onDrop hook. Overflow logs are throttled (first, then
-   * every 1000th eviction) so sustained overflow can't storm the log;
-   * failed-batch drops log every time (bounded by flush cadence).
-   */
-  private recordDrop(events: ResolvedEvent[], reason: DropReason, detail?: string): void {
-    if (events.length === 0) return;
-    this.dropped += events.length;
-
-    if (reason === 'invalid') {
-      // Throttled like overflow: a tight loop of bad events can't storm the log.
-      this.invalidDrops += events.length;
-      if (this.invalidDrops === 1 || this.invalidDrops % 1000 === 0) {
-        console.warn(
-          `[aforo] Invalid event dropped — ${detail ?? 'failed validation'} ` +
-          `(${this.invalidDrops} invalid, ${this.dropped} total dropped). It was not sent.`,
-        );
-      }
-    } else if (reason === 'overflow') {
-      this.overflowDrops += events.length;
-      if (this.overflowDrops === 1 || this.overflowDrops % 1000 === 0) {
-        console.warn(
-          `[aforo] Buffer overflow: oldest event dropped (${this.dropped} total dropped). ` +
-          `Consider raising maxQueueSize or checking ingest connectivity.`,
-        );
-      }
-    } else {
-      console.warn(
-        `[aforo] Dropped ${events.length} event(s) — ${reason}` +
-        `${detail ? `: ${detail}` : ''} (${this.dropped} total dropped).`,
-      );
-    }
-
-    if (this.onDrop) {
-      try {
-        this.onDrop(events, reason);
-      } catch {
-        // A hook bug must never break tracking/flushing.
-      }
-    }
+  /** @internal Count and report an event a middleware could not build (reason 'invalid'). */
+  reportInvalid(event: ResolvedEvent, detail: string): void {
+    this.core.reportDrop([event], 'invalid', detail);
   }
 
   /**
-   * Force-flush all buffered events to the ingestor.
-   * Safe to call concurrently — only one flush runs at a time.
+   * Send everything queued now and wait for it. Runs on the single flusher —
+   * never a second concurrent request. While the ingestor is down this makes
+   * one attempt; unsent events stay queued.
    */
   async flush(): Promise<FlushResult> {
-    if (this.flushing && this.pendingFlush) {
-      return this.pendingFlush;
-    }
-
-    this.flushing = true;
-    this.pendingFlush = this.doFlush();
-
-    try {
-      return await this.pendingFlush;
-    } finally {
-      this.flushing = false;
-      this.pendingFlush = null;
-    }
-  }
-
-  private async doFlush(): Promise<FlushResult> {
-    let totalSent = 0;
-    let totalFailed = 0;
-
-    while (!this.buffer.isEmpty) {
-      const batch = this.buffer.drainUpTo(this.flushCount);
-      if (batch.length === 0) break;
-
-      const result = await this.transport.send(batch);
-      totalSent += result.sent;
-      totalFailed += result.failed;
-
-      if (result.failed > 0) {
-        // The batch was already drained from the buffer — without this it
-        // vanishes silently. Surface it (counter + WARN + opt-in hook).
-        // A partially accepted batch drops only the events the server
-        // rejected: by index when the response names them; otherwise they are
-        // counted and logged but not handed to onDrop (which ones is unknown).
-        if (result.sent > 0 || result.rejected) {
-          if (result.rejected) {
-            const lost = result.rejected.map((r) => batch[r.index]).filter(Boolean);
-            this.recordDrop(lost, 'rejected', result.message);
-          } else {
-            this.dropped += result.failed;
-            console.warn(
-              `[aforo] Ingestor rejected ${result.failed} of ${batch.length} event(s) in a batch` +
-              `${result.message ? `: ${result.message}` : ''} (${this.dropped} total dropped).`,
-            );
-          }
-        } else {
-          this.recordDrop(batch, result.reason ?? 'retry_exhausted', result.message);
-        }
-      }
-    }
-
-    return { sent: totalSent, failed: totalFailed };
+    const r = await this.core.flush();
+    return { sent: r.sent, failed: r.failed, requeued: r.requeued, queued: r.queued };
   }
 
   /**
-   * Flush remaining events and stop the client.
-   * After shutdown, track() will throw.
+   * Stop accepting events and send what is queued, for at most
+   * `shutdownTimeoutMs`. Events still queued at the deadline are counted and
+   * reported through onDrop with reason 'shutdown'. Safe to call more than once.
    */
   async shutdown(): Promise<void> {
-    if (this.closed) return;
-    this.closed = true;
-
-    // Deregister signal handlers so repeated create/shutdown cycles don't
-    // accumulate process listeners (safe if already fired — once() removed it).
-    process.removeListener('SIGTERM', this.signalHandler);
-    process.removeListener('SIGINT', this.signalHandler);
-
-    // Stop session heartbeats
     this.stopHeartbeatTimer();
-
-    // Clear periodic flush timer
-    if (this.flushTimer) {
-      clearInterval(this.flushTimer);
-      this.flushTimer = null;
-    }
-
-    // Flush with timeout. The escape-hatch timer MUST be cleared once the
-    // race settles — left dangling it holds the event loop open for up to
-    // shutdownTimeoutMs after a clean shutdown, delaying process exit in
-    // short-lived producers (CLIs, jobs, serverless handlers).
-    let escapeTimer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        this.flush(),
-        new Promise<void>((resolve) => {
-          escapeTimer = setTimeout(resolve, this.shutdownTimeoutMs);
-        }),
-      ]);
-    } finally {
-      if (escapeTimer) clearTimeout(escapeTimer);
-    }
+    await this.core.shutdown();
   }
 
-  /** Number of events currently buffered. */
+  /** Number of events currently queued. */
   get bufferedCount(): number {
-    return this.buffer.size;
+    return this.core.queued;
   }
 
-  /** Total events permanently dropped (overflow, failed batches, server-rejected and invalid events) since creation. */
+  /** Total events permanently dropped (every DropReason) since creation. */
   get droppedCount(): number {
-    return this.dropped;
+    return this.core.droppedCount;
   }
 
   /** Whether the client has been shut down. */
   get isShutdown(): boolean {
-    return this.closed;
+    return this.core.closed;
+  }
+
+  toJSON(): Record<string, unknown> {
+    return { productType: this.productType, buffered: this.bufferedCount, dropped: this.droppedCount, shutdown: this.isShutdown };
+  }
+
+  [Symbol.for('nodejs.util.inspect.custom')](): string {
+    return `AforoClient { productType: '${this.productType}', buffered: ${this.bufferedCount}, dropped: ${this.droppedCount}, shutdown: ${this.isShutdown} }`;
   }
 }
 

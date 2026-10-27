@@ -109,7 +109,7 @@ def test_wrapped_client_events_carry_no_status(http):
     c.publish("t/1", "x", qos=1)
     c.subscribe("t/#")
     c.on_connect(c, None, {}, 0)
-    c.on_disconnect(c, None, 1)
+    c.on_disconnect(c, None, 0)  # a clean disconnect is billed at once (a drop is debounced)
     b.shutdown()
     events = _events(http)
     assert len(events) == 4

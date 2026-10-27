@@ -71,6 +71,7 @@ describe('ingest contract guard (shared fixture)', () => {
       tenantId: 'tenant-001',
       productId: 'prod-grpc-001',
       apiKey: 'sk_test_abc',
+      trustCustomerHeader: true,
       ingestorUrl: 'https://ingest.test.aforo.ai',
       serviceName: 'acme.v1.UserService',
     });
@@ -110,6 +111,7 @@ describe('ingest contract guard (shared fixture)', () => {
       tenantId: 'tenant-001',
       productId: 'prod-grpc-001',
       apiKey: 'sk_test_abc',
+      trustCustomerHeader: true,
       ingestorUrl: 'https://ingest.test.aforo.ai',
       serviceName: 'acme.v1.UserService',
     });

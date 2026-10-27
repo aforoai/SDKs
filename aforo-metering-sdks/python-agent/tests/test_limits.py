@@ -20,7 +20,8 @@ from aforo_agent_metering.client import DEFAULT_INGESTOR_URL, MAX_LENGTHS
 def _client(**overrides: Any) -> AforoAgentClient:
     base: Dict[str, Any] = dict(
         tenant_id="tenant_test", product_id="prod_ai_001", api_key="k",
-        ingestor_url="https://ingest.test.aforo.ai",
+        ingestor_url="https://ingest.example.test", default_customer_id="cust_default",
+        flush_interval_sec=3600.0,
     )
     base.update(overrides)
     return AforoAgentClient(**base)
@@ -68,10 +69,10 @@ def test_values_at_the_limit_are_accepted_and_not_truncated() -> None:
         capability_name="c" * 64, agent_id="a" * 36, session_id="s" * 64, customer_id="x" * 64,
     )
     assert len(client) == 1 and client.dropped_count == 0
-    event = client._buffer.drain()[0]
+    event = client._buffer[0]
     assert event["agentId"] == "a" * 36 and event["customerId"] == "x" * 64
     assert event["metadata"]["capability_name"] == "c" * 64
-    assert event["metadata"]["sdkVersion"] == __version__ == "0.3.2"
+    assert event["metadata"]["sdkVersion"] == __version__ == "1.0.0"
 
 
 def test_invalid_step_is_dropped_not_raised() -> None:
@@ -91,7 +92,7 @@ def test_invalid_warning_is_throttled(caplog) -> None:
         for _ in range(1000):
             client.record_capability(capability_name="c", agent_id="")
     assert client.dropped_count == 1000
-    assert caplog.text.count("invalid event not sent") == 2  # 1st and 1000th
+    assert caplog.text.count("Invalid event not sent") == 2  # 1st and 1000th
 
 
 def test_unknown_execution_status_is_not_an_invalid_event() -> None:
@@ -104,7 +105,7 @@ def test_product_type_default_option_and_per_event_override() -> None:
     client = _client(product_type=" agentic_api ")
     client.record_capability(capability_name="c", agent_id="a")
     client.record_capability(capability_name="c", agent_id="a", product_type="ai_agent")
-    assert [e["productType"] for e in client._buffer.drain()] == ["AGENTIC_API", "AI_AGENT"]
+    assert [e["productType"] for e in client._buffer] == ["AGENTIC_API", "AI_AGENT"]
     assert _client().product_type == "AI_AGENT"
 
 
@@ -113,7 +114,7 @@ async def test_decorator_with_over_limit_agent_id_does_not_break_the_handler() -
     drops: List[str] = []
     client = _client(on_drop=lambda evs, reason: drops.append(reason))
 
-    @wrap_capability_handler(client, capability_name="c")
+    @wrap_capability_handler(client, trust_customer_header=True, capability_name="c")
     async def handler(*, agent_id: str) -> str:
         return "ok"
 
@@ -132,9 +133,10 @@ async def test_flush_count_clamped_and_flush_sent_in_slices_of_1000() -> None:
     client = _client(flush_count=5000, post_fn=post)
     assert client.flush_count == 1000
     for _ in range(2500):
-        client._buffer._events.append({"x": 1})
+        client.record_capability(capability_name="c", agent_id="a")
     await client.flush()
-    assert sizes == [1000, 1000, 500]
+    assert sum(sizes) == 2500 and max(sizes) <= 1000
+    await client.shutdown()
 
 
 @pytest.mark.asyncio
