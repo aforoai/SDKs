@@ -68,7 +68,9 @@
 
 -spec init() -> ok.
 init() ->
-    ensure(?TAB, [named_table, public, set, {write_concurrency, true}, {read_concurrency, true}]),
+    %% ordered_set: keys start with the window, so ets:first/1 is the
+    %% oldest open window (used when pruning emission counters).
+    ensure(?TAB, [named_table, public, ordered_set, {write_concurrency, true}, {read_concurrency, true}]),
     ensure(?EMITTED, [named_table, public, set]),
     persistent_term:put(?SETTINGS, #{
         window_ms => aforo_metering_config:aggregation_window_ms(),
@@ -299,10 +301,16 @@ build_event(Key = {WindowStart, Owner, EventType, Topic, Detail}, Customer, Coun
                   <<"mqttRetained">> => Retain}
     end.
 
-%% Forget emission counters for windows far in the past.
+%% Forget emission counters for windows far in the past -- never for a
+%% window that still has open rows (deferred or pending), or its next
+%% emission would reuse the first emission's key and be deduplicated.
 prune_emitted(_NowMs, 0) -> ok;
 prune_emitted(NowMs, WindowMs) ->
-    Old = NowMs - 10 * WindowMs - ?GRACE_MS,
+    Oldest = case ets:first(?TAB) of
+        {W, _, _, _, _} -> W;
+        '$end_of_table' -> NowMs
+    end,
+    Old = min(NowMs - 10 * WindowMs - ?GRACE_MS, Oldest),
     _ = ets:select_delete(?EMITTED, [{{{'$1', '_', '_', '_', '_'}, '_'},
                                       [{'<', '$1', Old}], [true]}]),
     ok.

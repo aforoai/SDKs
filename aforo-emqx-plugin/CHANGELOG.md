@@ -32,15 +32,15 @@ See [`TODO.md`](TODO.md) for the full production-hardening checklist.
 - Plugin stop (`prep_stop/1`) unhooks, closes every open window and sends within `shutdown_timeout_ms`; each send is cut off at the deadline even if the HTTP client does not honour its own timeout. Leftovers are counted as dropped.
 - Closing windows takes only as many as the queue has room for (counting the batch in flight); the rest wait in the counter table, so a slow ingestor never evicts freshly closed usage.
 - The ETS tables (customer cache, aggregation counters) are owned by `aforo_metering_sup`, so a crash of the resolver pool or the flusher loses neither the resolved customers nor the open windows; the flusher counts the queued events it loses on an abnormal stop.
-- Customer-cache rows record which connection they belong to: after a session takeover, the old channel's disconnect no longer expires the new session's entry. On reconnect the http resolver keeps using the previous customer until the new answer arrives; a lookup the queue refuses keeps it too.
+- Customer-cache rows record which connection they belong to: after a session takeover, the old channel's disconnect no longer expires the new session's entry. Within one connection a re-lookup keeps using the customer already resolved until the new answer arrives (a lookup the queue refuses keeps it too); a new connection never inherits the previous connection's customer.
 - The http resolver sends `clientAttrs` (what EMQX authentication set) with `clientId` and `username`, and is retried after the negative TTL from `message.publish` too. A pending lookup lasts `customer_resolver_pending_max_seconds`. Lookups that overrun their deadline are killed.
 - `exclude_topics` is now read (MQTT filters with `+` and `#`; read at start).
-- SNI is not sent for IP-literal hosts.
+- For IP-literal hosts no SNI is sent; the certificate is still checked against the IP (iPAddress SAN).
 - The configuration is validated at start (`aforo_metering_config:validate/0`); a bad setting stops the plugin with each reason logged.
 - Hooks catch their own failures, so metering can never break message delivery.
 - New counters: `aforo.metering.events.rejected`, `aforo.metering.events.unresolved`, `aforo.metering.aggregation.keys_dropped`, `aforo.metering.customer_lookup.negative`, `aforo.metering.resolver.dropped`. `health/0` adds `open_aggregation_keys`. `flush_now/0` returns after one send attempt.
 - `metadata.sdkVersion` is now `2.0.0`; `rebar.config` release and `vsn` are both `2.0.0`.
-- The eunit suites build without EMQX (`test` profile defines `AFORO_NO_EMQX`, using `include/aforo_metering_emqx.hrl`). 138 tests, including delivery tests against the Node mock ingestor and real TLS handshakes.
+- The eunit suites build without EMQX (`test` profile defines `AFORO_NO_EMQX`, using `include/aforo_metering_emqx.hrl`). 142 tests, including delivery tests against the Node mock ingestor and real TLS handshakes.
 
 ### Removed
 

@@ -109,7 +109,7 @@ pending_ttl_is_pending_max_test() ->
 %% A refused lookup keeps the client's previous customer.
 refused_lookup_keeps_previous_customer_test() ->
     tables(#{}, fun() ->
-        ok = ?C:put(?T, <<"d">>, <<"cust_prev">>),
+        ok = ?C:put(?T, <<"d">>, <<"cust_prev">>, 2, <<"u">>),
         Ref = make_ref(),
         ok = ?C:put_pending(?T, <<"d">>, Ref, 60000, {2, <<"u">>}),
         ?assertEqual({ok, <<"cust_prev">>}, ?C:get(?T, <<"d">>)),
@@ -255,14 +255,49 @@ http_lookup_sends_client_attrs_test_() ->
         end
     end}.
 
-%% ── #11: no SNI for an IP literal ──────────────────────────────────
+%% ── #11: IP literals: no SNI option, hostname check still on ──────
 
-no_sni_for_ip_literal_test() ->
+ip_literal_keeps_hostname_check_test() ->
     aforo_test_util:with_config(#{}),
     try
-        ?assertEqual(disable, proplists:get_value(server_name_indication,
-                     aforo_metering_http:ssl_options(<<"https://10.0.0.5/v1/ingest/batch">>))),
-        ?assertEqual(disable, proplists:get_value(server_name_indication,
+        O = aforo_metering_http:ssl_options(<<"https://10.0.0.5/v1/ingest/batch">>),
+        ?assertEqual(undefined, proplists:get_value(server_name_indication, O)),
+        ?assertEqual(verify_peer, proplists:get_value(verify, O)),
+        ?assertMatch([{match_fun, _}], proplists:get_value(customize_hostname_check, O)),
+        ?assertEqual(undefined, proplists:get_value(server_name_indication,
                      aforo_metering_http:ssl_options(<<"https://[::1]:8443/x">>)))
     after aforo_test_util:reset_config()
     end.
+
+%% ── #8: a new connection does not inherit the old customer ─────────
+
+new_connection_does_not_inherit_previous_customer_test() ->
+    tables(#{}, fun() ->
+        ok = ?C:put(?T, <<"d">>, <<"cust_old">>, 1, <<"u">>),
+        ok = ?C:put_pending(?T, <<"d">>, make_ref(), 60000, {2, <<"u">>}),
+        ?assertEqual(pending, ?C:get(?T, <<"d">>)),
+        %% same connection: the previous customer is used meanwhile
+        ok = ?C:put(?T, <<"e">>, <<"cust_e">>, 3, <<"u">>),
+        ok = ?C:put_pending(?T, <<"e">>, make_ref(), 60000, {3, <<"u">>}),
+        ?assertEqual({ok, <<"cust_e">>}, ?C:get(?T, <<"e">>))
+    end).
+
+%% ── review 2: a deferred row past the prune horizon keeps its key ──
+
+deferred_row_keeps_emission_counter_test() ->
+    tables(#{}, fun() ->
+        Old = erlang:system_time(millisecond) div 60000 * 60000 - 20 * 60000,
+        K = fun(C) -> {Old, {customer, C}, <<"PUBLISH">>, <<"#">>, {agg, 0, false}} end,
+        ets:insert(aforo_metering_agg, {K(<<"b">>), 1, 0}),
+        %% emitted just after the window ended
+        {[E1], 0} = ?A:close_windows(Old + 62000),
+        %% a late increment for b lands, plus a row for a; 20 minutes later
+        %% the queue has room for one: a (sorted first) goes, b waits while
+        %% the emission counters are pruned
+        ets:insert(aforo_metering_agg, {K(<<"b">>), 1, 0}),
+        ets:insert(aforo_metering_agg, {K(<<"a">>), 1, 0}),
+        {[_A], 0} = ?A:close_windows(erlang:system_time(millisecond), 1),
+        {[E2], 0} = ?A:close_windows(erlang:system_time(millisecond)),
+        ?assertEqual(<<"b">>, maps:get(<<"customerId">>, E2)),
+        ?assertNotEqual(maps:get(<<"idempotencyKey">>, E1), maps:get(<<"idempotencyKey">>, E2))
+    end).

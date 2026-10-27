@@ -36,7 +36,10 @@
 -define(OVERRIDES, {?MODULE, overrides}).
 
 %% Backends whose answer the connecting client chooses. They need
-%% `unsafe_trust_client_identity = true'.
+%% `unsafe_trust_client_identity = true'. `http' is the operator's own
+%% resolver (the SDKs' customerResolver): it receives the verified
+%% clientAttrs as well as the client-sent clientId/username, and which
+%% one it maps from is the operator's code -- so it is not gated here.
 -define(UNSAFE_BACKENDS, [<<"username">>, <<"clientid_prefix">>, <<"jwt_unverified">>]).
 -define(SAFE_BACKENDS, [<<"client_attrs">>, <<"http">>]).
 

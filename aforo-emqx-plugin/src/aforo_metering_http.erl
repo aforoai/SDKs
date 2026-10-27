@@ -62,19 +62,19 @@ ssl_options(Url) ->
     case string:lowercase(to_bin(Scheme)) of
         <<"https">> ->
             Host = binary_to_list(strip_brackets(to_bin(Host0))),
-            %% SNI carries a DNS name only (RFC 6066 3); for an IP literal it
-            %% is switched off and the certificate is checked against the
-            %% IP (iPAddress SAN) by the hostname check.
+            %% For an IP literal the option is left out: OTP then checks the
+            %% certificate against the host it connects to and sends no SNI
+            %% (RFC 6066 3 allows DNS names only). Never `disable' -- that
+            %% also switches the hostname check off.
             Sni = case inet:parse_address(Host) of
-                {ok, _} -> disable;
-                {error, _} -> Host
+                {ok, _} -> [];
+                {error, _} -> [{server_name_indication, Host}]
             end,
             [{verify, verify_peer},
              ca_option(),
              {depth, 10},
-             {server_name_indication, Sni},
              {customize_hostname_check,
-              [{match_fun, public_key:pkix_verify_hostname_match_fun(https)}]}];
+              [{match_fun, public_key:pkix_verify_hostname_match_fun(https)}]}] ++ Sni;
         _ -> []
     end.
 

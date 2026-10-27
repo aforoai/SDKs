@@ -91,7 +91,9 @@ resolve(ClientInfo) ->
                     start_async(Tenant, ClientId, Conn, ClientInfo);
                 Backend ->
                     C = resolve_sync(Backend, ClientInfo, #{}),
-                    ok = aforo_metering_cache:put(Tenant, ClientId, C, undefined, username(ClientInfo)),
+                    %% keep the row's connection marker (session takeover)
+                    Conn = aforo_metering_cache:conn_of(Tenant, ClientId),
+                    ok = aforo_metering_cache:put(Tenant, ClientId, C, Conn, username(ClientInfo)),
                     C
             end
     end.

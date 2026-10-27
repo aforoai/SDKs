@@ -100,7 +100,7 @@ Delivery follows the same rules as the Aforo SDKs (`aforo-metering-sdks/contract
 - 401, 403 and 3xx are outages, not drops: the key or URL is wrong, and fixing it must not lose the queued usage. Logged at ERROR once per pause.
 - After an outage the batch goes back to the front of the queue with the same keys and sending pauses for `max(250 ms, random(0, min(5 min, 5 s · 2ⁿ)))`; the next success resumes it.
 - 413 halves the batch. Any other 4xx, and events a 2xx marks `retryable: false`, are dropped and logged. Events marked `retryable: true` are re-sent.
-- The queue holds `max_buffer_size` events (counting the batch in flight). Closed windows that don't fit wait in the counter table until there is room, so a slow or failing ingestor fills the counter table (capped by `max_aggregation_keys`, overflow counted) before any queued usage is dropped.
+- The queue holds `max_buffer_size` events (counting the batch in flight). Closed windows that don't fit wait in the counter table until there is room, so a slow or failing ingestor fills the counter table before any queued usage is dropped. Once the table reaches `max_aggregation_keys`, usage for NEW (customer, metric, window) keys is dropped and counted; existing keys keep counting.
 - On plugin stop, every open window is closed and sent within `shutdown_timeout_ms`; what is left is counted as dropped.
 
 ## Hooks and events

@@ -36,6 +36,7 @@
     complete_pending/4,
     refuse_pending/3,
     retry_inputs/2,
+    conn_of/2,
     expire_after/4,
     invalidate/2,
     sweep/0,
@@ -122,14 +123,17 @@ put_negative(TenantId, ClientId, TtlMs) ->
     end,
     insert({Key, none, undefined, now_ms() + TtlMs, Conn, User}).
 
-%% Start (or restart) an async lookup. The last good customer is kept
-%% and used until the answer arrives.
+%% Start (or restart) an async lookup. Within one connection the last
+%% good customer is kept and used until the answer arrives; a new
+%% connection (possibly a different identity) starts without one.
 -spec put_pending(binary(), binary(), reference(), pos_integer(), {term(), binary()}) -> ok.
 put_pending(TenantId, ClientId, Ref, TtlMs, {Conn, Username}) ->
     Key = {TenantId, ClientId},
+    Now = now_ms(),
     Prev = case lookup(Key) of
-        [{_, ok, C, _, _, _}] -> C;
-        [{_, pending, {_, P}, _, _, _}] -> P;
+        [{_, ok, C, Exp, Conn, _}] when Conn =/= undefined, Conn =/= gone ->
+            case live(Exp, Now) of true -> C; false -> undefined end;
+        [{_, pending, {_, P}, _, Conn, _}] when Conn =/= undefined, Conn =/= gone -> P;
         _ -> undefined
     end,
     insert({Key, pending, {Ref, Prev}, now_ms() + TtlMs, Conn, Username}).
@@ -193,6 +197,14 @@ expire_after(TenantId, ClientId, Conn, Ms) ->
           when Conn =:= undefined; RowConn =:= undefined; RowConn =:= Conn ->
             insert({Key, S, V, now_ms() + Ms, gone, User});
         _ -> ok
+    end.
+
+%% The connection marker of an existing row, or undefined.
+-spec conn_of(binary(), binary()) -> term().
+conn_of(TenantId, ClientId) ->
+    case lookup({TenantId, ClientId}) of
+        [{_, _, _, _, Conn, _}] when Conn =/= gone -> Conn;
+        _ -> undefined
     end.
 
 -spec invalidate(binary(), binary()) -> ok.

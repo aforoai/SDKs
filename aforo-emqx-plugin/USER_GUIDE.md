@@ -96,7 +96,7 @@ Other resolvers:
 
 Set `unsafe_trust_client_identity = true` only when broker authentication already ties that value to one customer (for example, username/password authentication where each username belongs to one customer).
 
-The `http` resolver runs in a worker pool, never in the client's process: CONNECT does not wait for your service. Usage recorded while a lookup is pending is held under the client ID (up to `customer_resolver_pending_max_seconds`) and attributed when the answer arrives; on reconnect the previous customer is used until the new answer arrives. "No customer" answers and failed lookups are cached for `customer_resolver_negative_ttl_seconds`, then retried — also from `message.publish`, so a device that only publishes recovers after a mapping-service blip.
+The `http` resolver runs in a worker pool, never in the client's process: CONNECT does not wait for your service. Usage recorded while a lookup is pending is held under the client ID (up to `customer_resolver_pending_max_seconds`) and attributed when the answer arrives; a reconnect waits for its own answer (it never inherits the previous connection's customer). "No customer" answers and failed lookups are cached for `customer_resolver_negative_ttl_seconds`, then retried — also from `message.publish`, so a device that only publishes recovers after a mapping-service blip.
 
 > ⚠ On `message.publish` the hook only receives the client identifier, so the publisher's customer comes from the connect-time cache. A client that publishes without `client.connected` firing after the plugin started (persistent sessions across a plugin restart) is not billed until it reconnects; its messages count as `aforo.metering.events.unresolved`.
 

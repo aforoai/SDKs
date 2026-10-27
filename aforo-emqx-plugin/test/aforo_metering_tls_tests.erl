@@ -52,13 +52,16 @@ ssl_options_test() ->
 
 %% Server certificate for DnsName signed by a fresh test root. Returns
 %% {ServerSslOpts, RootDer}.
-test_pki(DnsName) ->
+test_pki({ip, Ip}) -> test_pki_san({iPAddress, Ip});
+test_pki(DnsName) -> test_pki_san({dNSName, DnsName}).
+
+test_pki_san(San) ->
     Data = public_key:pkix_test_data(#{
         server_chain => #{root => [{key, {rsa, 2048, 65537}}], intermediates => [],
                           peer => [{key, {rsa, 2048, 65537}},
                                    {extensions,
                                     [#'Extension'{extnID = ?'id-ce-subjectAltName',
-                                                  extnValue = [{dNSName, DnsName}],
+                                                  extnValue = [San],
                                                   critical = false}]}]},
         client_chain => #{root => [], intermediates => [], peer => []}}),
     #{server_config := ServerOpts, client_config := ClientOpts} = Data,
@@ -97,14 +100,16 @@ write_pem(Der) ->
     ok = file:write_file(File, public_key:pem_encode([{'Certificate', Der, not_encrypted}])),
     File.
 
-tls_case(SanName, Cfg, Fun) ->
+tls_case(SanName, Cfg, Fun) -> tls_case(SanName, "localhost", Cfg, Fun).
+
+tls_case(SanName, UrlHost, Cfg, Fun) ->
     _ = application:ensure_all_started(ssl),
     {ServerOpts, RootDer} = test_pki(SanName),
     {Pid, Port} = start_tls_server(ServerOpts),
     Pem = write_pem(RootDer),
     aforo_test_util:with_config(Cfg(Pem)),
     ok = ?H:start_profile(),
-    try Fun("https://localhost:" ++ integer_to_list(Port) ++ "/v1/ingest/batch")
+    try Fun("https://" ++ UrlHost ++ ":" ++ integer_to_list(Port) ++ "/v1/ingest/batch")
     after
         exit(Pid, kill),
         file:delete(Pem),
@@ -132,3 +137,16 @@ hostname_mismatch_is_refused_test() ->
 ca_file_ignored_for_plain_loopback_test() ->
     ?assertEqual(ok, validate(<<"http://127.0.0.1:8084/v1/ingest/batch">>,
                               #{ca_cert_file => <<"/no/such/file.pem">>})).
+
+%% An IP-literal URL still gets the hostname check: a trusted certificate
+%% for another name is refused...
+ip_literal_wrong_name_is_refused_test() ->
+    tls_case("localhost", "127.0.0.1", fun(Pem) -> #{ca_cert_file => list_to_binary(Pem)} end, fun(Url) ->
+        ?assertMatch({error, _}, ?H:request_post(Url, [], <<"{}">>, 5000))
+    end).
+
+%% ...and one issued for that IP (iPAddress SAN) is accepted.
+ip_literal_matching_ip_san_succeeds_test() ->
+    tls_case({ip, <<127, 0, 0, 1>>}, "127.0.0.1", fun(Pem) -> #{ca_cert_file => list_to_binary(Pem)} end, fun(Url) ->
+        ?assertMatch({ok, {{_, 200, _}, _, _}}, ?H:request_post(Url, [], <<"{}">>, 5000))
+    end).
