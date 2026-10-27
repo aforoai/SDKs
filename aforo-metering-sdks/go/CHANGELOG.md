@@ -2,6 +2,27 @@
 
 All notable changes to `metering-go` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [2.0.0] - 2026-10-26
+
+**Breaking.** New import path `github.com/aforoai/SDKs/aforo-metering-sdks/go/v2`. Migration: `client, err := metering.NewClient(opts)`; `client.Close(ctx)` and `client.Flush(ctx)` take a context; build the middleware with `metering.NewMiddleware(client, metering.MiddlewareOptions{CustomerResolver: ...})` and close the client yourself at shutdown.
+
+### Changed
+- **Transport edge cases (wave 5 review, contract/TRANSPORT-SPEC.md "Edge cases").** Redirects are never followed, also with a caller-supplied `HTTPClient` (a copy with redirects refused is used): a `3xx` is logged at ERROR with the target host and handled like an outage. Every `5xx` is retried (`501`/`505` were dropped). `Timeout` now also covers reading the response body; a `2xx` whose body is cut off is retried with the same keys instead of counted as sent. Events a `2xx` names in `errors[]` as `retryable` are resent after the normal backoff at most `MaxRetries` times, then handled as an outage; `errors[]` is used even when `failed` is missing or 0. The breaker pause is `max(250 ms, random(0, 5 s·2^n))`, capped at 5 min (it was 5 s plus jitter). Shutdown keeps retrying an unreachable ingestor until its deadline instead of stopping at the first outage. `Retry-After` accepts fractional seconds (`1.5`). A second close returns the first one's result.
+- **Callbacks may call Flush and Close.** Calling them from `OnDrop`, `OnError` or `OnAccepted` deadlocked the sender; `Flush` now returns at once there and close starts the shutdown and returns.
+- **`Options.OnError` and `Options.OnAccepted` (new).** `OnError` receives a `*TransportError` with `Kind` (`KindOutage`, `KindAuth`, `KindRejected`, `KindShutdown`, `KindClosed`), `Status` and the `Events` concerned; `OnAccepted` receives each `2xx` body (envelope removed) and its events.
+- **Customer identity (G265).** The middleware needs a `CustomerResolver` (your authenticated customer id) or `TrustCustomerHeader: true`; with neither, `NewMiddleware` returns `ErrNoCustomerResolver`. It no longer reads `X-Customer-Id` by default. `CustomerIDFunc` is renamed `CustomerResolver`. A request with no resolved customer is dropped as `invalid` and counted, not skipped silently.
+- **You own the client (G272).** `NewMiddleware`, `HTTPMiddleware(next, client, opts)` and `ChiMiddleware(client, opts)` take the client you created; `MiddlewareOptions.APIKey`, `BaseURL` and `ClientOptions` are removed. Chi no longer creates one client per handler.
+- **One sender, bounded queue (G266, G274).** `Track` no longer starts a goroutine above the threshold; it wakes one long-lived sender. `Flush(ctx)` hands work to that sender and waits.
+- **Outages keep the events (G267).** After the retries (and on `401`/`403`) a batch goes back to the front of the queue with the same idempotency keys and the sender pauses (5 s doubling to 5 min). `Flush` returns `ErrIngestUnavailable` instead of dropping. `retry_exhausted` is no longer reported.
+- **Bounded shutdown (G273).** `Close(ctx)` stops at the earlier of `ctx`'s deadline and `ShutdownTimeout` (previously never read), reports what is left as `shutdown` and returns `ErrShutdownIncomplete`. `Track` after `Close` reports `closed`.
+- **Retries (G268).** Full-jitter backoff (base 500 ms, cap 30 s); `Retry-After` in seconds or HTTP-date form, capped at 60 s; `413` splits the batch; per-event `retryable` failures are requeued.
+- **Batches and connections (G269).** Default `FlushCount` is 500 (was 50); a batch over 4 MiB of JSON is split. One pooled HTTP client per SDK client. No gzip (the ingestor does not decode it).
+- **https only (G270).** `NewClient` returns an error for an `http://` URL other than localhost unless `AllowInsecureHTTP` is set. `Options.String()` and the client's `String()` never print the API key.
+- **Middleware writer (G275).** The response writer implements `Flush`, `Hijack` and `Unwrap`.
+- **One transport core (G271).** Sending lives in `internal/ingest`, copied unchanged into `go-ws`, `go-mqtt`, `go-grpc` and `go-graphql`.
+- New: `FlushResult{Sent, Rejected, Pending}` (was `Sent, Failed`), `DropShutdown`, `DropClosed`, `ErrIngestUnavailable`, `ErrShutdownIncomplete`, `Options.HTTPClient`, `Options.AllowInsecureHTTP`, `User-Agent: aforo-go/2.0.0`.
+- `VERSION`: 2.0.0.
+
 ## [1.1.2] - 2026-10-01
 
 ### Changed

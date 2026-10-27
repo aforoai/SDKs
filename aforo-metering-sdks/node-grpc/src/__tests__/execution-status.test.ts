@@ -19,6 +19,7 @@ const config = () => ({
   tenantId: 'tenant-001',
   productId: 'prod-001',
   apiKey: 'sk_test_abc',
+  trustCustomerHeader: true,
   ingestorUrl: 'https://api.aforo.ai',
   serviceName: 'acme.v1.UserService',
   flushCount: 100,

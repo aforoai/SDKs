@@ -2,7 +2,7 @@
 
 Meter every GraphQL operation — query, mutation, subscription — with AST-derived complexity scoring, and ship the usage events to Aforo without touching your resolvers. Drops in as an Apollo Server 4 plugin or an Express/`graphql-http` middleware.
 
-**Version:** 1.2.2 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -12,7 +12,7 @@ Intended public install (once published):
 npm i @aforoai/graphql-metering graphql
 ```
 
-> **Install `1.2.2` or later. `1.0.0` on npm was built from an older copy of this code and lacks the fixes listed in the changelog.** If `1.2.2` is not on npm yet, install from source with the steps below. `graphql` is a peer dependency (`^15 || ^16`), so install it in your app.
+> **Install `2.0.0` or later. `1.0.0` on npm was built from an older copy of this code and lacks the fixes listed in the changelog.** If `2.0.0` is not on npm yet, install from source with the steps below. `graphql` is a peer dependency (`^15 || ^16`), so install it in your app.
 
 ```bash
 # from the SDKs repo root
@@ -38,6 +38,8 @@ const billing = new AforoGraphQlBilling({
   apiKey: process.env.AFORO_API_KEY!,
   ingestorUrl: 'https://api.aforo.ai', // SDK appends /v1/ingest/batch
   schemaVersion: 'v2.1',
+  // Who is billed: from identity your server verified. Receives Apollo's contextValue.
+  customerResolver: (ctx) => ctx.user?.aforoCustomerId,
 });
 
 const server = new ApolloServer({
@@ -48,8 +50,13 @@ const server = new ApolloServer({
 
 await startStandaloneServer(server, {
   listen: { port: 4000 },
-  // the default customer-id extractor reads x-customer-id off the request headers
-  context: async ({ req }) => ({ req, headers: req.headers }),
+  context: async ({ req }) => ({ user: await verifySession(req) }),
+});
+
+// The SDK installs no signal handlers. Flush from your own:
+process.once('SIGTERM', async () => {
+  await billing.shutdown();
+  process.exit(0);
 });
 ```
 
@@ -65,6 +72,7 @@ const billing = new AforoGraphQlBilling({
   productId: 'prod_graphql_001',
   apiKey: process.env.AFORO_API_KEY!,
   ingestorUrl: 'https://api.aforo.ai',
+  customerResolver: (req) => req.user?.aforoCustomerId, // receives the Express request
 });
 
 const app = express();
@@ -72,7 +80,7 @@ app.use(express.json()); // billing.middleware() reads req.body.query — body m
 app.use('/graphql', billing.middleware(), createHandler({ schema }));
 ```
 
-> The middleware records in `res.end`, after the response is produced. It never blocks or fails the request — any error inside the metering path is swallowed.
+> The middleware lets the response go out first: `res.end` sends it, and the body is parsed and the operation recorded on the next turn of the event loop (`setImmediate`). The Apollo plugin does the same after `willSendResponse`. Metering never blocks or fails the request; an error in the metering path is reported through `onError`.
 
 Every recorded operation emits one event with `metricName: "graphql_api.operations"`, `quantity: 1`, and the operation's type/name/complexity/field-count attached. Ships to `POST https://api.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
 
@@ -84,16 +92,23 @@ Every recorded operation emits one event with `metricName: "graphql_api.operatio
 |---|---|---|---|
 | `tenantId` | `string` | — (required) | Aforo tenant. Sent as the `X-Tenant-Id` header. Never read from a client header. |
 | `productId` | `string` | — (required) | Aforo product id; attached to each event's `metadata.productId`. |
-| `apiKey` | `string` | — (required) | Aforo API key. Sent as `X-API-Key: <apiKey>`. |
-| `ingestorUrl` | `string` | — (required) | Ingestion base URL. The SDK appends `/v1/ingest/batch` (trailing slash trimmed). Use `https://api.aforo.ai`. |
+| `apiKey` | `string` | — (required) | Aforo API key. Sent only as `X-API-Key: <apiKey>`; never logged or shown by `inspect()` / `JSON.stringify`. |
+| `ingestorUrl` | `string` | — (required) | Ingestion base URL, `https://` (see `allowInsecureHttp`). The SDK appends `/v1/ingest/batch` (trailing slash trimmed). Use `https://api.aforo.ai`. |
 | `productType` | `string` | `'GRAPHQL_API'` | Aforo product type sent as top-level `productType` on every event (trimmed + uppercased; unknown values pass through). Override via `record({ productType })`, `billing.middleware({ productType })` or `aforoApolloPlugin(billing, { productType })`. |
 | `schemaVersion` | `string` | `undefined` | Optional schema version string; copied into each event's `metadata.schemaVersion`. |
-| `customerIdExtractor` | `(context) => string \| undefined` | reads `x-customer-id` from the request/context headers | Resolve the Aforo customer id per operation. Return `undefined` and the operation is not metered. |
+| `customerResolver` | `(context) => string \| undefined` | — (required unless `trustCustomerHeader`) | The Aforo customer per operation, from identity your server verified. Receives the Express request (`middleware()`) or Apollo's `contextValue` (plugin). Returning nothing, or throwing, drops that operation's event as `invalid` (counted); the response is never affected. The constructor throws when neither this nor `trustCustomerHeader` is given. `customerIdExtractor` still works as a deprecated alias. |
+| `trustCustomerHeader` | `boolean` | `false` | Bill the `x-customer-id` request header (from `req.headers`, `ctx.req.headers` or `request.http.headers`). Any client can send it, so only turn this on behind a proxy you control that sets it. |
 | `complexityScorer` | `(doc, operationName?) => { complexity, fieldCount }` | `fieldCount + 5 × maxDepth` | Override the complexity formula. Receives the parsed `DocumentNode`. |
-| `flushCount` | `number` | `50` | Buffered events that trigger an immediate flush. |
-| `flushIntervalMs` | `number` | `5000` | Max ms before a partial batch is flushed by the background timer. |
-| `onError` | `(error: Error) => void` | logs to `console.error` | Called once per delivery problem: a batch dropped after 3 attempts (network errors / 408 / 429 honouring `Retry-After` / 5xx), a batch refused with any other 4xx (not retried; the message includes the ingestor's `errors[].message`), per-event failures reported in a 2xx response, and an unusable `executionStatus`. Exceptions it throws are swallowed. |
-| `onDrop` | `(events, reason) => void` | none | Receives events that were permanently dropped, with reason `invalid`, `rejected` or `retry_exhausted`. See [Dropped events](#dropped-events). |
+| `allowInsecureHttp` | `boolean` | `false` | Accept a plain `http://` `ingestorUrl` on a non-local host. `https://` is required otherwise (plain http is fine for `localhost`, `127.0.0.1`, `::1`). |
+| `flushCount` | `number` | `500` | Events per request (max 1000). Reaching it wakes the background sender; recording an event never sends by itself. |
+| `flushIntervalMs` | `number` | `5000` | The background sender also runs this often. |
+| `maxQueueSize` | `number` | `10000` | Queue capacity. When it is full — usually during a long outage — the oldest event is dropped with reason `overflow`. |
+| `maxRetries` | `number` | `3` | Retries per batch on network errors, timeouts, 408, 429 and 5xx, with full-jitter backoff (`Retry-After` in seconds or as a date is honoured, capped at 60 s). |
+| `timeoutMs` | `number` | `10000` | Total deadline per request. |
+| `shutdownTimeoutMs` | `number` | `5000` | How long `shutdown()` keeps sending. Events still queued then are dropped with reason `shutdown`. |
+| `flushOnExit` | `boolean` | `true` | Send queued events on the process `beforeExit` event, within `shutdownTimeoutMs`. The SDK installs no signal handlers. |
+| `onError` | `(error: Error) => void` | logs to `console.error` | Called for delivery problems: a batch the ingestor refused (the message includes its `errors[].message`), an ingestor outage (once per outage), events lost at the shutdown deadline, and an unusable `executionStatus`. Exceptions it throws are caught. Delivery reports are a `CoreTransportError`: branch on `err.kind` (`outage`, `auth`, `rejected`, `shutdown`, `closed`) and read `err.events`, not the message. |
+| `onDrop` | `(events, reason) => void` | none | Receives events lost for good. See [Dropped events](#dropped-events). |
 
 Exported symbols: `AforoGraphQlBilling` (with `record` / `middleware` / `shutdown` / `droppedCount`), `aforoApolloPlugin(billing, options?)`, `defaultComplexityScorer(doc, operationName?)`, `outcomeFromGraphQlResponse`, `outcomeFromHttpStatus`, `DEFAULT_PRODUCT_TYPE`, and the `AforoGraphQlConfig` / `RecordArgs` / `GraphQlMiddlewareOptions` / `AforoApolloPluginOptions` / `AforoGraphQlIntegrationOptions` / `GraphQlUsageEvent` / `DropReason` types.
 
@@ -113,6 +128,10 @@ Each recorded operation becomes a single event:
   "executionDurationMs": 12
 }
 ```
+
+## Delivery
+
+One background sender per client sends one request at a time; recording an event only queues it. If the ingestor is unreachable, keeps answering 408/429/5xx after the retries, or answers 401/403 (a wrong or revoked key — logged as an error), the batch goes back to the front of the queue with its idempotency keys and sending pauses (5 s, doubling to 5 min, randomized). New events keep queueing up to `maxQueueSize`; the first successful request resumes sending, and the ingestor deduplicates the re-sent keys. A 413 splits the batch. Request bodies are plain JSON (the ingestor does not decode gzip). `flush()` sends what is queued now; `shutdown()` sends for at most `shutdownTimeoutMs` — call it from your own SIGTERM handler.
 
 ## Execution status
 
@@ -152,11 +171,14 @@ The SDK does not throw into your resolvers or the response path for event conten
 
 | Reason | When |
 |---|---|
-| `invalid` | The event failed a client-side check and was never buffered or sent: `customerId` longer than 64 characters or `productType` longer than 20. Values you set are never truncated. An operation name longer than 255 characters is not a drop: it is read from the query, so it is cut to 255 and the event is sent (one warning per label). The warning names the field, the limit and the value (first 80 characters); it is logged for the first occurrence per field and for every 1000th after that. |
+| `invalid` | The customer resolver returned nothing (or threw), or the event failed a client-side check and was never queued or sent: `customerId` longer than 64 characters or `productType` longer than 20. Values you set are never truncated. An operation name longer than 255 characters is not a drop: it is read from the query, so it is cut to 255 and the event is sent (one warning per label). The warning names the field, the limit and the value (first 80 characters); it is logged for the first invalid event and for every 1000th after that. |
 | `rejected` | The ingestor refused the batch with a 4xx other than 408 / 429 (not retried), or named individual events in the `errors[]` of a 2xx response — then only those events are dropped. When a 2xx reports `failed > 0` without a usable `index`, the count is added to `droppedCount` and `onDrop` is not called. |
-| `retry_exhausted` | Network errors, 408, 429 or 5xx persisted through 3 attempts (1s / 2s / 4s backoff; `Retry-After` honoured up to 30 s). |
+| `overflow` | The queue (`maxQueueSize`) was full and the oldest event was evicted. |
+| `shutdown` | Still queued when `shutdownTimeoutMs` ran out (also reported through `onError`). |
+| `closed` | Recorded after `shutdown()`. |
+| `retry_exhausted` | Not produced by 2.x (kept in the type): an outage keeps events queued instead of dropping them. |
 
-A call with no resolvable customer id is not billable; it is skipped and is not counted as a drop.
+An operation with no resolvable customer is not metered and is counted as an `invalid` drop. Calling `record()` yourself with a blank `customerId` does the same.
 
 ```ts
 const billing = new AforoGraphQlBilling({
@@ -172,6 +194,6 @@ Step-by-step from install to a verified event in Aforo: [USER_GUIDE.md](USER_GUI
 ## What this doesn't cover
 
 - **No per-field cost tables out of the box.** The default scorer is `fieldCount + 5 × maxDepth`. Real per-field pricing means supplying your own `complexityScorer`.
-- **No persistent buffer.** Events live in memory until flushed. A hard crash before flush drops the buffered batch; `shutdown()` flushes on graceful exit, but `SIGKILL` / power loss does not.
-- **No automatic customer resolution beyond `x-customer-id`.** JWT decoding, session lookups, etc. require a `customerIdExtractor`.
+- **No persistent buffer.** Events live in memory until sent. A hard crash loses what is queued; `shutdown()` sends it on graceful exit, but `SIGKILL` / power loss does not.
+- **No automatic customer resolution.** You supply `customerResolver` (session lookup, JWT decoding), or opt in to the `x-customer-id` header with `trustCustomerHeader`.
 - **The SDK does not enforce or read pricing.** It emits usage; rating/billing happens in Aforo.

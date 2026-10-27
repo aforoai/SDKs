@@ -13,10 +13,20 @@ from aforo.client import AforoClient
 from aforo.limits import MAX_LENGTHS, describe_limit_violation
 
 
+_clients = []
+
+
+@pytest.fixture(autouse=True)
+def _shutdown_clients():
+    yield
+    while _clients:
+        _clients.pop().shutdown(timeout=0)
+
+
 def _client(drops=None):
-    # base_url points at a closed port: these tests assert on what is buffered,
-    # and the shutdown flush must never reach a real ingestor.
-    return AforoClient(
+    # base_url points at a closed port: these tests assert on what is queued,
+    # and nothing must ever reach a real ingestor.
+    client = AforoClient(
         api_key="sk_test_limits",
         base_url="http://127.0.0.1:1",
         flush_count=1_000_000,
@@ -24,6 +34,8 @@ def _client(drops=None):
         max_retries=0,
         on_drop=(lambda events, reason: drops.append((events, reason))) if drops is not None else None,
     )
+    _clients.append(client)
+    return client
 
 
 def _assert_invalid_drop(client, drops, before=0):
@@ -47,12 +59,12 @@ def test_string_length_limit(field, kwarg, caplog):
     client = _client(drops)
 
     client.track(**{**_valid(), kwarg: "x" * limit})
-    assert client._buffer.size == 1
+    assert client.buffered_count == 1
     assert client.dropped_count == 0
 
     with caplog.at_level("WARNING", logger="aforo.client"):
         client.track(**{**_valid(), kwarg: "x" * (limit + 1)})  # must not raise
-    assert client._buffer.size == 1, "the invalid event must not be buffered"
+    assert client.buffered_count == 1, "the invalid event must not be buffered"
     _assert_invalid_drop(client, drops)
     assert field in caplog.text and str(limit) in caplog.text
 
@@ -62,7 +74,7 @@ def test_quantity_decimal_places_rejected_not_rounded(caplog):
     client = _client(drops)
     with caplog.at_level("WARNING", logger="aforo.client"):
         client.track(**{**_valid(), "quantity": 1.1234567})
-    assert client._buffer.size == 0
+    assert client.buffered_count == 0
     _assert_invalid_drop(client, drops)
     assert "decimal places" in caplog.text
     assert drops[-1][0][0].quantity == 1.1234567
@@ -71,7 +83,7 @@ def test_quantity_decimal_places_rejected_not_rounded(caplog):
 def test_quantity_at_six_decimal_places_accepted():
     client = _client()
     client.track(**{**_valid(), "quantity": 1.123456})
-    assert client._buffer.size == 1
+    assert client.buffered_count == 1
 
 
 def test_quantity_integer_digits_rejected(caplog):
@@ -79,7 +91,7 @@ def test_quantity_integer_digits_rejected(caplog):
     client = _client(drops)
     with caplog.at_level("WARNING", logger="aforo.client"):
         client.track(**{**_valid(), "quantity": 10**15})
-    assert client._buffer.size == 0
+    assert client.buffered_count == 0
     _assert_invalid_drop(client, drops)
     assert "integer digits" in caplog.text
 
@@ -89,7 +101,7 @@ def test_malformed_occurred_at_rejected(caplog):
     client = _client(drops)
     with caplog.at_level("WARNING", logger="aforo.client"):
         client.track(**{**_valid(), "occurred_at": "last tuesday"})
-    assert client._buffer.size == 0
+    assert client.buffered_count == 0
     _assert_invalid_drop(client, drops)
     assert "ISO-8601" in caplog.text
 
@@ -101,7 +113,7 @@ def test_server_configurable_limits_left_to_the_server():
     client = _client()
     client.track(**{**_valid(), "occurred_at": "2020-01-01T00:00:00Z"})
     client.track(**{**_valid(), "metadata": {"blob": "x" * 20_000}})
-    assert client._buffer.size == 2
+    assert client.buffered_count == 2
 
 
 def test_rejected_event_leaves_buffered_events_alone():
@@ -111,7 +123,7 @@ def test_rejected_event_leaves_buffered_events_alone():
     client.track(**{**_valid(), "customer_id": "c" * 65})
     client.track(**{**_valid(), "customer_id": "cust_3"})
 
-    assert client._buffer.size == 2
+    assert client.buffered_count == 2
     _assert_invalid_drop(client, drops)
 
 
@@ -126,16 +138,16 @@ def test_extra_field_limits_mirror_the_server_dto():
     drops = []
     client = _client(drops)
     client.track(**_valid(), extra_fields={"agentId": "a" * 36})
-    assert client._buffer.size == 1
+    assert client.buffered_count == 1
     client.track(**_valid(), extra_fields={"agentId": "a" * 37})
-    assert client._buffer.size == 1
+    assert client.buffered_count == 1
     _assert_invalid_drop(client, drops)
 
 
 def test_unknown_execution_status_is_not_an_invalid_event():
     client = _client()
     client.track(**_valid(), execution_status="bogus")
-    assert client._buffer.size == 1 and client.dropped_count == 0
+    assert client.buffered_count == 1 and client.dropped_count == 0
 
 
 def test_describe_limit_violation_names_field_limit_and_size():

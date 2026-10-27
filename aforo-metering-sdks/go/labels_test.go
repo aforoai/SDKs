@@ -42,12 +42,14 @@ func TestTruncateUTF16(t *testing.T) {
 
 func newLabelMiddleware(t *testing.T, url string) http.Handler {
 	t.Helper()
-	return HTTPMiddleware(
+	client := mustNewClient(t, Options{APIKey: "k", BaseURL: url, FlushCount: 1, FlushInterval: 50 * time.Millisecond, MaxRetries: 1})
+	h, err := HTTPMiddleware(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }),
-		MiddlewareOptions{
-			APIKey:        "k",
-			ClientOptions: &Options{BaseURL: url, FlushCount: 1, FlushInterval: 50 * time.Millisecond, MaxRetries: 1, RetryBase: time.Millisecond},
-		})
+		client, MiddlewareOptions{TrustCustomerHeader: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
 }
 
 func waitEvents(t *testing.T, srv *captureServer, n int) []map[string]any {

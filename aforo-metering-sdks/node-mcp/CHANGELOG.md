@@ -2,6 +2,37 @@
 
 All notable changes to `@aforoai/mcp-metering` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [2.0.0] - 2026-10-26
+
+### Fixed (transport core, review of 2026-10-26)
+These come from the shared Node core (`src/transport-core/core.ts`) and follow contract/TRANSPORT-SPEC.md "Edge cases every core handles the same way".
+- **The request deadline covers reading the response body.** A server that sent headers and then stalled, or dripped the body a byte at a time, held `flush()` and `shutdown()` forever; the read is now inside `timeoutMs` and the batch is retried.
+- **Redirects are never followed.** Every request is sent with `redirect: 'manual'`, so the API key cannot reach the host a 3xx names. A 3xx keeps the batch queued, opens the breaker and is logged once at ERROR with the target host (never the key); fix the base URL and the queue drains without loss. `onError` gets `kind: 'outage'` with the 3xx `status`.
+- **Events are serialized when tracked.** An event JSON cannot represent (a `BigInt`, a cycle, `NaN` or `Infinity` in metadata) is dropped as `invalid` and counted at track time; before, it made the whole batch fail to serialize and every event in it was lost unreported. Later changes to a tracked object are no longer sent.
+- **Exit flush waits for the batch in flight.** On `beforeExit` the process stays alive (up to the shutdown deadline) until the queue and the batch being sent or retried are done. It used to exit during a retry and lose that batch.
+- **Per-event `retryable` failures back off and are capped.** They are re-sent after the normal jittered backoff, at most `maxRetries` times, then treated as an outage; a 2xx that hits the cap no longer resets the breaker, so its cooldown keeps growing instead of flapping.
+- **Breaker cooldown is `max(250 ms, random(0, ceiling))`** even when a small `breakerInitialMs` is configured.
+- The session heartbeat request is sent with `redirect: 'manual'`; a 3xx is reported through `onError` ("redirects are not followed; check ingestorUrl").
+
+### Changed (breaking)
+- **Who is billed is your decision.** `wrapToolHandler` needs `customerResolver(request, extra)` (identity your server authenticated), `customerId` (one customer) or `trustCustomerHeader: true` (bill `params._meta.customer_id` as the client sends it), and throws without one. `_meta.customer_id` is ignored unless trusted, and a call is never billed to its agent id. A call whose customer cannot be decided runs and its event is dropped as `invalid`. Migrate: add one of the three options.
+- Delivery moves to the shared Node transport core (`src/transport-core/`, copied from `node/src/transport-core/`; contract/TRANSPORT-SPEC.md): a bounded queue (`maxQueueSize`, default 10 000, oldest dropped as `overflow`), one background sender (a full batch wakes it; never two requests in flight), full-jitter retries with `Retry-After` in both forms (capped at 60 s), a deadline per request. An outage no longer drops the batch: after the last retry it goes back to the front of the queue with the same keys and the sender pauses (5 s doubling to 5 min). 401/403 are an outage, logged once.
+- `McpDropReason` adds `overflow`, `shutdown`, `closed`; `retry_exhausted` is no longer produced.
+- `flushCount` defaults to 500 (was 50). `flush()` resolves to `{ sent, failed, requeued, queued }`.
+- `shutdown()` sends for at most `shutdownTimeoutMs` (default 5000); leftovers are dropped as `shutdown`, and calls recorded afterwards as `closed`. Queued events are sent on `beforeExit` (`flushOnExit`, default true). No signal handlers are installed.
+- `ingestorUrl` must be `https://` unless it is localhost / 127.0.0.1 / ::1 or `allowInsecureHttp: true`.
+- `killedSessionIds` is read from heartbeat responses and from usage-batch responses (through the core's `onAccepted` hook), as in 1.x. A throwing `onSessionKilled` is reported to `onError`.
+- The User-Agent is `aforo-mcp-metering-node/2.0.0`.
+
+### Added
+- `onError` receives a `CoreTransportError` (still an `Error`) for delivery reports: branch on `err.kind` — `outage`, `auth` (401/403, wrong or revoked key), `rejected`, `shutdown`, `closed` — and read `err.events` instead of matching the message. Exported from the package.
+- `customerResolver`, `trustCustomerHeader`, `maxQueueSize`, `maxRetries`, `timeoutMs`, `shutdownTimeoutMs`, `flushOnExit`, `allowInsecureHttp`, `queuedCount`.
+- `wrapToolHandler` passes the handler's extra arguments (the MCP SDK's `extra`) through to the handler and the resolver.
+- Integration tests against the repo's fault-injecting mock ingestor.
+
+### Fixed
+- A throwing `onDrop` is logged instead of silently swallowed.
+
 ## [1.3.2] - 2026-10-01
 
 ### Changed

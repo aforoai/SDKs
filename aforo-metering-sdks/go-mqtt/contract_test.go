@@ -140,6 +140,7 @@ func TestIngestContract(t *testing.T) {
 		ProductID:     "prod-mqtt-001",
 		APIKey:        "sk_mqtt_abc",
 		IngestorURL:   srv.URL,
+		hooks:         fastHooks(),
 		FlushCount:    100, // buffer only — Shutdown's final drain does the synchronous flush (no async race)
 		FlushInterval: time.Minute,
 	})
@@ -147,7 +148,7 @@ func TestIngestContract(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	b.RecordPublish("cust_contract", "client-1", "sensors/temp", 1, false, 4)
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -195,6 +196,7 @@ func TestIngestContract_ExecutionStatusValues(t *testing.T) {
 		ProductID:         "prod-mqtt-001",
 		APIKey:            "sk_mqtt_abc",
 		IngestorURL:       srv.URL,
+		hooks:             fastHooks(),
 		EmitDeliverEvents: true,
 		FlushCount:        100,
 		FlushInterval:     time.Minute,
@@ -207,7 +209,7 @@ func TestIngestContract_ExecutionStatusValues(t *testing.T) {
 	b.RecordPublishWithOptions("cust_contract", "client-1", "t/1", 1, false, 10, EventOptions{ExecutionStatus: "blocked"})
 	b.RecordDeliverWithOptions("cust_contract", "client-1", "t/1", 1, false, 10, EventOptions{ExecutionStatus: "   "})
 	b.RecordPublish("cust_contract", "client-1", "t/1", 1, false, 10)
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -349,6 +351,7 @@ func newContractBilling(t *testing.T, url string, sink *errSink, mutate ...func(
 		ProductID:     "prod-001",
 		APIKey:        "sk_contract",
 		IngestorURL:   url,
+		hooks:         fastHooks(),
 		FlushCount:    1,
 		FlushInterval: time.Minute,
 		OnError:       sink.add,
@@ -379,7 +382,7 @@ func emit(b *Billing, opts ...EventOptions) {
 	b.RecordPublish("cust_1", "client-1", "devices/1/telemetry", 1, false, 42, opts...)
 }
 
-func shutdown(b *Billing) error { return b.Shutdown() }
+func shutdown(b *Billing) error { return b.Shutdown(bg) }
 
 func TestContractDefaultProductType(t *testing.T) {
 	srv := &scriptedServer{}

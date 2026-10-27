@@ -18,7 +18,7 @@ func TestWebSocketExecutionStatusExplicitOnly(t *testing.T) {
 	withOpts := b.OpenWithOptions("cust_001", nil, EventOptions{ExecutionStatus: " success "})
 	b.RecordFrameWithOptions(withOpts, "CLIENT_TO_SERVER", "TEXT", 3, EventOptions{ExecutionStatus: "   "})
 	b.CloseWithOptions(withOpts, 1000, EventOptions{ExecutionStatus: "cancelled"})
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	evs := r.events()
 	want := []any{nil, nil, nil, "SUCCESS", nil, "CANCELLED"}
@@ -43,9 +43,12 @@ func TestRecordFrameWithOptionsNoEventWhenPerFrameOff(t *testing.T) {
 	b := newBilling(t, srv)
 	id := b.Open("cust_001", nil)
 	b.RecordFrameWithOptions(id, "CLIENT_TO_SERVER", "TEXT", 3, EventOptions{ExecutionStatus: "ERROR"})
-	_ = b.Shutdown()
-	if n := len(r.events()); n != 1 {
-		t.Fatalf("got %d events, want only CONNECTION_OPENED", n)
+	_ = b.Shutdown(bg)
+	// OPEN, then the CLOSE Shutdown synthesizes for the still-open connection;
+	// no per-frame event.
+	evs := r.events()
+	if len(evs) != 2 || evs[0]["wsFrameType"] != "OPEN" || evs[1]["wsFrameType"] != "CLOSE" {
+		t.Fatalf("got %v, want only CONNECTION_OPENED and the shutdown CONNECTION_CLOSED", evs)
 	}
 }
 
@@ -56,7 +59,7 @@ func TestUnknownExecutionStatusOmittedEventStillSent(t *testing.T) {
 	b := newBilling(t, srv)
 	id := b.OpenWithOptions("cust_001", nil, EventOptions{ExecutionStatus: "done"})
 	b.CloseWithOptions(id, 1000, EventOptions{ExecutionStatus: "SUCCESSFUL_OUTCOME_XYZ"})
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	evs := r.events()
 	if len(evs) != 2 {

@@ -2,6 +2,33 @@
 
 All notable changes to `aforo-grpc-metering` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [2.0.0] - 2026-10-26
+
+Breaking. Migration: give the interceptor a customer resolver (`AforoGrpcInterceptor(billing, customer_resolver=...)` or `customer_id_extractor=` on the client), or pass `trust_customer_header=True` to keep reading `x-customer-id` metadata; use an `https://` `ingestor_url` (or `allow_insecure_http=True`).
+
+### Changed
+- **Shared transport core** (`aforo_grpc_metering/_transport`, a copy of the core SDK's; G271, G285): one bounded queue (`max_queue_size`, default 10 000; overflow drops the oldest as `overflow`) and one sender thread. `record()` no longer starts a thread per flush, and the old unbounded list is gone.
+- **Outages keep events**: after 3 full-jitter retries, or on 401/403, the batch is requeued with the same idempotency keys and retried after a pause (G267, G268). `Retry-After` is read in both forms, capped at 60 s. `retry_exhausted` is no longer reported; new drop reasons `shutdown` and `closed`.
+- **`shutdown()` is bounded** by `shutdown_timeout_sec` (default 5) and also runs at interpreter exit; one pooled HTTP client per billing client; default `flush_count` 500 (G269).
+- **`ingestor_url` must be `https://`** (localhost excepted, or `allow_insecure_http=True`); the API key is no longer kept as a public attribute and is never in `repr()` (G270).
+- **All four RPC shapes are metered** (G286): unary, server streaming, client streaming and bidirectional, with `messageCount` = messages read plus sent. New `AforoAioGrpcInterceptor` for `grpc.aio` servers.
+- **Customer resolver required** (G265): `customer_id_extractor` no longer defaults to reading `x-customer-id`; `trust_customer_header=True` opts in. A call with no customer is counted as an `invalid` drop.
+- `customerId` length is counted in UTF-16 units (G284). `httpx` is now a dependency.
+
+### Changed (transport core, review 2026-10-26)
+Settles the cases in `contract/TRANSPORT-SPEC.md` "Edge cases every core handles the same way". Migration: if your `on_error` hook matched on message text, branch on `error.kind` instead.
+- **`on_error` gets a typed `TransportError`** with `kind` (`outage`, `auth`, `rejected`, `shutdown`, `closed`), `events`, `status` and `will_retry`. It subclasses `RuntimeError`, so existing `Exception` hooks keep working. An outage is reported once per breaker opening, and events still queued at the shutdown deadline are reported as `shutdown`.
+- **The request timeout covers the whole exchange**, including reading the response body: a server that stalls or drips its answer one byte at a time is cut off at the deadline (httpx's own timeout is per read).
+- **Redirects are an outage**: a 3xx is never followed (the API key must not reach another host); the batch is requeued, the breaker opens, and one ERROR names the host it pointed to.
+- **Every 5xx is retried** (501, 505, ... too).
+- **Per-event `retryable` errors in a 2xx** are re-sent with the same keys after the normal backoff, at most `max_retries` times, then treated as an outage. They were re-sent at once, in a tight loop. `errors[]` is authoritative even when `failed` is missing or 0.
+- **Breaker pause** is `max(250 ms, random(0, min(5 min, 5 s * 2^n)))`; a per-event retry cap reached right after a 2xx does not reset `n`.
+- **`flush()` while the breaker is open makes one attempt** (it returned at once).
+- **Shutdown keeps retrying** with jittered backoff until `shutdown_timeout` after an outage (it stopped at the first one).
+- **Nothing taken off the queue is lost unreported at shutdown**: the unsent half of a split batch, and a batch requeued just after shutdown gave up on a hung request, are reported as `shutdown`. Pending `flush()` callers always return.
+- **An event that cannot be turned into JSON** (a cycle, `NaN`, an unknown object) is dropped as `invalid` when it is recorded, not when its batch is sent; it no longer goes to `on_error`.
+- **A second `shutdown()`** waits for the first one and never drains again; `shutdown()` called from a hook on the sender thread no longer makes a later `shutdown()` wait 7 s.
+
 ## [1.2.2] - 2026-10-01
 
 ### Changed

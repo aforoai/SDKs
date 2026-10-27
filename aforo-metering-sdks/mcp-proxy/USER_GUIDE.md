@@ -1,6 +1,6 @@
 # @aforoai/mcp-proxy — User Guide
 
-**Version:** 1.2.2 · **Updated:** 2026-10-01 · **Audience:** operators metering an MCP server they don't own the source of — stdio (Claude Desktop / Cursor), SSE, or Streamable HTTP.
+**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** operators metering an MCP server they don't own the source of — stdio (Claude Desktop / Cursor), SSE, or Streamable HTTP.
 
 ## What you'll build
 
@@ -20,7 +20,7 @@ Public install (once published):
 npm i -g @aforoai/mcp-proxy
 ```
 
-Install `1.2.2` or later. `1.0.0` on npm was built from an older copy of this code and lacks the fixes listed in the changelog. If `1.2.2` is not on npm yet, install from source:
+Install `2.0.0` or later. `1.0.0` on npm was built from an older copy of this code and lacks the fixes listed in the changelog. If `2.0.0` is not on npm yet, install from source:
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
@@ -44,7 +44,10 @@ export AFORO_API_KEY="sk_live_xxx"
 export AFORO_TENANT_ID="tenant_smartai"
 export AFORO_PRODUCT_ID="prod_mcp_fs"
 export AFORO_INGESTOR_URL="https://api.aforo.ai"
+export AFORO_CUSTOMER_ID="cust_acme"   # who the calls are billed to (see "Who is billed" in the README)
 ```
+
+The proxy also needs a customer source and refuses to start without one: `AFORO_CUSTOMER_ID` / `--customer-id` for a sidecar that serves one customer, `--auth-tokens-file` on the HTTP transports to bill each client's token to its customer, or `--trust-client-customer-id` to bill the `params._meta.customer_id` your own clients send. A call is never billed to its agent id.
 
 > ⚠ `--ingestor-url` (or `AFORO_INGESTOR_URL`) is the **base** URL. The proxy appends `/v1/ingest/batch` for events and `/api/v1/quota/check` for quota — don't include those paths yourself.
 
@@ -54,10 +57,12 @@ The proxy spawns the server as a child process and meters the JSON-RPC crossing 
 
 ```bash
 aforo-mcp-proxy --transport stdio \
-  --command "npx" --args "-y,@modelcontextprotocol/server-filesystem,/tmp"
+  --command "npx" --arg -y --arg @modelcontextprotocol/server-filesystem --arg /tmp
 ```
 
 (The four credentials come from the env you set in Step 2.)
+
+> ⚠ The child gets a short allowlist of the proxy's environment (`PATH`, `HOME`, locale, temp dirs, proxy and npm-cache settings) and never any `AFORO_*` variable, so a third-party server cannot read your Aforo key. Pass anything else it needs with `--pass-env NAME1,NAME2` or the config file's `env` block.
 
 > ⚠ stdio metering parses **newline-delimited** JSON-RPC. The proxy spawns the child, forwards its stderr to yours, and writes parsed messages to the client. If your server frames messages differently, calls can be missed — confirm metering on a known tool first (Step 4).
 
@@ -87,31 +92,37 @@ Point the host's `mcpServers` entry at the proxy with a config file:
     "apiKey": "sk_live_xxx",
     "ingestorUrl": "https://api.aforo.ai",
     "agentId": "agent_claude_desktop",
+    "customerId": "cust_acme",
     "productType": "MCP_SERVER",
     "quotaEnforcement": false
   }
 }
 ```
 
-> ⚠ In a config file, `args` is a real JSON array (`["-y", "@…", "/tmp"]`). On the CLI it's one comma-separated string (`--args "-y,@…,/tmp"`) that the proxy splits on `,`. Don't mix the two forms.
+> ⚠ In a config file, `args` is a real JSON array (`["-y", "@…", "/tmp"]`). On the CLI, repeat `--arg` once per argument; each value is passed unchanged, so `--arg "select a,b from t"` reaches the child as one argument. The older `--args "-y,@…,/tmp"` still works but splits on `,`. When both are given, `--arg` is used and `--args` is ignored with a warning.
 
 ## Step 3b — Run in SSE / Streamable HTTP mode (front a network server)
 
 The proxy listens on `--port`/`--host` and forwards to `--upstream`:
 
 ```bash
+export AFORO_PROXY_AUTH_TOKEN="$(openssl rand -hex 24)"
 aforo-mcp-proxy --transport sse \
   --upstream http://localhost:8080/sse --port 3100 --host 127.0.0.1
 ```
 
-Then point your MCP client at `http://127.0.0.1:3100` instead of the upstream directly. `--transport streamable-http` is the same shape.
+Then point your MCP client at `http://127.0.0.1:3100` instead of the upstream directly, with `Authorization: Bearer $AFORO_PROXY_AUTH_TOKEN`. `--transport streamable-http` is the same shape. The listener refuses to start without `--auth-token`, `--auth-tokens-file` or (loopback only) `--allow-unauthenticated`, and refuses requests whose Host header is not this proxy (421) or whose Origin is not in `--allowed-origins` (403). With several clients, give each its own token in a tokens file so each is billed to its own customer:
+
+```json
+{ "tok_7f3c9a1e5b2d4c6f": "cust_acme", "tok_0a9b8c7d6e5f4a3b": "cust_globex" }
+```
 
 ## Step 4 — Make a tool call and confirm metering
 
 Trigger any `tools/call` through the client. With `--debug` the proxy logs each flush result:
 
 ```bash
-aforo-mcp-proxy --transport stdio --command "npx" --args "-y,@modelcontextprotocol/server-filesystem,/tmp" --debug
+aforo-mcp-proxy --transport stdio --command "npx" --arg -y --arg @modelcontextprotocol/server-filesystem --arg /tmp --debug
 ```
 
 You'll see a `Flushed events` log line with `accepted` / `duplicates` / `failed` counts once the buffer flushes (≤ `flushIntervalMs`, default 5s, or at `flushCount` events). `tools/list`, `resources/read`, and `prompts/get` are tracked but not billed; `initialize`, `ping`, and notifications are ignored.
@@ -129,7 +140,7 @@ node -e "require('http').createServer((req,res)=>{let b='';req.on('data',d=>b+=d
 
 ```bash
 aforo-mcp-proxy --transport stdio \
-  --command "npx" --args "-y,@modelcontextprotocol/server-filesystem,/tmp" \
+  --command "npx" --arg -y --arg @modelcontextprotocol/server-filesystem --arg /tmp \
   --ingestor-url http://localhost:8084 --debug
 ```
 
@@ -137,7 +148,7 @@ Make a tool call. The catcher prints `POST /v1/ingest/batch` with a body like:
 
 ```json
 {"events":[
-  {"customerId":"agent_claude_desktop","metricName":"mcp_server.tool_invocations","quantity":1,"productType":"MCP_SERVER","toolName":"read_file","agentId":"agent_claude_desktop","executionStatus":"SUCCESS"}
+  {"customerId":"cust_acme","metricName":"mcp_server.tool_invocations","quantity":1,"productType":"MCP_SERVER","toolName":"read_file","agentId":"agent_claude_desktop","executionStatus":"SUCCESS"}
 ]}
 ```
 
@@ -149,11 +160,11 @@ If you see that hit `/v1/ingest/batch`, the proxy is metering. Point `--ingestor
 
 ```bash
 aforo-mcp-proxy --transport stdio \
-  --command "npx" --args "-y,@modelcontextprotocol/server-filesystem,/tmp" \
+  --command "npx" --arg -y --arg @modelcontextprotocol/server-filesystem --arg /tmp \
   --quota-enforcement
 ```
 
-> ⚠ The quota check has a **50ms** latency budget and **fails open**: a timeout or network error lets the call through unmetered-by-quota. Deny decisions are cached in-process for 5s to avoid hammering the endpoint. This is a soft gate, not a hard wall — don't rely on it for security-grade blocking.
+> ⚠ The quota check has a **1 s** deadline (`--quota-timeout-ms`) and **fails open** by default: a timeout or network error lets the call through. Add `--quota-fail-mode closed` to refuse calls the check cannot answer. DENY answers are reused for 5 s and ALLOW answers for 1 s (`AFORO_QUOTA_ALLOW_CACHE_MS`), so a burst can run up to a second past a newly reached limit.
 
 ## Configuration reference
 
@@ -163,7 +174,8 @@ Precedence: **env var > CLI flag > config file > default.**
 |---|---|---|---|---|
 | `-t, --transport` | `transport` | `AFORO_TRANSPORT` | — (required) | `stdio` \| `sse` \| `streamable-http`. |
 | `--command` | `command` | — | — | Server command to spawn (stdio; required for stdio). |
-| `--args` | `args` | — | — | Comma-separated args (CLI) / array (config). |
+| `--arg` (repeatable) | `args` | — | — | One argument per `--arg`, passed unchanged (commas allowed). |
+| `--args` | `args` | — | — | Comma-separated args (an argument can't contain a comma). `--arg` wins over `--args`; both win over the config file's `args`. |
 | `--upstream` | `upstream` | — | — | Upstream URL (required for sse / streamable-http). |
 | `--port` | `listen.port` | — | `3100` | Listen port (sse / streamable-http). |
 | `--host` | `listen.host` | — | `127.0.0.1` | Listen host (sse / streamable-http). |
@@ -172,12 +184,12 @@ Precedence: **env var > CLI flag > config file > default.**
 | `--api-key` | `aforo.apiKey` | `AFORO_API_KEY` | — (required) | `X-API-Key: <apiKey>`. |
 | `--ingestor-url` | `aforo.ingestorUrl` | `AFORO_INGESTOR_URL` | — (required) | Base URL; proxy appends `/v1/ingest/batch` and `/api/v1/quota/check`. |
 | `--agent-id` | `aforo.agentId` | `AFORO_AGENT_ID` | — | Agent id override when traffic lacks `_meta.agent_id`. |
-| — | `aforo.customerId` | `AFORO_CUSTOMER_ID` | — | Customer billed when a `tools/call` carries no `_meta.customer_id` (otherwise the agent id is billed). Also the customer on session heartbeats (else the first call's customer, else `system`). |
+| `--customer-id` | `aforo.customerId` | `AFORO_CUSTOMER_ID` | — | One customer billed for every tool call; also the heartbeat customer. See the README for the other customer sources and the listener flags. |
 | — | `aforo.productType` | `AFORO_PRODUCT_TYPE` | `MCP_SERVER` | Top-level `productType` on every event (required by the ingestor). Trimmed and uppercased. |
-| `--quota-enforcement` | `aforo.quotaEnforcement` | `AFORO_QUOTA_ENFORCEMENT` | `false` | Pre-flight quota gate (fail-open, 50ms budget). |
+| `--quota-enforcement` | `aforo.quotaEnforcement` | `AFORO_QUOTA_ENFORCEMENT` | `false` | Pre-flight quota gate (1 s deadline; fail mode `--quota-fail-mode open\|closed`). |
 | `--debug` | `aforo.debug` | `AFORO_DEBUG` | `false` | Verbose logging. |
 | — | `aforo.flushIntervalMs` | `AFORO_FLUSH_INTERVAL_MS` | `5000` | Timed flush cadence. |
-| — | `aforo.flushCount` | `AFORO_FLUSH_COUNT` | `50` | Force flush at this buffer size. |
+| — | `aforo.flushCount` | `AFORO_FLUSH_COUNT` | `500` | Events per request; reaching it wakes the sender. |
 | — | `aforo.heartbeatIntervalMs` | `AFORO_HEARTBEAT_INTERVAL_MS` | `30000` | Interval between session heartbeats (`system.session.heartbeat`, quantity 1). The first tool call starts the session and sends one immediately; a `SESSION_END` is sent on shutdown. Each heartbeat goes in its own `/v1/ingest/batch` request, never inside a usage batch, so the ingestor intercepts it before billing. Best-effort: no retries, failures ignored. |
 
 ## Troubleshooting
@@ -186,20 +198,25 @@ Precedence: **env var > CLI flag > config file > default.**
 |---|---|---|
 | Exits at startup with `aforo.<field> is required` | A required credential is missing across all sources | Provide `tenantId`, `productId`, `apiKey`, `ingestorUrl` via flag, env, or config. |
 | `transport is required` / `Invalid transport` | `--transport` unset or not one of the three | Set `stdio`, `sse`, or `streamable-http`. |
-| `command is required for stdio transport` | stdio mode with no `--command` | Add `--command` (and `--args` if needed). |
+| `command is required for stdio transport` | stdio mode with no `--command` | Add `--command` (and `--arg` for each argument it needs). |
 | `upstream URL is required for SSE/HTTP transport` | sse/http mode with no `--upstream` | Add `--upstream`. |
 | Events POST to `…/v1/ingest/batch/v1/ingest/batch` (404) | `--ingestor-url` included the batch path | Pass only the base URL. |
-| Usage rolls up under `"unknown"` | Traffic carries no `_meta.agent_id` | Set `--agent-id` / `AFORO_AGENT_ID`, and `AFORO_CUSTOMER_ID` (or `_meta.customer_id`) to bill a real customer. |
+| Exits with `No customer source configured` | No `--customer-id`, tokens file, resolver or `--trust-client-customer-id` | Set one. |
+| Exits with `The HTTP listener needs authentication` | sse / streamable-http without a token | Set `--auth-token` or `--auth-tokens-file`. |
+| Clients get 401 / 421 / 403 | Missing or wrong bearer token / Host not this proxy / Origin not allowed | Send `Authorization: Bearer <token>`; add the name you reach the proxy by to `--allowed-hosts`; add browser origins to `--allowed-origins`. |
+| `Tool call not metered — ... no customer` | No source named a customer for that call | Map the client's token to a customer, or set `--customer-id`. |
+| The MCP server cannot find a variable it needs | The child gets an allowlisted environment | Add it with `--pass-env NAME` or the config file's `env`. |
+| Usage rolls up under agent `"unknown"` | Traffic carries no `_meta.agent_id` | Set `--agent-id` / `AFORO_AGENT_ID`. |
 | `Events dropped` in logs, `reason: rejected` | The ingestor refused the batch (non-retryable 4xx) or some of its events; the log carries the server's message | Check `apiKey` + `tenantId`, and fix what the message names (unknown metric, bad field). |
-| `Events dropped` in logs, `reason: retry_exhausted` | The ingestor was unreachable or kept returning 5xx/408/429 for all 3 attempts | Check connectivity to `ingestorUrl`. |
+| `Aforo ingestor unavailable` in logs | The ingestor was unreachable, or kept returning 401/403/5xx/408/429 | The usage stays queued and is re-sent; check connectivity to `ingestorUrl` and the API key. |
 | `Tool call not metered — invalid event dropped` in logs | The call's `agentId` (> 36 chars), `customerId` (> 64) or `sessionId` (> 64) exceeds the ingestor's limit | Shorten the value at its source. The call itself is still forwarded. |
 | A failed tool call is billed as `ERROR`, a slow one as `TIMEOUT` | That is the default status mapping (see the README's "What each tool call is billed as") | Raise `AFORO_RESPONSE_TIMEOUT_MS` for long-running tools, or set `aforo.statusResolver` when embedding the proxy as a library. |
-| Quota enforcement never denies under load | The 50ms check failed open on timeout | Expected on a slow path; quota is a soft gate. Raise the limit upstream, don't rely on it for hard blocking. |
+| Quota enforcement never denies under load | The check failed open on timeout | Raise `--quota-timeout-ms`, or use `--quota-fail-mode closed`. |
 | stdio metering misses calls | Server uses non-newline JSON-RPC framing | Confirm metering on a known tool; report the framing your server uses. |
 
 ## What this guide does NOT cover
 
-- **Hard quota blocking.** `--quota-enforcement` is a 50ms fail-open pre-flight gate, not a security wall. A timeout lets the call through.
-- **Guaranteed delivery.** A 3-attempt backoff then the batch is dropped: counted, logged, and passed to `aforo.onDrop` when the proxy is embedded as a library. No on-disk queue.
+- **Hard quota blocking by default.** `--quota-enforcement` fails open unless you set `--quota-fail-mode closed`, and reuses ALLOW answers for up to a second.
+- **Guaranteed delivery.** During an outage usage is kept in memory (up to `maxQueueSize`) and re-sent; it is lost if the proxy dies first. No on-disk queue.
 - **Transforming payloads or adding upstream auth.** The proxy observes and meters; it doesn't rewrite tool inputs/outputs or authenticate to the upstream server for you.
 - **Product / metric / rate-plan setup.** Done in the Aforo console.

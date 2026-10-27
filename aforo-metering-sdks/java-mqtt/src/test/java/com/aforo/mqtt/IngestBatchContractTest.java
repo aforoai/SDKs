@@ -132,7 +132,9 @@ class IngestBatchContractTest {
             }
         }
         waitFor(() -> captured.stream().mapToInt(c -> c.body().get("events").size()).sum() == 2500, 5000);
-        assertThat(captured).hasSize(3);
+        // flushCount is clamped to 1000, so the sender wakes while events are still arriving:
+        // at least 3 requests, none over the ingestor's 1000-event limit.
+        assertThat(captured.size()).isGreaterThanOrEqualTo(3);
         for (Captured c : captured) {
             assertThat(c.path()).isEqualTo("/v1/ingest/batch");
             assertThat(c.body().get("events").size()).isBetween(1, 1000);

@@ -3,12 +3,14 @@
 //
 // Usage:
 //
-//	billing, _ := grpcmetering.New(grpcmetering.Config{
+//	billing, err := grpcmetering.New(grpcmetering.Config{
 //	    TenantID:    "tenant_acme",
 //	    ProductID:   "prod_grpc_user_svc",
 //	    APIKey:      os.Getenv("AFORO_API_KEY"),
 //	    IngestorURL: "https://api.aforo.ai",
 //	    ServiceName: "acme.v1.UserService",
+//	    // The customer your auth interceptor put on the context.
+//	    CustomerResolver: func(ctx context.Context) string { return auth.CustomerID(ctx) },
 //	})
 //	defer billing.Shutdown(context.Background())
 //
@@ -20,22 +22,24 @@ package grpcmetering
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
 	"net/http"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+
+	"github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc/v2/internal/ingest"
 )
 
-const sdkVersion = "1.2.2"
+const sdkVersion = "2.0.0"
 
 // Ingestor limits for the gRPC fields (IngestUsageEventRequest @Size).
 const (
@@ -43,101 +47,105 @@ const (
 	maxGrpcMethodLen  = 128
 )
 
-// Config captures all SDK options.
-// DropReason describes why a buffered batch was permanently dropped.
-// The buffer is unbounded (drained at flush start), so unlike the core SDK
-// there is no overflow reason here.
-type DropReason string
+// DefaultCustomerMetadataKey is the incoming metadata key read for the
+// customer id when Config.TrustCustomerHeader is true.
+const DefaultCustomerMetadataKey = "x-customer-id"
 
-const (
-	// DropRetryExhausted — the batch failed after all transport retries.
-	DropRetryExhausted DropReason = "retry_exhausted"
-	// DropRejected — the ingestor answered a non-retryable 4xx, refused the
-	// event individually in a 2xx partial-failure response, or the batch
-	// could not be serialized.
-	DropRejected DropReason = "rejected"
-	// DropInvalid — the event failed client-side validation (a required field
-	// was blank or a field exceeded the ingestor's limit) and was never
-	// buffered.
-	DropInvalid DropReason = "invalid"
-)
+// ErrNoCustomerResolver is returned by New when Config has neither a
+// CustomerResolver nor TrustCustomerHeader.
+var ErrNoCustomerResolver = errors.New("grpcmetering: Config needs a CustomerResolver (the Aforo customer id from your own authentication: auth token subject, API-key lookup, mTLS identity) or TrustCustomerHeader: true to bill the customer named in incoming metadata, which your callers control")
 
+// Config captures all SDK options. Sending defaults follow the shared
+// transport policy (contract/ingest-contract.json → transportPolicy).
 type Config struct {
-	TenantID          string
-	ProductID         string
-	APIKey            string
-	IngestorURL       string
-	ServiceName       string                           // fully-qualified gRPC service, e.g. "acme.v1.UserService"
-	ProductType       string                           // default "GRPC_API"; sent as top-level productType on every event
-	FlushCount        int                              // default 50
-	FlushInterval     time.Duration                    // default 5s
-	HTTPClient        *http.Client                     // optional override
-	CustomerExtractor func(ctx context.Context) string // default reads "x-customer-id" md
-	OnError           func(error)
-	// OnDrop is an OPT-IN hook invoked with events the SDK is about to lose
-	// permanently (retry exhaustion, a rejection by the ingestor, or
-	// client-side validation — see DropReason). Events keep
-	// their idempotency keys, so re-submitting them after recovery is
-	// dedup-safe. Default: nil (drops are still counted in DroppedCount()
-	// and WARN-logged). Panics in the hook are recovered.
+	TenantID    string
+	ProductID   string
+	APIKey      string // sent only as X-API-Key; never logged or printed
+	IngestorURL string // must be https (http only for localhost or with AllowInsecureHTTP)
+	ServiceName string // fully-qualified gRPC service, e.g. "acme.v1.UserService"
+	ProductType string // default "GRPC_API"; sent as top-level productType on every event
+
+	// CustomerResolver returns the Aforo customer id for a call, from identity
+	// your server authenticated (auth interceptor, token subject, mTLS peer).
+	// Required unless TrustCustomerHeader is true. A blank result is not
+	// billed: the event is dropped as DropInvalid and counted; the RPC itself
+	// is never affected.
+	CustomerResolver func(ctx context.Context) string
+	// TrustCustomerHeader bills the customer named in the incoming metadata
+	// key CustomerMetadataKey. Callers control metadata, so only turn this on
+	// when a trusted proxy sets it and strips client values. Ignored when
+	// CustomerResolver is set.
+	TrustCustomerHeader bool
+	// CustomerMetadataKey defaults to DefaultCustomerMetadataKey.
+	CustomerMetadataKey string
+
+	AllowInsecureHTTP bool          // allow http:// to a host other than localhost/127.0.0.1/::1
+	FlushCount        int           // events per request, default 500 (max 1000)
+	FlushInterval     time.Duration // default 5s
+	MaxQueueSize      int           // default 10000; when full the oldest event is dropped (DropOverflow)
+	MaxRetries        int           // default 3; negative disables retries
+	RetryBase         time.Duration // full-jitter backoff base, default 500ms
+	Timeout           time.Duration // total deadline per request, default 10s
+	ShutdownTimeout   time.Duration // how long Shutdown keeps sending, default 5s
+
+	HTTPClient *http.Client // optional; you keep ownership
+	// OnError is called for sending problems with a *TransportError (use
+	// errors.As and branch on Kind: outage, auth, rejected, shutdown,
+	// closed) and for events refused client-side with a plain error. It runs
+	// on the background sender and may call Flush or Shutdown. Never carries
+	// the API key.
+	OnError func(error)
+	// OnAccepted, when set, receives the body of every 2xx answer (the data
+	// object, envelope removed) and the events of that request. Same
+	// goroutine and panic rules as OnError.
+	OnAccepted func(body json.RawMessage, events []map[string]any)
+	// OnDrop is an OPT-IN hook invoked with events the SDK gives up on (see
+	// DropReason). Events keep their idempotency keys, so re-submitting them
+	// after recovery is dedup-safe. Default: nil (drops are still counted in
+	// DroppedCount() and WARN-logged). Panics in the hook are recovered.
 	OnDrop func(events []map[string]any, reason DropReason)
+
+	hooks ingest.Hooks // tests: clock, sleep and random source
 }
 
 type Billing struct {
-	cfg    Config
-	url    string
-	client *http.Client
-
-	mu       sync.Mutex
-	buffer   []map[string]any
-	stop     chan struct{}
-	stopOnce sync.Once
-	dropped  atomic.Int64
-	// invalidDrops throttles the DropInvalid WARN log.
-	invalidDrops atomic.Int64
+	cfg      Config
+	tp       *ingest.Client
+	customer func(ctx context.Context) string
 	// truncWarned holds the label names already WARN-logged as truncated.
 	truncWarned sync.Map
-	// retryBackoffBase is the exponential-backoff base (default 1s) —
-	// package-private so tests can skip real sleeps.
-	retryBackoffBase time.Duration
-	wg               sync.WaitGroup
 }
 
-// New constructs a Billing instance and starts the background flush loop.
+// New constructs a Billing instance and starts the background sender. It
+// returns ErrNoCustomerResolver when Config has neither CustomerResolver nor
+// TrustCustomerHeader, and an error for a non-https IngestorURL.
 func New(cfg Config) (*Billing, error) {
 	if cfg.TenantID == "" || cfg.ProductID == "" || cfg.APIKey == "" || cfg.IngestorURL == "" || cfg.ServiceName == "" {
 		return nil, errors.New("grpcmetering: TenantID, ProductID, APIKey, IngestorURL and ServiceName are required")
+	}
+	customer := cfg.CustomerResolver
+	if customer == nil {
+		if !cfg.TrustCustomerHeader {
+			return nil, ErrNoCustomerResolver
+		}
+		key := strings.ToLower(strings.TrimSpace(cfg.CustomerMetadataKey))
+		if key == "" {
+			key = DefaultCustomerMetadataKey
+		}
+		customer = func(ctx context.Context) string { return metadataCustomer(ctx, key) }
 	}
 	cfg.ProductType = normalizeProductType(cfg.ProductType)
 	if cfg.ProductType == "" {
 		cfg.ProductType = DefaultProductType
 	}
-	if cfg.FlushCount == 0 {
-		cfg.FlushCount = 50
-	}
-	if cfg.FlushInterval == 0 {
-		cfg.FlushInterval = 5 * time.Second
-	}
-	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = &http.Client{Timeout: 10 * time.Second}
-	}
-	if cfg.CustomerExtractor == nil {
-		cfg.CustomerExtractor = defaultCustomerExtractor
-	}
 	if cfg.OnError == nil {
 		cfg.OnError = func(err error) {}
 	}
-
-	b := &Billing{
-		cfg:              cfg,
-		url:              strings.TrimRight(cfg.IngestorURL, "/") + "/v1/ingest/batch",
-		client:           cfg.HTTPClient,
-		stop:             make(chan struct{}),
-		retryBackoffBase: time.Second,
+	tp, err := newTransport(cfg)
+	if err != nil {
+		return nil, err
 	}
-	b.wg.Add(1)
-	go b.flushLoop()
-	return b, nil
+	return &Billing{cfg: cfg, tp: tp, customer: customer}, nil
 }
 
 // UnaryInterceptor returns a grpc.UnaryServerInterceptor that meters every call.
@@ -152,14 +160,15 @@ func (b *Billing) UnaryInterceptor() grpc.UnaryServerInterceptor {
 }
 
 // StreamInterceptor returns a grpc.StreamServerInterceptor that meters streaming RPCs.
-// Streaming RPCs emit one event on stream completion with messageCount = 1 (we cannot
-// observe per-frame counts without wrapping the ServerStream — call Record() manually
-// from inside the handler if you need exact frame counts).
+// Each stream emits one event on completion. Its messageCount is the number of
+// messages the stream actually carried (received + sent); metadata adds
+// messagesReceived and messagesSent.
 func (b *Billing) StreamInterceptor() grpc.StreamServerInterceptor {
 	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 		start := time.Now()
 		ms := &meteredStream{ServerStream: ss, ctx: withStatusHolder(ss.Context())}
 		err := handler(srv, ms)
+		received, sent := ms.received.Load(), ms.sent.Load()
 		callType := "BIDI_STREAM"
 		switch {
 		case info.IsClientStream && !info.IsServerStream:
@@ -167,7 +176,8 @@ func (b *Billing) StreamInterceptor() grpc.StreamServerInterceptor {
 		case !info.IsClientStream && info.IsServerStream:
 			callType = "SERVER_STREAM"
 		}
-		b.recordRPC(ms.ctx, info.FullMethod, callType, err, 1, start)
+		b.recordRPCCounts(ms.ctx, info.FullMethod, callType, err, int(received+sent), start,
+			map[string]any{"messagesReceived": received, "messagesSent": sent})
 		return err
 	}
 }
@@ -194,10 +204,11 @@ func (b *Billing) RecordWithOptions(ctx context.Context, method, callType string
 }
 
 func (b *Billing) record(ctx context.Context, method, callType string, messageCount int, err error, durationMs int64, opts []EventOptions) {
-	customerID := strings.TrimSpace(b.cfg.CustomerExtractor(ctx))
-	if customerID == "" {
-		return
-	}
+	b.recordWithMeta(ctx, method, callType, messageCount, err, durationMs, opts, nil)
+}
+
+func (b *Billing) recordWithMeta(ctx context.Context, method, callType string, messageCount int, err error, durationMs int64, opts []EventOptions, extraMeta map[string]any) {
+	customerID := strings.TrimSpace(b.customer(ctx))
 	statusLabel := "OK"
 	executionStatus := OutcomeFromGrpcCode(codes.OK)
 	if err != nil {
@@ -243,6 +254,9 @@ func (b *Billing) record(ctx context.Context, method, callType string, messageCo
 			"productId":  b.cfg.ProductID,
 		},
 	}
+	for k, v := range extraMeta {
+		event["metadata"].(map[string]any)[k] = v
+	}
 	// grpcCallType is an enum on the ingestor; an unknown value rejects the
 	// whole event, so omit it rather than send something outside the set.
 	switch ct := strings.ToUpper(callType); ct {
@@ -253,6 +267,9 @@ func (b *Billing) record(ctx context.Context, method, callType string, messageCo
 	// dropped here (DropInvalid) instead of failing server-side unseen.
 	msg := ""
 	switch {
+	case customerID == "":
+		// Not billed, but counted: a call without a resolved customer.
+		msg = "customerId is required (CustomerResolver returned nothing)"
 	case strings.TrimSpace(method) == "":
 		msg = "grpcMethod is required for a GRPC_API event"
 	case strings.TrimSpace(b.cfg.ServiceName) == "":
@@ -275,57 +292,36 @@ func (b *Billing) record(ctx context.Context, method, callType string, messageCo
 		b.dropInvalid(event, msg)
 		return
 	}
-	b.mu.Lock()
-	b.buffer = append(b.buffer, event)
-	overflow := len(b.buffer) >= b.cfg.FlushCount
-	b.mu.Unlock()
-	if overflow {
-		go b.flush()
-	}
+	b.push(event)
 }
 
 func (b *Billing) recordRPC(ctx context.Context, fullMethod, callType string, err error, messageCount int, start time.Time) {
+	b.recordRPCCounts(ctx, fullMethod, callType, err, messageCount, start, nil)
+}
+
+func (b *Billing) recordRPCCounts(ctx context.Context, fullMethod, callType string, err error, messageCount int, start time.Time, meta map[string]any) {
 	method := fullMethod
 	if i := strings.LastIndex(fullMethod, "/"); i >= 0 {
 		method = fullMethod[i+1:]
 	}
-	b.record(ctx, method, callType, messageCount, err, time.Since(start).Milliseconds(), nil)
+	b.recordWithMeta(ctx, method, callType, messageCount, err, time.Since(start).Milliseconds(), nil, meta)
 }
 
-func (b *Billing) flushLoop() {
-	defer b.wg.Done()
-	ticker := time.NewTicker(b.cfg.FlushInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			b.flush()
-		case <-b.stop:
-			b.flush()
-			return
-		}
-	}
-}
-
-// Shutdown flushes pending events and stops the background goroutine.
+// Shutdown sends what is queued until the earlier of ctx's deadline and
+// Config.ShutdownTimeout. Events still queued then are reported as
+// DropShutdown and Shutdown returns an error wrapping ErrShutdownIncomplete.
+// Safe to call more than once.
 func (b *Billing) Shutdown(ctx context.Context) error {
-	b.stopOnce.Do(func() { close(b.stop) })
-	done := make(chan struct{})
-	go func() { b.wg.Wait(); close(done) }()
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return b.shutdownTransport(ctx)
 }
 
-func defaultCustomerExtractor(ctx context.Context) string {
+// metadataCustomer reads key from the incoming metadata (TrustCustomerHeader).
+func metadataCustomer(ctx context.Context, key string) string {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return ""
 	}
-	if v := md.Get("x-customer-id"); len(v) > 0 {
+	if v := md.Get(key); len(v) > 0 {
 		return v[0]
 	}
 	return ""

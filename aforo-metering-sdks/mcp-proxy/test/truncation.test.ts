@@ -51,6 +51,8 @@ describe('request-derived toolName', () => {
       tenantId: 'test_tenant',
       productId: 'prod_001',
       transport: 'stdio',
+      customerId: 'cust_test',
+      trustClientCustomerId: true,
     });
     stderr = [];
     realWrite = process.stderr.write;

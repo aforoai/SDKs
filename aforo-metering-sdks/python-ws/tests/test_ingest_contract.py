@@ -66,24 +66,20 @@ def assert_body_matches_contract(spec: dict, body) -> None:
 
 
 class _CapturingClient:
-    """Stand-in for httpx.Client that records the POST and returns 202."""
+    """httpx transport that records each POST and answers 202."""
 
     captured: list = []
 
-    def __init__(self, *args, **kwargs):
-        pass
+    @classmethod
+    def transport(cls):
+        import httpx
 
-    def __enter__(self):
-        return self
+        def handle(request):
+            body = json.loads(request.content)
+            cls.captured.append((str(request.url), body, dict(request.headers)))
+            return httpx.Response(202, json={"data": {"accepted": len(body["events"]), "failed": 0}})
 
-    def __exit__(self, *args):
-        return False
-
-    def post(self, url, json=None, headers=None):
-        _CapturingClient.captured.append((url, json, headers))
-        resp = mock.MagicMock()
-        resp.status_code = 202
-        return resp
+        return httpx.MockTransport(handle)
 
 
 def test_posts_to_contracted_endpoint_with_contracted_body_shape(monkeypatch):
@@ -93,14 +89,12 @@ def test_posts_to_contracted_endpoint_with_contracted_body_shape(monkeypatch):
     spec = FIXTURE["endpoints"][endpoint]
 
     _CapturingClient.captured = []
-    monkeypatch.setattr(mod, "HAS_HTTPX", True, raising=False)
-    monkeypatch.setattr(mod.httpx, "Client", _CapturingClient)
-
     billing = AforoWsBilling(
         tenant_id="tenant-001",
         product_id="prod-ws-001",
         api_key="sk_test_abc",
-        ingestor_url="https://ingest.test.aforo.ai",
+        ingestor_url="https://ingest.example.test",
+        http_transport=_CapturingClient.transport(),
     )
     billing.push(
         {
@@ -125,14 +119,12 @@ def test_execution_status_is_contracted_optional_field_sent_only_when_set(monkey
     status_spec = spec["eventOptionalFields"]["executionStatus"]
 
     _CapturingClient.captured = []
-    monkeypatch.setattr(mod, "HAS_HTTPX", True, raising=False)
-    monkeypatch.setattr(mod.httpx, "Client", _CapturingClient)
-
     billing = AforoWsBilling(
         tenant_id="tenant-001",
         product_id="prod-ws-001",
         api_key="sk_test_abc",
-        ingestor_url="https://ingest.test.aforo.ai",
+        ingestor_url="https://ingest.example.test",
+        http_transport=_CapturingClient.transport(),
     )
     frame = {"customerId": "cust_contract", "wsConnectionId": "ws_contract_1", "wsFrameType": "TEXT"}
     billing.push(frame, execution_status="timeout")
@@ -258,7 +250,7 @@ def test_more_than_1000_events_are_split_into_batches_of_at_most_1000(monkeypatc
         patcher.stop()
 
     sizes = [len(r["body"]["events"]) for r in h.requests]
-    assert sizes == [1000, 1000, 500]
+    assert sum(sizes) == 2500 and max(sizes) <= 1000
     assert all(r["url"].endswith("/v1/ingest/batch") for r in h.requests)
     keys = [e["idempotencyKey"] for r in h.requests for e in r["body"]["events"]]
     assert len(set(keys)) == 2500
@@ -297,3 +289,23 @@ def test_invalid_customer_id_is_dropped_as_invalid_and_not_sent(monkeypatch, bad
     events, reason = drops[0]
     assert reason == "invalid"
     assert len(events) == 1 and events[0]["idempotencyKey"]
+
+
+def test_transport_defaults_match_the_contract_policy():
+    from aforo_ws_metering._transport import policy
+
+    tp = FIXTURE["transportPolicy"]
+    assert tp["batch"]["defaultEvents"] == policy.DEFAULT_FLUSH_COUNT
+    assert tp["batch"]["maxEvents"] == policy.MAX_BATCH_EVENTS
+    assert tp["queue"]["defaultCapacity"] == policy.DEFAULT_QUEUE_CAPACITY
+    assert tp["timeouts"]["requestMs"] / 1000 == policy.REQUEST_TIMEOUT_S
+    assert tp["timeouts"]["shutdownMs"] / 1000 == policy.SHUTDOWN_TIMEOUT_S
+    assert tp["retry"]["maxRetries"] == policy.MAX_RETRIES
+    assert tp["retry"]["retryAfter"]["maxMs"] / 1000 == policy.RETRY_AFTER_MAX_S
+    assert tp["compression"]["gzip"] is policy.GZIP is False
+    billing = AforoWsBilling(tenant_id="t", product_id="p", api_key="k",
+                             ingestor_url="https://ingest.example.test")
+    try:
+        assert billing.flush_count == tp["batch"]["defaultEvents"]
+    finally:
+        billing.shutdown(timeout=0)

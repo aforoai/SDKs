@@ -32,8 +32,8 @@ def _client(captured: List[Dict[str, Any]], **overrides: Any) -> AforoAgentClien
 
     return AforoAgentClient(
         tenant_id="tenant_test", product_id="prod_ai_001", api_key="k",
-        ingestor_url="https://ingest.test.aforo.ai", flush_interval_sec=3600.0,
-        post_fn=post, **overrides,
+        ingestor_url="https://ingest.example.test", flush_interval_sec=3600.0,
+        post_fn=post, **{"default_customer_id": "cust_default", **overrides},
     )
 
 
@@ -49,7 +49,7 @@ async def test_over_long_capability_from_call_kwargs_is_truncated_and_sent(caplo
     drops: List[str] = []
     client = _client(sent, on_drop=lambda evs, reason: drops.append(reason))
 
-    @wrap_capability_handler(client)
+    @wrap_capability_handler(client, trust_customer_header=True)
     async def dispatch(*, agent_id: str, capability_name: str) -> str:
         return "ok"
 
@@ -81,11 +81,11 @@ async def test_caller_set_values_still_drop_as_invalid() -> None:
     drops: List[str] = []
     client = _client(sent, on_drop=lambda evs, reason: drops.append(reason))
 
-    @wrap_capability_handler(client, capability_name="d" * 65)  # the caller's own name
+    @wrap_capability_handler(client, trust_customer_header=True, capability_name="d" * 65)  # the caller's own name
     async def fixed(*, agent_id: str) -> str:
         return "ok"
 
-    @wrap_capability_handler(client)
+    @wrap_capability_handler(client, trust_customer_header=True)
     async def dispatch(*, agent_id: str, customer_id: str, capability_name: str) -> str:
         return "ok"
 

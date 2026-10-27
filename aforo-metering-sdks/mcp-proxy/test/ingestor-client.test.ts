@@ -1,5 +1,5 @@
 /**
- * @file Unit tests for IngestorClient (batch + single-event sends) and config
+ * @file Unit tests for IngestorClient (single-event heartbeat sends) and config
  * productType / customerId handling.
  */
 
@@ -57,37 +57,24 @@ describe('IngestorClient', () => {
     assert.deepEqual(res?.killedSessionIds, ['s1']);
   });
 
-  it('sendBatch does not retry a 400 and returns the response with errors[].message', async () => {
-    const calls = stubFetch([{ status: 400 }]);
-    const client = new IngestorClient({ baseUrl: 'https://x.test', apiKey: 'k', tenantId: 't' });
-    assert.equal(await client.sendBatch([event()]), null);
-    assert.equal(calls.length, 1);
-
-    stubFetch([{ status: 202, body: { success: true, data: { accepted: 0, duplicates: 0, failed: 1, errors: [{ index: 0, message: 'unknown metric' }] } } }]);
-    const res = await client.sendBatch([event()]);
-    assert.equal(res?.errors?.[0].message, 'unknown metric');
+  it('refuses a plain-http base URL on a non-loopback host', () => {
+    assert.throws(() => new IngestorClient({ baseUrl: 'http://ingest.example.com', apiKey: 'k', tenantId: 't' }), /https/);
+    new IngestorClient({ baseUrl: 'http://127.0.0.1:8084', apiKey: 'k', tenantId: 't' });
+    new IngestorClient({ baseUrl: 'http://ingest.internal', apiKey: 'k', tenantId: 't', allowInsecureHttp: true });
   });
 
-  it('sendBatchDetailed says why a batch failed: rejected with the server message, or retry_exhausted', async () => {
-    stubFetch([{ status: 400, body: { errors: [{ index: 0, message: 'productType is required' }] } }]);
-    const client = new IngestorClient({ baseUrl: 'https://x.test', apiKey: 'k', tenantId: 't', maxRetries: 1 });
-    const rejected = await client.sendBatchDetailed([event()]);
-    assert.equal(rejected.result, null);
-    assert.equal(rejected.reason, 'rejected');
-    assert.match(rejected.message ?? '', /HTTP 400: productType is required/);
-
-    const calls = stubFetch([{ status: 503 }]);
-    const exhausted = await client.sendBatchDetailed([event()]);
-    assert.equal(exhausted.result, null);
-    assert.equal(exhausted.reason, 'retry_exhausted');
-    assert.equal(calls.length, 1);
+  it('never shows the API key in inspect() or JSON', () => {
+    const client = new IngestorClient({ baseUrl: 'https://x.test', apiKey: 'sk_secret_value', tenantId: 't' });
+    const util = require('node:util');
+    assert.doesNotMatch(util.inspect(client, { depth: 5 }), /sk_secret_value/);
+    assert.doesNotMatch(JSON.stringify(client), /sk_secret_value/);
   });
 });
 
 describe('loadConfig productType / customerId', () => {
   const base = {
     transport: 'stdio' as const, command: 'node',
-    aforo: { tenantId: 't', productId: 'p', apiKey: 'k', ingestorUrl: 'https://x.test' },
+    aforo: { tenantId: 't', productId: 'p', apiKey: 'k', ingestorUrl: 'https://x.test', customerId: 'cust_0' },
   };
 
   it('defaults productType to MCP_SERVER and normalises configured values', () => {

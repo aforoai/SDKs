@@ -29,28 +29,32 @@ import java.util.logging.Logger;
  * already been committed, so this adds zero latency to the API call.</p>
  *
  * <h2>Metric</h2>
- * Each request is recorded against {@link #metricName(String) a fixed metric}
+ * Each request is recorded against {@link Builder#metricName(String) a fixed metric}
  * (default {@value #DEFAULT_METRIC_NAME}) or the result of a
- * {@link #metricNameResolver(MetricNameResolver) resolver}. The metric must exist
+ * {@link Builder#metricNameResolver(MetricNameResolver) resolver}. The metric must exist
  * in the tenant's Aforo catalog: the ingestor rejects unknown metrics, and
  * because it validates a batch as a whole, one such event fails the entire
  * batch. The old default, {@code "METHOD /path"}, is a name no catalog contains.
  *
  * <h2>Customer</h2>
- * The customer id comes from a {@link #customerIdResolver(CustomerIdResolver)
- * resolver} if set, otherwise from the {@link #customerIdHeader(String)
- * customer header} (default {@value #DEFAULT_CUSTOMER_ID_HEADER}). The
- * authenticated principal's name is used (ahead of the header) only when
- * explicitly enabled with {@link #usePrincipalAsCustomerId(boolean)}: a login
- * name is rarely an Aforo customer id. The caller's {@code X-Api-Key} header is never used — it is a
- * secret, not an id. Requests with no customer are not metered.
+ * The customer id must come from an identity you trust. Build the filter with a
+ * {@link Builder#customerIdResolver(CustomerIdResolver) resolver} that reads it
+ * from your authentication (session, JWT subject, API-key lookup), or opt in to
+ * {@link Builder#usePrincipalAsCustomerId(boolean) the authenticated principal's
+ * name}. Reading the {@link Builder#customerIdHeader(String) customer header}
+ * (default {@value #DEFAULT_CUSTOMER_ID_HEADER}) needs
+ * {@link Builder#trustCustomerHeader(boolean) trustCustomerHeader(true)}: the
+ * caller of your API controls that header, so anyone could bill usage to another
+ * customer. With none of the three, {@link Builder#build()} throws. A request for
+ * which no customer is found is not sent; it is counted and reported to
+ * {@code onDrop} as {@code INVALID}. The request itself always goes through.
  *
  * <p>{@code OPTIONS} (CORS preflight) requests are never metered.</p>
  *
  * <p>Each event carries top-level {@code endpointPath} (the matched Spring MVC
  * route pattern, else the normalized request path, without query string),
  * {@code httpMethod}, {@code statusCode}, {@code responseTimeMs}, and
- * {@code productType} ({@link #productType(String)}, else the client default).</p>
+ * {@code productType} ({@link Builder#productType(String)}, else the client default).</p>
  *
  * <p>{@code endpointPath} and {@code httpMethod} come from the request. A value
  * over the ingestor's limit (512 / 16 characters) is truncated and the event is
@@ -62,7 +66,7 @@ public class AforoServletFilter implements Filter {
     /** Metric recorded when none is configured. Must exist in your Aforo catalog. */
     public static final String DEFAULT_METRIC_NAME = "api_calls";
 
-    /** Header read for the customer id when no resolver is configured. */
+    /** Header read for the customer id when {@link Builder#trustCustomerHeader(boolean)} is on. */
     public static final String DEFAULT_CUSTOMER_ID_HEADER = "X-Customer-Id";
 
     /** Ingestor limit on {@code endpointPath}. */
@@ -88,7 +92,7 @@ public class AforoServletFilter implements Filter {
         String resolve(HttpServletRequest request, HttpServletResponse response);
     }
 
-    /** Derives the Aforo customer id for a request. Returning null/blank skips metering it. */
+    /** Derives the Aforo customer id for a request from your authentication. Null/blank: the event is dropped as INVALID. */
     @FunctionalInterface
     public interface CustomerIdResolver {
         String resolve(HttpServletRequest request);
@@ -96,64 +100,144 @@ public class AforoServletFilter implements Filter {
 
     private final AforoClient client;
     private final List<String> excludePaths;
-    private String metricName = DEFAULT_METRIC_NAME;
-    private MetricNameResolver metricNameResolver;
-    private String customerIdHeader = DEFAULT_CUSTOMER_ID_HEADER;
-    private CustomerIdResolver customerIdResolver;
-    private boolean usePrincipalAsCustomerId;
-    private String productType;
+    private final String metricName;
+    private final MetricNameResolver metricNameResolver;
+    private final String customerIdHeader;
+    private final CustomerIdResolver customerIdResolver;
+    private final boolean trustCustomerHeader;
+    private final boolean usePrincipalAsCustomerId;
+    private final String productType;
+    private final boolean closeClientOnDestroy;
 
-    public AforoServletFilter(AforoClient client) {
-        this(client, DEFAULT_EXCLUDE_PATHS);
+    private AforoServletFilter(Builder b) {
+        this.client = b.client;
+        this.excludePaths = List.copyOf(b.excludePaths);
+        this.metricName = b.metricName;
+        this.metricNameResolver = b.metricNameResolver;
+        this.customerIdHeader = b.customerIdHeader;
+        this.customerIdResolver = b.customerIdResolver;
+        this.trustCustomerHeader = b.trustCustomerHeader;
+        this.usePrincipalAsCustomerId = b.usePrincipalAsCustomerId;
+        this.productType = b.productType;
+        this.closeClientOnDestroy = b.closeClientOnDestroy;
     }
 
-    public AforoServletFilter(AforoClient client, List<String> excludePaths) {
-        this.client = client;
-        this.excludePaths = excludePaths;
+    /** Start building a filter that records into {@code client}. */
+    public static Builder builder(AforoClient client) {
+        return new Builder(client);
     }
 
-    /** Fixed metric recorded per request. Default {@value #DEFAULT_METRIC_NAME}. */
-    public AforoServletFilter metricName(String metricName) {
-        this.metricName = isBlank(metricName) ? DEFAULT_METRIC_NAME : metricName;
-        return this;
+    /** Builds an {@link AforoServletFilter}; {@link #build()} checks the customer source. */
+    public static final class Builder {
+        private final AforoClient client;
+        private List<String> excludePaths = DEFAULT_EXCLUDE_PATHS;
+        private String metricName = DEFAULT_METRIC_NAME;
+        private MetricNameResolver metricNameResolver;
+        private String customerIdHeader = DEFAULT_CUSTOMER_ID_HEADER;
+        private CustomerIdResolver customerIdResolver;
+        private boolean trustCustomerHeader;
+        private boolean usePrincipalAsCustomerId;
+        private String productType;
+        private boolean closeClientOnDestroy = true;
+
+        private Builder(AforoClient client) {
+            if (client == null) throw new IllegalArgumentException("client is required");
+            this.client = client;
+        }
+
+        /** Path prefixes never metered. Default: /health, /ready, /metrics, /favicon.ico, /actuator. */
+        public Builder excludePaths(List<String> excludePaths) {
+            this.excludePaths = excludePaths == null ? List.of() : excludePaths;
+            return this;
+        }
+
+        /** Fixed metric recorded per request. Default {@value #DEFAULT_METRIC_NAME}. */
+        public Builder metricName(String metricName) {
+            this.metricName = isBlank(metricName) ? DEFAULT_METRIC_NAME : metricName;
+            return this;
+        }
+
+        /** Per-request metric; takes precedence over {@link #metricName(String)}. */
+        public Builder metricNameResolver(MetricNameResolver resolver) {
+            this.metricNameResolver = resolver;
+            return this;
+        }
+
+        /**
+         * Reads the customer id from your authenticated identity. Takes precedence
+         * over the principal and the header. Returning null/blank drops that
+         * request's event as {@code INVALID}.
+         */
+        public Builder customerIdResolver(CustomerIdResolver resolver) {
+            this.customerIdResolver = resolver;
+            return this;
+        }
+
+        /**
+         * Opt in to reading the customer id from {@link #customerIdHeader(String) the
+         * customer header}. Only do this when something in front of your app (a gateway
+         * that authenticates the caller) sets the header and strips any value the caller
+         * sent.
+         */
+        public Builder trustCustomerHeader(boolean trust) {
+            this.trustCustomerHeader = trust;
+            return this;
+        }
+
+        /** Header read when {@link #trustCustomerHeader(boolean)} is on. Default {@value #DEFAULT_CUSTOMER_ID_HEADER}. */
+        public Builder customerIdHeader(String header) {
+            this.customerIdHeader = isBlank(header) ? DEFAULT_CUSTOMER_ID_HEADER : header;
+            return this;
+        }
+
+        /**
+         * Opt in to using {@code getUserPrincipal().getName()} as the customer id
+         * (ahead of the header). Use it when the principal name is the Aforo customer id.
+         */
+        public Builder usePrincipalAsCustomerId(boolean enabled) {
+            this.usePrincipalAsCustomerId = enabled;
+            return this;
+        }
+
+        /**
+         * Product type for events recorded by this filter. {@code null} (default)
+         * uses the client's {@link AforoOptions#productType(String)}.
+         */
+        public Builder productType(String productType) {
+            this.productType = AforoOptions.normalizeProductType(productType);
+            return this;
+        }
+
+        /**
+         * Close the client when the servlet container destroys the filter (default
+         * {@code true}). The Spring Boot auto-configuration turns this off because
+         * Spring closes the client bean itself.
+         */
+        public Builder closeClientOnDestroy(boolean close) {
+            this.closeClientOnDestroy = close;
+            return this;
+        }
+
+        /**
+         * @throws IllegalStateException when no customer source is configured: set
+         *         {@link #customerIdResolver}, {@link #usePrincipalAsCustomerId} or
+         *         {@link #trustCustomerHeader}
+         */
+        public AforoServletFilter build() {
+            if (customerIdResolver == null && !usePrincipalAsCustomerId && !trustCustomerHeader) {
+                throw new IllegalStateException(MISSING_CUSTOMER_SOURCE);
+            }
+            return new AforoServletFilter(this);
+        }
     }
 
-    /** Per-request metric; takes precedence over {@link #metricName(String)}. */
-    public AforoServletFilter metricNameResolver(MetricNameResolver resolver) {
-        this.metricNameResolver = resolver;
-        return this;
-    }
-
-    /** Header carrying the Aforo customer id. Default {@value #DEFAULT_CUSTOMER_ID_HEADER}. */
-    public AforoServletFilter customerIdHeader(String header) {
-        this.customerIdHeader = isBlank(header) ? DEFAULT_CUSTOMER_ID_HEADER : header;
-        return this;
-    }
-
-    /** Per-request customer id; takes precedence over the header and principal. */
-    public AforoServletFilter customerIdResolver(CustomerIdResolver resolver) {
-        this.customerIdResolver = resolver;
-        return this;
-    }
-
-    /**
-     * Opt in to using {@code getUserPrincipal().getName()} as the customer id
-     * (ahead of the customer header). Off by default: a principal name is usually
-     * a login, not an Aforo customer id.
-     */
-    public AforoServletFilter usePrincipalAsCustomerId(boolean enabled) {
-        this.usePrincipalAsCustomerId = enabled;
-        return this;
-    }
-
-    /**
-     * Product type for events recorded by this filter. {@code null} (default)
-     * uses the client's {@link AforoOptions#productType(String)}.
-     */
-    public AforoServletFilter productType(String productType) {
-        this.productType = AforoOptions.normalizeProductType(productType);
-        return this;
-    }
+    /** Message for a filter built without a customer source. */
+    public static final String MISSING_CUSTOMER_SOURCE = "AforoServletFilter needs to know which customer each"
+            + " request belongs to. Set customerIdResolver(...) to read it from your authenticated identity"
+            + " (session, JWT subject, API-key lookup), or usePrincipalAsCustomerId(true) when the principal"
+            + " name is the Aforo customer id. trustCustomerHeader(true) reads the " + DEFAULT_CUSTOMER_ID_HEADER
+            + " header instead; only use it when a gateway in front of your app sets that header, because"
+            + " callers can otherwise bill usage to any customer.";
 
     @Override
     public void doFilter(ServletRequest servletRequest, ServletResponse servletResponse,
@@ -179,8 +263,8 @@ public class AforoServletFilter implements Filter {
             // Check exclusions
             if (excludePaths.stream().anyMatch(path::startsWith)) return;
 
+            // A request with no customer is reported (INVALID) by the client, never blocked.
             String customerId = extractCustomerId(req);
-            if (customerId == null) return;
 
             client.track(TrackEvent.builder(customerId, resolveMetricName(req, res))
                     .quantity(1)
@@ -236,7 +320,7 @@ public class AforoServletFilter implements Filter {
             String principal = trimToNull(req.getUserPrincipal().getName());
             if (principal != null) return principal;
         }
-        return trimToNull(req.getHeader(customerIdHeader));
+        return trustCustomerHeader ? trimToNull(req.getHeader(customerIdHeader)) : null;
     }
 
     private static boolean isBlank(String s) {
@@ -252,6 +336,6 @@ public class AforoServletFilter implements Filter {
 
     @Override
     public void destroy() {
-        client.close();
+        if (closeClientOnDestroy) client.close();
     }
 }

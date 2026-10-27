@@ -36,7 +36,7 @@ describe('koaMiddleware', () => {
   });
 
   it('meters with the default catalog metric and X-Customer-Id', async () => {
-    const mw = koaMiddleware({ apiKey: 'k', clientOptions });
+    const mw = koaMiddleware({ apiKey: 'k', trustCustomerHeader: true, clientOptions });
     await mw(koaCtx('GET', { 'x-customer-id': 'cust_1' }), async () => {});
     await tick();
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
@@ -44,7 +44,7 @@ describe('koaMiddleware', () => {
   });
 
   it('skips OPTIONS and never falls back to x-api-key', async () => {
-    const mw = koaMiddleware({ apiKey: 'k', clientOptions });
+    const mw = koaMiddleware({ apiKey: 'k', trustCustomerHeader: true, clientOptions });
     await mw(koaCtx('OPTIONS', { 'x-customer-id': 'cust_1' }), async () => {});
     await mw(koaCtx('GET', { 'x-api-key': 'secret' }), async () => {});
     await tick();
@@ -59,7 +59,7 @@ describe('fastifyPlugin', () => {
   });
 
   it('meters with a configured metric resolver', async () => {
-    await runFastify({ apiKey: 'k', clientOptions, metricName: () => 'otp_delivered' },
+    await runFastify({ apiKey: 'k', trustCustomerHeader: true, clientOptions, metricName: () => 'otp_delivered' },
       { url: '/api/data', method: 'POST', headers: { 'x-customer-id': 'cust_2' } });
     await tick();
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
@@ -67,9 +67,9 @@ describe('fastifyPlugin', () => {
   });
 
   it('skips OPTIONS and never falls back to x-api-key', async () => {
-    await runFastify({ apiKey: 'k', clientOptions },
+    await runFastify({ apiKey: 'k', trustCustomerHeader: true, clientOptions },
       { url: '/api/data', method: 'OPTIONS', headers: { 'x-customer-id': 'cust_1' } });
-    await runFastify({ apiKey: 'k', clientOptions },
+    await runFastify({ apiKey: 'k', trustCustomerHeader: true, clientOptions },
       { url: '/api/data', method: 'GET', headers: { 'x-api-key': 'secret' } });
     await tick();
     expect(mockFetch).not.toHaveBeenCalled();
@@ -96,9 +96,9 @@ describe('customer, quantity and metadata options', () => {
   });
 
   it('koa: fixed customerId and excluded paths/status codes', async () => {
-    const mw = koaMiddleware({ apiKey: 'k', clientOptions, customerId: 'cust_static', excludePaths: ['/api'] });
+    const mw = koaMiddleware({ apiKey: 'k', trustCustomerHeader: true, clientOptions, customerId: 'cust_static', excludePaths: ['/api'] });
     await mw(koaCtx('GET', {}), async () => {});
-    const mw2 = koaMiddleware({ apiKey: 'k', clientOptions, customerId: 'cust_static', excludeStatusCodes: [200] });
+    const mw2 = koaMiddleware({ apiKey: 'k', trustCustomerHeader: true, clientOptions, customerId: 'cust_static', excludeStatusCodes: [200] });
     await mw2(koaCtx('GET', {}), async () => {});
     await tick();
     expect(mockFetch).not.toHaveBeenCalled();
@@ -115,9 +115,9 @@ describe('customer, quantity and metadata options', () => {
   });
 
   it('fastify: customerId resolver, excluded paths/status codes', async () => {
-    await runFastify({ apiKey: 'k', clientOptions, customerId: () => 'c', excludePaths: ['/api'] },
+    await runFastify({ apiKey: 'k', trustCustomerHeader: true, clientOptions, customerId: () => 'c', excludePaths: ['/api'] },
       { url: '/api/data', method: 'GET', headers: {} });
-    await runFastify({ apiKey: 'k', clientOptions, customerId: () => 'c', excludeStatusCodes: [200] },
+    await runFastify({ apiKey: 'k', trustCustomerHeader: true, clientOptions, customerId: () => 'c', excludeStatusCodes: [200] },
       { url: '/api/data', method: 'GET', headers: {} });
     await tick();
     expect(mockFetch).not.toHaveBeenCalled();
@@ -131,7 +131,7 @@ describe('productType, HTTP fields and quantity <= 0', () => {
   });
 
   it('koa: sends productType and top-level HTTP fields', async () => {
-    const mw = koaMiddleware({ apiKey: 'k', clientOptions, productType: 'agentic_api' });
+    const mw = koaMiddleware({ apiKey: 'k', trustCustomerHeader: true, clientOptions, productType: 'agentic_api' });
     await mw({ ...koaCtx('POST', { 'x-customer-id': 'cust_1' }), path: '/api/data', status: 201 }, async () => {});
     await tick();
     const ev = JSON.parse(mockFetch.mock.calls[0][1].body).events[0];
@@ -140,7 +140,7 @@ describe('productType, HTTP fields and quantity <= 0', () => {
   });
 
   it('koa: skips quantity <= 0', async () => {
-    const mw = koaMiddleware({ apiKey: 'k', clientOptions, quantity: 0 });
+    const mw = koaMiddleware({ apiKey: 'k', trustCustomerHeader: true, clientOptions, quantity: 0 });
     await mw(koaCtx('GET', { 'x-customer-id': 'cust_1' }), async () => {});
     await tick();
     expect(mockFetch).not.toHaveBeenCalled();
@@ -148,7 +148,7 @@ describe('productType, HTTP fields and quantity <= 0', () => {
 
   it('fastify: default productType API, path without query, elapsed time', async () => {
     const hooks: Record<string, Function> = {};
-    await fastifyPlugin({ addHook: (n: string, fn: Function) => { hooks[n] = fn; } }, { apiKey: 'k', clientOptions });
+    await fastifyPlugin({ addHook: (n: string, fn: Function) => { hooks[n] = fn; } }, { apiKey: 'k', trustCustomerHeader: true, clientOptions });
     await new Promise<void>((resolve) => hooks.onResponse(
       { url: '/api/data?x=1', method: 'GET', headers: { 'x-customer-id': 'cust_1' } },
       { statusCode: 200, elapsedTime: 12.6 }, resolve));
@@ -158,7 +158,7 @@ describe('productType, HTTP fields and quantity <= 0', () => {
   });
 
   it('fastify: skips quantity <= 0', async () => {
-    await runFastify({ apiKey: 'k', clientOptions, quantity: () => -1 },
+    await runFastify({ apiKey: 'k', trustCustomerHeader: true, clientOptions, quantity: () => -1 },
       { url: '/api/data', method: 'GET', headers: { 'x-customer-id': 'cust_1' } });
     await tick();
     expect(mockFetch).not.toHaveBeenCalled();

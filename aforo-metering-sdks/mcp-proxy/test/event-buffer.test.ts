@@ -1,215 +1,207 @@
 /**
- * @file Unit tests for EventBuffer — flush triggers, batching.
+ * @file EventBuffer on the shared transport core, against the repo's
+ * fault-injecting mock ingestor (real HTTP): flush triggers, batching, the
+ * single flusher, and drop accounting — an outage re-queues with the same
+ * keys, a non-retryable 4xx drops as 'rejected', per-event `retryable`
+ * failures are re-sent, a slow answer past the timeout is retried, shutdown
+ * honours its deadline, and overflow drops the oldest while the ingestor is down.
  */
 
-import { describe, it, afterEach } from 'node:test';
+import { describe, it, before, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { EventBuffer } from '../src/telemetry/EventBuffer.js';
-import type { ProxyUsageEvent } from '../src/types.js';
+import { EventBuffer, type EventBufferConfig } from '../src/telemetry/EventBuffer.js';
+import type { DropReason, ProxyUsageEvent } from '../src/types.js';
+import { startMockIngestor, waitUntil, type MockIngestor } from './support/mock-ingestor.js';
 
+let seq = 0;
 function makeEvent(toolName: string): ProxyUsageEvent {
   return {
-    customerId: 'agent_1',
+    customerId: 'cust_1',
     metricName: 'mcp_server.tool_invocations',
     quantity: 1,
     occurredAt: new Date().toISOString(),
-    idempotencyKey: `key_${toolName}_${Date.now()}`,
+    idempotencyKey: `key_${toolName}_${++seq}`,
     productType: 'MCP_SERVER',
     toolName,
     agentId: 'agent_1',
     sessionId: 'session_1',
     executionStatus: 'SUCCESS',
     executionDurationMs: 100,
-    metadata: { proxy: true, proxyVersion: '1.0.0', transport: 'stdio', productId: 'prod_1' },
+    metadata: { proxy: true, proxyVersion: '2.0.0', transport: 'stdio', productId: 'prod_1' },
   };
 }
 
-// Stub IngestorClient
-class StubClient {
-  batches: ProxyUsageEvent[][] = [];
-  async sendBatch(events: ProxyUsageEvent[]) {
-    this.batches.push([...events]);
-    return { accepted: events.length, duplicates: 0, failed: 0 };
-  }
-}
+describe('EventBuffer (mock ingestor)', () => {
+  let mock: MockIngestor;
+  let buffers: EventBuffer[] = [];
+  let drops: Array<{ events: ProxyUsageEvent[]; reason: DropReason }> = [];
 
-describe('EventBuffer', () => {
-  let buffer: EventBuffer;
-  let client: StubClient;
-
+  before(async () => { mock = await startMockIngestor(); });
+  after(async () => { await mock.close(); });
+  beforeEach(async () => { await mock.reset(); drops = []; });
   afterEach(async () => {
-    if (buffer) await buffer.shutdown();
+    await fetch(`${mock.url}/__control/faults`, { method: 'DELETE' });
+    for (const b of buffers) await b.shutdown();
+    buffers = [];
   });
 
-  it('flushes when count threshold is reached', async () => {
-    client = new StubClient();
-    buffer = new EventBuffer({
-      flushCount: 3,
-      flushIntervalMs: 60_000, // Very long — won't trigger during test
-      client: client as any,
+  function make(extra: Partial<EventBufferConfig> = {}): EventBuffer {
+    const b = new EventBuffer({
+      baseUrl: mock.url, apiKey: 'sk_test', tenantId: 't1',
+      flushIntervalMs: 3_600_000, maxRetries: 0,
+      onDrop: (events, reason) => drops.push({ events, reason }),
+      ...extra,
     });
+    buffers.push(b);
+    return b;
+  }
 
-    buffer.push(makeEvent('a'));
-    buffer.push(makeEvent('b'));
-    assert.equal(client.batches.length, 0);
-
-    buffer.push(makeEvent('c')); // Triggers flush
-
-    // Wait for async flush
-    await new Promise(resolve => setTimeout(resolve, 50));
-
-    assert.equal(client.batches.length, 1);
-    assert.equal(client.batches[0].length, 3);
+  it('flushes when the count threshold is reached, without an explicit flush', async () => {
+    const b = make({ flushCount: 3 });
+    for (const t of ['a', 'b', 'c']) b.push(makeEvent(t));
+    const state = await mock.waitFor((s) => s.acceptedCount === 3);
+    assert.equal(state.requests.length, 1);
+    assert.equal(b.size, 0);
   });
 
-  it('reports correct size', () => {
-    client = new StubClient();
-    buffer = new EventBuffer({
-      flushCount: 100,
-      flushIntervalMs: 60_000,
-      client: client as any,
+  it('reports the queue size and drains it on flush', async () => {
+    const b = make({ flushCount: 100 });
+    b.push(makeEvent('a'));
+    b.push(makeEvent('b'));
+    assert.equal(b.size, 2);
+    const r = await b.flush();
+    assert.equal(r.sent, 2);
+    assert.equal(b.size, 0);
+  });
+
+  it('flush is a no-op when nothing is queued', async () => {
+    const b = make();
+    const r = await b.flush();
+    assert.equal(r.sent, 0);
+    assert.equal((await mock.state()).requests.length, 0);
+  });
+
+  it('shutdown sends what is queued', async () => {
+    const b = make({ flushCount: 100 });
+    b.push(makeEvent('a'));
+    await b.shutdown();
+    assert.equal((await mock.state()).acceptedCount, 1);
+  });
+
+  it('sends more than 1000 queued events as requests of at most 1000, one at a time', async () => {
+    const b = make({ flushCount: 5000 });
+    for (let i = 0; i < 2500; i++) b.push(makeEvent(`t${i}`));
+    await b.flush();
+    const state = await mock.state();
+    assert.deepEqual(state.requests.map((r) => r.eventCount), [1000, 1000, 500]);
+    assert.equal(state.maxInFlight, 1);
+  });
+
+  it('sends X-API-Key and X-Tenant-Id, never Authorization', async () => {
+    let headers: Record<string, string> = {};
+    const b = make({
+      fetch: async (url, init) => { headers = init.headers; return fetch(url, init); },
     });
-
-    assert.equal(buffer.size, 0);
-    buffer.push(makeEvent('a'));
-    assert.equal(buffer.size, 1);
-    buffer.push(makeEvent('b'));
-    assert.equal(buffer.size, 2);
-  });
-
-  it('manual flush drains all events', async () => {
-    client = new StubClient();
-    buffer = new EventBuffer({
-      flushCount: 100,
-      flushIntervalMs: 60_000,
-      client: client as any,
-    });
-
-    buffer.push(makeEvent('a'));
-    buffer.push(makeEvent('b'));
-
-    await buffer.flush();
-
-    assert.equal(client.batches.length, 1);
-    assert.equal(client.batches[0].length, 2);
-    assert.equal(buffer.size, 0);
-  });
-
-  it('flush is a no-op when buffer is empty', async () => {
-    client = new StubClient();
-    buffer = new EventBuffer({
-      flushCount: 100,
-      flushIntervalMs: 60_000,
-      client: client as any,
-    });
-
-    await buffer.flush();
-    assert.equal(client.batches.length, 0);
-  });
-
-  it('shutdown stops timer and flushes remaining', async () => {
-    client = new StubClient();
-    buffer = new EventBuffer({
-      flushCount: 100,
-      flushIntervalMs: 60_000,
-      client: client as any,
-    });
-
-    buffer.push(makeEvent('a'));
-    buffer.push(makeEvent('b'));
-
-    await buffer.shutdown();
-
-    assert.equal(client.batches.length, 1);
-    assert.equal(client.batches[0].length, 2);
-  });
-
-  it('sends more than 1000 buffered events as slices of at most 1000', async () => {
-    client = new StubClient();
-    buffer = new EventBuffer({ flushCount: 5000, flushIntervalMs: 60_000, client: client as any });
-
-    for (let i = 0; i < 2500; i++) buffer.push(makeEvent(`t${i}`));
-    await buffer.flush();
-
-    assert.deepEqual(client.batches.map(b => b.length), [1000, 1000, 500]);
-    assert.equal(buffer.size, 0);
+    b.push(makeEvent('a'));
+    await b.flush();
+    assert.equal(headers['X-API-Key'], 'sk_test');
+    assert.equal(headers['X-Tenant-Id'], 't1');
+    assert.equal(headers.Authorization, undefined);
+    assert.match(headers['User-Agent'], /^aforo-mcp-proxy\//);
   });
 
   describe('drop accounting', () => {
-    const outcomeClient = (outcome: any) => ({
-      bodies: [] as ProxyUsageEvent[][],
-      async sendBatch() { throw new Error('sendBatchDetailed should be used'); },
-      async sendBatchDetailed(events: ProxyUsageEvent[]) { this.bodies.push([...events]); return outcome; },
-    });
-    const make = (c: any, drops: Array<{ events: ProxyUsageEvent[]; reason: string }>) => new EventBuffer({
-      flushCount: 100, flushIntervalMs: 60_000, client: c,
-      onDrop: (events, reason) => drops.push({ events, reason }),
-    });
-
-    it('a batch that exhausts its retries is dropped as retry_exhausted, keys intact', async () => {
-      const drops: Array<{ events: ProxyUsageEvent[]; reason: string }> = [];
-      buffer = make(outcomeClient({ result: null, reason: 'retry_exhausted', message: 'HTTP 503' }), drops);
-      const a = makeEvent('a');
-      buffer.push(a);
-      buffer.push(makeEvent('b'));
-      await buffer.flush();
-      assert.equal(buffer.droppedCount, 2);
-      assert.equal(drops.length, 1);
-      assert.equal(drops[0].reason, 'retry_exhausted');
-      assert.equal(drops[0].events[0].idempotencyKey, a.idempotencyKey);
+    it('an outage re-queues the batch with the same keys; nothing is dropped', async () => {
+      const b = make();
+      await mock.faults([{ status: 503, times: 1 }]);
+      const events = [makeEvent('a'), makeEvent('b')];
+      for (const e of events) b.push(e);
+      const first = await b.flush();
+      assert.equal(first.requeued, 2);
+      assert.equal(b.droppedCount, 0);
+      assert.deepEqual(drops, []);
+      await b.flush();
+      const state = await mock.state();
+      assert.deepEqual(state.events.map((e) => e.idempotencyKey), events.map((e) => e.idempotencyKey));
     });
 
-    it('a non-retryable 4xx batch is dropped as rejected', async () => {
-      const drops: Array<{ events: ProxyUsageEvent[]; reason: string }> = [];
-      buffer = make(outcomeClient({ result: null, reason: 'rejected', message: 'HTTP 400: bad' }), drops);
-      buffer.push(makeEvent('a'));
-      await buffer.flush();
-      assert.equal(buffer.droppedCount, 1);
-      assert.equal(drops[0].reason, 'rejected');
+    it('401 is an outage, not a drop', async () => {
+      const b = make();
+      await mock.faults([{ status: 401, times: 1 }]);
+      b.push(makeEvent('a'));
+      await b.flush();
+      assert.deepEqual(drops, []);
+      assert.equal((await b.flush()).sent, 1);
     });
 
-    it('per-event errors[] in a 2xx response drop only the named events', async () => {
-      const drops: Array<{ events: ProxyUsageEvent[]; reason: string }> = [];
-      buffer = make(outcomeClient({
-        result: { accepted: 2, duplicates: 0, failed: 1, errors: [{ index: 1, message: 'Metric not found' }] },
-      }), drops);
-      buffer.push(makeEvent('a'));
-      buffer.push(makeEvent('b'));
-      buffer.push(makeEvent('c'));
-      await buffer.flush();
-      assert.equal(buffer.droppedCount, 1);
+    it('a non-retryable 4xx batch is dropped as rejected, not retried', async () => {
+      const b = make({ maxRetries: 3 });
+      await mock.faults([{ status: 422, times: 1 }]);
+      b.push(makeEvent('a'));
+      await b.flush();
       assert.equal(drops.length, 1);
       assert.equal(drops[0].reason, 'rejected');
-      assert.deepEqual(drops[0].events.map((e) => e.toolName), ['b']);
+      assert.equal(b.droppedCount, 1);
+      assert.equal((await mock.state()).requests.length, 1);
     });
 
-    it('a failure count without indexes is counted but not attributed to events', async () => {
-      const drops: Array<{ events: ProxyUsageEvent[]; reason: string }> = [];
-      buffer = make(outcomeClient({ result: { accepted: 1, duplicates: 0, failed: 1 } }), drops);
-      buffer.push(makeEvent('a'));
-      buffer.push(makeEvent('b'));
-      await buffer.flush();
-      assert.equal(buffer.droppedCount, 1);
-      assert.equal(drops.length, 0);
+    it('per-event errors: retryable ones are re-sent, the others dropped as rejected', async () => {
+      const b = make();
+      await mock.faults([{ perEvent: [{ index: 0, message: 'busy', retryable: true }, { index: 1, message: 'unknown metric', retryable: false }] }]);
+      for (const t of ['a', 'b', 'c']) b.push(makeEvent(t));
+      const first = await b.flush();
+      assert.deepEqual([first.sent, first.failed, first.requeued], [1, 1, 1]);
+      assert.deepEqual(drops.map((d) => [d.reason, d.events[0].toolName]), [['rejected', 'b']]);
+      await b.flush();
+      assert.deepEqual((await mock.state()).events.map((e) => e.toolName).sort(), ['a', 'c']);
+    });
+
+    it('a response slower than the request timeout is retried, not lost', async () => {
+      const b = make({ timeoutMs: 100 });
+      await mock.faults([{ delayMs: 600, times: 1 }]);
+      b.push(makeEvent('slow'));
+      assert.equal((await b.flush()).requeued, 1);
+      assert.equal((await b.flush()).sent, 1);
+      assert.deepEqual(drops, []);
+    });
+
+    it('shutdown while a request hangs stops at the deadline and reports the leftovers', async () => {
+      const b = make({ shutdownTimeoutMs: 300 });
+      await mock.faults([{ hang: true, times: -1 }]);
+      b.push(makeEvent('a'));
+      b.push(makeEvent('b'));
+      const started = Date.now();
+      await b.shutdown();
+      assert.ok(Date.now() - started < 3000);
+      assert.deepEqual(drops.map((d) => [d.reason, d.events.length]), [['shutdown', 2]]);
+      b.push(makeEvent('late'));
+      assert.equal(drops[1].reason, 'closed');
+    });
+
+    it('while the ingestor is down the queue is bounded: overflow drops the oldest', async () => {
+      const b = make({ maxQueueSize: 2 });
+      await mock.faults([{ status: 503, times: -1 }]);
+      b.push(makeEvent('first'));
+      b.push(makeEvent('second'));
+      await b.flush();
+      b.push(makeEvent('third'));
+      assert.deepEqual(drops.map((d) => [d.reason, d.events[0].toolName]), [['overflow', 'first']]);
+      assert.equal(b.size, 2);
     });
 
     it('recordDrop counts invalid events and survives a throwing hook', () => {
-      buffer = new EventBuffer({
-        flushCount: 100, flushIntervalMs: 60_000, client: new StubClient() as any,
-        onDrop: () => { throw new Error('hook bug'); },
-      });
-      assert.doesNotThrow(() => buffer.recordDrop([makeEvent('a')], 'invalid', 'toolName exceeds 64 chars'));
-      assert.equal(buffer.droppedCount, 1);
-      assert.equal(buffer.size, 0);
+      const b = make({ onDrop: () => { throw new Error('hook bug'); } });
+      b.recordDrop([makeEvent('x')], 'invalid', 'agentId too long');
+      assert.equal(b.droppedCount, 1);
     });
 
     it('a delivered batch drops nothing', async () => {
-      const drops: Array<{ events: ProxyUsageEvent[]; reason: string }> = [];
-      buffer = make(outcomeClient({ result: { accepted: 1, duplicates: 0, failed: 0 } }), drops);
-      buffer.push(makeEvent('a'));
-      await buffer.flush();
-      assert.equal(buffer.droppedCount, 0);
-      assert.equal(drops.length, 0);
+      const b = make();
+      b.push(makeEvent('a'));
+      await b.flush();
+      await waitUntil(async () => (await mock.state()).acceptedCount === 1);
+      assert.equal(b.droppedCount, 0);
+      assert.deepEqual(drops, []);
     });
   });
 });

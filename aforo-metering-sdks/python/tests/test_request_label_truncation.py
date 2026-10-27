@@ -25,17 +25,26 @@ def _fresh_warnings():
 
 @pytest.fixture
 def client():
-    c = AforoClient(api_key="k", flush_interval=3600, flush_count=1000)
-    sent: list = []
+    from types import SimpleNamespace
 
-    def send_sync(batch):
-        from aforo.types import FlushResult
+    from .fakes import ScriptedServer
 
-        sent.extend(batch)
-        return FlushResult(sent=len(batch), failed=0)
+    server = ScriptedServer()
+    drops: list = []
+    c = AforoClient(api_key="k", base_url="https://ingest.example.test", flush_interval=3600,
+                    flush_count=1000, http_transport=server.transport(),
+                    on_drop=lambda events, reason: drops.append(reason))
 
-    c._transport.send_sync = send_sync  # type: ignore[method-assign]
-    c.sent = sent  # type: ignore[attr-defined]
+    def sent():
+        out = []
+        for r in server.requests:
+            for e in r["body"]["events"]:
+                out.append(SimpleNamespace(extra_fields=e, idempotency_key=e["idempotencyKey"],
+                                           metric_name=e["metricName"]))
+        return out
+
+    c.sent_events = sent  # type: ignore[attr-defined]
+    c.drops = drops  # type: ignore[attr-defined]
     yield c
     c.shutdown()
 
@@ -93,11 +102,11 @@ def test_event_with_truncated_request_labels_is_sent(client):
         )
     assert client.dropped_count == 0
     client.flush()
-    assert len(client.sent) == 2
-    assert all(len(e.extra_fields["endpointPath"]) == 512 for e in client.sent)
+    assert len(client.sent_events()) == 2
+    assert all(len(e.extra_fields["endpointPath"]) == 512 for e in client.sent_events())
     # The key is a random UUID minted per event: it does not depend on the
     # path, so truncation cannot make two requests share one.
-    keys = {e.idempotency_key for e in client.sent}
+    keys = {e.idempotency_key for e in client.sent_events()}
     assert len(keys) == 2
 
 
@@ -111,7 +120,7 @@ def test_asgi_middleware_meters_a_request_with_an_over_long_path(client):
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": b"ok"})
 
-    mw = AforoMeteringMiddleware(app, api_key="k")
+    mw = AforoMeteringMiddleware(app, api_key="k", trust_customer_header=True)
     mw._client.shutdown()
     mw._client = client
 
@@ -130,14 +139,13 @@ def test_asgi_middleware_meters_a_request_with_an_over_long_path(client):
     asyncio.run(mw(scope, receive, send))
     assert client.dropped_count == 0
     client.flush()
-    assert len(client.sent) == 1
-    assert len(client.sent[0].extra_fields["endpointPath"]) == 512
-    assert client.sent[0].metric_name == "api_calls"
+    assert len(client.sent_events()) == 1
+    assert len(client.sent_events()[0].extra_fields["endpointPath"]) == 512
+    assert client.sent_events()[0].metric_name == "api_calls"
 
 
 def test_caller_set_fields_still_drop_as_invalid(client):
-    drops: list = []
-    client._on_drop = lambda events, reason: drops.append(reason)
+    drops = client.drops
     client.track(customer_id="c" * 65, metric_name="api_calls", quantity=1)
     # A label the caller passes explicitly is not truncated either.
     client.track(
@@ -147,7 +155,7 @@ def test_caller_set_fields_still_drop_as_invalid(client):
     assert drops == ["invalid", "invalid"]
     assert client.dropped_count == 2
     client.flush()
-    assert client.sent == []
+    assert client.sent_events() == []
 
 
 def test_truncate_label_leaves_non_strings_alone():

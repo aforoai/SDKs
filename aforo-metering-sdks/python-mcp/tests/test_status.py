@@ -20,15 +20,29 @@ CANONICAL = json.loads(
 )["endpoints"]["/v1/ingest/batch"]["eventOptionalFields"]["executionStatus"]["values"]
 
 
+_CLIENTS: list = []
+
+
+@pytest.fixture(autouse=True)
+def _shutdown_clients():
+    yield
+    while _CLIENTS:
+        _CLIENTS.pop().shutdown_sync(timeout=0)
+
+
 def _billing() -> AforoMcpBilling:
-    return AforoMcpBilling(
+    billing = AforoMcpBilling(
         tenant_id="tenant_test",
         product_id="prod_test",
         api_key="test-key",
-        ingestor_url="https://ingest.test.aforo.ai",
+        ingestor_url="https://ingest.example.test",
         flush_interval_sec=3600.0,
         heartbeat_enabled=False,
+        customer_resolver=lambda call: "cust_1",
+        agent_resolver=lambda call: "agent_1",
     )
+    _CLIENTS.append(billing)
+    return billing
 
 
 def _run(coro):

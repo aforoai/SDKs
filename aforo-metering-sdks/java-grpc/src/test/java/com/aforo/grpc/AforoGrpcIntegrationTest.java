@@ -143,7 +143,7 @@ class AforoGrpcIntegrationTest {
         capturePort = captureServer.getAddress().getPort();
 
         // Build billing
-        billing = AforoGrpcBilling.newBuilder()
+        billing = AforoGrpcBilling.newBuilder().trustCustomerHeader(true)
                 .tenantId("tenant-int-grpc")
                 .productId("prod-int-grpc")
                 .apiKey("sk_int_grpc")

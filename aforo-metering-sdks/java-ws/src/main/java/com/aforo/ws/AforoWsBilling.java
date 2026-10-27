@@ -1,25 +1,16 @@
 package com.aforo.ws;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.aforo.ws.internal.transport.TransportConfig;
+import com.aforo.ws.internal.transport.TransportCore;
 
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
@@ -29,52 +20,103 @@ import java.util.logging.Logger;
  * and {@code closeConnection} from your Jakarta WebSocket {@code @OnOpen} /
  * {@code @OnMessage} / {@code @OnClose} handlers (or Spring WebSocket
  * equivalents). The SDK aggregates per-connection counters in memory and
- * emits one CONNECTION_OPENED + one CONNECTION_CLOSED billing event with
- * the totals (or per-frame events when {@code perFrameEvents=true}).</p>
+ * emits one CONNECTION_OPENED ({@code wsFrameType: OPEN}, metric
+ * {@code websocket_api.connection_opened}) + one CONNECTION_CLOSED billing event
+ * with the totals (or per-frame events when {@code perFrameEvents=true}).</p>
+ *
+ * <p>The open-connection map is bounded: a connection with no activity for
+ * {@link Builder#connectionIdleTimeoutMs(long)} (default 1 h) is closed by a sweep
+ * ({@code ABNORMAL_CLOSURE}, metadata {@code closedBy: sdk_idle_timeout}), and
+ * {@link #close()} emits CONNECTION_CLOSED ({@code GOING_AWAY}, {@code closedBy:
+ * sdk_shutdown}) for every connection still open.</p>
  */
 public final class AforoWsBilling implements AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(AforoWsBilling.class.getName());
-    private static final String SDK_VERSION = "1.2.1";
-    /** The ingestor rejects {@code /v1/ingest/batch} requests with more than 1000 events. */
-    static final int MAX_EVENTS_PER_REQUEST = 1000;
+    private static final String SDK_VERSION = "2.0.0";
     private static final int MAX_IDEMPOTENCY_KEY = 255;
     /** Default top-level {@code productType}; override with {@link Builder#productType(String)}. */
     public static final String DEFAULT_PRODUCT_TYPE = "WEBSOCKET_API";
+    /** Default for {@link Builder#connectionIdleTimeoutMs(long)}: one hour. */
+    public static final long DEFAULT_CONNECTION_IDLE_TIMEOUT_MS = 3_600_000L;
 
     private final String tenantId, productId, apiKey;
-    private final URI ingestorUri;
     private final String productType;
     private final boolean perFrameEvents;
-    private final int flushCount;
-    private final long flushIntervalMs;
 
     private final ConcurrentHashMap<String, ConnectionState> active = new ConcurrentHashMap<>();
-    private final ConcurrentLinkedQueue<Map<String, Object>> buffer = new ConcurrentLinkedQueue<>();
-    private final AtomicInteger bufferSize = new AtomicInteger();
-    private final AtomicLong dropped = new AtomicLong();
     private final BiConsumer<java.util.List<Map<String, Object>>, DropReason> onDrop;
-    /** Retry backoff base in ms — package-private so tests can skip real sleeps. */
-    long retryBackoffBaseMs = 1000L;
+    private final java.util.function.Consumer<MeteringError> onError;
+    private final BiConsumer<Map<String, Object>, java.util.List<Map<String, Object>>> onAccepted;
     private final ObjectMapper mapper = new ObjectMapper();
-    private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
-    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-        Thread t = new Thread(r, "aforo-ws-flush");
-        t.setDaemon(true);
-        return t;
-    });
+    private final TransportCore<Map<String, Object>> core;
+    private final long idleTimeoutMs;
+    private final java.util.function.LongSupplier clock;
+    private final java.util.concurrent.ScheduledExecutorService sweeper;
+    /** Opens hold the read lock; close() takes the write lock, so no open slips past the shutdown CLOSE pass. */
+    private final java.util.concurrent.locks.ReentrantReadWriteLock lifecycle =
+            new java.util.concurrent.locks.ReentrantReadWriteLock();
+    private volatile boolean closing;
 
     private AforoWsBilling(Builder b) {
         this.tenantId = require(b.tenantId, "tenantId");
         this.productId = require(b.productId, "productId");
         this.apiKey = require(b.apiKey, "apiKey");
-        this.ingestorUri = URI.create(stripTrailingSlash(require(b.ingestorUrl, "ingestorUrl")) + "/v1/ingest/batch");
         this.productType = normalizeProductType(b.productType, DEFAULT_PRODUCT_TYPE);
         this.perFrameEvents = b.perFrameEvents;
-        this.flushCount = b.flushCount;
-        this.flushIntervalMs = b.flushIntervalMs;
         this.onDrop = b.onDrop;
-        scheduler.scheduleAtFixedRate(this::flushQuietly, flushIntervalMs, flushIntervalMs, TimeUnit.MILLISECONDS);
+        this.onError = b.onError;
+        this.onAccepted = b.onAccepted;
+        if (b.connectionIdleTimeoutMs < 0) {
+            throw new IllegalArgumentException("connectionIdleTimeoutMs must be > 0 (0 = default of 1 h); got "
+                    + b.connectionIdleTimeoutMs + ". A sweep keeps the open-connection map bounded, so it cannot be disabled.");
+        }
+        this.idleTimeoutMs = b.connectionIdleTimeoutMs == 0 ? DEFAULT_CONNECTION_IDLE_TIMEOUT_MS : b.connectionIdleTimeoutMs;
+        this.clock = b.clock == null ? System::currentTimeMillis : b.clock;
+        this.core = new TransportCore<>(TransportConfig.builder()
+                .baseUrl(require(b.ingestorUrl, "ingestorUrl"))
+                .apiKey(apiKey)
+                .allowInsecureHttp(b.allowInsecureHttp)
+                .header("X-Tenant-Id", tenantId)
+                .userAgent("aforo-java-ws/" + SDK_VERSION)
+                .flushCount(b.flushCount)
+                .flushIntervalMs(b.flushIntervalMs)
+                .maxQueueSize(b.maxQueueSize)
+                .maxRetries(b.maxRetries)
+                .retryBaseMs(b.retryBaseMs)
+                .timeoutMs(b.timeoutMs)
+                .shutdownTimeoutMs(b.shutdownTimeoutMs)
+                .breakerInitialMs(b.breakerCooldownMs)
+                .threadName("aforo-ws-flush")
+                .loggerName(AforoWsBilling.class.getName())
+                .logPrefix("[aforo-ws]")
+                .build(),
+                mapper::writeValueAsString,
+                TransportCore.Listeners.<Map<String, Object>>builder()
+                        .onDrop((events, reason) -> { if (onDrop != null) onDrop.accept(events, map(reason)); })
+                        .onError(onError == null ? null : e -> onError.accept(
+                                new MeteringError(map(e.kind()), e.message(), e.events(), e.status())))
+                        .onAccepted(onAccepted == null ? null : (body, events) -> onAccepted.accept(asMap(body), events))
+                        .build());
+        this.sweeper = startSweeper();
+    }
+
+    /** Runs the idle sweep every idleTimeout/4, between 1 s and 1 min. */
+    private java.util.concurrent.ScheduledExecutorService startSweeper() {
+        long every = Math.max(1_000, Math.min(60_000, idleTimeoutMs / 4));
+        java.util.concurrent.ScheduledExecutorService s = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "aforo-ws-idle-sweep");
+            t.setDaemon(true);
+            return t;
+        });
+        s.scheduleWithFixedDelay(() -> {
+            try {
+                sweepIdle();
+            } catch (RuntimeException e) {
+                LOG.log(java.util.logging.Level.WARNING, "[aforo-ws] idle sweep failed; continuing", e);
+            }
+        }, every, every, java.util.concurrent.TimeUnit.MILLISECONDS);
+        return s;
     }
 
     /** Open a billing-tracked connection. Returns the synthetic connection ID. */
@@ -88,15 +130,39 @@ public final class AforoWsBilling implements AutoCloseable {
      * Returns the synthetic connection ID.
      */
     public String openConnection(String customerId, Map<String, Object> metadata, String executionStatus) {
-        if (customerId == null || customerId.isBlank()) return null;
         String connectionId = UUID.randomUUID().toString();
-        active.put(connectionId, new ConnectionState(customerId, System.currentTimeMillis(), metadata));
+        if (customerId == null || customerId.isBlank()) {
+            // No customer: the connection is not metered. Counted and reported, never thrown.
+            Map<String, Object> openMeta = new HashMap<>(metadata == null ? Map.of() : metadata);
+            openMeta.put("event", "CONNECTION_OPENED");
+            recordInvalid(connEvent(customerId, connectionId, "OPEN", "SERVER_TO_CLIENT", 0, 0, 0, null, openMeta,
+                    canonicalExecutionStatus(executionStatus)), "customerId is required");
+            return null;
+        }
         // Merge caller metadata into the OPEN marker so per-connection tags (region,
         // userAgent, deviceClass...) are on both the OPEN event and the eventual CLOSE event.
         Map<String, Object> openMeta = new HashMap<>(metadata == null ? Map.of() : metadata);
         openMeta.put("event", "CONNECTION_OPENED");
-        push(connEvent(customerId, connectionId, "PING", "SERVER_TO_CLIENT", 0, 0, 0, null, openMeta,
-                canonicalExecutionStatus(executionStatus)));
+        Map<String, Object> open = connEvent(customerId, connectionId, "OPEN", "SERVER_TO_CLIENT", 0, 0, 0, null,
+                openMeta, canonicalExecutionStatus(executionStatus));
+        String violation = limitViolation(open);
+        if (violation != null) {
+            // Over an ingestor limit (customerId > 64 ...): not metered and not tracked, like a blank customer.
+            recordInvalid(open, violation + "; connection not metered");
+            return null;
+        }
+        lifecycle.readLock().lock();
+        try {
+            if (closing) {
+                // After close(): never tracked; the event is reported as CLOSED.
+                push(open);
+                return null;
+            }
+            active.put(connectionId, new ConnectionState(customerId, clock.getAsLong(), metadata));
+            push(open);
+        } finally {
+            lifecycle.readLock().unlock();
+        }
         return connectionId;
     }
 
@@ -117,9 +183,11 @@ public final class AforoWsBilling implements AutoCloseable {
         if (s == null) return;
         s.frames.incrementAndGet();
         s.bytes.addAndGet(bytes);
+        long now = clock.getAsLong();
+        s.lastActivity = now;
         if (perFrameEvents) {
             push(connEvent(s.customerId, connectionId, frameType, direction, 1, bytes,
-                    System.currentTimeMillis() - s.startMs, null, s.metadata,
+                    now - s.startMs, null, s.metadata,
                     canonicalExecutionStatus(executionStatus)));
         }
     }
@@ -139,16 +207,22 @@ public final class AforoWsBilling implements AutoCloseable {
      * HITL_REQUIRED. Any other value is logged and left off the event.
      */
     public void closeConnection(String connectionId, int closeCode, String executionStatus) {
+        closeTracked(connectionId, closeCode, null, executionStatus);
+    }
+
+    /** Emits CONNECTION_CLOSED once per connection; {@code closedBy} names an SDK-initiated close. */
+    private void closeTracked(String connectionId, int closeCode, String closedBy, String executionStatus) {
         if (connectionId == null) return;
         ConnectionState s = active.remove(connectionId);
         if (s == null) return;
-        long durationMs = System.currentTimeMillis() - s.startMs;
+        long durationMs = clock.getAsLong() - s.startMs;
         String reason = mapCloseReason(closeCode);
         Map<String, Object> meta = new HashMap<>(s.metadata == null ? Map.of() : s.metadata);
         meta.put("event", "CONNECTION_CLOSED");
         meta.put("frames", s.frames.get());
         meta.put("bytes", s.bytes.get());
         meta.put("closeCode", closeCode);
+        if (closedBy != null) meta.put("closedBy", closedBy);
         push(connEvent(s.customerId, connectionId, "CLOSE", "SERVER_TO_CLIENT",
                 (int) Math.min(s.frames.get(), Integer.MAX_VALUE), s.bytes.get(), durationMs, reason, meta,
                 canonicalExecutionStatus(executionStatus)));
@@ -162,11 +236,14 @@ public final class AforoWsBilling implements AutoCloseable {
                                           String direction, int frames, long bytes, long durationMs,
                                           String closeReason, Map<String, Object> metadata,
                                           String executionStatus) {
-        Instant now = Instant.now();
+        Instant now = Instant.ofEpochMilli(clock.getAsLong());
         Map<String, Object> e = new HashMap<>();
         e.put("customerId", customerId);
-        e.put("metricName", "CLOSE".equals(frameType)
-                ? "websocket_api.connection_closed" : "websocket_api.message");
+        e.put("metricName", switch (frameType == null ? "" : frameType) {
+            case "OPEN" -> "websocket_api.connection_opened";
+            case "CLOSE" -> "websocket_api.connection_closed";
+            default -> "websocket_api.message";
+        });
         e.put("quantity", 1);
         e.put("occurredAt", now.toString());
         e.put("idempotencyKey", idempotencyKey("ws:" + tenantId + ":" + connectionId + ":" + frameType, now));
@@ -219,12 +296,12 @@ public final class AforoWsBilling implements AutoCloseable {
     }
 
     private static final java.util.Set<String> WS_DIRECTIONS = java.util.Set.of("CLIENT_TO_SERVER", "SERVER_TO_CLIENT");
-    private static final java.util.Set<String> WS_FRAME_TYPES = java.util.Set.of("TEXT", "BINARY", "PING", "PONG", "CLOSE");
+    private static final java.util.Set<String> WS_FRAME_TYPES = java.util.Set.of("OPEN", "TEXT", "BINARY", "PING", "PONG", "CLOSE");
 
     private static void putEnumOrMetadata(Map<String, Object> event, Map<String, Object> meta,
                                           String field, String value, java.util.Set<String> allowed) {
         if (value == null) return;
-        String upper = value.toUpperCase();
+        String upper = value.toUpperCase(java.util.Locale.ROOT);
         if (allowed.contains(upper)) event.put(field, upper);
         else meta.put(field, value);
     }
@@ -244,40 +321,113 @@ public final class AforoWsBilling implements AutoCloseable {
     }
 
     /**
-     * Why an event was permanently dropped. The buffer is unbounded (drained
-     * at flush start), so unlike the core SDK there is no OVERFLOW reason.
+     * Why events were permanently dropped. An ingest outage does not drop anything: the
+     * batch goes back to the queue with its idempotency keys and is resent after a
+     * cooldown.
      * <ul>
-     *   <li>{@code RETRY_EXHAUSTED} — the batch failed after all transport attempts</li>
-     *   <li>{@code REJECTED} — the ingestor refused the batch (non-retryable 4xx) or
-     *       refused this event individually in a partial response</li>
-     *   <li>{@code INVALID} — the event breaks an ingestor field limit; it was never
-     *       buffered or sent</li>
+     *   <li>{@code OVERFLOW} — the queue was full ({@link Builder#maxQueueSize(int)}); the oldest event was evicted</li>
+     *   <li>{@code REJECTED} — the ingestor refused the batch (non-retryable 4xx) or this event in a partial response</li>
+     *   <li>{@code INVALID} — the event breaks an ingestor field limit, or has no customer; it was never sent</li>
+     *   <li>{@code SHUTDOWN} — still queued when {@link #close()} reached its shutdown deadline</li>
+     *   <li>{@code CLOSED} — recorded after {@link #close()}</li>
+     *   <li>{@code RETRY_EXHAUSTED} — kept for compatibility; only reported when a requeue is impossible</li>
      * </ul>
      */
-    public enum DropReason { RETRY_EXHAUSTED, REJECTED, INVALID }
+    public enum DropReason { RETRY_EXHAUSTED, REJECTED, INVALID, OVERFLOW, SHUTDOWN, CLOSED }
 
-    /** Number of events permanently dropped since this instance was created. */
-    public long droppedCount() { return dropped.get(); }
+    /** What a {@link MeteringError} is about. Branch on this, never on the message. */
+    public enum ErrorKind {
+        /** Ingestor unreachable, 408/429/5xx or a redirect after every retry; the events stay queued and are resent. */
+        OUTAGE,
+        /** 401/403: the API key is wrong or revoked; the events stay queued and are resent. */
+        AUTH,
+        /** The ingestor refused the events; they are dropped. */
+        REJECTED,
+        /** Still queued at the shutdown deadline; dropped. */
+        SHUTDOWN,
+        /** Recorded after {@code close()}; dropped. */
+        CLOSED
+    }
 
-    /**
-     * Account for a permanently lost batch: bump the counter, WARN-log, and
-     * invoke the opt-in onDrop hook. The buffer is drained at flush start, so
-     * drops here are bounded by flush cadence — no log throttle needed.
-     */
-    private void recordDrop(java.util.List<Map<String, Object>> events, DropReason reason) {
-        long total = dropped.addAndGet(events.size());
-        LOG.warning("[aforo-ws] Dropped " + events.size() + " event(s) — " + reason + " (" + total + " total dropped).");
-        if (onDrop != null) {
-            try {
-                onDrop.accept(events, reason);
-            } catch (Exception e) {
-                // A hook bug must never break flushing.
-                LOG.log(Level.FINE, "onDrop hook threw", e);
-            }
+    /** A delivery problem reported to {@code Builder.onError}. The message never contains the API key. */
+    public static final class MeteringError {
+        private final ErrorKind kind;
+        private final String message;
+        private final java.util.List<Map<String, Object>> events;
+        private final int status;
+
+        MeteringError(ErrorKind kind, String message, java.util.List<Map<String, Object>> events, int status) {
+            this.kind = kind;
+            this.message = message;
+            this.events = java.util.List.copyOf(events);
+            this.status = status;
+        }
+
+        public ErrorKind kind() { return kind; }
+        public String message() { return message; }
+        /** The events concerned: the queued ones for OUTAGE/AUTH, the dropped ones otherwise (may be empty). */
+        public java.util.List<Map<String, Object>> events() { return events; }
+        /** HTTP status of the answer that caused the report, or 0. */
+        public int status() { return status; }
+        /** True when the events are still queued and will be resent. */
+        public boolean willRetry() { return kind == ErrorKind.OUTAGE || kind == ErrorKind.AUTH; }
+
+        @Override
+        public String toString() {
+            return "MeteringError{kind=" + kind + ", status=" + status + ", events=" + events.size()
+                    + ", message=" + message + "}";
         }
     }
 
-    private final AtomicLong invalidDrops = new AtomicLong();
+    private static ErrorKind map(TransportCore.ErrorKind kind) {
+        return switch (kind) {
+            case OUTAGE -> ErrorKind.OUTAGE;
+            case AUTH -> ErrorKind.AUTH;
+            case REJECTED -> ErrorKind.REJECTED;
+            case SHUTDOWN -> ErrorKind.SHUTDOWN;
+            case CLOSED -> ErrorKind.CLOSED;
+        };
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> asMap(Object body) {
+        return body instanceof Map<?, ?> m ? java.util.Collections.unmodifiableMap((Map<String, Object>) m) : Map.of();
+    }
+
+    private static DropReason map(TransportCore.Reason reason) {
+        return switch (reason) {
+            case OVERFLOW -> DropReason.OVERFLOW;
+            case REJECTED -> DropReason.REJECTED;
+            case INVALID -> DropReason.INVALID;
+            case SHUTDOWN -> DropReason.SHUTDOWN;
+            case CLOSED -> DropReason.CLOSED;
+            case RETRY_EXHAUSTED -> DropReason.RETRY_EXHAUSTED;
+        };
+    }
+
+    /** Number of events permanently dropped (every {@link DropReason}) since this instance was created. */
+    public long droppedCount() { return core.droppedCount(); }
+
+    /** Events waiting to be sent. */
+    public int bufferedCount() { return core.size(); }
+
+    /** Connections opened and not yet closed (by you, the idle sweep or {@link #close()}). */
+    public int openConnections() { return active.size(); }
+
+    /** Closes connections idle longer than the idle timeout; returns how many. Runs on the sweep thread. */
+    int sweepIdle() {
+        long cutoff = clock.getAsLong() - idleTimeoutMs;
+        int n = 0;
+        for (Map.Entry<String, ConnectionState> e : active.entrySet()) {
+            if (e.getValue().lastActivity <= cutoff) {
+                closeTracked(e.getKey(), 1006, "sdk_idle_timeout", null);
+                n++;
+            }
+        }
+        if (n > 0) LOG.info("[aforo-ws] closed " + n + " connection(s) idle for over " + idleTimeoutMs + " ms");
+        return n;
+    }
+
 
     /**
      * Ingestor field limits ({@code IngestUsageEventRequest} {@code @Size} constraints).
@@ -305,24 +455,12 @@ public final class AforoWsBilling implements AutoCloseable {
     }
 
     /**
-     * An event the ingestor would refuse: not buffered, not sent, counted in
-     * {@link #droppedCount()}, logged (first, then every 1000th, so a tight loop
-     * can't storm the log) and handed to the onDrop hook with {@link DropReason#INVALID}.
+     * An event the ingestor would refuse: not queued, not sent, counted in
+     * {@link #droppedCount()}, logged (first, then every 1000th) and handed to the
+     * onDrop hook with {@link DropReason#INVALID}.
      */
     private void recordInvalid(Map<String, Object> event, String violation) {
-        long total = dropped.incrementAndGet();
-        long invalids = invalidDrops.incrementAndGet();
-        if (invalids == 1 || invalids % 1000 == 0) {
-            LOG.warning("[aforo-ws] Dropping invalid event: " + violation + " (" + invalids
-                    + " invalid, " + total + " total dropped).");
-        }
-        if (onDrop != null) {
-            try {
-                onDrop.accept(java.util.List.of(event), DropReason.INVALID);
-            } catch (Exception e) {
-                LOG.log(Level.FINE, "onDrop hook threw", e);
-            }
-        }
+        core.dropInvalid(event, violation);
     }
 
     /** Buffers an event, or drops it as {@link DropReason#INVALID} when it breaks a field limit. */
@@ -332,170 +470,32 @@ public final class AforoWsBilling implements AutoCloseable {
             recordInvalid(event, violation);
             return;
         }
-        buffer.offer(event);
-        if (bufferSize.incrementAndGet() >= flushCount) {
-            scheduler.execute(this::flushQuietly);
-        }
-    }
-
-    private final Object drainLock = new Object();
-
-    private void flushQuietly() {
-        try { flush(); } catch (Exception e) { LOG.log(Level.WARNING, "[aforo-ws] flush failed", e); }
-    }
-
-    private void flush() throws Exception {
-        if (bufferSize.get() == 0) return;
-        java.util.List<Map<String, Object>> batch = new java.util.ArrayList<>();
-        Map<String, Object> ev;
-        // One drain at a time: a size-triggered flush on the scheduler thread and
-        // close()'s flush on the caller thread would otherwise split one batch into
-        // two interleaved requests.
-        synchronized (drainLock) {
-            while ((ev = buffer.poll()) != null) { batch.add(ev); bufferSize.decrementAndGet(); }
-        }
-        if (batch.isEmpty()) return;
-
-        // Slice into requests of at most MAX_EVENTS_PER_REQUEST; a failed slice does
-        // not stop the remaining slices from being delivered.
-        Exception failure = null;
-        for (int from = 0; from < batch.size(); from += MAX_EVENTS_PER_REQUEST) {
-            try {
-                send(java.util.List.copyOf(batch.subList(from, Math.min(batch.size(), from + MAX_EVENTS_PER_REQUEST))));
-            } catch (Exception e) {
-                failure = e;
-            }
-        }
-        if (failure != null) throw failure;
+        core.track(event);
     }
 
     /**
-     * POSTs one slice. The body is serialized once, so every retry resends the same
-     * idempotency keys. Every way the slice can be lost goes through recordDrop.
+     * Sends what is queued until the shutdown deadline ({@link Builder#shutdownTimeoutMs(long)},
+     * default 5 s), then stops the background thread and the HTTP client. Events left at the
+     * deadline are reported as {@link DropReason#SHUTDOWN}. Idempotent.
      */
-    private void send(java.util.List<Map<String, Object>> events) throws Exception {
-        String body = mapper.writeValueAsString(Map.of("events", events));
-        HttpRequest req = HttpRequest.newBuilder(ingestorUri)
-                .timeout(Duration.ofSeconds(10))
-                .header("Content-Type", "application/json")
-                .header("X-API-Key", apiKey)
-                .header("X-Tenant-Id", tenantId)
-                .POST(HttpRequest.BodyPublishers.ofString(body))
-                .build();
-
-        for (int attempt = 1; attempt <= 3; attempt++) {
-            long delayMs = (long) Math.pow(2, attempt - 1) * retryBackoffBaseMs;
-            try {
-                HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-                int status = resp.statusCode();
-                if (status >= 200 && status < 300) {
-                    recordPartialRejections(events, resp.body());
-                    return;
-                }
-                // 4xx other than 408/429 (bad key, invalid event, unknown metric) cannot succeed on retry.
-                if (status >= 400 && status < 500 && status != 408 && status != 429) {
-                    LOG.warning("[aforo-ws] ingestor returned " + status + " — not retrying"
-                            + errorMessages(resp.body()));
-                    recordDrop(events, DropReason.REJECTED);
-                    return;
-                }
-                if (status == 429) delayMs = retryAfterMs(resp, delayMs);
-            } catch (Exception e) {
-                if (attempt == 3) {
-                    recordDrop(events, DropReason.RETRY_EXHAUSTED);
-                    throw e;
-                }
-            }
-            if (attempt == 3) break;
-            try {
-                Thread.sleep(delayMs);
-            } catch (InterruptedException ie) {
-                // Interrupted mid-backoff (e.g. close() racing shutdownNow) — the
-                // batch is already drained and will never be retried; account for
-                // it before propagating, and restore the interrupt flag for the
-                // caller's subsequent blocking calls.
-                recordDrop(events, DropReason.RETRY_EXHAUSTED);
-                Thread.currentThread().interrupt();
-                throw ie;
-            }
-        }
-        recordDrop(events, DropReason.RETRY_EXHAUSTED);
-        LOG.warning("[aforo-ws] flush exhausted retries — dropped " + events.size() + " events");
-    }
-
-    /**
-     * A 2xx batch response can still report events the ingestor refused individually
-     * ({@code failed} / {@code errors[{index,message}]}). Those events are dropped with
-     * {@link DropReason#REJECTED}; only events the response identifies by index are
-     * handed to the hook — any others are counted but not guessed at.
-     */
-    private void recordPartialRejections(java.util.List<Map<String, Object>> events, String body) {
-        if (body == null || body.isBlank()) return;
-        java.util.List<Map<String, Object>> rejected = new java.util.ArrayList<>();
-        int failed;
-        try {
-            com.fasterxml.jackson.databind.JsonNode root = unwrapEnvelope(mapper.readTree(body));
-            com.fasterxml.jackson.databind.JsonNode errors = root.path("errors");
-            java.util.Set<Integer> seen = new java.util.HashSet<>();
-            if (errors.isArray()) {
-                for (com.fasterxml.jackson.databind.JsonNode err : errors) {
-                    com.fasterxml.jackson.databind.JsonNode idx = err.get("index");
-                    if (idx != null && idx.isInt() && idx.asInt() >= 0 && idx.asInt() < events.size()
-                            && seen.add(idx.asInt())) {
-                        rejected.add(events.get(idx.asInt()));
-                    }
-                }
-            }
-            failed = Math.min(events.size(), Math.max(root.path("failed").asInt(0), rejected.size()));
-        } catch (Exception e) {
-            return; // not a batch-response body — treat as accepted
-        }
-        if (failed == 0) return;
-        LOG.warning("[aforo-ws] ingestor rejected " + failed + " of " + events.size() + " event(s)"
-                + errorMessages(body));
-        if (!rejected.isEmpty()) recordDrop(rejected, DropReason.REJECTED);
-        int unidentified = failed - rejected.size();
-        if (unidentified > 0) dropped.addAndGet(unidentified);
-    }
-
-    /** {@code errors[].message} from an ingestor batch response, formatted for a log line; "" if none. */
-    private String errorMessages(String body) {
-        if (body == null || body.isBlank()) return "";
-        try {
-            com.fasterxml.jackson.databind.JsonNode errors = unwrapEnvelope(mapper.readTree(body)).path("errors");
-            if (!errors.isArray() || errors.isEmpty()) return "";
-            StringBuilder sb = new StringBuilder(":");
-            int shown = 0;
-            for (com.fasterxml.jackson.databind.JsonNode err : errors) {
-                if (shown++ == 10) { sb.append(" ..."); break; }
-                sb.append(" [");
-                if (err.has("index")) sb.append(err.get("index").asText()).append(": ");
-                sb.append(err.path("message").asText("")).append(']');
-            }
-            return sb.toString();
-        } catch (Exception e) {
-            return "";
-        }
-    }
-
-    /** Honours a delta-seconds {@code Retry-After} header on 429; otherwise keeps {@code fallbackMs}. */
-    private static long retryAfterMs(HttpResponse<String> resp, long fallbackMs) {
-        String retryAfter = resp.headers().firstValue("Retry-After").orElse(null);
-        if (retryAfter == null) return fallbackMs;
-        try {
-            return Math.max(0, Long.parseLong(retryAfter.trim())) * 1000;
-        } catch (NumberFormatException e) {
-            return fallbackMs;
-        }
-    }
-
     @Override
     public void close() {
-        scheduler.shutdown();
+        lifecycle.writeLock().lock();
         try {
-            flushQuietly();
-            if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) scheduler.shutdownNow();
-        } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            if (closing) {
+                // Second call: the first one did the CLOSE pass; just wait for the transport.
+                core.close();
+                return;
+            }
+            closing = true;
+        } finally {
+            lifecycle.writeLock().unlock();
+        }
+        sweeper.shutdownNow();
+        for (String id : new java.util.ArrayList<>(active.keySet())) {
+            closeTracked(id, 1001, "sdk_shutdown", null);
+        }
+        core.close();
     }
 
     private static class ConnectionState {
@@ -504,10 +504,12 @@ public final class AforoWsBilling implements AutoCloseable {
         final Map<String, Object> metadata;
         final AtomicLong frames = new AtomicLong();
         final AtomicLong bytes = new AtomicLong();
+        volatile long lastActivity;
 
         ConnectionState(String customerId, long startMs, Map<String, Object> metadata) {
             this.customerId = customerId;
             this.startMs = startMs;
+            this.lastActivity = startMs;
             this.metadata = metadata;
         }
     }
@@ -529,9 +531,6 @@ public final class AforoWsBilling implements AutoCloseable {
         return s;
     }
 
-    private static String stripTrailingSlash(String s) {
-        return s.endsWith("/") ? s.substring(0, s.length() - 1) : s;
-    }
 
     /** The client-level {@code productType} stamped on events without a per-call override. */
     public String getProductType() { return productType; }
@@ -542,9 +541,20 @@ public final class AforoWsBilling implements AutoCloseable {
         private String productType;
         private String tenantId, productId, apiKey, ingestorUrl;
         private boolean perFrameEvents = false;
-        private int flushCount = 100;
-        private long flushIntervalMs = 3_000L;
+        private int flushCount = TransportConfig.DEFAULT_FLUSH_COUNT;
+        private long flushIntervalMs = TransportConfig.DEFAULT_FLUSH_INTERVAL_MS;
+        private int maxQueueSize = TransportConfig.DEFAULT_QUEUE_CAPACITY;
+        private int maxRetries = TransportConfig.DEFAULT_MAX_RETRIES;
+        private long retryBaseMs = TransportConfig.DEFAULT_RETRY_BASE_MS;
+        private long timeoutMs = TransportConfig.DEFAULT_TIMEOUT_MS;
+        private long shutdownTimeoutMs = TransportConfig.DEFAULT_SHUTDOWN_TIMEOUT_MS;
+        private long breakerCooldownMs = TransportConfig.DEFAULT_BREAKER_INITIAL_MS;
+        private boolean allowInsecureHttp;
+        private long connectionIdleTimeoutMs;
+        private java.util.function.LongSupplier clock;
         private BiConsumer<java.util.List<Map<String, Object>>, DropReason> onDrop;
+        private java.util.function.Consumer<MeteringError> onError;
+        private BiConsumer<Map<String, Object>, java.util.List<Map<String, Object>>> onAccepted;
 
         public Builder tenantId(String s) { this.tenantId = s; return this; }
         public Builder productId(String s) { this.productId = s; return this; }
@@ -556,8 +566,24 @@ public final class AforoWsBilling implements AutoCloseable {
         public Builder productType(String s) { this.productType = s; return this; }
         public Builder ingestorUrl(String s) { this.ingestorUrl = s; return this; }
         public Builder perFrameEvents(boolean b) { this.perFrameEvents = b; return this; }
+        /** Events per request (default 500, at most 1000). */
         public Builder flushCount(int n) { this.flushCount = n; return this; }
+        /** How often queued events are sent when the batch is not full (default 5 s). */
         public Builder flushIntervalMs(long n) { this.flushIntervalMs = n; return this; }
+        /** Queue capacity (default 10 000). When full, the oldest event is dropped as {@code OVERFLOW}. */
+        public Builder maxQueueSize(int n) { this.maxQueueSize = n; return this; }
+        /** Retries per request on a network error, timeout, 408, 429 or 5xx (default 3). */
+        public Builder maxRetries(int n) { this.maxRetries = n; return this; }
+        /** Base of the full-jitter retry backoff (default 500 ms). */
+        public Builder retryBaseMs(long n) { this.retryBaseMs = n; return this; }
+        /** Total deadline of one ingest request (default 10 s). */
+        public Builder timeoutMs(long n) { this.timeoutMs = n; return this; }
+        /** How long {@link #close()} keeps sending queued events (default 5 s). */
+        public Builder shutdownTimeoutMs(long n) { this.shutdownTimeoutMs = n; return this; }
+        /** First pause after the ingestor stays unreachable through every retry (default 5 s, doubling to 5 min). */
+        public Builder breakerCooldownMs(long n) { this.breakerCooldownMs = n; return this; }
+        /** Allow a plain http:// ingestor URL on a host other than localhost. Off by default: the API key is in every request. */
+        public Builder allowInsecureHttp(boolean b) { this.allowInsecureHttp = b; return this; }
         /**
          * Opt-in hook receiving events that were permanently dropped (retry
          * exhaustion, a terminal rejection, or an event that breaks an ingestor
@@ -567,18 +593,23 @@ public final class AforoWsBilling implements AutoCloseable {
          * none (drops are still counted in droppedCount() and WARN-logged).
          */
         public Builder onDrop(BiConsumer<java.util.List<Map<String, Object>>, DropReason> fn) { this.onDrop = fn; return this; }
+        /**
+         * Opt-in hook for delivery problems, typed by {@link MeteringError#kind()}. Runs on the
+         * background sender thread; it may call {@code close()}. Exceptions are caught and logged.
+         */
+        public Builder onError(java.util.function.Consumer<MeteringError> fn) { this.onError = fn; return this; }
+        /**
+         * Opt-in hook receiving the envelope-unwrapped body of every accepted (2xx) batch (empty
+         * when the body was not a JSON object). Runs on the sender thread; exceptions are caught and logged.
+         */
+        public Builder onAccepted(BiConsumer<Map<String, Object>, java.util.List<Map<String, Object>>> fn) { this.onAccepted = fn; return this; }
+        /**
+         * Close a tracked connection that has had no frame for this long (default 1 h; 0 = default).
+         * Negative values are refused: the sweep is what keeps the open-connection map bounded.
+         */
+        public Builder connectionIdleTimeoutMs(long n) { this.connectionIdleTimeoutMs = n; return this; }
+        /** Test seam: epoch-millisecond clock for timestamps, durations and the idle sweep. */
+        Builder clock(java.util.function.LongSupplier c) { this.clock = c; return this; }
         public AforoWsBilling build() { return new AforoWsBilling(this); }
-    }
-
-    /**
-     * The ingestor wraps every 2xx JSON body in {@code {success, data, meta}}.
-     * Returns the inner {@code data} object when present, else the node itself
-     * (bare shape).
-     */
-    static com.fasterxml.jackson.databind.JsonNode unwrapEnvelope(com.fasterxml.jackson.databind.JsonNode root) {
-        if (root != null && root.isObject() && root.path("data").isObject()) {
-            return root.get("data");
-        }
-        return root;
     }
 }

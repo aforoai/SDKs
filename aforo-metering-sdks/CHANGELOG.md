@@ -5,6 +5,76 @@ released by git tag; their in-code `sdkVersion` constant is bumped here so
 events report the right version. Publishing is a DevOps step — merging to
 `main` does not release anything.
 
+## Unreleased — 2026-10-26 (wave 5: every SDK gets a new major)
+
+Every module changes its public API, so every published module gets a new
+**major** version. Per-module details and migration notes are in each
+module's `CHANGELOG.md`; the shared rules are in
+[contract/TRANSPORT-SPEC.md](./contract/TRANSPORT-SPEC.md).
+
+**Versions.** `node`, `node-ws`, `node-mqtt`, `node-grpc`, `node-graphql`,
+`node-mcp`, `node-agent`, `mcp-proxy`, `python`, `python-ws`, `python-mqtt`,
+`python-grpc`, `python-graphql`, `python-mcp`, `java`, `java-ws`, `java-mqtt`,
+`java-grpc`, `java-graphql`, `go`, `go-ws`, `go-mqtt`, `go-grpc`, `go-graphql`
+→ **2.0.0**; `python-agent` → **1.0.0**. Go module paths now end in `/v2`
+(`github.com/aforoai/SDKs/aforo-metering-sdks/go/v2`, …); `go-grpc` needs Go
+1.26+. `node-agent` 2.0.0 includes the never-published 2.0.0 from mirror PR #58.
+
+**Customer identity — breaking (decision 2026-10-26).** Integrations that meter
+an incoming request need a customer resolver. Reading a value your API's
+callers control (`X-Customer-Id`, gRPC metadata, MCP `_meta.customer_id`, the
+MQTT username) needs the explicit `trustCustomerHeader` opt-in. Neither →
+construction fails. No fallback to `unknown`, `anonymous` or the agent id.
+
+**One transport core per language.** `go/internal/ingest`,
+`node/src/transport-core`, `python/aforo/_transport`,
+`java/.../internal/transport`, copied into each variant by
+`scripts/sync-transport.sh` (CI checks the copies). One bounded queue and one
+sender per client (no thread/goroutine/task per event), batches of 500,
+full-jitter retries, `Retry-After` in both forms capped at 60 s, a deadline on
+every request, 413 splits the batch, per-event `retryable` failures re-sent
+with the same key, requeue behind a breaker after the last retry and on
+401/403, `shutdown`/`close` bounded by `shutdownTimeout` with leftovers
+reported, `https://` required, API key kept out of logs and `repr`/`toString`.
+New drop reasons `shutdown` and `closed`. No gzip: the ingestor does not
+decode compressed request bodies yet.
+
+**Protocol fixes.** Go: caller-owned middleware client, `Close(ctx)`,
+`statusWriter` Flush/Hijack/Unwrap, GraphQL body cap and GET/APQ metering,
+WebSocket OPEN/CLOSE events, gRPC dependency CVEs. Python: fork safety, all
+four gRPC shapes + grpc.aio, GraphQL body cap off the event loop, MQTT billed
+after success with reconnect debounce, httpx required. Node: no SIGTERM
+handler, normalized paths, WebSocket bills a closing connection once, MQTT
+billed after the ack, GraphQL metered after the response. Java: SmartLifecycle,
+`@ConditionalOnMissingBean`, `getGraphQLContext()`, gRPC call always closed,
+`Locale.ROOT`, Maven `autoPublish=false`. mcp-proxy: bearer auth, Host/Origin
+checks, child environment allowlist, JSON-RPC batches metered, 1 s quota
+timeout with an opt-in fail-closed mode, one session per SSE connection,
+bounded tables, non-root image with a real health check.
+
+**Review fixes (2026-10-27).** An independent review compared the four cores
+and found them disagreeing on edge cases; the spec's "Edge cases every core
+handles the same way" table now settles each one and every core has a test
+per row: the request deadline covers reading the response body, redirects are
+never followed (a 3xx is an outage), every 5xx is retried, per-event
+`retryable` re-sends back off and are capped, breaker cooldown is
+`max(250 ms, random(0, ceiling))`, shutdown keeps retrying until its deadline,
+every event of a split batch is accounted for, unserializable events are
+dropped at `track()`, callbacks may call `flush()`/`close()`, `onError` is typed
+by `kind` and `onAccepted` gets the unwrapped body in every language.
+**WebSocket (all four languages):** an opened connection is metric
+`websocket_api.connection_opened` (frame type `OPEN`), shutdown sends
+CONNECTION_CLOSED for connections still open, and an idle sweep
+(`connectionIdleTimeout`, default 1 h; negative refused) bounds the
+open-connection table.
+
+**Tooling.** Contract v2 (JSON Schema + `transportPolicy`),
+`contract/verify-ingestor.mjs` (drift check against the usage-ingestor
+source), `mock-ingestor/` (fault-injecting ingestor every suite runs
+against), `scripts/check-mirror-sync.sh`, and publish workflows pinned to
+SHAs, bound to the release tag, run in protected environments, with SBOM,
+vulnerability scan and build-provenance attestation.
+
 ## Unreleased — 2026-10-02
 
 ### npm scope is `@aforoai` for every package

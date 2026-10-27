@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="aforo-ws-metering",
-    version="1.2.2",
+    version="2.0.0",
     description="Aforo WebSocket Metering SDK — wrappers for the `websockets` library + FastAPI/Starlette WebSocket routes that meter frames, bytes and connection duration.",
     long_description=open("README.md").read() if __import__("os").path.exists("README.md") else "",
     long_description_content_type="text/markdown",
@@ -10,7 +10,7 @@ setup(
     license="Apache-2.0",
     packages=find_packages(),
     python_requires=">=3.9",
-    install_requires=[],
+    install_requires=["httpx>=0.25"],
     extras_require={
         "websockets": ["websockets>=11"],
         "fastapi": ["fastapi>=0.100", "starlette>=0.27"],

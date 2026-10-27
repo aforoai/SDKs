@@ -276,7 +276,7 @@ class IngestBatchContractTest {
     void servletFilterSendsTopLevelHttpFields() throws Exception {
         FilterChain chain = (req, res) -> {};
         try (var client = new AforoClient(options())) {
-            new AforoServletFilter(client).doFilter(request("cust_9"), response(), chain);
+            AforoServletFilter.builder(client).trustCustomerHeader(true).build().doFilter(request("cust_9"), response(), chain);
             client.flush();
         }
         JsonNode ev = onlyEvent();
@@ -293,8 +293,8 @@ class IngestBatchContractTest {
     void servletFilterProductTypeOptionOverridesClientDefault() throws Exception {
         FilterChain chain = (req, res) -> {};
         try (var client = new AforoClient(options().productType("agentic_api"))) {
-            new AforoServletFilter(client).doFilter(request("cust_9"), response(), chain);
-            new AforoServletFilter(client).productType(" ai_agent ").doFilter(request("cust_9"), response(), chain);
+            AforoServletFilter.builder(client).trustCustomerHeader(true).build().doFilter(request("cust_9"), response(), chain);
+            AforoServletFilter.builder(client).trustCustomerHeader(true).productType(" ai_agent ").build().doFilter(request("cust_9"), response(), chain);
             client.flush();
         }
         JsonNode events = bodies.get(0).get("events");
@@ -315,7 +315,7 @@ class IngestBatchContractTest {
                 });
         FilterChain chain = (rq, rs) -> {};
         try (var client = new AforoClient(options())) {
-            new AforoServletFilter(client).doFilter(req, response(), chain);
+            AforoServletFilter.builder(client).trustCustomerHeader(true).build().doFilter(req, response(), chain);
             client.flush();
         }
         assertThat(onlyEvent().get("endpointPath").asText()).hasSize(512);

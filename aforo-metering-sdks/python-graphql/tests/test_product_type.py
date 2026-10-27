@@ -92,7 +92,7 @@ def test_blank_client_product_type_uses_package_default(env):
     assert _events(h)[0]["productType"] == 'GRAPHQL_API'
 
 
-@pytest.mark.parametrize("status", [400, 401, 403, 422])
+@pytest.mark.parametrize("status", [400, 404, 422])
 def test_4xx_is_not_retried_and_reports_error_messages(env, status):
     h, sleeps, errors = env
     h.responses = [(status, {"accepted": 0, "failed": 1,
@@ -124,21 +124,37 @@ def test_429_honours_retry_after(env):
     h.responses = [(429, None, {"Retry-After": "7"}), (202, None, {})]
     b = _make(errors)
     _emit(b)
+    b.flush()
     b.shutdown()
     assert len(h.requests) == 2
     assert sleeps == [7.0]
     assert errors == []
 
 
-def test_exhausted_retries_report_once_without_trailing_sleep(env):
-    h, sleeps, errors = env
-    h.responses = [(503, None, {})] * 3
+@pytest.mark.parametrize("status", [401, 403])
+def test_auth_failure_keeps_the_event_and_reports_it(env, status):
+    h, _s, errors = env
+    h.responses = [(status, None, {})]
     b = _make(errors)
     _emit(b)
+    assert b.flush() == 1
+    assert b.dropped_count == 0
+    assert len(errors) == 1 and str(status) in str(errors[0])
     b.shutdown()
-    assert len(h.requests) == 3
-    assert sleeps == [1.0, 2.0]
-    assert len(errors) == 1 and "after 3 attempts" in str(errors[0])
+    assert b.dropped_count == 0
+    assert len(h.requests) == 2
+
+
+def test_exhausted_retries_report_once_and_keep_the_event(env):
+    h, sleeps, errors = env
+    h.responses = [(503, None, {})] * 4
+    b = _make(errors)
+    _emit(b)
+    b.flush()
+    b.shutdown()
+    assert len(h.requests) == 5  # 1 + 3 retries, then the resend
+    assert b.dropped_count == 0
+    assert len(errors) == 1 and "unreachable" in str(errors[0])
 
 
 def test_accepted_response_with_failed_events_reports_errors_message(env):

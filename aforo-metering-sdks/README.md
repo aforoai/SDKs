@@ -7,7 +7,7 @@ send usage events to Aforo lives here.
 Every package in this repo is either:
 
 - A **production SDK** a tenant installs into their application (`@aforoai/*`, `aforo-*`, `ai.aforo:*`, `github.com/aforoai/SDKs/aforo-metering-sdks/go*`), OR
-- A **testing tool** used to validate Aforo's own metering plumbing (`@aforoai/mcp-test-server`, and the `contract/` shared schema).
+- A **testing tool** used to validate Aforo's own metering plumbing (`@aforoai/mcp-test-server`, `@aforoai/agent-test-server`, the fault-injecting `mock-ingestor/` every SDK suite runs against, and the `contract/` shared schema).
 
 Tenants publish their MCP servers, agents, and APIs; Aforo meters the calls.
 Every SDK in this repo is a "thin metering layer" you add to your code, or a
@@ -25,7 +25,7 @@ buffering, retries, and idempotency for you.
 | `@aforoai/metering` | [`node/`](./node/) | `npm i @aforoai/metering` | Node 18+ |
 | `aforo-metering` | [`python/`](./python/) | `pip install aforo-metering` | Python 3.9+ |
 | `ai.aforo:metering` | [`java/`](./java/) | Maven `ai.aforo:metering` (Java packages are `com.aforo.*`) | Java 17+ |
-| `github.com/aforoai/SDKs/aforo-metering-sdks/go` | [`go/`](./go/) | `go get github.com/aforoai/SDKs/aforo-metering-sdks/go` | Go 1.21+ |
+| `github.com/aforoai/SDKs/aforo-metering-sdks/go/v2` | [`go/`](./go/) | `go get github.com/aforoai/SDKs/aforo-metering-sdks/go/v2` | Go 1.21+ |
 
 ### Reporting the request outcome (`executionStatus`)
 
@@ -54,13 +54,14 @@ sent as-is, the ingestor would reject that event and its usage would be lost.
 
 ## What every SDK does on the wire
 
-- **Endpoint and host.** `POST https://api.aforo.ai/v1/ingest/batch` with `{"events":[...]}`, at most 1000 events per request (`@aforoai/agent-metering` posts single events to `/v1/ingest/events`). Override the host with the base-URL option.
+- **Endpoint and host.** `POST https://api.aforo.ai/v1/ingest/batch` with `{"events":[...]}`, at most 1000 events per request. Override the host with the base-URL option.
 - **Auth.** The API key goes in `X-API-Key`. No `Authorization` header is sent.
 - **`productType`.** Every event carries a top-level `productType`; the production ingestor rejects events without one. Defaults: core SDKs `API`, GraphQL `GRAPHQL_API`, gRPC `GRPC_API`, WebSocket `WEBSOCKET_API`, MQTT `MQTT_BROKER`, MCP SDKs and proxy `MCP_SERVER`, agent SDKs `AI_AGENT`. Set it per client or per event.
 - **Idempotency keys.** One key per event, created when the event is recorded and reused on every retry, so a re-sent batch is deduplicated. Pass your own key to control deduplication; otherwise the SDK generates a random one.
-- **Retries.** Network errors, 5xx, 408 and 429 are retried (429 honours `Retry-After`). Any other 4xx is not retried.
+- **Delivery (2.0.0).** One bounded queue and one background sender per client; recording an event never sends. Batches of 500 by default (max 1000). Network errors, timeouts, 408, 429 and 5xx are retried with full-jitter backoff, honouring `Retry-After` in seconds or HTTP-date form (capped at 60 s). After the last retry — and on 401/403, which usually means a wrong or revoked key — the batch goes back to the front of the queue with the same keys and sending pauses behind a breaker, so an outage loses nothing until the queue overflows. Any other 4xx is not retried. `https://` is required except for localhost or with the insecure-HTTP opt-in. The full rules: [contract/TRANSPORT-SPEC.md](./contract/TRANSPORT-SPEC.md).
 - **Session heartbeats.** Sent one per request, outside the usage batch, best-effort. A failed heartbeat is not a dropped usage event.
-- **HTTP middlewares.** The default metric is `api_calls` (it must exist in your catalog); pass a fixed metric or a resolver to change it. `OPTIONS` requests are not metered, and a request with no resolvable customer is skipped — the caller's `X-Api-Key` header is never used as a customer id.
+- **Customer identity (2.0.0, breaking).** Every integration that meters an incoming request (HTTP middlewares, gRPC, GraphQL, WebSocket, MQTT, MCP, the servlet filter) needs a customer resolver that reads the customer from your own authentication. Reading `X-Customer-Id`, gRPC metadata, MCP `_meta.customer_id` or the MQTT username — values your API's callers control — needs the explicit `trustCustomerHeader` opt-in (Python `trust_customer_header`, Go `TrustCustomerHeader`); turn it on only when a gateway you run sets that value. With neither, construction fails. When the resolver finds no customer, that event is dropped as `invalid` and counted; the request itself is never blocked.
+- **HTTP middlewares.** The default metric is `api_calls` (it must exist in your catalog); pass a fixed metric or a resolver to change it. `OPTIONS` requests are not metered. The caller's `X-Api-Key` header is never used as a customer id.
 
 ### Dropped events
 
@@ -69,7 +70,9 @@ An event the SDK cannot deliver is counted (`droppedCount`), logged as a warning
 | Reason | When |
 |---|---|
 | `overflow` | The buffer was full; the oldest event was evicted. |
-| `retry_exhausted` | A batch still failed after all retries. |
+| `shutdown` | Still queued when `shutdown` / `close` reached its deadline (`shutdownTimeout`, default 5 s). |
+| `closed` | Recorded after the client was shut down. Nothing is thrown. |
+| `retry_exhausted` | Kept for compatibility; with requeue-on-outage it is only reported when requeue is impossible. |
 | `rejected` | The ingestor refused the batch with a non-retryable 4xx, or refused individual events in an otherwise accepted batch. |
 | `invalid` | The event breaks a limit the ingestor enforces, so it was never sent. |
 
@@ -93,10 +96,10 @@ natively and forwards to `/v1/ingest` internally.
 
 | Protocol | Node | Python | Java | Go |
 |---|---|---|---|---|
-| **WebSocket** | `@aforoai/ws-metering` [`node-ws/`](./node-ws/) | `aforo-ws-metering` [`python-ws/`](./python-ws/) | `ws-metering` [`java-ws/`](./java-ws/) | `github.com/aforoai/SDKs/aforo-metering-sdks/go-ws` [`go-ws/`](./go-ws/) |
-| **gRPC** | `@aforoai/grpc-metering` [`node-grpc/`](./node-grpc/) | `aforo-grpc-metering` [`python-grpc/`](./python-grpc/) | `grpc-metering` [`java-grpc/`](./java-grpc/) | `github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc` [`go-grpc/`](./go-grpc/) |
-| **GraphQL** | `@aforoai/graphql-metering` [`node-graphql/`](./node-graphql/) | `aforo-graphql-metering` [`python-graphql/`](./python-graphql/) | `graphql-metering` [`java-graphql/`](./java-graphql/) | `github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql` [`go-graphql/`](./go-graphql/) |
-| **MQTT** | `@aforoai/mqtt-metering` [`node-mqtt/`](./node-mqtt/) | `aforo-mqtt-metering` [`python-mqtt/`](./python-mqtt/) | `mqtt-metering` [`java-mqtt/`](./java-mqtt/) | `github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt` [`go-mqtt/`](./go-mqtt/) |
+| **WebSocket** | `@aforoai/ws-metering` [`node-ws/`](./node-ws/) | `aforo-ws-metering` [`python-ws/`](./python-ws/) | `ws-metering` [`java-ws/`](./java-ws/) | `github.com/aforoai/SDKs/aforo-metering-sdks/go-ws/v2` [`go-ws/`](./go-ws/) |
+| **gRPC** | `@aforoai/grpc-metering` [`node-grpc/`](./node-grpc/) | `aforo-grpc-metering` [`python-grpc/`](./python-grpc/) | `grpc-metering` [`java-grpc/`](./java-grpc/) | `github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc/v2` [`go-grpc/`](./go-grpc/) |
+| **GraphQL** | `@aforoai/graphql-metering` [`node-graphql/`](./node-graphql/) | `aforo-graphql-metering` [`python-graphql/`](./python-graphql/) | `graphql-metering` [`java-graphql/`](./java-graphql/) | `github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql/v2` [`go-graphql/`](./go-graphql/) |
+| **MQTT** | `@aforoai/mqtt-metering` [`node-mqtt/`](./node-mqtt/) | `aforo-mqtt-metering` [`python-mqtt/`](./python-mqtt/) | `mqtt-metering` [`java-mqtt/`](./java-mqtt/) | `github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt/v2` [`go-mqtt/`](./go-mqtt/) |
 
 Every protocol variant also accepts `executionStatus` (Python:
 `execution_status`), normalized and checked the same way as the core SDKs. A
@@ -110,7 +113,7 @@ don't pass one:
 | GraphQL | Derived from the response: no errors → `SUCCESS`; errors with data → `PARTIAL`; errors with `data: null` (failed while running) → `ERROR`; errors with no `data` key (rejected before running) → `VALIDATION_FAILED`. `errors` counts as present unless it is missing, `null` or `[]`. Python result objects always have a `data` attribute, so there `data: None` with only path-less errors (parse/validation) is `VALIDATION_FAILED`. With only an HTTP status, the gateway plugins' HTTP table applies. |
 | WebSocket, MQTT | None. Frames and messages carry no success or failure signal, so pass the status yourself when it matters. |
 
-Each module's README shows the exact option names.
+Each module's README shows the exact option names. `go-grpc` 2.0.0 needs Go 1.26 or later (its gRPC and `x/net` dependencies require it).
 
 ## MCP metering — three ways in
 

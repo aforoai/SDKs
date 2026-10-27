@@ -15,7 +15,6 @@ import json
 from pathlib import Path
 from urllib.parse import urlparse
 
-from unittest import mock
 
 from aforo.client import AforoClient
 
@@ -56,25 +55,27 @@ def assert_body_matches_contract(spec: dict, body) -> None:
         raise AssertionError(f"unhandled cardinality in fixture: {spec['cardinality']}")
 
 
-class _CapturingClient:
-    """Stand-in for httpx.Client that records the POST and returns 202."""
+class _Capture:
+    """httpx transport that records each POST and answers 202."""
 
     captured: list = []
 
-    def __init__(self, *args, **kwargs):
-        pass
+    @classmethod
+    def transport(cls):
+        import httpx
 
-    def __enter__(self):
-        return self
+        def handle(request):
+            body = json.loads(request.content)
+            cls.captured.append((str(request.url), body, dict(request.headers)))
+            return httpx.Response(202, json={"data": {"accepted": len(body["events"]), "failed": 0}})
 
-    def __exit__(self, *args):
-        return False
+        return httpx.MockTransport(handle)
 
-    def post(self, url, json=None, headers=None):
-        _CapturingClient.captured.append((url, json, headers))
-        resp = mock.MagicMock()
-        resp.status_code = 202
-        return resp
+
+def _capturing_client():
+    _Capture.captured = []
+    return AforoClient(api_key="test-key", base_url="https://ingest.example.test",
+                       flush_count=50, max_retries=0, http_transport=_Capture.transport())
 
 
 def test_posts_to_contracted_endpoint_with_contracted_body_shape():
@@ -83,20 +84,14 @@ def test_posts_to_contracted_endpoint_with_contracted_body_shape():
     endpoint = sdk_entry["endpoint"]
     spec = FIXTURE["endpoints"][endpoint]
 
-    _CapturingClient.captured = []
-    with mock.patch("aforo.transport.httpx.Client", _CapturingClient):
-        client = AforoClient(
-            api_key="test-key",
-            base_url="https://ingest.test.aforo.ai",
-            flush_count=50,
-            max_retries=0,
-        )
+    if True:
+        client = _capturing_client()
         client.track(customer_id="cust_contract", metric_name="api_calls", quantity=1)
         client.flush()
         client.shutdown()
 
-    assert _CapturingClient.captured, "no wire request observed"
-    url, body, _headers = _CapturingClient.captured[0]
+    assert _Capture.captured, "no wire request observed"
+    url, body, _headers = _Capture.captured[0]
     assert urlparse(str(url)).path == endpoint
     assert_body_matches_contract(spec, body)
 
@@ -105,21 +100,15 @@ def test_execution_status_is_contracted_optional_field_sent_only_when_set():
     spec = FIXTURE["endpoints"][FIXTURE["sdks"][MODULE_KEY]["endpoint"]]
     status_spec = spec["eventOptionalFields"]["executionStatus"]
 
-    _CapturingClient.captured = []
-    with mock.patch("aforo.transport.httpx.Client", _CapturingClient):
-        client = AforoClient(
-            api_key="test-key",
-            base_url="https://ingest.test.aforo.ai",
-            flush_count=50,
-            max_retries=0,
-        )
+    if True:
+        client = _capturing_client()
         client.track(customer_id="cust_contract", metric_name="api_calls", execution_status="timeout")
         client.track(customer_id="cust_contract", metric_name="api_calls")
         client.flush()
         client.shutdown()
 
-    assert _CapturingClient.captured, "no wire request observed"
-    _url, body, _headers = _CapturingClient.captured[0]
+    assert _Capture.captured, "no wire request observed"
+    _url, body, _headers = _Capture.captured[0]
     assert_body_matches_contract(spec, body)
     with_status, without_status = body[spec["batchKey"]]
     assert with_status["executionStatus"] == "TIMEOUT"
@@ -142,24 +131,66 @@ def test_canonical_statuses_match_contract():
 def test_unknown_execution_status_is_left_off_and_batch_still_valid():
     spec = FIXTURE["endpoints"][FIXTURE["sdks"][MODULE_KEY]["endpoint"]]
 
-    _CapturingClient.captured = []
-    with mock.patch("aforo.transport.httpx.Client", _CapturingClient):
-        client = AforoClient(
-            api_key="test-key",
-            base_url="https://ingest.test.aforo.ai",
-            flush_count=50,
-            max_retries=0,
-        )
+    if True:
+        client = _capturing_client()
         client.track(customer_id="cust_contract", metric_name="api_calls", execution_status="bogus")
         client.track(customer_id="cust_contract", metric_name="api_calls", execution_status="X" * 25)
         client.track(customer_id="cust_contract", metric_name="api_calls", execution_status="success")
         client.flush()
         client.shutdown()
 
-    _url, body, _headers = _CapturingClient.captured[0]
+    _url, body, _headers = _Capture.captured[0]
     assert_body_matches_contract(spec, body)
     bogus, too_long, ok = body[spec["batchKey"]]
     assert "executionStatus" not in bogus
     assert "executionStatus" not in too_long
     assert bogus["customerId"] == "cust_contract" and bogus["metricName"] == "api_calls"
     assert ok["executionStatus"] == "SUCCESS"
+
+
+def test_transport_defaults_match_the_contract_policy():
+    """Every number the transport uses comes from transportPolicy."""
+    from aforo._transport import policy
+    from aforo.types import AforoOptions
+
+    tp = FIXTURE["transportPolicy"]
+    assert tp["endpoint"] == policy.INGEST_PATH
+    assert tp["batch"]["defaultEvents"] == policy.DEFAULT_FLUSH_COUNT == AforoOptions(api_key="k").flush_count
+    assert tp["batch"]["maxEvents"] == policy.MAX_BATCH_EVENTS
+    assert tp["batch"]["targetRequestBodyBytes"] == policy.TARGET_REQUEST_BODY_BYTES
+    assert tp["batch"]["maxRequestBodyBytes"] == policy.MAX_REQUEST_BODY_BYTES
+    assert tp["queue"]["defaultCapacity"] == policy.DEFAULT_QUEUE_CAPACITY == AforoOptions(api_key="k").max_queue_size
+    assert tp["timeouts"]["requestMs"] / 1000 == policy.REQUEST_TIMEOUT_S == AforoOptions(api_key="k").timeout
+    assert tp["timeouts"]["connectMs"] / 1000 == policy.CONNECT_TIMEOUT_S
+    assert tp["timeouts"]["shutdownMs"] / 1000 == policy.SHUTDOWN_TIMEOUT_S == AforoOptions(api_key="k").shutdown_timeout
+    retry = tp["retry"]
+    assert retry["maxRetries"] == policy.MAX_RETRIES == AforoOptions(api_key="k").max_retries
+    assert retry["baseMs"] / 1000 == policy.RETRY_BASE_S == AforoOptions(api_key="k").retry_base_s
+    assert retry["maxDelayMs"] / 1000 == policy.RETRY_MAX_DELAY_S
+    assert retry["retryAfter"]["maxMs"] / 1000 == policy.RETRY_AFTER_MAX_S
+    assert set(retry["retryOnStatus"]) == set(policy.RETRY_STATUSES) | set(policy.RETRY_STATUS_CLASSES)
+    assert all(policy.is_retry_status(s) for s in (408, 429, 500, 501, 502, 503, 504, 505, 599))
+    assert not any(policy.is_retry_status(s) for s in (301, 400, 401, 404, 413, 422))
+    assert set(retry["splitOnStatus"]) == set(policy.SPLIT_STATUSES)
+    assert set(retry["authFailureStatus"]) == set(policy.AUTH_FAILURE_STATUSES)
+    breaker = tp["afterRetriesExhausted"]["breakerCooldownMs"]
+    assert breaker["floor"] / 1000 == policy.BREAKER_FLOOR_S
+    assert breaker["initial"] / 1000 == policy.BREAKER_INITIAL_S
+    assert breaker["max"] / 1000 == policy.BREAKER_MAX_S
+    assert breaker["multiplier"] == policy.BREAKER_MULTIPLIER
+    assert tp["compression"]["gzip"] is policy.GZIP is False
+    assert set(tp["security"]["plainHttpAllowedHosts"]) == set(policy.PLAIN_HTTP_HOSTS)
+    assert tuple(tp["dropReasons"]) == policy.DROP_REASONS
+
+
+def test_wire_request_carries_contract_headers_and_no_content_encoding():
+    client = _capturing_client()
+    client.track(customer_id="cust_contract", metric_name="api_calls")
+    client.flush()
+    client.shutdown()
+    _url, _body, headers = _Capture.captured[0]
+    assert headers["content-type"] == "application/json"
+    assert headers["x-api-key"] == "test-key"
+    assert "content-encoding" not in headers
+    assert "authorization" not in headers
+    assert headers["user-agent"].startswith("aforo-python/")

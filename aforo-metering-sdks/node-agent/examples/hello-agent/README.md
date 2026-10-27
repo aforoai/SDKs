@@ -8,7 +8,7 @@ invocations** using the 5 canonical capabilities from
 
 ```bash
 cd examples/hello-agent
-cp .env.example .env    # then edit — set AFORO_TENANT_ID, AFORO_PRODUCT_ID, AFORO_API_KEY, AFORO_CUSTOMER_ID
+cp .env.example .env    # then edit — set AFORO_API_KEY and AFORO_CUSTOMER_ID
 npm install
 node index.js
 ```
@@ -30,72 +30,34 @@ Emits one AI_AGENT session against Aforo's usage-ingestor:
    - `answer_question` × 1
 4. `session.end({taskCompleted: true})` with final flush
 
-Each recordStep passes `capabilityName` — the SDK stamps this at the
-event's top level AND in `metadata.capability_name` so usage-ingestor's
-`ProductTypeEventExtractor.extractAiAgentFields` bridges it to
-`event.toolName` for per-capability billing.
+Each step is recorded with `stepKind: 'TOOL_CALL'` and a `capabilityName`,
+which the SDK sends as the event's top-level `capabilityName`.
 
 ## Expected event count
 
-The SDK emits one event per `recordStep` call as `agent_step`, plus a
-second `token_usage` event whenever `inputTokens + outputTokens > 0`.
-The invocation plan sets non-zero tokens on every step, so per run:
+All events go to `POST /v1/ingest/batch`. Per run:
 
-- **1** `agent_session_start`
-- **10** `agent_step` (one per capability invocation)
-- **10** `token_usage` (one per step — matches token-based analytics)
-- **1** `agent_session_end`
+- **10** `Agent Steps` (one per step)
+- **10** `Agent Tool Calls` (every step is a TOOL_CALL)
+- **10** `Tokens Consumed` (input + output tokens of each step)
+- **1** `Tasks Completed`
+- **1** `Agent Sessions` (carries `sessionBoundary: SESSION_END`)
 
-**Total: 22 events** into usage-ingestor per run.
-
-Downstream:
-- `usage_events` (usage-ingestor Postgres): **22 rows** (one per emitted event).
-- `ai_agent_invocations` (analytics-service ClickHouse via
-  `AiAgentEventConsumer` — sibling of the MCP consumer, populated
-  by the `agent_step` events with a `capability_name` metadata field):
-  **10 rows**, one per invocation.
-
-## Verify
-
-```sql
--- usage-ingestor Postgres
-SELECT event_type, count(*)
-FROM usage_events
-WHERE tenant_id = '<AFORO_TENANT_ID>'
-  AND event_time > now() - interval '1 minute'
-GROUP BY 1;
--- expected:
--- agent_session_start | 1
--- agent_step          | 10
--- token_usage         | 10
--- agent_session_end   | 1
-
--- analytics-service ClickHouse
-SELECT capability_name, count(*)
-FROM ai_agent_invocations
-WHERE tenant_id = '<AFORO_TENANT_ID>'
-  AND event_time > now() - INTERVAL 1 MINUTE
-GROUP BY 1
-ORDER BY 1;
--- expected: 5 rows keyed by capability name, counts matching the plan.
-```
+**Total: 32 events** per run.
 
 ## Idempotency
 
-Each event carries an `idempotencyKey` stamped by the SDK at creation
-time (see `node-agent/src/index.ts` `genKey()`). Re-running this example
-against the same target with the same env produces a fresh set of keys —
-the ingestor won't dedup them, so **each run generates 22 new events**.
-The idempotency key exists so a SDK-side retry after a drop is
-dedup-safe against a partially-delivered batch; it isn't a run
-deduplicator.
+Each event's `idempotencyKey` is `<sessionId>:<n>` (n counts up within the
+session). The session id is a fresh UUID per run, so every run produces 32
+new events; a retried batch re-sends the same keys and is deduplicated.
 
 ## Fatal errors
 
 - `[hello-agent] missing required env vars: ...` — copy `.env.example`
-  to `.env` and set the three required vars.
+  to `.env` and set the required vars.
 - `[hello-agent] fatal: ...` — the SDK constructor failed. Likely
-  cause: missing tenant/product/API key.
-- `[hello-agent] dropped N event(s) — ...` — the ingestor rejected or
-  timed out on N events. Check the target URL, API key, and
-  usage-ingestor health.
+  cause: missing API key.
+- `[hello-agent] retrying: ...` — the ingestor was unreachable or returned
+  429/5xx; the events stay buffered and are re-sent on the next flush.
+- `[hello-agent] rejected|partial|invalid: ...` — events were refused
+  (bad API key, unknown customer, bad field). The message says why.

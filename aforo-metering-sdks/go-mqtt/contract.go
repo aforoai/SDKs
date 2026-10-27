@@ -1,18 +1,19 @@
 package mqttmetering
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log"
-	"net/http"
-	"strconv"
 	"strings"
-	"time"
+
+	"github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt/v2/internal/ingest"
 )
 
 // ── Ingest contract helpers ──
+//
+// Sending (queue, batching, retries, breaker, shutdown) lives in
+// internal/ingest, a byte-identical copy of the Go core's transport
+// (scripts/sync-transport.sh). This file adapts it to this package.
 
 const (
 	// DefaultProductType is stamped on every event as the top-level
@@ -20,18 +21,179 @@ const (
 	// overrides it.
 	DefaultProductType = "MQTT_BROKER"
 
-	// maxBatchSize is the ingestor's per-request cap on POST /v1/ingest/batch.
-	maxBatchSize = 1000
-
-	maxSendAttempts = 3
-	maxRetryAfter   = 60 * time.Second
-
 	// Field limits mirror the ingestor's IngestUsageEventRequest @Size
 	// constraints. The SDK never truncates an id: an over-limit event is
 	// dropped with DropInvalid instead.
 	maxCustomerIDLen  = 64
 	maxProductTypeLen = 20
 )
+
+// DropReason describes why the SDK gave up on an event.
+type DropReason string
+
+const (
+	// DropOverflow — the queue (Config.MaxQueueSize) was full; the oldest
+	// event was evicted.
+	DropOverflow DropReason = "overflow"
+	// DropRejected — the ingestor refused the event: a non-retryable 4xx, a
+	// single event still too large after 413 splitting, or errors[] with
+	// retryable=false in a 2xx answer.
+	DropRejected DropReason = "rejected"
+	// DropInvalid — the event failed client-side validation (a required field
+	// was blank — including a blank customer id — or a field exceeded the
+	// ingestor's limit) and was never queued.
+	DropInvalid DropReason = "invalid"
+	// DropShutdown — still queued when Shutdown's deadline passed.
+	DropShutdown DropReason = "shutdown"
+	// DropClosed — recorded after Shutdown.
+	DropClosed DropReason = "closed"
+	// DropRetryExhausted is kept for API compatibility. Since v2 a batch that
+	// keeps failing goes back to the queue (the ingestor deduplicates on the
+	// idempotency key), so the transport does not report it.
+	DropRetryExhausted DropReason = "retry_exhausted"
+)
+
+// ErrIngestUnavailable is returned by Flush when the ingestor could not be
+// reached (or refused the API key) after the retries; the events stay queued.
+var ErrIngestUnavailable = ingest.ErrIngestUnavailable
+
+// ErrShutdownIncomplete is returned (wrapped) by Shutdown when events were
+// still queued at the deadline; they were reported with DropShutdown.
+var ErrShutdownIncomplete = ingest.ErrShutdownIncomplete
+
+// ErrClosed is returned by Flush after Shutdown.
+var ErrClosed = ingest.ErrClosed
+
+// ErrorKind classifies a *TransportError.
+type ErrorKind = ingest.ErrorKind
+
+const (
+	KindOutage   = ingest.KindOutage   // ingestor unreachable, 5xx/408/429 after retries, or a redirect; events kept queued
+	KindAuth     = ingest.KindAuth     // 401/403: API key wrong or revoked; events kept queued
+	KindRejected = ingest.KindRejected // the ingestor refused events; they went to OnDrop as rejected
+	KindShutdown = ingest.KindShutdown // still queued at the shutdown deadline
+	KindClosed   = ingest.KindClosed   // recorded after Shutdown
+)
+
+// TransportError is what OnError receives for a sending problem. Branch on
+// Kind, never on Message. Events are the events concerned (requeued for
+// outage/auth, dropped otherwise). errors.Is matches ErrIngestUnavailable
+// (outage, auth), ErrShutdownIncomplete and ErrClosed.
+type TransportError struct {
+	Kind    ErrorKind
+	Status  int // HTTP status that caused it, 0 for a network error
+	Message string
+	Events  []map[string]any
+	err     *ingest.TransportError
+}
+
+func (e *TransportError) Error() string { return e.Message }
+
+// Unwrap exposes the sentinel error for the kind.
+func (e *TransportError) Unwrap() error { return e.err }
+
+func newTransportError(e *ingest.TransportError) *TransportError {
+	return &TransportError{Kind: e.Kind, Status: e.Status, Message: e.Message, Events: eventMaps(e.Events), err: e}
+}
+
+// eventMaps hands callbacks the events as queued (keys kept).
+func eventMaps(events []ingest.Event) []map[string]any {
+	out := make([]map[string]any, len(events))
+	for i, e := range events {
+		if m, ok := e.Ref.(map[string]any); ok {
+			out[i] = m
+		} else {
+			out[i] = map[string]any{"idempotencyKey": e.Key}
+		}
+	}
+	return out
+}
+
+// String never prints the API key.
+func (c Config) String() string {
+	return fmt.Sprintf("mqttmetering.Config{TenantID:%q, ProductID:%q, APIKey:%s, IngestorURL:%q}",
+		c.TenantID, c.ProductID, ingest.RedactKey(c.APIKey), c.IngestorURL)
+}
+
+// GoString never prints the API key.
+func (c Config) GoString() string { return c.String() }
+
+// String never prints the API key.
+func (b *Billing) String() string { return "mqttmetering.Billing{" + b.cfg.String() + "}" }
+
+// newTransport builds the transport core from Config. It enforces https
+// (http only for localhost, 127.0.0.1, ::1 or with AllowInsecureHTTP).
+func newTransport(cfg Config) (*ingest.Client, error) {
+	onDrop := cfg.OnDrop
+	tc := ingest.Config{
+		BaseURL:           cfg.IngestorURL,
+		APIKey:            cfg.APIKey,
+		UserAgent:         "aforo-go-mqtt/" + sdkVersion,
+		Headers:           map[string]string{"X-Tenant-Id": cfg.TenantID},
+		AllowInsecureHTTP: cfg.AllowInsecureHTTP,
+		HTTPClient:        cfg.HTTPClient,
+		Timeout:           cfg.Timeout,
+		FlushCount:        cfg.FlushCount,
+		FlushInterval:     cfg.FlushInterval,
+		MaxQueueSize:      cfg.MaxQueueSize,
+		MaxRetries:        cfg.MaxRetries,
+		RetryBase:         cfg.RetryBase,
+		ShutdownTimeout:   cfg.ShutdownTimeout,
+		OnError: func(e *ingest.TransportError) {
+			if cfg.OnError != nil {
+				cfg.OnError(newTransportError(e))
+			}
+		},
+		LogPrefix: "[mqttmetering]",
+		Hooks:     cfg.hooks,
+	}
+	if onDrop != nil {
+		tc.OnDrop = func(events []ingest.Event, reason ingest.DropReason) {
+			onDrop(eventMaps(events), DropReason(reason))
+		}
+	}
+	if onAccepted := cfg.OnAccepted; onAccepted != nil {
+		tc.OnAccepted = func(body json.RawMessage, events []ingest.Event) {
+			onAccepted(body, eventMaps(events))
+		}
+	}
+	return ingest.New(tc)
+}
+
+// push queues a resolved event. It never blocks on the network and never
+// starts a goroutine; after Shutdown the event is reported as DropClosed.
+func (b *Billing) push(event map[string]any) {
+	if event == nil {
+		return
+	}
+	key, _ := event["idempotencyKey"].(string)
+	body, err := json.Marshal(event)
+	if err != nil {
+		b.dropInvalid(event, "event cannot be serialized: "+err.Error())
+		return
+	}
+	_ = b.tp.Enqueue(ingest.Event{Key: key, Body: body, Ref: event})
+}
+
+// Flush sends everything queued and waits, or until ctx ends. During an
+// ingest outage it returns ErrIngestUnavailable; nothing is lost.
+func (b *Billing) Flush(ctx context.Context) error {
+	_, err := b.tp.Flush(ctx)
+	return err
+}
+
+// BufferedCount returns the number of queued events.
+func (b *Billing) BufferedCount() int { return b.tp.Len() }
+
+// shutdownTransport closes the transport: it sends what is queued until the
+// earlier of ctx's deadline and Config.ShutdownTimeout, then reports the
+// rest as DropShutdown. Safe to call more than once.
+func (b *Billing) shutdownTransport(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return b.tp.Close(ctx)
+}
 
 func normalizeProductType(s string) string {
 	return strings.ToUpper(strings.TrimSpace(s))
@@ -84,195 +246,19 @@ func tooLong(field, value string, max int) string {
 	return ""
 }
 
-// dropInvalid accounts for an event refused client-side. It is never buffered
-// or sent: it is counted in DroppedCount(), WARN-logged (first occurrence,
-// then every 1000th, so a tight loop cannot storm the log), reported through
-// OnError and handed to the opt-in OnDrop hook with DropInvalid. The event is
-// the best-effort resolved event, with its idempotency key when one was minted.
+// dropInvalid accounts for an event refused client-side. It is never queued
+// or sent: it is counted in DroppedCount(), WARN-logged (throttled), reported
+// through OnError and handed to the opt-in OnDrop hook with DropInvalid.
 func (b *Billing) dropInvalid(event map[string]any, msg string) {
-	total := b.dropped.Add(1)
-	if n := b.invalidDrops.Add(1); n == 1 || n%1000 == 0 {
-		log.Printf("[mqttmetering] WARN: invalid event dropped, not sent — %s (%d invalid, %d total dropped).", msg, n, total)
-	}
+	key, _ := event["idempotencyKey"].(string)
 	b.cfg.OnError(fmt.Errorf("mqttmetering: invalid event dropped: %s", msg))
-	b.callOnDrop([]map[string]any{event}, DropInvalid)
+	b.tp.ReportInvalid(ingest.Event{Key: key, Ref: event}, msg)
 }
 
-// callOnDrop invokes the opt-in hook. A hook bug must never break
-// recording or flushing.
-func (b *Billing) callOnDrop(events []map[string]any, reason DropReason) {
-	if b.cfg.OnDrop == nil || len(events) == 0 {
-		return
-	}
-	defer func() { _ = recover() }()
-	b.cfg.OnDrop(events, reason)
-}
-
-// DroppedCount returns the total events permanently dropped since this
-// Billing instance was created (failed batches, events the ingestor rejected,
-// and events refused client-side).
+// DroppedCount returns the total events the SDK gave up on since this Billing
+// instance was created (every DropReason).
 func (b *Billing) DroppedCount() int64 {
-	return b.dropped.Load()
-}
-
-// recordDrop accounts for permanently lost events: bumps the counter,
-// WARN-logs, and invokes the opt-in OnDrop hook. The buffer is drained at
-// flush start, so drops here are bounded by flush cadence — no log throttle
-// needed.
-func (b *Billing) recordDrop(events []map[string]any, reason DropReason) {
-	if len(events) == 0 {
-		return
-	}
-	total := b.dropped.Add(int64(len(events)))
-	log.Printf("[mqttmetering] WARN: dropped %d event(s) — %s (%d total dropped).", len(events), reason, total)
-	b.callOnDrop(events, reason)
-}
-
-// batchResponse is the 202 body returned by POST /v1/ingest/batch.
-type batchResponse struct {
-	Accepted   int `json:"accepted"`
-	Duplicates int `json:"duplicates"`
-	Failed     int `json:"failed"`
-	Errors     []struct {
-		Index   *int   `json:"index"`
-		Message string `json:"message"`
-	} `json:"errors"`
-}
-
-// flush drains the buffer and sends it in chunks of at most maxBatchSize.
-func (b *Billing) flush() {
-	b.mu.Lock()
-	if len(b.buffer) == 0 {
-		b.mu.Unlock()
-		return
-	}
-	batch := b.buffer
-	b.buffer = nil
-	b.mu.Unlock()
-
-	for start := 0; start < len(batch); start += maxBatchSize {
-		end := start + maxBatchSize
-		if end > len(batch) {
-			end = len(batch)
-		}
-		b.send(batch[start:end])
-	}
-}
-
-// send POSTs one chunk of at most maxBatchSize events. The body is marshalled
-// once, so every retry carries the same idempotencyKeys. Transport errors,
-// 408, 429 (honouring Retry-After) and 5xx are retried; exhausting the
-// retries drops the chunk with DropRetryExhausted. Any other 4xx is not
-// retried (retrying cannot fix it) and drops the chunk with DropRejected.
-func (b *Billing) send(chunk []map[string]any) {
-	body, err := json.Marshal(map[string]any{"events": chunk})
-	if err != nil {
-		b.recordDrop(chunk, DropRejected)
-		b.cfg.OnError(err)
-		return
-	}
-	var lastErr error
-	for attempt := 1; attempt <= maxSendAttempts; attempt++ {
-		req, err := http.NewRequest(http.MethodPost, b.url, bytes.NewReader(body))
-		if err != nil {
-			b.recordDrop(chunk, DropRejected)
-			b.cfg.OnError(err)
-			return
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-API-Key", b.cfg.APIKey)
-		req.Header.Set("X-Tenant-Id", b.cfg.TenantID)
-		delay := time.Duration(1<<(attempt-1)) * b.retryBackoffBase
-		resp, err := b.client.Do(req)
-		if err != nil {
-			lastErr = err
-		} else {
-			respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-			resp.Body.Close()
-			code := resp.StatusCode
-			switch {
-			case code >= 200 && code < 300:
-				b.reportPartialFailure(respBody, chunk)
-				return
-			case code == http.StatusRequestTimeout || code == http.StatusTooManyRequests || code >= 500:
-				lastErr = fmt.Errorf("ingestor returned HTTP %d", code)
-				if code == http.StatusTooManyRequests {
-					if secs, perr := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); perr == nil && secs >= 0 {
-						delay = time.Duration(secs) * time.Second
-						if delay > maxRetryAfter {
-							delay = maxRetryAfter
-						}
-					}
-				}
-			default:
-				b.recordDrop(chunk, DropRejected)
-				b.cfg.OnError(fmt.Errorf("mqttmetering: ingestor rejected batch of %d events with HTTP %d: %s",
-					len(chunk), code, errorMessages(respBody)))
-				return
-			}
-		}
-		if attempt < maxSendAttempts {
-			time.Sleep(delay)
-		}
-	}
-	b.recordDrop(chunk, DropRetryExhausted)
-	b.cfg.OnError(fmt.Errorf("mqttmetering: flush exhausted retries (dropped %d events): %v", len(chunk), lastErr))
-}
-
-// reportPartialFailure handles a 2xx body whose "failed" count is non-zero:
-// it surfaces errors[].message through OnError and drops the events the
-// ingestor refused with DropRejected. Only events identified by errors[].index
-// are handed to OnDrop; failures the ingestor did not identify are counted
-// without naming an event.
-func (b *Billing) reportPartialFailure(respBody []byte, chunk []map[string]any) {
-	var br batchResponse
-	if unmarshalBatchResponse(respBody, &br) != nil || br.Failed <= 0 {
-		return
-	}
-	failed := br.Failed
-	if failed > len(chunk) {
-		failed = len(chunk)
-	}
-	seen := make(map[int]struct{}, len(br.Errors))
-	var rejected []map[string]any
-	for _, e := range br.Errors {
-		if e.Index == nil || *e.Index < 0 || *e.Index >= len(chunk) {
-			continue
-		}
-		if _, dup := seen[*e.Index]; dup {
-			continue
-		}
-		seen[*e.Index] = struct{}{}
-		rejected = append(rejected, chunk[*e.Index])
-	}
-	if len(rejected) > failed {
-		rejected = nil // response is inconsistent; do not guess
-	}
-	b.recordDrop(rejected, DropRejected)
-	if unidentified := failed - len(rejected); unidentified > 0 {
-		total := b.dropped.Add(int64(unidentified))
-		log.Printf("[mqttmetering] WARN: dropped %d event(s) — %s; the ingestor did not identify them (%d total dropped).", unidentified, DropRejected, total)
-	}
-	b.cfg.OnError(fmt.Errorf("mqttmetering: ingestor rejected %d of %d events: %s",
-		br.Failed, len(chunk), errorMessages(respBody)))
-}
-
-// errorMessages renders errors[].message ("[index] message; ...") from an
-// ingestor response, falling back to the raw body.
-func errorMessages(respBody []byte) string {
-	var br batchResponse
-	if unmarshalBatchResponse(respBody, &br) == nil && len(br.Errors) > 0 {
-		msgs := make([]string, 0, len(br.Errors))
-		for _, e := range br.Errors {
-			if e.Index != nil {
-				msgs = append(msgs, fmt.Sprintf("[%d] %s", *e.Index, e.Message))
-			} else {
-				msgs = append(msgs, e.Message)
-			}
-		}
-		return truncate(strings.Join(msgs, "; "), 1024)
-	}
-	return truncate(string(respBody), 512)
+	return b.tp.Dropped()
 }
 
 func truncate(s string, n int) string {
@@ -280,19 +266,4 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
-}
-
-// unmarshalBatchResponse decodes a 2xx ingest response. The ingestor wraps
-// every 2xx JSON body in {success, data, meta}; the inner data object is used
-// when present, else the body itself (bare shape).
-func unmarshalBatchResponse(body []byte, br *batchResponse) error {
-	var env struct {
-		Data json.RawMessage `json:"data"`
-	}
-	if json.Unmarshal(body, &env) == nil {
-		if inner := bytes.TrimSpace(env.Data); len(inner) > 0 && inner[0] == '{' {
-			body = inner
-		}
-	}
-	return json.Unmarshal(body, br)
 }

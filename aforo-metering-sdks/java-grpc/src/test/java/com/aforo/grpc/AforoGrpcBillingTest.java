@@ -69,7 +69,7 @@ class AforoGrpcBillingTest {
     }
 
     private AforoGrpcBilling.Builder baseBuilder() {
-        return AforoGrpcBilling.newBuilder()
+        return AforoGrpcBilling.newBuilder().trustCustomerHeader(true)
                 .tenantId("tenant-001")
                 .productId("prod-001")
                 .apiKey("sk_test_abc")
@@ -93,15 +93,15 @@ class AforoGrpcBillingTest {
     @DisplayName("Missing required fields throw IllegalArgumentException")
     void missingFieldsRejected() {
         // Each required field missing throws
-        assertThatIllegalArgumentExceptionThrown(() -> AforoGrpcBilling.newBuilder()
+        assertThatIllegalArgumentExceptionThrown(() -> AforoGrpcBilling.newBuilder().trustCustomerHeader(true)
                 .productId("p").apiKey("k").ingestorUrl("u").serviceName("s").build());
-        assertThatIllegalArgumentExceptionThrown(() -> AforoGrpcBilling.newBuilder()
+        assertThatIllegalArgumentExceptionThrown(() -> AforoGrpcBilling.newBuilder().trustCustomerHeader(true)
                 .tenantId("t").apiKey("k").ingestorUrl("u").serviceName("s").build());
-        assertThatIllegalArgumentExceptionThrown(() -> AforoGrpcBilling.newBuilder()
+        assertThatIllegalArgumentExceptionThrown(() -> AforoGrpcBilling.newBuilder().trustCustomerHeader(true)
                 .tenantId("t").productId("p").ingestorUrl("u").serviceName("s").build());
-        assertThatIllegalArgumentExceptionThrown(() -> AforoGrpcBilling.newBuilder()
+        assertThatIllegalArgumentExceptionThrown(() -> AforoGrpcBilling.newBuilder().trustCustomerHeader(true)
                 .tenantId("t").productId("p").apiKey("k").serviceName("s").build());
-        assertThatIllegalArgumentExceptionThrown(() -> AforoGrpcBilling.newBuilder()
+        assertThatIllegalArgumentExceptionThrown(() -> AforoGrpcBilling.newBuilder().trustCustomerHeader(true)
                 .tenantId("t").productId("p").apiKey("k").ingestorUrl("u").build());
     }
 

@@ -1,6 +1,6 @@
 # ai.aforo:ws-metering — User Guide
 
-**Version:** 1.2.1 · **Updated:** 2026-10-01 · **Audience:** Java engineers running a WebSocket server (Jakarta WebSocket, Spring WebSocket, Netty, Undertow) who need connection/frame/byte metering.
+**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Java engineers running a WebSocket server (Jakarta WebSocket, Spring WebSocket, Netty, Undertow) who need connection/frame/byte metering.
 
 ## What you'll build
 
@@ -11,7 +11,7 @@ A WebSocket endpoint that reports one Aforo event when a connection opens and on
 - JDK 17 or newer.
 - A WebSocket server you can hook open/message/close callbacks on. For the Jakarta path, `jakarta.websocket-api` 2.1+ supplied by your container.
 - An Aforo API key (`AFORO_API_KEY`), a `tenant_id`, and a `product_id` for this socket surface.
-- A way to resolve the customer id when a connection opens (a query param, a header captured at handshake, or your session).
+- A way to resolve the customer id when a connection opens from what your handshake authenticated (session, verified token). Not a query parameter: the client sets those.
 
 ## Step 1 — Build the SDK into your local Maven repo
 
@@ -27,7 +27,7 @@ Add to your service's `pom.xml`:
 <dependency>
   <groupId>ai.aforo</groupId>
   <artifactId>ws-metering</artifactId>
-  <version>1.2.1</version>
+  <version>2.0.0</version>
 </dependency>
 ```
 
@@ -60,8 +60,8 @@ AforoWsBilling billing = AforoWsBilling.newBuilder()
 ```java
 @OnOpen
 public void open(Session s) {
-    String customerId = s.getRequestParameterMap()
-            .getOrDefault("customer", java.util.List.of("")).get(0);
+    // From the identity your handshake authenticated, never a query parameter the client sets.
+    String customerId = customers.idFor(s.getUserPrincipal());
     this.connectionId = billing.openConnection(customerId, java.util.Map.of("path", "/ws"));
 }
 
@@ -90,7 +90,7 @@ billing.close();   // flushes synchronously, then shuts down the daemon thread
 
 Then confirm on the Aforo side:
 
-- Aforo console → **Ingestion → Recent Events**, filter by your `customerId`. You'll see `websocket_api.message` (the OPEN marker) and `websocket_api.connection_closed` with the aggregated `messageCount`, `dataBytes`, `executionDurationMs`, and `wsCloseReason`.
+- Aforo console → **Ingestion → Recent Events**, filter by your `customerId`. You'll see `websocket_api.connection_opened` (the OPEN event) and `websocket_api.connection_closed` with the aggregated `messageCount`, `dataBytes`, `executionDurationMs`, and `wsCloseReason`.
 
 For a long-running server, register the flush on shutdown:
 
@@ -108,8 +108,15 @@ Runtime.getRuntime().addShutdownHook(new Thread(billing::close));
 | `ingestorUrl` | `String` | *(required)* | Host; SDK appends `/v1/ingest/batch`. |
 | `perFrameEvents` | `boolean` | `false` | `true` = one event per frame; `false` = OPEN + CLOSE only, aggregated. |
 | `productType` | `String` | `WEBSOCKET_API` | Top-level `productType` on every event; trimmed + uppercased. |
-| `flushCount` | `int` | `100` | Events per immediate flush. |
-| `flushIntervalMs` | `long` | `3000` | Background flush cadence (ms). |
+| `flushCount` | `int` | `500` | Events per request (at most 1000); also how many queued events wake the sender. |
+| `flushIntervalMs` | `long` | `5000` | How often queued events are sent when the batch is not full (ms). |
+| `maxQueueSize` | `int` | `10000` | Queue capacity; when full, the oldest event is dropped as `OVERFLOW`. |
+| `maxRetries` | `int` | `3` | Retries per request on a network error, timeout, 408, 429 or 5xx. |
+| `retryBaseMs` | `long` | `500` | Base of the full-jitter backoff (each wait is random up to `min(30 s, base × 2^attempt)`). |
+| `timeoutMs` | `long` | `10000` | Total deadline of one ingest request (ms). |
+| `shutdownTimeoutMs` | `long` | `5000` | How long `close()` keeps sending; leftovers are reported as `SHUTDOWN`. |
+| `breakerCooldownMs` | `long` | `5000` | Pause after a batch fails every retry or gets 401/403; doubles with jitter up to 5 minutes. |
+| `allowInsecureHttp` | `boolean` | `false` | Accept a plain `http://` `ingestorUrl` on a host other than localhost / 127.0.0.1 / ::1. |
 
 ## Troubleshooting
 
@@ -120,7 +127,7 @@ Runtime.getRuntime().addShutdownHook(new Thread(billing::close));
 | CLOSE event missing | `closeConnection` was never called (e.g. abnormal disconnect) or the process died first | Call `closeConnection` from `@OnClose` / your error path; flush before shutdown. |
 | Events POST to a 404 | `ingestorUrl` already includes the path | Pass the host only; the SDK appends `/v1/ingest/batch`. |
 | Far more events than connections | `perFrameEvents(true)` is set | That's per-frame mode. Leave it `false` for aggregated OPEN/CLOSE only. |
-| `flush exhausted retries — dropped N events` in logs | Network error, 5xx, 408 or 429 on all 3 attempts | Check connectivity to `ingestorUrl`; the batch is reported to `onDrop` with `RETRY_EXHAUSTED`. |
+| `Ingestor unreachable after retries; N event(s) put back in the queue` in logs | Network error, timeout, 5xx, 408 or 429 on every attempt | Check connectivity to `ingestorUrl`. Nothing is lost while the queue has room; events still queued when `close()` hits its deadline go to `onDrop` as `SHUTDOWN`. |
 | `ingestor returned 4xx — not retrying` or `Dropped N event(s) — REJECTED` in logs | Bad key, unknown metric, or an event the ingestor refused; a 4xx other than 408/429 is sent once | Verify the key + `X-Tenant-Id`; ensure the `websocket_api.*` metric exists in Aforo. The log line carries the ingestor's `errors[].message`. |
 | `Dropping invalid event: ...` in logs, `droppedCount()` grows | The event breaks an ingestor field limit (`DropReason.INVALID`) and was not sent | The message names the field, the limit and the value. See [Dropped events](README.md#dropped-events). |
 

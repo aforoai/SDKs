@@ -7,6 +7,7 @@
  */
 
 import { AforoGrpcBilling, GRPC_STATUS } from '../index';
+import { settleWithFakeTimers } from '../../test-support/timing';
 
 // ── Test setup ───────────────────────────────────────────────────────────
 
@@ -58,6 +59,7 @@ const config = () => ({
   tenantId: 'tenant-001',
   productId: 'prod-001',
   apiKey: 'sk_test_abc',
+  trustCustomerHeader: true,
   ingestorUrl: 'https://api.aforo.ai/',  // trailing slash on purpose — SDK should strip it
   serviceName: 'acme.v1.UserService',
 });
@@ -257,33 +259,34 @@ describe('flush request shape', () => {
 // ── Retry behaviour ──────────────────────────────────────────────────────
 
 describe('retry on flush failure', () => {
-  test('retries 3× on non-2xx response, then drops batch and invokes onError', async () => {
+  test('retries 3× on a 5xx response, then keeps the batch queued (same keys) and reports the outage once', async () => {
     jest.useFakeTimers();
-    const onError = jest.fn();
-    const b = new AforoGrpcBilling({ ...config(), flushCount: 1, onError });
-    nextFetchResponse = () => failResponse(500);
+    try {
+      const onError = jest.fn();
+      const b = new AforoGrpcBilling({ ...config(), flushCount: 1, onError, flushIntervalMs: 1e9 });
+      nextFetchResponse = () => failResponse(500);
 
-    const wrapped = b.wrapUnary('M', async () => ({}));
-    const { cb } = makeCallback();
-    wrapped(makeCall(), cb);
+      const wrapped = b.wrapUnary('M', async () => ({}));
+      const { cb } = makeCallback();
+      wrapped(makeCall(), cb);
+      await settleWithFakeTimers(b.flush(), 'flush during an outage');
 
-    // Microtasks advance the first send; then we tick through the retry sleeps.
-    await Promise.resolve();
-    await Promise.resolve();
-    for (const ms of [1000, 2000, 4000]) {
-      jest.advanceTimersByTime(ms);
-      await Promise.resolve();
-      await Promise.resolve();
+      expect(capturedRequests.length).toBe(4); // 1 + maxRetries (3)
+      // Every retry re-sends the exact same events, idempotencyKeys included.
+      const keysPerAttempt = capturedRequests.map((r) => JSON.stringify(r.body.events.map((e: any) => e.idempotencyKey)));
+      expect(new Set(keysPerAttempt).size).toBe(1);
+      expect(b.droppedCount).toBe(0); // not dropped: requeued behind the breaker
+      expect(b.queuedCount).toBe(1);
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(onError.mock.calls[0][0].message).toMatch(/unavailable/);
+
+      nextFetchResponse = okResponse();
+      await settleWithFakeTimers(b.shutdown(), 'shutdown after recovery');
+      expect(capturedRequests.length).toBe(5);
+      expect(b.queuedCount).toBe(0);
+    } finally {
+      jest.useRealTimers();
     }
-
-    expect(capturedRequests.length).toBe(3);   // 3 attempts
-    // Every retry re-sends the exact same events, idempotencyKeys included.
-    const keysPerAttempt = capturedRequests.map((r) => JSON.stringify(r.body.events.map((e: any) => e.idempotencyKey)));
-    expect(new Set(keysPerAttempt).size).toBe(1);
-    expect(onError).toHaveBeenCalledTimes(1);  // dropped
-    expect(onError.mock.calls[0][0].message).toMatch(/3 attempts/);
-    jest.useRealTimers();
-    await b.shutdown();
   });
 
   test('successful 1st attempt → no retry, no onError', async () => {
@@ -370,7 +373,7 @@ describe('ingest batch contract', () => {
     assertBatchContract(capturedRequests, 'sk_test_abc', FIELDS);
   });
 
-  test('blank customerId is not metered; an over-long one is dropped as invalid (never thrown, never sent)', async () => {
+  test('blank customerId is not metered (one invalid drop); an over-long one is dropped as invalid (never thrown, never sent)', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     const onError = jest.fn();
     const drops: Array<{ events: any[]; reason: string }> = [];
@@ -386,14 +389,15 @@ describe('ingest batch contract', () => {
     await b.shutdown();
     expect(calls).toHaveLength(2); // both RPCs still answered
     expect(capturedRequests).toHaveLength(0);
-    expect(b.droppedCount).toBe(1); // the blank one is non-billable, not a drop
-    expect(drops).toHaveLength(1);
-    expect(drops[0].reason).toBe('invalid');
-    expect(drops[0].events[0].customerId).toBe('c'.repeat(65));
-    expect(drops[0].events[0].idempotencyKey).toBeTruthy();
+    expect(b.droppedCount).toBe(2); // no customer and an over-long one: both counted as invalid
+    expect(drops).toHaveLength(2);
+    expect(drops.map((d) => d.reason)).toEqual(['invalid', 'invalid']);
+    expect(drops[0].events[0].customerId).toBe('');
+    expect(drops[1].events[0].customerId).toBe('c'.repeat(65));
+    expect(drops[1].events[0].idempotencyKey).toBeTruthy();
     expect(onError).not.toHaveBeenCalled();
-    expect(warn).toHaveBeenCalledTimes(1);
-    expect(warn.mock.calls[0][0]).toMatch(/invalid: customerId is 65 chars, limit 64/);
+    expect(warn).toHaveBeenCalledTimes(1); // invalid drops are logged on the 1st and every 1000th
+    expect(warn.mock.calls[0][0]).toMatch(/invalid: no customer/);
     warn.mockRestore();
   });
 

@@ -190,7 +190,7 @@ class _Ctx:
 
 def _run_interceptor(http, resolver):
     b = _billing()
-    interceptor = AforoGrpcInterceptor(b, execution_status_resolver=resolver)
+    interceptor = AforoGrpcInterceptor(b, execution_status_resolver=resolver, trust_customer_header=True)
     wrapped = interceptor.intercept_service(lambda _d: _Handler(), _CallDetails())
     wrapped.unary_unary({}, _Ctx())
     b.shutdown()

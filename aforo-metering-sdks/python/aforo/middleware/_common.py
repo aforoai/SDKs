@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, Optional, Union
 
+from .._transport.identity import clean_customer_id, require_customer_source
 from ..limits import truncate_label
+
+logger = logging.getLogger("aforo.middleware")
+
+NO_CUSTOMER = "no customer for this request (the customer resolver returned nothing)"
 
 DEFAULT_METRIC_NAME = "api_calls"
 """Metric recorded per request when ``metric_name`` is not configured.
@@ -35,16 +41,37 @@ def resolve_metric_name(metric_name: MetricName, *args: Any) -> str:
     return metric_name or DEFAULT_METRIC_NAME
 
 
-def resolve_customer_id(customer_id: CustomerId, request: Any) -> Optional[str]:
-    """Configured customer resolver/fixed value, or ``None`` if not configured."""
-    if callable(customer_id):
-        value = customer_id(request)
+def customer_lookup(
+    customer_resolver: CustomerId,
+    trust_customer_header: bool,
+    header_reader: Callable[[Any], Optional[str]],
+    *,
+    integration: str,
+) -> Callable[[Any], Optional[str]]:
+    """Build the per-request customer lookup, or raise ValueError.
+
+    ``customer_resolver`` is a callable (or one fixed id) that returns the
+    customer from identity your service has verified. Without one,
+    ``trust_customer_header=True`` is required to read ``X-Customer-Id``, a
+    header the caller of your API controls. There is no other fallback.
+    """
+    resolver: Optional[Callable[[Any], Any]]
+    if customer_resolver is None or callable(customer_resolver):
+        resolver = customer_resolver
     else:
-        value = customer_id
-    if value is None:
-        return None
-    value = str(value).strip()
-    return value or None
+        fixed = clean_customer_id(customer_resolver)
+        if fixed is None:
+            raise ValueError(f"{integration}: customer_resolver is blank")
+        resolver = lambda _request: fixed  # noqa: E731 -- one configured customer
+    require_customer_source(resolver, trust_customer_header, integration=integration,
+                            untrusted_source="the X-Customer-Id request header")
+
+    def lookup(request: Any) -> Optional[str]:
+        if resolver is not None:
+            return clean_customer_id(resolver(request))
+        return clean_customer_id(header_reader(request))
+
+    return lookup
 
 
 def resolve_product_type(product_type: Optional[str]) -> str:

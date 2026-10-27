@@ -50,15 +50,16 @@ describe('AforoClient — drop observability + onDrop hook', () => {
     expect(drops[0].reason).toBe('overflow');
     expect(drops[0].events).toHaveLength(1);
     expect(drops[0].events[0].idempotencyKey).toBe('k1'); // oldest evicted
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Buffer overflow'));
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('overflow'));
 
     await client.shutdown();
   });
 
-  it('retry exhaustion drops the drained batch, counts it, warns, and fires onDrop', async () => {
+  it('an outage keeps the batch queued with its keys; only the shutdown deadline drops it', async () => {
     mockFetch.mockRejectedValue(new Error('ECONNREFUSED'));
     const drops: Array<{ events: ResolvedEvent[]; reason: DropReason }> = [];
     const client = newClient({
+      shutdownTimeoutMs: 50,
       onDrop: (events: ResolvedEvent[], reason: DropReason) => drops.push({ events, reason }),
     });
 
@@ -66,16 +67,18 @@ describe('AforoClient — drop observability + onDrop hook', () => {
     await client.track({ customerId: 'cust_2', metricName: 'api_calls', idempotencyKey: 'k2' });
     const result = await client.flush();
 
-    expect(result.failed).toBe(2);
+    expect(result).toMatchObject({ sent: 0, failed: 0, requeued: 2, queued: 2 });
+    expect(client.droppedCount).toBe(0);
+    expect(drops).toHaveLength(0);
+
+    await client.shutdown();
     expect(client.droppedCount).toBe(2);
     expect(drops).toHaveLength(1);
-    expect(drops[0].reason).toBe('retry_exhausted');
+    expect(drops[0].reason).toBe('shutdown');
     expect(drops[0].events.map((e) => e.idempotencyKey)).toEqual(['k1', 'k2']);
     // Events keep their keys — dedup-safe replay via track() is possible
     expect(drops[0].events[0].customerId).toBe('cust_1');
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('retry_exhausted'));
-
-    await client.shutdown();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('shutdown'));
   });
 
   it('non-retryable 4xx rejection fires onDrop with reason "rejected"', async () => {
@@ -94,14 +97,13 @@ describe('AforoClient — drop observability + onDrop hook', () => {
     await client.shutdown();
   });
 
-  it('default (no onDrop): drops are counted + warned but flush result is unchanged', async () => {
-    mockFetch.mockRejectedValue(new Error('ECONNREFUSED'));
+  it('default (no onDrop): drops are counted + warned', async () => {
+    mockFetch.mockResolvedValue({ ok: false, status: 422, headers: new Map() });
     const client = newClient();
 
     await client.track({ customerId: 'cust_1', metricName: 'api_calls' });
     const result = await client.flush();
 
-    // Same result shape/values as before the hardening
     expect(result.sent).toBe(0);
     expect(result.failed).toBe(1);
     expect(client.droppedCount).toBe(1);
@@ -111,7 +113,7 @@ describe('AforoClient — drop observability + onDrop hook', () => {
   });
 
   it('a throwing onDrop hook never breaks flushing', async () => {
-    mockFetch.mockRejectedValue(new Error('ECONNREFUSED'));
+    mockFetch.mockResolvedValue({ ok: false, status: 400, headers: new Map() });
     const client = newClient({
       onDrop: () => {
         throw new Error('hook bug');
@@ -127,15 +129,17 @@ describe('AforoClient — drop observability + onDrop hook', () => {
     await client.shutdown();
   });
 
-  it('shutdown deregisters SIGTERM/SIGINT handlers (no listener leak)', async () => {
-    const before = process.listenerCount('SIGTERM');
+  it('installs no SIGTERM/SIGINT handlers at all', async () => {
+    const term = process.listenerCount('SIGTERM');
+    const int = process.listenerCount('SIGINT');
     const client = newClient();
-    expect(process.listenerCount('SIGTERM')).toBe(before + 1);
+    expect(process.listenerCount('SIGTERM')).toBe(term);
+    expect(process.listenerCount('SIGINT')).toBe(int);
 
     await client.shutdown();
 
-    expect(process.listenerCount('SIGTERM')).toBe(before);
-    expect(process.listenerCount('SIGINT')).toBeLessThanOrEqual(before + 1);
+    expect(process.listenerCount('SIGTERM')).toBe(term);
+    expect(process.listenerCount('SIGINT')).toBe(int);
   });
 
   it('a 2xx with per-event errors[] drops only the events the server named (reason rejected)', async () => {
@@ -153,7 +157,7 @@ describe('AforoClient — drop observability + onDrop hook', () => {
     await client.track({ customerId: 'cust_3', metricName: 'api_calls', idempotencyKey: 'k3' });
     const result = await client.flush();
 
-    expect(result).toEqual({ sent: 2, failed: 1 });
+    expect(result).toMatchObject({ sent: 2, failed: 1 });
     expect(client.droppedCount).toBe(1);
     expect(drops).toHaveLength(1);
     expect(drops[0].reason).toBe('rejected');
@@ -175,10 +179,10 @@ describe('AforoClient — drop observability + onDrop hook', () => {
     await client.track({ customerId: 'cust_2', metricName: 'api_calls' });
     const result = await client.flush();
 
-    expect(result).toEqual({ sent: 1, failed: 1 });
+    expect(result).toMatchObject({ sent: 1, failed: 1 });
     expect(client.droppedCount).toBe(1);
     expect(onDrop).not.toHaveBeenCalled();
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('rejected 1 of 2'));
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('rejected 1 event(s) without naming them'));
 
     await client.shutdown();
   });

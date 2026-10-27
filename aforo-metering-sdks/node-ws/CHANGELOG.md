@@ -2,6 +2,41 @@
 
 All notable changes to `@aforoai/ws-metering` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com); this package adheres to [SemVer](https://semver.org).
 
+## [2.0.0] - 2026-10-26
+
+Breaking. Migration: give `wrapServer` a `customerResolver` (or `trustCustomerHeader: true` behind a proxy you control), use an `https://` `ingestorUrl` (or `allowInsecureHttp: true`), and call `await billing.shutdown()` from your SIGTERM handler.
+
+### Changed (billing)
+- **An outbound frame is billed only once the socket accepts it.** The `send()` wrapper counts the frame (and emits its per-frame event) in `ws`'s send callback when it reports no error, so a frame sent to a closing or broken socket is no longer billed. Before, it was counted when `send()` was called. The caller's own callback still runs with the same error. A frame accepted after the connection was reported closed is not added to the totals already sent.
+
+### Fixed (transport core, review of 2026-10-26)
+These come from the shared Node core (`src/transport-core/core.ts`) and follow contract/TRANSPORT-SPEC.md "Edge cases every core handles the same way".
+- **The request deadline covers reading the response body.** A server that sent headers and then stalled, or dripped the body a byte at a time, held `flush()` and `shutdown()` forever; the read is now inside `timeoutMs` and the batch is retried.
+- **Redirects are never followed.** Every request is sent with `redirect: 'manual'`, so the API key cannot reach the host a 3xx names. A 3xx keeps the batch queued, opens the breaker and is logged once at ERROR with the target host (never the key); fix the base URL and the queue drains without loss. `onError` gets `kind: 'outage'` with the 3xx `status`.
+- **Events are serialized when tracked.** An event JSON cannot represent (a `BigInt`, a cycle, `NaN` or `Infinity` in metadata) is dropped as `invalid` and counted at track time; before, it made the whole batch fail to serialize and every event in it was lost unreported. Later changes to a tracked object are no longer sent.
+- **Exit flush waits for the batch in flight.** On `beforeExit` the process stays alive (up to the shutdown deadline) until the queue and the batch being sent or retried are done. It used to exit during a retry and lose that batch.
+- **Per-event `retryable` failures back off and are capped.** They are re-sent after the normal jittered backoff, at most `maxRetries` times, then treated as an outage; a 2xx that hits the cap no longer resets the breaker, so its cooldown keeps growing instead of flapping.
+- **Breaker cooldown is `max(250 ms, random(0, ceiling))`** even when a small `breakerInitialMs` is configured.
+- **CONNECTION_OPENED has its own frame type (G279, as in go-ws 2.0.0).** It is sent with `wsFrameType: "OPEN"` and metric `websocket_api.connection_opened` (it was `PING` / `websocket_api.message`). Migrate: add `websocket_api.connection_opened` to your catalog if you bill connections opened, and update anything that matched `PING` for opens.
+- **Every connection gets its CONNECTION_CLOSED.** `shutdown()` bills one (`GOING_AWAY`, close code 1001, metadata `closedBy: "sdk_shutdown"`) for each connection still open, and a connection opened during or after `shutdown()` is reported as `closed` and not tracked. A second `shutdown()` returns the first call's promise.
+- **The open-connection map is bounded.** A sweep closes connections with no frame for `connectionIdleTimeoutMs` (new option, default 1 hour; `ABNORMAL_CLOSURE`, close code 1006, `closedBy: "sdk_idle_timeout"`). A negative or non-numeric value throws at construction. New `openConnections` getter and `sweepIdleConnections(now?)`.
+
+### Changed (breaking)
+- **Customer identity (G265).** `wrapServer` throws unless you pass `customerResolver` (`extractCustomerId` still works as a deprecated alias) or `trustCustomerHeader: true`. A connection with no customer — a resolver that returns nothing, or a blank `customerId` to `trackConnection` — is counted as one `invalid` drop instead of being skipped silently.
+- **Delivery (G266, G267, G268, G296).** Events go to a bounded queue (`maxQueueSize`, default 10 000; overflow drops the oldest) with one background sender — recording an event never starts a request. Every request has a total deadline (`AbortSignal.timeout`, `timeoutMs`). Retries use full jitter and honour `Retry-After` in both forms (capped at 60 s). After the retries, or on 401/403, the batch is requeued with its keys behind a breaker instead of being dropped; `retry_exhausted` is no longer produced. New drop reasons `overflow`, `shutdown`, `closed`.
+- **Defaults (G269).** `flushCount` 500 (was 100), `flushIntervalMs` 5000 (was 3000).
+- **https required (G270).** `ingestorUrl` must be `https://` except for localhost; the API key is held only by the transport and never shown by `inspect()` / `JSON.stringify`.
+- **One closing event per connection (G297).** A socket `error` followed by `close` is billed once.
+- `shutdown()` is bounded by `shutdownTimeoutMs`; events still queued then are dropped with reason `shutdown` and reported through `onError`.
+
+### Fixed
+- **`ws.send(data, options, cb)` lost the callback.** The metering wrapper accepted `(data, cb)` only, so the caller's callback in the third position was never called. Every argument is now passed through to `ws`.
+
+### Added
+- `onError` receives a `CoreTransportError` (still an `Error`) for delivery reports: branch on `err.kind` — `outage`, `auth` (401/403, wrong or revoked key), `rejected`, `shutdown`, `closed` — and read `err.events` instead of matching the message. Exported from the package.
+- Shared Node transport core in `src/transport-core/` (copied from `node/`, G271).
+- `flush()`, `queuedCount`, and the options `allowInsecureHttp`, `maxQueueSize`, `maxRetries`, `timeoutMs`, `shutdownTimeoutMs`, `flushOnExit`. `User-Agent: aforo-ws-metering/<version>`.
+
 ## [1.2.1] - 2026-10-01
 
 ### Fixed

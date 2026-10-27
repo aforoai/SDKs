@@ -26,7 +26,7 @@ describe('request-derived toolName', () => {
     drops = [];
     billing = new AforoMcpBilling({
       tenantId: 'tenant_test', productId: 'prod_test', apiKey: 'k', ingestorUrl: 'https://ingest.test.aforo.ai',
-      flushCount: 100, heartbeatEnabled: false, onError: () => {},
+      flushCount: 100, heartbeatEnabled: false, onError: () => {}, trustCustomerHeader: true, customerId: 'cust_test',
       onDrop: (events, reason) => drops.push({ events, reason }),
     });
   });

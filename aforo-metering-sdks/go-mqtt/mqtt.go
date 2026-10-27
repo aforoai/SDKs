@@ -8,17 +8,20 @@
 package mqttmetering
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
 	"net/http"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
+
+	"github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt/v2/internal/ingest"
 )
 
-const sdkVersion = "1.2.2"
+const sdkVersion = "2.0.0"
 
 // Ingestor limits for the MQTT fields (IngestUsageEventRequest @Size).
 const (
@@ -26,64 +29,58 @@ const (
 	maxMqttClientIDLen = 128
 )
 
-// DropReason describes why a buffered batch was permanently dropped.
-// The buffer is unbounded (drained at flush start), so unlike the core SDK
-// there is no overflow reason here.
-type DropReason string
-
-const (
-	// DropRetryExhausted — the batch failed after all transport retries.
-	DropRetryExhausted DropReason = "retry_exhausted"
-	// DropRejected — the ingestor answered a non-retryable 4xx, refused the
-	// event individually in a 2xx partial-failure response, or the batch
-	// could not be serialized.
-	DropRejected DropReason = "rejected"
-	// DropInvalid — the event failed client-side validation (a required field
-	// was blank or a field exceeded the ingestor's limit) and was never
-	// buffered.
-	DropInvalid DropReason = "invalid"
-)
-
+// Config configures Billing. Sending defaults follow the shared transport
+// policy (contract/ingest-contract.json → transportPolicy).
+//
+// The customer id is an argument of every Record* call: pass the Aforo
+// customer you resolved from your own authentication. The SDK never derives
+// it from the MQTT username or client id.
 type Config struct {
 	TenantID          string
 	ProductID         string
-	APIKey            string
-	IngestorURL       string
-	ProductType       string        // default "MQTT_BROKER"; sent as top-level productType on every event
-	EmitDeliverEvents bool          // off by default — DELIVER events are high-volume
-	FlushCount        int           // default 200 — MQTT is highest volume
-	FlushInterval     time.Duration // default 2s
-	HTTPClient        *http.Client
-	OnError           func(error)
-	// OnDrop is an OPT-IN hook invoked with events the SDK is about to lose
-	// permanently (retry exhaustion, a rejection by the ingestor, or
-	// client-side validation — see DropReason). Events keep
-	// their idempotency keys, so re-submitting them after recovery is
-	// dedup-safe. Default: nil (drops are still counted in DroppedCount()
-	// and WARN-logged). Panics in the hook are recovered.
+	APIKey            string // sent only as X-API-Key; never logged or printed
+	IngestorURL       string // must be https (http only for localhost or with AllowInsecureHTTP)
+	ProductType       string // default "MQTT_BROKER"; sent as top-level productType on every event
+	EmitDeliverEvents bool   // off by default — DELIVER events are high-volume
+
+	AllowInsecureHTTP bool          // allow http:// to a host other than localhost/127.0.0.1/::1
+	FlushCount        int           // events per request, default 500 (max 1000)
+	FlushInterval     time.Duration // default 5s
+	MaxQueueSize      int           // default 10000; when full the oldest event is dropped (DropOverflow)
+	MaxRetries        int           // default 3; negative disables retries
+	RetryBase         time.Duration // full-jitter backoff base, default 500ms
+	Timeout           time.Duration // total deadline per request, default 10s
+	ShutdownTimeout   time.Duration // how long Shutdown keeps sending, default 5s
+
+	HTTPClient *http.Client // optional; you keep ownership
+	// OnError is called for sending problems with a *TransportError (use
+	// errors.As and branch on Kind: outage, auth, rejected, shutdown,
+	// closed) and for events refused client-side with a plain error. It runs
+	// on the background sender and may call Flush or Shutdown. Never carries
+	// the API key.
+	OnError func(error)
+	// OnAccepted, when set, receives the body of every 2xx answer (the data
+	// object, envelope removed) and the events of that request. Same
+	// goroutine and panic rules as OnError.
+	OnAccepted func(body json.RawMessage, events []map[string]any)
+	// OnDrop is an OPT-IN hook invoked with events the SDK gives up on (see
+	// DropReason). Events keep their idempotency keys, so re-submitting them
+	// after recovery is dedup-safe. Default: nil (drops are still counted in
+	// DroppedCount() and WARN-logged). Panics in the hook are recovered.
 	OnDrop func(events []map[string]any, reason DropReason)
+
+	hooks ingest.Hooks // tests: clock, sleep and random source
 }
 
 type Billing struct {
-	cfg    Config
-	url    string
-	client *http.Client
-
-	mu       sync.Mutex
-	buffer   []map[string]any
-	stop     chan struct{}
-	stopOnce sync.Once
-	dropped  atomic.Int64
-	// invalidDrops throttles the DropInvalid WARN log.
-	invalidDrops atomic.Int64
+	cfg Config
+	tp  *ingest.Client
 	// truncWarned holds the label names already WARN-logged as truncated.
 	truncWarned sync.Map
-	// retryBackoffBase is the exponential-backoff base (default 1s) —
-	// package-private so tests can skip real sleeps.
-	retryBackoffBase time.Duration
-	wg               sync.WaitGroup
 }
 
+// New validates cfg and starts the background sender. Call Shutdown(ctx)
+// when your client stops.
 func New(cfg Config) (*Billing, error) {
 	if cfg.TenantID == "" || cfg.ProductID == "" || cfg.APIKey == "" || cfg.IngestorURL == "" {
 		return nil, errors.New("mqttmetering: TenantID, ProductID, APIKey, IngestorURL are required")
@@ -92,35 +89,30 @@ func New(cfg Config) (*Billing, error) {
 	if cfg.ProductType == "" {
 		cfg.ProductType = DefaultProductType
 	}
-	if cfg.FlushCount == 0 {
-		cfg.FlushCount = 200
-	}
-	if cfg.FlushInterval == 0 {
-		cfg.FlushInterval = 2 * time.Second
-	}
-	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = &http.Client{Timeout: 10 * time.Second}
-	}
 	if cfg.OnError == nil {
 		cfg.OnError = func(err error) {}
 	}
-	b := &Billing{
-		cfg:              cfg,
-		url:              strings.TrimRight(cfg.IngestorURL, "/") + "/v1/ingest/batch",
-		client:           cfg.HTTPClient,
-		stop:             make(chan struct{}),
-		retryBackoffBase: time.Second,
+	tp, err := newTransport(cfg)
+	if err != nil {
+		return nil, err
 	}
-	b.wg.Add(1)
-	go b.flushLoop()
-	return b, nil
+	return &Billing{cfg: cfg, tp: tp}, nil
+}
+
+// Shutdown sends what is queued until the earlier of ctx's deadline and
+// Config.ShutdownTimeout. Events still queued then are reported as
+// DropShutdown and Shutdown returns an error wrapping ErrShutdownIncomplete.
+// Safe to call more than once.
+func (b *Billing) Shutdown(ctx context.Context) error {
+	return b.shutdownTransport(ctx)
 }
 
 // Per-event recording methods — wrap these around your MQTT client API.
 // Each accepts optional EventOptions (productType override, explicit
 // ExecutionStatus) and has a *WithOptions form taking a single EventOptions.
 //
-// A blank customerID is not metered. An event the ingestor would refuse (blank
+// A blank customerID is not billed: the event is dropped as DropInvalid and
+// counted. An event the ingestor would refuse (blank
 // topic on a topic event, a field over its limit) is not buffered: it is
 // counted in DroppedCount(), WARN-logged and handed to OnDrop with DropInvalid.
 // topic and clientID are the exception: they originate from the MQTT client,
@@ -180,11 +172,11 @@ func (b *Billing) RecordDisconnectWithOptions(customerID, clientID string, opts 
 
 func (b *Billing) eventOf(customerID, clientID, eventType, topic string, qos int, retained bool, bytesAmt int64, opts []EventOptions) map[string]any {
 	customerID = strings.TrimSpace(customerID)
-	if customerID == "" {
-		return nil
-	}
 	invalid := ""
-	if strings.TrimSpace(topic) == "" {
+	if customerID == "" {
+		invalid = "customerId is required"
+	}
+	if invalid == "" && strings.TrimSpace(topic) == "" {
 		switch eventType {
 		case "CONNECT", "DISCONNECT":
 			// mqttTopic is required for MQTT_BROKER events; session events have
@@ -246,40 +238,6 @@ func (b *Billing) eventOf(customerID, clientID, eventType, topic string, qos int
 		return nil
 	}
 	return e
-}
-
-func (b *Billing) push(event map[string]any) {
-	if event == nil {
-		return
-	}
-	b.mu.Lock()
-	b.buffer = append(b.buffer, event)
-	overflow := len(b.buffer) >= b.cfg.FlushCount
-	b.mu.Unlock()
-	if overflow {
-		go b.flush()
-	}
-}
-
-func (b *Billing) flushLoop() {
-	defer b.wg.Done()
-	ticker := time.NewTicker(b.cfg.FlushInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			b.flush()
-		case <-b.stop:
-			b.flush()
-			return
-		}
-	}
-}
-
-func (b *Billing) Shutdown() error {
-	b.stopOnce.Do(func() { close(b.stop) })
-	b.wg.Wait()
-	return nil
 }
 
 // idempotencyKeyFor returns

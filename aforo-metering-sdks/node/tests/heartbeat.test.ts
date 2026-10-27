@@ -135,4 +135,15 @@ describe('AforoClient — session heartbeats', () => {
     expect(jest.getTimerCount()).toBe(0);
     expect(client.isShutdown).toBe(true);
   });
+
+  it('heartbeats never follow a redirect (the API key must not reach another host)', async () => {
+    mockFetch.mockResolvedValue({ ok: false, status: 307, headers: new Map([['location', 'http://elsewhere.example/']]) });
+    const client = newClient();
+    client.startSession('sess_hb_redirect');
+    await client.endSession();
+    const heartbeatCalls = mockFetch.mock.calls.filter((c) => JSON.parse(c[1].body).events[0].metricName === 'system.session.heartbeat');
+    expect(heartbeatCalls.length).toBeGreaterThan(0);
+    for (const c of heartbeatCalls) expect(c[1].redirect).toBe('manual');
+    await client.shutdown();
+  });
 });

@@ -12,7 +12,7 @@ public class AforoMeteringProperties {
      * Default {@code API}; e.g. {@code AGENTIC_API}.
      */
     private String productType = "API";
-    private int flushCount = 50;
+    private int flushCount = 500;
     private long flushIntervalMs = 5_000;
 
     /**
@@ -24,13 +24,31 @@ public class AforoMeteringProperties {
     private String metricName = AforoServletFilter.DEFAULT_METRIC_NAME;
 
     /**
-     * Header carrying the Aforo customer id. For anything else, declare a
-     * {@link AforoServletFilter.CustomerIdResolver} bean.
+     * Header carrying the Aforo customer id, read only with {@code trust-customer-header=true}.
+     * Prefer an {@link AforoServletFilter.CustomerIdResolver} bean.
      */
     private String customerIdHeader = AforoServletFilter.DEFAULT_CUSTOMER_ID_HEADER;
 
     /** Use the authenticated principal's name as the customer id. Off by default. */
     private boolean usePrincipalAsCustomerId = false;
+
+    /**
+     * Read the customer id from {@link #customerIdHeader}. Off by default: callers of your
+     * API control that header. Turn it on only when a gateway in front of the app sets it.
+     */
+    private boolean trustCustomerHeader = false;
+
+    /** Queue capacity; overflow evicts the oldest event. */
+    private int maxQueueSize = 10_000;
+
+    /** Total deadline of one ingest request. */
+    private long timeoutMs = 10_000;
+
+    /** How long Spring's stop phase keeps sending queued events. */
+    private long shutdownTimeoutMs = 5_000;
+
+    /** Allow plain http:// on a host other than localhost. Off by default. */
+    private boolean allowInsecureHttp = false;
 
     public String getApiKey() { return apiKey; }
     public void setApiKey(String apiKey) { this.apiKey = apiKey; }
@@ -56,5 +74,27 @@ public class AforoMeteringProperties {
     public boolean isUsePrincipalAsCustomerId() { return usePrincipalAsCustomerId; }
     public void setUsePrincipalAsCustomerId(boolean usePrincipalAsCustomerId) {
         this.usePrincipalAsCustomerId = usePrincipalAsCustomerId;
+    }
+
+    public boolean isTrustCustomerHeader() { return trustCustomerHeader; }
+    public void setTrustCustomerHeader(boolean trustCustomerHeader) { this.trustCustomerHeader = trustCustomerHeader; }
+
+    public int getMaxQueueSize() { return maxQueueSize; }
+    public void setMaxQueueSize(int maxQueueSize) { this.maxQueueSize = maxQueueSize; }
+
+    public long getTimeoutMs() { return timeoutMs; }
+    public void setTimeoutMs(long timeoutMs) { this.timeoutMs = timeoutMs; }
+
+    public long getShutdownTimeoutMs() { return shutdownTimeoutMs; }
+    public void setShutdownTimeoutMs(long shutdownTimeoutMs) { this.shutdownTimeoutMs = shutdownTimeoutMs; }
+
+    public boolean isAllowInsecureHttp() { return allowInsecureHttp; }
+    public void setAllowInsecureHttp(boolean allowInsecureHttp) { this.allowInsecureHttp = allowInsecureHttp; }
+
+    /** The API key is never included. */
+    @Override
+    public String toString() {
+        return "AforoMeteringProperties{baseUrl=" + baseUrl + ", apiKey=[redacted], productType=" + productType
+                + ", metricName=" + metricName + "}";
     }
 }

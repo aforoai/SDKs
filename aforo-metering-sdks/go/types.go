@@ -1,90 +1,123 @@
 package metering
 
 import (
+	"encoding/json"
+	"fmt"
 	"log"
+	"net/http"
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/aforoai/SDKs/aforo-metering-sdks/go/v2/internal/ingest"
 )
 
-// DropReason describes why a buffered event was permanently dropped by the SDK.
+// DropReason describes why the SDK gave up on an event.
 type DropReason string
 
 const (
-	// DropOverflow — the ring buffer was full; the OLDEST event was evicted.
+	// DropOverflow — the queue was full; the OLDEST event was evicted.
 	DropOverflow DropReason = "overflow"
-	// DropRetryExhausted — a batch failed after all transport retries (ingest outage).
-	DropRetryExhausted DropReason = "retry_exhausted"
-	// DropRejected — the ingestor rejected the batch with a non-retryable 4xx
-	// (or the batch could not be serialized).
+	// DropRejected — the ingestor refused the event (a non-retryable 4xx, a
+	// single event still too large after 413 splitting, or errors[] with
+	// retryable=false in a 2xx answer).
 	DropRejected DropReason = "rejected"
 	// DropInvalid — the event failed client-side validation (blank required
-	// field, non-positive quantity, field over the ingestor's limit) and was
-	// never buffered. Track also returns ErrInvalidEvent for it.
+	// field, non-positive quantity, field over the ingestor's limit, or no
+	// customer resolved by the middleware) and was never queued. Track also
+	// returns ErrInvalidEvent for it.
 	DropInvalid DropReason = "invalid"
+	// DropShutdown — the event was still queued when Close's deadline passed.
+	DropShutdown DropReason = "shutdown"
+	// DropClosed — Track was called after Close. Track also returns
+	// ErrClientClosed.
+	DropClosed DropReason = "closed"
+	// DropRetryExhausted is kept for API compatibility. Since v2 a batch that
+	// keeps failing goes back to the queue (the ingestor deduplicates on the
+	// idempotency key) instead of being dropped, so this reason is not
+	// reported by the transport.
+	DropRetryExhausted DropReason = "retry_exhausted"
 )
 
 const (
 	// DefaultProductType is the product type stamped on events when neither
 	// Options.ProductType nor TrackEvent.ProductType is set.
 	DefaultProductType = "API"
+	// DefaultBaseURL is the ingestor used when Options.BaseURL is empty.
+	DefaultBaseURL = "https://api.aforo.ai"
 	// maxBatchSize is the ingestor's per-request event limit.
 	maxBatchSize = 1000
 )
 
 // Options configures the AforoClient.
+//
+// Defaults follow contract/ingest-contract.json → transportPolicy.
 type Options struct {
-	APIKey          string
-	BaseURL         string        // Default: "https://api.aforo.ai"
-	ProductType     string        // Default: "API". Sent as top-level `productType` on every event.
-	FlushCount      int           // Default: 50 (clamped to 1000, the ingestor batch limit)
-	FlushInterval   time.Duration // Default: 5s
-	MaxQueueSize    int           // Default: 10000
-	MaxRetries      int           // Default: 3
-	RetryBase       time.Duration // Default: 1s
-	Timeout         time.Duration // Default: 10s
-	ShutdownTimeout time.Duration // Default: 5s
+	APIKey      string // sent only as the X-API-Key header; never logged or printed
+	BaseURL     string // Default: "https://api.aforo.ai". Must be https (see AllowInsecureHTTP)
+	ProductType string // Default: "API". Sent as top-level `productType` on every event.
 
-	// OnDrop is an OPT-IN hook invoked with events the SDK is about to lose
-	// permanently (buffer overflow, retry exhaustion, non-retryable
-	// rejection, or client-side validation), so the app can persist / alert / replay them. Dropped
+	// AllowInsecureHTTP permits an http:// BaseURL on a host other than
+	// localhost, 127.0.0.1 or ::1. Leave it off in production.
+	AllowInsecureHTTP bool
+
+	FlushCount      int           // Events per request. Default: 500 (clamped to 1000, the ingestor batch limit)
+	FlushInterval   time.Duration // Default: 5s
+	MaxQueueSize    int           // Default: 10000. When full the oldest event is dropped (DropOverflow)
+	MaxRetries      int           // Default: 3; a negative value disables retries
+	RetryBase       time.Duration // Full-jitter backoff base. Default: 500ms
+	Timeout         time.Duration // Total deadline per request. Default: 10s
+	ShutdownTimeout time.Duration // How long Close keeps sending. Default: 5s
+
+	// HTTPClient, when set, is used for every request (you keep ownership).
+	// When nil the SDK builds one pooled client and closes it on Close.
+	HTTPClient *http.Client
+
+	// OnDrop is an OPT-IN hook invoked with events the SDK gives up on (see
+	// DropReason), so the app can persist / alert / replay them. Dropped
 	// events keep their idempotency keys — re-submitting them via Track()
 	// after recovery is dedup-safe. Default: nil (drops are still counted in
 	// DroppedCount() and WARN-logged). Panics in the hook are recovered.
 	OnDrop func(events []TrackEvent, reason DropReason)
+
+	// OnError, when set, receives a *TransportError for every sending
+	// problem: an outage or auth failure (events stay queued), a rejection, a
+	// shutdown loss, or Track after Close. Branch on Kind, never on the
+	// message. It runs on the background sender and may call Flush or Close;
+	// panics are recovered. It never carries the API key.
+	OnError func(err *TransportError)
+
+	// OnAccepted, when set, receives the body of every 2xx answer (the data
+	// object, envelope removed — for example accepted, duplicates,
+	// killedSessionIds) and the events of that request. Same rules as OnError.
+	OnAccepted func(body json.RawMessage, events []TrackEvent)
+
+	// hooks replace the clock, sleep and random source in tests.
+	hooks ingest.Hooks
 }
+
+// String never prints the API key.
+func (o Options) String() string {
+	return fmt.Sprintf("metering.Options{APIKey:%s, BaseURL:%q, ProductType:%q, FlushCount:%d, MaxQueueSize:%d}",
+		ingest.RedactKey(o.APIKey), o.BaseURL, o.ProductType, o.FlushCount, o.MaxQueueSize)
+}
+
+// GoString never prints the API key.
+func (o Options) GoString() string { return o.String() }
 
 func (o *Options) defaults() {
 	if o.BaseURL == "" {
-		o.BaseURL = "https://api.aforo.ai"
+		o.BaseURL = DefaultBaseURL
 	}
 	o.ProductType = normalizeProductType(o.ProductType)
 	if o.ProductType == "" {
 		o.ProductType = DefaultProductType
 	}
 	if o.FlushCount <= 0 {
-		o.FlushCount = 50
+		o.FlushCount = ingest.DefaultFlushCount
 	}
 	if o.FlushCount > maxBatchSize {
 		o.FlushCount = maxBatchSize
-	}
-	if o.FlushInterval <= 0 {
-		o.FlushInterval = 5 * time.Second
-	}
-	if o.MaxQueueSize <= 0 {
-		o.MaxQueueSize = 10_000
-	}
-	if o.MaxRetries <= 0 {
-		o.MaxRetries = 3
-	}
-	if o.RetryBase <= 0 {
-		o.RetryBase = 1 * time.Second
-	}
-	if o.Timeout <= 0 {
-		o.Timeout = 10 * time.Second
-	}
-	if o.ShutdownTimeout <= 0 {
-		o.ShutdownTimeout = 5 * time.Second
 	}
 }
 
@@ -138,32 +171,11 @@ type resolvedEvent struct {
 	ResponseTimeMs  int64  `json:"responseTimeMs,omitempty"`
 }
 
-// batchRequest is the JSON body sent to POST /v1/ingest/batch.
-type batchRequest struct {
-	Events []resolvedEvent `json:"events"`
-}
-
-// batchResponse is the 202 body returned by POST /v1/ingest/batch.
-type batchResponse struct {
-	Accepted   int `json:"accepted"`
-	Duplicates int `json:"duplicates"`
-	Failed     int `json:"failed"`
-	Errors     []struct {
-		Index   *int   `json:"index"`
-		Message string `json:"message"`
-	} `json:"errors"`
-}
-
-// FlushResult contains the result of a flush operation.
+// FlushResult reports what a Flush did.
 type FlushResult struct {
-	Sent   int
-	Failed int
-	// Reason describes why the batch failed, when Failed > 0. Empty on success.
-	Reason DropReason
-
-	// failedIndexes are the batch positions the ingestor refused in a 2xx
-	// partial-failure response (errors[].index), when it identified them.
-	failedIndexes []int
+	Sent     int // accepted (or reported as duplicate) by the ingestor
+	Rejected int // refused by the ingestor and reported through OnDrop
+	Pending  int // still queued (for example during an ingest outage)
 }
 
 // asTrackEvent converts the internal representation back to the public shape
@@ -230,4 +242,43 @@ func truncateForLog(value string) string {
 		return value
 	}
 	return value[:limit] + "..."
+}
+
+// ErrorKind classifies a TransportError.
+type ErrorKind = ingest.ErrorKind
+
+// Kinds a TransportError can have.
+const (
+	KindOutage   = ingest.KindOutage   // unreachable, 5xx/408/429 after the retries, or a redirect; events kept queued
+	KindAuth     = ingest.KindAuth     // 401/403: the API key is wrong or revoked; events kept queued
+	KindRejected = ingest.KindRejected // the ingestor refused events; they went to OnDrop as rejected
+	KindShutdown = ingest.KindShutdown // still queued at Close's deadline; reported as shutdown
+	KindClosed   = ingest.KindClosed   // tracked after Close; reported as closed
+)
+
+// TransportError is what Options.OnError receives. Events are the events
+// concerned (requeued for outage/auth, dropped for the other kinds). Status
+// is the HTTP status that caused it, 0 for a network error. errors.Is
+// matches ErrIngestUnavailable (outage, auth), ErrShutdownIncomplete
+// (shutdown) and ErrClientClosed (closed).
+type TransportError struct {
+	Kind    ErrorKind
+	Status  int
+	Message string
+	Events  []TrackEvent
+}
+
+func (e *TransportError) Error() string { return e.Message }
+
+// Unwrap exposes the sentinel error for the kind.
+func (e *TransportError) Unwrap() error {
+	switch e.Kind {
+	case KindOutage, KindAuth:
+		return ErrIngestUnavailable
+	case KindShutdown:
+		return ErrShutdownIncomplete
+	case KindClosed:
+		return ErrClientClosed
+	}
+	return nil
 }

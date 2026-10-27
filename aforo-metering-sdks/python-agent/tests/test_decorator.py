@@ -24,9 +24,9 @@ def _client(**overrides: Any) -> AforoAgentClient:
         tenant_id="tenant_test",
         product_id="prod_ai_001",
         api_key="sk_agent_abc",
-        ingestor_url="https://ingest.test.aforo.ai",
+        ingestor_url="https://ingest.example.test",
         flush_interval_sec=3600.0,
-        **overrides,
+        **{"default_customer_id": "cust_default", **overrides},
     )
 
 
@@ -44,7 +44,7 @@ async def test_decorator_records_on_success() -> None:
 
     client = _client(post_fn=post)
 
-    @wrap_capability_handler(client, capability_name="summarize_email")
+    @wrap_capability_handler(client, trust_customer_header=True, capability_name="summarize_email")
     async def summarize(text: str, *, agent_id: str, session_id: str, customer_id: str) -> str:
         return f"summary: {text}"
 
@@ -80,7 +80,7 @@ async def test_decorator_records_error_and_reraises() -> None:
 
     client = _client(post_fn=post)
 
-    @wrap_capability_handler(client, capability_name="broken")
+    @wrap_capability_handler(client, trust_customer_header=True, capability_name="broken")
     async def failing(*, agent_id: str, session_id: str) -> None:
         raise RuntimeError("boom")
 
@@ -105,7 +105,7 @@ async def test_decorator_measures_duration() -> None:
 
     client = _client(post_fn=post)
 
-    @wrap_capability_handler(client, capability_name="slow_thing")
+    @wrap_capability_handler(client, trust_customer_header=True, capability_name="slow_thing")
     async def slow(*, agent_id: str, session_id: str) -> None:
         await asyncio.sleep(0.02)
 
@@ -130,7 +130,7 @@ async def test_decorator_capability_name_kwarg_fallback() -> None:
 
     client = _client(post_fn=post)
 
-    @wrap_capability_handler(client, capability_name=None)
+    @wrap_capability_handler(client, trust_customer_header=True, capability_name=None)
     async def generic(**kwargs: Any) -> None:
         return None
 
@@ -158,7 +158,7 @@ async def test_decorator_capability_name_handler_name_fallback() -> None:
 
     client = _client(post_fn=post)
 
-    @wrap_capability_handler(client)
+    @wrap_capability_handler(client, trust_customer_header=True)
     async def translate_document(**kwargs: Any) -> None:
         return None
 
@@ -180,7 +180,7 @@ def test_decorator_rejects_sync_handlers() -> None:
         return None
 
     with pytest.raises(TypeError, match="async"):
-        wrap_capability_handler(client, capability_name="x")(sync_handler)  # type: ignore[arg-type]
+        wrap_capability_handler(client, trust_customer_header=True, capability_name="x")(sync_handler)  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
@@ -189,7 +189,7 @@ async def test_decorator_preserves_functools_wraps() -> None:
     frameworks (FastAPI, LangChain) that introspect the wrapped fn."""
     client = _client()
 
-    @wrap_capability_handler(client, capability_name="x")
+    @wrap_capability_handler(client, trust_customer_header=True, capability_name="x")
     async def documented(*, agent_id: str) -> None:
         """This is the docstring."""
 
@@ -202,22 +202,14 @@ async def test_decorator_absorbs_metering_failure() -> None:
     """If record_capability raises for any reason, the handler's return
     value must still surface — metering is best-effort."""
 
-    class ExplodingBuffer:
-        max_events = 50
-
-        def add(self, ev: Dict[str, Any]) -> bool:
-            raise RuntimeError("buffer bug")
-
-        def drain(self) -> List[Dict[str, Any]]:
-            return []
-
-        def __len__(self) -> int:
-            return 0
-
     client = _client()
-    client._buffer = ExplodingBuffer()  # type: ignore[assignment]
 
-    @wrap_capability_handler(client, capability_name="x")
+    def exploding_enqueue(event: Dict[str, Any]) -> bool:
+        raise RuntimeError("queue bug")
+
+    client._core.enqueue = exploding_enqueue  # type: ignore[method-assign]
+
+    @wrap_capability_handler(client, trust_customer_header=True, capability_name="x")
     async def normal(*, agent_id: str) -> str:
         return "returned normally"
 
@@ -236,7 +228,7 @@ async def _status_for(raise_exc: BaseException) -> str:
 
     client = _client(post_fn=post)
 
-    @wrap_capability_handler(client, capability_name="c")
+    @wrap_capability_handler(client, trust_customer_header=True, capability_name="c")
     async def handler(*, agent_id: str) -> None:
         raise raise_exc
 

@@ -88,7 +88,7 @@ func TestRecordWithOptionsSendsNormalizedStatus(t *testing.T) {
 		if ev := rec.events()[0]; ev["customerId"] != "cust_001" || ev["gqlOperationType"] == nil {
 			t.Errorf("input %q: rest of event not sent intact: %v", in, ev)
 		}
-		_ = b.Shutdown()
+		_ = b.Shutdown(bg)
 		srv.Close()
 	}
 }

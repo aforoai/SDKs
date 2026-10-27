@@ -20,11 +20,18 @@ ASTRAL = "\U0001F600"
 def sent(monkeypatch):
     batches: list = []
 
-    def post(url, body, headers):
-        batches.append(body["events"])
-        return 202, None, b""
+    import json as _json
 
-    monkeypatch.setattr(mod, "_post_json", post)
+    import httpx as _httpx
+
+    factory = mod.TransportCore
+
+    def handle(request):
+        batches.append(_json.loads(request.content)["events"])
+        return _httpx.Response(202, json={"data": {"failed": 0}})
+
+    monkeypatch.setattr(mod, "TransportCore",
+                        lambda *a, **k: factory(*a, **{**k, "http_transport": _httpx.MockTransport(handle)}))
     return batches
 
 

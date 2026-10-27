@@ -14,9 +14,7 @@ events (one per received message) are off unless emit_deliver_events=True.
 
 from __future__ import annotations
 
-import atexit
 import hashlib
-import json
 import logging
 import threading
 import time
@@ -25,13 +23,16 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-try:
-    import httpx  # type: ignore
-    HAS_HTTPX = True
-except ImportError:  # pragma: no cover
-    HAS_HTTPX = False
+from ._transport import (
+    TransportCore,
+    clean_customer_id,
+    require_customer_source,
+    truncate_utf16,
+    utf16_length,
+)
+from ._transport import policy as _policy
 
-__version__ = "1.2.2"
+__version__ = "2.0.0"
 logger = logging.getLogger("aforo_mqtt_metering")
 
 # POST /v1/ingest/batch takes 1..1000 events per request.
@@ -52,21 +53,8 @@ MAX_MQTT_CLIENT_ID_LEN = 128
 _truncation_lock = threading.Lock()
 
 
-def _utf16_length(text: str) -> int:
-    return sum(2 if ord(ch) > 0xFFFF else 1 for ch in text)
-
-
-def _truncate_utf16(text: str, limit: int) -> str:
-    """Longest prefix of ``text`` within ``limit`` UTF-16 code units. Cuts
-    between characters, so a surrogate pair is never split."""
-    if len(text) * 2 <= limit:
-        return text
-    units = 0
-    for index, ch in enumerate(text):
-        units += 2 if ord(ch) > 0xFFFF else 1
-        if units > limit:
-            return text[:index]
-    return text
+_utf16_length = utf16_length
+_truncate_utf16 = truncate_utf16
 
 
 def _truncate_label(field_name: str, value: Any, limit: int, warned: set) -> Any:
@@ -115,17 +103,6 @@ def _fit_idempotency_key(parts: List[Any], request_derived: Tuple[int, ...]) -> 
     return f"{parts[0]}:{_sha256_hex(full)}"
 
 
-def _unwrap_envelope(payload):
-    """The ingestor wraps every 2xx JSON body in ``{success, data, meta}``.
-
-    Returns the inner ``data`` object when present, else the payload unchanged
-    (bare shape).
-    """
-    if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
-        return payload["data"]
-    return payload
-
-
 def _clip(value: Any) -> str:
     text = repr(value)
     return text if len(text) <= 80 else text[:77] + "..."
@@ -135,97 +112,16 @@ def _customer_id_problem(customer_id: Any) -> Optional[str]:
     """Why the ingestor would refuse this customerId, or None when it is usable."""
     if not isinstance(customer_id, str) or not customer_id.strip():
         return f"customerId is required (got {_clip(customer_id)})"
-    if len(customer_id) > MAX_CUSTOMER_ID_LEN:
+    if utf16_length(customer_id) > MAX_CUSTOMER_ID_LEN:
         return f"customerId exceeds {MAX_CUSTOMER_ID_LEN} chars (got {_clip(customer_id)})"
     return None
 
 
-def _failed_events(raw: bytes, batch_len: int) -> Tuple[List[int], int]:
-    """(indexes of refused events, refused count) from a batch response."""
-    try:
-        data = _unwrap_envelope(json.loads(raw.decode("utf-8")) if raw else None)
-    except Exception:
-        return [], 0
-    if not isinstance(data, dict):
-        return [], 0
-    indexes: List[int] = []
-    errors = data.get("errors") or []
-    for err in errors if isinstance(errors, list) else []:
-        idx = err.get("index") if isinstance(err, dict) else None
-        if isinstance(idx, int) and not isinstance(idx, bool) and 0 <= idx < batch_len and idx not in indexes:
-            indexes.append(idx)
-    failed = data.get("failed")
-    if not isinstance(failed, int) or isinstance(failed, bool) or failed < 0:
-        failed = len(errors) if isinstance(errors, list) else 0
-    return indexes, min(max(failed, len(indexes)), batch_len)
-
-
 DEFAULT_PRODUCT_TYPE = "MQTT_BROKER"
-MAX_RETRY_AFTER_SEC = 60.0
-
-
 def _normalize_product_type(product_type: Any, default: str) -> str:
     """Trim + uppercase. Unknown values pass through; the ingestor is the authority."""
     value = str(product_type).strip().upper() if product_type is not None else ""
     return value or default
-
-
-def _post_json(url: str, body: Dict[str, Any], headers: Dict[str, str]) -> Tuple[int, Optional[str], bytes]:
-    """POST JSON; returns (status, Retry-After header, response body). Raises on network errors."""
-    if HAS_HTTPX:
-        with httpx.Client(timeout=10.0) as c:
-            r = c.post(url, json=body, headers=headers)
-            return r.status_code, r.headers.get("Retry-After"), r.content
-    import urllib.error
-    import urllib.request
-    req = urllib.request.Request(
-        url, data=json.dumps(body).encode("utf-8"),
-        headers=headers, method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10.0) as resp:
-            return resp.status, _header(resp, "Retry-After"), _read(resp)
-    except urllib.error.HTTPError as e:
-        return e.code, _header(e, "Retry-After"), _read(e)
-
-
-def _header(resp: Any, name: str) -> Optional[str]:
-    try:
-        value = resp.headers.get(name)
-        return value if isinstance(value, str) else None
-    except Exception:
-        return None
-
-
-def _read(resp: Any) -> bytes:
-    try:
-        data = resp.read()
-        return data if isinstance(data, (bytes, bytearray)) else b""
-    except Exception:
-        return b""
-
-
-def _retry_after_seconds(value: str, default: float) -> float:
-    try:
-        return min(max(0.0, float(value)), MAX_RETRY_AFTER_SEC)
-    except (TypeError, ValueError):
-        return default
-
-
-def _error_messages(raw: bytes) -> List[str]:
-    """Pull errors[].message out of a batch response ({accepted, failed, errors:[{index, message}]})."""
-    try:
-        data = _unwrap_envelope(json.loads(raw.decode("utf-8")) if raw else None)
-    except Exception:
-        return []
-    if not isinstance(data, dict):
-        return []
-    out: List[str] = []
-    for err in data.get("errors") or []:
-        if isinstance(err, dict) and err.get("message"):
-            prefix = f"[{err['index']}] " if err.get("index") is not None else ""
-            out.append(prefix + str(err["message"]))
-    return out
 
 
 MQTT_EVENT_TYPES = ("PUBLISH", "DELIVER", "SUBSCRIBE", "UNSUBSCRIBE", "CONNECT", "DISCONNECT")
@@ -287,6 +183,19 @@ def normalize_execution_status(value: Optional[str]) -> Optional[str]:
 
 
 class AforoMqttBilling:
+    """MQTT metering client: one bounded queue and one sender thread.
+
+    ``push()`` only queues. One background thread sends batches every
+    ``flush_interval_sec`` seconds or as soon as ``flush_count`` events are
+    queued. During an ingest outage batches stay queued with the same
+    idempotency keys and are retried after a pause. An event is lost only on
+    queue overflow, a rejection by the ingestor, invalid input, the shutdown
+    deadline, or ``push()`` after ``shutdown()`` -- each counted in
+    ``dropped_count`` and passed to ``on_drop``. ``ingestor_url`` must be
+    ``https://`` (plain ``http://`` only for localhost, or with
+    ``allow_insecure_http=True``). ``shutdown()`` also runs at interpreter exit.
+    """
+
     def __init__(
         self,
         tenant_id: str,
@@ -294,57 +203,50 @@ class AforoMqttBilling:
         api_key: str,
         ingestor_url: str,
         flush_interval_sec: float = 2.0,
-        flush_count: int = 200,
+        flush_count: int = _policy.DEFAULT_FLUSH_COUNT,
         emit_deliver_events: bool = False,
         on_error: Optional[Callable[[Exception], None]] = None,
         on_drop: Optional[Callable[[List[Dict[str, Any]], str], None]] = None,
         product_type: str = DEFAULT_PRODUCT_TYPE,
+        *,
+        max_queue_size: int = _policy.DEFAULT_QUEUE_CAPACITY,
+        timeout_sec: float = _policy.REQUEST_TIMEOUT_S,
+        shutdown_timeout_sec: float = _policy.SHUTDOWN_TIMEOUT_S,
+        allow_insecure_http: bool = False,
+        http_transport: Any = None,
+        transport_options: Optional[Dict[str, Any]] = None,
     ):
         if not all([tenant_id, product_id, api_key, ingestor_url]):
             raise ValueError("tenant_id, product_id, api_key and ingestor_url are required")
 
         self.tenant_id = tenant_id
         self.product_id = product_id
-        self.api_key = api_key
-        self.ingestor_url = ingestor_url.rstrip("/")
-        self.flush_interval_sec = flush_interval_sec
-        self.flush_count = flush_count
         self.emit_deliver_events = emit_deliver_events
         # Top-level productType on every event; push(product_type=...) overrides per call.
         self.product_type = _normalize_product_type(product_type, DEFAULT_PRODUCT_TYPE)
-        self.on_error = on_error or (lambda e: logger.error(f"[aforo-mqtt] {e}"))
-        # Opt-in hook receiving permanently dropped events (with their
-        # idempotency keys — dedup-safe replay). Reasons: 'retry_exhausted'
-        # (network/5xx/408/429 after 3 attempts) | 'rejected' (terminal 4xx,
-        # or events the ingestor refused inside a 2xx partial response) |
-        # 'invalid' (failed a client-side check; never buffered or sent).
-        # Exceptions raised by the hook are swallowed.
-        self.on_drop = on_drop
-        self._dropped = 0
-        self._drop_lock = threading.Lock()
-        self._invalid_warned: set = set()
         self._truncation_warned: set = set()
-
-        self._buffer: List[Dict[str, Any]] = []
-        self._buffer_lock = threading.Lock()
-        self._stop_event = threading.Event()
-        self._flush_thread = threading.Thread(target=self._flush_loop, daemon=True, name="aforo-mqtt-flush")
-        self._flush_thread.start()
-
-        # Safety net for normal interpreter exit. The flush thread is a
-        # daemon (so it won't block process exit), which historically meant
-        # any in-flight events at exit were dropped unless the user
-        # explicitly called shutdown(). atexit covers the common case
-        # where the user forgets — does NOT cover SIGKILL or os._exit().
-        atexit.register(self._safe_shutdown)
-
-    def _safe_shutdown(self) -> None:
-        """atexit-safe wrapper around shutdown()."""
-        try:
-            if not self._stop_event.is_set():
-                self.shutdown()
-        except Exception:
-            pass
+        self.on_error = on_error or (lambda e: logger.debug("[aforo-mqtt] %s", e))
+        self._core = TransportCore(
+            api_key=api_key,
+            base_url=ingestor_url,
+            user_agent=f"aforo-mqtt-metering-python/{__version__}",
+            name="aforo-mqtt",
+            logger=logger,
+            flush_count=flush_count,
+            flush_interval=flush_interval_sec,
+            max_queue_size=max_queue_size,
+            timeout=timeout_sec,
+            shutdown_timeout=shutdown_timeout_sec,
+            allow_insecure_http=allow_insecure_http,
+            on_drop=on_drop,
+            on_error=self._safe_on_error,
+            extra_headers={"X-Tenant-Id": tenant_id},
+            http_transport=http_transport,
+            **(transport_options or {}),
+        )
+        self.ingestor_url = self._core.url[: -len(_policy.INGEST_PATH)]
+        self.flush_count = self._core.flush_count
+        self.flush_interval_sec = flush_interval_sec
 
     def push(
         self,
@@ -434,149 +336,121 @@ class AforoMqttBilling:
             executionStatus=normalize_execution_status(execution_status),
         )
         if invalid is not None:
-            self._record_invalid(ev.to_dict(), invalid)
+            self._core.report_drop([ev.to_dict()], "invalid", detail=invalid)
             return
-        with self._buffer_lock:
-            self._buffer.append(ev.to_dict())
-            if len(self._buffer) >= self.flush_count:
-                threading.Thread(target=self._flush, daemon=True).start()
+        self._core.enqueue(ev.to_dict())
 
-    def _flush_loop(self) -> None:
-        while not self._stop_event.wait(self.flush_interval_sec):
-            self._flush()
-
-    def _flush(self) -> None:
-        with self._buffer_lock:
-            if not self._buffer:
-                return
-            pending = self._buffer
-            self._buffer = []
-
-        # /v1/ingest/batch accepts at most MAX_BATCH_EVENTS per request.
-        for i in range(0, len(pending), MAX_BATCH_EVENTS):
-            self._send_batch(pending[i:i + MAX_BATCH_EVENTS])
-
-    def _send_batch(self, batch: List[Dict[str, Any]]) -> None:
-        # Events (and their idempotencyKeys) are built once in record/push,
-        # so every retry below re-sends identical keys.
-        body = {"events": batch}
-        headers = {
-            "Content-Type": "application/json",
-            "X-API-Key": self.api_key,
-            "X-Tenant-Id": self.tenant_id,
-        }
-        url = f"{self.ingestor_url}/v1/ingest/batch"
-
-        for attempt in range(3):
-            delay = float(2 ** attempt)
-            try:
-                status, retry_after, raw = _post_json(url, body, headers)
-            except Exception as e:
-                if attempt == 2:
-                    self._record_drop(batch, "retry_exhausted")
-                    self.on_error(e)
-                    return
-                time.sleep(delay)
-                continue
-            if 200 <= status < 300:
-                # 202 can still carry per-event failures ({failed, errors:[{index, message}]}).
-                self._report_partial_failures(batch, raw)
-                return
-            if 400 <= status < 500 and status not in (408, 429):
-                # 400 invalid batch / 401 bad key / 422 unknown metric: retrying cannot help.
-                messages = _error_messages(raw)
-                self._record_drop(batch, "rejected")
-                self.on_error(RuntimeError(
-                    f"MQTT metering flush rejected with HTTP {status}, not retrying "
-                    f"(dropped {len(batch)} events)" + (": " + "; ".join(messages[:5]) if messages else "")
-                ))
-                return
-            if status == 429 and retry_after:
-                delay = _retry_after_seconds(retry_after, delay)
-            if attempt < 2:
-                time.sleep(delay)
-        self._record_drop(batch, "retry_exhausted")
-        self.on_error(RuntimeError(f"MQTT metering flush failed after 3 attempts (dropped {len(batch)} events)"))
-
-    def _report_partial_failures(self, batch: List[Dict[str, Any]], raw: bytes) -> None:
-        """A 2xx batch response can refuse individual events. Those events are
-        dropped with reason 'rejected'; the rest of the batch was accepted."""
-        messages = _error_messages(raw)
-        indexes, failed = _failed_events(raw, len(batch))
-        if not messages and failed <= 0:
-            return
-        rejected = [batch[i] for i in indexes]
-        unidentified = max(failed - len(rejected), 0)
-        if rejected:
-            self._record_drop(rejected, "rejected")
-        if unidentified:
-            # The response gave a count but no usable indexes: count the loss
-            # without guessing which events it was (on_drop is not called).
-            with self._drop_lock:
-                self._dropped += unidentified
-                total = self._dropped
-            logger.warning(
-                "[aforo-mqtt] Ingestor rejected %d event(s) it did not identify (%d total dropped).",
-                unidentified, total,
-            )
-        self.on_error(RuntimeError(
-            "MQTT metering: ingestor rejected events: " + "; ".join(messages[:5])
-            if messages else
-            f"MQTT metering: ingestor rejected {failed} event(s)"
-        ))
-
-    @property
     def dropped_count(self) -> int:
         """Total events permanently dropped (failed batches)."""
         with self._drop_lock:
             return self._dropped
 
-    def _record_drop(self, events: List[Dict[str, Any]], reason: str) -> None:
-        """Account for a permanently lost batch: bump the counter, WARN-log,
-        and invoke the opt-in on_drop hook. The buffer is drained at flush
-        start, so drops are bounded by flush cadence — no log throttle
-        needed. The hook fires OUTSIDE all locks, so a hook that calls
-        shutdown() cannot deadlock."""
-        with self._drop_lock:
-            self._dropped += len(events)
-            dropped_total = self._dropped
-        logger.warning(
-            "[aforo-mqtt] Dropped %d event(s) — %s (%d total dropped).",
-            len(events), reason, dropped_total,
-        )
-        if self.on_drop is not None:
-            try:
-                self.on_drop(events, reason)
-            except Exception:
-                # A hook bug must never break flushing.
-                logger.debug("on_drop hook raised", exc_info=True)
+    # ── Delivery (shared transport core) ─────────────────────────
 
-    def _record_invalid(self, event: Dict[str, Any], message: str) -> None:
-        """Account for an event that failed a client-side check. Never raises.
-        The WARN is logged once per distinct message (bounded to 100 messages)
-        so a tight loop cannot flood the log; the counter and hook always run."""
-        with self._drop_lock:
-            self._dropped += 1
-            warn = message not in self._invalid_warned and len(self._invalid_warned) < 100
-            if warn:
-                self._invalid_warned.add(message)
-        if warn:
-            logger.warning("[aforo-mqtt] Dropped invalid event: %s", message)
-        if self.on_drop is not None:
-            try:
-                self.on_drop([event], "invalid")
-            except Exception:
-                logger.debug("on_drop hook raised", exc_info=True)
+    @property
+    def on_drop(self) -> Optional[Callable[[List[Dict[str, Any]], str], None]]:
+        """``on_drop(events, reason)``: events lost for good. Reasons:
+        ``overflow``, ``rejected``, ``invalid``, ``shutdown``, ``closed``."""
+        return self._core._on_drop
 
-    def shutdown(self) -> None:
-        self._stop_event.set()
-        # Deregister so repeated create/shutdown cycles don't accumulate
-        # atexit handlers (which also pin the client from GC). Safe no-op
-        # if called FROM the atexit handler itself.
-        atexit.unregister(self._safe_shutdown)
-        self._flush()
-        if self._flush_thread.is_alive():
-            self._flush_thread.join(timeout=5.0)
+    @on_drop.setter
+    def on_drop(self, hook: Optional[Callable[[List[Dict[str, Any]], str], None]]) -> None:
+        self._core._on_drop = hook
+
+    def _safe_on_error(self, exc: Exception) -> None:
+        try:
+            self.on_error(exc)
+        except Exception:
+            logger.debug("[aforo-mqtt] on_error hook raised", exc_info=True)
+
+    def __repr__(self) -> str:
+        return f"AforoMqttBilling(tenant_id={self.tenant_id!r}, ingestor_url={self.ingestor_url!r})"
+
+    def flush(self, timeout: Optional[float] = None) -> int:
+        """Ask the sender thread to send everything queued and wait for it.
+        Returns the number of events still queued (non-zero while the
+        ingestor is unreachable; they are retried after a pause)."""
+        return self._core.flush(timeout).pending
+
+    _flush = flush
+
+    @property
+    def dropped_count(self) -> int:
+        """Events lost for good: overflow, rejected, invalid, shutdown, closed."""
+        return self._core.dropped_count
+
+    @property
+    def queued_count(self) -> int:
+        return self._core.queue_size
+
+    def report_invalid(self, detail: str) -> None:
+        """Count an event an integration could not build (no customer) as ``invalid``."""
+        self._core.report_drop([], "invalid", count=1, detail=detail)
+
+    def shutdown(self, timeout: Optional[float] = None) -> None:
+        """Stop accepting events and flush for at most ``shutdown_timeout_sec``
+        (or ``timeout``) seconds; what is still queued then is reported to
+        ``on_drop`` as ``"shutdown"``. Also runs at interpreter exit."""
+        self._core.close(timeout)
+
+# ── Customer identity ────────────────────────────────────────────
+
+_UNSET: Any = object()
+
+#: Unconfirmed QoS>0 publishes kept per client while waiting for the broker's
+#: ack. A full table drops the oldest entry unmetered (logged at debug).
+MAX_PENDING_PUBLISHES = 10_000
+
+
+def _mqtt_username(client: Any) -> Optional[str]:
+    value = getattr(client, "_username", None)
+    if value is None:
+        value = getattr(client, "username", None)
+    if isinstance(value, (bytes, bytearray)):
+        value = bytes(value).decode("utf-8", "replace")
+    return value if isinstance(value, str) else None
+
+
+def _customer_source(client: Any, customer_id: Any, customer_resolver: Optional[Callable[[Any], Optional[str]]],
+                     trust_customer_header: bool, integration: str) -> Callable[[], Optional[str]]:
+    """How the wrapper finds the customer for each event.
+
+    An explicit ``customer_id`` is the value your code resolved from identity
+    it verified. Otherwise ``customer_resolver(client)`` is called per event;
+    using the MQTT username -- which whoever configures the connection
+    controls -- needs ``trust_customer_header=True``. With none of the three
+    this raises ValueError. A missing customer drops that event as
+    ``invalid`` (counted); MQTT traffic is never blocked.
+    """
+    if customer_id is not _UNSET:
+        fixed = clean_customer_id(customer_id)
+        return lambda: fixed
+    require_customer_source(customer_resolver, trust_customer_header, integration=integration,
+                            untrusted_source="the MQTT username of the connection")
+    if customer_resolver is not None:
+        def resolve() -> Optional[str]:
+            try:
+                return clean_customer_id(customer_resolver(client))
+            except Exception:
+                logger.warning("[aforo-mqtt] customer_resolver raised; the event is not metered", exc_info=True)
+                return None
+        return resolve
+    return lambda: clean_customer_id(_mqtt_username(client))
+
+
+def _rc_ok(rc: Any) -> bool:
+    """True for a successful paho return / reason code (int 0, or a v2
+    ReasonCode that is not a failure)."""
+    if rc is None:
+        return True
+    is_failure = getattr(rc, "is_failure", None)
+    if isinstance(is_failure, bool):
+        return not is_failure
+    value = getattr(rc, "value", rc)
+    try:
+        return int(value) == 0
+    except (TypeError, ValueError):
+        return False
 
 
 # ── paho-mqtt (synchronous) integration ──────────────────────────
@@ -585,24 +459,46 @@ def wrap_paho_client(
     billing: AforoMqttBilling,
     client: Any,
     *,
-    customer_id: str,
+    customer_id: Any = _UNSET,
+    customer_resolver: Optional[Callable[[Any], Optional[str]]] = None,
+    trust_customer_header: bool = False,
     client_id: Optional[str] = None,
     product_type: Optional[str] = None,
+    reconnect_debounce_sec: float = 30.0,
 ) -> None:
     """
     Attach metering callbacks to a paho-mqtt client *before* calling .connect().
+
+    The customer: ``customer_id`` (resolved by your own auth), or
+    ``customer_resolver=callable(client) -> str | None``, or
+    ``trust_customer_header=True`` to bill the connection's MQTT username.
+    With none of them this raises ValueError.
+
+    What is metered:
+      - CONNECT when the broker accepts the connection (CONNACK success).
+      - DISCONNECT when you disconnect, or ``reconnect_debounce_sec`` after a
+        dropped connection that did not come back. A connection that drops
+        and reconnects within that window is one session: no new
+        CONNECT/DISCONNECT pair is billed for the flap.
+      - PUBLISH after paho confirms it (``on_publish``: the broker's ack for
+        QoS 1/2, the socket write for QoS 0). A publish paho refuses
+        (``rc != 0``) is not billed.
+      - SUBSCRIBE / UNSUBSCRIBE when requested; DELIVER per received message
+        when ``emit_deliver_events=True``.
 
     Usage:
         import paho.mqtt.client as mqtt
         from aforo_mqtt_metering import AforoMqttBilling, wrap_paho_client
 
         billing = AforoMqttBilling(...)
-        c = mqtt.Client(client_id="device-001")
-        wrap_paho_client(billing, c, customer_id="cust_acme_001")
+        c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="device-001")
+        wrap_paho_client(billing, c, customer_id=device_registry.owner_of("device-001"))
         c.connect("broker.example.com", 1883)
         c.publish("devices/001/temp", "23.4")
         c.loop_forever()
     """
+    customer = _customer_source(client, customer_id, customer_resolver, trust_customer_header,
+                                "wrap_paho_client")
     cid = client_id or getattr(client, "_client_id", None)
     if isinstance(cid, bytes):
         cid = cid.decode("utf-8")
@@ -611,64 +507,124 @@ def wrap_paho_client(
     orig_on_connect = getattr(client, "on_connect", None)
     orig_on_disconnect = getattr(client, "on_disconnect", None)
     orig_on_message = getattr(client, "on_message", None)
+    orig_on_publish = getattr(client, "on_publish", None)
     orig_publish = client.publish
     orig_subscribe = client.subscribe
     orig_unsubscribe = client.unsubscribe
 
+    lock = threading.Lock()
+    state: Dict[str, Any] = {"connected": False, "timer": None}
+    pending: "Dict[int, Dict[str, Any]]" = {}
+    acked_early: "Dict[int, bool]" = {}
+
+    def _push(**fields: Any) -> None:
+        billing.push(customer_id=customer(), product_type=product_type, client_id=cid, **fields)
+
+    def _emit_disconnect() -> None:
+        with lock:
+            state["timer"] = None
+            if state["connected"]:
+                return  # it reconnected after all
+        _push(topic="", qos=0, retained=False, event_type="DISCONNECT")
+
     def _on_connect(c, userdata, flags, rc, *args, **kwargs):  # type: ignore[no-untyped-def]
-        billing.push(customer_id=customer_id, product_type=product_type, topic="", qos=0, retained=False,
-                     event_type="CONNECT", client_id=cid)
+        if _rc_ok(rc):
+            with lock:
+                timer, state["timer"] = state["timer"], None
+                flap = timer is not None
+                state["connected"] = True
+            if timer is not None:
+                timer.cancel()
+            if not flap:
+                _push(topic="", qos=0, retained=False, event_type="CONNECT")
         if orig_on_connect:
             return orig_on_connect(c, userdata, flags, rc, *args, **kwargs)
 
-    def _on_disconnect(c, userdata, rc, *args, **kwargs):  # type: ignore[no-untyped-def]
-        billing.push(customer_id=customer_id, product_type=product_type, topic="", qos=0, retained=False,
-                     event_type="DISCONNECT", client_id=cid)
+    def _on_disconnect(c, userdata, *args, **kwargs):  # type: ignore[no-untyped-def]
+        # paho 1.x: (client, userdata, rc); 2.x: (client, userdata, flags, rc, properties)
+        rc = args[1] if len(args) >= 2 and hasattr(args[0], "is_disconnect_packet_from_server") else (
+            args[0] if args else 0)
+        with lock:
+            was_connected = state["connected"]
+            state["connected"] = False
+        if was_connected:
+            if _rc_ok(rc):
+                _push(topic="", qos=0, retained=False, event_type="DISCONNECT")
+            else:
+                timer = threading.Timer(reconnect_debounce_sec, _emit_disconnect)
+                timer.daemon = True
+                with lock:
+                    previous, state["timer"] = state["timer"], timer
+                if previous is not None:
+                    previous.cancel()
+                timer.start()
         if orig_on_disconnect:
-            return orig_on_disconnect(c, userdata, rc, *args, **kwargs)
+            return orig_on_disconnect(c, userdata, *args, **kwargs)
 
     def _on_message(c, userdata, msg):  # type: ignore[no-untyped-def]
-        billing.push(
-            customer_id=customer_id, product_type=product_type,
+        _push(
             topic=msg.topic,
             qos=getattr(msg, "qos", 0),
             retained=getattr(msg, "retain", False),
             event_type="DELIVER",
-            client_id=cid,
             data_bytes=len(msg.payload) if msg.payload else 0,
         )
         if orig_on_message:
             return orig_on_message(c, userdata, msg)
 
+    def _on_publish(c, userdata, mid, *args, **kwargs):  # type: ignore[no-untyped-def]
+        with lock:
+            fields = pending.pop(mid, None)
+            if fields is None:
+                acked_early[mid] = True
+                while len(acked_early) > MAX_PENDING_PUBLISHES:
+                    acked_early.pop(next(iter(acked_early)))
+        reason = args[0] if args else None
+        if fields is not None and _rc_ok(reason):
+            _push(**fields)
+        if orig_on_publish:
+            return orig_on_publish(c, userdata, mid, *args, **kwargs)
+
     client.on_connect = _on_connect
     client.on_disconnect = _on_disconnect
     client.on_message = _on_message
+    client.on_publish = _on_publish
 
     def _publish(topic, payload=None, qos=0, retain=False, **kwargs):  # type: ignore[no-untyped-def]
-        billing.push(
-            customer_id=customer_id, product_type=product_type,
-            topic=topic,
-            qos=qos,
-            retained=retain,
-            event_type="PUBLISH",
-            client_id=cid,
-            data_bytes=_payload_bytes(payload),
-        )
-        return orig_publish(topic, payload=payload, qos=qos, retain=retain, **kwargs)
+        fields = {"topic": topic, "qos": qos, "retained": retain, "event_type": "PUBLISH",
+                  "data_bytes": _payload_bytes(payload)}
+        info = orig_publish(topic, payload=payload, qos=qos, retain=retain, **kwargs)
+        mid = getattr(info, "mid", None)
+        if mid is None or not hasattr(info, "rc"):
+            _push(**fields)  # not paho: the call returned without error
+            return info
+        if not _rc_ok(info.rc):
+            return info  # paho refused it: nothing was published
+        with lock:
+            if acked_early.pop(mid, False):
+                confirmed = True
+            else:
+                confirmed = False
+                pending[mid] = fields
+                while len(pending) > MAX_PENDING_PUBLISHES:
+                    lost = next(iter(pending))
+                    pending.pop(lost)
+                    logger.debug("[aforo-mqtt] too many unconfirmed publishes; mid %s not metered", lost)
+        if confirmed:
+            _push(**fields)
+        return info
 
     def _subscribe(topic, qos=0, *args, **kwargs):  # type: ignore[no-untyped-def]
         # Paho accepts str or [(str, qos)] — normalize
         topics = [topic] if isinstance(topic, str) else [t[0] if isinstance(t, tuple) else t for t in topic]
         for t in topics:
-            billing.push(customer_id=customer_id, product_type=product_type, topic=t, qos=qos, retained=False,
-                         event_type="SUBSCRIBE", client_id=cid)
+            _push(topic=t, qos=qos, retained=False, event_type="SUBSCRIBE")
         return orig_subscribe(topic, qos, *args, **kwargs)
 
     def _unsubscribe(topic, *args, **kwargs):  # type: ignore[no-untyped-def]
         topics = [topic] if isinstance(topic, str) else list(topic)
         for t in topics:
-            billing.push(customer_id=customer_id, product_type=product_type, topic=t, qos=0, retained=False,
-                         event_type="UNSUBSCRIBE", client_id=cid)
+            _push(topic=t, qos=0, retained=False, event_type="UNSUBSCRIBE")
         return orig_unsubscribe(topic, *args, **kwargs)
 
     client.publish = _publish
@@ -682,54 +638,59 @@ def wrap_aiomqtt_client(
     billing: AforoMqttBilling,
     client: Any,
     *,
-    customer_id: str,
+    customer_id: Any = _UNSET,
+    customer_resolver: Optional[Callable[[Any], Optional[str]]] = None,
+    trust_customer_header: bool = False,
     client_id: Optional[str] = None,
     product_type: Optional[str] = None,
 ) -> None:
     """
-    Wrap an aiomqtt.Client's publish/subscribe methods + CONNECT/DISCONNECT
-    markers. Call before entering the client's async context.
+    Wrap an aiomqtt.Client's publish/subscribe methods + a CONNECT marker.
+    Call inside the client's async context (after it connected).
+
+    The customer is found as in ``wrap_paho_client``. PUBLISH is billed after
+    ``publish()`` returns: aiomqtt waits for the broker's ack for QoS 1/2, so a
+    publish that raises is not billed.
 
     Usage:
         async with aiomqtt.Client("broker.example.com") as c:
-            wrap_aiomqtt_client(billing, c, customer_id="cust_acme_001")
+            wrap_aiomqtt_client(billing, c, customer_id=tenant.customer_id)
             await c.publish("devices/001", "hello")
             async for msg in c.messages:
                 ...
     """
+    customer = _customer_source(client, customer_id, customer_resolver, trust_customer_header,
+                                "wrap_aiomqtt_client")
     cid = client_id or getattr(client, "_client_id", None) or "aiomqtt-client"
     if isinstance(cid, bytes):
         cid = cid.decode("utf-8")
 
-    # CONNECT marker (best-effort — aiomqtt doesn't expose an on_connect callback)
-    billing.push(customer_id=customer_id, product_type=product_type, topic="", qos=0, retained=False,
-                 event_type="CONNECT", client_id=cid)
+    def _push(**fields: Any) -> None:
+        billing.push(customer_id=customer(), product_type=product_type, client_id=cid, **fields)
+
+    # CONNECT marker (aiomqtt exposes no on_connect callback; the wrapper is
+    # applied inside the connected context).
+    _push(topic="", qos=0, retained=False, event_type="CONNECT")
 
     orig_publish = client.publish
     orig_subscribe = client.subscribe
     orig_unsubscribe = client.unsubscribe
 
     async def _publish(topic, payload=None, qos=0, retain=False, **kwargs):  # type: ignore[no-untyped-def]
-        billing.push(
-            customer_id=customer_id, product_type=product_type,
-            topic=topic, qos=qos, retained=retain,
-            event_type="PUBLISH", client_id=cid,
-            data_bytes=_payload_bytes(payload),
-        )
-        return await orig_publish(topic, payload=payload, qos=qos, retain=retain, **kwargs)
+        result = await orig_publish(topic, payload=payload, qos=qos, retain=retain, **kwargs)
+        _push(topic=topic, qos=qos, retained=retain, event_type="PUBLISH", data_bytes=_payload_bytes(payload))
+        return result
 
     async def _subscribe(topic, qos=0, *args, **kwargs):  # type: ignore[no-untyped-def]
         topics = [topic] if isinstance(topic, str) else list(topic)
         for t in topics:
-            billing.push(customer_id=customer_id, product_type=product_type, topic=str(t), qos=qos, retained=False,
-                         event_type="SUBSCRIBE", client_id=cid)
+            _push(topic=str(t), qos=qos, retained=False, event_type="SUBSCRIBE")
         return await orig_subscribe(topic, qos, *args, **kwargs)
 
     async def _unsubscribe(topic, *args, **kwargs):  # type: ignore[no-untyped-def]
         topics = [topic] if isinstance(topic, str) else list(topic)
         for t in topics:
-            billing.push(customer_id=customer_id, product_type=product_type, topic=str(t), qos=0, retained=False,
-                         event_type="UNSUBSCRIBE", client_id=cid)
+            _push(topic=str(t), qos=0, retained=False, event_type="UNSUBSCRIBE")
         return await orig_unsubscribe(topic, *args, **kwargs)
 
     client.publish = _publish

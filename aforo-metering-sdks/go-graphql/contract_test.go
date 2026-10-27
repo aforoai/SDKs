@@ -136,18 +136,20 @@ func TestIngestContract(t *testing.T) {
 	defer srv.Close()
 
 	b, err := New(Config{
-		TenantID:      "tenant-001",
-		ProductID:     "prod-gql-001",
-		APIKey:        "sk_gql_abc",
-		IngestorURL:   srv.URL,
-		FlushCount:    100, // buffer only — Shutdown's final drain does the synchronous flush (no async race)
-		FlushInterval: time.Minute,
+		TenantID:            "tenant-001",
+		ProductID:           "prod-gql-001",
+		APIKey:              "sk_gql_abc",
+		IngestorURL:         srv.URL,
+		hooks:               fastHooks(),
+		TrustCustomerHeader: true,
+		FlushCount:          100, // buffer only — Shutdown's final drain does the synchronous flush (no async race)
+		FlushInterval:       time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	b.Record("cust_contract", "{ a }", "", 5, false)
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -207,12 +209,14 @@ func TestIngestContract_ExecutionStatusValues(t *testing.T) {
 	defer srv.Close()
 
 	b, err := New(Config{
-		TenantID:      "tenant-001",
-		ProductID:     "prod-gql-001",
-		APIKey:        "sk_gql_abc",
-		IngestorURL:   srv.URL,
-		FlushCount:    100,
-		FlushInterval: time.Minute,
+		TenantID:            "tenant-001",
+		ProductID:           "prod-gql-001",
+		APIKey:              "sk_gql_abc",
+		IngestorURL:         srv.URL,
+		hooks:               fastHooks(),
+		TrustCustomerHeader: true,
+		FlushCount:          100,
+		FlushInterval:       time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -224,7 +228,7 @@ func TestIngestContract_ExecutionStatusValues(t *testing.T) {
 	b.RecordWithOptions("cust_contract", "{ a }", "", 5, true, EventOptions{ExecutionStatus: OutcomeFromHTTPStatus(504)})
 	b.RecordWithOptions("cust_contract", "{ a }", "", 5, false, EventOptions{ExecutionStatus: "   "})
 	b.Record("cust_contract", "{ a }", "", 5, false)
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -362,13 +366,15 @@ func (e *errSink) joined() string {
 func newContractBilling(t *testing.T, url string, sink *errSink, mutate ...func(*Config)) *Billing {
 	t.Helper()
 	cfg := Config{
-		TenantID:      "tenant-001",
-		ProductID:     "prod-001",
-		APIKey:        "sk_contract",
-		IngestorURL:   url,
-		FlushCount:    1,
-		FlushInterval: time.Minute,
-		OnError:       sink.add,
+		TenantID:            "tenant-001",
+		ProductID:           "prod-001",
+		APIKey:              "sk_contract",
+		IngestorURL:         url,
+		hooks:               fastHooks(),
+		TrustCustomerHeader: true,
+		FlushCount:          1,
+		FlushInterval:       time.Minute,
+		OnError:             sink.add,
 	}
 	for _, m := range mutate {
 		m(&cfg)
@@ -396,7 +402,7 @@ func emit(b *Billing, opts ...EventOptions) {
 	b.Record("cust_1", "mutation CreateUser { createUser { id } }", "", 3, false, opts...)
 }
 
-func shutdown(b *Billing) error { return b.Shutdown() }
+func shutdown(b *Billing) error { return b.Shutdown(bg) }
 
 func TestContractDefaultProductType(t *testing.T) {
 	srv := &scriptedServer{}

@@ -1,6 +1,6 @@
 # aforo-grpc-metering — User Guide
 
-**Version:** 1.2.2 · **Updated:** 2026-10-01 · **Audience:** Python engineers running a gRPC server who need per-RPC billing.
+**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Python engineers running a gRPC server who need per-RPC billing.
 
 ## What you'll build
 
@@ -11,12 +11,12 @@ A gRPC server that reports one Aforo event per RPC — unary calls metered autom
 - Python **3.9+** and `grpcio>=1.50`.
 - An Aforo **API key**, **tenant id**, and **product id** from the Aforo console.
 - The fully-qualified gRPC **service name** (e.g. `acme.v1.UserService`).
-- Callers that send `x-customer-id` in gRPC metadata, or a custom extractor.
+- A function that returns the customer for a call from identity your service verified (a validated token, an mTLS peer).
 
 ## Step 1 — Install
 
 ```bash
-pip install -e .                  # from python-grpc/ (or: pip install "aforo-grpc-metering>=1.2.2")
+pip install -e .                  # from python-grpc/ (or: pip install "aforo-grpc-metering>=2.0.0")
 pip install -e ".[httpx]"         # or [aiohttp]
 ```
 
@@ -48,30 +48,30 @@ from aforo_grpc_metering import AforoGrpcInterceptor
 
 server = grpc.server(
     futures.ThreadPoolExecutor(max_workers=10),
-    interceptors=[AforoGrpcInterceptor(billing)],
+    interceptors=[AforoGrpcInterceptor(billing, customer_resolver=customer_for)],
 )
+# grpc.aio:  grpc.aio.server(interceptors=[AforoAioGrpcInterceptor(billing, customer_resolver=customer_for)])
 ```
 
-The interceptor times each handler and records the call in a `finally`, so failed RPCs are still billed with the mapped error label.
+The interceptor wraps all four RPC shapes (unary, server streaming, client streaming, bidirectional) and records each call once, when it ends, in a `finally` — so failed RPCs are still billed with the mapped error label.
 
 ## Step 4 — Make sure the customer ID resolves
 
-The default extractor reads `x-customer-id` from invocation metadata. A call with no resolvable customer ID is dropped — not metered. Set it client-side, or override:
+The interceptor needs a customer resolver: `customer_resolver=` on the interceptor, or `customer_id_extractor=` on `AforoGrpcBilling`. Without one it raises `ValueError` when you build it. A call whose resolver returns nothing still runs; it is not metered and is counted as an `invalid` drop.
 
 ```python
-billing = AforoGrpcBilling(
-    # ...
-    customer_id_extractor=lambda ctx: decode_jwt(
-        dict(ctx.invocation_metadata()).get("authorization", "")
-    ),
-)
+def customer_for(context):
+    token = dict(context.invocation_metadata()).get("authorization", "")
+    return verify_jwt(token)["customer_id"]   # verified, not taken on trust
+
+interceptor = AforoGrpcInterceptor(billing, customer_resolver=customer_for)
 ```
 
-> ⚠ Derive `customer_id` from something you trust (a verified token, your mesh identity). Don't bill against a raw metadata value the caller can set to any customer.
+> ⚠ `trust_customer_header=True` makes the interceptor bill the `x-customer-id` metadata as sent. Any caller can set it to any customer, so use it only when a proxy in front of the service overwrites it.
 
-## Step 5 — Meter streaming RPCs
+## Step 5 — Streaming RPCs
 
-The interceptor auto-wraps **unary** only. For server-stream, client-stream, and bidi, call `record()` at the end of the handler — it's the only way the SDK learns the message count and final status:
+The interceptor meters streaming RPCs on its own: one event when the stream ends, with `messageCount` = request messages read plus response messages sent. Call `record()` yourself only for calls that do not pass through the interceptor, for example:
 
 ```python
 import time
@@ -98,7 +98,7 @@ def ListUsers(request, context):
 
 ## Step 6 — Run an RPC and flush
 
-Call any RPC against the server. Events buffer and flush on `flush_count` (50) or every `flush_interval_sec` (5 s) via a daemon thread started at construction. Force delivery now:
+Call any RPC against the server. `record()` only queues; one background thread sends batches of up to `flush_count` (500) events every `flush_interval_sec` (5 s), sooner when 500 are queued. If the ingestor is down, batches stay queued and are retried after a pause. To send now and wait (`flush()` returns how many events are still queued):
 
 ```python
 billing.flush()
@@ -106,7 +106,7 @@ billing.flush()
 
 ## Step 7 — Verify it landed in Aforo
 
-In the Aforo console, open the usage/events view for your tenant and filter by `metric_name = grpc_api.rpc_calls`. You should see one event per call carrying `grpcService`, `grpcMethod`, `grpcStatusCode`, `grpcCallType`, and `executionDurationMs`. If nothing appears, check the `ingestor_url` host and the `x-customer-id` metadata — see Troubleshooting.
+In the Aforo console, open the usage/events view for your tenant and filter by `metric_name = grpc_api.rpc_calls`. You should see one event per call carrying `grpcService`, `grpcMethod`, `grpcStatusCode`, `grpcCallType`, and `executionDurationMs`. If nothing appears, check the `ingestor_url` host and that your customer resolver returns a value — see Troubleshooting.
 
 ## Step 8 — Shut down cleanly
 
@@ -124,11 +124,17 @@ billing.shutdown()   # flushes the final batch before process exit
 | `ingestor_url` | `str` | required | Host; `/v1/ingest/batch` appended. |
 | `service_name` | `str` | required | Stamped as `grpcService`. |
 | `flush_interval_sec` | `float` | `5.0` | Background flush cadence. |
-| `flush_count` | `int` | `50` | Buffer size that forces a flush. |
-| `on_error` | `Callable?` | logs | Called on permanent batch failure, and with the ingestor's `errors[].message` when it rejects events. |
-| `on_drop` | `Callable[[list[dict], str], None]?` | `None` | Called with events that will not be delivered and the reason (`invalid`, `rejected`, `retry_exhausted`). Pass by keyword. |
+| `flush_count` | `int` | `500` | Events per request, and the queue size that wakes the sender early (at most 1000). |
+| `on_error` | `Callable?` | logs | Receives a `TransportError`; branch on `.kind`: `outage` / `auth` (events still queued and retried), `rejected` (the ingestor refused them; message carries its `errors[].message`), `shutdown`, `closed`. `.events` and `.status` say which events and which HTTP status. |
+| `on_drop` | `Callable[[list[dict], str], None]?` | `None` | Called with events that will not be delivered and the reason (`overflow`, `rejected`, `invalid`, `shutdown`, `closed`). Pass by keyword. |
 | `product_type` | `str` | `"GRPC_API"` | Top-level `productType` sent on every event (trimmed and upper-cased; values the SDK does not know are passed through). Override per event with `record(..., product_type=...)`. |
-| `customer_id_extractor` | `Callable?` | reads `x-customer-id` metadata | Resolve the billed customer. |
+| `max_queue_size` | `int` | `10000` | Queue capacity; the oldest event is dropped as `overflow` when full. Keyword-only. |
+| `timeout_sec` | `float` | `10.0` | Total deadline per HTTP request. Keyword-only. |
+| `shutdown_timeout_sec` | `float` | `5.0` | `shutdown()` flushes for at most this long; leftovers are dropped as `shutdown`. Keyword-only. |
+| `allow_insecure_http` | `bool` | `False` | Allow plain `http://` to a host other than localhost. Keyword-only. |
+| `http_transport`, `transport_options` | | `None` | An `httpx` transport / extra transport-core settings, for tests and unusual networks. Keyword-only. |
+| `customer_id_extractor` | `Callable?` | `None` | Customer resolver used by the interceptors; or pass `customer_resolver=` to the interceptor. |
+| `trust_customer_header` | `bool` | `False` | Bill the `x-customer-id` metadata as sent. |
 
 `record()` arguments: `method`, `call_type`, `customer_id`, `status`, `message_count`, `duration_ms`, `data_bytes=0`. Exports: `AforoGrpcBilling`, `AforoGrpcInterceptor`, `GRPC_STATUS_LABELS`.
 
@@ -139,9 +145,10 @@ Execution status (`executionStatus`, used by OUTCOME_BASED pricing) is described
 | Symptom | Cause | Fix |
 |---|---|---|
 | Unary calls metered, streaming calls aren't | The interceptor auto-wraps unary only. | Call `billing.record(...)` in the streaming handler's `finally`. |
-| Some calls never metered | No `x-customer-id` in metadata, so the extractor returned nothing. | Send the metadata client-side or supply a `customer_id_extractor`. |
-| `on_error` fires with "flush rejected with HTTP 401" (or 403) | Bad or unscoped API key. A 4xx other than 408 / 429 is not retried; the batch is dropped with reason `rejected`. | Fix `api_key`; confirm it matches `tenant_id`. Replay the batch from an `on_drop` hook if you keep one. |
-| `billing.dropped_count` is above 0 | Events were dropped: `invalid` (failed a client-side check), `rejected` (ingestor refused them) or `retry_exhausted`. | Read the WARNING log line for the reason; see [Dropped events](README.md#dropped-events). |
+| Some calls never metered; `dropped_count` rises with `invalid` | Your customer resolver returned nothing for those calls. | Check the resolver against an authenticated call. |
+| `ValueError: AforoGrpcInterceptor needs to know which customer to bill` | No resolver and no `trust_customer_header`. | Pass `customer_resolver=` (recommended). |
+| ERROR log "Ingestor answered HTTP 401" (or 403) | Bad or revoked API key. The events stay queued (up to `max_queue_size`) and are retried after a pause. | Fix `api_key` and restart; confirm it matches `tenant_id`. |
+| `billing.dropped_count` is above 0 | Events were dropped: `invalid` (failed a client-side check, or no customer), `rejected` (ingestor refused them), `overflow` (queue full during an outage), `shutdown` (still queued at the shutdown deadline) or `closed` (sent after shutdown). An ingest outage alone does not drop events. | Read the WARNING log line for the reason; see [Dropped events](README.md#dropped-events). |
 | Events sent, none in console | Wrong `ingestor_url` host, or `grpc_api.rpc_calls` isn't mapped to a rate plan. | Use `https://api.aforo.ai`; map the metric in Aforo. |
 | `grpcStatusCode` shows `UNKNOWN` for errors | The numeric code wasn't in `GRPC_STATUS_LABELS` (defaults to `UNKNOWN`, code 2). | Expected for unusual codes; pass an explicit `status` label via `record()` if you need precision. |
 | Final batch lost on shutdown | `shutdown()` not called before exit. | Call `billing.shutdown()` in your server-stop path. |

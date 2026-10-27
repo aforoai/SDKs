@@ -105,7 +105,7 @@ class AforoServletFilterTruncationTest {
     void overLongPathIsTruncatedTo512AndStillSent_warnsOnce() throws Exception {
         String longA = "/" + "a".repeat(700);
         String longB = "/" + "a".repeat(600) + "b".repeat(100);
-        List<JsonNode> events = run(new AforoServletFilter(client),
+        List<JsonNode> events = run(AforoServletFilter.builder(client).trustCustomerHeader(true).build(),
                 request("GET", longA, "cust_1"), request("GET", longB, "cust_1"));
 
         assertThat(events).hasSize(2);
@@ -124,7 +124,7 @@ class AforoServletFilterTruncationTest {
     void truncationNeverSplitsASurrogatePair() throws Exception {
         // "/" + 510 x 'a' puts the emoji's two code units at index 511 and 512.
         String path = "/" + "a".repeat(510) + "😀" + "zzz";
-        List<JsonNode> events = run(new AforoServletFilter(client), request("GET", path, "cust_1"));
+        List<JsonNode> events = run(AforoServletFilter.builder(client).trustCustomerHeader(true).build(), request("GET", path, "cust_1"));
 
         String sent = events.get(0).get("endpointPath").asText();
         assertThat(sent).hasSize(511).isEqualTo("/" + "a".repeat(510));
@@ -133,7 +133,7 @@ class AforoServletFilterTruncationTest {
 
     @Test
     void overLongHttpMethodIsTruncatedTo16() throws Exception {
-        List<JsonNode> events = run(new AforoServletFilter(client),
+        List<JsonNode> events = run(AforoServletFilter.builder(client).trustCustomerHeader(true).build(),
                 request("X".repeat(40), "/users", "cust_1"), request("Y".repeat(40), "/users", "cust_1"));
 
         assertThat(events).hasSize(2);
@@ -145,7 +145,7 @@ class AforoServletFilterTruncationTest {
     @Test
     void labelsWithinTheLimitAreUntouchedAndNotWarned() throws Exception {
         String path = "/" + "a".repeat(511);
-        List<JsonNode> events = run(new AforoServletFilter(client), request("DELETE", path, "cust_1"));
+        List<JsonNode> events = run(AforoServletFilter.builder(client).trustCustomerHeader(true).build(), request("DELETE", path, "cust_1"));
 
         assertThat(events.get(0).get("endpointPath").asText()).isEqualTo(path);
         assertThat(events.get(0).get("httpMethod").asText()).isEqualTo("DELETE");
@@ -154,7 +154,7 @@ class AforoServletFilterTruncationTest {
 
     @Test
     void overLongCustomerIdIsStillDroppedAsInvalid() throws Exception {
-        List<JsonNode> events = run(new AforoServletFilter(client),
+        List<JsonNode> events = run(AforoServletFilter.builder(client).trustCustomerHeader(true).build(),
                 request("GET", "/users", "c".repeat(65)));
 
         assertThat(events).isEmpty();
@@ -164,7 +164,7 @@ class AforoServletFilterTruncationTest {
 
     @Test
     void overLongCallerMetricNameIsStillDroppedAsInvalid() throws Exception {
-        List<JsonNode> events = run(new AforoServletFilter(client).metricNameResolver((q, s) -> "m".repeat(256)),
+        List<JsonNode> events = run(AforoServletFilter.builder(client).trustCustomerHeader(true).metricNameResolver((q, s) -> "m".repeat(256)).build(),
                 request("GET", "/users", "cust_1"));
 
         assertThat(events).isEmpty();

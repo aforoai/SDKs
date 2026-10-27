@@ -34,7 +34,8 @@ const config = () => ({
 // A tiny WebSocket stub that matches the SDK's MinimalWs surface.
 class FakeWs extends EventEmitter {
   readyState = 1;
-  send(_data: any, _cb?: any) { /* stubbed; billing rewrites this at trackConnection time */ }
+  // Like ws: the send callback runs once the frame is written.
+  send(_data: any, ...rest: any[]) { const cb = rest.find((a) => typeof a === 'function'); cb?.(); }
 }
 
 function eventsOfType(type: string) {
@@ -57,7 +58,7 @@ describe('trackConnection — default (OPEN + CLOSE only)', () => {
     expect(opens).toHaveLength(1);
     expect(opens[0].productType).toBe('WEBSOCKET_API');
     expect(opens[0].customerId).toBe('cust_001');
-    expect(opens[0].wsFrameType).toBe('PING');   // lifecycle marker
+    expect(opens[0].wsFrameType).toBe('OPEN');   // lifecycle marker (was PING before 2.0.0)
     expect(opens[0].messageCount).toBe(0);
     await billing.shutdown();
   });
@@ -239,7 +240,7 @@ describe('event shape', () => {
     await new Promise((r) => setTimeout(r, 20));
 
     const key = capturedRequests[0].body.events[0].idempotencyKey;
-    expect(key).toMatch(/^ws:tenant-001:[0-9a-f-]+:PING:\d+:[a-z0-9]{8}$/);
+    expect(key).toMatch(/^ws:tenant-001:[0-9a-f-]+:OPEN:\d+:[a-z0-9]{8}$/);
     await billing.shutdown();
   });
 
@@ -301,16 +302,19 @@ describe('ingest batch contract', () => {
     billing.trackConnection(ws as any, { customerId: 'cust_001' }); // 1 OPEN event
     for (let i = 0; i < 2499; i++) ws.emit('message', 'm', false);
     await billing.shutdown();
-    expect(capturedRequests.map((r) => r.body.events.length)).toEqual([1000, 1000, 500]);
+    // 1 OPEN + 2499 frames + the CONNECTION_CLOSED shutdown() bills for the still-open socket.
+    expect(capturedRequests.map((r) => r.body.events.length)).toEqual([1000, 1000, 501]);
     assertBatchContract(capturedRequests, 'sk_ws_abc', FIELDS);
   });
 
-  test('blank customerId is not metered', async () => {
+  test('blank customerId is not metered; it is counted as one invalid drop', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     const billing = new AforoWsBilling({ ...config(), flushCount: 1 });
     billing.trackConnection(new FakeWs() as any, { customerId: ' ' });
     await billing.shutdown();
     expect(capturedRequests).toHaveLength(0);
-    expect(billing.droppedCount).toBe(0); // not billable, not a drop
+    expect(billing.droppedCount).toBe(1);
+    warn.mockRestore();
   });
 
   test('over-long customerId: every event of the connection is dropped as invalid — not thrown, not sent', async () => {
@@ -331,7 +335,7 @@ describe('ingest batch contract', () => {
     expect(drops[1].events[0].metadata.event).toBe('CONNECTION_CLOSED');
     expect(drops[1].events[0].idempotencyKey).toBeTruthy();
     expect(onError).not.toHaveBeenCalled();
-    expect(warn).toHaveBeenCalledTimes(1); // throttled per field: first, then every 1000th
+    expect(warn).toHaveBeenCalledTimes(1); // invalid drops are logged on the first and every 1000th
     expect(warn.mock.calls[0][0]).toMatch(/invalid: customerId is 65 chars, limit 64/);
     warn.mockRestore();
   });
@@ -358,6 +362,8 @@ describe('productType', () => {
     const types = capturedRequests[0].body.events.map((e: any) => `${e.customerId}=${e.productType}`);
     expect(types).toEqual([
       'c_default=AGENTIC_API', 'c_custom=CUSTOM_TYPE', 'c_blank=AGENTIC_API', 'c_server=API', 'c_server=API',
+      // shutdown() closes the three connections that were never closed, with the same productType
+      'c_default=AGENTIC_API', 'c_custom=CUSTOM_TYPE', 'c_blank=AGENTIC_API',
     ]);
   });
 

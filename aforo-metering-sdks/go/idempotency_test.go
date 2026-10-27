@@ -61,7 +61,7 @@ func TestTrack_SameInstantEventsGetDistinctKeys(t *testing.T) {
 	defer ts.Close()
 
 	client := newTestClient(t, ts.URL)
-	defer client.Close()
+	defer closeNow(client)
 
 	const sameInstant = "2026-03-21T00:00:00.000Z"
 	for i := 0; i < 2; i++ {
@@ -74,7 +74,7 @@ func TestTrack_SameInstantEventsGetDistinctKeys(t *testing.T) {
 			t.Fatalf("Track: %v", err)
 		}
 	}
-	client.Flush()
+	flushNow(client)
 
 	evs := srv.events()
 	if len(evs) != 2 {
@@ -95,7 +95,7 @@ func TestTrack_ExplicitKeyPreservedVerbatim(t *testing.T) {
 	defer ts.Close()
 
 	client := newTestClient(t, ts.URL)
-	defer client.Close()
+	defer closeNow(client)
 
 	for i := 0; i < 2; i++ {
 		if err := client.Track(TrackEvent{
@@ -108,7 +108,7 @@ func TestTrack_ExplicitKeyPreservedVerbatim(t *testing.T) {
 			t.Fatalf("Track: %v", err)
 		}
 	}
-	client.Flush()
+	flushNow(client)
 
 	for i, ev := range srv.events() {
 		if ev["idempotencyKey"] != "caller-owned-key" {

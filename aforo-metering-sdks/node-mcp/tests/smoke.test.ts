@@ -1,12 +1,14 @@
 import { AforoMcpBilling } from '../src/index';
 
-const cfg = { tenantId: 't', productId: 'p', apiKey: 'k', ingestorUrl: 'https://ingestor.example' };
+const bare = { tenantId: 't', productId: 'p', apiKey: 'k', ingestorUrl: 'https://ingestor.example' };
+const cfg = { ...bare, customerId: 'cust_1' };
 
 describe('AforoMcpBilling (smoke)', () => {
   beforeEach(() => {
     // Stub the network so shutdown()'s final flush never makes a real request.
     (global as { fetch?: unknown }).fetch = jest.fn().mockResolvedValue({
       ok: true,
+      status: 202,
       json: async () => ({ accepted: 1, duplicates: 0, failed: 0 }),
     });
   });
@@ -65,6 +67,8 @@ describe('AforoMcpBilling session heartbeats', () => {
     }
     const hbs = bodies.flatMap((b: any) => b.events).filter((e: any) => e.metricName === 'system.session.heartbeat');
     expect(hbs.map((e: any) => e.sessionBoundary)).toEqual(['HEARTBEAT', 'SESSION_END']);
+    // No request (heartbeat or usage batch) may follow a redirect: it carries the API key.
+    for (const c of fetchMock.mock.calls) expect((c as any[])[1].redirect).toBe('manual');
     for (const hb of hbs) {
       expect(hb).toMatchObject({
         customerId: 'cust_1', quantity: 1, sessionId: 'sess_1', productType: 'MCP_SERVER',
@@ -82,7 +86,7 @@ describe('AforoMcpBilling session heartbeats', () => {
     const fetchMock = okFetch();
     (global as { fetch?: unknown }).fetch = fetchMock;
 
-    const billing = new AforoMcpBilling(cfg);
+    const billing = new AforoMcpBilling({ ...bare, trustCustomerHeader: true });
     const wrapped = billing.wrapToolHandler(async (_req: { params: { name: string; _meta?: Record<string, unknown> } }) => 'ok');
     await wrapped({ params: { name: 'search', _meta: { session_id: 'sess_2', customer_id: 'cust_meta' } } });
     await billing.shutdown();
@@ -91,7 +95,7 @@ describe('AforoMcpBilling session heartbeats', () => {
 
     const f2 = okFetch();
     (global as { fetch?: unknown }).fetch = f2;
-    const b2 = new AforoMcpBilling(cfg);
+    const b2 = new AforoMcpBilling(bare);
     b2.startSession('sess_3', { productType: 'agentic_api' });
     await b2.endSession();
     await b2.shutdown();
@@ -151,6 +155,58 @@ describe('AforoMcpBilling session heartbeats', () => {
   });
 });
 
+describe('AforoMcpBilling killedSessionIds on usage batches', () => {
+  const killedBody = (ids: string[]) => ({ success: true, data: { accepted: 1, duplicates: 0, failed: 0, errors: [], killedSessionIds: ids } });
+
+  it('fires onSessionKilled and stops heartbeats when a usage-batch response lists the active session', async () => {
+    const fetchMock = okFetch(killedBody(['sess_b']));
+    (global as { fetch?: unknown }).fetch = fetchMock;
+    const onSessionKilled = jest.fn();
+    const billing = new AforoMcpBilling({ ...cfg, onSessionKilled, heartbeatEnabled: false });
+    billing.startSession('sess_b');
+    billing.recordToolInvocation('search', 'agent_1', 'sess_b', 'SUCCESS', 5);
+    await billing.flush();
+    expect(onSessionKilled).toHaveBeenCalledTimes(1);
+    expect(onSessionKilled).toHaveBeenCalledWith('sess_b', 'SERVER_KILL');
+    // The killed session is no longer active: ending it sends no SESSION_END heartbeat.
+    const before = fetchMock.mock.calls.length;
+    await billing.endSession();
+    const after = bodiesOf(fetchMock).slice(before).flatMap((b: any) => b.events);
+    expect(after.filter((e: any) => e.metricName === 'system.session.heartbeat')).toEqual([]);
+    await billing.shutdown();
+  });
+
+  it('a usage batch that lists another session leaves the active one running', async () => {
+    (global as { fetch?: unknown }).fetch = okFetch(killedBody(['someone_else']));
+    const onSessionKilled = jest.fn();
+    const billing = new AforoMcpBilling({ ...cfg, onSessionKilled, heartbeatEnabled: false });
+    billing.startSession('sess_live');
+    billing.recordToolInvocation('search', 'agent_1', 'sess_live', 'SUCCESS', 5);
+    await billing.flush();
+    expect(onSessionKilled).not.toHaveBeenCalled();
+    await billing.shutdown();
+  });
+
+  it('a throwing onSessionKilled is reported to onError and does not break delivery', async () => {
+    (global as { fetch?: unknown }).fetch = okFetch(killedBody(['sess_t']));
+    const onError = jest.fn();
+    const billing = new AforoMcpBilling({
+      ...cfg,
+      onError,
+      heartbeatEnabled: false,
+      onSessionKilled: () => {
+        throw new Error('handler bug');
+      },
+    });
+    billing.startSession('sess_t');
+    billing.recordToolInvocation('search', 'agent_1', 'sess_t', 'SUCCESS', 5);
+    const r = await billing.flush();
+    expect(r).toMatchObject({ sent: 1 });
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('onSessionKilled') }));
+    await billing.shutdown();
+  });
+});
+
 describe('AforoMcpBilling productType, attribution and validation', () => {
   it('stamps productType: default MCP_SERVER, client option, per-call override', async () => {
     const fetchMock = okFetch();
@@ -169,18 +225,74 @@ describe('AforoMcpBilling productType, attribution and validation', () => {
     expect(bodiesOf(f2)[0].events[0].productType).toBe('MCP_SERVER');
   });
 
-  it('resolves customer from _meta.customer_id, then customerId config, then agentId; agentId from _meta, then config', async () => {
+  it('wrapToolHandler refuses to wrap without a customer source', () => {
+    const billing = new AforoMcpBilling(bare);
+    expect(() => billing.wrapToolHandler(async () => 'ok')).toThrow(/no customer source/);
+  });
+
+  it('ignores _meta.customer_id unless trustCustomerHeader is on, and never bills the agent id', async () => {
     const fetchMock = okFetch();
     (global as { fetch?: unknown }).fetch = fetchMock;
-    const billing = new AforoMcpBilling({ ...cfg, customerId: 'cust_cfg', agentId: 'agent_cfg' });
-    const wrapped = billing.wrapToolHandler(async (_req: { params: { name: string; _meta?: Record<string, unknown> } }) => 'ok');
-    await wrapped({ params: { name: 'a', _meta: { customer_id: 'cust_meta', agent_id: 'agent_meta' } } });
-    await wrapped({ params: { name: 'b' } });
-    await billing.shutdown();
-    const events = bodiesOf(fetchMock)[0].events;
-    expect(events.map((e: any) => [e.customerId, e.agentId])).toEqual([
-      ['cust_meta', 'agent_meta'], ['cust_cfg', 'agent_cfg'],
+    const untrusted = new AforoMcpBilling({ ...bare, customerId: 'cust_cfg', agentId: 'agent_cfg' });
+    const u = untrusted.wrapToolHandler(async (_req: { params: { name: string; _meta?: Record<string, unknown> } }) => 'ok');
+    await u({ params: { name: 'a', _meta: { customer_id: 'cust_meta', agent_id: 'agent_meta' } } });
+    await untrusted.shutdown();
+
+    const trusted = new AforoMcpBilling({ ...bare, customerId: 'cust_cfg', agentId: 'agent_cfg', trustCustomerHeader: true });
+    const t = trusted.wrapToolHandler(async (_req: { params: { name: string; _meta?: Record<string, unknown> } }) => 'ok');
+    await t({ params: { name: 'b', _meta: { customer_id: 'cust_meta', agent_id: 'agent_meta' } } });
+    await t({ params: { name: 'c' } });
+    await trusted.shutdown();
+
+    const events = bodiesOf(fetchMock).flatMap((b: any) => b.events);
+    expect(events.map((e: any) => [e.toolName, e.customerId, e.agentId])).toEqual([
+      ['a', 'cust_cfg', 'agent_meta'], ['b', 'cust_meta', 'agent_meta'], ['c', 'cust_cfg', 'agent_cfg'],
     ]);
+  });
+
+  it('bills the customer a resolver returns from authenticated identity, sync or async, without delaying the tool', async () => {
+    const fetchMock = okFetch();
+    (global as { fetch?: unknown }).fetch = fetchMock;
+    const onError = jest.fn();
+    let release!: (v: string) => void;
+    const slow = new Promise<string>((r) => { release = r; });
+    const billing = new AforoMcpBilling({
+      ...bare, customerId: 'cust_ignored', trustCustomerHeader: true, onError,
+      customerResolver: (req, extra: any) => {
+        if (req.params.name === 'slow') return slow;
+        if (req.params.name === 'anon') return undefined;
+        if (req.params.name === 'boom') throw new Error('lookup failed');
+        return `cust_${extra?.authInfo?.clientId}`;
+      },
+    });
+    const wrapped = billing.wrapToolHandler(async (_req: { params: { name: string; _meta?: Record<string, unknown> } }, _extra?: unknown) => 'ok');
+    expect(await wrapped({ params: { name: 'fast', _meta: { customer_id: 'cust_spoofed' } } }, { authInfo: { clientId: 'c1' } })).toBe('ok');
+    // The tool answers while the resolver is still pending.
+    expect(await wrapped({ params: { name: 'slow' } }, {})).toBe('ok');
+    await wrapped({ params: { name: 'anon' } }, {});
+    await wrapped({ params: { name: 'boom' } }, {});
+    release('cust_slow');
+    await new Promise((r) => setImmediate(r));
+    await billing.shutdown();
+
+    const events = bodiesOf(fetchMock).flatMap((b: any) => b.events);
+    expect(events.map((e: any) => `${e.toolName}:${e.customerId}`).sort()).toEqual(['fast:cust_c1', 'slow:cust_slow']);
+    expect(billing.droppedCount).toBe(2);
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('lookup failed') }));
+  });
+
+  it('recordToolInvocation without a customer drops the event as invalid', async () => {
+    const fetchMock = okFetch();
+    (global as { fetch?: unknown }).fetch = fetchMock;
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const drops: string[] = [];
+    const billing = new AforoMcpBilling({ ...bare, onDrop: (_e, reason) => drops.push(reason) });
+    billing.recordToolInvocation('search', 'agent_1', undefined, 'SUCCESS', 1);
+    await billing.shutdown();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(drops).toEqual(['invalid']);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('no customer'));
+    warn.mockRestore();
   });
 
   it('drops invalid events (blank toolName, long agentId/customerId/sessionId) as "invalid" without throwing', async () => {
@@ -303,6 +415,7 @@ describe('AforoMcpBilling batch flush', () => {
   it('posts {events:[...]} to /v1/ingest/batch with X-API-Key, in slices of at most 1000', async () => {
     const fetchMock = jest.fn().mockResolvedValue({
       ok: true,
+      status: 202,
       json: async () => ({ accepted: 1, duplicates: 0, failed: 0 }),
     });
     (global as { fetch?: unknown }).fetch = fetchMock;
@@ -326,7 +439,7 @@ describe('AforoMcpBilling batch flush', () => {
 
     const e = bodies[0].events[0];
     expect(e).toMatchObject({
-      customerId: 'agent_1', metricName: 'mcp_server.tool_invocations', quantity: 1,
+      customerId: 'cust_1', metricName: 'mcp_server.tool_invocations', quantity: 1,
       productType: 'MCP_SERVER', toolName: 'search', agentId: 'agent_1',
       sessionId: 'sess_1', executionStatus: 'SUCCESS', executionDurationMs: 12,
     });
