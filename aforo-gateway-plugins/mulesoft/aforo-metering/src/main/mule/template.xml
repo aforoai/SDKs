@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Aforo Usage Metering 3.0.0 - Mule 4 custom policy template.
+  Aforo Usage Metering 3.0.2 - Mule 4 custom policy template.
 
   One API call:
     1. Configuration. Every policy property arrives as the attribute value
@@ -316,13 +316,18 @@ var problems =
                 <set-variable variableName="aforoStartMs" value="#[now() as Number {unit: 'milliseconds'}]"/>
                 <set-variable variableName="aforoRequestText" value="#[null]"/>
                 <!-- MCP_SERVER: the JSON-RPC body, for tools/call detection. The
-                     payload stream is repeatable, so the API still reads it. -->
+                     payload stream is repeatable, so the API still reads it. The
+                     output type is explicit: the request payload is application/json
+                     and the value a Java String (3.0.2 live: no tools/call was ever
+                     seen, so MCP calls were not metered). A failure is logged, since
+                     the call then goes unmetered. -->
                 <choice>
                     <when expression="#[vars.aforoCfg.productType == 'MCP_SERVER' and upper(attributes.method default '') == 'POST']">
                         <try>
-                            <set-variable variableName="aforoRequestText" value="#[if (((attributes.headers.'content-length' default '0') as Number) > 1048576) null else ((payload.^raw default '') as String {encoding: 'UTF-8'})]"/>
+                            <set-variable variableName="aforoRequestText" value="#[output application/java --- if (((attributes.headers.'content-length' default '0') as Number) > 1048576) null else ((payload.^raw default '') as String {encoding: 'UTF-8'})]"/>
                             <error-handler>
                                 <on-error-continue type="ANY" logException="false">
+                                    <logger level="WARN" message="#['[aforo-metering] could not read the MCP request body, so its tools/call is not metered: ' ++ (error.description default 'unknown error')]"/>
                                     <set-variable variableName="aforoRequestText" value="#[null]"/>
                                 </on-error-continue>
                             </error-handler>
@@ -503,7 +508,7 @@ var staleUsable = (entry != null) and (entry.active == true) and beforeExpiry an
                             <http:request config-ref="{{{policyId}}}-aforo-http" method="POST" url="#[vars.aforoCfg.introspectUrl]"
                                           responseTimeout="#[vars.aforoCfg.introspectTimeoutMs]" followRedirects="false"
                                           outputMimeType="text/plain" target="aforoIntrospection"
-                                          targetValue="#[{status: attributes.statusCode, text: (payload default '') as String}]">
+                                          targetValue="#[output application/java --- {status: attributes.statusCode, text: (payload default '') as String}]">
                                 <http:body><![CDATA[#[output application/json --- {key: vars.aforoReq.key}]]]></http:body>
                                 <http:headers><![CDATA[#[{'Content-Type': 'application/json', 'X-API-Key': vars.aforoCfg.apiKey}]]]></http:headers>
                                 <http:response-validator>
@@ -717,7 +722,7 @@ var fresh = (parsed is Object) and (["ALLOW", "WARN"] contains parsed.decision) 
                                     <http:request config-ref="{{{policyId}}}-aforo-http" method="POST" url="#[vars.aforoCfg.quotaUrl]"
                                                   responseTimeout="#[vars.aforoCfg.quotaTimeoutMs]" followRedirects="false"
                                                   outputMimeType="text/plain" target="aforoQuotaResponse"
-                                                  targetValue="#[{status: attributes.statusCode, text: (payload default '') as String}]">
+                                                  targetValue="#[output application/java --- {status: attributes.statusCode, text: (payload default '') as String}]">
                                         <http:body><![CDATA[#[output application/json --- {customerId: vars.aforoAccess.quota.customerId, metricName: vars.aforoAccess.quota.metricName}]]]></http:body>
                                         <http:headers><![CDATA[#[{'Content-Type': 'application/json', 'X-API-Key': vars.aforoCfg.apiKey, 'X-Tenant-Id': vars.aforoCfg.tenantId}]]]></http:headers>
                                         <http:response-validator>
@@ -1132,7 +1137,7 @@ var dropped = ((checked filter ($.problem != null)) map $.problem)
                                                                                 <http:request config-ref="{{{policyId}}}-aforo-http" method="POST" url="#[vars.aforoCfg.endpoint]"
                                                                                               responseTimeout="10000" followRedirects="false"
                                                                                               outputMimeType="text/plain" target="aforoIngestResponse"
-                                                                                              targetValue="#[{status: attributes.statusCode, text: (payload default '') as String}]">
+                                                                                              targetValue="#[output application/java --- {status: attributes.statusCode, text: (payload default '') as String}]">
                                                                                     <http:body><![CDATA[#[vars.aforoPendingText]]]></http:body>
                                                                                     <http:headers><![CDATA[#[{'Content-Type': 'application/json', 'X-API-Key': vars.aforoCfg.apiKey}]]]></http:headers>
                                                                                     <http:response-validator>
@@ -1495,7 +1500,7 @@ var dropped = ((checked filter ($.problem != null)) map $.problem)
                                                                     <http:request config-ref="{{{policyId}}}-aforo-http" method="POST" url="#[vars.aforoCfg.endpoint]"
                                                                                   responseTimeout="10000" followRedirects="false"
                                                                                   outputMimeType="text/plain" target="aforoIngestResponse"
-                                                                                  targetValue="#[{status: attributes.statusCode, text: (payload default '') as String}]">
+                                                                                  targetValue="#[output application/java --- {status: attributes.statusCode, text: (payload default '') as String}]">
                                                                         <http:body><![CDATA[#[vars.aforoPendingText]]]></http:body>
                                                                         <http:headers><![CDATA[#[{'Content-Type': 'application/json', 'X-API-Key': vars.aforoCfg.apiKey}]]]></http:headers>
                                                                         <http:response-validator>

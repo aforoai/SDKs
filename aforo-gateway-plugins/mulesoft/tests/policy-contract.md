@@ -1,11 +1,11 @@
-# MuleSoft policy 3.0.0 — live contract checklist
+# MuleSoft policy 3.0.2 — live contract checklist
 
-`dataweave.test.cjs` runs the policy's DataWeave under the DataWeave CLI and `policy.test.cjs` checks the template's structure. Neither runs a Mule runtime: custom policies need the Enterprise runtime with API Gateway. Run this checklist on a **test API instance** before rolling 3.0.0 out, and after any runtime upgrade.
+`dataweave.test.cjs` runs the policy's DataWeave under the DataWeave CLI and `policy.test.cjs` checks the template's structure. Neither runs a Mule runtime: custom policies need the Enterprise runtime with API Gateway. Run this checklist on a **test API instance** before rolling 3.0.2 out, and after any runtime upgrade.
 
 ## Setup
 
 - A test API instance (a basic-endpoint proxy is enough) whose upstream echoes the request headers and can be told which response headers and status to return, e.g. a small mock that answers `X-Aforo-*` headers from query parameters.
-- `aforo-metering` 3.0.0 applied with `aforo-endpoint`, `aforo-api-key` (scope `usage:ingest`), `aforo-tenant-id` and `aforo-product-id` for a test product; `quota-enabled: true`.
+- `aforo-metering` 3.0.2 applied with `aforo-endpoint`, `aforo-api-key` (scope `usage:ingest`), `aforo-tenant-id` and `aforo-product-id` for a test product; `quota-enabled: true`.
 - Keys from Aforo: `KEY` (subscribed to the product), `KEY_OTHER` (active, another product), `KEY_NONE` (active, `productIds: []`), `KEY_REVOKED`, and for an AI_AGENT / MCP product an agent client secret (48 lowercase hex).
 - Access to the tenant's ingested events in Aforo and to the runtime's log.
 
