@@ -4,11 +4,58 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [Unreleased]
 
+- Run 2.0.0 inside a real EMQX 5.7+ broker (hooks, `client_attrs`, plugin config through `emqx_conf`) — not yet done.
 - Load test (10K msg/sec sustained, 100K peak per node) — not yet run.
 - CI pipeline (rebar3 compile + eunit + ct), GPG-signed release tarballs, marketplace publish — not yet built.
 - HTTP endpoint exposing `aforo_metering:health/0` — needs a separate dashboard plugin module.
 
 See [`TODO.md`](TODO.md) for the full production-hardening checklist.
+
+## [2.0.0] — 2026-10-27
+
+**Breaking.** Changes the default customer source, the usage-event shape (per-minute totals) and the TLS behaviour, and removes config keys. Read "Upgrading to 2.0.0" below before installing. Wave 6 package W6.6 (gaps G363–G368). Tested on plain Erlang/OTP against stand-ins for the EMQX headers and against the Aforo mock ingestor; **not run inside a real EMQX broker**.
+
+### Fixed
+
+- **Every event crashed before it was buffered (0.1.0).** The metric name was built as `<<"mqtt_broker.", (string:to_lower(...))/binary>>`; `string:to_lower/1` on a list returns a list, so `do_buffer_event` raised `badarg` on every hook call and no usage was ever recorded. The plugin also never compiled with `rebar3 compile`: `aforo_metering.app.src` sat at the repository root instead of `src/`, so rebar3 did not see the application, and the eunit suites failed with `undef` (26 tests, 13 failures, 13 cancelled).
+- **A client could bill its traffic to another customer (G363).** The default resolver read the MQTT username, which the client chooses, and the `jwt` resolver decoded tokens without checking their signature. The default is now `client_attrs`: the customer comes from a client attribute EMQX authentication set (a `client_attrs` claim in a JWT that EMQX verified, or the HTTP authenticator's response; EMQX 5.7.0+). `username`, `clientid_prefix` and `jwt_unverified` (the old `jwt`) still exist but the plugin refuses to start with them unless `unsafe_trust_client_identity = true`. An unknown resolver name no longer falls back to the username; it stops the plugin from starting.
+- **The http resolver blocked the client for up to 5 s and never cached a miss (G364).** Lookups now run in `aforo_metering_resolver_pool`: a bounded queue (`customer_resolver_http_queue_size`), at most `customer_resolver_http_workers` in flight, a `customer_resolver_http_timeout_ms` deadline each. Hooks return at once; usage recorded meanwhile is held under the client id and attributed when the answer arrives. "No customer" and failed lookups are cached for `customer_resolver_negative_ttl_seconds`. A slower answer for an older connection never overwrites a newer lookup. The Aforo API key is no longer sent to the mapping service (it was sent as `Authorization: Bearer`); set `customer_resolver_http_authorization` if the service needs a credential.
+- **The retention cap dropped events from concurrent publishers (G365).** Each publishing process drained and re-inserted the whole buffer when it hit the cap, and dropped half of it each time. The queue is now owned by one process (`aforo_metering_flusher`); hooks only bump counters (`ets:update_counter/4`) and never touch the queue. Overflow evicts only the oldest events beyond `max_buffer_size`, and counts them.
+- **A flush process was spawned per event above `flush_count`, and timer flushes overlapped (G366).** There is one flusher with exactly one request in flight.
+- **TLS certificates were not verified (G367).** Every https request now uses `verify_peer` with the OS trust store (`public_key:cacerts_get/0`) or `ca_cert_file`, hostname checking and SNI. `http://` is refused except for localhost / 127.0.0.1 / ::1 unless `allow_insecure_http = true`. Redirects are never followed. Requests use a dedicated httpc profile.
+- **One usage event per PUBLISH / DELIVER (G368).** Broker events are now counted per (customer, metric, QoS, retain[, topic]) per `aggregation_window_seconds` (default 60) and sent as one usage event with `quantity` = message count and `dataBytes` = summed payload. The idempotency key is a SHA-256 of tenant, product, broker node, plugin incarnation, window, owner, metric, topic and an emission number; it is fixed when the event is built and reused on every re-send (Rule #21). Set `aggregation_window_seconds = 0` for one event per broker event.
+- **Events without a topic were rejected by the ingestor.** CONNECT / DISCONNECT events were sent with `mqttTopic = ""`, which the `MQTT_BROKER` descriptor requires to be non-blank. Events without a topic dimension now carry `"#"`. Topics are cut to 500 bytes (the DTO limit) at a UTF-8 boundary.
+
+### Changed
+
+- Delivery follows `aforo-metering-sdks/contract/TRANSPORT-SPEC.md`: full-jitter backoff (500 ms base, 30 s cap), `Retry-After` in both forms (capped at 60 s), every 5xx retried, 401/403/3xx treated as outages (requeue, logged once per pause) instead of dropping the batch, 413 halves the batch, per-event `retryable` errors in a 2xx re-sent, failed batches re-queued at the front with the same keys, breaker pause `max(250 ms, random(0, min(5 min, 5 s · 2ⁿ)))`.
+- Plugin stop (`prep_stop/1`) unhooks, closes every open window and sends within `shutdown_timeout_ms`; each send is cut off at the deadline even if the HTTP client does not honour its own timeout. Leftovers are counted as dropped.
+- Closing windows takes only as many as the queue has room for (counting the batch in flight); the rest wait in the counter table, so a slow ingestor never evicts freshly closed usage.
+- The ETS tables (customer cache, aggregation counters) are owned by `aforo_metering_sup`, so a crash of the resolver pool or the flusher loses neither the resolved customers nor the open windows; the flusher counts the queued events it loses on an abnormal stop.
+- Customer-cache rows record which connection they belong to: after a session takeover, the old channel's disconnect no longer expires the new session's entry. On reconnect the http resolver keeps using the previous customer until the new answer arrives; a lookup the queue refuses keeps it too.
+- The http resolver sends `clientAttrs` (what EMQX authentication set) with `clientId` and `username`, and is retried after the negative TTL from `message.publish` too. A pending lookup lasts `customer_resolver_pending_max_seconds`. Lookups that overrun their deadline are killed.
+- `exclude_topics` is now read (MQTT filters with `+` and `#`; read at start).
+- SNI is not sent for IP-literal hosts.
+- The configuration is validated at start (`aforo_metering_config:validate/0`); a bad setting stops the plugin with each reason logged.
+- Hooks catch their own failures, so metering can never break message delivery.
+- New counters: `aforo.metering.events.rejected`, `aforo.metering.events.unresolved`, `aforo.metering.aggregation.keys_dropped`, `aforo.metering.customer_lookup.negative`, `aforo.metering.resolver.dropped`. `health/0` adds `open_aggregation_keys`. `flush_now/0` returns after one send attempt.
+- `metadata.sdkVersion` is now `2.0.0`; `rebar.config` release and `vsn` are both `2.0.0`.
+- The eunit suites build without EMQX (`test` profile defines `AFORO_NO_EMQX`, using `include/aforo_metering_emqx.hrl`). 138 tests, including delivery tests against the Node mock ingestor and real TLS handshakes.
+
+### Removed
+
+- `aforo_metering_buffer` (the two-table ETS swap buffer) — replaced by the aggregator and the flusher's queue.
+- Config keys `circuit_failure_threshold` and `circuit_cooldown_seconds` (ignored if present).
+- `customer_resolver = "jwt"` (use EMQX JWT authentication with `client_attrs`, or `jwt_unverified` + `unsafe_trust_client_identity`).
+
+### Upgrading to 2.0.0
+
+1. **Identity.** Make EMQX authentication set the customer attribute (default name `aforo_customer_id`): a `client_attrs` claim in the JWTs your JWT authenticator verifies, or `client_attrs` in your HTTP authenticator's success response. Requires EMQX 5.7.0+. If you relied on the username and your broker authentication really does tie each username to one customer, set `customer_resolver = "username"` and `unsafe_trust_client_identity = true` instead. `customer_resolver = "jwt"` must change.
+2. **Billable units.** Usage events now carry per-minute totals. In Aforo, every billable unit on an `mqtt_broker.*` metric must aggregate with **SUM** on quantity; a COUNT unit would bill one per window. To keep one event per message, set `aggregation_window_seconds = 0`.
+3. **TLS.** Make sure the broker node trusts the ingestor's certificate (OS trust store, or `ca_cert_file`). Replace any `http://` ingestor or resolver URL with `https://`, or set `allow_insecure_http = true` deliberately.
+4. **http resolver.** The mapping service no longer receives the Aforo API key. If it needs a credential, set `customer_resolver_http_authorization`.
+5. Remove `circuit_failure_threshold` / `circuit_cooldown_seconds` from your config (they are ignored).
+6. Build against EMQX's headers (`ERL_LIBS` pointing at an EMQX build), install `aforo_metering-2.0.0.tar.gz`, start it, and check the log for `aforo_metering plugin loaded` (or `refused to start` with the reason).
 
 ## [0.1.0] — 2026-06-29
 

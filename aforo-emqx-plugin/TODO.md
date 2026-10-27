@@ -54,6 +54,18 @@ Two-table swap implemented in `aforo_metering_buffer.erl`. Two ETS `ordered_set`
 
 Eliminates the race window in the previous single-table design where `ets:foldl` + `ets:delete` could miss rows inserted between the two operations.
 
+## 2.0.0 (2026-10-27) — wave 6 W6.6
+
+Replaced items 1, 2 and 5 below: one aggregator (hooks bump `ets:update_counter/4`), one flusher gen_server owning the queue and the single in-flight request, the SDK transport rules, TLS verification, identity from EMQX authentication (`client_attrs`), async http resolver with a negative cache. See CHANGELOG 2.0.0.
+
+Open:
+- [ ] Load 2.0.0 into a real EMQX 5.7+ broker and check: hooks fire with the ClientInfo shape assumed, `client_attrs` from JWT/HTTP authn reaches `client.connected`, and `emqx_conf:get([aforo_metering, Key])` actually returns the plugin's HOCON values (carried over from 0.1.0, never verified).
+- [ ] Customers of clients connected before the plugin started are unknown on `message.publish` (no ClientInfo there); look them up through EMQX's channel registry.
+- [ ] The copy in `aforo-nextgen-docker/emqx-plugin-aforo-metering/` is still the 0.1.0 code; sync it after this lands.
+- [ ] Product decision: the MQTT_BROKER descriptor templates "Messages Published" / "Retained Messages" use COUNT; with aggregation on they must be SUM on quantity (or the default window set to 0).
+- [ ] At shutdown, a batch cut off mid-send is counted wholly as dropped even if part of it arrived (accounting only; the ingestor dedups any re-send).
+- [ ] Hot reload of aggregation settings / `exclude_topics` (read at start today).
+
 ## 6. Load Test
 
 **Hardening path:**
