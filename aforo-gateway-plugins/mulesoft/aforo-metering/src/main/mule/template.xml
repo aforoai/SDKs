@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Aforo Usage Metering 3.0.0 - Mule 4 custom policy template.
+  Aforo Usage Metering 3.1.0 - Mule 4 custom policy template.
 
   One API call:
     1. Configuration. Every policy property arrives as the attribute value
@@ -28,10 +28,14 @@
     7. Metering runs in an async scope on a copy of the event: the "events"
        script builds the call's events once (API / AGENTIC_API / AI_AGENT /
        MCP_SERVER, as the Kong and Apigee plugins do), and the delivery posts
-       them to aforo-endpoint, re-sending only what the ingestor reports as
-       "The event could not be stored..." (or the whole batch on no answer,
-       5xx, 408, 429), up to 3 attempts. At most 16 deliveries run at once
-       and at most 1000 wait; past that the usage is dropped with a WARN.
+       them to aforo-endpoint, re-sending only the events the ingestor
+       marks retryable (or the whole batch on no answer, 408, 429 or any
+       5xx), up to 3 attempts. The wait before a retry is full
+       jitter on a 500 ms base (at most 30 s), or Retry-After when longer
+       (at most 60 s). At most 16 deliveries run at once and at most 1000
+       wait; past that the usage is dropped with a WARN. One delivery per
+       API call: a Mule policy has no timer to collect several calls into
+       one request.
 
   The DataWeave scripts are the only copy of the billing logic. Each starts
   with a "// aforo-script: <name>" line; tests/dataweave.test.cjs runs them
@@ -1119,39 +1123,82 @@ var dropped = ((checked filter ($.problem != null)) map $.problem)
                                                             <!-- ═════ 7. Delivery, after the response ═════ -->
                                                             <async maxConcurrency="16">
                                                                 <try>
-                                                                    <!-- Each attempt sends what the pending entry still holds:
-                                                                         the whole batch first, then only the events to re-send.
-                                                                         The idempotencyKeys never change, so a copy that did
-                                                                         land is deduplicated, never billed twice. -->
-                                                                    <until-successful maxRetries="2" millisBetweenRetries="2000">
-                                                                        <os:retrieve key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending" target="aforoPendingText">
-                                                                            <os:default-value>#['']</os:default-value>
-                                                                        </os:retrieve>
+                                                                    <!-- Up to 3 attempts. Each sends what the pending entry still holds:
+                                                                         the whole batch first, then only the events to re-send. The
+                                                                         idempotencyKeys never change, so a copy that did land is
+                                                                         deduplicated, never billed twice. Between attempts the delivery
+                                                                         script picks the wait: full jitter (random(0, min(30 s,
+                                                                         500 ms x 2^attempt))), or the ingestor's Retry-After when longer,
+                                                                         at most 60 s. -->
+                                                                    <set-variable variableName="aforoDelivery" value="#[{retryText: 'pending', retryDelayMs: 0, retryReason: '', refusedLog: null, status: 0}]"/>
+                                                                    <foreach collection="#[[1, 2, 3]]" counterVariableName="aforoAttempt">
                                                                         <choice>
-                                                                            <when expression="#[vars.aforoPendingText != '']">
-                                                                                <http:request config-ref="{{{policyId}}}-aforo-http" method="POST" url="#[vars.aforoCfg.endpoint]"
-                                                                                              responseTimeout="10000" followRedirects="false"
-                                                                                              outputMimeType="text/plain" target="aforoIngestResponse"
-                                                                                              targetValue="#[{status: attributes.statusCode, text: (payload default '') as String}]">
-                                                                                    <http:body><![CDATA[#[vars.aforoPendingText]]]></http:body>
-                                                                                    <http:headers><![CDATA[#[{'Content-Type': 'application/json', 'X-API-Key': vars.aforoCfg.apiKey}]]]></http:headers>
-                                                                                    <http:response-validator>
-                                                                                        <http:success-status-code-validator values="100..599"/>
-                                                                                    </http:response-validator>
-                                                                                </http:request>
-                                                                                <ee:transform>
-                                                                                    <ee:variables>
-                                                                                        <ee:set-variable variableName="aforoDelivery"><![CDATA[%dw 2.0
+                                                                            <when expression="#[vars.aforoDelivery.retryText != null]">
+                                                                                <choice>
+                                                                                    <when expression="#[(vars.aforoAttempt > 1) and (vars.aforoDelivery.retryDelayMs > 0)]">
+                                                                                        <!-- The wait. until-successful reads millisBetweenRetries once,
+                                                                                             on entry, and waits on the runtime's scheduler without
+                                                                                             holding a thread: the first pass raises, the second
+                                                                                             (after the delay) finds the deadline passed. -->
+                                                                                        <set-variable variableName="aforoWaitUntilMs" value="#[(now() as Number {unit: 'milliseconds'}) + floor(vars.aforoDelivery.retryDelayMs / 2)]"/>
+                                                                                        <until-successful maxRetries="1" millisBetweenRetries="#[vars.aforoDelivery.retryDelayMs]">
+                                                                                            <choice>
+                                                                                                <when expression="#[vars.aforoWaitUntilMs > (now() as Number {unit: 'milliseconds'})]">
+                                                                                                    <raise-error type="AFORO:BACKOFF_WAIT" description="waiting before the next delivery attempt"/>
+                                                                                                </when>
+                                                                                            </choice>
+                                                                                        </until-successful>
+                                                                                    </when>
+                                                                                </choice>
+                                                                                <os:retrieve key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending" target="aforoPendingText">
+                                                                                    <os:default-value>#['']</os:default-value>
+                                                                                </os:retrieve>
+                                                                                <choice>
+                                                                                    <when expression="#[vars.aforoPendingText != '']">
+                                                                                        <try>
+                                                                                            <http:request config-ref="{{{policyId}}}-aforo-http" method="POST" url="#[vars.aforoCfg.endpoint]"
+                                                                                                          responseTimeout="10000" followRedirects="false"
+                                                                                                          outputMimeType="text/plain" target="aforoIngestResponse"
+                                                                                                          targetValue="#[{status: attributes.statusCode, text: (payload default '') as String, retryAfter: attributes.headers.'retry-after' default null}]">
+                                                                                                <http:body><![CDATA[#[vars.aforoPendingText]]]></http:body>
+                                                                                                <http:headers><![CDATA[#[{'Content-Type': 'application/json', 'X-API-Key': vars.aforoCfg.apiKey}]]]></http:headers>
+                                                                                                <http:response-validator>
+                                                                                                    <http:success-status-code-validator values="100..599"/>
+                                                                                                </http:response-validator>
+                                                                                            </http:request>
+                                                                                            <error-handler>
+                                                                                                <!-- No answer: retried like a 5xx. -->
+                                                                                                <on-error-continue type="HTTP:CONNECTIVITY, HTTP:TIMEOUT" logException="false">
+                                                                                                    <set-variable variableName="aforoIngestResponse" value="#[{status: 0, text: '', retryAfter: null, noAnswer: error.description default 'no response'}]"/>
+                                                                                                </on-error-continue>
+                                                                                            </error-handler>
+                                                                                        </try>
+                                                                                        <set-variable variableName="aforoJitter" value="#[random()]"/>
+                                                                                        <set-variable variableName="aforoNowMs" value="#[now() as Number {unit: 'milliseconds'}]"/>
+                                                                                        <ee:transform>
+                                                                                            <ee:variables>
+                                                                                                <ee:set-variable variableName="aforoDelivery"><![CDATA[%dw 2.0
 // aforo-script: delivery
-// The ingestor's answer to one attempt:
-//   202 {"success":true,"data":{"accepted","failed","errors":[{index,message}]}}
-//     an error starting "The event could not be stored" is transient: that
-//     event is re-sent; any other is permanent: logged and dropped
-//   5xx, 408, 429: the whole batch is re-sent
+// The ingestor's answer to one attempt (vars.aforoAttempt, 1-3):
+//   202 {"success":true,"data":{"accepted","failed","errors":[{index,message,retryable}]}}
+//     an error with retryable=true (or, from an older ingestor without the
+//     flag, a message starting "The event could not be stored") is
+//     transient: that event is re-sent; any other is permanent: logged and
+//     dropped. errors[] is read even when "failed" is missing or 0.
+//   no answer, 408, 429 or any 5xx: the whole batch is re-sent
 //   any other status: the ingestor refused the request (key, URL): logged
+// retryDelayMs, the wait before the next attempt (0 when nothing is
+// re-sent): max(Retry-After, random(0, min(MAX_BACKOFF_MS, BASE_MS x
+// 2^attempt))), at most MAX_RETRY_AFTER_MS. Retry-After is read as
+// delta-seconds (fractional allowed) or an HTTP-date; an unreadable value
+// is ignored. vars.aforoJitter (0..1) and vars.aforoNowMs are set by the
+// template just before this script, so the tests can fix them.
 output application/java
 fun str(v) = if (v is String) v else if ((v is Number) or (v is Boolean)) (v as String) else ""
 var TRANSIENT = "The event could not be stored"
+var BASE_MS = 500
+var MAX_BACKOFF_MS = 30000
+var MAX_RETRY_AFTER_MS = 60000
 var pending = dw::Runtime::try(() -> read(str(vars.aforoPendingText), "application/json")).result
 var events = if ((pending is Object) and (pending.events is Array)) pending.events else []
 var resp = vars.aforoIngestResponse
@@ -1161,15 +1208,17 @@ var errors =
   if ((body is Object) and (body.data is Object) and (body.data.errors is Array)) body.data.errors
   else if ((body is Object) and (body.errors is Array)) body.errors
   else []
-var indexed = (errors filter ((e) -> (e is Object) and (e.index is Number))) map ((e) -> {index: e.index, message: str(e.message)})
-var transientIdx = (indexed filter ($.message startsWith TRANSIENT)) map $.index
-var permanent = indexed filter (not ($.message startsWith TRANSIENT))
+var indexed = (errors filter ((e) -> (e is Object) and (e.index is Number)))
+  map ((e) -> {index: e.index, message: str(e.message),
+    transient: if (e.retryable is Boolean) (e.retryable == true) else (str(e.message) startsWith TRANSIENT)})
+var transientIdx = (indexed filter $.transient) map $.index
+var permanent = indexed filter (not $.transient)
 fun describe(i) = do {
   var e = events[i]
   ---
   if (e is Object) (str(e.metricName) ++ " " ++ str(e.idempotencyKey)) else ("event " ++ (i as String))
 }
-var wholeRetry = (status >= 500) or (status == 408) or (status == 429) or (status == 0)
+var wholeRetry = (status == 0) or (status == 408) or (status == 429) or ((status >= 500) and (status <= 599))
 var refusedBatch = (not wholeRetry) and ((status < 200) or (status >= 300))
 var retryEvents =
   if (wholeRetry) events
@@ -1179,39 +1228,62 @@ var refused =
   if (refusedBatch) ["the ingestor refused the batch (HTTP " ++ (status as String) ++ "; check aforo-api-key and aforo-endpoint): " ++
     (do { var t = str(resp.text) --- if (sizeOf(t) > 300) t[0 to 299] else t })]
   else permanent map ((p) -> describe(p.index) ++ ": " ++ p.message)
+var attempt = if ((vars.aforoAttempt is Number) and (vars.aforoAttempt >= 1)) vars.aforoAttempt else 1
+var jitter = if ((vars.aforoJitter is Number) and (vars.aforoJitter >= 0) and (vars.aforoJitter < 1)) vars.aforoJitter else 1
+var nowMs = if (vars.aforoNowMs is Number) vars.aforoNowMs else (now() as Number {unit: "milliseconds"})
+var backoffMs = floor(jitter * min([MAX_BACKOFF_MS, BASE_MS * (2 pow attempt)]))
+var retryAfterText = trim(str(if (resp.retryAfter is Array) resp.retryAfter[0] else resp.retryAfter))
+var retryAfterSeconds = dw::Runtime::try(() -> retryAfterText as Number).result
+var retryAfterAt = dw::Runtime::try(() -> (retryAfterText as DateTime {format: "EEE, dd MMM yyyy HH:mm:ss zzz", locale: "en"}) as Number {unit: "milliseconds"}).result
+var retryAfterMs =
+  if (retryAfterText == "") 0
+  else if (retryAfterSeconds is Number) (if (retryAfterSeconds > 0) ceil(retryAfterSeconds * 1000) else 0)
+  else if (retryAfterAt is Number) max([0, retryAfterAt - nowMs])
+  else 0
 ---
 {
   status: status,
   retryText: if (isEmpty(retryEvents)) null else write({events: retryEvents}, "application/json", {indent: false}),
-  retryReason: if (wholeRetry) ("the ingestor answered HTTP " ++ (status as String))
+  retryDelayMs: if (isEmpty(retryEvents)) 0 else min([MAX_RETRY_AFTER_MS, max([retryAfterMs, backoffMs])]),
+  retryReason: if (status == 0) ("no answer from the ingestor (" ++ (if (str(resp.noAnswer) != "") str(resp.noAnswer) else "no response") ++ ")")
+    else if (wholeRetry) ("the ingestor answered HTTP " ++ (status as String))
     else ((sizeOf(retryEvents) as String) ++ " event(s) could not be stored"),
   refusedLog: if (isEmpty(refused)) null
     else "[aforo-metering] USAGE EVENT REFUSED (permanent, not retried): " ++ (refused joinBy " | ")
 }]]></ee:set-variable>
-                                                                                    </ee:variables>
-                                                                                </ee:transform>
-                                                                                <choice>
-                                                                                    <when expression="#[vars.aforoDelivery.refusedLog != null]">
-                                                                                        <logger level="WARN" message="#[vars.aforoDelivery.refusedLog]"/>
-                                                                                    </when>
-                                                                                </choice>
-                                                                                <choice>
-                                                                                    <when expression="#[vars.aforoDelivery.retryText != null]">
-                                                                                        <os:store key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending">
-                                                                                            <os:value>#[vars.aforoDelivery.retryText]</os:value>
-                                                                                        </os:store>
-                                                                                        <raise-error type="AFORO:DELIVERY_RETRY" description="#[vars.aforoDelivery.retryReason]"/>
+                                                                                            </ee:variables>
+                                                                                        </ee:transform>
+                                                                                        <choice>
+                                                                                            <when expression="#[vars.aforoDelivery.refusedLog != null]">
+                                                                                                <logger level="WARN" message="#[vars.aforoDelivery.refusedLog]"/>
+                                                                                            </when>
+                                                                                        </choice>
+                                                                                        <choice>
+                                                                                            <when expression="#[vars.aforoDelivery.retryText != null]">
+                                                                                                <os:store key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending">
+                                                                                                    <os:value>#[vars.aforoDelivery.retryText]</os:value>
+                                                                                                </os:store>
+                                                                                                <choice>
+                                                                                                    <when expression="#[vars.aforoAttempt >= 3]">
+                                                                                                        <raise-error type="AFORO:DELIVERY_RETRY" description="#[vars.aforoDelivery.retryReason]"/>
+                                                                                                    </when>
+                                                                                                </choice>
+                                                                                            </when>
+                                                                                            <otherwise>
+                                                                                                <os:remove key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending"/>
+                                                                                            </otherwise>
+                                                                                        </choice>
                                                                                     </when>
                                                                                     <otherwise>
-                                                                                        <os:remove key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending"/>
+                                                                                        <set-variable variableName="aforoDelivery" value="#[{retryText: null, retryDelayMs: 0, retryReason: '', refusedLog: null, status: 0}]"/>
                                                                                     </otherwise>
                                                                                 </choice>
                                                                             </when>
                                                                         </choice>
-                                                                    </until-successful>
+                                                                    </foreach>
                                                                     <error-handler>
                                                                         <on-error-continue type="ANY" logException="false">
-                                                                            <logger level="WARN" message="#['[aforo-metering] USAGE NOT DELIVERED after 3 attempts (' ++ (error.description default 'unknown error') ++ '): request ' ++ (vars.aforoReq.requestId default '?')]"/>
+                                                                            <logger level="WARN" message="#['[aforo-metering] USAGE NOT DELIVERED (' ++ (error.description default 'unknown error') ++ '): request ' ++ (vars.aforoReq.requestId default '?')]"/>
                                                                             <try>
                                                                                 <os:remove key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending"/>
                                                                                 <error-handler>
@@ -1482,39 +1554,82 @@ var dropped = ((checked filter ($.problem != null)) map $.problem)
                                                 <!-- ═════ 7. Delivery, after the response ═════ -->
                                                 <async maxConcurrency="16">
                                                     <try>
-                                                        <!-- Each attempt sends what the pending entry still holds:
-                                                             the whole batch first, then only the events to re-send.
-                                                             The idempotencyKeys never change, so a copy that did
-                                                             land is deduplicated, never billed twice. -->
-                                                        <until-successful maxRetries="2" millisBetweenRetries="2000">
-                                                            <os:retrieve key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending" target="aforoPendingText">
-                                                                <os:default-value>#['']</os:default-value>
-                                                            </os:retrieve>
+                                                        <!-- Up to 3 attempts. Each sends what the pending entry still holds:
+                                                             the whole batch first, then only the events to re-send. The
+                                                             idempotencyKeys never change, so a copy that did land is
+                                                             deduplicated, never billed twice. Between attempts the delivery
+                                                             script picks the wait: full jitter (random(0, min(30 s,
+                                                             500 ms x 2^attempt))), or the ingestor's Retry-After when longer,
+                                                             at most 60 s. -->
+                                                        <set-variable variableName="aforoDelivery" value="#[{retryText: 'pending', retryDelayMs: 0, retryReason: '', refusedLog: null, status: 0}]"/>
+                                                        <foreach collection="#[[1, 2, 3]]" counterVariableName="aforoAttempt">
                                                             <choice>
-                                                                <when expression="#[vars.aforoPendingText != '']">
-                                                                    <http:request config-ref="{{{policyId}}}-aforo-http" method="POST" url="#[vars.aforoCfg.endpoint]"
-                                                                                  responseTimeout="10000" followRedirects="false"
-                                                                                  outputMimeType="text/plain" target="aforoIngestResponse"
-                                                                                  targetValue="#[{status: attributes.statusCode, text: (payload default '') as String}]">
-                                                                        <http:body><![CDATA[#[vars.aforoPendingText]]]></http:body>
-                                                                        <http:headers><![CDATA[#[{'Content-Type': 'application/json', 'X-API-Key': vars.aforoCfg.apiKey}]]]></http:headers>
-                                                                        <http:response-validator>
-                                                                            <http:success-status-code-validator values="100..599"/>
-                                                                        </http:response-validator>
-                                                                    </http:request>
-                                                                    <ee:transform>
-                                                                        <ee:variables>
-                                                                            <ee:set-variable variableName="aforoDelivery"><![CDATA[%dw 2.0
+                                                                <when expression="#[vars.aforoDelivery.retryText != null]">
+                                                                    <choice>
+                                                                        <when expression="#[(vars.aforoAttempt > 1) and (vars.aforoDelivery.retryDelayMs > 0)]">
+                                                                            <!-- The wait. until-successful reads millisBetweenRetries once,
+                                                                                 on entry, and waits on the runtime's scheduler without
+                                                                                 holding a thread: the first pass raises, the second
+                                                                                 (after the delay) finds the deadline passed. -->
+                                                                            <set-variable variableName="aforoWaitUntilMs" value="#[(now() as Number {unit: 'milliseconds'}) + floor(vars.aforoDelivery.retryDelayMs / 2)]"/>
+                                                                            <until-successful maxRetries="1" millisBetweenRetries="#[vars.aforoDelivery.retryDelayMs]">
+                                                                                <choice>
+                                                                                    <when expression="#[vars.aforoWaitUntilMs > (now() as Number {unit: 'milliseconds'})]">
+                                                                                        <raise-error type="AFORO:BACKOFF_WAIT" description="waiting before the next delivery attempt"/>
+                                                                                    </when>
+                                                                                </choice>
+                                                                            </until-successful>
+                                                                        </when>
+                                                                    </choice>
+                                                                    <os:retrieve key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending" target="aforoPendingText">
+                                                                        <os:default-value>#['']</os:default-value>
+                                                                    </os:retrieve>
+                                                                    <choice>
+                                                                        <when expression="#[vars.aforoPendingText != '']">
+                                                                            <try>
+                                                                                <http:request config-ref="{{{policyId}}}-aforo-http" method="POST" url="#[vars.aforoCfg.endpoint]"
+                                                                                              responseTimeout="10000" followRedirects="false"
+                                                                                              outputMimeType="text/plain" target="aforoIngestResponse"
+                                                                                              targetValue="#[{status: attributes.statusCode, text: (payload default '') as String, retryAfter: attributes.headers.'retry-after' default null}]">
+                                                                                    <http:body><![CDATA[#[vars.aforoPendingText]]]></http:body>
+                                                                                    <http:headers><![CDATA[#[{'Content-Type': 'application/json', 'X-API-Key': vars.aforoCfg.apiKey}]]]></http:headers>
+                                                                                    <http:response-validator>
+                                                                                        <http:success-status-code-validator values="100..599"/>
+                                                                                    </http:response-validator>
+                                                                                </http:request>
+                                                                                <error-handler>
+                                                                                    <!-- No answer: retried like a 5xx. -->
+                                                                                    <on-error-continue type="HTTP:CONNECTIVITY, HTTP:TIMEOUT" logException="false">
+                                                                                        <set-variable variableName="aforoIngestResponse" value="#[{status: 0, text: '', retryAfter: null, noAnswer: error.description default 'no response'}]"/>
+                                                                                    </on-error-continue>
+                                                                                </error-handler>
+                                                                            </try>
+                                                                            <set-variable variableName="aforoJitter" value="#[random()]"/>
+                                                                            <set-variable variableName="aforoNowMs" value="#[now() as Number {unit: 'milliseconds'}]"/>
+                                                                            <ee:transform>
+                                                                                <ee:variables>
+                                                                                    <ee:set-variable variableName="aforoDelivery"><![CDATA[%dw 2.0
 // aforo-script: delivery
-// The ingestor's answer to one attempt:
-//   202 {"success":true,"data":{"accepted","failed","errors":[{index,message}]}}
-//     an error starting "The event could not be stored" is transient: that
-//     event is re-sent; any other is permanent: logged and dropped
-//   5xx, 408, 429: the whole batch is re-sent
+// The ingestor's answer to one attempt (vars.aforoAttempt, 1-3):
+//   202 {"success":true,"data":{"accepted","failed","errors":[{index,message,retryable}]}}
+//     an error with retryable=true (or, from an older ingestor without the
+//     flag, a message starting "The event could not be stored") is
+//     transient: that event is re-sent; any other is permanent: logged and
+//     dropped. errors[] is read even when "failed" is missing or 0.
+//   no answer, 408, 429 or any 5xx: the whole batch is re-sent
 //   any other status: the ingestor refused the request (key, URL): logged
+// retryDelayMs, the wait before the next attempt (0 when nothing is
+// re-sent): max(Retry-After, random(0, min(MAX_BACKOFF_MS, BASE_MS x
+// 2^attempt))), at most MAX_RETRY_AFTER_MS. Retry-After is read as
+// delta-seconds (fractional allowed) or an HTTP-date; an unreadable value
+// is ignored. vars.aforoJitter (0..1) and vars.aforoNowMs are set by the
+// template just before this script, so the tests can fix them.
 output application/java
 fun str(v) = if (v is String) v else if ((v is Number) or (v is Boolean)) (v as String) else ""
 var TRANSIENT = "The event could not be stored"
+var BASE_MS = 500
+var MAX_BACKOFF_MS = 30000
+var MAX_RETRY_AFTER_MS = 60000
 var pending = dw::Runtime::try(() -> read(str(vars.aforoPendingText), "application/json")).result
 var events = if ((pending is Object) and (pending.events is Array)) pending.events else []
 var resp = vars.aforoIngestResponse
@@ -1524,15 +1639,17 @@ var errors =
   if ((body is Object) and (body.data is Object) and (body.data.errors is Array)) body.data.errors
   else if ((body is Object) and (body.errors is Array)) body.errors
   else []
-var indexed = (errors filter ((e) -> (e is Object) and (e.index is Number))) map ((e) -> {index: e.index, message: str(e.message)})
-var transientIdx = (indexed filter ($.message startsWith TRANSIENT)) map $.index
-var permanent = indexed filter (not ($.message startsWith TRANSIENT))
+var indexed = (errors filter ((e) -> (e is Object) and (e.index is Number)))
+  map ((e) -> {index: e.index, message: str(e.message),
+    transient: if (e.retryable is Boolean) (e.retryable == true) else (str(e.message) startsWith TRANSIENT)})
+var transientIdx = (indexed filter $.transient) map $.index
+var permanent = indexed filter (not $.transient)
 fun describe(i) = do {
   var e = events[i]
   ---
   if (e is Object) (str(e.metricName) ++ " " ++ str(e.idempotencyKey)) else ("event " ++ (i as String))
 }
-var wholeRetry = (status >= 500) or (status == 408) or (status == 429) or (status == 0)
+var wholeRetry = (status == 0) or (status == 408) or (status == 429) or ((status >= 500) and (status <= 599))
 var refusedBatch = (not wholeRetry) and ((status < 200) or (status >= 300))
 var retryEvents =
   if (wholeRetry) events
@@ -1542,39 +1659,62 @@ var refused =
   if (refusedBatch) ["the ingestor refused the batch (HTTP " ++ (status as String) ++ "; check aforo-api-key and aforo-endpoint): " ++
     (do { var t = str(resp.text) --- if (sizeOf(t) > 300) t[0 to 299] else t })]
   else permanent map ((p) -> describe(p.index) ++ ": " ++ p.message)
+var attempt = if ((vars.aforoAttempt is Number) and (vars.aforoAttempt >= 1)) vars.aforoAttempt else 1
+var jitter = if ((vars.aforoJitter is Number) and (vars.aforoJitter >= 0) and (vars.aforoJitter < 1)) vars.aforoJitter else 1
+var nowMs = if (vars.aforoNowMs is Number) vars.aforoNowMs else (now() as Number {unit: "milliseconds"})
+var backoffMs = floor(jitter * min([MAX_BACKOFF_MS, BASE_MS * (2 pow attempt)]))
+var retryAfterText = trim(str(if (resp.retryAfter is Array) resp.retryAfter[0] else resp.retryAfter))
+var retryAfterSeconds = dw::Runtime::try(() -> retryAfterText as Number).result
+var retryAfterAt = dw::Runtime::try(() -> (retryAfterText as DateTime {format: "EEE, dd MMM yyyy HH:mm:ss zzz", locale: "en"}) as Number {unit: "milliseconds"}).result
+var retryAfterMs =
+  if (retryAfterText == "") 0
+  else if (retryAfterSeconds is Number) (if (retryAfterSeconds > 0) ceil(retryAfterSeconds * 1000) else 0)
+  else if (retryAfterAt is Number) max([0, retryAfterAt - nowMs])
+  else 0
 ---
 {
   status: status,
   retryText: if (isEmpty(retryEvents)) null else write({events: retryEvents}, "application/json", {indent: false}),
-  retryReason: if (wholeRetry) ("the ingestor answered HTTP " ++ (status as String))
+  retryDelayMs: if (isEmpty(retryEvents)) 0 else min([MAX_RETRY_AFTER_MS, max([retryAfterMs, backoffMs])]),
+  retryReason: if (status == 0) ("no answer from the ingestor (" ++ (if (str(resp.noAnswer) != "") str(resp.noAnswer) else "no response") ++ ")")
+    else if (wholeRetry) ("the ingestor answered HTTP " ++ (status as String))
     else ((sizeOf(retryEvents) as String) ++ " event(s) could not be stored"),
   refusedLog: if (isEmpty(refused)) null
     else "[aforo-metering] USAGE EVENT REFUSED (permanent, not retried): " ++ (refused joinBy " | ")
 }]]></ee:set-variable>
-                                                                        </ee:variables>
-                                                                    </ee:transform>
-                                                                    <choice>
-                                                                        <when expression="#[vars.aforoDelivery.refusedLog != null]">
-                                                                            <logger level="WARN" message="#[vars.aforoDelivery.refusedLog]"/>
-                                                                        </when>
-                                                                    </choice>
-                                                                    <choice>
-                                                                        <when expression="#[vars.aforoDelivery.retryText != null]">
-                                                                            <os:store key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending">
-                                                                                <os:value>#[vars.aforoDelivery.retryText]</os:value>
-                                                                            </os:store>
-                                                                            <raise-error type="AFORO:DELIVERY_RETRY" description="#[vars.aforoDelivery.retryReason]"/>
+                                                                                </ee:variables>
+                                                                            </ee:transform>
+                                                                            <choice>
+                                                                                <when expression="#[vars.aforoDelivery.refusedLog != null]">
+                                                                                    <logger level="WARN" message="#[vars.aforoDelivery.refusedLog]"/>
+                                                                                </when>
+                                                                            </choice>
+                                                                            <choice>
+                                                                                <when expression="#[vars.aforoDelivery.retryText != null]">
+                                                                                    <os:store key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending">
+                                                                                        <os:value>#[vars.aforoDelivery.retryText]</os:value>
+                                                                                    </os:store>
+                                                                                    <choice>
+                                                                                        <when expression="#[vars.aforoAttempt >= 3]">
+                                                                                            <raise-error type="AFORO:DELIVERY_RETRY" description="#[vars.aforoDelivery.retryReason]"/>
+                                                                                        </when>
+                                                                                    </choice>
+                                                                                </when>
+                                                                                <otherwise>
+                                                                                    <os:remove key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending"/>
+                                                                                </otherwise>
+                                                                            </choice>
                                                                         </when>
                                                                         <otherwise>
-                                                                            <os:remove key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending"/>
+                                                                            <set-variable variableName="aforoDelivery" value="#[{retryText: null, retryDelayMs: 0, retryReason: '', refusedLog: null, status: 0}]"/>
                                                                         </otherwise>
                                                                     </choice>
                                                                 </when>
                                                             </choice>
-                                                        </until-successful>
+                                                        </foreach>
                                                         <error-handler>
                                                             <on-error-continue type="ANY" logException="false">
-                                                                <logger level="WARN" message="#['[aforo-metering] USAGE NOT DELIVERED after 3 attempts (' ++ (error.description default 'unknown error') ++ '): request ' ++ (vars.aforoReq.requestId default '?')]"/>
+                                                                <logger level="WARN" message="#['[aforo-metering] USAGE NOT DELIVERED (' ++ (error.description default 'unknown error') ++ '): request ' ++ (vars.aforoReq.requestId default '?')]"/>
                                                                 <try>
                                                                     <os:remove key="#[vars.aforoReq.requestId]" objectStore="{{{policyId}}}-aforo-pending"/>
                                                                     <error-handler>

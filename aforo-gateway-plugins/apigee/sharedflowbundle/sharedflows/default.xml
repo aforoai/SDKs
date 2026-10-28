@@ -14,6 +14,12 @@
                      The answer is never seen: an event the ingestor does not
                      store (outage, 5xx, a refused key, a per-event "could not
                      be stored") is lost, and nothing is logged.
+    pubsub           AforoMeteringPublish: one Pub/Sub message per call to
+                     KVM pubsub_topic; the Aforo Pub/Sub forwarder batches
+                     the messages to the ingestor and acks after it accepted
+                     them, so an ingestor outage loses nothing. The client
+                     waits for the publish, not for the ingestor. Without
+                     pubsub_topic the flow uses async instead.
     sync             AforoMeteringSendEvent waits for the 202 (1 s to
                      connect, 2 s for the answer), re-sends once what failed
                      transiently (whole batch on no answer / 5xx / 408; just
@@ -35,7 +41,11 @@
     </Step>
     <Step>
         <Name>AforoMeteringSendAsync</Name>
-        <Condition>(aforo.meteringSend = "true") and (private.aforo.deliveryMode != "sync")</Condition>
+        <Condition>(aforo.meteringSend = "true") and (private.aforo.deliveryMode != "sync") and ((private.aforo.deliveryMode != "pubsub") or (private.aforo.pubsubTopic = null))</Condition>
+    </Step>
+    <Step>
+        <Name>AforoMeteringPublish</Name>
+        <Condition>(aforo.meteringSend = "true") and (private.aforo.deliveryMode = "pubsub") and (private.aforo.pubsubTopic != null)</Condition>
     </Step>
     <Step>
         <Name>AforoMeteringSendEvent</Name>

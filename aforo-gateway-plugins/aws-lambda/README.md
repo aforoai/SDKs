@@ -2,9 +2,9 @@
 
 An AWS Lambda function that subscribes to API Gateway CloudWatch access logs, parses each entry, and batch-POSTs usage events to Aforo. It runs off the log stream asynchronously, so it adds nothing to your request path.
 
-**Version:** 2.2.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.4.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
-> Version lives in [`package.json`](package.json) (`"version": "2.2.0"`). It matches the version stated here and in the changelog.
+> Version lives in [`package.json`](package.json) (`"version": "2.4.0"`). It matches the version stated here and in the changelog.
 
 ## Install
 
@@ -13,6 +13,15 @@ There are two ways to deploy it. Both need JSON access logging on the stage, in 
 ### Deploy with SAM
 
 This is a private, SAM-deployed function — `package.json` is `"private": true` and there is no npm package. The function has no dependencies outside the Node.js 20 runtime.
+
+Store the Aforo API key in AWS Secrets Manager first. The function reads it from there (once per container, refreshed every 5 minutes); it is never put in an environment variable.
+
+```bash
+aws secretsmanager create-secret \
+  --name aforo/metering/api-key \
+  --secret-string "$AFORO_API_KEY"
+# Copy the "ARN" from the output.
+```
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
@@ -23,12 +32,16 @@ sam deploy --guided \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides \
     AforoEndpoint=https://api.aforo.ai/v1/ingest/batch \
-    AforoApiKey="$AFORO_API_KEY" \
+    AforoApiKeySecretArn="$AFORO_API_KEY_SECRET_ARN" \
     DefaultMetric=api_calls \
     ApiGatewayLogGroupName=/aws/apigateway/aforo-access-logs
 ```
 
-The template creates the function, the `lambda:InvokeFunction` permission for CloudWatch Logs, a `SubscriptionFilter` (empty filter pattern = all entries) on the named log group, and the SQS failure queue described under "Delivery".
+The template creates the function (arm64, reserved concurrency `ReservedConcurrency`, default 10; `0` reserves none), an IAM policy that lets it read only that secret, the `lambda:InvokeFunction` permission for CloudWatch Logs, a `SubscriptionFilter` on the named log group, the function's log group `/aforo/lambda/aforo-metering` (retention `LogRetentionDays`, default 14), and the SQS failure queue described under "Delivery".
+
+The subscription filter (`AccessLogFilterPattern`) forwards only lines that can bill: entries containing `customerId` or `caller`, and metering-proxy records (`aforoUsage`). Set it to `''` to forward every line while you debug an access-log format; lines without an identity are then counted as `no customerId` in the function's log.
+
+If the secret is encrypted with a customer-managed KMS key, pass its ARN as `SecretsKmsKeyArn`.
 
 ### Deploy from Aforo (one click)
 
@@ -43,7 +56,7 @@ Deploying again updates the code only when it changed and always refreshes the s
 
 Before you deploy:
 
-- **The connection's stack must grant the metering-install permissions.** The role template Aforo serves for the connection has an `AllowMeteringInstall` parameter; leave it at `true`. Stacks created before one-click metering are read-only — update the stack, and the deploy tells you which permission is missing if it isn't there. (The older `aws-cloudformation/aforo-apigateway-role.yaml` in this repo does not carry that parameter.)
+- **The connection's stack must grant the metering-install permissions.** The role template Aforo serves for the connection has an `AllowMeteringInstall` parameter; leave it at `true`. Stacks created before one-click metering are read-only — update the stack, and the deploy tells you which permission is missing if it isn't there. Since 3.0.0, `aws-cloudformation/aforo-apigateway-role.yaml` in this repo is the same template. Its subscription permission covers log groups starting with `/aws/apigateway/` or `API-Gateway-`; for any other access log group, update the stack with `AccessLogGroupPrefix=<log group name>`.
 - **Access logging must be on** for each stage you bill, writing to one log group, in the format below. Aforo does not change your stages. Put the log group's name in the connection's `accessLogGroup` setting (default `/aws/apigateway/aforo-access-logs`).
 
 The one-click install does not create the SQS failure queue. For that, use the SAM template.
@@ -78,7 +91,7 @@ Never used, even if your format logs them: `$context.identity.apiKey` (the API k
 sam deploy \
   --parameter-overrides \
     AforoEndpoint=https://api.aforo.ai/v1/ingest/batch \
-    AforoApiKey="$AFORO_API_KEY" \
+    AforoApiKeySecretArn="$AFORO_API_KEY_SECRET_ARN" \
     DefaultMetric=api_calls \
     MetricMappings='[{"matchType":"PREFIX","value":"/v1/sms","metricName":"sms_sent"}]' \
     ApiGatewayLogGroupName=/aws/apigateway/aforo-access-logs
@@ -93,7 +106,8 @@ The function reads everything from environment variables.
 | Env var | SAM parameter | Default | What it does |
 |---------|---------------|---------|--------------|
 | `AFORO_ENDPOINT` | `AforoEndpoint` | `https://api.aforo.ai/v1/ingest/batch` (template) | Aforo ingestor batch URL. |
-| `AFORO_API_KEY` | `AforoApiKey` | — | Aforo API key, scope `usage:ingest`. Sent as `X-API-Key`, alone — no `Authorization` header (the ingestor answers 401 to one) and no `X-Tenant-Id`. The tenant is derived from the key. |
+| `AFORO_API_KEY_SECRET_ARN` | `AforoApiKeySecretArn` (required) | — | ARN of the Secrets Manager secret holding the Aforo API key, scope `usage:ingest`, as plain text or JSON `{"apiKey":"…"}`. Read once per container and refreshed every 5 minutes; a failed refresh keeps the last value. Until the first read succeeds, a failed read makes the next invocations fail fast for 5 s (doubling to 60 s, with jitter) instead of each waiting up to 3 s on Secrets Manager. Sent as `X-API-Key`, alone — no `Authorization` header (the ingestor answers 401 to one) and no `X-Tenant-Id`. The tenant is derived from the key. If the secret cannot be read on a cold start, the invocation fails and Lambda retries it (nothing is dropped). |
+| `AFORO_API_KEY` | `AforoApiKey` (must be empty) | — | The key as a plain environment variable. Used only when `AFORO_API_KEY_SECRET_ARN` is unset — Aforo's one-click deploy still sets it. The template refuses a non-empty `AforoApiKey` since 2.4.0. With neither set, every invocation fails rather than sending events without a key. |
 | `METRIC_MAPPINGS` | `MetricMappings` | `[]` | JSON array of `{matchType, value, metricName}` rules, first match wins. `matchType` is `EXACT`, `PREFIX` or `CONTAINS` (plain string comparison). Invalid JSON, or an invalid rule, is logged and ignored. |
 | `METRIC_NAME_PATTERN` | `MetricNamePattern` | *(empty)* | Route-shaped template (`{method}`, `{path}`, `{service}`=stage, `{route}`=resource). Applies only when set, to requests no mapping matches. Every resulting name must be a catalog metric, which route-shaped names rarely are. |
 | `DEFAULT_METRIC` | `DefaultMetric` | `api_calls` | Metric for requests that neither a mapping nor the pattern names. |
@@ -102,7 +116,7 @@ The function reads everything from environment variables.
 | `EXCLUDE_STATUS_CODES` | `ExcludeStatusCodes` | `401,403,429` | Status codes that are not metered. A list replaces the default; `none` (or an empty value) meters every status. |
 | `STATUS_OUTCOMES` | `StatusOutcomes` | *(empty)* | `executionStatus` overrides for OUTCOME_BASED pricing, e.g. `404=VALIDATION_FAILED,429=ERROR`. Exact codes 200–599; invalid entries are skipped with a warning; the last duplicate wins. |
 | `CUSTOMER_ID_SOURCE` | `CustomerIdSource` | `consumer` | `consumer`: authorizer `customerId`, then IAM `caller`. `authorizer`: authorizer `customerId` only. Any other value (the long-removed `header` included) behaves as `authorizer` and logs a warning. |
-| `FLUSH_COUNT` | — (`50` in template) | `50` | Max events per POST. Capped at 1000: the ingestor rejects a larger batch with 400. |
+| `FLUSH_COUNT` | `FlushCount` | `500` | Max events per POST (50 before 2.4.0). Capped at 1000: the ingestor rejects a larger batch with 400. |
 | `INCLUDE_METADATA` | — (`true` in template) | `true` | Include request metadata in the event. `false` omits it. |
 | `MCP_ENABLED` | — | `false` | Detect MCP JSON-RPC `tools/call` in a `requestBody` field of an access-log line. Records from `metering-proxy.js` carry their tool calls already and need no flag. |
 | `MCP_METRIC` | `McpMetric` | *(empty → `DEFAULT_METRIC`)* | Metric for MCP tool-call events that no `METRIC_MAPPINGS` rule names. Up to 2.3.0 this was hard-coded `mcp_server.tool_invocations`; set that value to keep it. |
@@ -175,13 +189,29 @@ The 4th argument is the correlation seed — pass the request's stable id. `corr
 
 Both modules authenticate with `X-API-Key` only. `preflight-quota.js` reads the decision from the response's `data` field.
 
+`preflight-quota.js` (`checkPreFlightQuota(config, customerId, metricName)`):
+
+| `config` field | Default | |
+|---|---|---|
+| `preflightUrl` | — | `https://…/api/v1/quota/check`. Not https → fallback. |
+| `apiKey` | — | Sent as `X-API-Key`. Missing → fallback. |
+| `timeoutMs` | `250` | Whole request, including a cold TLS handshake. Was 50. |
+| `preflightFallback` | `ALLOW` | Decision on timeout, network error, non-2xx status or a body without `ALLOW` / `WARN` / `DENY`. Not cached. |
+| `tenantId` | — | Optional; only scopes the local cache. |
+| `allowCacheTtlMs` | `1000` | How long an `ALLOW` / `WARN` is reused. |
+| `cacheMaxEntries` | `5000` | Least recently used entries are dropped. |
+
+Cache entries are keyed by a fingerprint of `apiKey`, `tenantId`, the customer and the metric, so one workspace's `DENY` is never returned for another's key. A `DENY` is reused until the server's `retryAfterMs`, at most 60 s (a wallet top-up unblocks within a minute), or 5 s when the server sent none; a cached `DENY` reports the wait that is left. `build429Response` sets `Retry-After` to `retryAfterMs` rounded up to whole seconds, at least 1. Connections are kept alive between calls.
+
+`margin-guard.js` (`checkMarginGuard(customerId, config)`): calls pricing's `GET /api/v1/margin-guard/quick-check` with `X-API-Key: config.apiKey` (no key → no call, allowed). `marginGuardTimeoutMs` (default 200), `marginGuardCacheTtlMs` (30000; `BLOCK` and a plain `ALLOW` only), `marginGuardCacheMaxEntries` (10000, least recently used dropped). Cache entries are keyed by a fingerprint of the API key and the customer id. Fails open on any error or a body without `verdict`; failures are not cached.
+
 ## Walk me through it
 
 Step by step from `sam deploy` to a verified event in Aforo: [USER_GUIDE.md](USER_GUIDE.md).
 
 ## What this doesn't cover
 
-- **Blocking a request.** This Lambda runs after the response was served. For quota or margin enforcement, deploy `authorizer.js` / `margin-guard.js` as an API Gateway Lambda Authorizer (see [AUTHORIZER.md](AUTHORIZER.md)).
+- **Blocking a request.** This Lambda runs after the response was served. For quota or margin enforcement, deploy `authorizer.js` (needs `AFORO_TENANT_ID` since 2.5.0) / `margin-guard.js` as an API Gateway Lambda Authorizer (see [AUTHORIZER.md](AUTHORIZER.md)).
 - **Routes with only an API Gateway API key.** A usage-plan key alone gives no customer identity this function will use (the key value is a secret). Put an Aforo authorizer on the route (`key-authorizer.js` accepts the customer's Aforo key directly), or use IAM authorization.
 - **Outages longer than the retry window.** `MaximumEventAgeInSeconds: 21600` bounds async retries at 6 hours; past that the record goes to the failure queue (SAM deploy) or is lost (one-click deploy, which has no queue).
 - **gRPC, GraphQL, WebSocket.** An access log does not carry the fields those product types need.
@@ -193,4 +223,4 @@ Step by step from `sam deploy` to a verified event in Aforo: [USER_GUIDE.md](USE
 npm test
 ```
 
-Runs `tests/agent-mcp.test.js` (AI_AGENT / MCP events from proxy records), `tests/metering-proxy.test.js`, `tests/key-authorizer.test.js`, `tests/key-authorizer-jwt.test.js`, `tests/handler.test.js` (delivery, EMF metrics, key stability across redelivery, AGENTIC_API detection, compound `correlationId`, execution status) and `tests/contract.test.js` (wire contract against a local capture server: auth header, identity, metric mappings and precedence, `PRODUCT_TYPE`, `Retry-After`, deadline).
+Runs `tests/authorizer.test.js` (JWT authorizer: tenant pin and required issuer, revocation fails closed, TLS + AUTH, stage-scoped Allow, JWKS refetch limit), `tests/guards.test.js` (`margin-guard.js`, `preflight-quota.js`), `../aws-cloudformation/tests/templates.test.cjs`, `tests/agent-mcp.test.js` (AI_AGENT / MCP events from proxy records), `tests/metering-proxy.test.js`, `tests/key-authorizer.test.js`, `tests/key-authorizer-jwt.test.js`, `tests/handler.test.js` (delivery, EMF metrics, key stability across redelivery, AGENTIC_API detection, compound `correlationId`, execution status) and `tests/contract.test.js` (wire contract against a local capture server: auth header, identity, metric mappings and precedence, `PRODUCT_TYPE`, `Retry-After`, deadline).

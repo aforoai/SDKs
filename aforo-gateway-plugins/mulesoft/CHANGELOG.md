@@ -4,6 +4,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [Unreleased]
 
+## [3.1.0] — 2026-10-28
+
+Wave 6 (W6.5: G359, G361, G362). Configuration properties unchanged; see "Upgrading from 3.0.0" in the user guide. Not yet verified on a live Anypoint org.
+
+### Changed
+- **Delivery retries follow the transport spec** (`aforo-metering-sdks/contract/TRANSPORT-SPEC.md`): full-jitter backoff between attempts (base 500 ms, cap 30 s: a random 0–1 s before attempt 2, 0–2 s before attempt 3) instead of a fixed 2 s; the ingestor's `Retry-After` (delta-seconds, fractional allowed, or an HTTP date; unreadable values ignored) is used when longer, at most 60 s. The wait is an `until-successful` whose `millisBetweenRetries` the delivery script sets, so it runs on the runtime's scheduler and holds no thread. Attempts run in a `foreach` of 3.
+- Per-event `retryable` from the ingestor decides what is re-sent; the "The event could not be stored" message prefix is only the fallback when the flag is absent.
+- Whole-batch retry on no answer, 408, 429 and every 5xx, as the transport spec says; any other status is logged and dropped.
+- A connection error or timeout on the ingest call is caught on that call (`HTTP:CONNECTIVITY`, `HTTP:TIMEOUT`) and retried like a 5xx, with the cause in the log; any other error ends the delivery at once.
+- Log line `USAGE NOT DELIVERED after 3 attempts` is now `USAGE NOT DELIVERED (<reason>)`.
+
+### Documentation
+- README "Not part of this policy": JWT validation is not an Aforo MuleSoft feature (use MuleSoft's JWT Validation policy); compound metering and margin guard are not supported on MuleSoft. The installed policy calls no margin-guard or token-revocation endpoint.
+- README "Delivery": one delivery per API call (a custom policy has no timer to batch calls); the per-call object store entry is in-memory retry state and the backlog count, not a durable queue; 401/403 from the ingestor lose usage; no 413 split.
+
 ## [3.0.0] — 2026-10-22
 
 The MuleSoft path rebuilt to match the Kong plugin (proven in prod) and the Apigee 3.0.0 shared flows. **Breaking**: see "Upgrading from 2.x" in the user guide. Not yet verified on a live Anypoint org.

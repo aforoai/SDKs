@@ -38,6 +38,9 @@
     <Get assignTo="private.aforo.deliveryMode">
         <Key><Parameter>delivery_mode</Parameter></Key>
     </Get>
+    <Get assignTo="private.aforo.pubsubTopic">
+        <Key><Parameter>pubsub_topic</Parameter></Key>
+    </Get>
     <Get assignTo="private.aforo.maxRetries">
         <Key><Parameter>max_retries</Parameter></Key>
     </Get>

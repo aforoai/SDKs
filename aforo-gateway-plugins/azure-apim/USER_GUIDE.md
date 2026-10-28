@@ -1,6 +1,6 @@
 # Aforo Metering — Azure APIM Policy — User Guide
 
-**Version:** 2.2.0 · **Updated:** 2026-10-02 · **Audience:** engineers who own an Azure API Management instance and need gateway-level metering for Aforo billing.
+**Version:** 2.3.0 · **Updated:** 2026-10-27 · **Audience:** engineers who own an Azure API Management instance and need gateway-level metering for Aforo billing.
 
 > These fragments have not been executed on a live APIM instance in this repository. Follow this guide on a non-production instance first and use APIM request tracing to confirm each step. `scripts/verify-on-apim.sh` automates that for the metering fragment.
 
@@ -45,7 +45,7 @@ nv aforo-subscription-customer-map "acme-prod=cust_123;globex=cust_456"         
 nv aforo-product-type "API"
 ```
 
-For JWT identity add `aforo-jwks-uri` (an OpenID discovery document URL — see the README), `aforo-jwt-issuer` and `aforo-org-service-url`.
+For JWT identity add `aforo-jwks-uri` (an OpenID discovery document URL — see the README), `aforo-jwt-issuer`, `aforo-org-service-url` and `aforo-tenant-id` (your Aforo tenant id; a token for any other tenant gets 401 `TENANT_MISMATCH`).
 
 ## Step 2 — Import the fragments
 
@@ -125,16 +125,17 @@ Then the negative cases:
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Policy save fails: named value not found | A referenced Named Value doesn't exist. | `aforo-metering` needs four, `aforo-context` five, `aforo-jwt-validation` three. Create the missing one (`none` for empty). |
+| Policy save fails: named value not found | A referenced Named Value doesn't exist. | `aforo-metering` needs four, `aforo-context` five, `aforo-jwt-validation` five (2.3.0 adds `aforo-api-key` and `aforo-tenant-id`), `aforo-margin-guard` one (`aforo-api-key`). Create the missing one (`none` for empty). |
 | Fragment upload fails with an XML parse error | Uploaded with format `xml`. | Use `rawxml`. |
 | No events at all | No customer resolves. | Path A: the request needs an APIM subscription, or set `aforo-customer-id`. Path B: check the JWT `customer_id` claim or add the subscription id to the map. |
 | The trace shows the send, Aforo shows nothing | The ingestor rejected the event: unknown metric, unknown customer, or a key without `usage:ingest`. `send-one-way-request` discards the response. | Set `aforo-default-metric` to a catalog metric; check the customer exists. |
+| 401 `TENANT_MISMATCH` | The token's `tenant_id` claim is missing or is not `aforo-tenant-id`. | Set `aforo-tenant-id` to your Aforo tenant id; tokens for another tenant are refused on purpose. |
 | 401 on every request after adding JWT validation | `aforo-jwks-uri` is a bare JWKS URL (`openid-config` needs a discovery document), or the issuer does not match. | See the README, "What this does not cover". |
 | MCP requests metered as standard API | `aforo-mcp-enabled` is not `true`, or the request body was not captured in inbound. | Include `aforo-context`, or add the `aforo-mcp-body` line from the README. |
 
 ## What this guide does NOT cover
 
 - APIM provisioning and networking (reachability of the ingestor, org-service and pricing-service from APIM).
-- Retrying or buffering failed sends — `send-one-way-request` is fire-and-forget.
+- Durable delivery. The default direct send is fire-and-forget; Event Hub delivery (README, "Event Hub delivery", and `eventhub-forwarder/README.md`) is the durable option.
 - Fetching metric mappings from the catalog automatically.
 - The optional preflight, margin-guard and compound fragments: see the README, "Optional fragments", and the CHANGELOG for the lines a 2.1.0 install needs.

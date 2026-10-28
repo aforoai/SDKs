@@ -4,6 +4,49 @@ This monorepo ships five gateway metering plugins (Kong, Apigee, AWS Lambda, Azu
 
 ## Unreleased
 
+### Kong 2.8.0 (wave 6)
+
+- New shared dict `aforo_cache` for caches, throttles and counters, so they no longer share `aforo_buffer` with events (falls back with one error per worker when not declared).
+- JWT validation requires `jwt_issuer` (or `jwt_issuer_check_disabled`); new `jwt_audience`.
+- Revocation lookup is one round trip of pipelined `GET`s (one per key, so it works on Redis Cluster proxies and ElastiCache Serverless) with a 250 ms timeout (`jwt_redis_timeout_ms`), AUTH once per connection; Redis TLS for both Redis checks.
+- Pre-flight quota caches DENY until `Retry-After` (max 60 s), has a circuit breaker and sends `estimatedQuantity`.
+- Margin guard sends `X-API-Key`, has its own timeout (`margin_guard_timeout_ms`, default 300 ms; was a fixed 50 ms) and a circuit breaker.
+- `compound-metering.lua` removed (never called by the plugin).
+- Details and upgrade notes: `kong/CHANGELOG.md`.
+
+### Azure APIM 2.3.0 and ARM templates 2.0.0 (wave 6 W6.3: G348, G350, G351, G352, G353, G354)
+
+- Opt-in Event Hub delivery (`aforo-metering-eventhub` fragment + `azure-apim/eventhub-forwarder/` Function and ARM template): batching, retries and checkpoint-after-accept, so an ingest outage delays usage instead of losing it. Direct `send-one-way-request` stays the default; `aforo-metering` now builds its event into `aforo-event-batch` and sends it once.
+- Revocation and margin-guard calls send `X-API-Key` (no more `X-Internal-Call`); revocation, pre-flight and margin guard are cached with a per-key breaker; the subscription-map lookup is cached.
+- JWT tokens are bound to the configured workspace (Named Value `aforo-tenant-id`, now required by `aforo-jwt-validation`): another workspace's token gets 401 `TENANT_MISMATCH`, and `X-Tenant-Id` upstream is always the configured one. Pre-flight DENY cached at most 60 s; pre-flight and margin-guard caches scoped by a hash of the API key.
+- Compound metering never buffers SSE / streaming / oversized responses.
+- ARM deny policy: `denyAction` on delete, APIs/products matched by `fullName`, service matched by tag, assignment included.
+- Not run on a live APIM instance or Azure subscription. Details: `azure-apim/CHANGELOG.md` 2.3.0, `azure-arm-templates/CHANGELOG.md` 2.0.0.
+
+### Apigee 3.1.0 (W6.4): batched, durable delivery through Pub/Sub
+
+- New opt-in `delivery_mode = pubsub` (Apigee X / hybrid): `AforoMeteringPublish` (PublishMessage) writes each call's events to the topic in KVM `pubsub_topic`; without the key the flow falls back to `async`. New `apigee/pubsub-forwarder/` (Cloud Run): pulls the subscription, sends events in batches of up to 500 / 4 MiB with the transport-spec retries, and acks only after the ingestor accepted them; on an outage it nacks and Pub/Sub redelivers. `async` stays the default. See `apigee/CHANGELOG.md` 3.1.0.
+- Docs: Apigee does not check Aforo JWT revocation (no gateway-callable revocation endpoint exists yet). G355 (request-side checks on the PreProxyFlowHook, non-blocking default delivery) and G357 (margin guard) were already closed by 3.0.0.
+
+### MuleSoft 3.1.0 (W6.5)
+
+- **Delivery retries follow the SDK transport spec**: full-jitter backoff (base 500 ms, cap 30 s) instead of a fixed 2 s, `Retry-After` honoured (seconds or HTTP date, at most 60 s), per-event `retryable` decides what is re-sent, whole-batch retry only on no answer / 408 / 429 / 500 / 502 / 503 / 504. The wait is a scheduler-timed `until-successful`, not a sleeping thread. See `mulesoft/CHANGELOG.md`.
+- **Docs**: JWT validation is not an Aforo MuleSoft feature (use MuleSoft's JWT Validation policy); compound metering and margin guard are not supported on MuleSoft; one delivery per API call, with in-memory (not durable) retry state.
+- **CI**: the `mulesoft-policy` workflow builds with the pinned `./mvnw` (Maven 3.9.16); the runner's Maven failed with `NoSuchMethodError` on `DefaultMirrorSelector.add`.
+
+### AWS Lambda 2.5.0 and AWS CloudFormation 3.0.0: fail-closed revocation, scoped IAM
+
+- `authorizer.js`: Redis revocation over TLS with AUTH, fails closed; Allow scoped to the stage; recommended authorizer cache 60 s (was 840 s); unknown-`kid` JWKS refetch at most every 30 s. `margin-guard.js`: bounded LRU cache keyed by tenant key. `preflight-quota.js`: status checked, decisions cached, keep-alive. Details and upgrade steps: `aws-lambda/CHANGELOG.md` 2.5.0.
+- `aws-cloudformation/aforo-apigateway-role.yaml` is now the same file organization-service hosts: API Gateway `GET` only on REST APIs, HTTP APIs and usage plans in one region; API key reads denied; subscription filters only on API Gateway log groups; no API Gateway writes, no log reads. `aforo-monetized-deny-policy.yaml` can attach itself to roles, users and groups. Details: `aws-cloudformation/CHANGELOG.md` 3.0.0.
+
+### AWS Lambda 2.4.0: key in Secrets Manager, capped concurrency, filtered logs
+
+- The Aforo API key and the authorizer's tenant key are read from AWS Secrets Manager (`aws-secret.js`); the SAM template refuses the old plaintext parameters. Reserved concurrency (default 10), batch size 500, access-log filter on billable lines, arm64, log retention. Behaviour changes and upgrade steps: `aws-lambda/CHANGELOG.md` 2.4.0.
+
+### Demo stack
+
+- Kong Admin API listens on the container's loopback and is not published; proxy and frontend ports bind to `127.0.0.1`. The served `tokens.json` no longer carries the ingest key. The generator refuses an `aforo.ai` endpoint unless `DEMO_ALLOW_PRODUCTION=true`.
+
 ### AWS Lambda: AI_AGENT and MCP_SERVER through API Gateway
 
 - **`key-authorizer.js` accepts Aforo client-credential JWTs** (`POST /oauth/token`). RS256 only, verified with Node's `crypto` against the JWKS at `AFORO_JWKS_URL` (cached 1 h, one rate-limited refetch on an unknown `kid`); `exp` / `nbf` / `iat` with 30 s leeway; `iss` == `AFORO_JWT_ISSUER`; `tenant_id` == the new `AFORO_TENANT_ID` (required; unset refuses every JWT). A JWKS failure fails closed (500) and is not cached. The context adds `subscriptionIds`, `agentId` (from the `agent_id` claim) and `authType`. The `sk_live_` / `sk_test_` path is unchanged apart from `authType: "key"`.

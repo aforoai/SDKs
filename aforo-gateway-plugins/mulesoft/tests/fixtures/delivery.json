@@ -3,7 +3,10 @@
   "base": {
     "vars": {
       "aforoPendingText": "{\"events\": [{\"metricName\": \"api_calls\", \"idempotencyKey\": \"k1\", \"quantity\": 1}, {\"metricName\": \"mcp_server.tool_invocations\", \"idempotencyKey\": \"k2\", \"quantity\": 1}, {\"metricName\": \"tokens\", \"idempotencyKey\": \"k3\", \"quantity\": 5}]}",
-      "aforoIngestResponse": null
+      "aforoIngestResponse": null,
+      "aforoAttempt": 1,
+      "aforoJitter": 0.5,
+      "aforoNowMs": 1761609600000
     }
   },
   "cases": [
@@ -273,6 +276,261 @@
         "aforoIngestResponse": {
           "status": 202,
           "text": "<html>"
+        }
+      }
+    },
+    {
+      "name": "per-event retryable=true is re-sent whatever the message says",
+      "expect": {
+        "retryText.#json": {
+          "events": [
+            {
+              "metricName": "tokens",
+              "idempotencyKey": "k3",
+              "quantity": 5
+            }
+          ]
+        },
+        "refusedLog": null,
+        "retryDelayMs": 500
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 202,
+          "text": "{\"success\": true, \"data\": {\"accepted\": 2, \"failed\": 1, \"errors\": [{\"index\": 2, \"message\": \"Database busy\", \"retryable\": true}]}}"
+        }
+      }
+    },
+    {
+      "name": "per-event retryable=false is permanent even with the transient text",
+      "expect": {
+        "retryText": null,
+        "refusedLog": "[aforo-metering] USAGE EVENT REFUSED (permanent, not retried): tokens k3: The event could not be stored (invalid)"
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 202,
+          "text": "{\"success\": true, \"data\": {\"accepted\": 2, \"failed\": 1, \"errors\": [{\"index\": 2, \"message\": \"The event could not be stored (invalid)\", \"retryable\": false}]}}"
+        }
+      }
+    },
+    {
+      "name": "backoff after attempt 1 is full jitter up to 1000 ms",
+      "expect": {
+        "retryDelayMs": 250
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 500,
+          "text": "oops"
+        },
+        "aforoJitter": 0.25,
+        "aforoAttempt": 1
+      }
+    },
+    {
+      "name": "backoff after attempt 2 is full jitter up to 2000 ms",
+      "expect": {
+        "retryDelayMs": 1998
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 503,
+          "text": ""
+        },
+        "aforoJitter": 0.999,
+        "aforoAttempt": 2
+      }
+    },
+    {
+      "name": "Retry-After in seconds wins over a smaller jittered delay",
+      "expect": {
+        "retryDelayMs": 3000
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 429,
+          "text": "",
+          "retryAfter": "3"
+        },
+        "aforoJitter": 0.1
+      }
+    },
+    {
+      "name": "fractional Retry-After seconds",
+      "expect": {
+        "retryDelayMs": 1500
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 429,
+          "text": "",
+          "retryAfter": "1.5"
+        },
+        "aforoJitter": 0.1
+      }
+    },
+    {
+      "name": "Retry-After as an HTTP-date",
+      "expect": {
+        "retryDelayMs": 7000
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 503,
+          "text": "",
+          "retryAfter": "Tue, 28 Oct 2025 00:00:07 GMT"
+        },
+        "aforoJitter": 0.1
+      }
+    },
+    {
+      "name": "Retry-After in the past means 0: the jittered delay is used",
+      "expect": {
+        "retryDelayMs": 100
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 503,
+          "text": "",
+          "retryAfter": "Mon, 27 Oct 2025 00:00:00 GMT"
+        },
+        "aforoJitter": 0.1
+      }
+    },
+    {
+      "name": "Retry-After is capped at 60 s",
+      "expect": {
+        "retryDelayMs": 60000
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 429,
+          "text": "",
+          "retryAfter": "3600"
+        },
+        "aforoJitter": 0.1
+      }
+    },
+    {
+      "name": "an unreadable Retry-After is ignored",
+      "expect": {
+        "retryDelayMs": 100
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 429,
+          "text": "",
+          "retryAfter": "soon"
+        },
+        "aforoJitter": 0.1
+      }
+    },
+    {
+      "name": "no answer (connection or timeout): the whole batch is re-sent, the reason is named",
+      "expect": {
+        "retryText.#json": {
+          "events": [
+            {
+              "metricName": "api_calls",
+              "idempotencyKey": "k1",
+              "quantity": 1
+            },
+            {
+              "metricName": "mcp_server.tool_invocations",
+              "idempotencyKey": "k2",
+              "quantity": 1
+            },
+            {
+              "metricName": "tokens",
+              "idempotencyKey": "k3",
+              "quantity": 5
+            }
+          ]
+        },
+        "retryReason": "no answer from the ingestor (Remotely closed)"
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 0,
+          "text": "",
+          "noAnswer": "Remotely closed"
+        }
+      }
+    },
+    {
+      "name": "HTTP 501: every 5xx is retryable, the whole batch is re-sent",
+      "expect": {
+        "retryText.#json": {
+          "events": [
+            {
+              "metricName": "api_calls",
+              "idempotencyKey": "k1",
+              "quantity": 1
+            },
+            {
+              "metricName": "mcp_server.tool_invocations",
+              "idempotencyKey": "k2",
+              "quantity": 1
+            },
+            {
+              "metricName": "tokens",
+              "idempotencyKey": "k3",
+              "quantity": 5
+            }
+          ]
+        },
+        "retryReason": "the ingestor answered HTTP 501",
+        "refusedLog": null
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 501,
+          "text": "not implemented"
+        }
+      }
+    },
+    {
+      "name": "HTTP 505: every 5xx is retryable, the whole batch is re-sent",
+      "expect": {
+        "retryText.#json": {
+          "events": [
+            {
+              "metricName": "api_calls",
+              "idempotencyKey": "k1",
+              "quantity": 1
+            },
+            {
+              "metricName": "mcp_server.tool_invocations",
+              "idempotencyKey": "k2",
+              "quantity": 1
+            },
+            {
+              "metricName": "tokens",
+              "idempotencyKey": "k3",
+              "quantity": 5
+            }
+          ]
+        },
+        "retryReason": "the ingestor answered HTTP 505",
+        "refusedLog": null
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 505,
+          "text": "http version not supported"
+        }
+      }
+    },
+    {
+      "name": "nothing to re-send: no delay",
+      "expect": {
+        "retryDelayMs": 0
+      },
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 202,
+          "text": "{\"success\": true, \"data\": {\"accepted\": 3, \"failed\": 0, \"errors\": []}}"
         }
       }
     }

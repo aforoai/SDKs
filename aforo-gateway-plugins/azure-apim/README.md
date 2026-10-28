@@ -2,7 +2,7 @@
 
 Policy fragments that send one usage event to Aforo after each API response: standard API calls, AGENTIC_API calls (W3C `traceparent`) and MCP `tools/call` invocations. Optional fragments add JWT validation, a pre-flight quota check, margin guard and compound metering.
 
-**Version:** 2.2.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.3.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 2.2.0 merges two lines of work: the working repository (APIM-valid fragments, `executionStatus`, exclusions, frozen idempotency keys) and public release 2.1.0 (verified customer identity, metric mappings, `productType`). An install made from either one keeps working; see [CHANGELOG.md](CHANGELOG.md) for the two cases that need a line added.
 
@@ -18,6 +18,8 @@ Policy fragments that send one usage event to Aforo after each API response: sta
 | `preflight-quota-policy-fragment.xml` | `aforo-preflight` | inbound | Optional. |
 | `margin-guard-policy-fragment.xml` | `aforo-margin-guard` | inbound | Optional. |
 | `compound-metering-policy-fragment.xml` | `aforo-compound-metering` | outbound | Optional. |
+| `eventhub-delivery-policy-fragment.xml` | `aforo-metering-eventhub` | outbound, after `aforo-metering` (and `aforo-compound-metering`) | Optional (2.3.0). Event Hub delivery; needs the APIM logger `aforo-metering-logger`. |
+| `eventhub-forwarder/` | — | Azure Function | With Event Hub delivery. Reads the hub and sends to the ingestor. |
 
 `policy-fragment.xml` (an older body registered under the same id `aforo-metering`; it sends no `executionStatus`) and `mcp-policy-fragment.xml` (a fragment that included another fragment, which APIM does not allow) are removed. If you imported `policy-fragment.xml`, replace it with `outbound-policy.xml`.
 
@@ -32,7 +34,7 @@ Policy fragments that send one usage event to Aforo after each API response: sta
 | `aforo-mcp-enabled` | `true` to detect MCP `tools/call` requests, otherwise `false` |
 | `aforo-mcp-product-id` | Aforo product ID for the MCP server; `none` when MCP detection is off |
 
-`aforo-tenant-id` is no longer referenced by `aforo-metering` and no `X-Tenant-Id` header goes to the ingestor. An existing Named Value of that name is ignored.
+`aforo-tenant-id` is no longer referenced by `aforo-metering` and no `X-Tenant-Id` header goes to the ingestor. Since 2.3.0 `aforo-jwt-validation` requires it (see below); the other fragments do not read it.
 
 ## Install
 
@@ -189,16 +191,57 @@ The three below read **context variables**, like `aforo-metering`. Release 2.1.0
 |---|---|
 | `aforo-compound-metering` | `aforo-compound-enabled` (`true`), `aforo-compound-extraction-paths`, `aforo-compound-dimension-paths`, `aforo-ingestor-url` (`https://api.aforo.ai`). Paths are a JSON object (`{"$.usage.prompt_tokens":"input-tokens"}`) or `jsonPath=metricName` pairs separated by `;`. `correlationId` is the APIM request id. |
 | `aforo-preflight` | `aforo-preflight-enabled` (`true`), `aforo-preflight-url` (`https://api.aforo.ai/api/v1/quota/check`), `aforo-preflight-fallback` (`ALLOW` or `DENY`, used when the check times out, errors or answers anything but 200). Timeout is 1 second. |
-| `aforo-margin-guard` | `aforo-margin-guard-enabled` (`true`), `aforo-margin-guard-url` (pricing-service base URL), `aforo-tenant-id` (used when the JWT has no `tenant_id`). |
+| `aforo-margin-guard` | `aforo-margin-guard-enabled` (`true`), `aforo-margin-guard-url` (pricing-service base URL). No tenant is read: pricing answers for the API key's tenant. |
 
 All three use the same customer rule as `aforo-metering` (`aforo-customer-id`, else the subscription id; margin guard also accepts the verified JWT's `customer_id` / `sub`). None is sent or checked for `OPTIONS` or without a customer. Compound and preflight send `X-API-Key` from the context variable `aforo-api-key` when it exists, else from the Named Value `aforo-api-key`.
 
-`aforo-jwt-validation` references three Named Values, which must exist: `aforo-jwks-uri`, `aforo-jwt-issuer`, `aforo-org-service-url` (org-service base URL reachable from APIM, for the jti revocation check; it was a hardcoded docker-compose hostname before 2.1.0). The revocation check fails open after 2 seconds.
+`aforo-jwt-validation` references four Named Values, which must exist: `aforo-jwks-uri`, `aforo-jwt-issuer`, `aforo-org-service-url` (org-service base URL reachable from APIM, for the jti revocation check; it was a hardcoded docker-compose hostname before 2.1.0) and, since 2.3.0, `aforo-api-key` and `aforo-tenant-id` (each unless the context variable of the same name is set). The revocation check fails open after 2 seconds unless `aforo-jti-check-fallback` is `DENY` (then 503).
+
+Tenant binding (2.3.0): every tenant's Aforo JWTs are signed with the same key, so the fragment also requires the token's `tenant_id` claim to equal `aforo-tenant-id`. A token without the claim, or for another tenant, gets 401 `{"error":"invalid_token","error_description":"TENANT_MISMATCH"}` (Kong's answer), and so does every token when the configured tenant is empty. The `X-Tenant-Id` sent upstream is always the configured tenant. Before 2.3.0 tenant A's token was accepted on tenant B's APIM, forwarded with `X-Tenant-Id: A`, and metered with B's key for A's customer.
+
+### Caching and breakers (2.3.0)
+
+The three checks that run before the backend — revocation (`aforo-jwt-validation`), pre-flight quota (`aforo-preflight`) and margin guard (`aforo-margin-guard`) — keep their answer in the APIM cache, so most requests make no outbound call, and stop calling for a while when the service does not answer. One cache entry per token (revocation) or per API key and customer (pre-flight, margin guard) holds both the answer and the breaker state. The API key part is the first 22 characters of the base64 SHA-256 of the key (never the key itself): the ingestor and pricing answer for the key's tenant, so instances with different keys that share an external cache never read each other's answers.
+
+| Fragment | Kept | Breaker | Settings (context variables) |
+|---|---|---|---|
+| `aforo-jwt-validation` | not revoked: 30 s; revoked: until `exp` (max 24 h) | 3 failures, then 30 s without a call | `aforo-jti-cache-seconds`, `aforo-jti-breaker-failures`, `aforo-jti-breaker-seconds`, `aforo-jti-check-fallback` (`ALLOW` default / `DENY`), `aforo-jti-check-enabled` |
+| `aforo-preflight` | ALLOW / WARN: 5 s; DENY: until the ingestor's `retryAfterMs` (5 s if none, max 60 s, so a wallet top-up unblocks within a minute; as Kong 2.8.0), sent as `Retry-After` | 3 failures, then 30 s without a call | `aforo-preflight-cache-seconds`, `aforo-preflight-breaker-failures`, `aforo-preflight-breaker-seconds` |
+| `aforo-margin-guard` | answer: 30 s | 3 failures, then 30 s without a call | `aforo-margin-guard-cache-seconds`, `aforo-margin-guard-breaker-failures`, `aforo-margin-guard-breaker-seconds` |
+
+While a breaker is open each fragment applies its existing no-answer rule: revocation and margin guard let the request through (revocation answers 503 with `aforo-jti-check-fallback=DENY`), pre-flight applies `aforo-preflight-fallback`. A cache time of `0` asks every time; DENY and revoked answers are always kept. A revocation therefore takes effect within `aforo-jti-cache-seconds`.
+
+`aforo-context` caches the subscription-map lookup the same way (`aforo-customer-map-cache-seconds`, default 300; `aforo-customer-map-version` to force a refresh). The map itself is one Named Value of at most 4096 characters, about 100 subscriptions. For more, set `aforo-customer-id` with `set-variable` in each product's policy (one product policy covers every subscription to it), or issue Aforo JWTs carrying `customer_id`.
+
+The Consumption tier has no built-in cache: configure an external Redis cache for the instance, otherwise every lookup misses and each request calls, as in 2.2.0.
+
+### Event Hub delivery (2.3.0)
+
+`send-one-way-request` has no retry: an ingest 5xx or 429 loses that request's event. For delivery that survives an ingest outage, set `aforo-delivery-mode` to `eventhub` and include `aforo-metering-eventhub` (`eventhub-delivery-policy-fragment.xml`) after `aforo-metering` (and after `aforo-compound-metering` when you use it). The policy then writes each event to Event Hub with `log-to-eventhub`, and the forwarder Function in `eventhub-forwarder/` batches the events (up to 500 per request), retries with back-off and `Retry-After`, and moves its Event Hub checkpoint only after the ingestor accepts. Events wait in the hub (up to 7 days on the Standard tier) while the ingestor is down. Setup: `eventhub-forwarder/README.md`.
+
+```xml
+<inbound>
+    <base />
+    <set-variable name="aforo-delivery-mode" value="eventhub" />
+</inbound>
+<outbound>
+    <base />
+    <include-fragment fragment-id="aforo-metering" />
+    <include-fragment fragment-id="aforo-metering-eventhub" />
+</outbound>
+```
+
+Without `aforo-delivery-mode`, nothing changes: `aforo-metering` sends directly, as in 2.2.0, and needs no logger.
+
+### Streaming responses (2.3.0)
+
+`aforo-compound-metering` reads the response body. It no longer does so for `text/event-stream`, `*ndjson*` / `*stream*` content types, chunked responses without a `Content-Length` that are not JSON, or bodies over `aforo-compound-max-body-bytes` (default 1 MiB); it sends nothing for them and writes a trace. Token counts of streamed LLM responses have to come from the backend or an SDK. `aforo-metering` never reads the response body.
 
 ## What this does not cover
 
 - The response body is never read by `aforo-metering`, so an MCP call that returns a JSON-RPC `error` inside a 2xx is classified from the HTTP status alone.
-- There is no retry: `send-one-way-request` reports no failure. A request whose ingest call fails, or whose event the ingestor rejects (unknown metric, unknown customer), is not metered and APIM logs nothing. Retrying would mean `send-request`, which waits for the ingestor before the client gets its response.
+- In the default direct mode there is no retry: `send-one-way-request` reports no failure. A request whose ingest call fails, or whose event the ingestor rejects (unknown metric, unknown customer), is not metered and APIM logs nothing. Retrying would mean `send-request`, which waits for the ingestor before the client gets its response. Use Event Hub delivery (above) when that matters.
+- The revocation check calls org-service `GET /api/v1/public/gateway/token-status` and the margin guard calls pricing `GET /api/v1/margin-guard/quick-check`. Both are public endpoints authenticated by the Aforo API key (`X-API-Key`); each takes the tenant from the key. They need org-service and pricing builds that serve them (see the CHANGELOG 2.3.0); against older builds the checks get no answer and fail open, and the breakers keep that cheap.
 - `openid-config` in `aforo-jwt-validation` expects an OpenID Connect discovery document, not a bare JWKS URL. If Aforo serves only a JWKS for your tenant, `validate-jwt` loads no keys; confirm before you enable it.
 - Metric mappings are not fetched from the catalog. Keep `aforo-metric-mappings` in step with it by hand or by automation.
 - Self-hosted and workspace gateways (see the rules table above).
@@ -207,6 +250,8 @@ All three use the same customer rule as `aforo-metering` (`aforo-customer-id`, e
 
 ```bash
 node azure-apim/tests/policy.test.cjs
+node azure-arm-templates/tests/deny-policy.test.cjs
+cd azure-apim/eventhub-forwarder && npm test   # needs aforo-metering-sdks/mock-ingestor (AFORO_MOCK_INGESTOR)
 ```
 
 There is no local APIM runtime. The test checks every `.xml` file is well formed and follows the fragment rules (no section element, no nested fragment, no XML entity inside an expression, no `//` comment inside an attribute expression, uploaded part under 16 KiB), runs the decision expressions from the shipped files against a mock `context` (exclusions, outcome table, customer, metric mappings, MCP detection, product type, and the `aforo-context` resolution), and locks the send gates, the Named Values each file references and the idempotency keys.

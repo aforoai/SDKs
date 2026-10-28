@@ -6,6 +6,25 @@ This bundle ships on the Aforo gateway-plugins line; the whole repo is versioned
 
 ## [Unreleased]
 
+## [3.1.0] — 2026-10-28
+
+Wave 6 W6.4 (G355, G356, G357, G358). No breaking change: redeploy both bundles; the flow hooks stay as they are.
+
+### Added
+- **`delivery_mode = pubsub`** (Apigee X / hybrid, opt-in; G358): `AforoMeteringPublish` (PublishMessage) writes each call's events to the topic in the new KVM key `pubsub_topic`. Without the key the flow uses `async`. The shared flow must be deployed with a service account that has `roles/pubsub.publisher`.
+- **`pubsub-forwarder/`**: a Cloud Run service that reads a pull subscription, sends the events in batches of up to 500 events / 4 MiB, honours `Retry-After`, splits on 413, re-sends per-event `retryable` errors with the same keys, and acks a message only after the ingestor accepted or permanently rejected it. On an outage it nacks (Pub/Sub redelivers) and pauses with a jittered breaker. Same delivery logic as the Azure Event Hub forwarder.
+- Tests: three pubsub flow tests and two fallback ones; static checks that request-side checks stay in `aforo-access`, that only `sync` waits for the ingestor, the PublishMessage wiring, and that no file claims a jti check; 31 forwarder tests (mock ingestor and a fake subscription), run by `run-all.cjs`.
+
+### Fixed
+- `pubsub-forwarder` reads the ingestor's answer up to 256 KiB and stops there (it used to buffer the whole body). A 2xx answer over the cap is retried with the same keys instead of being counted as accepted.
+
+### Docs
+- Token revocation (G356): the docs now say that a revoked Aforo JWT is not checked on Apigee. No Aforo service offers a gateway-callable revocation lookup yet, so nothing is wired.
+
+### Already fixed in 3.0.0 (recorded here for the wave 6 review)
+- G355: JWT validation and the quota check run in `aforo-access` (PreProxyFlowHook); `async` is the default, so metering never holds the response unless `sync` is chosen.
+- G357: margin guard was removed from the Apigee flows, so its uncached, unauthenticated call is gone.
+
 ## [3.0.0] — 2026-10-21
 
 The Apigee path rebuilt to match the Kong plugin. There are now two shared flows: `aforo-access` (new, PreProxyFlowHook) and `aforo-metering` (PostProxyFlowHook). This repo is again the single source of truth; it starts from org-service's newer bundled copy (aforo-gateway-plugins@04f5165) and the unmerged `sync/gateway-plugins-2026-10-02` work. **Breaking**: see "Upgrading from 2.x" in the user guide. Not yet verified on a live Apigee org.

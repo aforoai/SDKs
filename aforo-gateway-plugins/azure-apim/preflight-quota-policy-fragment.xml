@@ -36,6 +36,27 @@
     Skipped for OPTIONS, when no customer resolves, and when
     aforo-preflight-url is empty. aforo-preflight-timeout-ms was documented
     in earlier releases and never read; it has no effect.
+
+    Cache and breaker (2.3.0). The answer is kept in the APIM cache under
+    "aforo:pf:<scope>:<customer>", so most requests make no call at all.
+    <scope> is the first 22 characters of the base64 SHA-256 of the Aforo
+    API key: the ingestor answers for the key's tenant, so two instances
+    (or APIs) with different keys sharing one external cache never read
+    each other's answer, and the key itself is not in the cache key.
+      ALLOW / WARN  kept for aforo-preflight-cache-seconds (default 5; "0"
+                    = ask every time)
+      DENY          kept until the ingestor's retryAfterMs runs out (5 s
+                    when it sends none, at most 60 s, so a wallet top-up
+                    unblocks within a minute; same as Kong 2.8.0). The 429
+                    carries the time left as Retry-After.
+      no answer     (timeout, error, non-200) counts a failure. After
+                    aforo-preflight-breaker-failures failures in a row
+                    (default 3) the breaker opens: no call for
+                    aforo-preflight-breaker-seconds (default 30) and the
+                    fallback decision applies. One answer closes it.
+    The breaker is per customer, kept in the same cache entry.
+    Consumption tier: configure an external Redis cache for the instance;
+    without one, lookups miss and every request asks, as in 2.2.0.
 -->
 <fragment>
     <set-variable name="aforo-preflight-customer" value="@{
@@ -48,57 +69,137 @@
     }" />
     <choose>
         <when condition="@(context.Variables.GetValueOrDefault<string>("aforo-preflight-enabled", "false") == "true" && context.Request.Method != "OPTIONS" && Convert.ToString(context.Variables["aforo-preflight-customer"]).Length > 0 && context.Variables.GetValueOrDefault<string>("aforo-preflight-url", "").Trim().Length > 0)">
-            <send-request mode="new" response-variable-name="preflightResponse" timeout="1" ignore-error="true">
-                <set-url>@(context.Variables.GetValueOrDefault<string>("aforo-preflight-url", "").Trim())</set-url>
-                <set-method>POST</set-method>
-                <set-header name="Content-Type" exists-action="override">
-                    <value>application/json</value>
-                </set-header>
-                <set-header name="X-API-Key" exists-action="override">
-                    <value>@(context.Variables.ContainsKey("aforo-api-key") ? Convert.ToString(context.Variables["aforo-api-key"]) : "{{aforo-api-key}}")</value>
-                </set-header>
-                <set-body>@{
-                    var body = new JObject();
-                    body["customerId"] = Convert.ToString(context.Variables["aforo-preflight-customer"]);
-                    return body.ToString(Newtonsoft.Json.Formatting.None);
-                }</set-body>
-            </send-request>
-
+            <set-variable name="aforo-preflight-scope" value="@{
+                var k = context.Variables.ContainsKey("aforo-api-key") ? Convert.ToString(context.Variables["aforo-api-key"]) : "{{aforo-api-key}}";
+                if (k == null) { k = ""; }
+                var h = System.Security.Cryptography.SHA256.Create().ComputeHash(System.Text.Encoding.UTF8.GetBytes(k));
+                return Convert.ToBase64String(h).Substring(0, 22);
+            }" />
+            <cache-lookup-value key="@("aforo:pf:" + Convert.ToString(context.Variables["aforo-preflight-scope"]) + ":" + Convert.ToString(context.Variables["aforo-preflight-customer"]))" variable-name="aforo-preflight-cached" />
+            <set-variable name="aforo-preflight-now" value="@(DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString())" />
+            <set-variable name="aforo-preflight-limits" value="@{
+                var names = "aforo-preflight-cache-seconds,aforo-preflight-breaker-failures,aforo-preflight-breaker-seconds".Split(',');
+                var defs = "5,3,30".Split(',');
+                var res = "";
+                var i = 0;
+                foreach (var n in names) {
+                    var v = context.Variables.ContainsKey(n) ? Convert.ToString(context.Variables[n]) : "";
+                    if (v == null) { v = ""; }
+                    v = v.Trim();
+                    var ok = i == 0 ? System.Text.RegularExpressions.Regex.IsMatch(v, "^[0-9]{1,5}$") : System.Text.RegularExpressions.Regex.IsMatch(v, "^[1-9][0-9]{0,4}$");
+                    res = res + (i == 0 ? "" : ",") + (ok ? v : defs[i]);
+                    i = i + 1;
+                }
+                return res;
+            }" />
+            <set-variable name="aforo-preflight-call" value="@{
+                var c = context.Variables.ContainsKey("aforo-preflight-cached") ? Convert.ToString(context.Variables["aforo-preflight-cached"]) : "";
+                if (c == null || c.Length == 0) { return "true"; }
+                if (!c.StartsWith("F:", StringComparison.Ordinal)) { return "false"; }
+                if (!System.Text.RegularExpressions.Regex.IsMatch(c, "^F:[0-9]{1,5}$")) { return "true"; }
+                var lim = Convert.ToString(context.Variables["aforo-preflight-limits"]).Split(',');
+                return Convert.ToInt32(c.Substring(2)) < Convert.ToInt32(lim[1]) ? "true" : "false";
+            }" />
             <choose>
-                <when condition="@(context.Variables.ContainsKey("preflightResponse"))">
-                    <set-variable name="preflightDecision" value="@{
-                        var fallback = context.Variables.GetValueOrDefault<string>("aforo-preflight-fallback", "ALLOW").Trim().ToUpperInvariant() == "DENY" ? "DENY" : "ALLOW";
-                        try {
-                            var response = ((IResponse)context.Variables["preflightResponse"]);
-                            if (response == null || response.StatusCode != 200) { return fallback; }
-                            var body = response.Body.As<JObject>();
-                            /* The ingestor wraps every 2xx as success + data + meta. */
-                            var data = body["data"] ?? body;
-                            return data["decision"]?.ToString() ?? "ALLOW";
-                        } catch {
-                            return fallback;
-                        }
-                    }" />
-
-                    <choose>
-                        <when condition="@(context.Variables.GetValueOrDefault<string>("preflightDecision") == "DENY")">
-                            <return-response>
-                                <set-status code="429" reason="Too Many Requests" />
-                                <set-header name="Content-Type" exists-action="override">
-                                    <value>application/json</value>
-                                </set-header>
-                                <set-header name="Retry-After" exists-action="override">
-                                    <value>60</value>
-                                </set-header>
-                                <set-body>{"message": "Rate limit exceeded"}</set-body>
-                            </return-response>
-                        </when>
-                        <when condition="@(context.Variables.GetValueOrDefault<string>("preflightDecision") == "WARN")">
-                            <set-header name="X-RateLimit-Warning" exists-action="override">
-                                <value>approaching-limit</value>
-                            </set-header>
-                        </when>
-                    </choose>
+                <when condition="@(Convert.ToString(context.Variables["aforo-preflight-call"]) == "true")">
+                    <send-request mode="new" response-variable-name="preflightResponse" timeout="1" ignore-error="true">
+                        <set-url>@(context.Variables.GetValueOrDefault<string>("aforo-preflight-url", "").Trim())</set-url>
+                        <set-method>POST</set-method>
+                        <set-header name="Content-Type" exists-action="override">
+                            <value>application/json</value>
+                        </set-header>
+                        <set-header name="X-API-Key" exists-action="override">
+                            <value>@(context.Variables.ContainsKey("aforo-api-key") ? Convert.ToString(context.Variables["aforo-api-key"]) : "{{aforo-api-key}}")</value>
+                        </set-header>
+                        <set-body>@{
+                            var body = new JObject();
+                            body["customerId"] = Convert.ToString(context.Variables["aforo-preflight-customer"]);
+                            return body.ToString(Newtonsoft.Json.Formatting.None);
+                        }</set-body>
+                    </send-request>
+                </when>
+            </choose>
+            <set-variable name="aforo-preflight-answer" value="@{
+                if (Convert.ToString(context.Variables["aforo-preflight-call"]) != "true") { return ""; }
+                try {
+                    var response = context.Variables.ContainsKey("preflightResponse") ? (IResponse)context.Variables["preflightResponse"] : null;
+                    if (response == null || response.StatusCode != 200) { return "UNAVAILABLE"; }
+                    var body = response.Body.As<JObject>();
+                    /* The ingestor wraps every 2xx as success + data + meta. */
+                    var data = body["data"] ?? body;
+                    var decision = (data["decision"]?.ToString() ?? "ALLOW").Trim().ToUpperInvariant();
+                    if (decision != "DENY") { return decision == "WARN" ? "WARN" : "ALLOW"; }
+                    var raw = data["retryAfterMs"];
+                    long ms = raw != null && raw.Type == JTokenType.Integer ? (long)raw : 5000;
+                    var seconds = (ms + 999) / 1000;
+                    if (seconds < 1) { seconds = 1; }
+                    if (seconds > 60) { seconds = 60; }
+                    return "DENY|" + seconds;
+                } catch {
+                    return "UNAVAILABLE";
+                }
+            }" />
+            <set-variable name="aforo-preflight-state" value="@{
+                if (Convert.ToString(context.Variables["aforo-preflight-call"]) != "true") { return ""; }
+                var a = Convert.ToString(context.Variables["aforo-preflight-answer"]);
+                var lim = Convert.ToString(context.Variables["aforo-preflight-limits"]).Split(',');
+                if (a == "ALLOW" || a == "WARN") { return lim[0] == "0" ? "" : "D:" + a + "|" + lim[0]; }
+                if (a.StartsWith("DENY|", StringComparison.Ordinal)) {
+                    var s = Convert.ToInt64(a.Substring(5));
+                    return "D:DENY:" + (Convert.ToInt64(Convert.ToString(context.Variables["aforo-preflight-now"])) + s) + "|" + s;
+                }
+                var c = context.Variables.ContainsKey("aforo-preflight-cached") ? Convert.ToString(context.Variables["aforo-preflight-cached"]) : "";
+                if (c == null) { c = ""; }
+                var n = 1;
+                if (System.Text.RegularExpressions.Regex.IsMatch(c, "^F:[0-9]{1,5}$")) { n = Convert.ToInt32(c.Substring(2)) + 1; }
+                return (n >= Convert.ToInt32(lim[1]) ? "OPEN" : "F:" + n) + "|" + lim[2];
+            }" />
+            <choose>
+                <when condition="@(Convert.ToString(context.Variables["aforo-preflight-state"]).Length > 0)">
+                    <cache-store-value key="@("aforo:pf:" + Convert.ToString(context.Variables["aforo-preflight-scope"]) + ":" + Convert.ToString(context.Variables["aforo-preflight-customer"]))" value="@{ var s = Convert.ToString(context.Variables["aforo-preflight-state"]); return s.Substring(0, s.LastIndexOf("|")); }" duration="@{ var s = Convert.ToString(context.Variables["aforo-preflight-state"]); return Convert.ToInt32(s.Substring(s.LastIndexOf("|") + 1)); }" />
+                </when>
+            </choose>
+            <set-variable name="preflightDecision" value="@{
+                var fallback = context.Variables.GetValueOrDefault<string>("aforo-preflight-fallback", "ALLOW").Trim().ToUpperInvariant() == "DENY" ? "DENY" : "ALLOW";
+                var a = Convert.ToString(context.Variables["aforo-preflight-answer"]);
+                if (Convert.ToString(context.Variables["aforo-preflight-call"]) == "true") {
+                    if (a == "ALLOW" || a == "WARN") { return a; }
+                    return a.StartsWith("DENY|", StringComparison.Ordinal) ? "DENY" : fallback;
+                }
+                var c = context.Variables.ContainsKey("aforo-preflight-cached") ? Convert.ToString(context.Variables["aforo-preflight-cached"]) : "";
+                if (c == null) { c = ""; }
+                if (c.StartsWith("D:DENY:", StringComparison.Ordinal)) { return "DENY"; }
+                if (c == "D:WARN") { return "WARN"; }
+                if (c == "D:ALLOW") { return "ALLOW"; }
+                return fallback;
+            }" />
+            <set-variable name="aforo-preflight-retry-after" value="@{
+                var a = Convert.ToString(context.Variables["aforo-preflight-answer"]);
+                if (a != null && a.StartsWith("DENY|", StringComparison.Ordinal)) { return a.Substring(5); }
+                var c = context.Variables.ContainsKey("aforo-preflight-cached") ? Convert.ToString(context.Variables["aforo-preflight-cached"]) : "";
+                if (c != null && System.Text.RegularExpressions.Regex.IsMatch(c, "^D:DENY:[0-9]{1,12}$")) {
+                    var left = Convert.ToInt64(c.Substring(7)) - Convert.ToInt64(Convert.ToString(context.Variables["aforo-preflight-now"]));
+                    return left < 1 ? "1" : left.ToString();
+                }
+                return "60";
+            }" />
+            <choose>
+                <when condition="@(context.Variables.GetValueOrDefault<string>("preflightDecision") == "DENY")">
+                    <return-response>
+                        <set-status code="429" reason="Too Many Requests" />
+                        <set-header name="Content-Type" exists-action="override">
+                            <value>application/json</value>
+                        </set-header>
+                        <set-header name="Retry-After" exists-action="override">
+                            <value>@(Convert.ToString(context.Variables["aforo-preflight-retry-after"]))</value>
+                        </set-header>
+                        <set-body>{"message": "Rate limit exceeded"}</set-body>
+                    </return-response>
+                </when>
+                <when condition="@(context.Variables.GetValueOrDefault<string>("preflightDecision") == "WARN")">
+                    <set-header name="X-RateLimit-Warning" exists-action="override">
+                        <value>approaching-limit</value>
+                    </set-header>
                 </when>
             </choose>
         </when>

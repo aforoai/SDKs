@@ -55,10 +55,54 @@
   Values must not contain double quotes or backslashes: they are substituted
   into C# string literals.
 
+  Subscription map cache (2.3.0). When the customer comes from the map, the
+  result (or "not in the map") is kept in the APIM cache under
+  "aforo:cust:<version>:<map length>:<subscription id>" for
+  aforo-customer-map-cache-seconds (default 300; "0" = parse every time).
+  Changing the map usually changes its length and so the key; for an edit
+  that keeps the length, raise the context variable
+  aforo-customer-map-version (default "1") or wait out the TTL.
+  Consumption tier: without an external Redis cache every request parses.
+
+  The map is one Named Value (at most 4096 characters, about 100
+  subscriptions). For more, set aforo-customer-id per product or per API
+  with set-variable (a product policy covers every subscription to that
+  product), or issue Aforo JWTs carrying customer_id.
+
   The expressions stay inside the subset azure-apim/tests/policy.test.cjs
   can run (var, foreach, if; no lambdas, no null-conditional operators).
 -->
 <fragment>
+    <set-variable name="aforo-customer-source" value="@{
+        var existing = context.Variables.ContainsKey("aforo-customer-id")
+            ? Convert.ToString(context.Variables["aforo-customer-id"]) : "";
+        if (existing != null && existing.Trim().Length > 0) { return "preset"; }
+        var payload = context.Variables.GetValueOrDefault<object>("aforo-jwt-payload", null) as JObject;
+        if (payload != null) {
+            var fromJwt = Convert.ToString(payload["customer_id"]);
+            if (fromJwt != null && fromJwt.Trim().Length > 0) { return "jwt"; }
+        }
+        if (context.Subscription == null || string.IsNullOrEmpty(context.Subscription.Id)) { return "none"; }
+        return "map";
+    }" />
+    <set-variable name="aforo-customer-map-key" value="@{
+        if (Convert.ToString(context.Variables["aforo-customer-source"]) != "map") { return ""; }
+        var ttl = context.Variables.ContainsKey("aforo-customer-map-cache-seconds")
+            ? Convert.ToString(context.Variables["aforo-customer-map-cache-seconds"]) : "";
+        if (ttl != null && ttl.Trim() == "0") { return ""; }
+        var version = context.Variables.ContainsKey("aforo-customer-map-version")
+            ? Convert.ToString(context.Variables["aforo-customer-map-version"]) : "";
+        if (version == null || version.Trim().Length == 0 || version.Trim().Length > 32) { version = "1"; }
+        var map = context.Variables.ContainsKey("aforo-subscription-customer-map")
+            ? Convert.ToString(context.Variables["aforo-subscription-customer-map"]) : "";
+        if (map == null || map.Trim().Length == 0) { map = "{{aforo-subscription-customer-map}}"; }
+        return "aforo:cust:" + version.Trim() + ":" + map.Length + ":" + context.Subscription.Id;
+    }" />
+    <choose>
+        <when condition="@(Convert.ToString(context.Variables["aforo-customer-map-key"]).Length > 0)">
+            <cache-lookup-value key="@(Convert.ToString(context.Variables["aforo-customer-map-key"]))" variable-name="aforo-customer-map-cached" />
+        </when>
+    </choose>
     <set-variable name="aforo-customer-id" value="@{
         var existing = context.Variables.ContainsKey("aforo-customer-id")
             ? Convert.ToString(context.Variables["aforo-customer-id"]) : "";
@@ -69,6 +113,10 @@
             if (fromJwt != null && fromJwt.Trim().Length > 0) { return fromJwt.Trim(); }
         }
         if (context.Subscription == null || string.IsNullOrEmpty(context.Subscription.Id)) { return ""; }
+        if (context.Variables.ContainsKey("aforo-customer-map-cached")) {
+            var hit = Convert.ToString(context.Variables["aforo-customer-map-cached"]);
+            return hit == null || hit == "~" ? "" : hit;
+        }
         var subId = context.Subscription.Id;
         var map = context.Variables.ContainsKey("aforo-subscription-customer-map")
             ? Convert.ToString(context.Variables["aforo-subscription-customer-map"]) : "";
@@ -80,6 +128,11 @@
         }
         return "";
     }" />
+    <choose>
+        <when condition="@(Convert.ToString(context.Variables["aforo-customer-map-key"]).Length > 0 && !context.Variables.ContainsKey("aforo-customer-map-cached"))">
+            <cache-store-value key="@(Convert.ToString(context.Variables["aforo-customer-map-key"]))" value="@{ var c = Convert.ToString(context.Variables["aforo-customer-id"]); return c.Length == 0 ? "~" : c; }" duration="@{ var t = context.Variables.GetValueOrDefault<string>("aforo-customer-map-cache-seconds", "300").Trim(); return System.Text.RegularExpressions.Regex.IsMatch(t, "^[1-9][0-9]{0,5}$") ? Convert.ToInt32(t) : 300; }" />
+        </when>
+    </choose>
     <set-variable name="aforo-product-type" value="@{
         var v = context.Variables.ContainsKey("aforo-product-type")
             ? Convert.ToString(context.Variables["aforo-product-type"]) : "";

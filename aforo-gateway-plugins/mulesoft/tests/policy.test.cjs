@@ -5,7 +5,7 @@
  * The billing logic (the DataWeave scripts) is executed by
  * dataweave.test.cjs with the DataWeave CLI. This file checks everything
  * around it that a Mule runtime would otherwise be needed for:
- *   1. the package: pom (mule-policy, 3.0.0 = VERSION, public repositories
+ *   1. the package: pom (mule-policy, 3.1.0 = VERSION, public repositories
  *      only), mule-artifact.json, the policy definition (every MC3 property,
  *      defaults, the secret marked sensitive)
  *   2. the template agrees with the definition: every property is read
@@ -67,7 +67,7 @@ const MC3 = [
 
 // ── 1. Package ───────────────────────────────────────────────────────
 const VERSION = read('VERSION').trim();
-eq('VERSION', VERSION, '3.0.0');
+eq('VERSION', VERSION, '3.1.0');
 check('pom packaging is mule-policy', pom.indexOf('<packaging>mule-policy</packaging>') !== -1);
 eq('pom artifactId/version',
     (pom.match(/<artifactId>aforo-metering<\/artifactId>\s*<version>([^<]+)<\/version>/) || [])[1], VERSION);
@@ -250,7 +250,7 @@ check('request id minted once with uuid(), never from the client', code.indexOf(
 {
     // Every variable read is written somewhere (set-variable, ee:set-variable or target).
     const written = {};
-    (template.match(/(?:variableName|target)="(aforo\w+)"/g) || []).forEach(function (m) { written[m.replace(/.*="|"/g, '')] = true; });
+    (template.match(/(?:variableName|counterVariableName|target)="(aforo\w+)"/g) || []).forEach(function (m) { written[m.replace(/.*="|"/g, '')] = true; });
     const reads = (template.match(/vars\.(aforo\w+)/g) || []).map(function (m) { return m.slice(5); })
         .filter(function (v, i, a) { return a.indexOf(v) === i; });
     eq('every vars.aforo* read is written', reads.filter(function (v) { return !written[v]; }), []);
@@ -271,7 +271,8 @@ requestsFull.forEach(function (r, i) {
     const label = 'outbound call ' + (i + 1);
     check(label + ' uses the policy http config, no redirects, own target',
         r.indexOf('config-ref="{{{policyId}}}-aforo-http"') !== -1 && r.indexOf('followRedirects="false"') !== -1 &&
-        /target="aforo\w+"/.test(r) && r.indexOf('targetValue="#[{status: attributes.statusCode, text: (payload default \'\') as String}]"') !== -1);
+        /target="aforo\w+"/.test(r) && (r.indexOf('targetValue="#[{status: attributes.statusCode, text: (payload default \'\') as String}]"') !== -1 ||
+            r.indexOf('targetValue="#[{status: attributes.statusCode, text: (payload default \'\') as String, retryAfter: attributes.headers.\'retry-after\' default null}]"') !== -1));
     check(label + ' reads every status itself (validator 100..599)', r.indexOf('<http:success-status-code-validator values="100..599"/>') !== -1);
     check(label + ' sends its own body, never the API payload', r.indexOf('<http:body>') !== -1);
 });
@@ -301,8 +302,23 @@ function headerNames(r) {
     });
 }
 check('delivery: 3 attempts, re-send only what the pending entry holds',
-    count(template, '<until-successful maxRetries="2" millisBetweenRetries="2000">') === 2 &&
-    count(template, '<raise-error type="AFORO:DELIVERY_RETRY"') === 2);
+    count(template, '<foreach collection="#[[1, 2, 3]]" counterVariableName="aforoAttempt">') === 2 &&
+    count(template, '<raise-error type="AFORO:DELIVERY_RETRY"') === 2 &&
+    count(template, 'millisBetweenRetries="2000"') === 0);
+check('delivery: the wait before a retry is a non-blocking until-successful timed by the delivery script',
+    count(template, '<until-successful maxRetries="1" millisBetweenRetries="#[vars.aforoDelivery.retryDelayMs]">') === 2 &&
+    count(template, '<raise-error type="AFORO:BACKOFF_WAIT"') === 2 &&
+    code.indexOf('Thread') === -1 && code.indexOf('sleep(') === -1);
+check('delivery: full-jitter backoff (500 ms base, 30 s cap) and Retry-After (60 s cap) in the script',
+    template.indexOf('var BASE_MS = 500') !== -1 && template.indexOf('var MAX_BACKOFF_MS = 30000') !== -1 &&
+    template.indexOf('var MAX_RETRY_AFTER_MS = 60000') !== -1 &&
+    count(template, '<set-variable variableName="aforoJitter" value="#[random()]"/>') === 2);
+check('delivery: per-event retryable flag is read', template.indexOf('e.retryable == true') !== -1);
+check('delivery: whole-batch retry on no answer, 408, 429 and every 5xx (TRANSPORT-SPEC)',
+    count(template, 'var wholeRetry = (status == 0) or (status == 408) or (status == 429) or ((status >= 500) and (status <= 599))') === 2 &&
+    template.indexOf('RETRY_STATUSES') === -1);
+check('delivery: no answer is caught on the ingest call only (connectivity, timeout)',
+    count(template, '<on-error-continue type="HTTP:CONNECTIVITY, HTTP:TIMEOUT" logException="false">') === 2);
 check('delivery is bounded: 16 at once, 1000 waiting',
     count(template, '<async maxConcurrency="16">') === 2 &&
     count(template, '<when expression="#[1000 > sizeOf(vars.aforoPendingKeys default [])]">') === 2);

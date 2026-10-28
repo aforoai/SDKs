@@ -36,9 +36,14 @@
  * sk_live_/sk_test_ path is unchanged (its context gains authType "key").
  *
  * Env:
- *   AFORO_TENANT_KEY       required for sk_live_/sk_test_ keys. The provider's
+ *   AFORO_TENANT_KEY_SECRET_ARN  required for sk_live_/sk_test_ keys. ARN of
+ *                          the Secrets Manager secret holding the provider's
  *                          Aforo tenant key, scope usage:ingest (or
- *                          customer-keys:introspect).
+ *                          customer-keys:introspect), as plain text or JSON
+ *                          {"apiKey": "..."}. Read once per container,
+ *                          refreshed every 5 minutes.
+ *   AFORO_TENANT_KEY       the same key as a plain environment variable; used
+ *                          only when AFORO_TENANT_KEY_SECRET_ARN is unset.
  *   AFORO_INTROSPECT_URL   default https://api.aforo.ai/api/v1/customer-keys/introspect
  *   CACHE_TTL_MS           default 60000. How long one answer is reused by this
  *                          container (API Gateway's own result TTL applies too).
@@ -57,10 +62,15 @@
 const https = require('https');
 const http = require('http');
 const crypto = require('crypto');
+const { createSecretSource } = require('./aws-secret');
 
 const INTROSPECT_URL = process.env.AFORO_INTROSPECT_URL
     || 'https://api.aforo.ai/api/v1/customer-keys/introspect';
-const TENANT_KEY = process.env.AFORO_TENANT_KEY || '';
+const TENANT_KEY = createSecretSource({
+    label: 'Aforo tenant key',
+    secretIdEnv: 'AFORO_TENANT_KEY_SECRET_ARN',
+    plainEnv: 'AFORO_TENANT_KEY',
+});
 const CACHE_TTL_MS = positiveInt(process.env.CACHE_TTL_MS, 60000);
 const INTROSPECT_TIMEOUT_MS = positiveInt(process.env.INTROSPECT_TIMEOUT_MS, 3000);
 const MAX_CACHE_ENTRIES = 10000;
@@ -101,7 +111,7 @@ function extractKey(authorizationToken) {
     return KEY_PATTERN.test(raw) ? raw : null;
 }
 
-function introspect(key) {
+function introspect(key, tenantKey) {
     const body = JSON.stringify({ key });
     const url = new URL(INTROSPECT_URL);
     const client = url.protocol === 'http:' ? http : https;
@@ -115,7 +125,7 @@ function introspect(key) {
             headers: {
                 'Content-Type': 'application/json',
                 'Content-Length': Buffer.byteLength(body),
-                'X-API-Key': TENANT_KEY,
+                'X-API-Key': tenantKey,
             },
         }, (res) => {
             let data = '';
@@ -162,7 +172,10 @@ async function lookup(key) {
     const hit = cache.get(hash);
     if (hit && hit.expires > Date.now()) return hit.info;
 
-    const info = await introspect(key); // throws → not cached, fails closed
+    // Both throw → not cached, fails closed. The tenant key is read only on a
+    // cache miss, so a warm container answers cached keys without it.
+    const tenantKey = await TENANT_KEY.get();
+    const info = await introspect(key, tenantKey);
     if (cache.size >= MAX_CACHE_ENTRIES) cache.clear();
     cache.set(hash, { info, expires: Date.now() + CACHE_TTL_MS });
     return info;
@@ -328,8 +341,8 @@ async function handler(event) {
     const jwt = extractJwt(event && event.authorizationToken);
     if (jwt) return handleJwt(jwt, event.methodArn);
 
-    if (!TENANT_KEY) {
-        console.error('AFORO_TENANT_KEY is not set; denying every call.');
+    if (!TENANT_KEY.configured) {
+        console.error('AFORO_TENANT_KEY_SECRET_ARN is not set; denying every call.');
         throw new Error('Aforo authorizer is not configured');
     }
     const key = extractKey(event && event.authorizationToken);

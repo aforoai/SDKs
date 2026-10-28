@@ -7,9 +7,17 @@
  *
  * Environment variables:
  *   AFORO_ENDPOINT       — Aforo ingestor batch URL (…/v1/ingest/batch)
- *   AFORO_API_KEY        — Aforo API key (scope usage:ingest). Sent as
+ *   AFORO_API_KEY_SECRET_ARN — ARN of the AWS Secrets Manager secret holding
+ *                          the Aforo API key (scope usage:ingest), as plain
+ *                          text or JSON {"apiKey": "..."}. Read once per
+ *                          container, refreshed every 5 minutes. Sent as
  *                          X-API-Key. The tenant is derived from the key; no
  *                          tenant header is sent.
+ *   AFORO_API_KEY        — The same key as a plain environment variable. Used
+ *                          only when AFORO_API_KEY_SECRET_ARN is unset (stacks
+ *                          from before 2.4.0, organization-service's one-click
+ *                          deploy). Anyone who can read the function's
+ *                          configuration can read it; prefer the secret.
  *   METRIC_MAPPINGS      — JSON array of endpoint→metric rules, first match
  *                          wins: [{"matchType":"PREFIX","value":"/v1/sms",
  *                          "metricName":"sms_sent"}]. matchType is EXACT,
@@ -24,7 +32,7 @@
  *                          event whose metric is not in the Aforo catalog;
  *                          the Lambda cannot know the catalog.
  *   QUANTITY_SOURCE      — "1" (count) or "response_size"
- *   FLUSH_COUNT          — Max events per batch (default 50, capped at 1000 —
+ *   FLUSH_COUNT          — Max events per batch (default 500, capped at 1000 —
  *                          the ingestor rejects larger batches with 400)
  *   INCLUDE_METADATA     — "false" to omit request metadata
  *   MCP_ENABLED          — "true" to enable MCP JSON-RPC detection
@@ -89,9 +97,14 @@ const https = require('https');
 const http = require('http');
 const zlib = require('zlib');
 const crypto = require('crypto');
+const { createSecretSource } = require('./aws-secret');
 
 const AFORO_ENDPOINT = process.env.AFORO_ENDPOINT || '';
-const AFORO_API_KEY = process.env.AFORO_API_KEY || '';
+const AFORO_API_KEY = createSecretSource({
+    label: 'Aforo API key',
+    secretIdEnv: 'AFORO_API_KEY_SECRET_ARN',
+    plainEnv: 'AFORO_API_KEY',
+});
 // Never sent to the ingestor (the tenant comes from the API key). Kept only
 // because it is part of the frozen MCP idempotency-key shape and an EMF
 // property; unset is fine.
@@ -106,7 +119,7 @@ const QUANTITY_SOURCE = process.env.QUANTITY_SOURCE || '1';
 // batch), so FLUSH_COUNT is clamped to that however it is configured.
 const MAX_BATCH_EVENTS = 1000;
 const FLUSH_COUNT = Math.min(MAX_BATCH_EVENTS,
-    Math.max(1, parseInt(process.env.FLUSH_COUNT || '50', 10) || 50));
+    Math.max(1, parseInt(process.env.FLUSH_COUNT || '500', 10) || 500));
 const INCLUDE_METADATA = process.env.INCLUDE_METADATA !== 'false';
 const MCP_ENABLED = process.env.MCP_ENABLED === 'true';
 const PRODUCT_TYPE = normalizeProductType(process.env.PRODUCT_TYPE);
@@ -664,6 +677,15 @@ async function handler(event, context) {
         return { statusCode: 200, body: 'No events after filtering' };
     }
 
+    // Read the key before sending anything. Not configured, or Secrets Manager
+    // unreachable on a cold start: throw, so Lambda's async retry redelivers
+    // the log payload (and the OnFailure queue keeps it) instead of posting
+    // without a key and having the ingestor drop the batch with 401.
+    if (!AFORO_API_KEY.configured) {
+        throw new Error('Aforo API key is not configured: set AFORO_API_KEY_SECRET_ARN');
+    }
+    const apiKey = await AFORO_API_KEY.get();
+
     const batches = [];
     for (let i = 0; i < usageEvents.length; i += FLUSH_COUNT) {
         batches.push(usageEvents.slice(i, i + FLUSH_COUNT));
@@ -675,7 +697,7 @@ async function handler(event, context) {
         ? context.getRemainingTimeInMillis() : 30000;
     const deadline = Date.now() + remaining - DEADLINE_SAFETY_MS;
 
-    const results = await Promise.all(batches.map(b => sendToAforo(b, deadline)));
+    const results = await Promise.all(batches.map(b => sendToAforo(b, deadline, apiKey)));
 
     let totalSent = 0;
     let dropped = 0;
@@ -944,7 +966,7 @@ function countRejectedEvents(resBody, events) {
  * The body is serialized ONCE, so every attempt carries the same idempotency
  * keys.
  */
-async function sendToAforo(events, deadline) {
+async function sendToAforo(events, deadline, apiKey) {
     const body = JSON.stringify({ events });
     let retryAfterMs = null;
 
@@ -952,7 +974,7 @@ async function sendToAforo(events, deadline) {
         const timeLeft = deadline - Date.now();
         if (timeLeft <= 0) break;
         try {
-            const res = await doPost(AFORO_ENDPOINT, body, Math.min(REQUEST_TIMEOUT_MS, timeLeft));
+            const res = await doPost(AFORO_ENDPOINT, body, Math.min(REQUEST_TIMEOUT_MS, timeLeft), apiKey);
             if (res.status >= 200 && res.status < 300) {
                 return { outcome: 'sent', rejectedEvents: countRejectedEvents(res.body, events) };
             }
@@ -1000,7 +1022,7 @@ function parseRetryAfter(value) {
 // without buffering an unbounded body.
 const MAX_RESPONSE_BYTES = 262144;
 
-function doPost(url, body, timeoutMs) {
+function doPost(url, body, timeoutMs, apiKey) {
     return new Promise((resolve, reject) => {
         const parsedUrl = new URL(url);
         const options = {
@@ -1015,7 +1037,7 @@ function doPost(url, body, timeoutMs) {
                 // this header; an Authorization: Bearer is parsed as a JWT and
                 // rejected 401 — alone or alongside. The tenant comes from the
                 // key, so no X-Tenant-Id is sent.
-                'X-API-Key': AFORO_API_KEY,
+                'X-API-Key': apiKey,
             },
             timeout: timeoutMs,
         };

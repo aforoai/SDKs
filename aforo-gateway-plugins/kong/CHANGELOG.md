@@ -6,6 +6,76 @@ The Kong plugin has one version: the rockspec's. `handler.lua`'s `VERSION` const
 
 ## [Unreleased]
 
+## [2.8.0] — 2026-10-28
+
+Access-phase checks and shared memory (wave 6, G323, G325, G326, G327, G331, G332, G333, G334, G335; review fixes for G325, G327 and G331 before release). G320 was already fixed in 2.6.0 (one buffer per destination, mappings keyed per tenant and URL).
+
+### Changed (customers will notice)
+- **The issuer is required for JWT validation** (G326). With `jwt_validation_enabled` and no `jwt_issuer`, the issuer check used to be skipped, so a token from any issuer whose key verified was accepted. Such a config is now refused by the schema, and a config stored before 2.8.0 loads but answers JWTs with **500** `{"error":"server_error","error_description":"ISSUER_NOT_CONFIGURED"}`. Set `jwt_issuer`, or set the new `jwt_issuer_check_disabled = true` to accept any issuer on purpose. `jwt_issuer` still defaults to `https://auth.aforo.ai`, so only configs that cleared it are affected.
+- **`jwt_audience`** (new, G326). When set, the token's `aud` (string or array of strings) must name one of the values; a token without `aud` gets 401 `INVALID_AUDIENCE`. Unset, `aud` is not checked: organization-service mints tokens without `aud` and binds them to the tenant (`tenant_id` must equal the plugin's).
+- **Revocation lookup: one round trip, 250 ms timeout** (G327). The jti and client keys are read with one `GET` per key, pipelined on one connection, so they cost one round trip; AUTH is sent only on a new connection, and connections are pooled per host, port, TLS settings and password. Before: up to three sequential `GET`s, each with a 500 ms timeout, and AUTH on every request. The timeout is the new `jwt_redis_timeout_ms` (default 250; it applies to the connect, including the TLS handshake, and to the round trip). A failed round trip, an error reply for a key or any reply `GET` does not give is "Redis could not answer" (`jti_redis_fail_mode`), never "not revoked"; a key that holds a value is revoked even when another key could not be read.
+- **Revocation works on Redis Cluster proxies and ElastiCache Serverless** (G327 review). Not `MGET`: organization-service writes `jti:blocked:<jti>` and `jti:client:<id>` without a common hash tag, so the keys land in different slots and a multi-key `MGET` is refused with `CROSSSLOT`, which under the default `jti_redis_fail_mode = closed` answered every JWT request 503. Each pipelined `GET` names one key, which a proxy that routes per key (ElastiCache Serverless, Envoy / twemproxy-style cluster proxies) sends to the right shard. A classic Redis Cluster node reached directly answers a key it does not own with `MOVED` (the plugin does not follow redirects); that is "Redis could not answer": 503 by default, or let through and counted with `jti_redis_fail_mode = open`. Point `jwt_redis_host` at a cluster-aware proxy or the serverless endpoint, not at one cluster node.
+- **Redis over TLS** (G325). New `jwt_redis_ssl`, `jwt_redis_ssl_verify`, `jwt_redis_server_name` for the blocklist Redis and `rate_limit_redis_ssl`, `rate_limit_redis_ssl_verify`, `rate_limit_redis_server_name` for the rate-limit Redis. The certificate is verified against `lua_ssl_trusted_certificate` by default and the server name (SNI) defaults to the host. The blocklist settings default to the rate-limit ones when the blocklist is on the rate-limit Redis host and port. `ssl_verify = false` is accepted and logged once per worker.
+- **Pre-flight quota: DENY is cached** (G333) until the ingestor's `retryAfterMs`, at most 60 s, and 5 s when the answer gives none (the `Retry-After` for an answer without `retryAfterMs` was 60, now 5). A refused customer's requests are answered 429 from the cache with the remaining `Retry-After`. Before, every refused request asked the ingestor again. A top-up now unblocks within that wait rather than at once. `preflight_quota_cache_ttl_ms = 0` turns this cache off too.
+- **Pre-flight quota: circuit breaker** (G334). After `preflight_quota_breaker_threshold` (default 5, `0` = off) failures in a row (timeout, error, non-200, unreadable answer) the check is not called for `preflight_quota_breaker_cooldown_s` (default 10) and `preflight_quota_fail_open` applies at once; then one request probes, and a success closes the breaker. Shared by all workers, per quota-check URL and tenant.
+- **Pre-flight quota sends `estimatedQuantity`** (G334): a numeric `quantity_source`, else 1. A quantity from the response (`quantity_header`, `response_size`) is not known in the access phase. The option to fail closed asked for in G334 already exists as `preflight_quota_fail_open = false`; no second setting was added.
+- **Margin guard: timeout and circuit breaker** (G331 review). The pricing call's timeout is the new `margin_guard_timeout_ms` (default 300, 10–5000); it was a fixed 50 ms, too short for pricing's public host over TLS, so the check mostly timed out and failed open. After `margin_guard_breaker_threshold` (default 5, `0` = off) failures in a row (timeout, error, non-200, no verdict) pricing is not called for `margin_guard_breaker_cooldown_s` (default 10) and requests go through at once; then one request probes and a success closes the breaker. Before, a down pricing cost every request up to two timeouts (GLOBAL and CUSTOMER scope). Shared by all workers (`aforo_cache`), per tenant and pricing URL; the same breaker code as the pre-flight quota check (now in `event-util.lua`). Cached ALLOW / BLOCK answers are still used while the breaker is open. Fail open is unchanged.
+- **Margin guard calls pricing's public, key-authenticated check** (G332): `GET {margin_guard_url}/api/v1/margin-guard/quick-check?scopeType=&scopeId=` with the plugin's `api_key` as `X-API-Key`. Pricing takes the tenant from the key, so the `tenantId` parameter and the `X-Tenant-Id` header are no longer sent. Before, the call went to pricing's `/internal/v1/margin-guard/quick-check` (refused by public `*.aforo.ai` hosts) carrying only `X-Tenant-Id`. Parameters are URL-escaped. Upgrade note: deploy the pricing-service release with `/api/v1/margin-guard/quick-check` (aforoai/aforo-nextgen-pricing-service#75) before enabling margin guard on 2.8.0; until then the check gets 404 and fails open.
+
+### Shared memory (G323, G331)
+- **New shared dict `aforo_cache`.** Caches, warning throttles and counters move out of `aforo_buffer`: the pre-flight quota cache and breaker, the margin guard cache, the rate-limit policy cache, the metric mappings, warning throttles, and the drop and revocation counters. `aforo_buffer` keeps only events and delivery state, so a cache can no longer fill the dict the events need, and `incr()` on a counter (which evicts least recently used entries like `set()`) no longer runs in it.
+- Without `aforo_cache` the plugin works as before 2.8.0 (everything in `aforo_buffer`) and each worker logs one error naming the missing dict. With neither dict, each worker logs once that nothing is cached; the margin guard (G331) and the other checks then call their services on every request, as before, but no longer silently.
+- The buffer cap stays a count (10,000 events per destination, 500 for a refused one) plus the dict's free space. Byte counters were not added: per-buffer byte totals drift (see `event-buffer.lua`), and the free-space checks already use the dict's real state.
+
+### Removed
+- **`compound-metering.lua`** (G335). It was packaged for "integrations that call it directly", but the plugin never called it and no schema setting enabled it, so nothing in a Kong deployment used it. It is removed from the rockspec, the source tree and the docs, with its two spec files. Compound metering through Kong needs a design first (which response fields, which ingest endpoint); when it is built, its `correlationId` must again come from Kong's request id (Rule #21).
+
+### Added
+- `redis-util.lua`: one connect function for both Redis checks (TLS, pooling, AUTH only on a new connection).
+- `event-util.lua`: `breaker_settings` / `breaker_allows` / `breaker_success` / `breaker_failure`, the circuit breaker shared by the pre-flight quota check and the margin guard.
+- Config: `margin_guard_timeout_ms`, `margin_guard_breaker_threshold`, `margin_guard_breaker_cooldown_s`.
+
+### Docs
+- The Admin API examples (`Dockerfile`, USER_GUIDE "Running in Docker" and "Local development") listen on `127.0.0.1:8001` and no longer publish port 8001; the guide shows `docker exec` and a loopback-only publish.
+
+### Tests
+- busted 360/360 locally (LuaJIT 2.1, mocked PDK; was 326, minus the 14 compound specs, plus 30 new in `spec/access_spec.lua` "2.8.0 hardening", 26 of which failed on 2.7.0, plus 16 from the review fixes, which failed on the first 2.8.0 code: pipelined per-key `GET`s and no `MGET`, revocation against a Redis that refuses cross-slot `MGET`, `MOVED` / failed-commit / unexpected replies failing closed, the 250 ms and 300 ms defaults, the margin guard breaker). Two existing specs that asserted "DENY is never cached" now assert the cached DENY. Not yet run against a live Kong, Redis with TLS or in cluster mode, ElastiCache Serverless, ingestor or pricing.
+
+### Upgrade notes
+- Add the second dict: `nginx_http_lua_shared_dict = aforo_buffer 10m; lua_shared_dict aforo_cache 5m` in `kong.conf`, or `KONG_NGINX_HTTP_LUA_SHARED_DICT="aforo_buffer 10m; lua_shared_dict aforo_cache 5m"` (the image sets it). Counters (`aforo_dropped:*`, `aforo_revocation_unavailable:*`) restart from 0 in the new dict.
+- `jwt_validation_enabled` without `jwt_issuer`: set `jwt_issuer`, or `jwt_issuer_check_disabled = true`. In DB-less mode such a declarative config is refused at load.
+- Revocation timeout is 250 ms (2.7.0: 500 ms per `GET`, up to three `GET`s). It covers the connect including the TLS handshake, then the one round trip. With `jti_redis_fail_mode = closed` a Redis slower than that answers 503; raise `jwt_redis_timeout_ms`.
+- Revocation on Redis Cluster: use ElastiCache Serverless or a proxy that routes per key. A direct connection to one node of a classic cluster answers `MOVED` for keys on other shards, which fails closed (503) by default.
+- Margin guard: the timeout is now 300 ms (`margin_guard_timeout_ms`, was a fixed 50 ms), so while pricing is slow a request can wait up to 300 ms per scope until the breaker opens (after 5 failures in a row).
+- Redis behind TLS: set `rate_limit_redis_ssl` / `jwt_redis_ssl`, and make sure `lua_ssl_trusted_certificate` trusts the Redis certificate (Kong's default is the system store; a private CA must be added there).
+- Margin guard: pricing's quick-check must accept the plugin's `api_key` before it enforces authentication.
+- Integrations that required `kong.plugins.aforo-metering.compound-metering` must vendor their own copy; it is no longer installed.
+
+## [2.7.0] — 2026-10-27
+
+Rate limiting (wave 6, G328, G329, G330).
+
+### Changed (customers will notice)
+- **JWT requests are rate limited by their API key** (G328). The policy is looked up by the verified token's `key_id` claim under `ratelimit:policy:{tenantId}:keyid:{keyId}`, and the counter belongs to the key, so a token refresh no longer starts a new counter. Only a token whose signature was verified counts (this plugin's check with `jwt_public_key` / `jwt_jwks_uri`, or Kong's `jwt` plugin); a token let through by `jwt_allow_unverified_signature` is not used, and such requests stay unlimited, logged once. 2.6.0 skipped rate limiting for every JWT request; earlier versions looked the policy up by the SHA-256 of the token bytes, which matched nothing. **Needs pricing-service to write the `keyid:` policy key**; until it does, JWT requests still find no policy.
+- **Sliding-window counter instead of a fixed window** (G329). A tier now counts `previous window × (share of it still inside the last window) + current window`. A client can no longer send the limit at the end of one minute and the limit again at the start of the next (up to 2× before). The module header used to say "sliding window" while the code was a fixed window.
+- **A refused request (HARD) is not counted.** Before, every refused request also incremented the counter. `SOFT` mode counts every request, as before.
+- **`Retry-After` and `X-RateLimit-Reset` follow the sliding window**: the seconds until one more request fits (`Retry-After` is at least 1). `X-RateLimit-Reset` is that wait when nothing is left, otherwise the seconds until the current window rolls over.
+- **PER_CUSTOMER uses the customer the plugin bills**: the handler's verified customer (verified JWT claim; on a Kong-`jwt` route the `customer_id_jwt_claim`, never the issuer consumer). **PER_APP for a verified-JWT request counts the key** (an Aforo key belongs to one app or agent).
+- Counter keys keep their names (`ratelimit:count:{tenantId}:{scope}:{window}:{epochWindow}`); their TTL is now 2 × window + 10 s so the previous window is still there to weigh. A JWT request's PER_KEY scope is `keyid:{keyId}`.
+
+### Performance (G330)
+- AUTH is sent only on a new Redis connection (`get_reused_times() == 0`). Connections are pooled per host, port and password, so a pooled connection is never reused under another password. Before, AUTH was sent on every request. An AUTH failure now closes the connection instead of leaving it open.
+- All tiers are checked and counted in one `EVALSHA` (falling back to `EVAL` on `NOSCRIPT`), replacing one `INCR`+`EXPIRE` pipeline per tier.
+- The policy is cached in the `aforo_buffer` dict for 5 s (`safe_set`, so it never evicts buffered events). "No policy" is cached only for an authenticated key (key-auth credential or verified JWT), so random Bearer values cannot fill the dict.
+- Steady state: one Redis round trip per request (was AUTH + GET + one pipeline per tier).
+
+### Unchanged
+- Fail-open: a Redis connect, AUTH, error reply or script error lets the request through, with a warning at most once a minute. There is no config key for this; it was and is fail-open.
+- Redis Cluster is not supported by the rate-limit check (a tier's two counter keys can land in different slots); it fails open.
+
+### Tests
+- busted 326/326 locally (LuaJIT 2.1, mocked PDK; was 315). 11 new specs in `spec/access_spec.lua`: one counter across a token refresh, Kong-`jwt`-verified key id, unverified tokens not used, PER_CUSTOMER across a customer's keys, no 2× burst at a window edge, recovery as the previous window ages out, refused requests not counted, SOFT counts all, AUTH only on a new connection, one round trip per check, fail-open on a script error. The Redis mock runs the real script through a `redis.call` shim. The script was also run against Redis 8 locally (`EVALSHA`, 10/60 s: 10 allowed at :59.5, refused at :60.5 with `Retry-After` 6, 5 allowed at :90, TTL 130). Not run inside a Kong image or end to end.
+
 ## [2.6.0] — 2026-10-25
 
 One line again. Merges the internal 2.2.0–2.5.0 releases with the public work after 2.1.0 (Gowtham: "Fix/kong ai agent metering" #57 and "Fix/kong latest konnect" #61, listed below under "Public changes after 2.1.0"). Every config key of either line is accepted. Where the two lines decided differently:

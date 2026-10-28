@@ -38,7 +38,7 @@ jobs:
           cache: maven
       - name: Package the policy
         working-directory: mulesoft/aforo-metering
-        run: mvn -B -ntp clean package
+        run: ./mvnw -B -ntp clean package
       - name: Collect release files
         run: |
           mkdir -p dist
@@ -101,4 +101,4 @@ jobs:
           # Connected-app form documented by MuleSoft for the Exchange Maven facade.
           EXCHANGE_USERNAME: '~~~Client~~~'
           EXCHANGE_PASSWORD: ${{ secrets.ANYPOINT_CLIENT_ID }}~?~${{ secrets.ANYPOINT_CLIENT_SECRET }}
-        run: mvn -B -ntp clean deploy -Danypoint.org.id="$ANYPOINT_ORG_ID"
+        run: ./mvnw -B -ntp clean deploy -Danypoint.org.id="$ANYPOINT_ORG_ID"

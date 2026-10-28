@@ -1,23 +1,21 @@
 # Aforo AWS CloudFormation Templates
 
-Two CloudFormation templates that grant Aforo cross-account access to manage Amazon API Gateway for usage metering and key provisioning, and protect monetized API Gateway resources from accidental deletion.
+Two CloudFormation templates: a cross-account role that lets Aforo read your Amazon API Gateway configuration and, if you allow it, install Aforo's metering Lambda; and a policy that blocks deletion of monetized API Gateway resources.
 
-**Version:** 1.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 3.0.0 (not yet released) · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## When to reach for this
 
-Reach for these when you run Amazon API Gateway and want Aforo to provision keys / usage plans / stages and read CloudWatch logs in *your* account — without handing over static credentials. The cross-account role uses `sts:AssumeRole` with an `ExternalId` (confused-deputy protection), so Aforo assumes a role you own and can revoke at any time by deleting the stack.
+Use these when you run Amazon API Gateway and connect it to Aforo with a role instead of access keys. Aforo assumes a role you own, only with the `ExternalId` it gave you (confused-deputy protection), and you revoke access by deleting the stack.
 
-This is infrastructure-as-code you deploy into your own AWS account. There is no package to install and no metering code here — the actual API Gateway metering runs in the separate `aws-lambda` plugin.
+`aforo-apigateway-role.yaml` is the same file organization-service hosts for the console's one-click "Connect AWS" link (`src/main/resources/cloudformation/aws-apigateway-role.yaml` there). There is no metering code here; the metering function is in `aws-lambda/`.
 
 | Template | What it creates |
 |---|---|
-| `aforo-apigateway-role.yaml` | An IAM role `aforo-apigateway-role` that Aforo's account can assume (gated by your `ExternalId`), with API Gateway management + CloudWatch Logs read permissions. |
-| `aforo-monetized-deny-policy.yaml` | A managed IAM policy `aforo-deny-delete-monetized-apis` that **denies** `apigateway:DELETE` on resources tagged `aforo-monetized=true`. |
+| `aforo-apigateway-role.yaml` | An IAM role Aforo's account can assume with your `ExternalId`. Read: API Gateway `GET` on REST APIs, HTTP APIs and usage plans in one region. Never: API key values, API Gateway writes, log reads. With `AllowMeteringInstall=true` (default): create and update Lambda functions named `aforo-metering-*`, and subscribe them to API Gateway log groups; plus an execution role `aforo-metering-exec-<ExternalId>` that can only write its own logs. |
+| `aforo-monetized-deny-policy.yaml` | A managed policy `aforo-deny-delete-monetized-apis` that denies `apigateway:DELETE` on resources tagged `aforo-monetized=true`, optionally attached to the roles, users and groups you name. |
 
 ## Install
-
-These are CloudFormation YAML templates, not a package. The repo is **not yet published** publicly; deploy the template files directly. Aforo gives you the `ExternalId` (a UUID) when you start the integration in the console.
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
@@ -26,48 +24,61 @@ cd SDKs/aforo-gateway-plugins/aws-cloudformation
 
 ## Quickstart
 
-Deploy the role with the `ExternalId` Aforo gave you (the `AforoAccountId` default is the placeholder `000000000000` — Aforo supplies the real account ID, or it's pre-filled in the console-generated Quick Create link):
+Deploy in the region your API Gateway runs in, with the `ExternalId` Aforo gave you:
 
 ```bash
 aws cloudformation deploy \
+  --region <region> \
   --template-file aforo-apigateway-role.yaml \
-  --stack-name aforo-apigateway-role \
+  --stack-name aforo-apigateway-integration \
   --capabilities CAPABILITY_NAMED_IAM \
-  --parameter-overrides ExternalId="<uuid-from-aforo>" AforoAccountId="<aforo-aws-account-id>"
+  --parameter-overrides ExternalId="<uuid-from-aforo>"
 ```
 
-Read back the role ARN and paste it into Aforo to finish the integration:
+Read the role ARN and paste it into Aforo:
 
 ```bash
-aws cloudformation describe-stacks --stack-name aforo-apigateway-role \
-  --query "Stacks[0].Outputs[?OutputKey=='RoleArn'].OutputValue" --output text
+aws cloudformation describe-stacks --region <region> --stack-name aforo-apigateway-integration \
+  --query "Stacks[0].Outputs[?OutputKey=='AforoRoleArn'].OutputValue" --output text
 ```
 
 ## Configuration
 
-`aforo-apigateway-role.yaml` parameters:
+`aforo-apigateway-role.yaml`:
 
-| Parameter | Type | Default | What it does |
-|---|---|---|---|
-| `ExternalId` | String (`[a-f0-9-]+`, a UUID) | — (required) | The confused-deputy guard. Aforo must present this exact value in its `sts:AssumeRole` call; it's the one secret tying the role to your Aforo integration. |
-| `AforoAccountId` | String | `000000000000` | Aforo's AWS account ID — the only principal allowed to assume the role. The default is a placeholder; supply the real value. |
+| Parameter | Default | What it does |
+|---|---|---|
+| `ExternalId` | — (required) | 32–44 letters, digits or hyphens (Aforo issues a UUID). Aforo must present it in `sts:AssumeRole`. |
+| `AforoAccountId` | `082424191442` | Aforo's AWS account, the only principal that can assume the role. 12 digits. |
+| `ApiGatewayRegion` | empty | Region Aforo may read and install the metering Lambda in. Empty = this stack's region; `*` = every region. |
+| `AccessLogGroupPrefix` | empty | Only when your access logs go to a log group whose name starts with neither `/aws/apigateway/` nor `API-Gateway-`: that name or a prefix of it. |
+| `AllowMeteringInstall` | `true` | `false` keeps the role read-only; you then deploy the metering Lambda yourself (`aws-lambda/template.yaml`). |
 
-`aforo-monetized-deny-policy.yaml` parameters:
+Outputs: `AforoRoleArn`, and `AforoMeteringExecutionRoleArn` when `AllowMeteringInstall=true`.
 
-| Parameter | Type | Default | What it does |
-|---|---|---|---|
-| `AforoAccountId` | String | — (required) | Aforo's AWS account ID (kept for parameter symmetry with the role stack). |
+`aforo-monetized-deny-policy.yaml`:
 
-Outputs — `aforo-apigateway-role.yaml`: `RoleArn` (paste into Aforo), `ExternalId` (for verification). `aforo-monetized-deny-policy.yaml`: `PolicyArn`.
+| Parameter | Default | What it does |
+|---|---|---|
+| `AttachToRoles` / `AttachToUsers` / `AttachToGroups` | empty | Comma-separated IAM names to attach the policy to. Empty attaches to none. |
+| `AforoAccountId` | empty | Not used; kept so stacks created with it still update. Empty or 12 digits. |
 
-> ⚠ The role grants `apigateway:GET/POST/PUT/PATCH/DELETE` on `arn:aws:apigateway:<region>::/*` and CloudWatch Logs read + subscription-filter management. That DELETE grant is exactly why the deny-policy template exists — attach it where you want monetized resources protected.
+Output: `PolicyArn`.
 
-## Walk me through it
+### What the role cannot do
 
-Get the `ExternalId` from Aforo → deploy the role → paste the ARN back → optionally deploy the deny policy → verify the trust relationship: [USER_GUIDE.md](USER_GUIDE.md).
+- Read API key values: `GET /apikeys*` and `GET /usageplans/*/keys*` are explicitly denied in every region.
+- Change API Gateway (no `POST` / `PUT` / `PATCH` / `DELETE`).
+- Read log events, or subscribe anything to log groups outside the API Gateway prefixes. A subscription's destination is not an IAM condition key; it is limited by what the role can grant: it can add an invoke permission only to `aforo-metering-*` functions, can pass no role to CloudWatch Logs (Kinesis and Firehose destinations need one), and cross-account log destinations are denied.
+- Create or change IAM roles; the only role it can pass is the metering execution role, to Lambda only.
+
+## Tests
+
+`node aws-cloudformation/tests/templates.test.cjs` (also run by `cd aws-lambda && npm test`). It reads the template text and checks the statements above. `cfn-lint` was not run for 3.0.0.
 
 ## What this doesn't cover
 
-- **The metering itself.** API Gateway usage events are produced by the `aws-lambda` plugin, not these templates.
-- **Applying the deny policy to principals.** The template creates the managed policy; attaching it to the roles/users that must be denied (or wiring it into an SCP) is your IAM step.
-- **Tagging resources `aforo-monetized=true`.** Aforo applies that tag when a product is monetized; the deny policy only takes effect on already-tagged resources.
+- **Key and usage-plan provisioning by Aforo.** 1.0.0 granted API Gateway writes for it; Aforo's key provisioning uses access-key connections, not this role, so 3.0.0 drops them.
+- **Secrets Manager.** The one-click metering install still passes the Aforo key as a Lambda environment variable; moving it to Secrets Manager needs a `secretsmanager` permission here and a change in organization-service's installer together.
+- **SCPs.** Translating the deny policy into a Service Control Policy is your AWS Organizations step.
+- **Tagging.** The deny policy only matches resources already tagged `aforo-monetized=true`.

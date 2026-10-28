@@ -2,11 +2,11 @@
 
 One custom policy, **`aforo-metering`**, that Aforo applies to an API instance in Anypoint API Manager. On every call it checks the end customer's **Aforo API key**, refuses a customer whose hard limit is used up (**429**), lets the call through, and sends the call's usage to Aforo after the response. Your API needs no Aforo code.
 
-**Version:** 3.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 3.1.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 Target: **Mule 4 runtimes as API gateways** (CloudHub, CloudHub 2.0, Runtime Fabric, hybrid), Mule 4.4 or later, Java 8, 11 or 17. Flex Gateway is not covered (it needs a separate PDK policy).
 
-> **Not verified on a live Anypoint org yet.** The billing logic runs under the open-source DataWeave CLI against 166 cases, and the template's structure is checked statically (see [Tests](#tests)). See [What only a live runtime can prove](#what-only-a-live-runtime-can-prove).
+> **Not verified on a live Anypoint org yet.** The billing logic runs under the open-source DataWeave CLI against 179 cases, and the template's structure is checked statically (see [Tests](#tests)). See [What only a live runtime can prove](#what-only-a-live-runtime-can-prove).
 
 ## What Aforo deploys
 
@@ -14,7 +14,7 @@ Aforo's organization service does this when you connect your Anypoint org and de
 
 | What | Where | Notes |
 |---|---|---|
-| Policy asset `aforo-metering` **3.0.0** | your org's Exchange, groupId = your **Anypoint organization id** | the jar `aforo-metering-3.0.0-mule-policy.jar` plus its definition [`aforo-metering.yaml`](aforo-metering/aforo-metering.yaml) (classifier `policy-definition`) |
+| Policy asset `aforo-metering` **3.1.0** | your org's Exchange, groupId = your **Anypoint organization id** | the jar `aforo-metering-3.1.0-mule-policy.jar` plus its definition [`aforo-metering.yaml`](aforo-metering/aforo-metering.yaml) (classifier `policy-definition`) |
 | The policy, applied to each API instance | API Manager, per API instance (and environment) | with the [configuration properties](USER_GUIDE.md#configuration-properties) for the Aforo product it sells: `aforo-product-id`, `product-type`, metrics, quota |
 | The product ↔ API instance mapping | Aforo, `gateway_product_meterings` | provider `mulesoft`, `gateway_resource_id` = the API instance id |
 
@@ -93,22 +93,24 @@ Every event carries `customerId`, `metricName`, `quantity`, `idempotencyKey` (a 
 
 - On the request path the policy adds at most one introspection call (1500 ms timeout) when the key is not cached, and one quota call (`quota-timeout-ms`, 1500 ms) when quota is enforced and not cached for that customer and metric.
 - Usage is sent **after** the response, in an async scope: `POST {aforo-endpoint}` with `{"events": [...]}` and `X-API-Key: {aforo-api-key}`. The ingestor answers 202 `{"success":true,"data":{"accepted","failed","errors":[{"index","message"}]}}`:
-  - an error starting "The event could not be stored" is transient: only those events are re-sent;
+  - an error with `"retryable": true` is transient: only those events are re-sent (from an ingestor that does not send the flag, a message starting "The event could not be stored" counts as retryable);
   - any other per-event error is permanent: logged (`USAGE EVENT REFUSED`) and dropped;
-  - no answer, 5xx, 408 or 429: the whole batch is re-sent;
-  - up to 3 attempts, 2 s apart. The idempotency keys never change, so a copy that did land is deduplicated, never billed twice.
-- At most 16 deliveries run at once per policy instance and at most 1000 calls' usage waits; past that the usage is dropped with a `USAGE DROPPED` warning (once a minute). A worker restart loses usage that was still waiting.
+  - no answer (connection error, 10 s timeout), 408, 429 or any 5xx: the whole batch is re-sent;
+  - any other status (401, 403, other 4xx, a redirect): logged (`USAGE EVENT REFUSED`, with the status) and dropped. A wrong or revoked `aforo-api-key` therefore loses usage until it is fixed; the policy has no durable queue to hold it.
+  - up to 3 attempts. The wait before attempt 2 is a random 0–1 s, before attempt 3 a random 0–2 s (full jitter, base 500 ms, cap 30 s), or the ingestor's `Retry-After` (seconds or an HTTP date) when that is longer, at most 60 s. The wait runs on the runtime's scheduler (an `until-successful` timed by the delivery script) and holds no thread. The idempotency keys never change, so a copy that did land is deduplicated, never billed twice.
+- One delivery per API call, carrying that call's events (one, or one per tool call in an MCP batch). A Mule 4 custom policy has no scheduler or flush timer, so calls are not collected into larger batches. The pending usage of each call is held in an in-memory object store entry (`persistent="false"`, per worker) only while its delivery runs: it is the retry state and the backlog count, not a durable queue.
+- At most 16 deliveries run at once per policy instance and at most 1000 calls' usage waits; past that the usage is dropped with a `USAGE DROPPED` warning (once a minute). A worker restart loses usage that was still waiting. The policy does not split a batch on 413 (one call's events are far below the ingestor's size limit).
 - Warnings that could repeat on every call (introspection or quota unavailable, backlog full) are logged once a minute.
 
 ## Build
 
 ```bash
 cd aforo-gateway-plugins/mulesoft/aforo-metering
-docker run --rm -v "$PWD":/src -v "$HOME/.m2":/root/.m2 -w /src maven:3.9-eclipse-temurin-17 mvn -B -ntp clean package
-# -> target/aforo-metering-3.0.0-mule-policy.jar
+docker run --rm -v "$PWD":/src -v "$HOME/.m2":/root/.m2 -w /src eclipse-temurin:17 ./mvnw -B -ntp clean package
+# -> target/aforo-metering-3.1.0-mule-policy.jar
 ```
 
-Everything resolves from MuleSoft's public repository (`repository.mulesoft.org/releases`) and Maven Central: no Anypoint or Nexus EE credentials. The policy bundles the HTTP connector 1.10.3, the ObjectStore connector 1.2.2, the Java module 1.2.16 and the secure configuration property module 1.2.7. `mvn deploy -Danypoint.org.id=<org id>` publishes the jar and the definition to your Exchange (credentials in `~/.m2/settings.xml`, server id `exchange-server`).
+Everything resolves from MuleSoft's public repository (`repository.mulesoft.org/releases`) and Maven Central: no Anypoint or Nexus EE credentials. The policy bundles the HTTP connector 1.10.3, the ObjectStore connector 1.2.2, the Java module 1.2.16 and the secure configuration property module 1.2.7. `./mvnw deploy -Danypoint.org.id=<org id>` publishes the jar and the definition to your Exchange (credentials in `~/.m2/settings.xml`, server id `exchange-server`).
 
 ## Tests
 
@@ -133,8 +135,15 @@ There is no Mule 4 runtime that runs a custom policy offline: policies need the 
 - **Key removal**: `propagateMessageTransformations="true"` on `http-policy:source` and the Java module rebuilding `HttpRequestAttributes` without the header (what MuleSoft's own `http-transform:remove-headers` does). If the runtime refuses it, the call still goes through, with the header, and the policy logs `could not remove the x-api-key header`.
 - **Refusals**: the listener building the 401/403/429/503 response from `HttpPolicyResponseAttributes`.
 - That an API error (APIkit 404, 5xx) reaches the policy's `on-error-propagate` with the error response's status, and that propagating it leaves the client's response unchanged.
-- Object store, `async maxConcurrency` and `until-successful` behaviour; per-worker caches on multi-worker deployments.
+- Object store, `async maxConcurrency`, `foreach` and `until-successful` behaviour (the retry wait relies on `millisBetweenRetries` being read as an expression on entry, which Mule 4.4+ does); per-worker caches on multi-worker deployments.
 - How a 1.10.3 HTTP connector in the policy coexists with your application's own HTTP connector version.
+
+## Not part of this policy
+
+- **JWT validation.** Aforo ships no JWT policy for MuleSoft. If your API also accepts JWTs, use MuleSoft's own **JWT Validation** policy (as Kong's `jwt` plugin and Apigee's `VerifyJWT` are used on those gateways). This policy does not read JWT claims: the customer always comes from the Aforo key.
+- **Compound metering** (several metrics from one call, such as LLM input and output tokens with a shared `correlationId`) is not supported on MuleSoft. Send compound usage from your API with an Aforo SDK, or use a gateway that supports it.
+- **Margin guard** is not supported on MuleSoft.
+- The 2.x YAML files for these (`compound-metering-policy.yaml`, `margin-guard-policy.yaml`, `preflight-quota-policy.yaml`, `jwt-validation-config.yaml`) were descriptions, not installable policies, and were removed in 3.0.0. The quota pre-flight is part of this policy (`quota-enabled`).
 
 ## Known differences from Kong and Apigee
 

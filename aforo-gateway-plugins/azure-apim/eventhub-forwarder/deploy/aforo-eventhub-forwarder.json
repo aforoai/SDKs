@@ -1,0 +1,264 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "2.3.0.0",
+  "metadata": {
+    "description": "Aforo APIM Event Hub delivery: an Event Hubs namespace and hub, the APIM logger aforo-metering-logger (managed identity), and the forwarder Function that sends the events to the Aforo ingestor. Deploy into the resource group of the API Management instance."
+  },
+  "parameters": {
+    "apimName": {
+      "type": "string",
+      "metadata": {
+        "description": "Existing API Management instance in this resource group. Its system-assigned managed identity must be on."
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]"
+    },
+    "namespaceName": {
+      "type": "string",
+      "metadata": {
+        "description": "Event Hubs namespace to create (globally unique)."
+      }
+    },
+    "eventHubName": {
+      "type": "string",
+      "defaultValue": "aforo-metering"
+    },
+    "partitionCount": {
+      "type": "int",
+      "defaultValue": 4,
+      "minValue": 1,
+      "maxValue": 32
+    },
+    "retentionDays": {
+      "type": "int",
+      "defaultValue": 7,
+      "minValue": 1,
+      "maxValue": 7,
+      "metadata": {
+        "description": "How long events survive an ingest outage (Standard tier: at most 7 days)."
+      }
+    },
+    "consumerGroupName": {
+      "type": "string",
+      "defaultValue": "aforo-forwarder"
+    },
+    "functionAppName": {
+      "type": "string",
+      "metadata": {
+        "description": "Function app to create (globally unique host name)."
+      }
+    },
+    "storageAccountName": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 24,
+      "metadata": {
+        "description": "Storage account for the Function's state and Event Hub checkpoints."
+      }
+    },
+    "aforoApiKey": {
+      "type": "securestring",
+      "metadata": {
+        "description": "Aforo API key with scope usage:ingest. Pass a Key Vault reference (@Microsoft.KeyVault(SecretUri=...)) to keep the value out of the app settings; the Function's identity then needs Key Vault Secrets User on that secret."
+      }
+    },
+    "aforoIngestUrl": {
+      "type": "string",
+      "defaultValue": "https://api.aforo.ai/v1/ingest/batch"
+    }
+  },
+  "variables": {
+    "senderRole": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2b629674-e913-4c01-ae53-ef4638d8f975')]",
+    "receiverRole": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'a638d3c7-ab3a-418d-83e6-5f17a39d4fde')]",
+    "apimId": "[resourceId('Microsoft.ApiManagement/service', parameters('apimName'))]",
+    "planName": "[concat(parameters('functionAppName'), '-plan')]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.EventHub/namespaces",
+      "apiVersion": "2024-01-01",
+      "name": "[parameters('namespaceName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard",
+        "tier": "Standard",
+        "capacity": 1
+      },
+      "properties": {
+        "disableLocalAuth": true,
+        "minimumTlsVersion": "1.2",
+        "publicNetworkAccess": "Enabled"
+      }
+    },
+    {
+      "type": "Microsoft.EventHub/namespaces/eventhubs",
+      "apiVersion": "2024-01-01",
+      "name": "[concat(parameters('namespaceName'), '/', parameters('eventHubName'))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.EventHub/namespaces', parameters('namespaceName'))]"
+      ],
+      "properties": {
+        "partitionCount": "[parameters('partitionCount')]",
+        "messageRetentionInDays": "[parameters('retentionDays')]"
+      }
+    },
+    {
+      "type": "Microsoft.EventHub/namespaces/eventhubs/consumergroups",
+      "apiVersion": "2024-01-01",
+      "name": "[concat(parameters('namespaceName'), '/', parameters('eventHubName'), '/', parameters('consumerGroupName'))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.EventHub/namespaces/eventhubs', parameters('namespaceName'), parameters('eventHubName'))]"
+      ],
+      "properties": {}
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[concat('Microsoft.EventHub/namespaces/', parameters('namespaceName'), '/eventhubs/', parameters('eventHubName'))]",
+      "name": "[guid(variables('apimId'), resourceId('Microsoft.EventHub/namespaces/eventhubs', parameters('namespaceName'), parameters('eventHubName')), 'aforo-sender')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.EventHub/namespaces/eventhubs', parameters('namespaceName'), parameters('eventHubName'))]"
+      ],
+      "properties": {
+        "roleDefinitionId": "[variables('senderRole')]",
+        "principalId": "[reference(variables('apimId'), '2022-08-01', 'full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      }
+    },
+    {
+      "type": "Microsoft.ApiManagement/service/loggers",
+      "apiVersion": "2022-08-01",
+      "name": "[concat(parameters('apimName'), '/aforo-metering-logger')]",
+      "dependsOn": [
+        "[extensionResourceId(resourceId('Microsoft.EventHub/namespaces/eventhubs', parameters('namespaceName'), parameters('eventHubName')), 'Microsoft.Authorization/roleAssignments', guid(variables('apimId'), resourceId('Microsoft.EventHub/namespaces/eventhubs', parameters('namespaceName'), parameters('eventHubName')), 'aforo-sender'))]"
+      ],
+      "properties": {
+        "loggerType": "azureEventHub",
+        "description": "Aforo metering events (aforo-metering-eventhub fragment)",
+        "isBuffered": true,
+        "credentials": {
+          "endpointAddress": "[concat(parameters('namespaceName'), '.servicebus.windows.net')]",
+          "identityClientId": "SystemAssigned",
+          "name": "[parameters('eventHubName')]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts",
+      "apiVersion": "2023-05-01",
+      "name": "[parameters('storageAccountName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard_LRS"
+      },
+      "kind": "StorageV2",
+      "properties": {
+        "minimumTlsVersion": "TLS1_2",
+        "allowBlobPublicAccess": false,
+        "supportsHttpsTrafficOnly": true
+      }
+    },
+    {
+      "type": "Microsoft.Web/serverfarms",
+      "apiVersion": "2023-12-01",
+      "name": "[variables('planName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Y1",
+        "tier": "Dynamic"
+      },
+      "kind": "functionapp",
+      "properties": {
+        "reserved": true
+      }
+    },
+    {
+      "type": "Microsoft.Web/sites",
+      "apiVersion": "2023-12-01",
+      "name": "[parameters('functionAppName')]",
+      "location": "[parameters('location')]",
+      "kind": "functionapp,linux",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Web/serverfarms', variables('planName'))]",
+        "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]"
+      ],
+      "properties": {
+        "serverFarmId": "[resourceId('Microsoft.Web/serverfarms', variables('planName'))]",
+        "httpsOnly": true,
+        "siteConfig": {
+          "linuxFxVersion": "Node|20",
+          "minTlsVersion": "1.2",
+          "ftpsState": "Disabled",
+          "appSettings": [
+            {
+              "name": "AzureWebJobsStorage",
+              "value": "[concat('DefaultEndpointsProtocol=https;AccountName=', parameters('storageAccountName'), ';EndpointSuffix=', environment().suffixes.storage, ';AccountKey=', listKeys(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), '2023-05-01').keys[0].value)]"
+            },
+            {
+              "name": "FUNCTIONS_EXTENSION_VERSION",
+              "value": "~4"
+            },
+            {
+              "name": "FUNCTIONS_WORKER_RUNTIME",
+              "value": "node"
+            },
+            {
+              "name": "AFORO_EVENTHUB_CONNECTION__fullyQualifiedNamespace",
+              "value": "[concat(parameters('namespaceName'), '.servicebus.windows.net')]"
+            },
+            {
+              "name": "AFORO_EVENTHUB_NAME",
+              "value": "[parameters('eventHubName')]"
+            },
+            {
+              "name": "AFORO_EVENTHUB_CONSUMER_GROUP",
+              "value": "[parameters('consumerGroupName')]"
+            },
+            {
+              "name": "AFORO_API_KEY",
+              "value": "[parameters('aforoApiKey')]"
+            },
+            {
+              "name": "AFORO_INGEST_URL",
+              "value": "[parameters('aforoIngestUrl')]"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[concat('Microsoft.EventHub/namespaces/', parameters('namespaceName'), '/eventhubs/', parameters('eventHubName'))]",
+      "name": "[guid(resourceId('Microsoft.Web/sites', parameters('functionAppName')), resourceId('Microsoft.EventHub/namespaces/eventhubs', parameters('namespaceName'), parameters('eventHubName')), 'aforo-receiver')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.EventHub/namespaces/eventhubs', parameters('namespaceName'), parameters('eventHubName'))]",
+        "[resourceId('Microsoft.Web/sites', parameters('functionAppName'))]"
+      ],
+      "properties": {
+        "roleDefinitionId": "[variables('receiverRole')]",
+        "principalId": "[reference(resourceId('Microsoft.Web/sites', parameters('functionAppName')), '2023-12-01', 'full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      }
+    }
+  ],
+  "outputs": {
+    "loggerId": {
+      "type": "string",
+      "value": "aforo-metering-logger"
+    },
+    "functionAppName": {
+      "type": "string",
+      "value": "[parameters('functionAppName')]"
+    },
+    "eventHubNamespace": {
+      "type": "string",
+      "value": "[concat(parameters('namespaceName'), '.servicebus.windows.net')]"
+    }
+  }
+}

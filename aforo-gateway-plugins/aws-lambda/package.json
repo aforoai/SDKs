@@ -1,10 +1,10 @@
 {
   "name": "aforo-metering-lambda",
-  "version": "2.3.0",
+  "version": "2.5.0",
   "description": "Aforo API metering for AWS API Gateway via CloudWatch Logs",
   "main": "index.js",
   "scripts": {
-    "test": "node tests/handler.test.js && node tests/contract.test.js && node tests/key-authorizer.test.js && node tests/key-authorizer-jwt.test.js && node tests/metering-proxy.test.js && node tests/agent-mcp.test.js"
+    "test": "node tests/handler.test.js && node tests/contract.test.js && node tests/key-authorizer.test.js && node tests/key-authorizer-jwt.test.js && node tests/metering-proxy.test.js && node tests/agent-mcp.test.js && node tests/aws-secret.test.js && node tests/secret-wiring.test.js && node tests/template.test.js && node tests/margin-guard.test.js && node tests/authorizer.test.js && node tests/guards.test.js && node ../aws-cloudformation/tests/templates.test.cjs"
   },
   "author": "Aforo AI",
   "license": "Apache-2.0",

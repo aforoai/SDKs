@@ -12,27 +12,47 @@
 -- body all let the request through: a quota check that is down must not become
 -- an outage of the customer's own API. preflight_quota_fail_open = false makes
 -- those cases answer 503 instead, for deployments where over-serving costs more
--- than refusing.
+-- than refusing (prepaid wallets, hard quotas).
+--
+-- Circuit breaker (2.8.0, G334). After preflight_quota_breaker_threshold
+-- consecutive failures (default 5) the check stops calling the ingestor for
+-- preflight_quota_breaker_cooldown_s seconds (default 10) and applies the
+-- fail mode at once, so an outage no longer costs every request the full
+-- timeout. Then one request probes: a success closes the breaker, a failure
+-- opens it for another cool-down. Shared by all workers (aforo_cache dict),
+-- per quota-check URL and tenant. A threshold of 0 turns the breaker off.
+--
+-- DENY is cached (2.8.0, G333) until the ingestor's retryAfterMs, at most
+-- 60 s (5 s when the answer gives none), and answered 429 with the remaining
+-- Retry-After from the cache. Before, every request of a refused customer
+-- asked the ingestor again.
+--
+-- The request names the quantity the call will be billed (estimatedQuantity,
+-- 2.8.0): a fixed quantity_source, else 1. A quantity the upstream reports
+-- in its response (X-Aforo-Quantity, response_size) is not known yet.
 --
 -- Configuration (schema.lua):
---   preflight_quota_enabled       boolean (default false)
---   preflight_quota_url           string  (default: aforo_endpoint's origin + /api/v1/quota/check)
---   preflight_quota_api_key       string  (default: api_key)
---   preflight_quota_timeout_ms    integer (default 300)
---   preflight_quota_cache_ttl_ms  integer (default 1000; 0 disables the cache;
---                                 ALLOW and WARN are cached, DENY never)
---   preflight_quota_fail_open     boolean (default true)
+--   preflight_quota_enabled            boolean (default false)
+--   preflight_quota_url                string  (default: aforo_endpoint's origin + /api/v1/quota/check)
+--   preflight_quota_api_key            string  (default: api_key)
+--   preflight_quota_timeout_ms         integer (default 300)
+--   preflight_quota_cache_ttl_ms       integer (default 1000; 0 disables the ALLOW/WARN
+--                                      and DENY caches)
+--   preflight_quota_fail_open          boolean (default true)
+--   preflight_quota_breaker_threshold  integer (default 5; 0 disables the breaker)
+--   preflight_quota_breaker_cooldown_s integer (default 10)
 
 local http = require("resty.http")
 local cjson = require("cjson.safe")
 
-local M = {}
+local function require_sibling(name)
+    local ok, mod = pcall(require, "kong.plugins.aforo-metering." .. name)
+    if ok then return mod end
+    return require(name)
+end
+local event_util = require_sibling("event-util")
 
--- Cached in the existing aforo_buffer dict, as the metric mappings are:
--- requiring a second lua_shared_dict adds a deployment step operators forget.
--- (This module used to name its own "aforo_preflight_cache" dict, which no
--- install declared, so the cache silently never existed.)
-local CACHE_DICT = "aforo_buffer"
+local M = {}
 
 local QUOTA_CHECK_PATH = "/api/v1/quota/check"
 
@@ -40,6 +60,11 @@ local QUOTA_CHECK_PATH = "/api/v1/quota/check"
 -- (the old default) timed out often enough that the check silently failed
 -- open (2026-10-19). Raised to 300 ms; preflight_quota_timeout_ms overrides.
 local DEFAULT_TIMEOUT_MS = 300
+
+local DENY_DEFAULT_SECONDS = 5
+local DENY_MAX_SECONDS = 60
+local DEFAULT_BREAKER_THRESHOLD = 5
+local DEFAULT_BREAKER_COOLDOWN = 10
 
 -- Same shape as handler.lua's throttle: a check that runs on every request
 -- would otherwise log on every request while the ingestor is unreachable.
@@ -81,6 +106,59 @@ local function fallback(conf, dict, reason)
     return false
 end
 
+-- ── Circuit breaker ─────────────────────────────────────────
+-- State and transitions: event_util.breaker_* (shared with margin-guard.lua).
+local function breaker_settings(conf)
+    return event_util.breaker_settings(conf.preflight_quota_breaker_threshold,
+        conf.preflight_quota_breaker_cooldown_s, DEFAULT_BREAKER_THRESHOLD, DEFAULT_BREAKER_COOLDOWN)
+end
+
+-- true when the call may go ahead, false when the breaker says skip it.
+local function breaker_allows(dict, bkey, conf)
+    local threshold = breaker_settings(conf)
+    -- Half-open: exactly one request probes; it holds the probe for at
+    -- most timeout + 1 s, so a probe whose worker died is replaced.
+    local timeout_s = (tonumber(conf.preflight_quota_timeout_ms) or DEFAULT_TIMEOUT_MS) / 1000
+    return event_util.breaker_allows(dict, bkey, threshold, timeout_s + 1)
+end
+
+local function breaker_success(dict, bkey)
+    event_util.breaker_success(dict, bkey)
+end
+
+local function breaker_failure(dict, bkey, conf)
+    local threshold, cooldown = breaker_settings(conf)
+    local opened, fails, tripped = event_util.breaker_failure(dict, bkey, threshold, cooldown)
+    if opened then
+        warn_throttled(dict, "preflight_breaker_open",
+            "[aforo-preflight] Quota check failed ", tripped and "its probe" or (tostring(fails)
+            .. " times in a row"), "; not calling it for ", cooldown, "s (",
+            conf.preflight_quota_fail_open == false and "refusing with 503" or "failing OPEN",
+            " meanwhile). Repeats suppressed for 60s.")
+    end
+end
+
+-- The quantity to ask about: a positive number or 1.
+local function estimated_quantity(quantity)
+    local q = tonumber(quantity)
+    if q and q > 0 and q == q and q ~= math.huge then return q end
+    return 1
+end
+
+local function deny_response(retry_after, reason, headers)
+    local h = {}
+    if type(headers) == "table" then
+        for k, v in pairs(headers) do h[k] = v end
+    end
+    h["Retry-After"] = tostring(retry_after)
+    h["Content-Type"] = "application/json"
+    kong.response.exit(429, {
+        message = reason or "Quota exceeded",
+        retryAfter = retry_after,
+    }, h)
+    return true
+end
+
 -- Returns true when it has answered the request (429 / 503), so the caller
 -- stops: in Kong's access phase kong.response.exit only records the response,
 -- and the rest of the handler would otherwise still run.
@@ -89,30 +167,32 @@ end
 -- (handler.lua's resolve_customer_id). Never a request header: this decides
 -- whose quota is spent, and a client-settable value would let one customer
 -- borrow another's.
-function M.check(conf, customer_id, metric_name)
+function M.check(conf, customer_id, metric_name, quantity)
     if not conf.preflight_quota_enabled then return false end
     -- No verified identity, nothing to check against. The log phase refuses to
     -- meter such a request too.
     if not customer_id or customer_id == "" then return false end
 
-    local dict = ngx.shared[CACHE_DICT]
+    local dict = event_util.cache_dict()
 
     local url = quota_url(conf)
     if not url then
         return fallback(conf, dict, "no preflight_quota_url and aforo_endpoint has no http(s) origin")
     end
 
+    local qty = estimated_quantity(quantity)
+
     -- Tenant is part of the key: one gateway can front several tenants'
     -- plugin instances, and customer ids are only unique within a tenant.
     local cache_key = "aforo:preflight:" .. (conf.tenant_id or "") .. ":" .. customer_id
-        .. ":" .. (metric_name or "_all")
+        .. ":" .. (metric_name or "_all") .. ":" .. tostring(qty)
     local ttl_ms = conf.preflight_quota_cache_ttl_ms or 1000
-    -- ALLOW and WARN are cached; DENY never is, so a top-up or a new window
-    -- unblocks the customer immediately, not a TTL later. WARN lets the call
-    -- through just as ALLOW does, and the ingestor answers it for every
+    -- ALLOW and WARN are cached for preflight_quota_cache_ttl_ms. WARN lets the
+    -- call through just as ALLOW does, and the ingestor answers it for every
     -- customer near their limit and for overage plans past it (2026-10-19):
     -- uncached, those customers cost one quota call per request. A cached
-    -- WARN still marks the response with X-RateLimit-Warning.
+    -- WARN still marks the response with X-RateLimit-Warning. DENY is cached
+    -- until its Retry-After (see the module header).
     if dict and ttl_ms > 0 then
         local cached = dict:get(cache_key)
         if cached == "ALLOW" then
@@ -120,7 +200,20 @@ function M.check(conf, customer_id, metric_name)
         elseif cached == "WARN" then
             kong.response.set_header("X-RateLimit-Warning", "approaching-limit")
             return false
+        elseif type(cached) == "string" and cached:sub(1, 5) == "DENY:" then
+            local entry = cjson.decode(cached:sub(6))
+            if type(entry) == "table" and tonumber(entry.until_at) then
+                local left = math.ceil(tonumber(entry.until_at) - ngx.now())
+                if left >= 1 then
+                    return deny_response(left, entry.reason, entry.headers)
+                end
+            end
         end
+    end
+
+    local bkey = "aforo:preflight:cb:" .. ngx.md5((conf.tenant_id or "") .. "\n" .. url)
+    if not breaker_allows(dict, bkey, conf) then
+        return fallback(conf, dict, "circuit breaker open after repeated failures")
     end
 
     local httpc = http.new()
@@ -131,11 +224,12 @@ function M.check(conf, customer_id, metric_name)
         body = cjson.encode({
             customerId = customer_id,
             metricName = metric_name,
+            estimatedQuantity = qty,
         }),
         -- X-API-Key alone, never Authorization: Bearer -- same reason as the
-        -- ingest flush in handler.lua. The ingestor's ApiKeyAuthFilter reads
-        -- only X-API-Key, and an API key sent as Bearer is parsed as a JWT and
-        -- rejected 401 before that filter runs, even alongside X-API-Key.
+        -- ingest flush in event-buffer.lua. The ingestor's ApiKeyAuthFilter
+        -- reads only X-API-Key, and an API key sent as Bearer is parsed as a
+        -- JWT and rejected 401 before that filter runs, even alongside X-API-Key.
         headers = {
             ["Content-Type"] = "application/json",
             ["X-API-Key"]    = conf.preflight_quota_api_key or conf.api_key or "",
@@ -144,10 +238,12 @@ function M.check(conf, customer_id, metric_name)
     })
 
     if not res then
+        breaker_failure(dict, bkey, conf)
         return fallback(conf, dict, "error: " .. tostring(err))
     end
 
     if res.status ~= 200 then
+        breaker_failure(dict, bkey, conf)
         -- 401/403 is a credential problem, not an outage; say so, since it will
         -- not fix itself. The key must be one the ingestor accepts for
         -- /api/v1/quota/check -- hence preflight_quota_api_key.
@@ -158,8 +254,10 @@ function M.check(conf, customer_id, metric_name)
 
     local result = cjson.decode(res.body)
     if type(result) ~= "table" then
+        breaker_failure(dict, bkey, conf)
         return fallback(conf, dict, "unreadable response body")
     end
+    breaker_success(dict, bkey)
 
     -- The controller returns the decision flat; tolerate the platform's
     -- {success, data} envelope too in case a gateway in front adds it.
@@ -171,24 +269,21 @@ function M.check(conf, customer_id, metric_name)
         -- DOWN, so a wait under a second used to reach the client as
         -- "Retry-After: 0" -- an invitation to retry at once.
         local retry_ms = tonumber(data.retryAfterMs)
-        local retry_after = (retry_ms and retry_ms > 0) and math.max(1, math.ceil(retry_ms / 1000)) or 60
-        local headers = {}
-        if type(data.headers) == "table" then
-            for k, v in pairs(data.headers) do
-                headers[k] = v
-            end
+        local retry_after = (retry_ms and retry_ms > 0) and math.max(1, math.ceil(retry_ms / 1000))
+            or DENY_DEFAULT_SECONDS
+        if retry_after > DENY_MAX_SECONDS then retry_after = DENY_MAX_SECONDS end
+        local headers = type(data.headers) == "table" and data.headers or nil
+        local reason = type(data.reason) == "string" and data.reason or nil
+        if dict and ttl_ms > 0 then
+            local entry = cjson.encode({ until_at = ngx.now() + retry_after, reason = reason,
+                                         headers = headers })
+            -- safe_set: a cache never evicts anything; a full dict just misses.
+            if entry then dict:safe_set(cache_key, "DENY:" .. entry, retry_after) end
         end
-        headers["Retry-After"] = tostring(retry_after)
-        headers["Content-Type"] = "application/json"
-        kong.response.exit(429, {
-            message = data.reason or "Quota exceeded",
-            retryAfter = retry_after,
-        }, headers)
-        return true
+        return deny_response(retry_after, reason, headers)
     end
 
     if (data.decision == "ALLOW" or data.decision == "WARN") and dict and ttl_ms > 0 then
-        -- safe_set: a cache never evicts buffered events; a full dict just misses.
         dict:safe_set(cache_key, data.decision, ttl_ms / 1000)
     end
 

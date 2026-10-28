@@ -1,6 +1,6 @@
 # Aforo for Apigee X: user guide
 
-**Version:** 3.0.0 · **Updated:** 2026-10-21 · **Audience:** engineers running Apigee X or hybrid who want their API metered and quota-enforced by Aforo without changing their API.
+**Version:** 3.1.0 · **Updated:** 2026-10-28 · **Audience:** engineers running Apigee X or hybrid who want their API metered and quota-enforced by Aforo without changing their API.
 
 Aforo's organization service normally does every step below when you connect your Apigee org in Aforo and deploy a product to it. This guide does it by hand: for a test org, for troubleshooting, or to see exactly what Aforo changes. The [README](README.md) is the reference for every setting.
 
@@ -144,8 +144,17 @@ Apigee sends a target's 4xx/5xx to the error flow, which skips the PostProxyFlow
 
 - **`async`** (the default): the client never waits for Aforo. An event the ingestor does not store is lost without a trace. Use it in production.
 - **`sync`**: the client waits for the ingestor's answer, which takes at most about 4 s. A transient failure is re-sent once and every loss is logged. Use it while testing, or where every event matters more than latency.
+- **`pubsub`** (Apigee X / hybrid): each call's events go to a Pub/Sub topic (`pubsub_topic`), and the [Pub/Sub forwarder](pubsub-forwarder/README.md) delivers them in batches and acks only after the ingestor accepted them. The client waits for the publish, not for Aforo; an ingest outage loses nothing. Set it up with the forwarder README, then set `pubsub_topic` before `delivery_mode = pubsub`.
 
 See the README for why Apigee forces this choice.
+
+## Token revocation
+
+A revoked Aforo JWT is not checked: with `jwt_validation_enabled`, a valid token is accepted until it expires. Keep JWT lifetimes short. Revoking the end customer's key (the app credential) takes effect on the next call.
+
+## Upgrading from 3.0
+
+Nothing to change: 3.1.0 adds the opt-in `pubsub` delivery mode and the `pubsub_topic` KVM key. Import and deploy both bundles again (aforo-access reads the new key). The flow hooks stay as they are.
 
 ## Upgrading from 2.x
 

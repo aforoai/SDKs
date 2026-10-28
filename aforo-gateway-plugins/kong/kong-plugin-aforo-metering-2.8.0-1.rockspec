@@ -1,14 +1,14 @@
 package = "kong-plugin-aforo-metering"
-version = "2.6.0-1"
+version = "2.8.0-1"
 
 -- Released from the public repository github.com/aforoai/SDKs, where the plugin
 -- lives in aforo-gateway-plugins/kong/ and is tagged kong-vX.Y.Z. `dir` points
 -- LuaRocks at that subdirectory of the clone, so the module paths below are
 -- relative to this file. From a checkout (either repository), run
--- `luarocks make kong-plugin-aforo-metering-2.6.0-1.rockspec` in this directory.
+-- `luarocks make kong-plugin-aforo-metering-2.8.0-1.rockspec` in this directory.
 source = {
     url = "git+https://github.com/aforoai/SDKs.git",
-    tag = "kong-v2.6.0",
+    tag = "kong-v2.8.0",
     dir = "SDKs/aforo-gateway-plugins/kong",
 }
 
@@ -34,17 +34,17 @@ dependencies = {
 
 build = {
     type = "builtin",
-    -- Every Lua module in this directory. handler.lua requires the three
+    -- Every Lua module in this directory. handler.lua requires the
     -- access-phase helpers as kong.plugins.aforo-metering.<name> (falling back
-    -- to the bare name when run from a source tree); compound-metering is
-    -- shipped for integrations that call it directly.
+    -- to the bare name when run from a source tree). compound-metering was
+    -- removed in 2.8.0: the plugin never called it.
     modules = {
         ["kong.plugins.aforo-metering.handler"]            = "handler.lua",
         ["kong.plugins.aforo-metering.schema"]             = "schema.lua",
         ["kong.plugins.aforo-metering.rate-limit-enforce"] = "rate-limit-enforce.lua",
         ["kong.plugins.aforo-metering.margin-guard"]       = "margin-guard.lua",
         ["kong.plugins.aforo-metering.preflight-quota"]    = "preflight-quota.lua",
-        ["kong.plugins.aforo-metering.compound-metering"]  = "compound-metering.lua",
+        ["kong.plugins.aforo-metering.redis-util"]         = "redis-util.lua",
         ["kong.plugins.aforo-metering.event-util"]         = "event-util.lua",
         ["kong.plugins.aforo-metering.event-buffer"]       = "event-buffer.lua",
     },

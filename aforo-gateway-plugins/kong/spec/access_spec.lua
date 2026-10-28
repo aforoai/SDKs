@@ -79,40 +79,158 @@ _G.ngx = {
     sleep = function() end,
     decode_base64 = b64dec,
     md5 = function(s) return (s:gsub("[^%w]", "_")) end,
+    sha1_bin = function(s) return "sha1:" .. tostring(#s) .. ":" .. s:sub(1, 16) end,
     escape_uri = function(s) return (tostring(s):gsub("[^%w%-%._~]", function(c) return string.format("%%%02X", c:byte()) end)) end,
 }
 
 -- ── resty.redis mock: a key/value store plus scripted error replies ──
 -- lua-resty-redis returns (false, msg) for a Redis error reply ("-ERR ...").
+-- It also keeps a connection pool (get_reused_times / set_keepalive), records
+-- every command it is sent (one entry per round trip), and runs EVAL scripts
+-- for real against the store through a small redis.call shim, so the
+-- rate-limit script itself is what the specs exercise.
 local redis_store, redis_error_reply, redis_auth_calls, redis_auth_ok, redis_connects
+local redis_pool, redis_commands, redis_scripts, redis_ttl, redis_eval_error
+-- connect() options and set_timeout() values, newest last (2.8.0 TLS / timeout specs).
+local redis_connect_opts, redis_timeouts = {}, {}
+-- redis_cluster: MGET over keys in different slots answers CROSSSLOT.
+-- redis_pipeline_err: commit_pipeline() fails (timeout, closed socket).
+-- redis_reply_override: key -> raw reply for that key's pipelined GET.
+local redis_cluster, redis_pipeline_err, redis_reply_override
+-- resty.http set_timeout() values, newest last.
+local http_timeouts = {}
+local function redis_call(cmd, k, v)
+    cmd = string.upper(cmd)
+    if cmd == "GET" then
+        local x = redis_store[k]
+        if x == nil then return false end
+        return tostring(x)
+    elseif cmd == "INCR" then
+        redis_store[k] = (tonumber(redis_store[k]) or 0) + 1
+        return redis_store[k]
+    elseif cmd == "EXPIRE" then
+        redis_ttl[k] = tonumber(v)
+        return 1
+    end
+    error("mock redis.call: unsupported " .. cmd)
+end
+local function run_script(src, nkeys, ...)
+    local args = { ... }
+    local keys, argv = {}, {}
+    for i = 1, nkeys do keys[i] = args[i] end
+    for i = nkeys + 1, #args do argv[#argv + 1] = tostring(args[i]) end
+    local fn = assert((loadstring or load)(src))
+    local env = setmetatable({ KEYS = keys, ARGV = argv, redis = { call = redis_call } },
+                             { __index = _G })
+    if setfenv then setfenv(fn, env) end
+    local out = fn()
+    -- Redis converts Lua numbers in a reply to integers (truncation).
+    local function conv(v)
+        if type(v) == "number" then return math.floor(v) end
+        if type(v) == "table" then
+            local t = {}
+            for i, x in ipairs(v) do t[i] = conv(x) end
+            return t
+        end
+        return v
+    end
+    return conv(out)
+end
 package.loaded["resty.redis"] = {
     new = function()
         local r = {}
-        function r:set_timeout() end
-        function r:connect(host, port)
+        function r:set_timeout(ms) table.insert(redis_timeouts, ms) end
+        function r:connect(host, port, opts)
             table.insert(redis_connects, host .. ":" .. tostring(port))
+            table.insert(redis_connect_opts, opts or {})
+            local pool = (opts and opts.pool) or (host .. ":" .. tostring(port))
+            self._pool = pool
+            if (redis_pool[pool] or 0) > 0 then
+                redis_pool[pool] = redis_pool[pool] - 1
+                self._reused = 1
+            else
+                self._reused = 0
+            end
             return true
         end
+        function r:get_reused_times() return self._reused or 0 end
         function r:auth(pw)
+            table.insert(redis_commands, "auth")
             table.insert(redis_auth_calls, pw)
             if redis_auth_ok then return true end
             return false, "WRONGPASS invalid username-password pair"
         end
-        function r:set_keepalive() return true end
+        function r:set_keepalive()
+            local pool = self._pool or "default"
+            redis_pool[pool] = (redis_pool[pool] or 0) + 1
+            return true
+        end
         function r:close() return true end
         function r:get(k)
+            -- lua-resty-redis: inside a pipeline a command is queued and
+            -- returns nothing; its reply comes from commit_pipeline().
+            if self._p then table.insert(self._p, { "get", k }); return end
+            table.insert(redis_commands, "get")
             if redis_error_reply then return false, redis_error_reply end
             local v = redis_store[k]
             if v == nil then return ngx.null end
             return v
         end
+        function r:mget(...)
+            table.insert(redis_commands, "mget")
+            if redis_error_reply then return false, redis_error_reply end
+            -- Redis Cluster / ElastiCache Serverless: keys in different
+            -- slots (no common hash tag) are refused as one command.
+            if redis_cluster and select("#", ...) > 1 then
+                return false, "CROSSSLOT Keys in request don't hash to the same slot"
+            end
+            local out = {}
+            for i, k in ipairs({ ... }) do
+                local v = redis_store[k]
+                out[i] = (v == nil) and ngx.null or v
+            end
+            return out
+        end
+        function r:eval(src, nkeys, ...)
+            table.insert(redis_commands, "eval")
+            if redis_eval_error then return nil, redis_eval_error end
+            redis_scripts[ngx.sha1_bin and ngx.sha1_bin(src) or src] = src
+            return run_script(src, nkeys, ...)
+        end
+        function r:evalsha(sha, nkeys, ...)
+            table.insert(redis_commands, "evalsha")
+            if redis_eval_error then return nil, redis_eval_error end
+            for bin, src in pairs(redis_scripts) do
+                if package.loaded["resty.string"].to_hex(bin) == sha then
+                    return run_script(src, nkeys, ...)
+                end
+            end
+            return nil, "NOSCRIPT No matching script. Please use EVAL."
+        end
         function r:init_pipeline() self._p = {} end
-        function r:incr(k) table.insert(self._p, k) end
-        function r:expire() end
+        function r:cancel_pipeline() self._p = nil end
+        -- One round trip: recorded as "pipeline:<cmd>,<cmd>". A per-command
+        -- error reply comes back as { false, msg } in its slot (as in
+        -- lua-resty-redis); redis_pipeline_err fails the whole commit.
         function r:commit_pipeline()
-            local k = self._p[1]
-            redis_store[k] = (redis_store[k] or 0) + 1
-            return { redis_store[k], 1 }
+            local p = self._p or {}
+            self._p = nil
+            local names = {}
+            for i, c in ipairs(p) do names[i] = c[1] end
+            table.insert(redis_commands, "pipeline:" .. table.concat(names, ","))
+            if redis_pipeline_err then return nil, redis_pipeline_err end
+            local out = {}
+            for i, c in ipairs(p) do
+                local v = redis_store[c[2]]
+                if redis_error_reply then
+                    out[i] = { false, redis_error_reply }
+                elseif redis_reply_override and redis_reply_override[c[2]] ~= nil then
+                    out[i] = redis_reply_override[c[2]]
+                else
+                    out[i] = (v == nil) and ngx.null or v
+                end
+            end
+            return out
         end
         return r
     end,
@@ -134,7 +252,7 @@ local http_requests, http_responses = {}, {}
 package.loaded["resty.http"] = {
     new = function()
         return {
-            set_timeout = function() end,
+            set_timeout = function(_, ms) table.insert(http_timeouts, ms) end,
             request_uri = function(_, url, params)
                 table.insert(http_requests, { url = url, params = params })
                 local r = table.remove(http_responses, 1) or { status = 202, body = "" }
@@ -235,6 +353,13 @@ local function reset()
     K.ctx.shared = {}
     redis_store, redis_error_reply = {}, nil
     redis_auth_calls, redis_auth_ok, redis_connects = {}, true, {}
+    redis_pool, redis_commands, redis_scripts, redis_ttl, redis_eval_error = {}, {}, {}, {}, nil
+    redis_connect_opts, redis_timeouts = {}, {}
+    redis_cluster, redis_pipeline_err, redis_reply_override = nil, nil, nil
+    http_timeouts = {}
+    ngx.shared.aforo_cache = nil
+    ngx.now = function() return 1800000000.5 end
+    ngx.time = function() return 1800000000 end
     pkey_loads, pkey_verify_result = {}, true
     http_requests, http_responses = {}, {}
     timers, warnings = {}, {}
@@ -250,6 +375,18 @@ local function conf(extra)
     for k, v in pairs(BASE) do c[k] = v end
     for k, v in pairs(extra or {}) do c[k] = v end
     return c
+end
+
+-- A config field's definition from schema.lua, or nil.
+local function schema_field(schema, name)
+    for _, f in ipairs(schema.fields) do
+        if f.config then
+            for _, cf in ipairs(f.config.fields) do
+                if cf[name] then return cf[name] end
+            end
+        end
+    end
+    return nil
 end
 
 -- Claims exactly as org-service's JwtTokenService mints them.
@@ -698,12 +835,12 @@ describe("access phase", function()
             assert.equals(429, K.response._exit.status)
         end)
 
-        it("skips JWT traffic, saying so once", function()
+        it("skips a JWT with no verified key_id, saying so once", function()
             K.request._h["Authorization"] = "Bearer " .. jwt(aforo_claims())
             for _ = 1, 3 do assert.is_false(rate_limit.enforce(conf(RL))) end
             local n = 0
             for _, w in ipairs(warnings) do
-                if w:find("not applied to JWT-authenticated requests", 1, true) then n = n + 1 end
+                if w:find("without a verified key_id is not rate limited", 1, true) then n = n + 1 end
             end
             assert.equals(1, n)
         end)
@@ -727,6 +864,162 @@ describe("access phase", function()
                 if not rate_limit.enforce(conf(RL)) then allowed = allowed + 1 end
             end
             assert.equals(1, allowed)
+        end)
+
+        -- ── G328: a JWT is limited by its verified key id, not its bytes ──
+        describe("JWT identity (G328)", function()
+            local KEY_ID = "7d1c1f6e-0000-4000-8000-000000000001"
+            local function keyid_policy(json)
+                redis_store["ratelimit:policy:tenant-B:keyid:" .. KEY_ID] = json
+            end
+            local function jwt_rl(extra)
+                local c = { rate_limit_enabled = true, jwt_validation_enabled = true,
+                            jwt_public_key = "PEM" }
+                for k, v in pairs(extra or {}) do c[k] = v end
+                return c
+            end
+
+            it("keeps one counter for a key across a token refresh", function()
+                keyid_policy(ONE_PER_MINUTE)
+                assert.is_nil(access_with(jwt(aforo_claims({ jti = "jti-1" })), jwt_rl()))
+                -- The refreshed token: new jti, new exp, new bytes, same key.
+                local exit = access_with(jwt(aforo_claims({ jti = "jti-2", exp = 1800000950 })), jwt_rl())
+                assert.is_not_nil(exit, "the refreshed token got a fresh counter")
+                assert.equals(429, exit.status)
+            end)
+
+            it("uses the key_id of a token Kong's jwt plugin verified", function()
+                keyid_policy(ONE_PER_MINUTE)
+                local c = { rate_limit_enabled = true, customer_id_jwt_claim = "customer_id" }
+                for _, jti in ipairs({ "a", "b" }) do
+                    local token = jwt(aforo_claims({ jti = jti }))
+                    K.request._h["Authorization"] = "Bearer " .. token
+                    K.ctx.shared = { authenticated_jwt_token = token }
+                    K.response._exit = nil
+                    handler:access(conf(c))
+                end
+                assert.is_not_nil(K.response._exit)
+                assert.equals(429, K.response._exit.status)
+            end)
+
+            it("never takes the key id of a token whose signature was not verified", function()
+                keyid_policy(ONE_PER_MINUTE)
+                local c = { rate_limit_enabled = true, jwt_validation_enabled = true,
+                            jwt_allow_unverified_signature = true }
+                for _ = 1, 3 do
+                    assert.is_nil(access_with(jwt(aforo_claims()), c))
+                end
+            end)
+
+            it("limits PER_CUSTOMER by the verified customer, across that customer's keys", function()
+                local P = '{"policyName":"Cust","scope":"PER_CUSTOMER","enforcementMode":"HARD",'
+                    .. '"tiers":[{"windowSeconds":60,"maxRequests":1,"burstCapacity":0}]}'
+                redis_store["ratelimit:policy:tenant-B:keyid:key-1"] = P
+                redis_store["ratelimit:policy:tenant-B:keyid:key-2"] = P
+                assert.is_nil(access_with(jwt(aforo_claims({ key_id = "key-1" })), jwt_rl()))
+                local exit = access_with(jwt(aforo_claims({ key_id = "key-2", jti = "j2" })), jwt_rl())
+                assert.is_not_nil(exit)
+                assert.equals(429, exit.status)
+            end)
+        end)
+
+        -- ── G329: sliding window, no 2x burst at the window edge ──
+        describe("sliding window (G329)", function()
+            local TEN_PER_MINUTE = '{"policyName":"P10","enforcementMode":"HARD",'
+                .. '"tiers":[{"windowSeconds":60,"maxRequests":10,"burstCapacity":0}]}'
+            local W0 = 1800000000  -- a window boundary (divisible by 60)
+            local function at(t)
+                ngx.now = function() return t end
+                ngx.time = function() return math.floor(t) end
+            end
+            after_each(function() at(1800000000.5) end)
+
+            it("does not allow 2x the limit across a window edge", function()
+                policy("sk_live_sw", TEN_PER_MINUTE)
+                K.request._h["Authorization"] = "Bearer sk_live_sw"
+                local c = conf(RL)
+                at(W0 + 59.5)
+                for i = 1, 10 do
+                    assert.is_false(rate_limit.enforce(c), "request " .. i .. " refused")
+                end
+                -- One second later, in the next fixed window.
+                at(W0 + 60.5)
+                assert.is_true(rate_limit.enforce(c),
+                    "a fresh fixed window let 10 more through one second later")
+                assert.equals(429, K.response._exit.status)
+                local retry = tonumber(K.response._exit.headers["Retry-After"])
+                assert.is_true(retry >= 1 and retry <= 60, "Retry-After " .. tostring(retry))
+            end)
+
+            it("lets requests through again as the previous window ages out", function()
+                policy("sk_live_sw2", TEN_PER_MINUTE)
+                K.request._h["Authorization"] = "Bearer sk_live_sw2"
+                local c = conf(RL)
+                at(W0 + 59.5)
+                for _ = 1, 10 do rate_limit.enforce(c) end
+                -- Halfway through the next window, the previous one weighs ~half.
+                at(W0 + 90)
+                local allowed = 0
+                for _ = 1, 10 do
+                    K.response._exit = nil
+                    if not rate_limit.enforce(c) then allowed = allowed + 1 end
+                end
+                assert.is_true(allowed >= 4 and allowed <= 5, "allowed " .. allowed)
+            end)
+
+            it("does not count a request it refused", function()
+                policy("sk_live_sw3", ONE_PER_MINUTE)
+                K.request._h["Authorization"] = "Bearer sk_live_sw3"
+                local c = conf(RL)
+                rate_limit.enforce(c)
+                for _ = 1, 5 do rate_limit.enforce(c) end
+                local key = "ratelimit:count:tenant-B:hash(sk_live_sw3):60:" .. tostring(W0 / 60)
+                assert.equals(1, tonumber(redis_store[key]))
+                -- Kept long enough to weigh the whole next window.
+                assert.is_true((redis_ttl[key] or 0) >= 120)
+            end)
+
+            it("still counts every request in SOFT mode", function()
+                policy("sk_live_sw4", '{"policyName":"S","enforcementMode":"SOFT",'
+                    .. '"tiers":[{"windowSeconds":60,"maxRequests":1,"burstCapacity":0}]}')
+                K.request._h["Authorization"] = "Bearer sk_live_sw4"
+                local c = conf(RL)
+                for _ = 1, 3 do assert.is_false(rate_limit.enforce(c)) end
+                local key = "ratelimit:count:tenant-B:hash(sk_live_sw4):60:" .. tostring(W0 / 60)
+                assert.equals(3, tonumber(redis_store[key]))
+            end)
+        end)
+
+        -- ── G330: AUTH once per connection, one round trip per check ──
+        describe("Redis round trips (G330)", function()
+            it("sends AUTH only on a new connection", function()
+                policy("sk_live_rt", '{"enforcementMode":"HARD","tiers":[{"windowSeconds":60,"maxRequests":100}]}')
+                K.request._h["Authorization"] = "Bearer sk_live_rt"
+                local c = conf({ rate_limit_enabled = true, rate_limit_redis_password = "rl-pw" })
+                for _ = 1, 3 do rate_limit.enforce(c) end
+                assert.equals(1, #redis_auth_calls, "AUTH sent on a pooled connection")
+            end)
+
+            it("checks every tier in one round trip once the policy is cached", function()
+                local key = "sk_live_rt2"
+                K.client._credential = { key = key }
+                policy(key, '{"enforcementMode":"HARD","tiers":['
+                    .. '{"windowSeconds":60,"maxRequests":100},{"windowSeconds":3600,"maxRequests":1000}]}')
+                local c = conf(RL)
+                rate_limit.enforce(c)
+                rate_limit.enforce(c)
+                redis_commands = {}
+                rate_limit.enforce(c)
+                assert.same({ "evalsha" }, redis_commands)
+            end)
+
+            it("fails open when the check script errors", function()
+                policy("sk_live_rt3", ONE_PER_MINUTE)
+                K.request._h["Authorization"] = "Bearer sk_live_rt3"
+                redis_eval_error = "ERR something broke"
+                for _ = 1, 3 do assert.is_false(rate_limit.enforce(conf(RL))) end
+                assert.is_nil(K.response._exit)
+            end)
         end)
 
         it("fails open on a Redis error reply", function()
@@ -770,10 +1063,27 @@ describe("access phase", function()
             http_responses = { ALLOW, ALLOW }
             assert.is_false(margin_guard.check(conf(MG), "tenant B", "cust/1&x"))
             assert.equals(2, #http_requests)
-            assert.equals("http://pricing/internal/v1/margin-guard/quick-check"
-                .. "?tenantId=tenant%20B&scopeType=GLOBAL&scopeId=global", http_requests[1].url)
-            assert.equals("http://pricing/internal/v1/margin-guard/quick-check"
-                .. "?tenantId=tenant%20B&scopeType=CUSTOMER&scopeId=cust%2F1%26x", http_requests[2].url)
+            -- 2.8.0: pricing's public, key-authenticated path; the tenant comes from
+            -- the key, so neither a tenantId parameter nor X-Tenant-Id is sent.
+            assert.equals("http://pricing/api/v1/margin-guard/quick-check"
+                .. "?scopeType=GLOBAL&scopeId=global", http_requests[1].url)
+            assert.equals("http://pricing/api/v1/margin-guard/quick-check"
+                .. "?scopeType=CUSTOMER&scopeId=cust%2F1%26x", http_requests[2].url)
+        end)
+
+        it("authenticates with the API key only, never X-Tenant-Id", function()
+            http_responses = { ALLOW, ALLOW }
+            assert.is_false(margin_guard.check(conf(MG), "tenant-B", "cust-1"))
+            local h = http_requests[1].params.headers
+            assert.equals(conf(MG).api_key, h["X-API-Key"])
+            assert.is_nil(h["X-Tenant-Id"])
+        end)
+
+        it("keeps cache entries per tenant although the tenant is not on the wire", function()
+            http_responses = { BLOCK, ALLOW, ALLOW }
+            assert.is_true(margin_guard.check(conf(MG), "tenant-B", nil))
+            assert.is_false(margin_guard.check(conf(MG), "tenant-C", nil))
+            assert.equals(2, #http_requests)
         end)
 
         it("answers 429 on a THROTTLE of the customer's scope, and never caches it", function()
@@ -917,6 +1227,610 @@ describe("access phase", function()
             run()
             assert.is_nil(K.response._exit)
             assert.equals(1, buffered())
+        end)
+    end)
+end)
+
+-- ── 2.8.0 (wave 6): dicts, margin guard auth, preflight, Redis TLS, JWT aud/iss ──
+describe("2.8.0 hardening", function()
+    local preflight = require("preflight-quota")
+    local event_util = require("event-util")
+
+    -- A dict that honours TTLs against ngx.now(), for the cache specs.
+    local function ttl_dict()
+        local d = { store = {}, exp = {} }
+        local function live(self, k)
+            local e = self.exp[k]
+            if e and ngx.now() >= e then self.store[k], self.exp[k] = nil, nil end
+            return self.store[k]
+        end
+        function d:get(k) return live(self, k) end
+        function d:set(k, v, ttl)
+            self.store[k] = v
+            self.exp[k] = (ttl and ttl > 0) and (ngx.now() + ttl) or nil
+            return true
+        end
+        function d:add(k, v, ttl)
+            if live(self, k) ~= nil then return false, "exists" end
+            return self:set(k, v, ttl)
+        end
+        d.safe_set, d.safe_add = d.set, d.add
+        function d:delete(k) self.store[k], self.exp[k] = nil, nil end
+        function d:incr(k, v, init, init_ttl)
+            local cur = live(self, k)
+            if cur == nil then
+                if init == nil then return nil, "not found" end
+                self:set(k, init, init_ttl)
+                cur = init
+            end
+            self.store[k] = cur + v
+            return self.store[k]
+        end
+        function d:rpush(k, v) self.store[k] = self.store[k] or {}; table.insert(self.store[k], v); return #self.store[k] end
+        function d:lpush(k, v) self.store[k] = self.store[k] or {}; table.insert(self.store[k], 1, v); return #self.store[k] end
+        function d:lpop(k) local l = self.store[k]; return l and table.remove(l, 1) end
+        function d:rpop(k) local l = self.store[k]; return l and table.remove(l) end
+        function d:llen(k) local l = self.store[k]; return l and #l or 0 end
+        function d:capacity() return 10485760 end
+        function d:free_space() return 10485760 end
+        function d:ttl(k) if live(self, k) == nil then return nil, "not found" end return 0 end
+        function d:expire(k) return live(self, k) ~= nil end
+        return d
+    end
+
+    local function count_keys(dict, prefix)
+        local n = 0
+        for k in pairs(dict.store) do
+            if type(k) == "string" and k:sub(1, #prefix) == prefix then n = n + 1 end
+        end
+        return n
+    end
+
+    local function said(...)
+        local want, n = { ... }, 0
+        for _, w in ipairs(warnings) do
+            local all = true
+            for _, frag in ipairs(want) do if not w:find(frag, 1, true) then all = false end end
+            if all then n = n + 1 end
+        end
+        return n
+    end
+
+    local now
+    before_each(function()
+        reset()
+        if event_util._reset_cache_dict_warning then event_util._reset_cache_dict_warning() end
+        now = 1800000000.5
+        ngx.now = function() return now end
+        ngx.time = function() return math.floor(now) end
+    end)
+
+    -- ── G323: caches in their own dict ─────────────────────────────
+    describe("aforo_cache dict (G323)", function()
+        local PF = { preflight_quota_enabled = true, preflight_quota_url = "http://ingest/api/v1/quota/check" }
+
+        it("keeps caches, throttles and counters out of the event dict when aforo_cache is declared", function()
+            ngx.shared.aforo_cache = ttl_dict()
+            -- preflight ALLOW cache, margin guard cache, a warn throttle, a drop counter
+            http_responses = { { status = 200, body = '{"decision":"ALLOW"}' },
+                               { status = 200, body = '{"verdict":"ALLOW","currentLevel":"NONE"}' },
+                               { err = "timeout" } }
+            preflight.check(conf(PF), "cust-1", "api_calls")
+            margin_guard.check(conf({ margin_guard_enabled = true, margin_guard_url = "http://pricing" }),
+                "tenant-B", nil)
+            margin_guard.check(conf({ margin_guard_enabled = true, margin_guard_url = "http://pricing",
+                margin_guard_cache_ttl = 0 }), "tenant-X", nil)
+            event_util.record_drop("rejected", 2)
+
+            local buf, cache = ngx.shared.aforo_buffer, ngx.shared.aforo_cache
+            assert.equals(1, count_keys(cache, "aforo:preflight:"))
+            -- The ALLOW cache entry and the breaker's failure count from the timeout.
+            assert.equals(2, count_keys(cache, "aforo:mg:"))
+            assert.equals(1, count_keys(cache, "aforo:mg:cb:"))
+            assert.equals(1, count_keys(cache, "aforo:warn:"))
+            assert.equals(2, cache.store["aforo_dropped:rejected"])
+            for k in pairs(buf.store) do
+                assert.is_nil(k:find("^aforo:preflight:") or k:find("^aforo:mg:")
+                    or k:find("^aforo:warn:") or k:find("^aforo_dropped:"),
+                    "cache key in the event dict: " .. k)
+            end
+        end)
+
+        it("keeps the rate-limit policy cache and the metric mappings in aforo_cache", function()
+            ngx.shared.aforo_cache = ttl_dict()
+            K.client._consumer = { custom_id = "cust-1", username = "acme" }
+            redis_store["ratelimit:policy:tenant-B:hash(sk_live_9)"] = '{"enforcementMode":"SOFT",'
+                .. '"tiers":[{"windowSeconds":60,"maxRequests":100}]}'
+            K.request._h["Authorization"] = "Bearer sk_live_9"
+            handler:access(conf({ rate_limit_enabled = true, mappings_url = "http://catalog/m" }))
+            local cache, buf = ngx.shared.aforo_cache, ngx.shared.aforo_buffer
+            assert.is_true(count_keys(cache, "ratelimit:policy:") + count_keys(cache, "aforo:rl:") >= 1)
+            assert.is_true(count_keys(cache, "aforo:gateway_mappings:") >= 1)
+            assert.equals(0, count_keys(buf, "ratelimit:policy:") + count_keys(buf, "aforo:rl:"))
+            assert.equals(0, count_keys(buf, "aforo:gateway_mappings:"))
+        end)
+
+        it("falls back to aforo_buffer with one loud error when aforo_cache is not declared", function()
+            http_responses = { { status = 200, body = '{"decision":"ALLOW"}' },
+                               { status = 200, body = '{"decision":"ALLOW"}' } }
+            preflight.check(conf(PF), "cust-1", "api_calls")
+            preflight.check(conf(PF), "cust-2", "api_calls")
+            assert.equals(2, count_keys(ngx.shared.aforo_buffer, "aforo:preflight:"))
+            assert.equals(1, said("aforo_cache", "lua_shared_dict"))
+        end)
+    end)
+
+    -- ── G331 / G332: margin guard ──────────────────────────────────
+    describe("margin guard (G331, G332)", function()
+        local MG = { margin_guard_enabled = true, margin_guard_url = "http://pricing" }
+
+        it("sends the plugin's Aforo API key as X-API-Key", function()
+            http_responses = { { status = 200, body = '{"verdict":"ALLOW"}' } }
+            margin_guard.check(conf(MG), "tenant-B", nil)
+            assert.equals("k", http_requests[1].params.headers["X-API-Key"])
+            assert.is_nil(http_requests[1].params.headers["Authorization"])
+        end)
+
+        it("escapes the scope type as well as tenant and scope id", function()
+            http_responses = { { status = 200, body = '{"verdict":"ALLOW"}' } }
+            margin_guard.check(conf(MG), "tenant-B", nil)
+            assert.truthy(http_requests[1].url:find("scopeType=GLOBAL&", 1, true))
+        end)
+
+        it("logs a missing cache dict once, and still checks", function()
+            ngx.shared.aforo_buffer = nil
+            http_responses = { { status = 200, body = '{"verdict":"ALLOW"}' },
+                               { status = 200, body = '{"verdict":"ALLOW"}' } }
+            margin_guard.check(conf(MG), "tenant-B", nil)
+            margin_guard.check(conf(MG), "tenant-B", nil)
+            assert.equals(2, #http_requests)
+            assert.equals(1, said("aforo_cache", "not declared"))
+        end)
+    end)
+
+    -- ── G333 / G334: pre-flight quota ──────────────────────────────
+    describe("pre-flight quota (G333, G334)", function()
+        local PF = { preflight_quota_enabled = true, preflight_quota_url = "http://ingest/api/v1/quota/check" }
+        local DENY = { status = 200, body = '{"decision":"DENY","reason":"Wallet empty","retryAfterMs":3000}' }
+
+        it("caches a DENY until retryAfter and answers 429 from the cache", function()
+            ngx.shared.aforo_cache = ttl_dict()
+            http_responses = { DENY }
+            assert.is_true(preflight.check(conf(PF), "cust-1", "api_calls"))
+            assert.equals("3", K.response._exit.headers["Retry-After"])
+
+            K.response._exit = nil
+            now = now + 1.2
+            assert.is_true(preflight.check(conf(PF), "cust-1", "api_calls"))
+            assert.equals(1, #http_requests, "a cached DENY asked the ingestor again")
+            assert.equals(429, K.response._exit.status)
+            assert.equals("2", K.response._exit.headers["Retry-After"])
+            assert.equals("Wallet empty", K.response._exit.body.message)
+
+            -- Past retryAfter the ingestor is asked again.
+            K.response._exit = nil
+            now = now + 2
+            http_responses = { { status = 200, body = '{"decision":"ALLOW"}' } }
+            assert.is_false(preflight.check(conf(PF), "cust-1", "api_calls"))
+            assert.equals(2, #http_requests)
+        end)
+
+        it("bounds a cached DENY to 60 seconds, and to 5 without retryAfterMs", function()
+            ngx.shared.aforo_cache = ttl_dict()
+            http_responses = { { status = 200, body = '{"decision":"DENY","retryAfterMs":3600000}' },
+                               { status = 200, body = '{"decision":"DENY"}' } }
+            preflight.check(conf(PF), "cust-1", "api_calls")
+            preflight.check(conf(PF), "cust-2", "api_calls")
+            assert.equals("5", K.response._exit.headers["Retry-After"])
+            now = now + 6
+            http_responses = { { status = 200, body = '{"decision":"ALLOW"}' },
+                               { status = 200, body = '{"decision":"ALLOW"}' } }
+            preflight.check(conf(PF), "cust-2", "api_calls")
+            assert.equals(3, #http_requests)          -- cust-2's DENY expired
+            preflight.check(conf(PF), "cust-1", "api_calls")
+            assert.equals(3, #http_requests)          -- cust-1's still cached
+            now = now + 55
+            preflight.check(conf(PF), "cust-1", "api_calls")
+            assert.equals(4, #http_requests)          -- capped at 60 s
+        end)
+
+        it("sends the quantity the request will be billed", function()
+            http_responses = { { status = 200, body = '{"decision":"ALLOW"}' },
+                               { status = 200, body = '{"decision":"ALLOW"}' } }
+            preflight.check(conf(PF), "cust-1", "api_calls", 25)
+            local body = cjson.decode(http_requests[1].params.body)
+            assert.equals(25, body.estimatedQuantity)
+            preflight.check(conf(PF), "cust-2", "api_calls")
+            assert.equals(1, cjson.decode(http_requests[2].params.body).estimatedQuantity)
+        end)
+
+        it("the access phase sends a fixed quantity_source as estimatedQuantity", function()
+            K.client._consumer = { custom_id = "cust-1", username = "acme" }
+            http_responses = { { status = 200, body = '{"decision":"ALLOW"}' } }
+            local c = conf(PF)
+            c.quantity_source = "3"
+            handler:access(c)
+            assert.equals(3, cjson.decode(http_requests[1].params.body).estimatedQuantity)
+        end)
+
+        it("opens a breaker after consecutive failures, then probes once after the cool-down", function()
+            ngx.shared.aforo_cache = ttl_dict()
+            local c = conf(PF)
+            c.preflight_quota_breaker_threshold = 3
+            c.preflight_quota_breaker_cooldown_s = 10
+            for i = 1, 3 do
+                http_responses = { { err = "timeout" } }
+                assert.is_false(preflight.check(c, "cust-" .. i, "api_calls"))
+            end
+            assert.equals(3, #http_requests)
+            -- Open: no call, fails open at once.
+            assert.is_false(preflight.check(c, "cust-9", "api_calls"))
+            assert.equals(3, #http_requests, "an open breaker still called the ingestor")
+            -- Fail-closed deployments get the 503 at once too.
+            local closed = conf(PF)
+            closed.preflight_quota_breaker_threshold = 3
+            closed.preflight_quota_fail_open = false
+            assert.is_true(preflight.check(closed, "cust-9", "api_calls"))
+            assert.equals(503, K.response._exit.status)
+            assert.equals(3, #http_requests)
+
+            -- Cool-down over: one probe. Success closes the breaker.
+            now = now + 11
+            http_responses = { { status = 200, body = '{"decision":"ALLOW"}' } }
+            assert.is_false(preflight.check(c, "cust-9", "api_calls"))
+            assert.equals(4, #http_requests)
+            http_responses = { { status = 200, body = '{"decision":"ALLOW"}' } }
+            preflight.check(c, "cust-10", "api_calls")
+            assert.equals(5, #http_requests)
+        end)
+
+        it("a failed probe re-opens the breaker", function()
+            ngx.shared.aforo_cache = ttl_dict()
+            local c = conf(PF)
+            c.preflight_quota_breaker_threshold = 2
+            c.preflight_quota_breaker_cooldown_s = 10
+            http_responses = { { err = "timeout" }, { err = "timeout" } }
+            preflight.check(c, "a", "m"); preflight.check(c, "b", "m")
+            now = now + 11
+            http_responses = { { status = 503 } }
+            preflight.check(c, "c", "m")
+            assert.equals(3, #http_requests)
+            preflight.check(c, "d", "m")
+            assert.equals(3, #http_requests, "a failed probe did not re-open the breaker")
+        end)
+
+        it("a success resets the failure count", function()
+            ngx.shared.aforo_cache = ttl_dict()
+            local c = conf(PF)
+            c.preflight_quota_breaker_threshold = 2
+            http_responses = { { err = "timeout" }, { status = 200, body = '{"decision":"ALLOW"}' },
+                               { err = "timeout" }, { status = 200, body = '{"decision":"ALLOW"}' } }
+            for _, id in ipairs({ "a", "b", "c", "d" }) do preflight.check(c, id, "m") end
+            assert.equals(4, #http_requests)
+        end)
+    end)
+
+    -- ── G325 / G327: revocation Redis ──────────────────────────────
+    describe("revocation Redis (G325, G327)", function()
+        local function jwt_access(extra)
+            local c = { jwt_validation_enabled = true, jwt_public_key = "PEM" }
+            for k, v in pairs(extra or {}) do c[k] = v end
+            K.request._h["Authorization"] = "Bearer " .. jwt(aforo_claims())
+            handler:access(conf(c))
+            return K.response._exit
+        end
+
+        it("checks jti and both client keys with pipelined GETs, one round trip, no MGET", function()
+            assert.is_nil(jwt_access())
+            assert.same({ "pipeline:get,get,get" }, redis_commands)
+        end)
+
+        it("still finds a revoked client in the pipelined answer", function()
+            redis_store["jti:client:afr_abc"] = "revoked"
+            assert.equals("CLIENT_REVOKED", jwt_access().body.error_description)
+            assert.same({ "pipeline:get,get,get" }, redis_commands)
+        end)
+
+        it("finds a revocation recorded under key_id", function()
+            redis_store["jti:client:7d1c1f6e-0000-4000-8000-000000000001"] = "revoked"
+            assert.equals("CLIENT_REVOKED", jwt_access().body.error_description)
+        end)
+
+        it("works on Redis Cluster / ElastiCache Serverless, where a cross-slot MGET is refused (G327 review)", function()
+            redis_cluster = true
+            assert.is_nil(jwt_access(), "a cross-slot lookup was answered as Redis unavailable")
+            K.response._exit = nil
+            K.ctx.shared = {}
+            redis_store["jti:blocked:jti-1"] = "1"
+            assert.equals("TOKEN_REVOKED", jwt_access().body.error_description)
+        end)
+
+        it("an error reply for one key (MOVED on a classic cluster node) fails closed", function()
+            redis_reply_override = { ["jti:client:afr_abc"] = { false, "MOVED 1234 10.0.0.2:6379" } }
+            local exit = jwt_access()
+            assert.equals(503, exit.status)
+            assert.equals("REVOCATION_CHECK_UNAVAILABLE", exit.body.error_description)
+        end)
+
+        it("a value in an earlier slot still wins over an error reply in a later one", function()
+            redis_store["jti:blocked:jti-1"] = "1"
+            redis_reply_override = { ["jti:client:afr_abc"] = { false, "MOVED 1234 10.0.0.2:6379" } }
+            assert.equals("TOKEN_REVOKED", jwt_access().body.error_description)
+        end)
+
+        it("a failed pipeline commit fails closed, and fails open in open mode", function()
+            redis_pipeline_err = "timeout"
+            assert.equals(503, jwt_access().status)
+            K.response._exit = nil
+            K.ctx.shared = {}
+            assert.is_nil(jwt_access({ jti_redis_fail_mode = "open" }))
+        end)
+
+        it("an unexpected reply type fails closed", function()
+            redis_reply_override = { ["jti:blocked:jti-1"] = 7 }
+            assert.equals(503, jwt_access().status)
+        end)
+
+        it("a reply that is neither a value, nil nor an error fails closed", function()
+            redis_reply_override = { ["jti:client:7d1c1f6e-0000-4000-8000-000000000001"] = false }
+            assert.equals(503, jwt_access().status)
+        end)
+
+        it("AUTHs only on a new connection", function()
+            jwt_access({ jwt_redis_password = "pw" })
+            K.response._exit = nil
+            K.ctx.shared = {}
+            jwt_access({ jwt_redis_password = "pw" })
+            assert.equals(1, #redis_auth_calls)
+            assert.same({ "auth", "pipeline:get,get,get", "pipeline:get,get,get" }, redis_commands)
+        end)
+
+        it("defaults the revocation timeout to 250 ms, configurable with jwt_redis_timeout_ms", function()
+            jwt_access()
+            assert.equals(250, redis_timeouts[#redis_timeouts])
+            jwt_access({ jwt_redis_timeout_ms = 20 })
+            assert.equals(20, redis_timeouts[#redis_timeouts])
+        end)
+
+        it("the schema default for jwt_redis_timeout_ms is 250", function()
+            local saved = package.loaded["kong.db.schema.typedefs"]
+            package.loaded["kong.db.schema.typedefs"] = { no_consumer = {}, protocols_http = {} }
+            package.loaded["schema"] = nil
+            local schema = require("schema")
+            package.loaded["kong.db.schema.typedefs"] = saved
+            package.loaded["schema"] = nil
+            local f = schema_field(schema, "jwt_redis_timeout_ms")
+            assert.equals(250, f.default)
+        end)
+
+        it("connects with TLS when jwt_redis_ssl is set, verifying by default", function()
+            jwt_access({ jwt_redis_host = "redis.internal", jwt_redis_ssl = true,
+                         jwt_redis_server_name = "redis.example" })
+            local o = redis_connect_opts[#redis_connect_opts]
+            assert.is_true(o.ssl)
+            assert.is_true(o.ssl_verify)
+            assert.equals("redis.example", o.server_name)
+        end)
+
+        it("uses the host as the TLS server name when none is set", function()
+            jwt_access({ jwt_redis_host = "redis.internal", jwt_redis_ssl = true })
+            assert.equals("redis.internal", redis_connect_opts[#redis_connect_opts].server_name)
+        end)
+
+        it("inherits rate_limit_redis_ssl when the blocklist is on the rate-limit Redis", function()
+            jwt_access({ rate_limit_redis_host = "redis-a", rate_limit_redis_ssl = true })
+            assert.is_true(redis_connect_opts[#redis_connect_opts].ssl)
+            jwt_access({ jwt_redis_host = "redis-b", rate_limit_redis_host = "redis-a",
+                         rate_limit_redis_ssl = true })
+            assert.is_falsy(redis_connect_opts[#redis_connect_opts].ssl)
+        end)
+
+        it("does not share a pool between TLS and plain connections", function()
+            jwt_access({ jwt_redis_ssl = true })
+            jwt_access({})
+            local a, b = redis_connect_opts[1].pool, redis_connect_opts[2].pool
+            assert.is_not_nil(a)
+            assert.are_not.equal(a, b)
+        end)
+
+        it("a Redis error reply is never read as not revoked", function()
+            redis_error_reply = "LOADING Redis is loading the dataset in memory"
+            assert.equals(503, jwt_access().status)
+        end)
+
+        it("the rate-limit Redis connects with TLS when rate_limit_redis_ssl is set", function()
+            K.client._consumer = { custom_id = "cust-1", username = "acme" }
+            K.request._h["Authorization"] = "Bearer sk_live_9"
+            handler:access(conf({ rate_limit_enabled = true, rate_limit_redis_ssl = true,
+                                  rate_limit_redis_server_name = "rl.example" }))
+            local o = redis_connect_opts[#redis_connect_opts]
+            assert.is_true(o.ssl)
+            assert.is_true(o.ssl_verify)
+            assert.equals("rl.example", o.server_name)
+        end)
+    end)
+
+    -- ── G331 review: margin guard timeout and circuit breaker ─────────
+    describe("margin guard timeout and breaker (G331 review)", function()
+        local MG = { margin_guard_enabled = true, margin_guard_url = "http://pricing",
+                     margin_guard_cache_ttl = 0 }
+        local ALLOW = { status = 200, body = '{"verdict":"ALLOW","currentLevel":"NONE"}' }
+        local function load_schema()
+            local saved = package.loaded["kong.db.schema.typedefs"]
+            package.loaded["kong.db.schema.typedefs"] = { no_consumer = {}, protocols_http = {} }
+            package.loaded["schema"] = nil
+            local schema = require("schema")
+            package.loaded["kong.db.schema.typedefs"] = saved
+            package.loaded["schema"] = nil
+            return schema
+        end
+
+        it("defaults the pricing call timeout to 300 ms", function()
+            http_responses = { ALLOW }
+            margin_guard.check(conf(MG), "tenant-B", nil)
+            assert.equals(300, http_timeouts[#http_timeouts])
+        end)
+
+        it("takes the timeout from margin_guard_timeout_ms", function()
+            http_responses = { ALLOW }
+            local c = conf(MG); c.margin_guard_timeout_ms = 1200
+            margin_guard.check(c, "tenant-B", nil)
+            assert.equals(1200, http_timeouts[#http_timeouts])
+        end)
+
+        it("the schema declares margin_guard_timeout_ms (default 300, 10..5000) and breaker settings", function()
+            local schema = load_schema()
+            local t = schema_field(schema, "margin_guard_timeout_ms")
+            assert.equals(300, t.default)
+            assert.same({ 10, 5000 }, t.between)
+            assert.equals(5, schema_field(schema, "margin_guard_breaker_threshold").default)
+            assert.equals(10, schema_field(schema, "margin_guard_breaker_cooldown_s").default)
+        end)
+
+        it("opens after consecutive failures, skips pricing and fails open, then probes once", function()
+            ngx.shared.aforo_cache = ttl_dict()
+            local c = conf(MG)
+            c.margin_guard_breaker_threshold = 3
+            c.margin_guard_breaker_cooldown_s = 10
+            for _ = 1, 3 do
+                http_responses = { { err = "timeout" } }
+                assert.is_false(margin_guard.check(c, "tenant-B", nil))
+            end
+            assert.equals(3, #http_requests)
+            -- Open: pricing is not called, both scopes skipped, request let through.
+            assert.is_false(margin_guard.check(c, "tenant-B", "cust-1"))
+            assert.equals(3, #http_requests, "the breaker did not stop the calls")
+            -- After the cool-down one request probes; a success closes the breaker.
+            local t0 = ngx.now()
+            ngx.now = function() return t0 + 11 end
+            http_responses = { ALLOW }
+            assert.is_false(margin_guard.check(c, "tenant-B", nil))
+            assert.equals(4, #http_requests)
+            http_responses = { ALLOW, ALLOW }
+            margin_guard.check(c, "tenant-B", "cust-1")
+            assert.equals(6, #http_requests, "the breaker did not close after a successful probe")
+        end)
+
+        it("counts non-200 and unreadable answers as failures", function()
+            ngx.shared.aforo_cache = ttl_dict()
+            local c = conf(MG)
+            c.margin_guard_breaker_threshold = 2
+            http_responses = { { status = 503 }, { status = 200, body = "not json" } }
+            margin_guard.check(c, "tenant-B", nil)
+            margin_guard.check(c, "tenant-B", nil)
+            margin_guard.check(c, "tenant-B", nil)
+            assert.equals(2, #http_requests)
+        end)
+
+        it("a success resets the failure count", function()
+            ngx.shared.aforo_cache = ttl_dict()
+            local c = conf(MG)
+            c.margin_guard_breaker_threshold = 2
+            http_responses = { { err = "timeout" }, ALLOW, { err = "timeout" }, ALLOW }
+            for _ = 1, 4 do margin_guard.check(c, "tenant-B", nil) end
+            assert.equals(4, #http_requests)
+        end)
+
+        it("threshold 0 turns the breaker off", function()
+            ngx.shared.aforo_cache = ttl_dict()
+            local c = conf(MG)
+            c.margin_guard_breaker_threshold = 0
+            http_responses = { { err = "t" }, { err = "t" }, { err = "t" }, { err = "t" },
+                               { err = "t" }, { err = "t" } }
+            for _ = 1, 6 do margin_guard.check(c, "tenant-B", nil) end
+            assert.equals(6, #http_requests)
+        end)
+
+        it("the breaker is per tenant", function()
+            ngx.shared.aforo_cache = ttl_dict()
+            local c = conf(MG)
+            c.margin_guard_breaker_threshold = 1
+            http_responses = { { err = "timeout" }, ALLOW }
+            margin_guard.check(c, "tenant-B", nil)
+            margin_guard.check(c, "tenant-C", nil)
+            assert.equals(2, #http_requests)
+        end)
+    end)
+
+    -- ── G326: audience and issuer ──────────────────────────────────
+    describe("JWT audience and issuer (G326)", function()
+        local function run(claims, extra)
+            local c = conf({ jwt_validation_enabled = true, jwt_public_key = "PEM" })
+            for k, v in pairs(extra or {}) do c[k] = v end
+            K.request._h["Authorization"] = "Bearer " .. jwt(claims)
+            handler:access(c)
+            return K.response._exit
+        end
+
+        it("rejects a token without aud when jwt_audience is set", function()
+            local exit = run(aforo_claims(), { jwt_audience = { "https://api.acme.test" } })
+            assert.equals(401, exit.status)
+            assert.equals("INVALID_AUDIENCE", exit.body.error_description)
+        end)
+
+        it("rejects a token for another audience", function()
+            local exit = run(aforo_claims({ aud = "https://other.test" }),
+                { jwt_audience = { "https://api.acme.test" } })
+            assert.equals("INVALID_AUDIENCE", exit.body.error_description)
+        end)
+
+        it("accepts aud as a string or as an array containing a configured audience", function()
+            assert.is_nil(run(aforo_claims({ aud = "https://api.acme.test" }),
+                { jwt_audience = { "https://api.acme.test" } }))
+            K.ctx.shared = {}
+            assert.is_nil(run(aforo_claims({ aud = { "x", "https://api.acme.test" } }),
+                { jwt_audience = { "a", "https://api.acme.test" } }))
+        end)
+
+        it("rejects a non-string aud entry", function()
+            local exit = run(aforo_claims({ aud = { 1, {} } }), { jwt_audience = { "1" } })
+            assert.equals("INVALID_AUDIENCE", exit.body.error_description)
+        end)
+
+        it("refuses tokens when no issuer is configured, unless the check is explicitly disabled", function()
+            local exit = run(aforo_claims(), { jwt_issuer = cjson.null })
+            assert.equals(500, exit.status)
+            assert.equals("ISSUER_NOT_CONFIGURED", exit.body.error_description)
+            assert.is_nil(K.ctx.shared.aforo_jwt_claims)
+
+            K.response._exit = nil
+            assert.is_nil(run(aforo_claims({ iss = "anyone" }),
+                { jwt_issuer = cjson.null, jwt_issuer_check_disabled = true }))
+        end)
+
+        it("the schema refuses jwt_validation_enabled without an issuer", function()
+            local saved = package.loaded["kong.db.schema.typedefs"]
+            package.loaded["kong.db.schema.typedefs"] = { no_consumer = {}, protocols_http = {} }
+            package.loaded["schema"] = nil
+            local schema = require("schema")
+            package.loaded["kong.db.schema.typedefs"] = saved
+            local fn
+            for _, chk in ipairs(schema.entity_checks) do
+                if chk.custom_entity_check then fn = chk.custom_entity_check.fn end
+            end
+            assert.is_not_nil(fn, "no custom_entity_check for the issuer")
+            local ok, err = fn({ config = { jwt_validation_enabled = true, jwt_issuer = ngx.null } })
+            assert.is_falsy(ok)
+            assert.truthy(tostring(err):find("jwt_issuer", 1, true))
+            assert.is_true(fn({ config = { jwt_validation_enabled = true, jwt_issuer = "https://auth.aforo.ai" } }))
+            assert.is_true(fn({ config = { jwt_validation_enabled = true, jwt_issuer_check_disabled = true } }))
+            assert.is_true(fn({ config = { jwt_validation_enabled = false } }))
+        end)
+    end)
+
+    -- ── G335: compound-metering is not packaged ────────────────────
+    describe("package contents (G335)", function()
+        it("ships only modules the plugin loads, and every listed file exists", function()
+            local f = assert(io.open("kong-plugin-aforo-metering-2.8.0-1.rockspec", "rb"))
+            local src = f:read("*all")
+            f:close()
+            assert.is_nil(src:find("compound%-metering%.lua"), "compound-metering is still packaged")
+            for file in src:gmatch('=%s*"([%w%-]+%.lua)"') do
+                local h = io.open(file, "rb")
+                assert.is_not_nil(h, "rockspec lists a missing file: " .. file)
+                h:close()
+            end
+            assert.is_nil(io.open("compound-metering.lua", "rb"))
         end)
     end)
 end)

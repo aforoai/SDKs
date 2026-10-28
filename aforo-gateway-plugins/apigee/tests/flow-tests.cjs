@@ -80,6 +80,7 @@ function newEnv(opts) {
         quota: opts.quota || (() => ({ status: 200, body: JSON.stringify({ success: true, data: { decision: 'ALLOW' } }) })),
         ingest: opts.ingest || ((req) => ({ status: 202, body: JSON.stringify({ success: true, data: { accepted: JSON.parse(req.body).events.length, failed: 0, errors: [] } }) })),
         jwt: opts.jwt,
+        pubsub: opts.pubsub || (() => ({ ok: true })),
         log: [],
         http(req) {
             this.log.push(req);
@@ -137,7 +138,9 @@ function call(env, req) {
     const mine = env.log.slice(before);
     out.quotaCalls = mine.filter((r) => r.url === QUOTA_URL);
     out.ingestCalls = mine.filter((r) => r.url === INGEST_URL);
-    out.events = out.ingestCalls.length ? JSON.parse(out.ingestCalls[0].body).events : [];
+    out.publishes = msg.publishes || [];
+    out.events = out.ingestCalls.length ? JSON.parse(out.ingestCalls[0].body).events
+        : (out.publishes.length ? JSON.parse(out.publishes[0].data).events : []);
     return out;
 }
 
@@ -603,6 +606,60 @@ test('async (default): one send, nothing waited for, nothing read back', () => {
     assert.strictEqual(r.ingestCalls.length, 1);
     assert.strictEqual(r.ingestCalls[0].waits, false);
     assert.strictEqual(r.msg.get('aforo.calloutResponse.status.code'), null);
+});
+
+const TOPIC = 'projects/my-gcp-project/topics/aforo-metering';
+
+test('pubsub: one Pub/Sub message per call with the events, no HTTP send', () => {
+    const r = call(newEnv({ kvm: { delivery_mode: 'pubsub', pubsub_topic: TOPIC } }), { headers: KEY, messageid: 'ps-1' });
+    assert.strictEqual(r.ingestCalls.length, 0);
+    assert.strictEqual(r.publishes.length, 1);
+    assert.strictEqual(r.publishes[0].topic, TOPIC);
+    const events = JSON.parse(r.publishes[0].data).events;
+    assert.strictEqual(events.length, 1);
+    assert.strictEqual(events[0].idempotencyKey, 'ps-1', 'key frozen to messageid, so a redelivered message deduplicates');
+    assert.strictEqual(events[0].customerId, 'cust-1');
+});
+
+test('pubsub: MCP batch is one message carrying every tools/call event', () => {
+    const env = newEnv({ kvm: { delivery_mode: 'pubsub', pubsub_topic: TOPIC } });
+    const body = JSON.stringify([
+        { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'a' } },
+        { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'b' } }
+    ]);
+    const r = call(env, { proxy: 'mcp-proxy', verb: 'POST', suffix: '', body, headers: { 'x-api-key': 'client-secret-mcp' } });
+    assert.strictEqual(r.publishes.length, 1);
+    assert.strictEqual(JSON.parse(r.publishes[0].data).events.length, 2);
+});
+
+test('pubsub: a failed publish never fails the call', () => {
+    const r = call(newEnv({ kvm: { delivery_mode: 'pubsub', pubsub_topic: TOPIC }, pubsub: () => ({ error: 'PERMISSION_DENIED' }) }), { headers: KEY });
+    assert.strictEqual(r.meteringFault, null);
+    assert.strictEqual(r.publishes.length, 1);
+    assert.strictEqual(r.ingestCalls.length, 0);
+});
+
+test('pubsub without pubsub_topic: falls back to async HTTP delivery, nothing published', () => {
+    const r = call(newEnv({ kvm: { delivery_mode: 'pubsub' } }), { headers: KEY });
+    assert.strictEqual(r.publishes.length, 0);
+    assert.strictEqual(r.ingestCalls.length, 1);
+    assert.strictEqual(r.ingestCalls[0].waits, false);
+});
+
+test('async and sync never publish to Pub/Sub, even with pubsub_topic set', () => {
+    for (const mode of [undefined, 'async', 'sync']) {
+        const kvm = { pubsub_topic: TOPIC };
+        if (mode) kvm.delivery_mode = mode;
+        const r = call(newEnv({ kvm }), { headers: KEY });
+        assert.strictEqual(r.publishes.length, 0, String(mode));
+        assert.strictEqual(r.ingestCalls.length >= 1, true, String(mode));
+    }
+});
+
+test('refused or unmetered calls publish nothing', () => {
+    const env = newEnv({ kvm: { delivery_mode: 'pubsub', pubsub_topic: TOPIC } });
+    assert.strictEqual(call(env, {}).publishes.length, 0, 'missing key: 401');
+    assert.strictEqual(call(env, { headers: KEY, suffix: '/health' }).publishes.length, 0, 'excluded path');
 });
 
 // ─────────────────────────────────────────────────────────────────────────

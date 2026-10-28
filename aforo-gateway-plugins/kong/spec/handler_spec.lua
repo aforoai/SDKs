@@ -2246,7 +2246,7 @@ describe("aforo-metering handler", function()
             assert.equals(503, mock_kong.response._exit.status)
         end)
 
-        it("caches ALLOW per tenant/customer/metric but never DENY", function()
+        it("caches ALLOW per tenant/customer/metric, and DENY until its Retry-After (2.8.0)", function()
             with_customer("cust_a")
             http_mock.responses = { { status = 200, body = '{"decision":"ALLOW"}' } }
             access(conf())
@@ -2260,7 +2260,9 @@ describe("aforo-metering handler", function()
             }
             access(conf())
             access(conf())
-            assert.equals(3, #http_mock.requests)
+            -- The second DENY comes from the cache (G333; before 2.8.0 it asked again).
+            assert.equals(2, #http_mock.requests)
+            assert.equals(429, mock_kong.response._exit.status)
         end)
 
         it("caches WARN like ALLOW, still marking the response, and never DENY", function()

@@ -1,6 +1,6 @@
 # aforo-metering-lambda — User Guide
 
-**Version:** 2.3.0 · **Updated:** 2026-10-16 · **Audience:** engineers running AWS API Gateway who want API usage metered into Aforo from CloudWatch access logs.
+**Version:** 2.4.0 · **Updated:** 2026-10-27 · **Audience:** engineers running AWS API Gateway who want API usage metered into Aforo from CloudWatch access logs.
 
 ## What you'll build
 
@@ -11,8 +11,8 @@ A Lambda subscribed to your API Gateway access-log group. Each batch of log entr
 - AWS API Gateway with **access logging enabled** on the stage, emitting **JSON** entries to a CloudWatch log group. Access logging needs the account-level CloudWatch Logs role (API Gateway → Settings → *CloudWatch log role ARN*, policy `AmazonAPIGatewayPushToCloudWatchLogs`); set it once per account and region.
 - AWS SAM CLI authenticated to the target account/region.
 - An Aforo API key with scope `usage:ingest` (the tenant is derived from the key — there is no tenant id setting). Events go to `https://api.aforo.ai/v1/ingest/batch` (override `AforoEndpoint`).
-- Node.js 20 runtime is set in the template (`nodejs20.x`).
-- A verified customer identity on every route you want metered: an **Aforo authorizer** (see [AUTHORIZER.md](AUTHORIZER.md)): `key-authorizer.js`, which checks the customer's Aforo key (`sk_live_…`, issued when they subscribe) with Aforo, or `authorizer.js`, which verifies an Aforo JWT. Or IAM authorization, where the IAM caller is the customer. Routes with none are not metered.
+- Node.js 24 runtime is set in the template (`nodejs24.x`, since 2.5.0; `nodejs20.x` is deprecated and AWS blocks creating functions on it from 2027-02-01).
+- A verified customer identity on every route you want metered: an **Aforo authorizer** (see [AUTHORIZER.md](AUTHORIZER.md)): `key-authorizer.js`, which checks the customer's Aforo key (`sk_live_…`, issued when they subscribe) with Aforo, or `authorizer.js`, which verifies an Aforo JWT (set `AFORO_TENANT_ID` to your workspace id; tokens of any other workspace are denied). Or IAM authorization, where the IAM caller is the customer. Routes with none are not metered.
 - The metric(s) you will bill against already registered in the Aforo catalog (at minimum the `DefaultMetric`, `api_calls` by default). The ingestor rejects an event whose metric is not registered — that event, not the whole batch — and the Lambda logs it and counts it in `EventsRejected`.
 
 ## Step 1 — Enable JSON access logging on your API stage
@@ -29,6 +29,15 @@ Set your stage's access-log format to JSON with at least these fields:
 
 ## Step 2 — Deploy the function from source
 
+Store the Aforo API key in AWS Secrets Manager first. The function reads it from there (once per container, refreshed every 5 minutes); it is never put in an environment variable.
+
+```bash
+aws secretsmanager create-secret \
+  --name aforo/metering/api-key \
+  --secret-string "$AFORO_API_KEY"
+# Copy the "ARN" from the output.
+```
+
 ```bash
 git clone https://github.com/aforoai/SDKs.git
 cd SDKs/aforo-gateway-plugins/aws-lambda
@@ -38,7 +47,7 @@ sam deploy --guided \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides \
     AforoEndpoint=https://api.aforo.ai/v1/ingest/batch \
-    AforoApiKey="$AFORO_API_KEY" \
+    AforoApiKeySecretArn="$AFORO_API_KEY_SECRET_ARN" \
     DefaultMetric=api_calls \
     MetricMappings='[{"matchType":"PREFIX","value":"/v1/sms","metricName":"sms_sent"}]' \
     ApiGatewayLogGroupName=/aws/apigateway/aforo-access-logs
@@ -46,7 +55,7 @@ sam deploy --guided \
 
 `--guided` walks you through stack name, region, and saves an `samconfig.toml` so later deploys are just `sam deploy`.
 
-> ⚠ Set `ApiGatewayLogGroupName` to the **exact** log group your stage writes to. The template creates a `SubscriptionFilter` (empty filter pattern = every entry) on that group; if it points at the wrong group, the Lambda never fires.
+> ⚠ Set `ApiGatewayLogGroupName` to the **exact** log group your stage writes to. The template creates a `SubscriptionFilter` on that group that forwards only lines containing `customerId`, `caller` or `aforoUsage` (`AccessLogFilterPattern`); if it points at the wrong group, the Lambda never fires.
 
 ## Step 3 — Confirm the subscription filter
 
@@ -104,7 +113,7 @@ Set `MCP_ENABLED=true` on the function. For POST entries whose logged `requestBo
 ```bash
 aws lambda update-function-configuration \
   --function-name aforo-metering \
-  --environment "Variables={AFORO_ENDPOINT=https://api.aforo.ai/v1/ingest/batch,AFORO_API_KEY=$AFORO_API_KEY,DEFAULT_METRIC=api_calls,MCP_ENABLED=true}"
+  --environment "Variables={AFORO_ENDPOINT=https://api.aforo.ai/v1/ingest/batch,AFORO_API_KEY_SECRET_ARN=$AFORO_API_KEY_SECRET_ARN,DEFAULT_METRIC=api_calls,MCP_ENABLED=true}"
 ```
 
 > ⚠ MCP detection needs the request body in the access log (`requestBody`). API Gateway does not log bodies, so in practice use the metering proxy below, which sees the body itself.
@@ -138,7 +147,7 @@ Deploy `key-authorizer.js` with `AFORO_TENANT_ID` set to your tenant id (see [AU
 
 ### 2. The proxy integration
 
-With SAM, set `UpstreamUrl` (or `UpstreamFunction`) and `DeployKeyAuthorizer=true`, `AuthorizerTenantId=<tenant id>`. The stack creates `aforo-metering-proxy`, its log group `/aws/lambda/aforo-metering-proxy`, and a subscription filter from that log group to `aforo-metering`. Then on your REST API, set each metered method (or `ANY /{proxy+}`) to:
+With SAM, set `UpstreamUrl` (or `UpstreamFunction`) and `DeployKeyAuthorizer=true`, `AuthorizerTenantId=<tenant id>`, plus `AforoTenantKeySecretArn=<secret ARN>` to accept `sk_live_`/`sk_test_` customer keys (store the tenant key with `aws secretsmanager create-secret` first; without it the authorizer accepts JWTs only). The stack creates `aforo-metering-proxy`, its log group `/aws/lambda/aforo-metering-proxy`, and a subscription filter from that log group to `aforo-metering`. Then on your REST API, set each metered method (or `ANY /{proxy+}`) to:
 
 - Authorization: `CUSTOM`, the `aforo-key-authorizer` TOKEN authorizer (identity source `method.request.header.Authorization`).
 - Integration: Lambda proxy (`AWS_PROXY`) to `aforo-metering-proxy`.
@@ -198,7 +207,7 @@ MCP: send JSON-RPC 2.0 `tools/call` requests (single or batch) as the POST body;
 
 ## Configuration reference
 
-Full env-var / SAM-parameter table is in [README.md](README.md#configuration). You must set `AforoApiKey` (`AforoEndpoint` defaults to `https://api.aforo.ai/v1/ingest/batch`), and make sure `DefaultMetric` (and every `MetricMappings` metric) exists in your catalog.
+Full env-var / SAM-parameter table is in [README.md](README.md#configuration). You must set `AforoApiKeySecretArn` (`AforoEndpoint` defaults to `https://api.aforo.ai/v1/ingest/batch`), and make sure `DefaultMetric` (and every `MetricMappings` metric) exists in your catalog.
 
 ## Troubleshooting
 
@@ -207,7 +216,11 @@ Full env-var / SAM-parameter table is in [README.md](README.md#configuration). Y
 | Lambda never invokes | Subscription filter on the wrong log group, or access logging disabled | Enable JSON access logging on the stage; confirm `ApiGatewayLogGroupName` matches and the filter exists (`aws logs describe-subscription-filters`). |
 | `No usage events after filtering` every run | All entries hit the exclude list, or the parser couldn't read them | Check the access-log format is JSON; confirm the calls aren't `/health`-style paths or a status in `EXCLUDE_STATUS_CODES` (default `401,403,429`). |
 | `Skipped: {"no customerId":N}` | Access-log format lacks `customerId`, or the route is not behind the Aforo authorizer. After upgrading from a pre-2.1.0 build: the format still relies on `apiKey`, which is no longer read | Add `"customerId":"$context.authorizer.customerId"` to the format (Step 1) and attach the authorizer; for IAM routes log `"caller":"$context.identity.caller"`. |
-| `Aforo rejected the batch with 401` | Wrong `AFORO_API_KEY`, or something added an `Authorization` header | The key is sent only as `X-API-Key`; check the key value and that it has scope `usage:ingest`. |
+| `Aforo rejected the batch with 401` | Wrong key in the secret, or something added an `Authorization` header | The key is sent only as `X-API-Key`; check the secret's value and that the key has scope `usage:ingest`. |
+| `could not read AFORO_API_KEY_SECRET_ARN from Secrets Manager: … AccessDeniedException` | The function's role cannot read the secret, or a customer-managed KMS key is not passed | Deploy with the template (it grants `secretsmanager:GetSecretValue` on that ARN), and pass `SecretsKmsKeyArn` when the secret uses your own KMS key. |
+| `could not read … from Secrets Manager` on every invocation for a few seconds after a first failure | After a failed first read the function fails fast for 5 s (doubling to 60 s) rather than calling Secrets Manager each time | Fix the permission or the endpoint; the next attempt after the backoff picks it up. |
+| `authorizer.js` denies every call with `TENANT_NOT_CONFIGURED`, or `TENANT_MISMATCH` in the log | `AFORO_TENANT_ID` is unset, or the token was issued for another Aforo workspace | Set `AFORO_TENANT_ID` to your workspace id; tokens must be issued for that workspace. |
+| `Parameters: [AforoApiKeySecretArn] must have values` or the `NoPlaintextAforoKeys` rule fails | Upgrading a stack deployed before 2.4.0 | Create the secret and redeploy with `AforoApiKeySecretArn=<arn> AforoApiKey=''` (CHANGELOG 2.4.0, "Upgrade"). |
 | `Aforo rejected the batch with 400` | A malformed batch | The response body in the log names the field. The batch is dropped, not retried. |
 | `Aforo accepted the batch but rejected N event(s)` | An unregistered metric name, or a `customerId` that is not an Aforo customer | Register the metric / fix `METRIC_MAPPINGS` / `DEFAULT_METRIC`; check the JWT's `customer_id` claim. The log line lists each rejected event's reason. |
 | Events named `GET /v1/...` are rejected | `METRIC_NAME_PATTERN` is set (Aforo's one-click deploy sets it from the connection's metric pattern) | Clear it and use `METRIC_MAPPINGS` + `DEFAULT_METRIC`. |

@@ -1,0 +1,52 @@
+<!--
+  Aforo Metering — Event Hub delivery (fragment id: aforo-metering-eventhub)
+
+  OPTIONAL, since 2.3.0. Writes the usage event that aforo-metering built
+  (and the compound event aforo-compound-metering built) to Azure Event
+  Hubs instead of posting it to the ingestor from the gateway. A small Azure
+  Function (eventhub-forwarder/) reads the hub, sends batches to the
+  ingestor with retries, and moves its checkpoint only after the ingestor
+  answers 2xx. An ingest outage or a 429 therefore delays usage instead of
+  losing it (for as long as the hub keeps messages: 1 to 7 days).
+
+  Prerequisites:
+    - an APIM logger with the id aforo-metering-logger, type azureEventHub
+      (eventhub-forwarder/deploy/aforo-eventhub-forwarder.json creates it,
+      with the instance's managed identity). log-to-eventhub takes the
+      logger id literally; APIM refuses to save this fragment while the
+      logger does not exist. That is why this is a separate fragment:
+      aforo-metering itself names no logger and saves everywhere.
+    - the context variable aforo-delivery-mode set to "eventhub" before
+      aforo-metering runs (otherwise aforo-metering sends directly and this
+      fragment writes nothing).
+
+  Usage:
+    <inbound>
+        <base />
+        <set-variable name="aforo-delivery-mode" value="eventhub" />
+    </inbound>
+    <outbound>
+        <base />
+        <include-fragment fragment-id="aforo-metering" />
+        <include-fragment fragment-id="aforo-compound-metering" />   (optional)
+        <include-fragment fragment-id="aforo-metering-eventhub" />
+    </outbound>
+
+  Each message is exactly the body the direct mode would have posted:
+  {"events":[...]} for usage, the compound event object for compound. The
+  partition key is the customer, so one customer's events stay in order.
+  The Aforo API key is NOT in the message; the forwarder holds it.
+  log-to-eventhub cuts a message at 200 KB; these are a few hundred bytes.
+-->
+<fragment>
+  <choose>
+    <when condition="@(Convert.ToString(context.Variables.GetValueOrDefault("aforo-delivery-mode", "")).Trim().ToLowerInvariant() == "eventhub" && Convert.ToString(context.Variables.GetValueOrDefault("aforo-event-batch", "")).Length > 0)">
+      <log-to-eventhub logger-id="aforo-metering-logger" partition-key="@(Convert.ToString(context.Variables.GetValueOrDefault("aforo-event-customer", "")))">@(Convert.ToString(context.Variables["aforo-event-batch"]))</log-to-eventhub>
+    </when>
+  </choose>
+  <choose>
+    <when condition="@(Convert.ToString(context.Variables.GetValueOrDefault("aforo-delivery-mode", "")).Trim().ToLowerInvariant() == "eventhub" && Convert.ToString(context.Variables.GetValueOrDefault("aforo-compound-event", "")).Length > 0)">
+      <log-to-eventhub logger-id="aforo-metering-logger" partition-key="@(Convert.ToString(context.Variables.GetValueOrDefault("aforo-compound-customer", "")))">@(Convert.ToString(context.Variables["aforo-compound-event"]))</log-to-eventhub>
+    </when>
+  </choose>
+</fragment>

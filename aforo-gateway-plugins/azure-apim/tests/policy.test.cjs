@@ -199,13 +199,24 @@ function compile(name, text, namedValues) {
 
 // Convert.ToString(string null) is null, Convert.ToString(object null) is "".
 // The expressions guard for null wherever it matters, so null covers both.
-const Convert = { ToString: function (v) { return v === null || v === undefined ? null : String(v); } };
+const Convert = {
+    ToString: function (v) { return v === null || v === undefined ? null : String(v); },
+    ToBase64String: function (b) { return Buffer.from(b).toString('base64'); },
+};
 const JObjectShim = { Parse: function (s) {
     const v = JSON.parse(s);
     if (v === null || typeof v !== 'object' || Array.isArray(v)) throw new Error('not a JSON object');
     return v;
 } };
-const SystemShim = { Text: { RegularExpressions: { Regex: { IsMatch: function (s, re) { return new RegExp(re).test(s); } } } } };
+const SystemShim = {
+    Text: {
+        RegularExpressions: { Regex: { IsMatch: function (s, re) { return new RegExp(re).test(s); } } },
+        Encoding: { UTF8: { GetBytes: function (s) { return Buffer.from(String(s), 'utf8'); } } },
+    },
+    Security: { Cryptography: { SHA256: { Create: function () {
+        return { ComputeHash: function (b) { return require('crypto').createHash('sha256').update(b).digest(); } };
+    } } } },
+};
 const stringShim = { IsNullOrEmpty: function (s) { return s === null || s === undefined || s === ''; } };
 
 function makeContext(o) {
@@ -475,13 +486,18 @@ eq('context: default metric variable wins', run(ctxDefault, { vars: { 'aforo-def
 // ── 3. Source locks ──────────────────────────────────────────────────
 check('send is gated on aforo-skip',
     /<when condition="@\(Convert\.ToString\(context\.Variables\["aforo-skip"\]\) != "true"\)">\s*<choose>/.test(src));
-eq('exactly two outbound sends', (src.match(/<send-one-way-request /g) || []).length, 2);
+// 2.3.0 (G348): both event bodies are built into aforo-event-batch inside the
+// gate; ONE send after the gate posts it (direct mode) and nothing else
+// does. The batch is cleared at the top, so only a body built inside the
+// gate can reach the send.
+eq('exactly one outbound send', (src.match(/<send-one-way-request /g) || []).length, 1);
 {
     const gateAt = src.indexOf('context.Variables["aforo-skip"]) != "true"');
-    const firstSend = src.indexOf('<send-one-way-request ');
-    const lastSend = src.lastIndexOf('</send-one-way-request>');
-    const gateClose = src.lastIndexOf('</when>');
-    check('both sends sit inside the gate', gateAt !== -1 && gateAt < firstSend && lastSend < gateClose);
+    const bodyAts = [];
+    let at = -1;
+    while ((at = src.indexOf('<set-variable name="aforo-event-batch" value="@{', at + 1)) !== -1) bodyAts.push(at);
+    const gateEnd = src.indexOf('<send-one-way-request ');
+    check('both event bodies are built inside the gate', bodyAts.length === 2 && gateAt !== -1 && bodyAts.every(function (b) { return b > gateAt && b < gateEnd; }));
     check('aforo-skip is computed before the gate', src.indexOf('<set-variable name="aforo-skip"') < gateAt);
 }
 eq('executionStatus added in both send bodies', (src.match(/Add\("executionStatus"/g) || []).length, 2);
@@ -525,21 +541,24 @@ eq('idempotency key base computed once', (src.match(/name="aforo-idempotency-key
     ].map(function (m) { return src.indexOf(m); });
     check('every not-metered gate is present', order.every(function (i) { return i !== -1; }), order.join(','));
     check('gates run in order', order.every(function (i, n) { return n === 0 || order[n - 1] < i; }), order.join(','));
-    const firstSend = src.indexOf('<send-one-way-request ');
-    check('OPTIONS, no-customer and product-type gates come before the first send',
-        order[0] < firstSend && order[1] < firstSend && order[2] < firstSend);
-    const sends = src.split('<send-one-way-request ').slice(1).map(function (s) { return s.slice(0, s.indexOf('</send-one-way-request>')); });
-    check('MCP send sits in the MCP branch, standard send in <otherwise>',
-        src.indexOf('<send-one-way-request ') > order[3] && src.indexOf('<send-one-way-request ') < order[4]
-        && src.lastIndexOf('<send-one-way-request ') > order[5]);
+    const firstBody = src.indexOf('<set-variable name="aforo-event-batch" value="@{');
+    check('OPTIONS, no-customer and product-type gates come before the first body',
+        order[0] < firstBody && order[1] < firstBody && order[2] < firstBody);
+    const sends = src.split('<set-variable name="aforo-event-batch" value="@{').slice(1).map(function (s) { return s.slice(0, s.indexOf('}" />')); });
+    check('MCP body sits in the MCP branch, standard body in <otherwise>',
+        firstBody > order[3] && firstBody < order[4]
+        && src.lastIndexOf('<set-variable name="aforo-event-batch" value="@{') > order[5]);
     sends.forEach(function (s, n) {
-        check('send ' + n + ': customerId is the resolved customer',
+        check('body ' + n + ': customerId is the resolved customer',
             s.indexOf('new JProperty("customerId", Convert.ToString(context.Variables["aforo-event-customer"]))') !== -1);
-        check('send ' + n + ': top-level productType', /new JProperty\("productType",/.test(s));
-        check('send ' + n + ': X-API-Key only', s.indexOf('<set-header name="X-API-Key"') !== -1
-            && s.indexOf('X-Tenant-Id') === -1 && s.indexOf('Authorization') === -1);
-        check('send ' + n + ': no subscription key', !/Subscription\??\.Key/.test(s));
+        check('body ' + n + ': top-level productType', /new JProperty\("productType",/.test(s));
+        check('body ' + n + ': no subscription key', !/Subscription\??\.Key/.test(s));
     });
+    {
+        const send = src.slice(src.indexOf('<send-one-way-request '), src.indexOf('</send-one-way-request>'));
+        check('send: X-API-Key only', send.indexOf('<set-header name="X-API-Key"') !== -1
+            && send.indexOf('X-Tenant-Id') === -1 && send.indexOf('Authorization') === -1);
+    }
     check('standard send uses the resolved metric',
         sends[1].indexOf('new JProperty("metricName", Convert.ToString(context.Variables["aforo-event-metric"]))') !== -1);
     check('MCP send keeps the MCP metric', sends[0].indexOf('new JProperty("metricName", "mcp_server.tool_invocations")') !== -1);
@@ -577,9 +596,13 @@ eq('idempotency key base computed once', (src.match(/name="aforo-idempotency-key
     check('preflight reads the decision from the data envelope', preflight.indexOf('var data = body["data"] ?? body;') !== -1);
     const mg = fs.readFileSync(path.join(__dirname, '..', 'margin-guard-policy-fragment.xml'), 'utf8');
     const mgCode = mg.slice(mg.indexOf('\n<fragment>'));
-    check('margin guard references no Named Value', !/\{\{/.test(mgCode));
+    // 2.3.0: the call carries the Aforo API key (G350), so aforo-api-key is the one Named Value.
+    check('margin guard references no Named Value but the API key', (mgCode.match(/\{\{[^}]*\}\}/g) || []).every(function (r) { return r === '{{aforo-api-key}}'; }));
     check('margin guard does not index a variable that may be absent', mgCode.indexOf('context.Variables["aforo-margin-guard-url"]') === -1);
-    check('margin guard escapes ids in the URL', (mgCode.match(/Uri\.EscapeDataString/g) || []).length === 2);
+    check('margin guard escapes the customer id in the URL', (mgCode.match(/Uri\.EscapeDataString/g) || []).length === 1);
+    check('margin guard calls the public key-authenticated check', mgCode.indexOf('"/api/v1/margin-guard/quick-check?scopeType=CUSTOMER&scopeId="') !== -1);
+    check('margin guard never calls the internal path', mgCode.indexOf('/internal/') === -1);
+    check('margin guard sends no tenant id (pricing takes it from the key)', !/tenantId=|name="X-Tenant-Id"/.test(mgCode));
     check('margin guard never reads identity from request headers', !/Request\.Headers/.test(mgCode));
     const jwt = fs.readFileSync(path.join(__dirname, '..', 'jwt-validation-policy.xml'), 'utf8');
     const jwtCode = jwt.slice(jwt.indexOf('\n<fragment>'));
@@ -649,6 +672,349 @@ check('nested legacy fragment is gone', !fs.existsSync(path.join(__dirname, '..'
     check('header comment closes directly before <fragment>', /-->\s*$/.test(src.slice(0, at)));
     check('header comment has no "--"', src.slice(4, src.indexOf('-->')).indexOf('--') === -1);
 }
+
+
+// ── 5. Wave 6 W6.3 (G348, G350, G351, G352, G353) ────────────────────
+// Each block runs on its own so a missing variable fails that block, not
+// the whole file.
+function section(name, fn) {
+    try { fn(); } catch (e) { check(name + ' (block threw)', false, e && e.message); }
+}
+const readPolicy = function (f) { return fs.readFileSync(path.join(__dirname, '..', f), 'utf8'); };
+const codeOf = function (t) { return t.slice(t.indexOf('\n<fragment>')); };
+// Convert.ToInt32 / ToInt64 throw on anything that is not a whole number, as in .NET.
+Convert.ToInt32 = Convert.ToInt64 = function (v) {
+    const t = String(v).trim();
+    if (!/^-?[0-9]+$/.test(t)) throw new Error('FormatException: ' + JSON.stringify(v));
+    return Number(t);
+};
+define(String.prototype, 'LastIndexOf', function (s) { return this.lastIndexOf(s); });
+
+section('G348 delivery mode', function () {
+    const deliveryFn = compile('aforo-delivery');
+    eq('delivery: default is direct', run(deliveryFn, {}), 'direct');
+    eq('delivery: eventhub (trimmed, any case)', run(deliveryFn, { vars: { 'aforo-delivery-mode': ' EventHub ' } }), 'eventhub');
+    eq('delivery: unknown value -> direct', run(deliveryFn, { vars: { 'aforo-delivery-mode': 'kafka' } }), 'direct');
+    eq('delivery: non-string -> direct', run(deliveryFn, { vars: { 'aforo-delivery-mode': 7 } }), 'direct');
+    eq('delivery: null -> direct', run(deliveryFn, { vars: { 'aforo-delivery-mode': null } }), 'direct');
+
+    eq('one outbound send, shared by both event shapes', (src.match(/<send-one-way-request /g) || []).length, 1);
+    eq('both event bodies are built into aforo-event-batch', (src.match(/<set-variable name="aforo-event-batch" value="@\{/g) || []).length, 2);
+    const sendAt = src.indexOf('<send-one-way-request ');
+    const sendBlock = src.slice(src.lastIndexOf('<when', sendAt), src.indexOf('</send-one-way-request>') + 23);
+    check('the send is skipped in eventhub mode',
+        sendBlock.indexOf('Convert.ToString(context.Variables["aforo-delivery"]) == "direct"') !== -1, sendBlock.slice(0, 200));
+    check('the send only fires when a batch was built',
+        sendBlock.indexOf('Convert.ToString(context.Variables["aforo-event-batch"]).Length > 0') !== -1);
+    check('the send body is the built batch', sendBlock.indexOf('<set-body>@(Convert.ToString(context.Variables["aforo-event-batch"]))</set-body>') !== -1);
+    check('the batch is cleared first, so a value from inbound is never sent',
+        src.indexOf('<set-variable name="aforo-event-batch" value="@(string.Empty)" />') !== -1
+        && src.indexOf('<set-variable name="aforo-event-batch" value="@(string.Empty)" />') < src.indexOf('<set-variable name="aforo-event-batch" value="@{'));
+    check('outbound policy does not reference a logger (it must save on installs without Event Hub)', codeOf(src).indexOf('log-to-eventhub') === -1);
+
+    const eh = readPolicy('eventhub-delivery-policy-fragment.xml');
+    const ehCode = codeOf(eh);
+    eq('eventhub fragment: two log-to-eventhub statements (usage + compound)', (ehCode.match(/<log-to-eventhub /g) || []).length, 2);
+    check('eventhub fragment: fixed logger id aforo-metering-logger', (ehCode.match(/logger-id="aforo-metering-logger"/g) || []).length === 2);
+    check('eventhub fragment: partition key is the customer', ehCode.indexOf('partition-key="@(') !== -1);
+    check('eventhub fragment: references no Named Value', !/\{\{/.test(ehCode));
+    check('eventhub fragment: logs only in eventhub mode', (ehCode.match(/== "eventhub"/g) || []).length >= 2);
+    check('eventhub fragment: never carries the API key', ehCode.indexOf('aforo-api-key') === -1 && ehCode.indexOf('X-API-Key') === -1);
+
+    const compound = readPolicy('compound-metering-policy-fragment.xml');
+    const cCode = codeOf(compound);
+    check('compound: event built into aforo-compound-event', cCode.indexOf('<set-variable name="aforo-compound-event" value="@{') !== -1);
+    check('compound: direct send skipped in eventhub mode', /<when condition="@\([^"]*aforo-compound-event[\s\S]*?"eventhub"/.test(cCode) || cCode.indexOf('!= "eventhub"') !== -1);
+    eq('compound: one send', (cCode.match(/<send-one-way-request /g) || []).length, 1);
+    check('compound: no logger here either', cCode.indexOf('log-to-eventhub') === -1);
+});
+
+section('G350 auth on outbound calls', function () {
+    const jwt = codeOf(readPolicy('jwt-validation-policy.xml'));
+    check('jwt: X-Internal-Call is gone', jwt.indexOf('X-Internal-Call') === -1);
+    const jtiCall = jwt.slice(jwt.indexOf('<send-request'), jwt.indexOf('</send-request>'));
+    check('jwt: revocation call sends X-API-Key', jtiCall.indexOf('<set-header name="X-API-Key"') !== -1);
+    check('jwt: revocation call goes to org-service token-status', jtiCall.indexOf('{{aforo-org-service-url}}/api/v1/public/gateway/token-status?jti={0}&keyId={1}&clientId={2}') !== -1);
+    check('jwt: revocation call never uses the old internal path', jwt.indexOf('/internal/v1/auth/token-check') === -1);
+    check('jwt: key from aforo-api-key (variable, else Named Value)',
+        jtiCall.indexOf('context.Variables.ContainsKey("aforo-api-key") ? Convert.ToString(context.Variables["aforo-api-key"]) : "{{aforo-api-key}}"') !== -1);
+    const mg = codeOf(readPolicy('margin-guard-policy-fragment.xml'));
+    const mgCall = mg.slice(mg.indexOf('<send-request'), mg.indexOf('</send-request>'));
+    check('margin guard: call sends X-API-Key', mgCall.indexOf('<set-header name="X-API-Key"') !== -1);
+    eq('margin guard: the only Named Value is the API key', Array.from(new Set(mg.match(/\{\{[^}]*\}\}/g) || [])).join(' '), '{{aforo-api-key}}');
+});
+
+// The breaker state machine shared by the three synchronous checks.
+// cached value -> call? ; answer -> next state "value|ttl"
+section('G351 preflight cache + breaker', function () {
+    const t = readPolicy('preflight-quota-policy-fragment.xml');
+    const limitsFn = compile('aforo-preflight-limits', t);
+    eq('preflight limits: defaults', run(limitsFn, {}), '5,3,30');
+    eq('preflight limits: overrides', run(limitsFn, { vars: { 'aforo-preflight-cache-seconds': '0', 'aforo-preflight-breaker-failures': ' 5 ', 'aforo-preflight-breaker-seconds': '120' } }), '0,5,120');
+    eq('preflight limits: junk -> defaults', run(limitsFn, { vars: { 'aforo-preflight-cache-seconds': '-1', 'aforo-preflight-breaker-failures': '0', 'aforo-preflight-breaker-seconds': 'x' } }), '5,3,30');
+    const L = { 'aforo-preflight-limits': '5,3,30' };
+    const callFn = compile('aforo-preflight-call', t);
+    const call = function (cached) {
+        const v = Object.assign({}, L);
+        if (cached !== undefined) v['aforo-preflight-cached'] = cached;
+        return run(callFn, { vars: v });
+    };
+    eq('preflight call: nothing cached -> call', call(), 'true');
+    eq('preflight call: cached ALLOW -> no call', call('D:ALLOW'), 'false');
+    eq('preflight call: cached DENY -> no call', call('D:DENY:1900000000'), 'false');
+    eq('preflight call: one failure so far -> call', call('F:1'), 'true');
+    eq('preflight call: failures at the limit would have opened -> F:3 does not call', call('F:3'), 'false');
+    eq('preflight call: breaker open -> no call', call('OPEN'), 'false');
+    eq('preflight call: corrupt cache entry -> call', call('F:x'), 'true');
+
+    const stateFn = compile('aforo-preflight-state', t);
+    const state = function (answer, cached, limits) {
+        const v = { 'aforo-preflight-limits': limits || '5,3,30', 'aforo-preflight-call': 'true', 'aforo-preflight-answer': answer, 'aforo-preflight-now': '1000' };
+        if (cached !== undefined) v['aforo-preflight-cached'] = cached;
+        return run(stateFn, { vars: v });
+    };
+    eq('preflight state: ALLOW cached for the cache window', state('ALLOW'), 'D:ALLOW|5');
+    eq('preflight state: WARN cached for the cache window', state('WARN'), 'D:WARN|5');
+    eq('preflight state: cache 0 -> ALLOW not cached', state('ALLOW', undefined, '0,3,30'), '');
+    eq('preflight state: DENY cached until Retry-After', state('DENY|90'), 'D:DENY:1090|90');
+    eq('preflight state: DENY cached even with cache 0', state('DENY|90', undefined, '0,3,30'), 'D:DENY:1090|90');
+    eq('preflight state: first failure counts', state('UNAVAILABLE'), 'F:1|30');
+    eq('preflight state: second failure counts', state('UNAVAILABLE', 'F:1'), 'F:2|30');
+    eq('preflight state: third failure opens the breaker', state('UNAVAILABLE', 'F:2'), 'OPEN|30');
+    eq('preflight state: success after failures resets', state('ALLOW', 'F:2'), 'D:ALLOW|5');
+    eq('preflight state: no call -> nothing stored', run(stateFn, { vars: Object.assign({ 'aforo-preflight-call': 'false', 'aforo-preflight-answer': '' }, L) }), '');
+
+    const decisionFn = compile('preflightDecision', t);
+    const decide = function (o) {
+        const v = Object.assign({}, L, o);
+        return run(decisionFn, { vars: v });
+    };
+    eq('preflight decision: answer ALLOW', decide({ 'aforo-preflight-call': 'true', 'aforo-preflight-answer': 'ALLOW' }), 'ALLOW');
+    eq('preflight decision: answer DENY', decide({ 'aforo-preflight-call': 'true', 'aforo-preflight-answer': 'DENY|60' }), 'DENY');
+    eq('preflight decision: unavailable -> fallback ALLOW', decide({ 'aforo-preflight-call': 'true', 'aforo-preflight-answer': 'UNAVAILABLE' }), 'ALLOW');
+    eq('preflight decision: unavailable -> fallback DENY when set', decide({ 'aforo-preflight-call': 'true', 'aforo-preflight-answer': 'UNAVAILABLE', 'aforo-preflight-fallback': ' deny ' }), 'DENY');
+    eq('preflight decision: cached DENY', decide({ 'aforo-preflight-call': 'false', 'aforo-preflight-answer': '', 'aforo-preflight-cached': 'D:DENY:1900000000' }), 'DENY');
+    eq('preflight decision: cached WARN', decide({ 'aforo-preflight-call': 'false', 'aforo-preflight-answer': '', 'aforo-preflight-cached': 'D:WARN' }), 'WARN');
+    eq('preflight decision: breaker open -> fallback', decide({ 'aforo-preflight-call': 'false', 'aforo-preflight-answer': '', 'aforo-preflight-cached': 'OPEN', 'aforo-preflight-fallback': 'DENY' }), 'DENY');
+
+    const retryFn = compile('aforo-preflight-retry-after', t);
+    eq('preflight Retry-After: from the answer', run(retryFn, { vars: { 'aforo-preflight-answer': 'DENY|90', 'aforo-preflight-now': '1000' } }), '90');
+    eq('preflight Retry-After: time left on a cached DENY', run(retryFn, { vars: { 'aforo-preflight-answer': '', 'aforo-preflight-cached': 'D:DENY:1042', 'aforo-preflight-now': '1000' } }), '42');
+    eq('preflight Retry-After: expired cached DENY -> 1', run(retryFn, { vars: { 'aforo-preflight-answer': '', 'aforo-preflight-cached': 'D:DENY:900', 'aforo-preflight-now': '1000' } }), '1');
+    eq('preflight Retry-After: otherwise 60', run(retryFn, { vars: { 'aforo-preflight-answer': '' } }), '60');
+
+    const code = codeOf(t);
+    eq('preflight: one cache lookup', (code.match(/<cache-lookup-value /g) || []).length, 1);
+    eq('preflight: one cache store', (code.match(/<cache-store-value /g) || []).length, 1);
+    check('preflight: the call happens only when the breaker allows it',
+        code.indexOf('<when condition="@(Convert.ToString(context.Variables["aforo-preflight-call"]) == "true")">') !== -1
+        && code.indexOf('aforo-preflight-call') < code.indexOf('<send-request'));
+    check('preflight: the 429 carries the computed Retry-After',
+        code.indexOf('<value>@(Convert.ToString(context.Variables["aforo-preflight-retry-after"]))</value>') !== -1);
+    check('preflight: the cache key names the key scope and the customer', code.indexOf('key="@("aforo:pf:" + Convert.ToString(context.Variables["aforo-preflight-scope"]) + ":" + Convert.ToString(context.Variables["aforo-preflight-customer"]))"') !== -1);
+});
+
+section('G351 revocation cache + breaker', function () {
+    const t = readPolicy('jwt-validation-policy.xml');
+    const keyFn = compile('aforo-jti-key', t);
+    eq('jti key: jti and key id', run(keyFn, { vars: { 'aforo-jwt-payload': { jti: 'j1', key_id: 'k1' } } }), 'aforo:jti:j1:k1');
+    eq('jti key: no jti and no key id -> no check', run(keyFn, { vars: { 'aforo-jwt-payload': { sub: 's' } } }), '');
+    eq('jti key: no payload -> no check', run(keyFn, {}), '');
+    eq('jti key: switched off', run(keyFn, { vars: { 'aforo-jwt-payload': { jti: 'j1' }, 'aforo-jti-check-enabled': 'false' } }), '');
+    const limitsFn = compile('aforo-jti-limits', t);
+    eq('jti limits: defaults', run(limitsFn, {}), '30,3,30');
+    const callFn = compile('aforo-jti-call', t);
+    const call = function (key, cached) {
+        const v = { 'aforo-jti-key': key, 'aforo-jti-limits': '30,3,30' };
+        if (cached !== undefined) v['aforo-jti-cached'] = cached;
+        return run(callFn, { vars: v });
+    };
+    eq('jti call: nothing cached', call('aforo:jti:j1:'), 'true');
+    eq('jti call: no key -> no call', call(''), 'false');
+    eq('jti call: cached OK', call('aforo:jti:j1:', 'OK'), 'false');
+    eq('jti call: cached REVOKED', call('aforo:jti:j1:', 'REVOKED'), 'false');
+    eq('jti call: breaker open', call('aforo:jti:j1:', 'OPEN'), 'false');
+    eq('jti call: below the failure limit', call('aforo:jti:j1:', 'F:2'), 'true');
+    const stateFn = compile('aforo-jti-state', t);
+    const state = function (answer, cached) {
+        const v = { 'aforo-jti-limits': '30,3,30', 'aforo-jti-call': 'true', 'aforo-jti-answer': answer };
+        if (cached !== undefined) v['aforo-jti-cached'] = cached;
+        return run(stateFn, { vars: v });
+    };
+    eq('jti state: not revoked cached for the cache window', state('OK'), 'OK|30');
+    eq('jti state: revoked cached for the token lifetime', state('REVOKED|1200'), 'REVOKED|1200');
+    eq('jti state: failures open the breaker', state('UNAVAILABLE', 'F:2'), 'OPEN|30');
+    eq('jti state: first failure', state('UNAVAILABLE'), 'F:1|30');
+    const verdictFn = compile('aforo-jti-verdict', t);
+    const verdict = function (o) { return run(verdictFn, { vars: o }); };
+    eq('jti verdict: revoked answer', verdict({ 'aforo-jti-call': 'true', 'aforo-jti-answer': 'REVOKED|5' }), 'revoked');
+    eq('jti verdict: cached revoked', verdict({ 'aforo-jti-call': 'false', 'aforo-jti-answer': '', 'aforo-jti-cached': 'REVOKED' }), 'revoked');
+    eq('jti verdict: ok', verdict({ 'aforo-jti-call': 'true', 'aforo-jti-answer': 'OK' }), 'ok');
+    eq('jti verdict: unavailable fails open by default (2.2.0 behaviour)', verdict({ 'aforo-jti-call': 'true', 'aforo-jti-answer': 'UNAVAILABLE' }), 'ok');
+    eq('jti verdict: unavailable with fallback DENY', verdict({ 'aforo-jti-call': 'true', 'aforo-jti-answer': 'UNAVAILABLE', 'aforo-jti-check-fallback': 'DENY' }), 'unavailable');
+    eq('jti verdict: breaker open with fallback DENY', verdict({ 'aforo-jti-call': 'false', 'aforo-jti-answer': '', 'aforo-jti-cached': 'OPEN', 'aforo-jti-check-fallback': 'DENY' }), 'unavailable');
+    eq('jti verdict: no check at all', verdict({ 'aforo-jti-call': 'false', 'aforo-jti-answer': '' }), 'ok');
+    const code = codeOf(t);
+    eq('jti: one cache lookup', (code.match(/<cache-lookup-value /g) || []).length, 1);
+    eq('jti: one cache store', (code.match(/<cache-store-value /g) || []).length, 1);
+    check('jti: unavailable + DENY answers 503', code.indexOf('<set-status code="503"') !== -1);
+});
+
+section('G351 margin guard breaker', function () {
+    const t = readPolicy('margin-guard-policy-fragment.xml');
+    const callFn = compile('mgCall', t);
+    const call = function (cached) {
+        const v = { 'mgLimits': '30,3,30' };
+        if (cached !== undefined) v['mgCached'] = cached;
+        return run(callFn, { vars: v });
+    };
+    eq('mg call: nothing cached', call(), 'true');
+    eq('mg call: cached result', call('R:{"verdict":"BLOCK"}'), 'false');
+    eq('mg call: breaker open', call('OPEN'), 'false');
+    eq('mg call: one failure', call('F:1'), 'true');
+    const stateFn = compile('mgState', t);
+    const state = function (answer, cached) {
+        const v = { 'mgLimits': '30,3,30', 'mgCall': 'true', 'mgAnswer': answer };
+        if (cached !== undefined) v['mgCached'] = cached;
+        return run(stateFn, { vars: v });
+    };
+    eq('mg state: BLOCK cached (even with a | inside)', state('{"verdict":"BLOCK","message":"x|y"}'), 'R:{"verdict":"BLOCK","message":"x|y"}|30');
+    eq('mg state: plain ALLOW cached', state('{"verdict":"ALLOW","currentLevel":"NONE"}'), 'R:{"verdict":"ALLOW","currentLevel":"NONE"}|30');
+    eq('mg state: enveloped BLOCK cached', state('{"success":true,"data":{"verdict":"BLOCK"}}'), 'R:{"success":true,"data":{"verdict":"BLOCK"}}|30');
+    eq('mg state: THROTTLE never cached', state('{"verdict":"THROTTLE","currentLevel":"L2_THROTTLE"}'), '');
+    eq('mg state: ALLOW while a throttle is active not cached', state('{"verdict":"ALLOW","currentLevel":"L2_THROTTLE"}'), '');
+    eq('mg state: WARN not cached', state('{"verdict":"WARN","currentLevel":"L1_WARNING"}'), '');
+    eq('mg state: an answer not kept resets the failure count', state('{"verdict":"THROTTLE"}', 'F:2'), 'F:0|30');
+    eq('mg state: an answer without verdict is not cached', state('{"allowed":false,"level":"L3_BLOCK"}'), '');
+    eq('mg state: failure', state('UNAVAILABLE', 'F:2'), 'OPEN|30');
+    eq('mg state: first failure', state('UNAVAILABLE'), 'F:1|30');
+    const resultFn = compile('mgResult', t);
+    eq('mg result: fresh answer', run(resultFn, { vars: { mgCall: 'true', mgAnswer: '{"verdict":"BLOCK"}' } }), '{"verdict":"BLOCK"}');
+    eq('mg result: cached answer', run(resultFn, { vars: { mgCall: 'false', mgAnswer: '', mgCached: 'R:{"verdict":"BLOCK"}' } }), '{"verdict":"BLOCK"}');
+    eq('mg result: breaker open fails open', run(resultFn, { vars: { mgCall: 'false', mgAnswer: '', mgCached: 'OPEN' } }), '{"verdict":"ALLOW","currentLevel":"NONE"}');
+    eq('mg result: unavailable fails open', run(resultFn, { vars: { mgCall: 'true', mgAnswer: 'UNAVAILABLE' } }), '{"verdict":"ALLOW","currentLevel":"NONE"}');
+    const verdictFn = compile('mgVerdict', t);
+    const verdict = function (result) { return run(verdictFn, { vars: { mgResult: result } }); };
+    eq('mg verdict: BLOCK', verdict('{"verdict":"BLOCK","currentLevel":"L3_BLOCK"}'), 'BLOCK');
+    eq('mg verdict: THROTTLE', verdict('{"verdict":"THROTTLE"}'), 'THROTTLE');
+    eq('mg verdict: WARN', verdict('{"verdict":"WARN"}'), 'WARN');
+    eq('mg verdict: lower case', verdict('{"verdict":"block"}'), 'BLOCK');
+    eq('mg verdict: enveloped', verdict('{"success":true,"data":{"verdict":"THROTTLE"}}'), 'THROTTLE');
+    eq('mg verdict: the old allowed/level shape is not a block', verdict('{"allowed":false,"level":"L3_BLOCK"}'), 'ALLOW');
+    eq('mg verdict: unknown value', verdict('{"verdict":"MAYBE"}'), 'ALLOW');
+    eq('mg verdict: not JSON', verdict('nope'), 'ALLOW');
+    const messageFn = compile('mgMessage', t);
+    eq('mg message: from the answer', run(messageFn, { vars: { mgResult: '{"verdict":"BLOCK","message":"low"}' } }), 'low');
+    eq('mg message: absent', run(messageFn, { vars: { mgResult: '{"verdict":"BLOCK"}' } }), '');
+    const code = codeOf(t);
+    eq('mg: one cache lookup', (code.match(/<cache-lookup-value /g) || []).length, 1);
+    eq('mg: one cache store', (code.match(/<cache-store-value /g) || []).length, 1);
+});
+
+section('G352 compound skips streaming responses', function () {
+    const t = readPolicy('compound-metering-policy-fragment.xml');
+    const fn = compile('aforo-compound-streaming', t);
+    const headers = function (h) {
+        const ctx = makeContext({});
+        ctx.Response.Headers = { GetValueOrDefault: function (k, d) {
+            const hit = Object.keys(h).filter(function (x) { return x.toLowerCase() === k.toLowerCase(); })[0];
+            return hit === undefined ? d : h[hit];
+        } };
+        return fn(ctx, Convert, SystemShim, { Ordinal: 4, OrdinalIgnoreCase: 5 }, stringShim, JObjectShim);
+    };
+    eq('compound: JSON with a length is read', headers({ 'Content-Type': 'application/json', 'Content-Length': '512' }), '');
+    eq('compound: SSE is never buffered', headers({ 'Content-Type': 'text/event-stream; charset=utf-8' }), 'text/event-stream');
+    eq('compound: NDJSON stream is never buffered', headers({ 'Content-Type': 'application/x-ndjson' }), 'stream');
+    eq('compound: chunked non-JSON is never buffered', headers({ 'Content-Type': 'text/plain', 'Transfer-Encoding': 'chunked' }), 'chunked');
+    eq('compound: chunked JSON is read', headers({ 'Content-Type': 'application/json', 'Transfer-Encoding': 'chunked' }), '');
+    eq('compound: body over the cap is not read', headers({ 'Content-Type': 'application/json', 'Content-Length': '2000000' }), 'too-large');
+    eq('compound: no response headers object -> read', headers({}), '');
+    const code = codeOf(t);
+    check('compound: the body is read only when not streaming',
+        code.indexOf('Convert.ToString(context.Variables["aforo-compound-streaming"]).Length == 0') !== -1
+        && code.indexOf('aforo-compound-streaming') < code.indexOf('Body.As<JObject>(preserveContent: true)'));
+    check('compound: a skipped stream is traced', code.indexOf('<trace source="aforo-compound-metering"') !== -1);
+});
+
+section('G353 subscription map lookup is cached', function () {
+    const srcFn = compile('aforo-customer-source', ctxSrc, NV);
+    eq('source: preset variable', run(srcFn, { subscription: 's', vars: { 'aforo-customer-id': 'c' } }), 'preset');
+    eq('source: JWT claim', run(srcFn, { subscription: 's', vars: { 'aforo-jwt-payload': { customer_id: 'c' } } }), 'jwt');
+    eq('source: subscription map', run(srcFn, { subscription: 's' }), 'map');
+    eq('source: nothing', run(srcFn, {}), 'none');
+    const keyFn = compile('aforo-customer-map-key', ctxSrc, NV);
+    const mapLen = NV['aforo-subscription-customer-map'].length;
+    eq('map key: version, map length and subscription', run(keyFn, { subscription: 'acme-prod', vars: { 'aforo-customer-source': 'map' } }), 'aforo:cust:1:' + mapLen + ':acme-prod');
+    eq('map key: version from the variable', run(keyFn, { subscription: 'acme-prod', vars: { 'aforo-customer-source': 'map', 'aforo-customer-map-version': ' 7 ' } }), 'aforo:cust:7:' + mapLen + ':acme-prod');
+    eq('map key: caching off', run(keyFn, { subscription: 'acme-prod', vars: { 'aforo-customer-source': 'map', 'aforo-customer-map-cache-seconds': '0' } }), '');
+    eq('map key: not a map lookup', run(keyFn, { subscription: 'acme-prod', vars: { 'aforo-customer-source': 'jwt' } }), '');
+    eq('map key: a map from a variable changes the key', run(keyFn, { subscription: 'acme-prod', vars: { 'aforo-customer-source': 'map', 'aforo-subscription-customer-map': 'a=b' } }), 'aforo:cust:1:3:acme-prod');
+    eq('customer: a cache hit is used without parsing', run(ctxCustomer, { subscription: 'acme-prod', vars: { 'aforo-customer-map-cached': 'cust_cached' } }), 'cust_cached');
+    eq('customer: a cached miss stays a miss', run(ctxCustomer, { subscription: 'acme-prod', vars: { 'aforo-customer-map-cached': '~' } }), '');
+    eq('customer: a JWT claim still wins over the cache', run(ctxCustomer, { subscription: 'acme-prod', vars: { 'aforo-customer-map-cached': 'cust_cached', 'aforo-jwt-payload': { customer_id: 'cust_jwt' } } }), 'cust_jwt');
+    const code = codeOf(ctxSrc);
+    eq('context: one cache lookup', (code.match(/<cache-lookup-value /g) || []).length, 1);
+    eq('context: one cache store', (code.match(/<cache-store-value /g) || []).length, 1);
+    check('context: a miss is stored as "~"', code.indexOf('"~"') !== -1);
+});
+
+
+section('W6.3 review: JWT tenant binding', function () {
+    const t = readPolicy('jwt-validation-policy.xml');
+    const NVT = { 'aforo-tenant-id': 'tenant_b' };
+    const tenantFn = compile('aforo-jwt-tenant', t, NVT);
+    eq('jwt tenant: the Named Value', run(tenantFn, {}), 'tenant_b');
+    eq('jwt tenant: the context variable wins, trimmed', run(tenantFn, { vars: { 'aforo-tenant-id': ' tenant_c ' } }), 'tenant_c');
+    eq('jwt tenant: an empty variable is no tenant', run(tenantFn, { vars: { 'aforo-tenant-id': null } }), '');
+    const matchFn = compile('aforo-jwt-tenant-match', t);
+    const match = function (claims, configured) {
+        const v = { 'aforo-jwt-tenant': configured === undefined ? 'tenant_b' : configured };
+        if (claims !== undefined) v['aforo-jwt-payload'] = claims;
+        return run(matchFn, { vars: v });
+    };
+    eq('tenant match: same tenant', match({ tenant_id: 'tenant_b' }), 'true');
+    eq('tenant match: another tenant\'s token is refused', match({ tenant_id: 'tenant_a' }), 'false');
+    eq('tenant match: no tenant_id claim is refused', match({ sub: 'x' }), 'false');
+    eq('tenant match: no payload is refused', match(undefined), 'false');
+    eq('tenant match: no configured tenant is refused (fail closed)', match({ tenant_id: '' }, ''), 'false');
+    eq('tenant match: case matters', match({ tenant_id: 'Tenant_B' }), 'false');
+    const code = codeOf(t);
+    const reject = code.indexOf('<when condition="@(Convert.ToString(context.Variables["aforo-jwt-tenant-match"]) != "true")">');
+    check('jwt: a tenant mismatch returns 401 TENANT_MISMATCH',
+        reject !== -1 && code.indexOf('"error_description": "TENANT_MISMATCH"', reject) !== -1 && code.indexOf('<set-status code="401"', reject) !== -1);
+    check('jwt: the tenant is checked before any header is set or any call is made',
+        reject !== -1 && reject < code.indexOf('<set-header name="X-Customer-Id"') && reject < code.indexOf('<send-request'));
+    const tenantHeader = code.slice(code.indexOf('<set-header name="X-Tenant-Id"'), code.indexOf('</set-header>', code.indexOf('<set-header name="X-Tenant-Id"')));
+    check('jwt: X-Tenant-Id upstream is the configured tenant, never the claim',
+        tenantHeader.indexOf('context.Variables["aforo-jwt-tenant"]') !== -1 && tenantHeader.indexOf('tenant_id') === -1);
+    check('jwt: references the Named Value aforo-tenant-id', code.indexOf('"{{aforo-tenant-id}}"') !== -1);
+});
+
+section('W6.3 review: cache keys are scoped to the API key', function () {
+    const pf = readPolicy('preflight-quota-policy-fragment.xml');
+    const mg = readPolicy('margin-guard-policy-fragment.xml');
+    const NVK = { 'aforo-api-key': 'sk_live_tenant_b' };
+    const pfScope = compile('aforo-preflight-scope', pf, NVK);
+    const mgScope = compile('mgScope', mg, NVK);
+    const expected = require('crypto').createHash('sha256').update('sk_live_tenant_b').digest('base64').substring(0, 22);
+    eq('preflight scope: hash of the Named Value key', run(pfScope, {}), expected);
+    eq('margin guard scope: the same hash', run(mgScope, {}), expected);
+    check('preflight scope: another key, another scope', run(pfScope, { vars: { 'aforo-api-key': 'sk_live_tenant_a' } }) !== expected);
+    check('preflight scope: never the key itself', run(pfScope, {}).indexOf('sk_live') === -1);
+    const pfCode = codeOf(pf);
+    const pfKey = 'key="@("aforo:pf:" + Convert.ToString(context.Variables["aforo-preflight-scope"]) + ":" + Convert.ToString(context.Variables["aforo-preflight-customer"]))"';
+    eq('preflight: lookup and store use the scoped key', pfCode.split(pfKey).length - 1, 2);
+    const mgCode = codeOf(mg);
+    const mgKey = 'key="@("mg:" + Convert.ToString(context.Variables["mgScope"]) + ":" + Convert.ToString(context.Variables["mgCustomerId"]))"';
+    eq('margin guard: lookup and store use the scoped key', mgCode.split(mgKey).length - 1, 2);
+    check('margin guard: the JWT tenant claim no longer keys the cache', mgCode.indexOf('tenant_id') === -1 && mgCode.indexOf('mgTenantId') === -1);
+});
+
+section('W6.3 review: pre-flight DENY cache window', function () {
+    const code = codeOf(readPolicy('preflight-quota-policy-fragment.xml'));
+    check('preflight: no retryAfterMs -> 5 s', code.indexOf('long ms = raw != null && raw.Type == JTokenType.Integer ? (long)raw : 5000;') !== -1);
+    check('preflight: DENY capped at 60 s', code.indexOf('if (seconds > 60) { seconds = 60; }') !== -1 && code.indexOf('3600') === -1);
+});
 
 console.log('\nAzure APIM policy tests: ' + passed + ' passed, ' + failed + ' failed');
 process.exit(failed === 0 ? 0 : 1);

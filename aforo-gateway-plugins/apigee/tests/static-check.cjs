@@ -101,7 +101,7 @@ for (const [name, dir] of Object.entries(BUNDLES)) {
 
     test('message templates are plain {variable} references', () => {
         for (const [file, p] of Object.entries(bundle.policies)) {
-            for (const tag of ['Header', 'Payload', 'URL']) {
+            for (const tag of ['Header', 'Payload', 'URL', 'Source', 'Topic']) {
                 for (const e of sim.descendants(p, tag)) {
                     const t = sim.text(e);
                     const stripped = t.replace(sim.TEMPLATE_VAR, '');
@@ -157,6 +157,44 @@ test('flow hooks: aforo-access is a request-path flow, aforo-metering a response
     assert.ok(/PreProxyFlowHook/.test(sim.text(sim.kid(access.manifest, 'Description'))));
     assert.ok(/PostProxyFlowHook/.test(sim.text(sim.kid(metering.manifest, 'Description'))));
     assert.ok(!Object.values(metering.policies).some((p) => p.name === 'RaiseFault'), 'metering never answers the client');
+});
+
+test('request-side checks live only in aforo-access: no VerifyJWT, VerifyAPIKey or quota call in aforo-metering (G355)', () => {
+    const metering = sim.loadBundle(BUNDLES['aforo-metering']);
+    for (const [file, p] of Object.entries(metering.policies)) {
+        assert.ok(!['VerifyJWT', 'VerifyAPIKey', 'RaiseFault', 'LookupCache'].includes(p.name), `${file}: ${p.name} belongs on the request path`);
+    }
+    for (const src of Object.values(metering.resources)) assert.ok(!/quota\/check|margin/i.test(src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')), 'metering script calls a request-side endpoint');
+    const jwt = sim.loadBundle(BUNDLES['aforo-access']).policies.AforoJwtValidation;
+    assert.strictEqual(jwt && jwt.name, 'VerifyJWT');
+});
+
+test('default delivery never waits: only the sync steps are ServiceCallouts with a <Response> (G355)', () => {
+    const metering = sim.loadBundle(BUNDLES['aforo-metering']);
+    for (const step of metering.steps) {
+        const p = metering.policies[step.name];
+        if (p.name !== 'ServiceCallout' || !sim.kid(p, 'Response')) continue;
+        assert.ok(/private\.aforo\.deliveryMode = "sync"/.test(step.condition), `${step.name} waits for the ingestor outside sync mode`);
+    }
+});
+
+test('pubsub delivery: PublishMessage to KVM pubsub_topic, continueOnError, only in pubsub mode (G358)', () => {
+    const metering = sim.loadBundle(BUNDLES['aforo-metering']);
+    const p = metering.policies.AforoMeteringPublish;
+    assert.strictEqual(p.name, 'PublishMessage');
+    assert.strictEqual(p.attrs.continueOnError, 'true');
+    assert.strictEqual(sim.text(sim.kid(sim.kid(p, 'CloudPubSub'), 'Topic')), '{private.aforo.pubsubTopic}');
+    assert.strictEqual(sim.text(sim.kid(p, 'Source')), '{aforo.eventPayload}');
+    const step = metering.steps.find((s) => s.name === 'AforoMeteringPublish');
+    assert.ok(/private\.aforo\.deliveryMode = "pubsub"/.test(step.condition), step.condition);
+    assert.ok(fs.existsSync(path.join(ROOT, 'pubsub-forwarder', 'src', 'forwarder.js')), 'the forwarder ships with the bundle');
+});
+
+test('token revocation (jti) is not claimed: no AforoJtiCheck reference, docs say it is not checked (G356)', () => {
+    for (const dir of Object.values(BUNDLES)) {
+        for (const f of walk(dir)) assert.ok(!/AforoJtiCheck|jti-check/i.test(fs.readFileSync(f, 'utf8')), path.relative(ROOT, f));
+    }
+    assert.ok(/revoked (Aforo )?JWT[^.]*not checked/i.test(DOCS), 'README/USER_GUIDE must say revoked tokens are not checked');
 });
 
 test('the pre-flight quota check waits at most 1500 ms', () => {
