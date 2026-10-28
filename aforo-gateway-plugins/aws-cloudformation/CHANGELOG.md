@@ -4,6 +4,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [Unreleased]
 
+## [3.2.0] — not yet released
+
+### `aforo-apigateway-role.yaml`
+
+- **Opt-in Gateway Orchestration and push ingestion for role-only connections.** New parameter `AllowGatewayOrchestration` (default `false`). With `false` the template grants exactly what 3.1.0 granted, for every parameter combination (`tests/templates.test.cjs` resolves both templates and compares them; the 3.1.0 file is kept as `tests/fixtures/aforo-apigateway-role-3.1.0.yaml`). With `true` the Aforo role gets one more policy, `AforoGatewayOrchestration`, with only the calls organization-service's `AwsApiGatewayProvisioningAdapter`, `AwsApiGatewayEnforcementAdapter` and `AwsApiGatewayEventAdapter` make, in `ApiGatewayRegion`:
+  - `apigateway:POST` on `/usageplans`, `/usageplans/*/keys`, `/apikeys` (CreateUsagePlan, CreateUsagePlanKey, CreateApiKey);
+  - `apigateway:PATCH` and `apigateway:DELETE` on `/usageplans/*`, `/apikeys/*` (UpdateUsagePlan, UpdateApiKey, DeleteUsagePlan, DeleteApiKey);
+  - `apigateway:GET` on `/apikeys/*` and `/usageplans/*/keys` (GetApiKey for enforcement status, GetUsagePlanKeys) — these return key values, so `NeverReadApiKeys` stops denying these two paths under the opt-in. `GET /apikeys` (every key, `includeValues=true`) and `GET /usageplans/*/keys/*` stay denied in every region;
+  - `cloudwatch:GetMetricData` on `*` (it has no resource-level permissions);
+  - `firehose:CreateDeliveryStream`, `DescribeDeliveryStream`, `UpdateDestination`, `DeleteDeliveryStream` on `deliverystream/aforo-gateway-*`;
+  - `logs:PutSubscriptionFilter`, `DeleteSubscriptionFilter` on the API Gateway log groups (`/aws/apigateway/*`, `API-Gateway-*`, `AccessLogGroupPrefix`);
+  - `iam:PassRole` of one role to `firehose.amazonaws.com` and one to `logs.amazonaws.com` (`iam:PassedToService`), and only when that role exists.
+- **Push ingestion's two service roles.** `FirehoseBackupBucketArn` (an existing bucket) makes the stack create `AforoFirehoseDeliveryRole` (trusted by Firehose with `sts:ExternalId` = this account; the six S3 actions Firehose needs, on that bucket only) and `AforoLogsToFirehoseRole` (trusted by CloudWatch Logs with `aws:SourceArn` in this account and region; `firehose:PutRecord` / `PutRecordBatch` on `aforo-gateway-*`), and output `FirehoseRoleArn`, `CloudWatchLogsRoleArn` and `FirehoseBackupBucketArn` for the Aforo connection. To use your own roles instead, pass `FirehoseRoleArn` and `CloudWatchLogsRoleArn` and leave the bucket empty; a stack rule refuses both at once.
+- Tests resolve the template for given parameters (`tests/cfn.cjs`, no npm packages) and check every adapter call against the resulting policies, plus the calls that must stay refused. `cfn-lint` 1.58.0 passes.
+
+### Upgrade from 3.1.0
+
+1. Nothing changes unless you set `AllowGatewayOrchestration=true`; updating with the same parameters leaves the role's permissions as they were.
+2. To turn it on: update the stack with `AllowGatewayOrchestration=true` and, for push ingestion, `FirehoseBackupBucketArn=<bucket ARN>` (see `USER_GUIDE.md`), then copy the three outputs into the Aforo connection.
+3. A connection that has access keys keeps using them for these calls; the opt-in matters only for a role-only connection.
+
 ## [3.1.0] — not yet released
 
 ### `aforo-apigateway-role.yaml`
