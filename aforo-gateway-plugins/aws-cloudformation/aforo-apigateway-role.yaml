@@ -20,7 +20,7 @@ Description: >-
 #
 # The same file is published as aforo-gateway-plugins/aws-cloudformation/aforo-apigateway-role.yaml
 # (and is organization-service src/main/resources/cloudformation/aws-apigateway-role.yaml).
-# Change both together (3.2.0 has not been copied there yet).
+# Change both together.
 
 Parameters:
   ExternalId:
