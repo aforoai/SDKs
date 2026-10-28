@@ -70,26 +70,9 @@ _truncation_warned: set = set()
 _truncation_lock = threading.Lock()
 
 
-def utf16_length(text: str) -> int:
-    """Length as the ingestor counts it (Java ``String.length()``): UTF-16 code
-    units, so a character outside the Basic Multilingual Plane counts as 2."""
-    return sum(2 if ord(ch) > 0xFFFF else 1 for ch in text)
-
-
-def truncate_utf16(text: str, limit: int) -> str:
-    """Longest prefix of ``text`` that is at most ``limit`` UTF-16 code units.
-
-    Cuts between characters, so a surrogate pair is never split: a character
-    that needs 2 units and has only 1 left is left out entirely.
-    """
-    if len(text) * 2 <= limit:
-        return text
-    units = 0
-    for index, ch in enumerate(text):
-        units += 2 if ord(ch) > 0xFFFF else 1
-        if units > limit:
-            return text[:index]
-    return text
+# Lengths are UTF-16 code units, as the ingestor (Java String.length()) counts
+# them; a character outside the Basic Multilingual Plane counts as 2.
+from ._transport.utf16 import truncate_utf16, utf16_length  # noqa: E402  (re-exported)
 
 
 def truncate_label(field: str, value: Any) -> Any:
@@ -134,10 +117,11 @@ def _length_error(field: str, value: Any) -> Optional[str]:
         return None
     text = str(value)
     limit = MAX_LENGTHS[field]
-    if len(text) <= limit:
+    length = utf16_length(text)
+    if length <= limit:
         return None
     return (
-        f"{field} is {len(text)} characters, exceeding the ingestor's {limit}-character "
+        f"{field} is {length} characters (UTF-16 units), exceeding the ingestor's {limit}-character "
         f'limit (value starts "{text[:80]}"). Shorten it — the SDK will not truncate it, '
         "because a truncated id bills the wrong thing."
     )

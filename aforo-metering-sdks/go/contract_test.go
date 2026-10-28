@@ -137,7 +137,7 @@ func TestIngestContract(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(Options{
+	client := mustNewClient(t, Options{
 		APIKey:        "test-key",
 		BaseURL:       srv.URL,
 		FlushCount:    100,
@@ -147,8 +147,8 @@ func TestIngestContract(t *testing.T) {
 	if err := client.Track(TrackEvent{CustomerID: "cust_contract", MetricName: "api_calls", Quantity: 1}); err != nil {
 		t.Fatalf("Track: %v", err)
 	}
-	client.Flush()
-	client.Close()
+	flushNow(client)
+	closeNow(client)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -181,7 +181,7 @@ func TestIngestContract_ExecutionStatusSentOnlyWhenSet(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(Options{
+	client := mustNewClient(t, Options{
 		APIKey:        "test-key",
 		BaseURL:       srv.URL,
 		FlushCount:    100,
@@ -200,8 +200,8 @@ func TestIngestContract_ExecutionStatusSentOnlyWhenSet(t *testing.T) {
 			t.Fatalf("Track: %v", err)
 		}
 	}
-	client.Flush()
-	client.Close()
+	flushNow(client)
+	closeNow(client)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -313,9 +313,7 @@ func newTestClient(t *testing.T, url string, mutate ...func(*Options)) *AforoCli
 	for _, m := range mutate {
 		m(&opts)
 	}
-	c := NewClient(opts)
-	t.Cleanup(c.Close)
-	return c
+	return mustNewClient(t, opts)
 }
 
 func TestOptions_DefaultBaseURLAndProductType(t *testing.T) {
@@ -326,9 +324,6 @@ func TestOptions_DefaultBaseURLAndProductType(t *testing.T) {
 	}
 	if o.ProductType != "API" {
 		t.Errorf("ProductType = %q, want API", o.ProductType)
-	}
-	if got := formatURL(o.BaseURL); got != "https://api.aforo.ai/v1/ingest/batch" {
-		t.Errorf("formatURL = %q", got)
 	}
 }
 
@@ -349,7 +344,7 @@ func TestTrack_SerializesRequiredFieldsAndDefaultProductType(t *testing.T) {
 	if err := c.Track(TrackEvent{CustomerID: "cust_1", MetricName: "api_calls"}); err != nil {
 		t.Fatal(err)
 	}
-	if r := c.Flush(); r.Sent != 1 {
+	if r := flushNow(c); r.Sent != 1 {
 		t.Fatalf("Sent = %d", r.Sent)
 	}
 	if srv.paths[0] != "/v1/ingest/batch" {
@@ -385,7 +380,7 @@ func TestTrack_ProductTypeClientOptionAndPerEventOverride(t *testing.T) {
 
 	_ = c.Track(TrackEvent{CustomerID: "c", MetricName: "m"})
 	_ = c.Track(TrackEvent{CustomerID: "c", MetricName: "m", ProductType: "mcp_server", Quantity: 2})
-	c.Flush()
+	flushNow(c)
 
 	evs := srv.events()
 	if len(evs) != 2 {
@@ -406,7 +401,7 @@ func TestTrack_OccurredAtNormalizedToUTC(t *testing.T) {
 	c := newTestClient(t, ts.URL)
 
 	_ = c.Track(TrackEvent{CustomerID: "c", MetricName: "m", OccurredAt: "2026-09-22T12:00:00+02:00"})
-	c.Flush()
+	flushNow(c)
 	if got := srv.events()[0]["occurredAt"]; got != "2026-09-22T10:00:00Z" {
 		t.Errorf("occurredAt = %v, want 2026-09-22T10:00:00Z", got)
 	}
@@ -479,7 +474,7 @@ func TestFlush_PartialFailureDropsOnlyNamedEvents(t *testing.T) {
 	})
 	_ = c.Track(TrackEvent{CustomerID: "c", MetricName: "m"})
 	_ = c.Track(TrackEvent{CustomerID: "c", MetricName: "x", IdempotencyKey: "key-x"})
-	c.Flush()
+	flushNow(c)
 	mu.Lock()
 	defer mu.Unlock()
 	if c.DroppedCount() != 1 || len(dropped) != 1 || dropped[0].IdempotencyKey != "key-x" {
@@ -501,7 +496,7 @@ func TestFlush_PartialFailureWithoutIndexesCountsOnly(t *testing.T) {
 	})
 	_ = c.Track(TrackEvent{CustomerID: "c", MetricName: "m"})
 	_ = c.Track(TrackEvent{CustomerID: "c", MetricName: "x"})
-	c.Flush()
+	flushNow(c)
 	if c.DroppedCount() != 1 || calls != 0 {
 		t.Errorf("DroppedCount=%d OnDrop calls=%d, want 1 and 0", c.DroppedCount(), calls)
 	}
@@ -514,9 +509,9 @@ func TestFlush_PartialFailureCounted(t *testing.T) {
 	c := newTestClient(t, ts.URL)
 	_ = c.Track(TrackEvent{CustomerID: "c", MetricName: "m"})
 	_ = c.Track(TrackEvent{CustomerID: "c", MetricName: "x"})
-	r := c.Flush()
-	if r.Sent != 1 || r.Failed != 1 {
-		t.Errorf("FlushResult = %+v, want Sent=1 Failed=1", r)
+	r := flushNow(c)
+	if r.Sent != 1 || r.Rejected != 1 {
+		t.Errorf("FlushResult = %+v, want Sent=1 Rejected=1", r)
 	}
 }
 
@@ -525,13 +520,16 @@ func TestHTTPMiddleware_SendsHTTPContextAndProductType(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	h := HTTPMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := mustNewClient(t, Options{APIKey: "k", BaseURL: ts.URL, FlushCount: 1, FlushInterval: time.Minute})
+	h, err := HTTPMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(201)
-	}), MiddlewareOptions{
-		APIKey:        "k",
-		ProductType:   "agentic_api",
-		ClientOptions: &Options{BaseURL: ts.URL, FlushCount: 1, FlushInterval: time.Minute},
+	}), client, MiddlewareOptions{
+		ProductType:         "agentic_api",
+		TrustCustomerHeader: true,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	req := httptest.NewRequest("POST", "/v1/orders/42?expand=items", nil)
 	req.Header.Set("X-Customer-Id", "cust_9")
 	h.ServeHTTP(httptest.NewRecorder(), req)
@@ -565,16 +563,21 @@ func TestChiMiddleware_SkipsWithoutCustomerID(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	mw := ChiMiddleware(MiddlewareOptions{
-		APIKey:        "k",
-		ClientOptions: &Options{BaseURL: ts.URL, FlushCount: 1, FlushInterval: 50 * time.Millisecond},
-	})
+	client := mustNewClient(t, Options{APIKey: "k", BaseURL: ts.URL, FlushCount: 1, FlushInterval: time.Minute})
+	mw, err := ChiMiddleware(client, MiddlewareOptions{TrustCustomerHeader: true})
+	if err != nil {
+		t.Fatal(err)
+	}
 	h := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
 	req := httptest.NewRequest("GET", "/v1/data", nil)
 	req.Header.Set("X-Customer-Id", "   ")
 	h.ServeHTTP(httptest.NewRecorder(), req)
-	time.Sleep(150 * time.Millisecond)
+	flushNow(client)
 	if n := len(srv.events()); n != 0 {
 		t.Errorf("got %d events without a customer id, want 0", n)
+	}
+	// Not billed, but counted: a request with no customer is dropped as invalid.
+	if client.DroppedCount() != 1 {
+		t.Errorf("DroppedCount = %d, want 1 (DropInvalid)", client.DroppedCount())
 	}
 }

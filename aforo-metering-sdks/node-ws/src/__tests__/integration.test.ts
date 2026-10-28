@@ -207,7 +207,7 @@ describe('Real-broker integration (ws.WebSocketServer + ws client)', () => {
       expect(opened).toBeDefined();
       expect(opened.customerId).toBe('cust_alpha');
       expect(opened.productType).toBe('WEBSOCKET_API');
-      expect(opened.wsFrameType).toBe('PING');           // SDK uses PING as the lifecycle "open" marker
+      expect(opened.wsFrameType).toBe('OPEN');           // its own frame type since 2.0.0 (was PING)
       expect(opened.wsDirection).toBe('SERVER_TO_CLIENT');
       expect(opened.metadata.event).toBe('CONNECTION_OPENED');
     },

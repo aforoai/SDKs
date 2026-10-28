@@ -25,6 +25,7 @@ const config = () => ({
   tenantId: 'tenant-001',
   productId: 'prod-gql-001',
   apiKey: 'sk_test_abc',
+  customerResolver: (ctx: any) => ctx?.customerId, trustCustomerHeader: true,
   ingestorUrl: 'https://api.aforo.ai',
   flushCount: 100,
 });

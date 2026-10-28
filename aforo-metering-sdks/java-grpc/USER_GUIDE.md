@@ -1,6 +1,6 @@
 # ai.aforo:grpc-metering — User Guide
 
-**Version:** 1.2.2 · **Updated:** 2026-10-01 · **Audience:** Java engineers running a `grpc-java` server who need per-RPC usage metering.
+**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Java engineers running a `grpc-java` server who need per-RPC usage metering.
 
 ## What you'll build
 
@@ -11,7 +11,7 @@ A gRPC server where every RPC — unary or streaming — emits one Aforo billing
 - JDK 17 or newer.
 - A `grpc-java` 1.60+ server you can add an interceptor to.
 - An Aforo API key (`AFORO_API_KEY`), a `tenant_id`, and a `product_id` for this gRPC service.
-- A way to put the customer id on call metadata (the default extractor reads the `x-customer-id` header).
+- A way to find the Aforo customer for a call from an identity you verified (mTLS peer, validated token).
 
 ## Step 1 — Build the SDK into your local Maven repo
 
@@ -27,7 +27,7 @@ Add to your service's `pom.xml`:
 <dependency>
   <groupId>ai.aforo</groupId>
   <artifactId>grpc-metering</artifactId>
-  <version>1.2.2</version>
+  <version>2.0.0</version>
 </dependency>
 ```
 
@@ -61,23 +61,23 @@ Server server = ServerBuilder.forPort(50051)
 
 > ⚠ `ingestorUrl` is the host only — the SDK appends `/v1/ingest/batch`. Pass `https://api.aforo.ai`, not the full path.
 
-## Step 4 — Make the customer id reachable from metadata
+## Step 4 — Tell the interceptor who the customer is
 
-The default extractor reads the `x-customer-id` gRPC metadata header. Have your client send it, or resolve it from the `authorization` header with a custom extractor:
+`build()` throws until you choose a customer source. Resolve it from credentials you verified:
 
 ```java
 import io.grpc.Metadata;
 
 AforoGrpcBilling billing = AforoGrpcBilling.newBuilder()
         // ... required fields ...
-        .customerIdExtractor(headers -> {
+        .customerResolver((call, headers) -> {
             String auth = headers.get(Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER));
-            return decodeJwt(auth);   // your verified-JWT logic
+            return verifiedCustomerId(auth);   // your JWT validation; null when unauthenticated
         })
         .build();
 ```
 
-> ⚠ Resolve the customer from verified metadata (a server-validated header or JWT) — not from a field inside the request message. A call with no resolvable customer id is silently not metered.
+> ⚠ `trustCustomerHeader(true)` reads the `x-customer-id` metadata instead. Callers set that header, so use it only behind a proxy that authenticates the caller and overwrites it. A call with no customer is served as usual; its event is counted as `INVALID` and passed to `onDrop`.
 
 ## Step 5 — Make a call, then flush and verify
 
@@ -116,18 +116,27 @@ billing.record("ListUsers", "SERVER_STREAM", customerId, "OK", durationMs);
 | `ingestorUrl` | `String` | *(required)* | Host; SDK appends `/v1/ingest/batch`. |
 | `serviceName` | `String` | *(required)* | `grpcService` field + idempotency key. |
 | `productType` | `String` | `GRPC_API` | Top-level `productType` on every event; trimmed + uppercased. Per call: `record(method, callType, customerId, status, durationMs, executionStatus, productType)` (a null/blank override uses the client value). |
-| `flushCount` | `int` | `50` | Events per immediate flush. |
-| `flushIntervalMs` | `long` | `5000` | Background flush cadence (ms). |
-| `customerIdExtractor` | `Function<Metadata, String>` | `x-customer-id` metadata | Per-call customer-id resolution. |
+| `flushCount` | `int` | `500` | Events per request (at most 1000); also how many queued events wake the sender. |
+| `flushIntervalMs` | `long` | `5000` | How often queued events are sent when the batch is not full (ms). |
+| `maxQueueSize` | `int` | `10000` | Queue capacity; when full, the oldest event is dropped as `OVERFLOW`. |
+| `maxRetries` | `int` | `3` | Retries per request on a network error, timeout, 408, 429 or 5xx. |
+| `retryBaseMs` | `long` | `500` | Base of the full-jitter backoff (each wait is random up to `min(30 s, base × 2^attempt)`). |
+| `timeoutMs` | `long` | `10000` | Total deadline of one ingest request (ms). |
+| `shutdownTimeoutMs` | `long` | `5000` | How long `close()` keeps sending; leftovers are reported as `SHUTDOWN`. |
+| `breakerCooldownMs` | `long` | `5000` | Pause after a batch fails every retry or gets 401/403; doubles with jitter up to 5 minutes. |
+| `allowInsecureHttp` | `boolean` | `false` | Accept a plain `http://` `ingestorUrl` on a host other than localhost / 127.0.0.1 / ::1. |
+| `customerResolver` | `CustomerResolver` | *(required unless `trustCustomerHeader`)* | Per-call customer from your authentication. |
+| `trustCustomerHeader` | `boolean` | `false` | Read `x-customer-id` metadata (only behind a proxy that sets it). |
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | `IllegalArgumentException: <field> is required` at build | A required builder field (`tenantId` / `productId` / `apiKey` / `ingestorUrl` / `serviceName`) is blank | Set all five; they're validated in the constructor. |
-| No events appear, no errors logged | Customer id not on metadata, so every call is skipped | Have the client send `x-customer-id`, or supply a `customerIdExtractor`. |
+| `IllegalStateException: AforoGrpcBilling needs to know which customer each call belongs to` | No customer source | Add `.customerResolver(...)` (or `.trustCustomerHeader(true)` behind a trusted proxy). |
+| No events appear; `Dropping invalid event: customerId is required` | Your resolver returned `null` | Check that the credentials reach the server and that your resolver maps them. |
 | Events POST to a 404 | `ingestorUrl` already includes the path | Pass the host only; the SDK appends `/v1/ingest/batch`. |
-| `flush exhausted retries — dropped N events` in logs | Network error, 5xx, 408 or 429 on all 3 attempts | Check connectivity to `ingestorUrl`; the batch is reported to `onDrop` with `RETRY_EXHAUSTED`. |
+| `Ingestor unreachable after retries; N event(s) put back in the queue` in logs | Network error, timeout, 5xx, 408 or 429 on every attempt | Check connectivity to `ingestorUrl`. Nothing is lost while the queue has room; events still queued when `close()` hits its deadline go to `onDrop` as `SHUTDOWN`. |
 | `ingestor returned 4xx — not retrying` or `Dropped N event(s) — REJECTED` in logs | Bad key, unknown metric, or an event the ingestor refused; a 4xx other than 408/429 is sent once | Verify the key + `X-Tenant-Id`; ensure the `grpc_api.rpc_calls` metric exists in Aforo. The log line carries the ingestor's `errors[].message`. |
 | `Dropping invalid event: ...` in logs, `droppedCount()` grows | The event breaks an ingestor field limit (`DropReason.INVALID`) and was not sent | The message names the field, the limit and the value. See [Dropped events](README.md#dropped-events). |
 | Streaming calls all show `messageCount = 1` | The interceptor counts one event per call, not per message | Call `billing.record(...)` inside the streaming handler for exact counts. |

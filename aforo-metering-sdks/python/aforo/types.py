@@ -9,16 +9,20 @@ from typing import Any, Callable, Literal, Optional
 # Same logger as AforoClient -- normalize_execution_status runs inside track().
 logger = logging.getLogger("aforo.client")
 
-DropReason = Literal["overflow", "retry_exhausted", "rejected", "invalid"]
-"""Why a buffered event was permanently dropped by the SDK.
+DropReason = Literal["overflow", "retry_exhausted", "rejected", "invalid", "shutdown", "closed"]
+"""Why an event was permanently dropped by the SDK.
 
-- ``overflow``: the ring buffer was full -- the OLDEST event was evicted.
-- ``retry_exhausted``: a batch failed after all transport retries (ingest outage).
-- ``rejected``: the ingestor rejected the batch with a non-retryable 4xx, or
-  rejected individual events in a partial (202 ``failed`` / ``errors[]``) response.
-- ``invalid``: ``track()`` refused the event before buffering it (blank
+- ``overflow``: the queue was full -- the OLDEST event was evicted. Happens
+  during a long ingest outage, when events keep arriving and none can be sent.
+- ``rejected``: the ingestor refused the batch with a non-retryable 4xx, or
+  refused individual events (non-retryable) in a 2xx partial response.
+- ``invalid``: ``track()`` refused the event before queueing it (blank
   customer/metric, quantity <= 0, or a field over the ingestor's limit). It was
   never sent.
+- ``shutdown``: still queued when ``shutdown()`` reached ``shutdown_timeout``.
+- ``closed``: ``track()`` was called after ``shutdown()``.
+- ``retry_exhausted``: kept for compatibility. An outage no longer drops
+  events: the batch goes back to the queue and is retried after a pause.
 """
 
 DEFAULT_PRODUCT_TYPE = "API"
@@ -32,41 +36,63 @@ MAX_BATCH_SIZE = 1000
 class AforoOptions:
     """Options for creating an AforoClient instance."""
 
-    api_key: str
-    """Aforo API key for authentication."""
+    api_key: str = field(repr=False)
+    """Aforo API key, sent only as ``X-API-Key``. Never shown in ``repr()`` or logs."""
 
     base_url: str = "https://api.aforo.ai"
-    """Base URL for the Aforo ingestor service."""
+    """Base URL for the Aforo ingestor. Must be ``https://``; plain ``http://`` is
+    allowed for localhost / 127.0.0.1 / ::1, or with ``allow_insecure_http``."""
 
-    flush_count: int = 50
-    """Maximum events to buffer before flushing (clamped to 1..1000, the ingestor's batch limit)."""
+    flush_count: int = 500
+    """Events per request; also the queue size that wakes the flusher early
+    (clamped to 1..1000, the ingestor's batch limit)."""
 
     flush_interval: float = 5.0
-    """Flush interval in seconds."""
+    """Seconds between background flushes."""
 
     max_queue_size: int = 10_000
-    """Maximum events in the ring buffer. Oldest dropped on overflow."""
+    """Maximum queued events. On overflow the oldest is dropped (reason ``overflow``)."""
 
     max_retries: int = 3
-    """Maximum retries on 5xx/timeout."""
+    """Retries per batch on network errors, timeouts, 408, 429 and 5xx."""
 
-    retry_base_s: float = 1.0
-    """Base delay in seconds for exponential backoff."""
+    retry_base_s: float = 0.5
+    """Base delay for full-jitter backoff: retry ``n`` waits ``random(0, min(30, base * 2**n))``."""
 
     timeout: float = 10.0
-    """Request timeout in seconds."""
+    """Total deadline per HTTP request, in seconds."""
 
     shutdown_timeout: float = 5.0
-    """Graceful shutdown timeout in seconds."""
+    """``shutdown()`` flushes for at most this many seconds; events still queued
+    then are dropped with reason ``shutdown``."""
+
+    allow_insecure_http: bool = False
+    """Allow a plain ``http://`` base_url on a host other than localhost."""
 
     on_drop: Optional[Callable[[list["ResolvedEvent"], DropReason], None]] = None
     """OPT-IN hook invoked with events the SDK is about to lose permanently
-    (buffer overflow, retry exhaustion, non-retryable rejection, or an event
-    ``track()`` refused as invalid), so the
-    app can persist / alert / replay them. Dropped events keep their
-    idempotency keys -- re-submitting them via track() after recovery is
-    dedup-safe. Default: None (drops are still counted in dropped_count and
-    WARN-logged). Exceptions raised by the hook are swallowed."""
+    (queue overflow, non-retryable rejection, an event ``track()`` refused as
+    invalid, the shutdown deadline, or ``track()`` after shutdown), so the app
+    can persist / alert / replay them. Dropped events keep their idempotency
+    keys -- re-submitting them via track() after recovery is dedup-safe.
+    Default: None (drops are still counted in dropped_count and WARN-logged).
+    Exceptions raised by the hook are caught and logged."""
+
+    on_error: Optional[Callable[[Exception], None]] = None
+    """OPT-IN hook for delivery problems. It receives an ``aforo.TransportError``
+    whose ``kind`` is ``outage`` / ``auth`` (events still queued and retried),
+    ``rejected``, ``shutdown`` or ``closed`` (events gone), with the ``events``
+    concerned and the HTTP ``status`` when there was one. Branch on ``kind``,
+    not the message. Exceptions raised by the hook are caught and logged."""
+
+    on_accepted: Optional[Callable[[Any, list["ResolvedEvent"]], None]] = None
+    """OPT-IN hook called after every accepted batch with the ingestor's response
+    ``data`` object and the events in the batch (for fields such as
+    ``killedSessionIds``). Exceptions raised by the hook are caught and logged."""
+
+    http_transport: Optional[Any] = field(default=None, repr=False)
+    """Optional ``httpx.BaseTransport`` for the SDK's HTTP client (tests, custom
+    proxies). Default: httpx's own."""
 
     product_type: str = DEFAULT_PRODUCT_TYPE
     """Default top-level ``productType`` for every event (``API``, ``AGENTIC_API``,
@@ -175,23 +201,32 @@ class FlushResult:
 class MiddlewareOptions:
     """Options for framework middleware."""
 
-    api_key: str
+    api_key: str = field(repr=False)
     base_url: str = "https://api.aforo.ai"
     product_type: str = DEFAULT_PRODUCT_TYPE
     """``productType`` stamped on every request event. Default ``"API"``."""
     metric_name: Optional[Callable | str] = None
     """Fixed metric or callable. Default ``"api_calls"``; must exist in your Aforo catalog."""
     quantity: Optional[Callable | float] = None
+    customer_resolver: Optional[Callable] = None
+    """Required unless ``trust_customer_header`` is True: ``callable(request) -> str | None``
+    returning the customer id from identity your service has verified (session,
+    JWT subject, API-key lookup). ``None`` for a request -> that request is not
+    metered and is counted as an ``invalid`` drop."""
     customer_id: Optional[Callable | str] = None
-    """Fixed id or callable. Default: ``X-Customer-Id`` header (never ``X-Api-Key``)."""
+    """Deprecated alias of ``customer_resolver`` (a callable or one fixed id)."""
+    trust_customer_header: bool = False
+    """Read the customer from the ``X-Customer-Id`` header. The caller of your API
+    controls that header, so only turn this on behind a gateway that sets it."""
     exclude_paths: list[str] = field(
         default_factory=lambda: ["/health", "/ready", "/metrics", "/favicon.ico"]
     )
     exclude_status_codes: list[int] = field(default_factory=list)
     metadata: Optional[Callable] = None
-    flush_count: int = 50
+    flush_count: int = 500
     flush_interval: float = 5.0
     max_queue_size: int = 10_000
+    allow_insecure_http: bool = False
 
 
 # Canonical execution statuses accepted by the usage-ingestor (mirrors

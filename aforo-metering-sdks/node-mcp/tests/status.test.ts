@@ -26,6 +26,7 @@ function newBilling(overrides: Record<string, unknown> = {}) {
     flushIntervalMs: 3_600_000,
     flushCount: 100,
     heartbeatEnabled: false,
+    customerId: 'cust_test',
     ...overrides,
   });
   created.push(billing);

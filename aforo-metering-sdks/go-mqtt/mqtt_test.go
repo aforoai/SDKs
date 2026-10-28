@@ -7,7 +7,9 @@
 package mqttmetering
 
 import (
+	"context"
 	"encoding/json"
+	"github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt/v2/internal/ingest"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -64,6 +66,7 @@ func newBilling(t *testing.T, srv *httptest.Server, opts ...func(*Config)) *Bill
 		ProductID:     "prod-mqtt-001",
 		APIKey:        "sk_mqtt_abc",
 		IngestorURL:   srv.URL,
+		hooks:         fastHooks(),
 		FlushCount:    1,
 		FlushInterval: 60 * time.Second,
 	}
@@ -99,7 +102,7 @@ func TestPublishEventShape(t *testing.T) {
 
 	b.RecordPublish("cust_001", "device-001", "sensors/room-a/temperature", 1, false, 4)
 	waitFor(t, func() bool { return len(r.events()) == 1 }, 2*time.Second)
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	ev := r.events()[0]
 	want := map[string]any{
@@ -128,7 +131,7 @@ func TestDeliverSkippedByDefault(t *testing.T) {
 	defer srv.Close()
 	b := newBilling(t, srv, func(c *Config) { c.FlushCount = 100 })
 	b.RecordDeliver("cust_001", "device-001", "t", 0, false, 10)
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	for _, e := range r.events() {
 		if e["mqttEventType"] == "DELIVER" {
@@ -145,7 +148,7 @@ func TestDeliverEmittedWhenEnabled(t *testing.T) {
 
 	b.RecordDeliver("cust_001", "device-001", "sensors/a", 1, false, 7)
 	waitFor(t, func() bool { return len(r.events()) == 1 }, 2*time.Second)
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	ev := r.events()[0]
 	if ev["mqttEventType"] != "DELIVER" {
@@ -177,7 +180,7 @@ func TestMetricNameFormula(t *testing.T) {
 		b := newBilling(t, srv)
 		c.emit(b)
 		waitFor(t, func() bool { return len(r.events()) == 1 }, 2*time.Second)
-		_ = b.Shutdown()
+		_ = b.Shutdown(bg)
 
 		ev := r.events()[0]
 		if ev["mqttEventType"] != c.want {
@@ -202,7 +205,7 @@ func TestQosRetainedCarried(t *testing.T) {
 	b.RecordPublish("c", "x", "t", 1, true, 1)
 	b.RecordPublish("c", "x", "t", 2, false, 1)
 	waitFor(t, func() bool { return len(r.events()) == 3 }, 2*time.Second)
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	events := r.events()
 	for i, expectQos := range []float64{0, 1, 2} {
@@ -223,7 +226,7 @@ func TestEmptyCustomerIDRejected(t *testing.T) {
 	defer srv.Close()
 	b := newBilling(t, srv)
 	b.RecordPublish("", "x", "t", 0, false, 1)
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 	if n := len(r.events()); n != 0 {
 		t.Errorf("got %d events, want 0", n)
 	}
@@ -239,7 +242,7 @@ func TestIdempotencyKeyFormat(t *testing.T) {
 
 	b.RecordPublish("cust_001", "c1", "a/b", 0, false, 1)
 	waitFor(t, func() bool { return len(r.events()) == 1 }, 2*time.Second)
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	key := r.events()[0]["idempotencyKey"].(string)
 	re := regexp.MustCompile(`^mqtt:tenant-001:c1:PUBLISH:a/b:\d+:[a-z0-9]{8}$`)
@@ -259,7 +262,7 @@ func TestBatchWireContract(t *testing.T) {
 	b.RecordConnect("cust_001", "c1")
 	b.RecordSubscribe("cust_001", "c1", "a/#", 7)      // invalid QoS
 	b.RecordPublish("cust_001", "c1", "", 0, false, 1) // no topic → dropped
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	r.mu.Lock()
 	path, hdr, body := r.paths[0], r.headers[0], r.requests[0]
@@ -306,12 +309,14 @@ func TestLargeBufferSplitsIntoBatchesOf1000(t *testing.T) {
 	for i := 0; i < 2500; i++ {
 		b.RecordPublish("cust_001", "c1", "a/b", 0, false, 1)
 	}
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if len(r.requests) != 3 {
-		t.Fatalf("requests = %d, want 3", len(r.requests))
+	// At least 3 requests: the flusher sends whatever is queued when it wakes
+	// at the 1000-event threshold, so the split can be finer than 1000/1000/500.
+	if len(r.requests) < 3 {
+		t.Fatalf("requests = %d, want at least 3", len(r.requests))
 	}
 	total := 0
 	for _, body := range r.requests {
@@ -332,11 +337,15 @@ func TestRetriesReuseIdempotencyKey(t *testing.T) {
 	defer srv.Close()
 	b := newBilling(t, srv, func(c *Config) { c.FlushCount = 100 })
 	b.RecordPublish("cust_001", "c1", "a/b", 0, false, 1)
-	_ = b.Shutdown() // blocks through all 3 attempts
+	// Shutdown retries until its deadline, then reports the leftover; a short
+	// deadline keeps the test fast.
+	ctx, cancel := context.WithTimeout(bg, 200*time.Millisecond)
+	defer cancel()
+	_ = b.Shutdown(ctx)
 
 	evs := r.events()
-	if len(evs) != 3 {
-		t.Fatalf("attempts = %d, want 3", len(evs))
+	if len(evs) < ingest.DefaultMaxRetries+1 {
+		t.Fatalf("attempts = %d, want at least %d", len(evs), ingest.DefaultMaxRetries+1)
 	}
 	for _, ev := range evs[1:] {
 		if ev["idempotencyKey"] != evs[0]["idempotencyKey"] {

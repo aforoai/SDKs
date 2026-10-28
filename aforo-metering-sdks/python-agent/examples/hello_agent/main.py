@@ -10,7 +10,6 @@ expects.
 
 What this covers:
     - AforoAgentClient construction with env-driven config
-    - client.start() to kick off the periodic-flush background task
     - client.record_capability() with capability_name (metadata
       snake_case → ProductTypeEventExtractor.extractAiAgentFields
       → event.toolName for per-capability billing)
@@ -153,7 +152,6 @@ async def run() -> None:
         flush_interval_sec=1.0,
         on_drop=_on_drop,
     )
-    await client.start()
 
     # The Python SDK's session id is a caller-managed value (unlike the Node
     # SDK's opaque handle). Stamp one per run so downstream analytics can

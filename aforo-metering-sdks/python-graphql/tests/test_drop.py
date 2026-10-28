@@ -58,12 +58,13 @@ def record_one(client, customer_id="cust_1"):
     )
 
 def drain(client):
-    """Flush synchronously through shutdown(), skipping retry sleeps."""
+    """Flush synchronously through shutdown(), skipping retry sleeps. The core
+    keeps retrying until the shutdown deadline, so the deadline is kept short."""
     with mock.patch("time.sleep"):
-        client.shutdown()
+        client.shutdown(timeout=0.3)
 
 
-def test_network_exhaustion_drops_counts_warns_and_fires_hook(no_httpx, cfg, caplog):
+def test_network_down_at_shutdown_drops_counts_warns_and_fires_hook(no_httpx, cfg, caplog):
     drops = []
     client = new_client(cfg, on_drop=lambda events, reason: drops.append((events, reason)))
     record_one(client, "cust_1")
@@ -76,7 +77,7 @@ def test_network_exhaustion_drops_counts_warns_and_fires_hook(no_httpx, cfg, cap
     assert client.dropped_count == 2
     assert len(drops) == 1
     events, reason = drops[0]
-    assert reason == "retry_exhausted"
+    assert reason == "shutdown"
     assert len(events) == 2
     # Events keep their keys — dedup-safe replay is possible
     assert events[0]["idempotencyKey"].startswith("gql:")
@@ -95,7 +96,7 @@ def test_terminal_4xx_classified_rejected(no_httpx, cfg):
     assert reasons == ["rejected"]
 
 
-def test_terminal_5xx_classified_retry_exhausted(no_httpx, cfg):
+def test_5xx_at_shutdown_reported_as_shutdown(no_httpx, cfg):
     reasons = []
     client = new_client(cfg, on_drop=lambda _e, reason: reasons.append(reason))
     record_one(client)
@@ -104,7 +105,7 @@ def test_terminal_5xx_classified_retry_exhausted(no_httpx, cfg):
         drain(client)
 
     assert client.dropped_count == 1
-    assert reasons == ["retry_exhausted"]
+    assert reasons == ["shutdown"]
 
 
 def test_default_no_hook_counts_warns_and_on_error_once(no_httpx, cfg, caplog):
@@ -117,7 +118,7 @@ def test_default_no_hook_counts_warns_and_on_error_once(no_httpx, cfg, caplog):
             drain(client)
 
     assert client.dropped_count == 1
-    assert len(errors) == 1
+    assert [e.kind for e in errors] == ["outage", "shutdown"]  # typed TransportError kinds
     assert "total dropped" in caplog.text
 
 
@@ -133,7 +134,7 @@ def test_throwing_hook_is_harmless(no_httpx, cfg):
         drain(client)  # must not raise
 
     assert client.dropped_count == 1
-    assert len(errors) == 1
+    assert [e.kind for e in errors] == ["outage", "shutdown"]  # typed TransportError kinds
 
 
 def test_hook_calling_shutdown_does_not_deadlock(no_httpx, cfg):
@@ -179,11 +180,12 @@ def test_happy_path_unchanged(no_httpx, cfg):
     assert len(captured) == 1
 
 
-def test_shutdown_deregisters_atexit_handler(no_httpx, cfg):
-    client = new_client(cfg)
+@pytest.mark.real_transport
+def test_shutdown_deregisters_atexit_handler(cfg):
+    client = new_client({**cfg, "ingestor_url": "http://127.0.0.1:1"})
     with mock.patch("atexit.unregister") as unreg:
-        drain(client)
-    unreg.assert_called_once_with(client._safe_shutdown)
+        client.shutdown(timeout=0)
+    unreg.assert_called_once_with(client._core._atexit_close)
 
 def test_positional_customer_id_extractor_still_binds(no_httpx):
     """Regression: on_drop must stay LAST in the signature — inserting it

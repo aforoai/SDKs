@@ -2,6 +2,32 @@
 
 All notable changes to `ai.aforo:grpc-metering` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [2.0.0] - 2026-10-26
+
+Breaking. Moves onto the shared wave 5 transport core (contract/TRANSPORT-SPEC.md).
+
+### Changed (breaking)
+- **The interceptor needs a customer source.** Set `customerResolver((call, headers) -> ...)` from your authentication (mTLS peer, verified token), or `trustCustomerHeader(true)` to read `x-customer-id`; `build()` throws without one. `customerIdExtractor(...)` still works (deprecated). A call with no customer is reported as `INVALID`. **Migration:** add `.customerResolver(...)`.
+- **Metering never keeps a call from closing**: `super.close(...)` runs in `finally`, and a throwing resolver counts as no customer.
+- **An outage no longer drops events.** The queue is bounded (`maxQueueSize`, default 10 000; overflow evicts the oldest as the new `DropReason.OVERFLOW`). After the retries, the batch goes back to the queue with the same idempotency keys and the sender pauses (5 s, doubling with jitter up to 5 min); 401/403 count as an outage. `RETRY_EXHAUSTED` is kept but no longer reported for outages.
+- **`close()` honours `shutdownTimeoutMs`** (default 5 s); events left at the deadline are reported as the new `DropReason.SHUTDOWN`. Recording after `close()` is reported as `DropReason.CLOSED`.
+- `ingestorUrl` must be `https://` (plain `http://` only for localhost, 127.0.0.1, ::1, or with `allowInsecureHttp(true)`).
+- Default `flushCount` is 500 (was 50). The package-private `retryBackoffBaseMs` field is gone; use `retryBaseMs(...)`.
+- `grpcCallType` and `grpcStatusCode` are upper-cased with `Locale.ROOT`; under a Turkish default locale they were mangled.
+
+### Added
+- One background sender thread per instance; recording never starts a thread or a request. One `HttpClient`, shut down on close.
+- Full-jitter retries; `Retry-After` in seconds or HTTP-date, capped at 60 s. A 413 splits the batch; bodies are split at 4 MiB. Events a 2xx marks `retryable: true` are resent with their keys.
+- Builder: `maxQueueSize`, `maxRetries`, `retryBaseMs`, `timeoutMs`, `shutdownTimeoutMs`, `breakerCooldownMs`, `allowInsecureHttp`; `bufferedCount()`.
+- Requests carry `User-Agent: aforo-java-grpc/2.0.0`.
+- Release: `autoPublish` is off; a person releases the staging deployment on Central.
+
+### Changed (review fixes, 2026-10-27)
+- Transport core (shared with `ai.aforo:metering` 2.0.0): `close()` cuts a request started before close at the shutdown deadline and reports its batch as `SHUTDOWN`; `timeoutMs` covers reading the body; a 3xx is an outage (logged with the target host, never followed); per-event `retryable` is capped at `maxRetries` with backoff; breaker cooldown is at least 250 ms; shutdown after an outage keeps retrying until the deadline; fractional `Retry-After`; an event that cannot be serialized (cyclic metadata) is dropped as `INVALID`.
+
+### Added (review fixes, 2026-10-27)
+- `Builder.onError(Consumer<MeteringError>)` typed by `MeteringError.kind()` (`OUTAGE`, `AUTH`, `REJECTED`, `SHUTDOWN`, `CLOSED`) and `Builder.onAccepted(...)` with the unwrapped 2xx body.
+
 ## [1.2.2] - 2026-10-01
 
 ### Changed

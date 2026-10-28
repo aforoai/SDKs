@@ -17,7 +17,7 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { IngestorClient } from '../src/telemetry/IngestorClient.js';
+import { EventBuffer } from '../src/telemetry/EventBuffer.js';
 import type { ProxyUsageEvent } from '../src/types.js';
 
 const MODULE_KEY = 'mcp-proxy';
@@ -98,14 +98,14 @@ describe('ingest contract guard (shared fixture)', () => {
     const spec = fixture.endpoints[endpoint];
     assert.notEqual(spec, undefined);
 
-    const client = new IngestorClient({
+    const buffer = new EventBuffer({
       baseUrl: 'https://ingest.test.aforo.ai',
       apiKey: 'sk_proxy_abc',
       tenantId: 'tenant-001',
-      maxRetries: 1,
+      flushIntervalMs: 3_600_000,
     });
-
-    await client.sendBatch([makeEvent()]);
+    buffer.push(makeEvent());
+    await buffer.shutdown();
 
     assert.notEqual(observed, null, 'no wire request observed');
     assert.equal(new URL(observed!.url).pathname, endpoint);

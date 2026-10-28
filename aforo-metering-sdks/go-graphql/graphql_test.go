@@ -55,13 +55,15 @@ func (r *recorder) events() []map[string]any {
 func newBilling(t *testing.T, srv *httptest.Server, opts ...func(*Config)) *Billing {
 	t.Helper()
 	cfg := Config{
-		TenantID:      "tenant-001",
-		ProductID:     "prod-gql-001",
-		APIKey:        "sk_gql_abc",
-		IngestorURL:   srv.URL,
-		SchemaVersion: "v2.1",
-		FlushCount:    1,
-		FlushInterval: 100 * time.Millisecond,
+		TenantID:            "tenant-001",
+		ProductID:           "prod-gql-001",
+		APIKey:              "sk_gql_abc",
+		IngestorURL:         srv.URL,
+		hooks:               fastHooks(),
+		TrustCustomerHeader: true,
+		SchemaVersion:       "v2.1",
+		FlushCount:          1,
+		FlushInterval:       100 * time.Millisecond,
 	}
 	for _, o := range opts {
 		o(&cfg)
@@ -70,7 +72,7 @@ func newBilling(t *testing.T, srv *httptest.Server, opts ...func(*Config)) *Bill
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = b.Shutdown() })
+	t.Cleanup(func() { _ = b.Shutdown(bg) })
 	return b
 }
 
@@ -327,12 +329,14 @@ func TestLargeBufferSplitsIntoBatchesOf1000(t *testing.T) {
 	for i := 0; i < 2500; i++ {
 		b.Record("cust_001", "{ a }", "", 1, false)
 	}
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
-	if len(rec.requests) != 3 {
-		t.Fatalf("requests = %d, want 3", len(rec.requests))
+	// At least 3 requests: the flusher sends whatever is queued when it wakes
+	// at the 1000-event threshold, so the split can be finer than 1000/1000/500.
+	if len(rec.requests) < 3 {
+		t.Fatalf("requests = %d, want at least 3", len(rec.requests))
 	}
 	total := 0
 	for _, body := range rec.requests {

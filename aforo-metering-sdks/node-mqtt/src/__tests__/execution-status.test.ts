@@ -5,6 +5,7 @@
 
 import { AforoMqttBilling } from '../index';
 import { EventEmitter } from 'events';
+import { ackingPublish } from '../../test-support/mqtt-fakes';
 
 let bodies: any[];
 
@@ -29,7 +30,7 @@ const settle = () => new Promise((r) => setTimeout(r, 10));
 
 class FakeClient extends EventEmitter {
   options = { clientId: 'dev-1' };
-  publish = jest.fn((_t: string, _m: any, _o?: any, _cb?: any) => undefined);
+  publish = ackingPublish();
 }
 
 describe('wrapAedesBroker', () => {

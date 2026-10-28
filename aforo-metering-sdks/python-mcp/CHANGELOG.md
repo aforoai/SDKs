@@ -2,6 +2,40 @@
 
 All notable changes to `aforo-mcp-metering` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [2.0.0] - 2026-10-26
+
+**Breaking.** Read "Who is billed" in the README before upgrading.
+
+### Changed
+- **The billed customer is no longer the `agent_id`.** `customerId` comes from a `customer_resolver(call)` you pass (on the client or on `wrap_tool_handler`), which receives a `ToolCall` (`name`, `arguments`, `kwargs`, `meta`). `trust_customer_header=True` bills the `customer_id` kwarg / `_meta.customer_id` the MCP client sends instead. With neither, `wrap_tool_handler` raises `ValueError`. `agentId` is still the `agent_id` kwarg; a new `agent_resolver(call)` covers calls without one.
+- **No `"unknown"` fallback.** A call with no customer or no agent still runs, but its event is dropped with reason `invalid` and counted. Before, it was billed to `"unknown"`.
+- `record_tool_invocation(...)` takes `customer_id=` (keyword).
+- **Sending.** One background thread sends batches over one pooled `httpx` connection, one request at a time, starting at construction; `start()` does nothing now. The old per-batch `asyncio` task and the 3-attempt retry are gone. Outages (network errors, timeouts, 408, 429, 5xx, 401, 403) are retried with jittered backoff and a circuit breaker and the events stay queued; `Retry-After` is read as seconds or an HTTP date and capped at 60 s; 413 splits the batch.
+- `flush_count` default 50 → 500. The queue is bounded by `max_queue_size` (10 000); the oldest events are dropped with reason `overflow` when it is full.
+- `flush()` and `shutdown()` run in a worker thread so they never block the event loop. `shutdown()` stops after `shutdown_timeout_sec` (5 s) and reports what is left as `shutdown`. `flush()` returns the number of events still queued.
+- `ingestor_url` must be `https://` (plain `http://` only for localhost, or with `allow_insecure_http=True`). The API key is never in `repr()` or logs.
+- Field limits are counted in UTF-16 code units, as the ingestor counts them. `customer_id` over 64 is dropped as `invalid`.
+- Drop reasons are `overflow`, `rejected`, `invalid`, `shutdown`, `closed`. `retry_exhausted` no longer happens.
+- `httpx` is a required dependency; the `urllib` fallback is gone. The `aiohttp` / `httpx` extras are kept and empty.
+
+### Added
+- `shutdown_sync()`, `max_queue_size`, `timeout_sec`, `shutdown_timeout_sec`, `allow_insecure_http`, `http_transport`, `transport_options`.
+- An exit hook sends queued events at interpreter exit, and a forked child gets its own sender.
+
+### Changed (transport core, review 2026-10-26)
+Settles the cases in `contract/TRANSPORT-SPEC.md` "Edge cases every core handles the same way". Migration: if your `on_error` hook matched on message text, branch on `error.kind` instead.
+- **`on_error` gets a typed `TransportError`** with `kind` (`outage`, `auth`, `rejected`, `shutdown`, `closed`), `events`, `status` and `will_retry`. It subclasses `RuntimeError`, so existing `Exception` hooks keep working. An outage is reported once per breaker opening, and events still queued at the shutdown deadline are reported as `shutdown`.
+- **The request timeout covers the whole exchange**, including reading the response body: a server that stalls or drips its answer one byte at a time is cut off at the deadline (httpx's own timeout is per read).
+- **Redirects are an outage**: a 3xx is never followed (the API key must not reach another host); the batch is requeued, the breaker opens, and one ERROR names the host it pointed to.
+- **Every 5xx is retried** (501, 505, ... too).
+- **Per-event `retryable` errors in a 2xx** are re-sent with the same keys after the normal backoff, at most `max_retries` times, then treated as an outage. They were re-sent at once, in a tight loop. `errors[]` is authoritative even when `failed` is missing or 0.
+- **Breaker pause** is `max(250 ms, random(0, min(5 min, 5 s * 2^n)))`; a per-event retry cap reached right after a 2xx does not reset `n`.
+- **`flush()` while the breaker is open makes one attempt** (it returned at once).
+- **Shutdown keeps retrying** with jittered backoff until `shutdown_timeout` after an outage (it stopped at the first one).
+- **Nothing taken off the queue is lost unreported at shutdown**: the unsent half of a split batch, and a batch requeued just after shutdown gave up on a hung request, are reported as `shutdown`. Pending `flush()` callers always return.
+- **An event that cannot be turned into JSON** (a cycle, `NaN`, an unknown object) is dropped as `invalid` when it is recorded, not when its batch is sent; it no longer goes to `on_error`.
+- **A second `shutdown()`** waits for the first one and never drains again; `shutdown()` called from a hook on the sender thread no longer makes a later `shutdown()` wait 7 s.
+
 ## [1.3.2] - 2026-10-01
 
 ### Changed

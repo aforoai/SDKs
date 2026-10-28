@@ -24,7 +24,7 @@ describe('request-derived gqlOperationName', () => {
     warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     drops = [];
     billing = new AforoGraphQlBilling({
-      tenantId: 'tenant-001', productId: 'prod-gql-001', apiKey: 'k', ingestorUrl: 'https://api.aforo.ai',
+      tenantId: 'tenant-001', productId: 'prod-gql-001', apiKey: 'k', ingestorUrl: 'https://api.aforo.ai', customerResolver: (ctx: any) => ctx?.customerId, trustCustomerHeader: true,
       flushCount: 100, onDrop: (events, reason) => drops.push({ events, reason }),
     });
   });

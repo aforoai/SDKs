@@ -41,6 +41,8 @@ describe('expressMiddleware', () => {
   it('should capture events after response finishes', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
       baseUrl: 'https://ingest.test.aforo.ai',
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
     });
@@ -71,6 +73,8 @@ describe('expressMiddleware', () => {
   it('should use a fixed metricName when configured', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
       metricName: 'sms_sent',
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
     });
@@ -95,6 +99,8 @@ describe('expressMiddleware', () => {
   it('should not meter CORS preflight (OPTIONS) requests', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
     });
 
@@ -116,6 +122,8 @@ describe('expressMiddleware', () => {
   it('should exclude health check paths', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
     });
 
@@ -135,6 +143,8 @@ describe('expressMiddleware', () => {
   it('should extract customer ID from x-customer-id header', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
     });
 
@@ -156,6 +166,8 @@ describe('expressMiddleware', () => {
   it('should never use the caller\'s x-api-key header as the customer ID', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
     });
 
@@ -176,6 +188,8 @@ describe('expressMiddleware', () => {
   it('should skip when no customer ID can be resolved', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
     });
 
@@ -195,6 +209,8 @@ describe('expressMiddleware', () => {
   it('should support custom metric name function', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
       metricName: (req: any) => `custom.${req.method.toLowerCase()}`,
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
     });
@@ -218,6 +234,8 @@ describe('expressMiddleware', () => {
   it('should support custom quantity function', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
       quantity: (_req: any, _res: any) => 42,
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
     });
@@ -240,6 +258,8 @@ describe('expressMiddleware', () => {
   it('should exclude specified status codes', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
       excludeStatusCodes: [401, 403],
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
     });
@@ -261,6 +281,8 @@ describe('expressMiddleware', () => {
   it('sends productType and top-level HTTP fields', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
       productType: 'agentic_api',
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
     });
@@ -277,6 +299,8 @@ describe('expressMiddleware', () => {
   it('defaults productType to API and caps endpointPath at 512 chars', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
     });
     const { req, res } = createMockReqRes({ url: '/' + 'a'.repeat(600), user: { id: 'cust_1' } });
@@ -292,6 +316,8 @@ describe('expressMiddleware', () => {
   it('skips requests whose quantity is <= 0', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
       quantity: 0,
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
     });

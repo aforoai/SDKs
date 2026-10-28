@@ -77,7 +77,7 @@ class IngestContractTest {
         Map<String, Object> spec = cast(endpoints.get(endpoint));
         assertThat(spec).isNotNull();
 
-        AforoGrpcBilling billing = AforoGrpcBilling.newBuilder()
+        AforoGrpcBilling billing = AforoGrpcBilling.newBuilder().trustCustomerHeader(true)
                 .tenantId("tenant-001")
                 .productId("prod-grpc-001")
                 .apiKey("sk_grpc_abc")
@@ -121,7 +121,7 @@ class IngestContractTest {
             assertThat(derived.length()).isLessThanOrEqualTo(maxLength);
         }
 
-        AforoGrpcBilling billing = AforoGrpcBilling.newBuilder()
+        AforoGrpcBilling billing = AforoGrpcBilling.newBuilder().trustCustomerHeader(true)
                 .tenantId("tenant-001")
                 .productId("prod-grpc-001")
                 .apiKey("sk_grpc_abc")

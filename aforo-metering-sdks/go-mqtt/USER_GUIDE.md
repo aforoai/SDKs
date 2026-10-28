@@ -1,6 +1,6 @@
 # mqtt-metering-go — User Guide
 
-**Version:** 1.2.2 · **Updated:** 2026-10-01 · **Audience:** Go engineers metering MQTT usage from the client/device side.
+**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Go engineers metering MQTT usage from the client/device side.
 
 ## What you'll build
 
@@ -16,7 +16,7 @@ A Go MQTT client that emits one Aforo billing event per MQTT action — `CONNECT
 
 ## Step 1 — Add the module
 
-Releases are git tags of the form `aforo-metering-sdks/go-mqtt/vX.Y.Z` on github.com/aforoai/SDKs. Use `v1.2.2` or later: `v1.0.0` was tagged from an older copy of this code and lacks the fixes listed in the changelog. Until the `v1.2.2` tag exists, `go get github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt@main` resolves to a pseudo-version of the default branch. To build against a local checkout, clone and `replace`:
+The import path ends in `/v2` (version 2 changed the public API; see the [changelog](CHANGELOG.md)). Releases are git tags `aforo-metering-sdks/go-mqtt/v2.X.Y` on github.com/aforoai/SDKs. Until the `v2.0.0` tag exists, build against a local checkout with a `replace`:
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
@@ -24,9 +24,9 @@ git clone https://github.com/aforoai/SDKs.git
 
 ```go
 // go.mod (your service)
-require github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt v1.2.2
+require github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt/v2 v2.0.0
 
-replace github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt => ../SDKs/aforo-metering-sdks/go-mqtt
+replace github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt/v2 => ../SDKs/aforo-metering-sdks/go-mqtt
 ```
 
 ```bash
@@ -42,7 +42,7 @@ import (
 	"log"
 	"os"
 
-	mqttmetering "github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt"
+	mqttmetering "github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt/v2"
 )
 
 billing, err := mqttmetering.New(mqttmetering.Config{
@@ -54,10 +54,10 @@ billing, err := mqttmetering.New(mqttmetering.Config{
 if err != nil {
 	log.Fatal(err) // returned when any required field is empty
 }
-defer billing.Shutdown()
+defer billing.Shutdown(context.Background()) // bounded by Config.ShutdownTimeout
 ```
 
-> ⚠ `Shutdown()` flushes the buffer and waits for the flush loop. With the aggressive defaults (200 events / 2s) for high-volume telemetry, an un-flushed buffer at exit can hold a lot — always `Shutdown()` on graceful exit.
+> ⚠ `Shutdown(ctx)` sends what is queued, bounded by the earlier of `ctx`'s deadline and `ShutdownTimeout` (5 s). Events still queued then go to `OnDrop` with reason `shutdown` and `Shutdown` returns an error wrapping `ErrShutdownIncomplete`. Call it from your shutdown path; the library installs no signal handler.
 
 ## Step 3 — Record connection lifecycle
 
@@ -111,7 +111,7 @@ Leave it `false` unless you genuinely bill inbound delivery — it can multiply 
 
 ## Step 6 — Verify it landed
 
-The buffer flushes every `FlushInterval` (2s) or when it reaches `FlushCount` (200). Publish once, wait ~3 seconds (or `Shutdown()` to force a drain), then check Aforo:
+The sender runs every `FlushInterval` (5s) or when `FlushCount` (500) events are queued. Publish once, then call `billing.Flush(ctx)` (or `Shutdown(ctx)`), then check Aforo:
 
 - In the console, open the customer and look for recent `mqtt_broker.publish` (and `.subscribe`, `.connect`, etc.) events.
 - Or query the ingestion API for that tenant + those metrics.
@@ -139,11 +139,18 @@ Content-Type: application/json
 | `IngestorURL` | `string` | — (required) | Base; `/v1/ingest/batch` is appended. |
 | `EmitDeliverEvents` | `bool` | `false` | Whether `RecordDeliver` emits. |
 | `ProductType` | `string` | `MQTT_BROKER` | Top-level `productType` on every event; per-event override via `EventOptions`. |
-| `FlushCount` | `int` | `200` | Buffer-size flush threshold. |
-| `FlushInterval` | `time.Duration` | `2s` | Background flush cadence. |
-| `HTTPClient` | `*http.Client` | `&http.Client{Timeout: 10s}` | HTTP client override. |
-| `OnError` | `func(error)` | no-op | Marshal failures, retry-exhausted drops, non-retryable `4xx` rejections, and partial failures (with the ingestor's `errors[].message`). |
-| `OnDrop` | `func([]map[string]any, DropReason)` | `nil` | Opt-in hook called with events the SDK drops (`retry_exhausted`, `rejected`, `invalid`). See [Dropped events](#dropped-events). |
+| `AllowInsecureHTTP` | `bool` | `false` | `IngestorURL` must be `https://`; plain `http://` is accepted only for `localhost`, `127.0.0.1`, `::1`, or with this set. |
+| `FlushCount` | `int` | `500` | Events per request (max 1000); reaching it wakes the sender. |
+| `FlushInterval` | `time.Duration` | `5s` | The sender also runs on this interval. |
+| `MaxQueueSize` | `int` | `10000` | Queue capacity. When full the **oldest** event is dropped (`overflow`). |
+| `MaxRetries` | `int` | `3` | Retries per batch; a negative value disables retries. |
+| `RetryBase` | `time.Duration` | `500ms` | Full-jitter backoff base (each wait is random up to `min(30s, RetryBase × 2^attempt)`). |
+| `Timeout` | `time.Duration` | `10s` | Total deadline per HTTP request. |
+| `ShutdownTimeout` | `time.Duration` | `5s` | How long `Shutdown` keeps sending. |
+| `HTTPClient` | `*http.Client` | one pooled client | Use your own client for every request; you keep ownership. |
+| `OnError` | `func(error)` | no-op | Called when the ingestor rejects a batch or events (messages include its `errors[].message`), when it becomes unreachable (once per outage), when `Shutdown` leaves events unsent, for an event recorded after `Shutdown`, and when an event is invalid. Sending problems arrive as `*TransportError`: use `errors.As` and branch on `Kind` (`KindOutage`, `KindAuth`, `KindRejected`, `KindShutdown`, `KindClosed`); `Events` holds the events concerned. Invalid events arrive as a plain error. Runs on the background sender; it may call `Flush` or `Shutdown`. Never carries the API key. |
+| `OnAccepted` | `func(body json.RawMessage, events []map[string]any)` | nil | Called after every `2xx` with the response's `data` object (envelope removed — for example `killedSessionIds`) and the events of that request. Same goroutine rules as `OnError`; panics are recovered. |
+| `OnDrop` | `func([]map[string]any, DropReason)` | `nil` | Opt-in hook called with events the SDK gives up on (`overflow`, `rejected`, `invalid`, `shutdown`, `closed`). See [Dropped events](#dropped-events). |
 
 Tier filtering: every event carries `mqttQos` (0/1/2) and `mqttRetained`, so Aforo descriptor filter conditions can charge selectively (e.g. `mqtt_qos in ['1','2']`, or premium for `mqtt_retained == true`).
 
@@ -153,11 +160,13 @@ An event the SDK cannot deliver is never lost silently. `billing.DroppedCount()`
 
 | `DropReason` | When |
 |---|---|
-| `mqttmetering.DropRetryExhausted` (`retry_exhausted`) | A batch failed all 3 attempts (transport error, `408`, `429`, `5xx`). |
+| `mqttmetering.DropOverflow` (`overflow`) | The queue was full (for example during a long outage); the oldest event was evicted. |
+| `mqttmetering.DropShutdown` (`shutdown`) | Still queued when `Shutdown`'s deadline passed. `Shutdown` returns an error wrapping `ErrShutdownIncomplete`. |
+| `mqttmetering.DropClosed` (`closed`) | Recorded after `Shutdown`. |
 | `mqttmetering.DropRejected` (`rejected`) | The ingestor answered a non-retryable `4xx`, or refused individual events in a `2xx` partial-failure response. In the partial case only the events named by `errors[].index` are passed to `OnDrop`; failures the ingestor does not identify are counted but not attributed to an event. |
 | `mqttmetering.DropInvalid` (`invalid`) | The event failed client-side validation and was never buffered: a blank or whitespace topic on a publish/deliver/subscribe/unsubscribe event, `customerId` over 64 characters or `productType` over 20. A topic over 500 or a client id over 128 is not dropped — both come from the MQTT client, so they are truncated to the limit without splitting a character, the event is sent, and a WARN is logged once per label. The invalid-drop WARN log names the field, the limit and the value (throttled: first occurrence, then every 1000th); `OnError` is called too. |
 
-A call with no customer id is not metered and is not a drop. An unknown `executionStatus` is not a drop either: the status is left off (or replaced by the derived one) and the event is sent.
+A call with a blank customer id is not billed: it is dropped as `invalid`, counted in `DroppedCount()` and reported via `OnError`. An unknown `executionStatus` is not a drop either: the status is left off (or replaced by the derived one) and the event is sent.
 
 ```go
 OnDrop: func(events []map[string]any, reason mqttmetering.DropReason) {
@@ -165,7 +174,7 @@ OnDrop: func(events []map[string]any, reason mqttmetering.DropReason) {
 },
 ```
 
-Idempotency keys are minted once, when the event is recorded. Every retry re-sends the same body, so a retried batch is deduplicated by the ingestor.
+Idempotency keys are minted once, when the event is recorded. Every retry and every resend after an outage carries the same key, so the ingestor deduplicates it. `DropRetryExhausted` (`retry_exhausted`) is kept for compatibility but is no longer reported: v2 keeps a failing batch queued instead of dropping it.
 
 ## Execution status
 
@@ -178,9 +187,9 @@ See [Execution status (outcome-based pricing)](README.md#execution-status-outcom
 | `New` returns an error | A required field is empty | Set `TenantID`, `ProductID`, `APIKey`, `IngestorURL`. |
 | Publishes/subscribes not metered | No matching `Record*` call at that site | Add the `Record*` call next to each MQTT client call you bill. |
 | Inbound traffic missing | `EmitDeliverEvents` is `false` (default) | Set `EmitDeliverEvents: true` and call `RecordDeliver` in your message handler. |
-| Nothing records for a session | Empty `customerID` passed to `Record*` | Resolve and pass a non-empty customer id; an empty id is skipped (not metered, not counted as a drop). |
-| `DroppedCount()` rises with reason `retry_exhausted` | Flush exhausted its 3 attempts | Set `OnError`; verify `APIKey`, `IngestorURL`, and that the tenant owns the metric. |
-| Large gaps at shutdown | Process exited before a flush with a full-ish buffer | Always `defer billing.Shutdown()`; consider lowering `FlushCount`/`FlushInterval`. |
+| Nothing records for a session | Empty `customerID` passed to `Record*` | Resolve and pass a non-empty customer id; an empty id is not billed and is counted as `invalid`. |
+| `OnError` reports "ingestor unavailable" | The ingestor is unreachable or answered `401`/`403` | Nothing is lost while the queue has room; verify `APIKey` and network access to `IngestorURL`. Events beyond `MaxQueueSize` are dropped as `overflow`. |
+| `Shutdown` returns `ErrShutdownIncomplete` | The ingestor was slow or down at exit | Raise `ShutdownTimeout`, or persist what `OnDrop` receives with reason `shutdown`. |
 
 ## What this guide does NOT cover
 

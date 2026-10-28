@@ -26,7 +26,8 @@ const config = () => ({
 });
 
 class FakeWs extends EventEmitter {
-  send(_data: any, _cb?: any) { /* stub */ }
+  // Like ws: the send callback runs once the frame is written.
+  send(_data: any, ...rest: any[]) { const cb = rest.find((a) => typeof a === 'function'); cb?.(); }
 }
 
 const events = () => bodies.flatMap((b) => b.events);

@@ -15,7 +15,10 @@ from aforo_mcp_metering.client import (
     _utf16_length,
 )
 
-CFG = dict(tenant_id="t", product_id="p", api_key="k", ingestor_url="https://ingestor.example")
+from .mcp_fakes import use_fake_post
+
+CFG = dict(tenant_id="t", product_id="p", api_key="k", ingestor_url="https://ingestor.example",
+           customer_resolver=lambda call: call.kwargs.get("bill_to", "cust_1"))
 ASTRAL = "\U0001F600"
 
 
@@ -27,7 +30,7 @@ def _billing(**kwargs):
         requests.append(json.loads(body)["events"])
         return 202, ""
 
-    billing._do_post_with_body = fake_post
+    use_fake_post(billing, fake_post)
     return billing, requests
 
 
@@ -107,7 +110,7 @@ def test_key_is_deterministic_and_unchanged_when_it_fits():
 def test_record_tool_invocation_truncates_the_tool_name_too():
     async def scenario():
         billing, requests = _billing()
-        billing.record_tool_invocation("t" * 65, "agent_1")
+        billing.record_tool_invocation("t" * 65, "agent_1", customer_id="cust_1")
         await billing.shutdown()
         (event,) = [e for r in requests for e in r]
         assert event["toolName"] == "t" * 64 and billing.dropped_count == 0
@@ -126,9 +129,9 @@ def test_ids_still_drop_as_invalid():
             return "ok"
 
         await handler("search", {}, agent_id="a" * 37)                   # agentId
-        await handler("search", {}, agent_id="c" * 65)                   # customerId (sent from agent_id)
+        await handler("search", {}, agent_id="agent_1", bill_to="c" * 65)  # customerId
         await handler("t" * 100, {}, agent_id="agent_1", session_id="s" * 65)
-        billing.record_tool_invocation("", "agent_1")                    # blank tool name
+        billing.record_tool_invocation("", "agent_1", customer_id="c")   # blank tool name
         await billing.shutdown()
         assert requests == [] and billing.dropped_count == 4
         assert [reason for _evs, reason in drops] == ["invalid"] * 4

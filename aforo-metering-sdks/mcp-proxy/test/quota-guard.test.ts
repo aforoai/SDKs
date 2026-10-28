@@ -182,10 +182,11 @@ describe('QuotaGuard', () => {
       }
     });
 
-    it('fails open when the check takes longer than 50ms', async () => {
+    it('fails open when the check takes longer than its timeout', async () => {
       stubFetch([{ body: quotaSpec.examples.deny, delayMs: 2000 }]);
       const started = Date.now();
-      assert.equal(await enabledGuard().check('cust_1', 'm', 1), null);
+      const guard = new QuotaGuard({ ingestorUrl: 'https://x.test/', tenantId: 't1', apiKey: 'k1', enabled: true, timeoutMs: 100 });
+      assert.equal(await guard.check('cust_1', 'm', 1), null);
       assert.ok(Date.now() - started < 1500, 'gave up at the timeout, did not wait for the reply');
     });
 
@@ -202,11 +203,15 @@ describe('QuotaGuard', () => {
     });
 
     it('asks again once the 5s deny cache entry has expired', async () => {
-      const guard = enabledGuard();
+      let now = 1_000_000;
+      const guard = new QuotaGuard({ ingestorUrl: 'https://x.test/', tenantId: 't1', apiKey: 'k1', enabled: true, now: () => now });
       const calls = stubFetch([{ body: quotaSpec.examples.deny }, { body: quotaSpec.examples.allow }]);
       assert.ok(await guard.check('cust_1', 'm', 1));
-      for (const entry of (guard as any).denyCache.values()) entry.expiresAt = Date.now() - 1;
-      assert.equal(await guard.check('cust_1', 'm', 2), null);
+      now += 4999;
+      assert.ok(await guard.check('cust_1', 'm', 2), 'still denied from the cache');
+      assert.equal(calls.length, 1);
+      now += 2;
+      assert.equal(await guard.check('cust_1', 'm', 3), null);
       assert.equal(calls.length, 2);
     });
 

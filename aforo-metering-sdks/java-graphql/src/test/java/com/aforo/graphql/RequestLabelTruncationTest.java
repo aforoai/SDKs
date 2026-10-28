@@ -23,7 +23,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class RequestLabelTruncationTest {
 
     private AforoGraphQlBilling.Builder builder() {
-        return AforoGraphQlBilling.newBuilder().tenantId("tenant-001").productId("prod-gql")
+        return AforoGraphQlBilling.newBuilder().trustCustomerHeader(true).tenantId("tenant-001").productId("prod-gql")
                 .apiKey("sk_test").ingestorUrl("http://127.0.0.1:" + port).flushIntervalMs(60_000);
     }
 

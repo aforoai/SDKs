@@ -38,7 +38,7 @@ class RequestLabelTruncationTest {
             Metadata.Key.of("x-customer-id", Metadata.ASCII_STRING_MARSHALLER);
 
     private AforoGrpcBilling.Builder builder() {
-        return AforoGrpcBilling.newBuilder().tenantId("tenant-001").productId("prod-grpc")
+        return AforoGrpcBilling.newBuilder().trustCustomerHeader(true).tenantId("tenant-001").productId("prod-grpc")
                 .apiKey("sk_test").ingestorUrl("http://127.0.0.1:" + port).serviceName("acme.v1.UserService")
                 .flushIntervalMs(60_000);
     }

@@ -6,31 +6,33 @@ Integration surfaces:
   - track_starlette_websocket(billing, ws, customer_id)     # FastAPI/Starlette
   - billing.record(...)                                      # low-level
 
-Default billing strategy: one CONNECTION_OPENED event on entry + one
-CONNECTION_CLOSED event on exit with aggregated counters/duration.
+Default billing strategy: one CONNECTION_OPENED event on entry (frame type
+OPEN, metric websocket_api.connection_opened) + one CONNECTION_CLOSED event on
+exit with aggregated counters/duration. Connections still open at shutdown(),
+or idle past connection_idle_timeout_sec, are closed by the SDK.
 Set per_frame_events=True to also emit one event per frame.
 """
 
 from __future__ import annotations
 
-import asyncio
-import atexit
-import json
 import logging
 import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
-try:
-    import httpx  # type: ignore
-    HAS_HTTPX = True
-except ImportError:  # pragma: no cover
-    HAS_HTTPX = False
+from ._transport import (
+    TransportCore,
+    clean_customer_id,
+    require_customer_source,
+    truncate_utf16,
+    utf16_length,
+)
+from ._transport import policy as _policy
 
-__version__ = "1.2.2"
+__version__ = "2.0.0"
 logger = logging.getLogger("aforo_ws_metering")
 
 # POST /v1/ingest/batch takes 1..1000 events per request.
@@ -50,21 +52,8 @@ MAX_WS_CLOSE_REASON_LEN = 32
 _truncation_lock = threading.Lock()
 
 
-def _utf16_length(text: str) -> int:
-    return sum(2 if ord(ch) > 0xFFFF else 1 for ch in text)
-
-
-def _truncate_utf16(text: str, limit: int) -> str:
-    """Longest prefix of ``text`` within ``limit`` UTF-16 code units. Cuts
-    between characters, so a surrogate pair is never split."""
-    if len(text) * 2 <= limit:
-        return text
-    units = 0
-    for index, ch in enumerate(text):
-        units += 2 if ord(ch) > 0xFFFF else 1
-        if units > limit:
-            return text[:index]
-    return text
+_utf16_length = utf16_length
+_truncate_utf16 = truncate_utf16
 
 
 def _truncate_label(field_name: str, value: Any, limit: int, warned: set) -> Any:
@@ -88,20 +77,9 @@ def _truncate_label(field_name: str, value: Any, limit: int, warned: set) -> Any
 
 
 
-def _unwrap_envelope(payload):
-    """The ingestor wraps every 2xx JSON body in ``{success, data, meta}``.
-
-    Returns the inner ``data`` object when present, else the payload unchanged
-    (bare shape).
-    """
-    if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
-        return payload["data"]
-    return payload
-
-
 def _cap_idempotency_key(key: str) -> str:
     """Keep keys within the ingestor's 255-char limit while staying unique."""
-    if len(key) <= MAX_IDEMPOTENCY_KEY_LEN:
+    if utf16_length(key) <= MAX_IDEMPOTENCY_KEY_LEN:
         return key
     suffix = uuid.uuid4().hex
     return key[:MAX_IDEMPOTENCY_KEY_LEN - len(suffix) - 1] + ":" + suffix
@@ -117,7 +95,7 @@ def _invalid_reason(partial: Dict[str, Any]) -> Optional[str]:
     customer_id = partial.get("customerId")
     if not isinstance(customer_id, str) or not customer_id.strip():
         return f"customerId is required (got {_clip(customer_id)})"
-    if len(customer_id) > MAX_CUSTOMER_ID_LEN:
+    if utf16_length(customer_id) > MAX_CUSTOMER_ID_LEN:
         return f"customerId exceeds {MAX_CUSTOMER_ID_LEN} chars (got {_clip(customer_id)})"
     connection_id = partial.get("wsConnectionId")
     if connection_id is None or not str(connection_id).strip():
@@ -125,92 +103,13 @@ def _invalid_reason(partial: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _failed_events(raw: bytes, batch_len: int) -> Tuple[List[int], int]:
-    """(indexes of refused events, refused count) from a batch response."""
-    try:
-        data = _unwrap_envelope(json.loads(raw.decode("utf-8")) if raw else None)
-    except Exception:
-        return [], 0
-    if not isinstance(data, dict):
-        return [], 0
-    indexes: List[int] = []
-    errors = data.get("errors") or []
-    for err in errors if isinstance(errors, list) else []:
-        idx = err.get("index") if isinstance(err, dict) else None
-        if isinstance(idx, int) and not isinstance(idx, bool) and 0 <= idx < batch_len and idx not in indexes:
-            indexes.append(idx)
-    failed = data.get("failed")
-    if not isinstance(failed, int) or isinstance(failed, bool) or failed < 0:
-        failed = len(errors) if isinstance(errors, list) else 0
-    return indexes, min(max(failed, len(indexes)), batch_len)
-
-
 DEFAULT_PRODUCT_TYPE = "WEBSOCKET_API"
-MAX_RETRY_AFTER_SEC = 60.0
 
 
 def _normalize_product_type(product_type: Any, default: str) -> str:
     """Trim + uppercase. Unknown values pass through; the ingestor is the authority."""
     value = str(product_type).strip().upper() if product_type is not None else ""
     return value or default
-
-
-def _post_json(url: str, body: Dict[str, Any], headers: Dict[str, str]) -> Tuple[int, Optional[str], bytes]:
-    """POST JSON; returns (status, Retry-After header, response body). Raises on network errors."""
-    if HAS_HTTPX:
-        with httpx.Client(timeout=10.0) as c:
-            r = c.post(url, json=body, headers=headers)
-            return r.status_code, r.headers.get("Retry-After"), r.content
-    import urllib.error
-    import urllib.request
-    req = urllib.request.Request(
-        url, data=json.dumps(body).encode("utf-8"),
-        headers=headers, method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10.0) as resp:
-            return resp.status, _header(resp, "Retry-After"), _read(resp)
-    except urllib.error.HTTPError as e:
-        return e.code, _header(e, "Retry-After"), _read(e)
-
-
-def _header(resp: Any, name: str) -> Optional[str]:
-    try:
-        value = resp.headers.get(name)
-        return value if isinstance(value, str) else None
-    except Exception:
-        return None
-
-
-def _read(resp: Any) -> bytes:
-    try:
-        data = resp.read()
-        return data if isinstance(data, (bytes, bytearray)) else b""
-    except Exception:
-        return b""
-
-
-def _retry_after_seconds(value: str, default: float) -> float:
-    try:
-        return min(max(0.0, float(value)), MAX_RETRY_AFTER_SEC)
-    except (TypeError, ValueError):
-        return default
-
-
-def _error_messages(raw: bytes) -> List[str]:
-    """Pull errors[].message out of a batch response ({accepted, failed, errors:[{index, message}]})."""
-    try:
-        data = _unwrap_envelope(json.loads(raw.decode("utf-8")) if raw else None)
-    except Exception:
-        return []
-    if not isinstance(data, dict):
-        return []
-    out: List[str] = []
-    for err in data.get("errors") or []:
-        if isinstance(err, dict) and err.get("message"):
-            prefix = f"[{err['index']}] " if err.get("index") is not None else ""
-            out.append(prefix + str(err["message"]))
-    return out
 
 
 WS_CLOSE_REASONS: Dict[int, str] = {
@@ -228,7 +127,27 @@ WS_CLOSE_REASONS: Dict[int, str] = {
 }
 
 WS_DIRECTIONS = ("CLIENT_TO_SERVER", "SERVER_TO_CLIENT")
-WS_FRAME_TYPES = ("TEXT", "BINARY", "PING", "PONG", "CLOSE")
+WS_FRAME_TYPES = ("OPEN", "TEXT", "BINARY", "PING", "PONG", "CLOSE")
+
+#: Metric per frame type; every other frame is a message.
+_FRAME_METRICS = {
+    "OPEN": "websocket_api.connection_opened",
+    "CLOSE": "websocket_api.connection_closed",
+}
+
+#: How long a tracked connection may go without traffic before the SDK closes
+#: it (a connection the app never closed would otherwise be held forever).
+DEFAULT_CONNECTION_IDLE_TIMEOUT_SEC = 3600.0
+
+
+class _OpenConnection:
+    """A connection opened through a helper and not closed yet."""
+
+    __slots__ = ("close", "last_activity")
+
+    def __init__(self, close: Callable[[str, str], None], now: float) -> None:
+        self.close = close  # close(close_reason, closed_by): emits CONNECTION_CLOSED
+        self.last_activity = now
 
 
 @dataclass
@@ -288,6 +207,17 @@ def normalize_execution_status(value: Optional[str]) -> Optional[str]:
 
 
 class AforoWsBilling:
+    """WebSocket metering client: one bounded queue and one sender thread.
+
+    ``push()`` only queues. A background thread sends batches every
+    ``flush_interval_sec`` seconds or when ``flush_count`` events are queued.
+    During an ingest outage batches stay queued (same idempotency keys) and are
+    retried after a pause; an event is lost only on queue overflow, a rejection
+    by the ingestor, an invalid event, the shutdown deadline, or ``push()``
+    after ``shutdown()`` -- each is counted in ``dropped_count`` and passed to
+    ``on_drop``. ``shutdown()`` runs at interpreter exit too.
+    """
+
     def __init__(
         self,
         tenant_id: str,
@@ -295,57 +225,93 @@ class AforoWsBilling:
         api_key: str,
         ingestor_url: str,
         flush_interval_sec: float = 3.0,
-        flush_count: int = 100,
+        flush_count: int = _policy.DEFAULT_FLUSH_COUNT,
         per_frame_events: bool = False,
         on_error: Optional[Callable[[Exception], None]] = None,
         on_drop: Optional[Callable[[List[Dict[str, Any]], str], None]] = None,
         product_type: str = DEFAULT_PRODUCT_TYPE,
+        *,
+        max_queue_size: int = _policy.DEFAULT_QUEUE_CAPACITY,
+        timeout_sec: float = _policy.REQUEST_TIMEOUT_S,
+        shutdown_timeout_sec: float = _policy.SHUTDOWN_TIMEOUT_S,
+        allow_insecure_http: bool = False,
+        http_transport: Any = None,
+        transport_options: Optional[Dict[str, Any]] = None,
+        connection_idle_timeout_sec: Optional[float] = DEFAULT_CONNECTION_IDLE_TIMEOUT_SEC,
     ):
+        """``ingestor_url`` must be ``https://`` (plain ``http://`` only for
+        localhost, or with ``allow_insecure_http=True``). ``on_drop(events,
+        reason)`` receives events that are lost for good; reasons are
+        ``overflow``, ``rejected``, ``invalid``, ``shutdown`` and ``closed``.
+        ``http_transport`` (an ``httpx.BaseTransport``) and
+        ``transport_options`` (extra transport-core settings such as
+        ``max_retries``) are for tests and unusual networks.
+
+        ``connection_idle_timeout_sec`` (default 1 hour): a connection opened
+        through a helper that sees no frames for this long is closed by the SDK
+        (CONNECTION_CLOSED with ``ABNORMAL_CLOSURE``, ``closedBy:
+        "sdk_idle_timeout"``) and forgotten, so connections the app never
+        closes do not pile up. ``None`` or 0 means the default; a negative
+        value raises ValueError."""
         if not all([tenant_id, product_id, api_key, ingestor_url]):
             raise ValueError("tenant_id, product_id, api_key and ingestor_url are required")
+        if connection_idle_timeout_sec is None or connection_idle_timeout_sec == 0:
+            connection_idle_timeout_sec = DEFAULT_CONNECTION_IDLE_TIMEOUT_SEC
+        if connection_idle_timeout_sec < 0:
+            raise ValueError("connection_idle_timeout_sec must be positive (or None / 0 for the 1-hour default)")
+        self.connection_idle_timeout_sec = float(connection_idle_timeout_sec)
+        self._connections: Dict[str, _OpenConnection] = {}
+        # Reentrant: a hook fired while an OPEN is queued may call shutdown().
+        self._connections_lock = threading.RLock()
+        self._next_sweep = 0.0
+        self._now: Callable[[], float] = time.monotonic
+        self._shutting_down = False
 
         self.tenant_id = tenant_id
         self.product_id = product_id
-        self.api_key = api_key
-        self.ingestor_url = ingestor_url.rstrip("/")
-        self.flush_interval_sec = flush_interval_sec
-        self.flush_count = flush_count
         self.per_frame_events = per_frame_events
         # Top-level productType on every event; a "productType" key in push() overrides it.
         self.product_type = _normalize_product_type(product_type, DEFAULT_PRODUCT_TYPE)
-        self.on_error = on_error or (lambda e: logger.error(f"[aforo-ws] {e}"))
-        # Opt-in hook receiving permanently dropped events (with their
-        # idempotency keys — dedup-safe replay). Reasons: 'retry_exhausted'
-        # (network/5xx/408/429 after 3 attempts) | 'rejected' (terminal 4xx,
-        # or events the ingestor refused inside a 2xx partial response) |
-        # 'invalid' (failed a client-side check; never buffered or sent).
-        # Exceptions raised by the hook are swallowed.
-        self.on_drop = on_drop
-        self._dropped = 0
-        self._drop_lock = threading.Lock()
+        self.on_error = on_error or (lambda e: logger.debug("[aforo-ws] %s", e))
         self._truncation_warned: set = set()
-        self._invalid_warned: set = set()
+        self._core = TransportCore(
+            api_key=api_key,
+            base_url=ingestor_url,
+            user_agent=f"aforo-ws-metering-python/{__version__}",
+            name="aforo-ws",
+            logger=logger,
+            flush_count=flush_count,
+            flush_interval=flush_interval_sec,
+            max_queue_size=max_queue_size,
+            timeout=timeout_sec,
+            shutdown_timeout=shutdown_timeout_sec,
+            allow_insecure_http=allow_insecure_http,
+            on_drop=on_drop,
+            on_error=self._safe_on_error,
+            extra_headers={"X-Tenant-Id": tenant_id},
+            http_transport=http_transport,
+            **(transport_options or {}),
+        )
+        self.ingestor_url = self._core.url[: -len(_policy.INGEST_PATH)]
+        self.flush_count = self._core.flush_count
+        self.flush_interval_sec = flush_interval_sec
 
-        self._buffer: List[Dict[str, Any]] = []
-        self._buffer_lock = threading.Lock()
-        self._stop_event = threading.Event()
-        self._flush_thread = threading.Thread(target=self._flush_loop, daemon=True, name="aforo-ws-flush")
-        self._flush_thread.start()
+    @property
+    def on_drop(self) -> Optional[Callable[[List[Dict[str, Any]], str], None]]:
+        return self._core._on_drop
 
-        # Safety net for normal interpreter exit. The flush thread is a
-        # daemon (so it won't block process exit), which historically meant
-        # any in-flight events at exit were dropped unless the user
-        # explicitly called shutdown(). atexit covers the common case
-        # where the user forgets — does NOT cover SIGKILL or os._exit().
-        atexit.register(self._safe_shutdown)
+    @on_drop.setter
+    def on_drop(self, hook: Optional[Callable[[List[Dict[str, Any]], str], None]]) -> None:
+        self._core._on_drop = hook
 
-    def _safe_shutdown(self) -> None:
-        """atexit-safe wrapper around shutdown()."""
+    def __repr__(self) -> str:
+        return f"AforoWsBilling(tenant_id={self.tenant_id!r}, ingestor_url={self.ingestor_url!r})"
+
+    def _safe_on_error(self, exc: Exception) -> None:
         try:
-            if not self._stop_event.is_set():
-                self.shutdown()
+            self.on_error(exc)
         except Exception:
-            pass
+            logger.debug("[aforo-ws] on_error hook raised", exc_info=True)
 
     def push(self, partial: Dict[str, Any], *, execution_status: Optional[str] = None) -> None:
         """Buffer one event built from ``partial`` (wire-named, camelCase keys).
@@ -363,6 +329,14 @@ class AforoWsBilling:
         TIMEOUT, ERROR, VALIDATION_FAILED, FAILED, FAILURE, CANCELLED, PENDING,
         BLOCKED, HITL_REQUIRED -- any other value is logged and left off the event.
         """
+        ev, invalid = self._event_from(partial, execution_status)
+        if invalid is not None:
+            self._core.report_drop([ev], "invalid", detail=invalid)
+            return
+        self._core.enqueue(ev)
+
+    def _event_from(self, partial: Any, execution_status: Optional[str]):
+        """The wire event for ``partial`` and why it is invalid (or None)."""
         if not isinstance(partial, dict):
             partial = {}
         invalid = _invalid_reason(partial)
@@ -381,7 +355,7 @@ class AforoWsBilling:
         close_reason = partial.get("wsCloseReason")
         ev = WsUsageEvent(
             customerId=partial.get("customerId"),
-            metricName="websocket_api.connection_closed" if frame_type == "CLOSE" else "websocket_api.message",
+            metricName=_FRAME_METRICS.get(frame_type, "websocket_api.message"),
             quantity=1,
             occurredAt=now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
             idempotencyKey=_cap_idempotency_key(f"ws:{self.tenant_id}:{partial['wsConnectionId']}:{frame_type}:{int(now.timestamp() * 1000)}:{uuid.uuid4().hex[:8]}"),
@@ -405,150 +379,168 @@ class AforoWsBilling:
                 or normalize_execution_status(partial.get("executionStatus"))
             ),
         )
-        if invalid is not None:
-            self._record_invalid(ev.to_dict(), invalid)
-            return
-        with self._buffer_lock:
-            self._buffer.append(ev.to_dict())
-            if len(self._buffer) >= self.flush_count:
-                threading.Thread(target=self._flush, daemon=True).start()
+        return ev.to_dict(), invalid
 
-    def _flush_loop(self) -> None:
-        while not self._stop_event.wait(self.flush_interval_sec):
-            self._flush()
+    def flush(self, timeout: Optional[float] = None) -> int:
+        """Ask the sender thread to send everything queued and wait for it.
+        Returns the number of events still queued (non-zero while the
+        ingestor is unreachable)."""
+        return self._core.flush(timeout).pending
 
-    def _flush(self) -> None:
-        with self._buffer_lock:
-            if not self._buffer:
-                return
-            pending = self._buffer
-            self._buffer = []
-
-        # /v1/ingest/batch accepts at most MAX_BATCH_EVENTS per request.
-        for i in range(0, len(pending), MAX_BATCH_EVENTS):
-            self._send_batch(pending[i:i + MAX_BATCH_EVENTS])
-
-    def _send_batch(self, batch: List[Dict[str, Any]]) -> None:
-        # Events (and their idempotencyKeys) are built once in record/push,
-        # so every retry below re-sends identical keys.
-        body = {"events": batch}
-        headers = {
-            "Content-Type": "application/json",
-            "X-API-Key": self.api_key,
-            "X-Tenant-Id": self.tenant_id,
-        }
-        url = f"{self.ingestor_url}/v1/ingest/batch"
-
-        for attempt in range(3):
-            delay = float(2 ** attempt)
-            try:
-                status, retry_after, raw = _post_json(url, body, headers)
-            except Exception as e:
-                if attempt == 2:
-                    self._record_drop(batch, "retry_exhausted")
-                    self.on_error(e)
-                    return
-                time.sleep(delay)
-                continue
-            if 200 <= status < 300:
-                # 202 can still carry per-event failures ({failed, errors:[{index, message}]}).
-                self._report_partial_failures(batch, raw)
-                return
-            if 400 <= status < 500 and status not in (408, 429):
-                # 400 invalid batch / 401 bad key / 422 unknown metric: retrying cannot help.
-                messages = _error_messages(raw)
-                self._record_drop(batch, "rejected")
-                self.on_error(RuntimeError(
-                    f"WebSocket metering flush rejected with HTTP {status}, not retrying "
-                    f"(dropped {len(batch)} events)" + (": " + "; ".join(messages[:5]) if messages else "")
-                ))
-                return
-            if status == 429 and retry_after:
-                delay = _retry_after_seconds(retry_after, delay)
-            if attempt < 2:
-                time.sleep(delay)
-        self._record_drop(batch, "retry_exhausted")
-        self.on_error(RuntimeError(f"WebSocket metering flush failed after 3 attempts (dropped {len(batch)} events)"))
-
-    def _report_partial_failures(self, batch: List[Dict[str, Any]], raw: bytes) -> None:
-        """A 2xx batch response can refuse individual events. Those events are
-        dropped with reason 'rejected'; the rest of the batch was accepted."""
-        messages = _error_messages(raw)
-        indexes, failed = _failed_events(raw, len(batch))
-        if not messages and failed <= 0:
-            return
-        rejected = [batch[i] for i in indexes]
-        unidentified = max(failed - len(rejected), 0)
-        if rejected:
-            self._record_drop(rejected, "rejected")
-        if unidentified:
-            # The response gave a count but no usable indexes: count the loss
-            # without guessing which events it was (on_drop is not called).
-            with self._drop_lock:
-                self._dropped += unidentified
-                total = self._dropped
-            logger.warning(
-                "[aforo-ws] Ingestor rejected %d event(s) it did not identify (%d total dropped).",
-                unidentified, total,
-            )
-        self.on_error(RuntimeError(
-            "WebSocket metering: ingestor rejected events: " + "; ".join(messages[:5])
-            if messages else
-            f"WebSocket metering: ingestor rejected {failed} event(s)"
-        ))
+    _flush = flush
 
     @property
     def dropped_count(self) -> int:
-        """Total events permanently dropped (failed batches)."""
-        with self._drop_lock:
-            return self._dropped
+        """Events lost for good: overflow, rejected, invalid, shutdown, closed."""
+        return self._core.dropped_count
 
-    def _record_drop(self, events: List[Dict[str, Any]], reason: str) -> None:
-        """Account for a permanently lost batch: bump the counter, WARN-log,
-        and invoke the opt-in on_drop hook. The buffer is drained at flush
-        start, so drops are bounded by flush cadence — no log throttle
-        needed. The hook fires OUTSIDE all locks, so a hook that calls
-        shutdown() cannot deadlock."""
-        with self._drop_lock:
-            self._dropped += len(events)
-            dropped_total = self._dropped
-        logger.warning(
-            "[aforo-ws] Dropped %d event(s) — %s (%d total dropped).",
-            len(events), reason, dropped_total,
-        )
-        if self.on_drop is not None:
-            try:
-                self.on_drop(events, reason)
-            except Exception:
-                # A hook bug must never break flushing.
-                logger.debug("on_drop hook raised", exc_info=True)
+    @property
+    def queued_count(self) -> int:
+        return self._core.queue_size
 
-    def _record_invalid(self, event: Dict[str, Any], message: str) -> None:
-        """Account for an event that failed a client-side check. Never raises.
-        The WARN is logged once per distinct message (bounded to 100 messages)
-        so a tight loop cannot flood the log; the counter and hook always run."""
-        with self._drop_lock:
-            self._dropped += 1
-            warn = message not in self._invalid_warned and len(self._invalid_warned) < 100
-            if warn:
-                self._invalid_warned.add(message)
-        if warn:
-            logger.warning("[aforo-ws] Dropped invalid event: %s", message)
-        if self.on_drop is not None:
-            try:
-                self.on_drop([event], "invalid")
-            except Exception:
-                logger.debug("on_drop hook raised", exc_info=True)
+    def report_invalid(self, detail: str) -> None:
+        """Count an event an integration could not build (no customer) as ``invalid``."""
+        self._core.report_drop([], "invalid", count=1, detail=detail)
 
-    def shutdown(self) -> None:
-        self._stop_event.set()
-        # Deregister so repeated create/shutdown cycles don't accumulate
-        # atexit handlers (which also pin the client from GC). Safe no-op
-        # if called FROM the atexit handler itself.
-        atexit.unregister(self._safe_shutdown)
-        self._flush()
-        if self._flush_thread.is_alive():
-            self._flush_thread.join(timeout=5.0)
+    def shutdown(self, timeout: Optional[float] = None) -> None:
+        """Send CONNECTION_CLOSED (``GOING_AWAY``, ``closedBy: "sdk_shutdown"``)
+        for every connection still open, stop accepting events and flush for at
+        most ``shutdown_timeout_sec`` (or ``timeout``) seconds; what is still
+        queued then is reported to ``on_drop`` as ``"shutdown"``. Also runs at
+        interpreter exit."""
+        with self._connections_lock:
+            self._shutting_down = True
+            still_open = list(self._connections.items())
+            self._connections.clear()
+        for conn_id, conn in still_open:
+            self._close_connection(conn_id, conn, "GOING_AWAY", "sdk_shutdown")
+        self._core.close(timeout)
+
+    # ── open connections (used by the helpers) ─────────────────────
+
+    @property
+    def open_connections(self) -> int:
+        """Connections opened through a helper and not closed yet (by the app,
+        the idle sweep or ``shutdown()``)."""
+        with self._connections_lock:
+            return len(self._connections)
+
+    def _open(self, conn_id: str, open_event: Dict[str, Any], close: Callable[[str, str], None]) -> bool:
+        """Queue CONNECTION_OPENED and track the connection, in one step, so a
+        concurrent ``shutdown()`` either sees the connection (and closes it) or
+        the OPEN is reported as ``"closed"`` and never sent. True when the
+        connection is tracked."""
+        self.sweep_idle_if_due()
+        if _invalid_reason(open_event) is not None:
+            self.push(open_event)  # counted as invalid; nothing to track
+            return False
+        with self._connections_lock:
+            if not self._shutting_down and not self._core.closed:
+                self._connections[conn_id] = _OpenConnection(close, self._now())
+                self.push(open_event)
+                return True
+        ev, invalid = self._event_from(open_event, None)
+        if invalid is not None:
+            self._core.report_drop([ev], "invalid", detail=invalid)
+        else:
+            self._core.report_drop([ev], "closed", detail="connection opened after shutdown()")
+        return False
+
+    def _touch(self, conn_id: str) -> None:
+        now = self._now()
+        with self._connections_lock:
+            conn = self._connections.get(conn_id)
+            if conn is not None:
+                conn.last_activity = now
+        self.sweep_idle_if_due()
+
+    def _unregister(self, conn_id: str) -> bool:
+        """True when the app's own close should emit CONNECTION_CLOSED; False
+        when the SDK already closed the connection (idle sweep or shutdown)."""
+        with self._connections_lock:
+            return self._connections.pop(conn_id, None) is not None
+
+    def sweep_idle_if_due(self) -> int:
+        """Run ``sweep_idle()`` at most every ``min(60 s, timeout / 4)`` (at
+        least 1 s apart). The helpers call this as connections open and send,
+        so no extra thread is needed."""
+        now = self._now()
+        with self._connections_lock:
+            if now < self._next_sweep:
+                return 0
+            every = min(60.0, max(1.0, self.connection_idle_timeout_sec / 4))
+            self._next_sweep = now + every
+        return self.sweep_idle()
+
+    def sweep_idle(self) -> int:
+        """Close connections idle longer than ``connection_idle_timeout_sec``
+        (CONNECTION_CLOSED with ``ABNORMAL_CLOSURE``, ``closedBy:
+        "sdk_idle_timeout"``). Returns how many were closed."""
+        cutoff = self._now() - self.connection_idle_timeout_sec
+        with self._connections_lock:
+            idle = [(cid, c) for cid, c in self._connections.items() if c.last_activity <= cutoff]
+            for cid, _ in idle:
+                del self._connections[cid]
+        for cid, conn in idle:
+            self._close_connection(cid, conn, "ABNORMAL_CLOSURE", "sdk_idle_timeout")
+        return len(idle)
+
+    @staticmethod
+    def _close_connection(conn_id: str, conn: _OpenConnection, reason: str, closed_by: str) -> None:
+        try:
+            conn.close(reason, closed_by)
+        except Exception:
+            logger.warning("[aforo-ws] could not report connection %s as closed", conn_id[:40], exc_info=True)
+
+
+# ── Customer identity ────────────────────────────────────────────
+
+_UNSET: Any = object()
+
+CustomerResolver = Callable[[Any], Optional[str]]
+
+
+def _handshake_header(websocket: Any, name: str) -> Optional[str]:
+    """A header from the WebSocket handshake (websockets >= 13, legacy
+    websockets, Starlette)."""
+    for holder in (getattr(getattr(websocket, "request", None), "headers", None),
+                   getattr(websocket, "request_headers", None),
+                   getattr(websocket, "headers", None)):
+        if holder is None:
+            continue
+        try:
+            value = holder.get(name)
+        except Exception:
+            logger.debug("[aforo-ws] could not read handshake headers", exc_info=True)
+            continue
+        if value:
+            return value
+    return None
+
+
+def _customer_for(websocket: Any, customer_id: Any, customer_resolver: Optional[CustomerResolver],
+                  trust_customer_header: bool, integration: str) -> Optional[str]:
+    """The customer to bill for this connection.
+
+    An explicit ``customer_id`` is the value your code resolved from identity
+    it verified. Otherwise ``customer_resolver(websocket)`` is called; reading
+    the ``x-customer-id`` handshake header -- which the client controls --
+    needs ``trust_customer_header=True``. With none of the three this raises
+    ValueError. A resolver returning nothing gives None: the connection's
+    events are then dropped as ``invalid`` and counted; the connection itself
+    is not affected.
+    """
+    if customer_id is not _UNSET:
+        return clean_customer_id(customer_id)
+    require_customer_source(customer_resolver, trust_customer_header, integration=integration,
+                            untrusted_source="the x-customer-id header of the WebSocket handshake")
+    if customer_resolver is not None:
+        try:
+            return clean_customer_id(customer_resolver(websocket))
+        except Exception:
+            logger.warning("[aforo-ws] customer_resolver raised; the connection is not metered", exc_info=True)
+            return None
+    return clean_customer_id(_handshake_header(websocket, "x-customer-id"))
 
 
 # ── `websockets` library integration ─────────────────────────────
@@ -556,14 +548,22 @@ class AforoWsBilling:
 async def track_websockets_connection(
     billing: AforoWsBilling,
     websocket: Any,
-    customer_id: str,
+    customer_id: Any = _UNSET,
     *,
+    customer_resolver: Optional[CustomerResolver] = None,
+    trust_customer_header: bool = False,
     metadata: Optional[Dict[str, Any]] = None,
     execution_status: Optional[str] = None,
     product_type: Optional[str] = None,
 ) -> Any:
     """
     Async context helper for the `websockets` library (and similar).
+
+    The customer: pass ``customer_id`` (resolved by your own auth), or
+    ``customer_resolver=callable(websocket) -> str | None``, or
+    ``trust_customer_header=True`` to read the ``x-customer-id`` handshake
+    header (the client controls it). With none of them this raises
+    ``ValueError``.
 
     Execution status is explicit only: pass ``execution_status``
     (keyword-only), or set ``tracker.execution_status`` inside the block, and
@@ -572,11 +572,14 @@ async def track_websockets_connection(
 
     Usage:
         async def handler(websocket):
-            customer_id = extract_customer_id(websocket)
-            async with track_websockets_connection(billing, websocket, customer_id):
+            customer_id = customer_for_token(websocket.request.headers["Authorization"])
+            async with await track_websockets_connection(billing, websocket, customer_id):
                 async for message in websocket:
                     ...  # handle frame
     """
+    customer_id = _customer_for(websocket, customer_id, customer_resolver, trust_customer_header,
+                                "track_websockets_connection")
+
     class _Tracker:
         def __init__(self):
             self.connection_id = str(uuid.uuid4())
@@ -592,6 +595,10 @@ async def track_websockets_connection(
 
             if self._orig_send is not None:
                 async def _send(data):
+                    # Billed only once the send returns without raising: a
+                    # frame the socket refuses is not counted.
+                    billing._touch(self.connection_id)
+                    result = await self._orig_send(data)
                     self.sent += 1
                     self.sent_bytes += _byte_len(data)
                     if billing.per_frame_events:
@@ -606,7 +613,7 @@ async def track_websockets_connection(
                             "executionDurationMs": int((time.monotonic() - self.start) * 1000),
                             "metadata": metadata,
                         })
-                    return await self._orig_send(data)
+                    return result
                 websocket.send = _send  # type: ignore[attr-defined]
 
             if self._orig_recv is not None:
@@ -614,6 +621,7 @@ async def track_websockets_connection(
                     data = await self._orig_recv()
                     self.recv += 1
                     self.recv_bytes += _byte_len(data)
+                    billing._touch(self.connection_id)
                     if billing.per_frame_events:
                         billing.push({
                             "customerId": customer_id,
@@ -630,14 +638,14 @@ async def track_websockets_connection(
                 websocket.recv = _recv  # type: ignore[attr-defined]
 
         async def __aenter__(self):
-            billing.push({
+            self._tracked = billing._open(self.connection_id, {
                 "customerId": customer_id,
                 "productType": product_type,
                 "wsConnectionId": self.connection_id,
                 "wsDirection": "SERVER_TO_CLIENT",
-                "wsFrameType": "PING",
+                "wsFrameType": "OPEN",
                 "metadata": {"event": "CONNECTION_OPENED", **(metadata or {})},
-            })
+            }, self._emit_closed)
             return self
 
         async def __aexit__(self, exc_type, exc, tb):
@@ -646,11 +654,19 @@ async def track_websockets_connection(
                 websocket.send = self._orig_send  # type: ignore[attr-defined]
             if self._orig_recv is not None:
                 websocket.recv = self._orig_recv  # type: ignore[attr-defined]
+            if not billing._unregister(self.connection_id) and getattr(self, "_tracked", False):
+                return  # the idle sweep or shutdown() already reported it
+            self._emit_closed("NORMAL_CLOSURE" if exc is None else "INTERNAL_ERROR", None)
 
-            close_reason = "NORMAL_CLOSURE"
-            if exc is not None:
-                close_reason = "INTERNAL_ERROR"
-
+        def _emit_closed(self, close_reason: str, closed_by: Optional[str]) -> None:
+            meta: Dict[str, Any] = {
+                "event": "CONNECTION_CLOSED",
+                "sentCount": self.sent, "recvCount": self.recv,
+                "sentBytes": self.sent_bytes, "recvBytes": self.recv_bytes,
+                **(metadata or {}),
+            }
+            if closed_by:
+                meta["closedBy"] = closed_by
             billing.push({
                 "executionStatus": normalize_execution_status(self.execution_status),
                 "customerId": customer_id,
@@ -662,12 +678,7 @@ async def track_websockets_connection(
                 "messageCount": self.sent + self.recv,
                 "dataBytes": self.sent_bytes + self.recv_bytes,
                 "executionDurationMs": int((time.monotonic() - self.start) * 1000),
-                "metadata": {
-                    "event": "CONNECTION_CLOSED",
-                    "sentCount": self.sent, "recvCount": self.recv,
-                    "sentBytes": self.sent_bytes, "recvBytes": self.recv_bytes,
-                    **(metadata or {}),
-                },
+                "metadata": meta,
             })
 
     return _Tracker()
@@ -678,8 +689,10 @@ async def track_websockets_connection(
 async def track_starlette_websocket(
     billing: AforoWsBilling,
     websocket: Any,
-    customer_id: str,
+    customer_id: Any = _UNSET,
     *,
+    customer_resolver: Optional[CustomerResolver] = None,
+    trust_customer_header: bool = False,
     metadata: Optional[Dict[str, Any]] = None,
     execution_status: Optional[str] = None,
     product_type: Optional[str] = None,
@@ -687,20 +700,22 @@ async def track_starlette_websocket(
     """
     Async context helper for FastAPI / Starlette WebSocket routes.
 
-    Execution status works as in ``track_websockets_connection``: the
-    CONNECTION_CLOSED event carries ``execution_status`` or
-    ``ctx.execution_status`` when set, and no status otherwise.
+    The customer is found as in ``track_websockets_connection``. Execution
+    status works the same way too: the CONNECTION_CLOSED event carries
+    ``execution_status`` or ``ctx.execution_status`` when set, and no status
+    otherwise.
 
     Usage:
         @app.websocket("/ws")
-        async def ws_handler(ws: WebSocket):
+        async def ws_handler(ws: WebSocket, user: User = Depends(current_user)):
             await ws.accept()
-            customer_id = ws.headers.get("x-customer-id")
-            async with await track_starlette_websocket(billing, ws, customer_id):
+            async with await track_starlette_websocket(billing, ws, user.customer_id):
                 while True:
                     data = await ws.receive_text()
                     await ws.send_text(f"echo: {data}")
     """
+    customer_id = _customer_for(websocket, customer_id, customer_resolver, trust_customer_header,
+                                "track_starlette_websocket")
     # Starlette's WebSocket exposes receive_text/receive_bytes/send_text/send_bytes
     # rather than send/recv — adapt:
     connection_id = str(uuid.uuid4())
@@ -716,6 +731,9 @@ async def track_starlette_websocket(
             continue
 
         async def _wrapped(data, _orig=orig, _attr=attr, _direction=direction):
+            # Billed only once the send returns without raising.
+            billing._touch(connection_id)
+            result = await _orig(data)
             counters["sent"] += 1
             counters["sent_bytes"] += _byte_len(data)
             if billing.per_frame_events:
@@ -730,7 +748,7 @@ async def track_starlette_websocket(
                     "executionDurationMs": int((time.monotonic() - start) * 1000),
                     "metadata": metadata,
                 })
-            return await _orig(data)
+            return result
 
         setattr(websocket, attr, _wrapped)
 
@@ -746,6 +764,7 @@ async def track_starlette_websocket(
             data = await _orig()
             counters["recv"] += 1
             counters["recv_bytes"] += _byte_len(data)
+            billing._touch(connection_id)
             if billing.per_frame_events:
                 billing.push({
                     "customerId": customer_id,
@@ -767,18 +786,30 @@ async def track_starlette_websocket(
             self.execution_status = execution_status
 
         async def __aenter__(self):
-            billing.push({
+            self._tracked = billing._open(connection_id, {
                 "customerId": customer_id,
                 "productType": product_type,
                 "wsConnectionId": connection_id,
                 "wsDirection": "SERVER_TO_CLIENT",
-                "wsFrameType": "PING",
+                "wsFrameType": "OPEN",
                 "metadata": {"event": "CONNECTION_OPENED", **(metadata or {})},
-            })
+            }, self._emit_closed)
             return self
 
         async def __aexit__(self, exc_type, exc, tb):
-            close_reason = "NORMAL_CLOSURE" if exc is None else "INTERNAL_ERROR"
+            if not billing._unregister(connection_id) and getattr(self, "_tracked", False):
+                return  # the idle sweep or shutdown() already reported it
+            self._emit_closed("NORMAL_CLOSURE" if exc is None else "INTERNAL_ERROR", None)
+
+        def _emit_closed(self, close_reason: str, closed_by: Optional[str]) -> None:
+            meta: Dict[str, Any] = {
+                "event": "CONNECTION_CLOSED",
+                "sentCount": counters["sent"], "recvCount": counters["recv"],
+                "sentBytes": counters["sent_bytes"], "recvBytes": counters["recv_bytes"],
+                **(metadata or {}),
+            }
+            if closed_by:
+                meta["closedBy"] = closed_by
             billing.push({
                 "executionStatus": normalize_execution_status(self.execution_status),
                 "customerId": customer_id,
@@ -790,12 +821,7 @@ async def track_starlette_websocket(
                 "messageCount": counters["sent"] + counters["recv"],
                 "dataBytes": counters["sent_bytes"] + counters["recv_bytes"],
                 "executionDurationMs": int((time.monotonic() - start) * 1000),
-                "metadata": {
-                    "event": "CONNECTION_CLOSED",
-                    "sentCount": counters["sent"], "recvCount": counters["recv"],
-                    "sentBytes": counters["sent_bytes"], "recvBytes": counters["recv_bytes"],
-                    **(metadata or {}),
-                },
+                "metadata": meta,
             })
 
     return _AsyncCtx()

@@ -13,13 +13,14 @@ Complexity scoring uses graphql-core's visit() on the parsed document:
 
 from __future__ import annotations
 
-import atexit
+import asyncio
 import hashlib
 import json
 import logging
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -33,13 +34,16 @@ except ImportError:  # pragma: no cover
     DocumentNode = Any  # type: ignore
     OperationDefinitionNode = Any  # type: ignore
 
-try:
-    import httpx  # type: ignore
-    HAS_HTTPX = True
-except ImportError:  # pragma: no cover
-    HAS_HTTPX = False
+from ._transport import (
+    TransportCore,
+    clean_customer_id,
+    require_customer_source,
+    truncate_utf16,
+    utf16_length,
+)
+from ._transport import policy as _policy
 
-__version__ = "1.2.2"
+__version__ = "2.0.0"
 logger = logging.getLogger("aforo_graphql_metering")
 
 # POST /v1/ingest/batch takes 1..1000 events per request.
@@ -59,21 +63,8 @@ MAX_GQL_OPERATION_NAME_LEN = 255
 _truncation_lock = threading.Lock()
 
 
-def _utf16_length(text: str) -> int:
-    return sum(2 if ord(ch) > 0xFFFF else 1 for ch in text)
-
-
-def _truncate_utf16(text: str, limit: int) -> str:
-    """Longest prefix of ``text`` within ``limit`` UTF-16 code units. Cuts
-    between characters, so a surrogate pair is never split."""
-    if len(text) * 2 <= limit:
-        return text
-    units = 0
-    for index, ch in enumerate(text):
-        units += 2 if ord(ch) > 0xFFFF else 1
-        if units > limit:
-            return text[:index]
-    return text
+_utf16_length = utf16_length
+_truncate_utf16 = truncate_utf16
 
 
 def _truncate_label(field_name: str, value: Any, limit: int, warned: set) -> Any:
@@ -122,17 +113,6 @@ def _fit_idempotency_key(parts: List[Any], request_derived: Tuple[int, ...]) -> 
     return f"{parts[0]}:{_sha256_hex(full)}"
 
 
-def _unwrap_envelope(payload):
-    """The ingestor wraps every 2xx JSON body in ``{success, data, meta}``.
-
-    Returns the inner ``data`` object when present, else the payload unchanged
-    (bare shape).
-    """
-    if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
-        return payload["data"]
-    return payload
-
-
 def _clip(value: Any) -> str:
     text = repr(value)
     return text if len(text) <= 80 else text[:77] + "..."
@@ -142,97 +122,16 @@ def _customer_id_problem(customer_id: Any) -> Optional[str]:
     """Why the ingestor would refuse this customerId, or None when it is usable."""
     if not isinstance(customer_id, str) or not customer_id.strip():
         return f"customerId is required (got {_clip(customer_id)})"
-    if len(customer_id) > MAX_CUSTOMER_ID_LEN:
+    if utf16_length(customer_id) > MAX_CUSTOMER_ID_LEN:
         return f"customerId exceeds {MAX_CUSTOMER_ID_LEN} chars (got {_clip(customer_id)})"
     return None
 
 
-def _failed_events(raw: bytes, batch_len: int) -> Tuple[List[int], int]:
-    """(indexes of refused events, refused count) from a batch response."""
-    try:
-        data = _unwrap_envelope(json.loads(raw.decode("utf-8")) if raw else None)
-    except Exception:
-        return [], 0
-    if not isinstance(data, dict):
-        return [], 0
-    indexes: List[int] = []
-    errors = data.get("errors") or []
-    for err in errors if isinstance(errors, list) else []:
-        idx = err.get("index") if isinstance(err, dict) else None
-        if isinstance(idx, int) and not isinstance(idx, bool) and 0 <= idx < batch_len and idx not in indexes:
-            indexes.append(idx)
-    failed = data.get("failed")
-    if not isinstance(failed, int) or isinstance(failed, bool) or failed < 0:
-        failed = len(errors) if isinstance(errors, list) else 0
-    return indexes, min(max(failed, len(indexes)), batch_len)
-
-
 DEFAULT_PRODUCT_TYPE = "GRAPHQL_API"
-MAX_RETRY_AFTER_SEC = 60.0
-
-
 def _normalize_product_type(product_type: Any, default: str) -> str:
     """Trim + uppercase. Unknown values pass through; the ingestor is the authority."""
     value = str(product_type).strip().upper() if product_type is not None else ""
     return value or default
-
-
-def _post_json(url: str, body: Dict[str, Any], headers: Dict[str, str]) -> Tuple[int, Optional[str], bytes]:
-    """POST JSON; returns (status, Retry-After header, response body). Raises on network errors."""
-    if HAS_HTTPX:
-        with httpx.Client(timeout=10.0) as c:
-            r = c.post(url, json=body, headers=headers)
-            return r.status_code, r.headers.get("Retry-After"), r.content
-    import urllib.error
-    import urllib.request
-    req = urllib.request.Request(
-        url, data=json.dumps(body).encode("utf-8"),
-        headers=headers, method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10.0) as resp:
-            return resp.status, _header(resp, "Retry-After"), _read(resp)
-    except urllib.error.HTTPError as e:
-        return e.code, _header(e, "Retry-After"), _read(e)
-
-
-def _header(resp: Any, name: str) -> Optional[str]:
-    try:
-        value = resp.headers.get(name)
-        return value if isinstance(value, str) else None
-    except Exception:
-        return None
-
-
-def _read(resp: Any) -> bytes:
-    try:
-        data = resp.read()
-        return data if isinstance(data, (bytes, bytearray)) else b""
-    except Exception:
-        return b""
-
-
-def _retry_after_seconds(value: str, default: float) -> float:
-    try:
-        return min(max(0.0, float(value)), MAX_RETRY_AFTER_SEC)
-    except (TypeError, ValueError):
-        return default
-
-
-def _error_messages(raw: bytes) -> List[str]:
-    """Pull errors[].message out of a batch response ({accepted, failed, errors:[{index, message}]})."""
-    try:
-        data = _unwrap_envelope(json.loads(raw.decode("utf-8")) if raw else None)
-    except Exception:
-        return []
-    if not isinstance(data, dict):
-        return []
-    out: List[str] = []
-    for err in data.get("errors") or []:
-        if isinstance(err, dict) and err.get("message"):
-            prefix = f"[{err['index']}] " if err.get("index") is not None else ""
-            out.append(prefix + str(err["message"]))
-    return out
 
 
 @dataclass
@@ -410,7 +309,18 @@ def default_complexity_scorer(doc: "DocumentNode", operation_name: Optional[str]
 
 
 class AforoGraphQlBilling:
-    """Aforo GraphQL metering client. Thread-safe, buffered, retrying."""
+    """GraphQL metering client: one bounded queue and one sender thread.
+
+    ``record()`` only queues. One background thread sends batches every
+    ``flush_interval_sec`` seconds or as soon as ``flush_count`` events are
+    queued. During an ingest outage batches stay queued with the same
+    idempotency keys and are retried after a pause. An event is lost only on
+    queue overflow, a rejection by the ingestor, invalid input, the shutdown
+    deadline, or ``record()`` after ``shutdown()`` -- each counted in
+    ``dropped_count`` and passed to ``on_drop``. ``ingestor_url`` must be
+    ``https://`` (plain ``http://`` only for localhost, or with
+    ``allow_insecure_http=True``). ``shutdown()`` also runs at interpreter exit.
+    """
 
     def __init__(
         self,
@@ -420,7 +330,7 @@ class AforoGraphQlBilling:
         ingestor_url: str,
         schema_version: Optional[str] = None,
         flush_interval_sec: float = 5.0,
-        flush_count: int = 50,
+        flush_count: int = _policy.DEFAULT_FLUSH_COUNT,
         on_error: Optional[Callable[[Exception], None]] = None,
         customer_id_extractor: Optional[Callable[[Any], Optional[str]]] = None,
         complexity_scorer: Optional[Callable[["DocumentNode", Optional[str]], Tuple[int, int]]] = None,
@@ -429,54 +339,58 @@ class AforoGraphQlBilling:
         # product_type by keyword.
         on_drop: Optional[Callable[[List[Dict[str, Any]], str], None]] = None,
         product_type: str = DEFAULT_PRODUCT_TYPE,
+        *,
+        max_queue_size: int = _policy.DEFAULT_QUEUE_CAPACITY,
+        timeout_sec: float = _policy.REQUEST_TIMEOUT_S,
+        shutdown_timeout_sec: float = _policy.SHUTDOWN_TIMEOUT_S,
+        allow_insecure_http: bool = False,
+        http_transport: Any = None,
+        transport_options: Optional[Dict[str, Any]] = None,
+        trust_customer_header: bool = False,
     ):
+        """``customer_id_extractor(context) -> str | None`` is the customer
+        resolver the integrations use (Strawberry: the execution context's
+        ``context``; ASGI: ``{"request": <headers>, "scope": scope}``). Reading
+        the ``x-customer-id`` header the caller sends needs
+        ``trust_customer_header=True``."""
         if not all([tenant_id, product_id, api_key, ingestor_url]):
             raise ValueError("tenant_id, product_id, api_key and ingestor_url are required")
 
         self.tenant_id = tenant_id
         self.product_id = product_id
-        self.api_key = api_key
-        self.ingestor_url = ingestor_url.rstrip("/")
         # Top-level productType on every event; record(product_type=...) overrides per call.
         self.product_type = _normalize_product_type(product_type, DEFAULT_PRODUCT_TYPE)
         self.schema_version = schema_version
-        self.flush_interval_sec = flush_interval_sec
-        self.flush_count = flush_count
-        self.on_error = on_error or (lambda e: logger.error(f"[aforo-graphql] {e}"))
-        # Opt-in hook receiving permanently dropped events (with their
-        # idempotency keys — dedup-safe replay). Reasons: 'retry_exhausted'
-        # (network/5xx/408/429 after 3 attempts) | 'rejected' (terminal 4xx,
-        # or events the ingestor refused inside a 2xx partial response) |
-        # 'invalid' (failed a client-side check; never buffered or sent).
-        # Exceptions raised by the hook are swallowed.
-        self.on_drop = on_drop
-        self._dropped = 0
-        self._drop_lock = threading.Lock()
-        self._invalid_warned: set = set()
-        self._truncation_warned: set = set()
-        self.customer_id_extractor = customer_id_extractor or _default_customer_extractor
+        self.customer_id_extractor = customer_id_extractor
+        self.trust_customer_header = trust_customer_header
         self.complexity_scorer = complexity_scorer or default_complexity_scorer
-
-        self._buffer: List[Dict[str, Any]] = []
-        self._buffer_lock = threading.Lock()
-        self._stop_event = threading.Event()
-        self._flush_thread = threading.Thread(target=self._flush_loop, daemon=True, name="aforo-graphql-flush")
-        self._flush_thread.start()
-
-        # Safety net for normal interpreter exit. The flush thread is a
-        # daemon (so it won't block process exit), which historically meant
-        # any in-flight events at exit were dropped unless the user
-        # explicitly called shutdown(). atexit covers the common case
-        # where the user forgets — does NOT cover SIGKILL or os._exit().
-        atexit.register(self._safe_shutdown)
-
-    def _safe_shutdown(self) -> None:
-        """atexit-safe wrapper around shutdown()."""
-        try:
-            if not self._stop_event.is_set():
-                self.shutdown()
-        except Exception:
-            pass
+        self._truncation_warned: set = set()
+        self.on_error = on_error or (lambda e: logger.debug("[aforo-graphql] %s", e))
+        # Thread pools the ASGI middlewares of this client parse and score
+        # queries on (one per asgi_middleware() call); shut down with it.
+        self._meter_executors: List[ThreadPoolExecutor] = []
+        self._meter_executors_lock = threading.Lock()
+        self._core = TransportCore(
+            api_key=api_key,
+            base_url=ingestor_url,
+            user_agent=f"aforo-graphql-metering-python/{__version__}",
+            name="aforo-graphql",
+            logger=logger,
+            flush_count=flush_count,
+            flush_interval=flush_interval_sec,
+            max_queue_size=max_queue_size,
+            timeout=timeout_sec,
+            shutdown_timeout=shutdown_timeout_sec,
+            allow_insecure_http=allow_insecure_http,
+            on_drop=on_drop,
+            on_error=self._safe_on_error,
+            extra_headers={"X-Tenant-Id": tenant_id},
+            http_transport=http_transport,
+            **(transport_options or {}),
+        )
+        self.ingestor_url = self._core.url[: -len(_policy.INGEST_PATH)]
+        self.flush_count = self._core.flush_count
+        self.flush_interval_sec = flush_interval_sec
 
     def record(
         self,
@@ -491,6 +405,7 @@ class AforoGraphQlBilling:
         execution_status: Optional[str] = None,
         result: Any = None,
         http_status: Optional[int] = None,
+        document: Any = None,
     ) -> None:
         """Buffer one GraphQL operation event.
 
@@ -511,6 +426,8 @@ class AforoGraphQlBilling:
             see ``outcome_from_graphql_result``.
           - ``http_status``: used only when ``result`` gives nothing; see
             ``outcome_from_http_status``.
+        ``document`` (keyword-only): the already-parsed ``DocumentNode`` for
+        ``query``, when your server has one; the query is then not parsed again.
         With none of them the event goes out without a status. Accepted
         values: SUCCESS, PARTIAL, TIMEOUT, ERROR, VALIDATION_FAILED, FAILED,
         FAILURE, CANCELLED, PENDING, BLOCKED, HITL_REQUIRED -- any other value is logged and left off the event.
@@ -518,10 +435,13 @@ class AforoGraphQlBilling:
         if not HAS_GRAPHQL:
             return
         invalid = _customer_id_problem(customer_id)
-        try:
-            doc = parse(query)
-        except Exception:
-            return
+        doc = document
+        if doc is None:
+            try:
+                doc = parse(query)
+            except Exception:
+                logger.debug("[aforo-graphql] query does not parse; the operation is not metered", exc_info=True)
+                return
 
         op = _find_operation(doc, operation_name)
         if op is None:
@@ -568,150 +488,74 @@ class AforoGraphQlBilling:
             ),
         )
         if invalid is not None:
-            self._record_invalid(ev.to_dict(), invalid)
+            self._core.report_drop([ev.to_dict()], "invalid", detail=invalid)
             return
-        with self._buffer_lock:
-            self._buffer.append(ev.to_dict())
-            if len(self._buffer) >= self.flush_count:
-                threading.Thread(target=self._flush, daemon=True).start()
+        self._core.enqueue(ev.to_dict())
 
-    def _flush_loop(self) -> None:
-        while not self._stop_event.wait(self.flush_interval_sec):
-            self._flush()
-
-    def _flush(self) -> None:
-        with self._buffer_lock:
-            if not self._buffer:
-                return
-            pending = self._buffer
-            self._buffer = []
-
-        # /v1/ingest/batch accepts at most MAX_BATCH_EVENTS per request.
-        for i in range(0, len(pending), MAX_BATCH_EVENTS):
-            self._send_batch(pending[i:i + MAX_BATCH_EVENTS])
-
-    def _send_batch(self, batch: List[Dict[str, Any]]) -> None:
-        # Events (and their idempotencyKeys) are built once in record/push,
-        # so every retry below re-sends identical keys.
-        body = {"events": batch}
-        headers = {
-            "Content-Type": "application/json",
-            "X-API-Key": self.api_key,
-            "X-Tenant-Id": self.tenant_id,
-        }
-        url = f"{self.ingestor_url}/v1/ingest/batch"
-
-        for attempt in range(3):
-            delay = float(2 ** attempt)
-            try:
-                status, retry_after, raw = _post_json(url, body, headers)
-            except Exception as e:
-                if attempt == 2:
-                    self._record_drop(batch, "retry_exhausted")
-                    self.on_error(e)
-                    return
-                time.sleep(delay)
-                continue
-            if 200 <= status < 300:
-                # 202 can still carry per-event failures ({failed, errors:[{index, message}]}).
-                self._report_partial_failures(batch, raw)
-                return
-            if 400 <= status < 500 and status not in (408, 429):
-                # 400 invalid batch / 401 bad key / 422 unknown metric: retrying cannot help.
-                messages = _error_messages(raw)
-                self._record_drop(batch, "rejected")
-                self.on_error(RuntimeError(
-                    f"GraphQL metering flush rejected with HTTP {status}, not retrying "
-                    f"(dropped {len(batch)} events)" + (": " + "; ".join(messages[:5]) if messages else "")
-                ))
-                return
-            if status == 429 and retry_after:
-                delay = _retry_after_seconds(retry_after, delay)
-            if attempt < 2:
-                time.sleep(delay)
-        self._record_drop(batch, "retry_exhausted")
-        self.on_error(RuntimeError(f"GraphQL metering flush failed after 3 attempts (dropped {len(batch)} events)"))
-
-    def _report_partial_failures(self, batch: List[Dict[str, Any]], raw: bytes) -> None:
-        """A 2xx batch response can refuse individual events. Those events are
-        dropped with reason 'rejected'; the rest of the batch was accepted."""
-        messages = _error_messages(raw)
-        indexes, failed = _failed_events(raw, len(batch))
-        if not messages and failed <= 0:
-            return
-        rejected = [batch[i] for i in indexes]
-        unidentified = max(failed - len(rejected), 0)
-        if rejected:
-            self._record_drop(rejected, "rejected")
-        if unidentified:
-            # The response gave a count but no usable indexes: count the loss
-            # without guessing which events it was (on_drop is not called).
-            with self._drop_lock:
-                self._dropped += unidentified
-                total = self._dropped
-            logger.warning(
-                "[aforo-graphql] Ingestor rejected %d event(s) it did not identify (%d total dropped).",
-                unidentified, total,
-            )
-        self.on_error(RuntimeError(
-            "GraphQL metering: ingestor rejected events: " + "; ".join(messages[:5])
-            if messages else
-            f"GraphQL metering: ingestor rejected {failed} event(s)"
-        ))
-
-    @property
     def dropped_count(self) -> int:
         """Total events permanently dropped (failed batches)."""
         with self._drop_lock:
             return self._dropped
 
-    def _record_drop(self, events: List[Dict[str, Any]], reason: str) -> None:
-        """Account for a permanently lost batch: bump the counter, WARN-log,
-        and invoke the opt-in on_drop hook. The buffer is drained at flush
-        start, so drops are bounded by flush cadence — no log throttle
-        needed. The hook fires OUTSIDE all locks, so a hook that calls
-        shutdown() cannot deadlock."""
-        with self._drop_lock:
-            self._dropped += len(events)
-            dropped_total = self._dropped
-        logger.warning(
-            "[aforo-graphql] Dropped %d event(s) — %s (%d total dropped).",
-            len(events), reason, dropped_total,
-        )
-        if self.on_drop is not None:
-            try:
-                self.on_drop(events, reason)
-            except Exception:
-                # A hook bug must never break flushing.
-                logger.debug("on_drop hook raised", exc_info=True)
+    # ── Delivery (shared transport core) ─────────────────────────
 
-    def _record_invalid(self, event: Dict[str, Any], message: str) -> None:
-        """Account for an event that failed a client-side check. Never raises.
-        The WARN is logged once per distinct message (bounded to 100 messages)
-        so a tight loop cannot flood the log; the counter and hook always run."""
-        with self._drop_lock:
-            self._dropped += 1
-            warn = message not in self._invalid_warned and len(self._invalid_warned) < 100
-            if warn:
-                self._invalid_warned.add(message)
-        if warn:
-            logger.warning("[aforo-graphql] Dropped invalid event: %s", message)
-        if self.on_drop is not None:
-            try:
-                self.on_drop([event], "invalid")
-            except Exception:
-                logger.debug("on_drop hook raised", exc_info=True)
+    @property
+    def on_drop(self) -> Optional[Callable[[List[Dict[str, Any]], str], None]]:
+        """``on_drop(events, reason)``: events lost for good. Reasons:
+        ``overflow``, ``rejected``, ``invalid``, ``shutdown``, ``closed``."""
+        return self._core._on_drop
 
-    def shutdown(self) -> None:
-        self._stop_event.set()
-        # Deregister so repeated create/shutdown cycles don't accumulate
-        # atexit handlers (which also pin the client from GC). Safe no-op
-        # if called FROM the atexit handler itself.
-        atexit.unregister(self._safe_shutdown)
-        self._flush()
-        if self._flush_thread.is_alive():
-            self._flush_thread.join(timeout=5.0)
+    @on_drop.setter
+    def on_drop(self, hook: Optional[Callable[[List[Dict[str, Any]], str], None]]) -> None:
+        self._core._on_drop = hook
 
+    def _safe_on_error(self, exc: Exception) -> None:
+        try:
+            self.on_error(exc)
+        except Exception:
+            logger.debug("[aforo-graphql] on_error hook raised", exc_info=True)
+
+    def __repr__(self) -> str:
+        return f"AforoGraphQlBilling(tenant_id={self.tenant_id!r}, ingestor_url={self.ingestor_url!r})"
+
+    def flush(self, timeout: Optional[float] = None) -> int:
+        """Ask the sender thread to send everything queued and wait for it.
+        Returns the number of events still queued (non-zero while the
+        ingestor is unreachable; they are retried after a pause)."""
+        return self._core.flush(timeout).pending
+
+    _flush = flush
+
+    @property
+    def dropped_count(self) -> int:
+        """Events lost for good: overflow, rejected, invalid, shutdown, closed."""
+        return self._core.dropped_count
+
+    @property
+    def queued_count(self) -> int:
+        return self._core.queue_size
+
+    def report_invalid(self, detail: str) -> None:
+        """Count an event an integration could not build (no customer) as ``invalid``."""
+        self._core.report_drop([], "invalid", count=1, detail=detail)
+
+    def shutdown(self, timeout: Optional[float] = None) -> None:
+        """Stop accepting events and flush for at most ``shutdown_timeout_sec``
+        (or ``timeout``) seconds; what is still queued then is reported to
+        ``on_drop`` as ``"shutdown"``. Also runs at interpreter exit. The
+        middleware's metering threads are shut down too; a request metered
+        after this is counted as ``"closed"``."""
+        with self._meter_executors_lock:
+            executors = list(self._meter_executors)
+        for executor in executors:
+            executor.shutdown(wait=False)  # queued metering still runs and records
+        self._core.close(timeout)
+
+    def _new_meter_executor(self, workers: int) -> ThreadPoolExecutor:
+        executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="aforo-graphql-meter")
+        with self._meter_executors_lock:
+            self._meter_executors.append(executor)
+        return executor
 
 def _find_operation(doc: "DocumentNode", operation_name: Optional[str]) -> Optional["OperationDefinitionNode"]:
     if not HAS_GRAPHQL:
@@ -735,12 +579,13 @@ def _resolve_explicit_status(resolver: Optional[Callable[[Any], Optional[str]]],
 
 
 def _default_customer_extractor(context: Any) -> Optional[str]:
-    """Read 'x-customer-id' from request headers (Starlette/ASGI/Strawberry)."""
+    """``x-customer-id`` from the request headers (Starlette/ASGI/Strawberry).
+
+    Only used with ``trust_customer_header=True``: the caller sets that header.
+    """
     try:
         # Strawberry passes an object with .request; ASGI dict contexts carry
-        # "request" as a key. (The previous one-liner parsed as
-        # `(... or ...) if isinstance(context, dict) else None`, so object
-        # contexts never had their headers read.)
+        # "request" as a key.
         if isinstance(context, dict):
             req = context.get("request")
         else:
@@ -758,15 +603,45 @@ def _default_customer_extractor(context: Any) -> Optional[str]:
     return None
 
 
+def _customer_lookup(billing: "AforoGraphQlBilling", customer_resolver: Optional[Callable[[Any], Optional[str]]],
+                     trust_customer_header: Optional[bool], integration: str) -> Callable[[Any], Optional[str]]:
+    """Per-operation customer lookup, or ValueError when there is no source."""
+    resolver = customer_resolver if customer_resolver is not None else billing.customer_id_extractor
+    trust = billing.trust_customer_header if trust_customer_header is None else trust_customer_header
+    require_customer_source(resolver, trust, integration=integration,
+                            untrusted_source="the x-customer-id request header")
+
+    def lookup(context: Any) -> Optional[str]:
+        try:
+            if resolver is not None:
+                return clean_customer_id(resolver(context))
+            return clean_customer_id(_default_customer_extractor(context))
+        except Exception:
+            logger.warning("[aforo-graphql] customer resolver raised; the operation is not metered", exc_info=True)
+            return None
+
+    return lookup
+
+
 # ── Strawberry extension ─────────────────────────────────────────
 
 def strawberry_extension(
     billing: AforoGraphQlBilling,
     *,
     execution_status_resolver: Optional[Callable[[Any], Optional[str]]] = None,
+    customer_resolver: Optional[Callable[[Any], Optional[str]]] = None,
+    trust_customer_header: Optional[bool] = None,
 ):  # type: ignore[no-untyped-def]
     """
     Returns a Strawberry Extension class that meters every operation.
+
+    The customer: ``customer_resolver(info_context)`` (Strawberry's
+    ``context``, e.g. the user your auth dependency attached), or the billing
+    client's ``customer_id_extractor``; ``trust_customer_header=True`` reads
+    the ``x-customer-id`` header the caller sends instead. With neither this
+    raises ValueError. An operation with no customer runs normally and is
+    counted as an ``invalid`` drop. The document Strawberry already parsed is
+    reused, so the query is not parsed twice.
 
     The execution status is derived from the operation result (see
     ``outcome_from_graphql_result``). ``execution_status_resolver``
@@ -787,6 +662,8 @@ def strawberry_extension(
             "strawberry-graphql is not installed — `pip install aforo-graphql-metering[strawberry]`."
         ) from e
 
+    customer = _customer_lookup(billing, customer_resolver, trust_customer_header, "strawberry_extension")
+
     class AforoStrawberryExtension(SchemaExtension):  # type: ignore[misc]
         # on_operation wraps the whole request (parse, validate, execute).
         # Strawberry dropped on_request_start / on_request_end, so hooks with
@@ -801,8 +678,10 @@ def strawberry_extension(
         def _record(self, duration_ms: int) -> None:
             try:
                 ctx = self.execution_context
-                customer_id = billing.customer_id_extractor(ctx.context) if ctx.context else None
+                customer_id = customer(ctx.context) if ctx.context is not None else None
                 if not customer_id:
+                    billing.report_invalid("no customer for a GraphQL operation "
+                                           "(the customer resolver returned nothing)")
                     return
                 result = getattr(ctx, "result", None)
                 billing.record(
@@ -813,6 +692,7 @@ def strawberry_extension(
                     has_errors=graphql_errors_present(getattr(result, "errors", None)),
                     execution_status=_resolve_explicit_status(execution_status_resolver, ctx),
                     result=result,
+                    document=getattr(ctx, "graphql_document", None),
                 )
             except Exception:
                 logger.debug("aforo-graphql: extension error", exc_info=True)
@@ -827,17 +707,39 @@ def strawberry_extension(
 # back to the HTTP status code.
 _MAX_RESULT_BODY_BYTES = 1024 * 1024
 
+#: Default cap on the request body the middleware keeps to read the query.
+DEFAULT_MAX_REQUEST_BODY_BYTES = 1024 * 1024
+
 
 def asgi_middleware(
     billing: AforoGraphQlBilling,
     *,
     path: str = "/graphql",
     execution_status_resolver: Optional[Callable[[Any], Optional[str]]] = None,
+    customer_resolver: Optional[Callable[[Any], Optional[str]]] = None,
+    trust_customer_header: Optional[bool] = None,
+    max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES,
+    meter_workers: int = 2,
 ):
     """
     ASGI middleware that meters POST requests to the configured GraphQL
     path. Works with any ASGI-native GraphQL server (graphql-core HTTP,
     Graphene-ASGI, Ariadne, custom).
+
+    The customer: ``customer_resolver(scope)`` (e.g. the user your auth
+    middleware put on the scope), or the billing client's
+    ``customer_id_extractor``; ``trust_customer_header=True`` reads the
+    ``x-customer-id`` header instead (the caller controls it). With neither
+    this raises ValueError. A request with no customer is served normally and
+    counted as an ``invalid`` drop.
+
+    The middleware keeps at most ``max_request_body_bytes`` of the request
+    body (default 1 MiB) to read the query; a bigger request is served
+    normally, not metered, and counted as ``invalid``. Reading the JSON,
+    parsing the query and scoring it run on a small thread pool of
+    ``meter_workers`` threads (default 2) owned by this middleware -- never
+    on the event loop and never on the application's default executor. The
+    pool is shut down by ``billing.shutdown()``.
 
     The execution status is derived from the JSON response body (see
     ``outcome_from_graphql_result``) when it is uncompressed and at most
@@ -848,8 +750,42 @@ def asgi_middleware(
     Usage:
         from aforo_graphql_metering import asgi_middleware
         app = MyAsgiApp(...)
-        app = asgi_middleware(billing, path="/graphql")(app)
+        app = asgi_middleware(billing, path="/graphql",
+                              customer_resolver=lambda scope: scope["user"].customer_id)(app)
     """
+    if isinstance(meter_workers, bool) or not isinstance(meter_workers, int) or meter_workers < 1:
+        raise ValueError("asgi_middleware: meter_workers must be an integer >= 1")
+    if customer_resolver is not None:
+        scope_resolver = customer_resolver
+        customer = _customer_lookup(billing, lambda ctx: scope_resolver(ctx["scope"]), None, "asgi_middleware")
+    else:
+        customer = _customer_lookup(billing, None, trust_customer_header, "asgi_middleware")
+    executor = billing._new_meter_executor(meter_workers)
+
+    def meter(scope: Any, raw: bytes, status: int, result: Any, duration_ms: int) -> None:
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            logger.debug("[aforo-graphql] request body is not JSON; not metered")
+            return
+        query = parsed.get("query") if isinstance(parsed, dict) else None
+        if not query:
+            return
+        headers_map = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+        customer_id = customer({"request": _HeadersShim(headers_map), "scope": scope})
+        if not customer_id:
+            billing.report_invalid("no customer for a GraphQL request (the customer resolver returned nothing)")
+            return
+        billing.record(
+            customer_id=customer_id,
+            query=query,
+            operation_name=parsed.get("operationName"),
+            duration_ms=duration_ms,
+            has_errors=status >= 400,
+            execution_status=_resolve_explicit_status(execution_status_resolver, scope),
+            result=_parse_result_body(result) if result is not None else None,
+            http_status=status,
+        )
 
     def factory(app):
         async def mw(scope, receive, send):
@@ -858,11 +794,18 @@ def asgi_middleware(
 
             start = time.monotonic()
             body_chunks: List[bytes] = []
+            req_state = {"size": 0, "over": False}
 
             async def recv_capture():
                 msg = await receive()
-                if msg.get("type") == "http.request" and msg.get("body"):
-                    body_chunks.append(msg["body"])
+                if msg.get("type") == "http.request" and msg.get("body") and not req_state["over"]:
+                    chunk = msg["body"]
+                    req_state["size"] += len(chunk)
+                    if req_state["size"] > max_request_body_bytes:
+                        req_state["over"] = True
+                        body_chunks.clear()
+                    else:
+                        body_chunks.append(chunk)
                 return msg
 
             status_holder = {"status": 200}
@@ -879,6 +822,7 @@ def asgi_middleware(
                                 resp_state["keep"] = False
                     except Exception:
                         # Metering must never break the response; just skip the body.
+                        logger.debug("[aforo-graphql] unreadable response headers", exc_info=True)
                         resp_state["keep"] = False
                 elif message.get("type") == "http.response.body" and resp_state["keep"]:
                     try:
@@ -890,35 +834,35 @@ def asgi_middleware(
                         elif chunk:
                             resp_chunks.append(chunk)
                     except Exception:
+                        logger.debug("[aforo-graphql] unreadable response body", exc_info=True)
                         resp_state["keep"] = False
                         resp_chunks.clear()
                 return await send(message)
 
             await app(scope, recv_capture, send_capture)
 
+            if req_state["over"]:
+                billing.report_invalid(
+                    f"GraphQL request body over {max_request_body_bytes} bytes; not metered "
+                    "(raise max_request_body_bytes to meter it)")
+                return
+            raw = b"".join(body_chunks)
+            if not raw:
+                return
+            args = (scope, raw, status_holder["status"], resp_chunks if resp_state["keep"] else None,
+                    int((time.monotonic() - start) * 1000))
             try:
-                raw = b"".join(body_chunks)
-                if not raw:
-                    return
-                parsed = json.loads(raw.decode("utf-8"))
-                query = parsed.get("query")
-                if not query:
-                    return
-                # Build a minimal "context" — headers map for extractor
-                headers_map = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
-                customer_id = billing.customer_id_extractor({"request": _HeadersShim(headers_map)})
-                if not customer_id:
-                    return
-                billing.record(
-                    customer_id=customer_id,
-                    query=query,
-                    operation_name=parsed.get("operationName"),
-                    duration_ms=int((time.monotonic() - start) * 1000),
-                    has_errors=status_holder["status"] >= 400,
-                    execution_status=_resolve_explicit_status(execution_status_resolver, scope),
-                    result=_parse_result_body(resp_chunks) if resp_state["keep"] else None,
-                    http_status=status_holder["status"],
-                )
+                future = asyncio.get_running_loop().run_in_executor(executor, meter, *args)
+            except RuntimeError:
+                # billing.shutdown() closed the pool: meter here, so the event
+                # is still counted (as "closed") rather than vanishing.
+                try:
+                    meter(*args)
+                except Exception:
+                    logger.debug("aforo-graphql: metering after shutdown failed", exc_info=True)
+                return
+            try:
+                await future
             except Exception:
                 logger.debug("aforo-graphql: middleware error", exc_info=True)
 

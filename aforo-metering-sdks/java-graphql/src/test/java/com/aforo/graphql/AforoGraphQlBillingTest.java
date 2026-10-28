@@ -51,7 +51,7 @@ class AforoGraphQlBillingTest {
     void stopServer() { server.stop(0); }
 
     private AforoGraphQlBilling.Builder baseBuilder() {
-        return AforoGraphQlBilling.newBuilder()
+        return AforoGraphQlBilling.newBuilder().trustCustomerHeader(true)
                 .tenantId("tenant-001")
                 .productId("prod-gql-001")
                 .apiKey("sk_gql_abc")

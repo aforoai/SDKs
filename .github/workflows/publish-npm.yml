@@ -1,46 +1,120 @@
 name: Publish — npm
 
-# Publishes one Node package to npm. Manual trigger (workflow_dispatch) so a
-# mistagged push can never auto-publish to a public registry.
+# Publishes one Node package to npm from a release tag on the public mirror.
 #
-# One-time setup required before this can run:
-#   - The `aforoai` (or relevant) npm org/scope exists and you own it.
-#   - Repository secret NPM_TOKEN = an npm automation token with publish rights,
-#     OR configure npm Trusted Publishing for this repo (then the token can be
-#     dropped). Provenance below needs id-token: write either way.
+# Run it from the tag: Actions → "Publish — npm" → "Use workflow from" = the tag
+# (e.g. node-v2.0.0) → pick the package. The run refuses to publish unless the
+# ref is a tag named <package>-v<version> and <version> equals package.json.
 #
-# Usage: Actions → "Publish — npm" → Run workflow → enter the package directory,
-#        e.g. aforo-metering-sdks/node
+# Guards (wave 5, G315–G317):
+#   - every action is pinned to a full commit SHA (the tag is in the comment);
+#   - two jobs: `build` has no OIDC token and does everything that runs package
+#     code (`npm ci` from the lockfile, build, full test suite, `npm audit`
+#     high+, CycloneDX SBOM, `npm pack`); `publish` runs in the protected `npm`
+#     environment (required reviewers and a tags-only rule — DevOps) and only
+#     attests and publishes the tarball `build` produced;
+#   - npm Trusted Publishing (OIDC): once it is configured for this repo and
+#     workflow on npmjs.com, delete the NPM_TOKEN secret — an empty token makes
+#     npm use OIDC. Until then the token is the fallback.
+#
+# This file is maintained in jayaforo/aforo-metering-sdks and copied into the
+# mirror's .github/workflows/ by the sync PR (PUBLISHING.md).
 
 on:
   workflow_dispatch:
     inputs:
-      package_dir:
-        description: "npm package directory (e.g. aforo-metering-sdks/node)"
+      package:
+        description: "Package to publish"
         required: true
-        type: string
+        type: choice
+        options: [node, node-graphql, node-grpc, node-ws, node-mqtt, node-mcp, node-agent, mcp-proxy]
 
 permissions:
   contents: read
-  id-token: write   # required for npm provenance (--provenance)
 
 jobs:
-  publish:
+  build:
+    # Packages are published only from the public mirror.
+    if: github.repository == 'aforoai/SDKs'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      PKG_DIR: aforo-metering-sdks/${{ inputs.package }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
-      - name: Build
-        working-directory: ${{ inputs.package_dir }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+      - name: Check the tag names this package and version
+        working-directory: ${{ env.PKG_DIR }}
+        env:
+          PACKAGE: ${{ inputs.package }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          npm install --no-audit --no-fund
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          expected="${PACKAGE}-v${version}"
+          if [ "$REF_TYPE" != "tag" ] || [ "$REF_NAME" != "$expected" ]; then
+            echo "::error::Run this from the tag ${expected} (got ${REF_TYPE} ${REF_NAME})."
+            exit 1
+          fi
+      - name: Install from the lockfile, build, test
+        working-directory: ${{ env.PKG_DIR }}
+        run: |
+          npm ci --no-audit --no-fund
           npm run build
           npm test
-      - name: Publish (public, with provenance)
-        working-directory: ${{ inputs.package_dir }}
-        run: npm publish --provenance --access public
+      - name: Transport core copies match
+        run: bash aforo-metering-sdks/scripts/sync-transport.sh --check node
+      - name: Vulnerability scan (runtime dependencies)
+        working-directory: ${{ env.PKG_DIR }}
+        run: npm audit --omit=dev --audit-level=high
+      - name: SBOM and tarball (written outside the package directory)
+        working-directory: ${{ env.PKG_DIR }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pack"
+          npm sbom --sbom-format cyclonedx --omit dev > "$RUNNER_TEMP/sbom.cdx.json"
+          npm pack --pack-destination "$RUNNER_TEMP/pack"
+          tar -tzf "$RUNNER_TEMP"/pack/*.tgz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tarball
+          path: ${{ runner.temp }}/pack/*.tgz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom-${{ inputs.package }}-${{ github.ref_name }}
+          path: ${{ runner.temp }}/sbom.cdx.json
+
+  publish:
+    needs: build
+    if: github.repository == 'aforoai/SDKs'
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write       # npm provenance / trusted publishing, attestations
+      attestations: write
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'   # npm >= 11.5 for Trusted Publishing
+          registry-url: 'https://registry.npmjs.org'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: tarball
+          path: pack
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: pack/*.tgz
+      - name: Publish the attested tarball (public, with provenance)
+        # ./ is required: without it npm parses "pack/<name>.tgz" as the GitHub shorthand
+        # owner/repo and runs git ls-remote ssh://git@github.com/pack/... (wave 5 first run).
+        run: npm publish ./pack/*.tgz --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

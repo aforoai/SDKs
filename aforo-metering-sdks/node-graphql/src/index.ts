@@ -6,7 +6,7 @@
  * ingestor. Exposes:
  *   - Apollo Server plugin: aforoApolloPlugin(billing)
  *   - Express middleware:   billing.middleware()  (for graphql-http, express-graphql, etc.)
- *   - Low-level recordOperation() for custom servers
+ *   - Low-level record() for custom servers
  *
  * Usage (Apollo Server 4):
  *   import { ApolloServer } from '@apollo/server';
@@ -18,6 +18,8 @@
  *     apiKey: process.env.AFORO_API_KEY!,
  *     ingestorUrl: 'https://api.aforo.ai',
  *     schemaVersion: 'v2.1',
+ *     // Who is billed: from identity your server verified (session, checked token).
+ *     customerResolver: (context) => context.user?.aforoCustomerId,
  *     // productType defaults to 'GRAPHQL_API'
  *   });
  *
@@ -25,9 +27,16 @@
  *     typeDefs, resolvers,
  *     plugins: [aforoApolloPlugin(billing)],
  *   });
+ *
+ *   // The SDK installs no signal handlers. Flush from your own:
+ *   process.once('SIGTERM', async () => { await billing.shutdown(); process.exit(0); });
  */
 
 import { createHash } from 'node:crypto';
+import { TransportCore, CoreDropReason } from './transport-core/core';
+
+/** What onError receives for delivery problems: branch on `kind`, read `events`. */
+export { CoreTransportError, type CoreErrorKind } from './transport-core/core';
 import { parse, visit, Kind, type OperationDefinitionNode, type DocumentNode } from 'graphql';
 
 export interface AforoGraphQlConfig {
@@ -43,20 +52,46 @@ export interface AforoGraphQlConfig {
   productType?: string;
   /** GraphQL schema version string, attached to every event's metadata. */
   schemaVersion?: string;
-  /** Extract Aforo customer ID from the request context. Default: ctx.headers['x-customer-id']. */
-  customerIdExtractor?: (context: unknown) => string | undefined;
+  /**
+   * Who is billed for an operation, from identity your server verified (a
+   * session, a checked token). Receives the Express request for
+   * `middleware()` and Apollo's `contextValue` for `aforoApolloPlugin()`.
+   * Required unless `trustCustomerHeader` is true. Returning nothing (or
+   * throwing) drops that operation's event as 'invalid' (counted); the
+   * response is never affected.
+   */
+  customerResolver?: (context: any) => string | undefined | null;
+  /** @deprecated Use `customerResolver` (same signature). */
+  customerIdExtractor?: (context: any) => string | undefined | null;
+  /**
+   * Bill the `x-customer-id` request header. Any client can send it, so only
+   * turn this on behind a proxy you control that sets it. Default false; the
+   * constructor throws when neither this nor `customerResolver` is given.
+   */
+  trustCustomerHeader?: boolean;
+  /** Allow a plain http:// ingestorUrl on a non-local host. Default false (https required). */
+  allowInsecureHttp?: boolean;
+  /** Queue capacity (default 10 000). The oldest event is dropped on overflow. */
+  maxQueueSize?: number;
+  /** Retries per batch before the breaker opens (default 3). */
+  maxRetries?: number;
+  /** Total deadline per request, in ms (default 10 000). */
+  timeoutMs?: number;
+  /** How long shutdown() keeps sending, in ms (default 5000). */
+  shutdownTimeoutMs?: number;
+  /** Send queued events on the process 'beforeExit' event (default true). */
+  flushOnExit?: boolean;
   /** Override the complexity scorer. Default: fieldCount + 5 × depth. */
   complexityScorer?: (doc: DocumentNode, operationName?: string) => { complexity: number; fieldCount: number };
-  /** How many events to buffer before flushing (default 50). */
+  /** Events per request (default 500, max 1000). Reaching it wakes the background sender. */
   flushCount?: number;
-  /** Max interval in ms before a partial batch is flushed (default 5000). */
+  /** The background sender also runs this often, in ms (default 5000). */
   flushIntervalMs?: number;
-  /** Callback invoked when a flush fails terminally. */
+  /** Callback for delivery problems (rejected batches, outages), resolver errors and bad executionStatus values. */
   onError?: (error: Error) => void;
   /**
-   * Opt-in hook receiving events that were permanently dropped (retry
-   * exhaustion, a rejection by the ingestor, or a failed client-side check —
-   * see DropReason). Events keep their idempotency keys,
+   * Opt-in hook receiving events that were permanently dropped (see
+   * DropReason). Events keep their idempotency keys,
    * so persisting and re-submitting them after recovery is dedup-safe.
    * Exceptions thrown by the hook are swallowed. Default: none (drops are
    * still counted in droppedCount and WARN-logged).
@@ -65,22 +100,19 @@ export interface AforoGraphQlConfig {
 }
 
 /**
- * Why events were permanently dropped. `retry_exhausted`: the ingestor stayed
- * unreachable / kept answering 408, 429 or 5xx. `rejected`: the ingestor
- * refused the batch (non-retryable 4xx) or individual events of an accepted
- * batch. `invalid`: the event failed a client-side check and was never sent.
- * The buffer is unbounded (drained at flush start), so unlike the core SDK
- * there is no 'overflow' reason here.
+ * Why events were permanently dropped. `overflow`: the queue was full and the
+ * oldest event was evicted. `rejected`: the ingestor refused the batch
+ * (non-retryable 4xx) or individual events of an accepted batch. `invalid`:
+ * the event failed a client-side check, or the customer resolver returned no
+ * customer. `shutdown`: still queued when the shutdown deadline passed.
+ * `closed`: recorded after shutdown(). `retry_exhausted`: kept for
+ * compatibility, not produced by 2.x — an outage keeps events queued.
  */
-export type DropReason = 'retry_exhausted' | 'rejected' | 'invalid';
+export type DropReason = 'overflow' | 'retry_exhausted' | 'rejected' | 'invalid' | 'shutdown' | 'closed';
 
-const SDK_VERSION = '1.2.2';
+const SDK_VERSION = '2.0.0';
 /** Default top-level `productType` for this SDK. */
 export const DEFAULT_PRODUCT_TYPE = 'GRAPHQL_API';
-/** Upper bound on a server-requested Retry-After wait. */
-const MAX_RETRY_AFTER_MS = 30_000;
-/** The ingestor rejects batch requests with more than 1000 events. */
-const MAX_BATCH_EVENTS = 1000;
 /** usage-ingestor limits (IngestUsageEventRequest). */
 const MAX_CUSTOMER_ID = 64;
 const MAX_IDEMPOTENCY_KEY = 255;
@@ -185,49 +217,75 @@ export interface AforoApolloPluginOptions extends AforoGraphQlIntegrationOptions
 const MAX_CAPTURED_RESPONSE_BYTES = 1024 * 1024;
 
 export class AforoGraphQlBilling {
-  private readonly config: Required<
-    Pick<AforoGraphQlConfig, 'tenantId' | 'productId' | 'apiKey' | 'ingestorUrl'>
-  >;
+  private readonly config: Required<Pick<AforoGraphQlConfig, 'tenantId' | 'productId'>>;
   private readonly schemaVersion?: string;
   private readonly productType: string;
-  private readonly flushCount: number;
-  private readonly flushIntervalMs: number;
   private readonly onError: (error: Error) => void;
-  private readonly onDrop?: (events: GraphQlUsageEvent[], reason: DropReason) => void;
-  private readonly customerIdExtractor: (context: unknown) => string | undefined;
+  private readonly resolveCustomer: (context: any) => string | undefined;
   private readonly complexityScorer: NonNullable<AforoGraphQlConfig['complexityScorer']>;
-
-  private buffer: GraphQlUsageEvent[] = [];
-  private flushTimer: ReturnType<typeof setInterval> | null = null;
-  private dropped = 0;
-  /** Invalid-event count per field, for WARN throttling. */
-  private readonly invalidSeen = new Map<string, number>();
+  private readonly core: TransportCore<GraphQlUsageEvent>;
   /** Request-derived labels already reported as truncated (one WARN per label). */
   private readonly truncationWarned = new Set<string>();
 
   constructor(config: AforoGraphQlConfig) {
+    const resolver = config.customerResolver ?? config.customerIdExtractor;
+    const trustHeader = config.trustCustomerHeader === true;
+    if (typeof resolver !== 'function' && !trustHeader) {
+      throw new Error(
+        '[aforo-graphql] AforoGraphQlBilling needs a customerResolver: (context) => the Aforo customer id from ' +
+          'identity your server verified. To bill the x-customer-id header instead — only safe behind a proxy that ' +
+          'sets it — pass trustCustomerHeader: true.',
+      );
+    }
     this.config = {
       tenantId: config.tenantId,
       productId: config.productId,
-      apiKey: config.apiKey,
-      ingestorUrl: config.ingestorUrl,
     };
     this.schemaVersion = config.schemaVersion;
     this.productType = normalizeProductType(config.productType) ?? DEFAULT_PRODUCT_TYPE;
-    this.flushCount = config.flushCount ?? 50;
-    this.flushIntervalMs = config.flushIntervalMs ?? 5000;
     this.onError = config.onError ?? ((err) => console.error('[aforo-graphql]', err.message));
-    this.onDrop = config.onDrop;
-    this.customerIdExtractor = config.customerIdExtractor ?? defaultCustomerExtractor;
+    this.resolveCustomer = (context: any) => {
+      const fromResolver = typeof resolver === 'function' ? textOrUndefined(resolver(context)) : undefined;
+      if (fromResolver) return fromResolver;
+      return trustHeader ? textOrUndefined(headerCustomerId(context)) : undefined;
+    };
     this.complexityScorer = config.complexityScorer ?? defaultComplexityScorer;
-    this.startTimer();
+    const onDrop = config.onDrop;
+    // The core is the only holder of the API key.
+    this.core = new TransportCore<GraphQlUsageEvent>({
+      baseUrl: config.ingestorUrl,
+      apiKey: config.apiKey,
+      allowInsecureHttp: config.allowInsecureHttp,
+      headers: { 'X-Tenant-Id': config.tenantId },
+      userAgent: `aforo-graphql-metering/${SDK_VERSION}`,
+      flushCount: config.flushCount,
+      flushIntervalMs: config.flushIntervalMs,
+      maxQueueSize: config.maxQueueSize,
+      maxRetries: config.maxRetries,
+      timeoutMs: config.timeoutMs,
+      shutdownTimeoutMs: config.shutdownTimeoutMs,
+      flushOnExit: config.flushOnExit,
+      logPrefix: '[aforo-graphql]',
+      onError: (err) => this.reportError(err),
+      onDrop: onDrop ? (events, reason: CoreDropReason) => onDrop(events, reason as DropReason) : undefined,
+    });
+  }
+
+  /**
+   * @internal The customer for a request context ('' when there is none). A
+   * resolver that throws is reported through onError and counts as none.
+   */
+  customerFor(context: unknown): string {
+    try {
+      return this.resolveCustomer(context) ?? '';
+    } catch (err) {
+      this.reportError(new Error(`[aforo-graphql] customerResolver threw: ${(err as Error)?.message ?? err}`));
+      return '';
+    }
   }
 
   /** Record a single GraphQL operation. Called by plugins/middleware or directly. */
   record(args: RecordArgs): void {
-    // No customer resolved — not billable, not a drop.
-    if (typeof args.customerId !== 'string' || !args.customerId.trim()) return;
-
     const doc = typeof args.query === 'string' ? safeParse(args.query) : args.query;
     if (!doc) return;
 
@@ -243,7 +301,7 @@ export class AforoGraphQlBilling {
     const fullOpName = op.name?.value ?? 'anonymous';
     const opName = this.requestLabel('gqlOperationName', fullOpName, MAX_GQL_OPERATION_NAME);
     const event: GraphQlUsageEvent = {
-      customerId: args.customerId,
+      customerId: typeof args.customerId === 'string' ? args.customerId : '',
       metricName: 'graphql_api.operations',
       quantity: 1,
       occurredAt: now.toISOString(),
@@ -286,17 +344,18 @@ export class AforoGraphQlBilling {
     // whole batch): it is dropped here with reason 'invalid', never thrown
     // into the request path.
     const invalid =
+      (!event.customerId.trim()
+        ? { field: 'customerId', problem: 'no customer: the customer resolver returned nothing; the operation is not metered' }
+        : undefined) ??
       tooLong('customerId', event.customerId, MAX_CUSTOMER_ID) ??
       tooLong('productType', event.productType, MAX_PRODUCT_TYPE);
     if (invalid) {
-      this.recordInvalid(event, invalid);
+      this.core.reportDrop([event], 'invalid', invalid.problem);
       return;
     }
 
-    this.buffer.push(event);
-    if (this.buffer.length >= this.flushCount) {
-      void this.flush();
-    }
+    // Queue only; the core's single background sender does the HTTP.
+    this.core.enqueue(event);
   }
 
   /**
@@ -311,7 +370,6 @@ export class AforoGraphQlBilling {
       const start = Date.now();
       const originalEnd = res.end.bind(res);
       let responseBytes = 0;
-      let sawErrors = false;
       let captured: Buffer[] | null = [];
       let capturedBytes = 0;
       const capture = (chunk: any, encoding?: any) => {
@@ -341,39 +399,47 @@ export class AforoGraphQlBilling {
       }
 
       res.end = (chunk: any, ...rest: any[]) => {
-        if (chunk) responseBytes += typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length ?? 0;
         try {
-          capture(chunk, rest[0]);
-          const body = req.body ?? {};
-          const query = body.query as string | undefined;
-          if (query) {
-            sawErrors = res.statusCode >= 400;
-            const customerId = this.customerIdExtractor(req);
-            if (customerId) {
-              let explicit: string | undefined;
-              try {
-                explicit = options.executionStatus?.(req, res);
-              } catch {
-                explicit = undefined; // a resolver bug must never break the response
-              }
-              this.record({
-                customerId,
-                query,
-                operationName: body.operationName,
-                durationMs: Date.now() - start,
-                hasErrors: sawErrors,
-                responseBytes,
-                executionStatus: explicit,
-                response: captured ? parseGraphQlResponse(Buffer.concat(captured)) : undefined,
-                httpStatus: res.statusCode,
-                productType: options.productType,
-              });
-            }
+          if (chunk && typeof chunk !== 'function') {
+            responseBytes += typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length ?? 0;
+            capture(chunk, typeof rest[0] === 'string' ? rest[0] : undefined);
           }
-        } catch {
-          // Never fail the response due to metering
+        } catch (err) {
+          console.debug('[aforo-graphql] response capture failed', err);
         }
-        return originalEnd(chunk, ...rest);
+        // Send the response first; parse and meter afterwards, off the response path.
+        const result = originalEnd(chunk, ...rest);
+        const durationMs = Date.now() - start;
+        const parts = captured;
+        setImmediate(() => {
+          try {
+            const body = req.body ?? {};
+            const query = body.query as string | undefined;
+            if (!query) return;
+            let explicit: string | undefined;
+            try {
+              explicit = options.executionStatus?.(req, res);
+            } catch {
+              explicit = undefined; // a resolver bug must never break metering
+            }
+            this.record({
+              customerId: this.customerFor(req),
+              query,
+              operationName: body.operationName,
+              durationMs,
+              hasErrors: res.statusCode >= 400,
+              responseBytes,
+              executionStatus: explicit,
+              response: parts ? parseGraphQlResponse(Buffer.concat(parts)) : undefined,
+              httpStatus: res.statusCode,
+              productType: options.productType,
+            });
+          } catch (err) {
+            // Never let metering affect the server.
+            this.reportError(new Error(`[aforo-graphql] metering failed: ${(err as Error)?.message ?? err}`));
+          }
+        });
+        return result;
       };
 
       next();
@@ -398,151 +464,52 @@ export class AforoGraphQlBilling {
     return truncateToLimit(value, max);
   }
 
-  private async flush(): Promise<void> {
-    if (this.buffer.length === 0) return;
-    const pending = this.buffer.splice(0, this.buffer.length);
-    // The ingestor accepts at most MAX_BATCH_EVENTS events per request.
-    for (let i = 0; i < pending.length; i += MAX_BATCH_EVENTS) {
-      await this.send(pending.slice(i, i + MAX_BATCH_EVENTS));
-    }
-  }
-
-  private async send(batch: GraphQlUsageEvent[]): Promise<void> {
-    // Serialized once, so every retry re-sends the same idempotencyKeys.
-    const body = JSON.stringify({ events: batch });
-    const maxRetries = 3;
-
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      let delayMs = Math.pow(2, attempt - 1) * 1000; // 1s, 2s, 4s
-      let res: Response | undefined;
-      let networkError: Error | undefined;
-      try {
-        res = await fetch(this.config.ingestorUrl.replace(/\/$/, '') + '/v1/ingest/batch', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-API-Key': this.config.apiKey,
-            'X-Tenant-Id': this.config.tenantId,
-          },
-          body,
-        });
-      } catch (err) {
-        networkError = err as Error;
-      }
-
-      if (res) {
-        if (res.ok) {
-          await this.handlePartialFailures(res, batch);
-          return;
-        }
-        if (!isRetryableStatus(res.status)) {
-          // 4xx other than 408/429: the same body would be refused again.
-          const { details } = await readBatchResult(res, batch.length);
-          this.recordDrop(batch, 'rejected');
-          this.reportError(new Error(`GraphQL metering batch rejected with HTTP ${res.status}${details ? ` — ${details}` : ''} (dropped ${batch.length} events, not retried)`));
-          return;
-        }
-        delayMs = parseRetryAfter(res) ?? delayMs;
-      } else if (attempt === maxRetries) {
-        this.recordDrop(batch, 'retry_exhausted');
-        this.reportError(networkError ?? new Error('GraphQL metering request failed'));
-        return;
-      }
-      if (attempt < maxRetries) await sleep(delayMs);
-    }
-    // Not re-queued: dropping avoids unbounded memory growth.
-    this.recordDrop(batch, 'retry_exhausted');
-    this.reportError(new Error(`GraphQL metering flush failed after ${maxRetries} attempts (dropped ${batch.length} events)`));
-  }
-
-  /**
-   * A 2xx can still carry per-event rejections:
-   * `{accepted, duplicates, failed, errors:[{index, message}]}`. Events the
-   * response names by index are dropped with reason 'rejected'; a `failed`
-   * count the response does not attribute to an index is counted only.
-   */
-  private async handlePartialFailures(res: Response, batch: GraphQlUsageEvent[]): Promise<void> {
-    const { failed, details, indexes } = await readBatchResult(res, batch.length);
-    if (failed <= 0) return;
-    if (indexes.length > 0) this.recordDrop(indexes.map((i) => batch[i]), 'rejected');
-    const unattributed = Math.min(failed, batch.length) - indexes.length;
-    if (unattributed > 0) {
-      this.dropped += unattributed;
-      console.warn(
-        `[aforo-graphql] Dropped ${unattributed} event(s) — rejected, not identified by the ingestor (${this.dropped} total dropped).`,
-      );
-    }
-    this.reportError(new Error(`Aforo ingestor rejected ${failed} event(s)${details ? ` — ${details}` : ''}`));
-  }
-
   /** Invoke onError; a hook bug must never break metering or flushing. */
   private reportError(err: Error): void {
     try {
       this.onError(err);
-    } catch {
-      // ignore
+    } catch (hookErr) {
+      console.debug('[aforo-graphql] onError hook threw', hookErr);
     }
   }
 
-  /** Number of events permanently dropped since this instance was created. */
+  /** Number of events permanently dropped since this instance was created (every DropReason). */
   get droppedCount(): number {
-    return this.dropped;
+    return this.core.droppedCount;
+  }
+
+  /** Number of events waiting to be sent. */
+  get queuedCount(): number {
+    return this.core.queued;
   }
 
   /**
-   * Account for permanently lost events: bump the counter, WARN-log, and
-   * invoke the opt-in onDrop hook. The buffer is drained at flush start, so
-   * drops here are bounded by flush cadence — no log throttle needed.
+   * Send what is queued now and wait for it (one request at a time; never
+   * concurrent). Operations whose response already went out are metered on the
+   * next turn of the event loop, so this waits one turn first to include them.
    */
-  private recordDrop(events: GraphQlUsageEvent[], reason: DropReason): void {
-    this.dropped += events.length;
-    console.warn(
-      `[aforo-graphql] Dropped ${events.length} event(s) — ${reason} (${this.dropped} total dropped).`,
-    );
-    this.notifyDrop(events, reason);
+  async flush(): Promise<{ sent: number; failed: number; requeued: number; queued: number }> {
+    await new Promise((resolve) => setImmediate(resolve));
+    return this.core.flush();
   }
 
   /**
-   * Account for an event that failed a client-side check: never buffered,
-   * never sent. Runs on the hot path, so the WARN is throttled per field
-   * (first occurrence, then every 1000th).
+   * Stop accepting events and send what is queued, for at most
+   * `shutdownTimeoutMs`. Events still queued then are dropped with reason
+   * 'shutdown' (counted, passed to onDrop). Call it from your SIGTERM handler.
    */
-  private recordInvalid(event: GraphQlUsageEvent, invalid: InvalidField): void {
-    this.dropped += 1;
-    const seen = (this.invalidSeen.get(invalid.field) ?? 0) + 1;
-    this.invalidSeen.set(invalid.field, seen);
-    if (seen === 1 || seen % 1000 === 0) {
-      console.warn(
-        `[aforo-graphql] Dropped 1 event — invalid: ${invalid.problem} ` +
-          `(${seen} for ${invalid.field}, ${this.dropped} total dropped).`,
-      );
-    }
-    this.notifyDrop([event], 'invalid');
-  }
-
-  private notifyDrop(events: GraphQlUsageEvent[], reason: DropReason): void {
-    if (!this.onDrop) return;
-    try {
-      this.onDrop(events, reason);
-    } catch {
-      // A hook bug must never break metering or flushing.
-    }
-  }
-
-  private startTimer(): void {
-    if (this.flushTimer) return;
-    this.flushTimer = setInterval(() => { void this.flush(); }, this.flushIntervalMs);
-    // Unref so the background timer never blocks host-process exit (final flush still needs shutdown()).
-    if (typeof (this.flushTimer as any).unref === 'function') (this.flushTimer as any).unref();
-  }
-
-  /** Flush any buffered events and stop the background timer. Call before process exit. */
   async shutdown(): Promise<void> {
-    if (this.flushTimer) {
-      clearInterval(this.flushTimer);
-      this.flushTimer = null;
-    }
-    await this.flush();
+    // Let operations whose response already went out be recorded first.
+    await new Promise((resolve) => setImmediate(resolve));
+    await this.core.shutdown();
+  }
+
+  toJSON(): Record<string, unknown> {
+    return { tenantId: this.config.tenantId, productId: this.config.productId, queued: this.queuedCount, dropped: this.droppedCount };
+  }
+
+  [Symbol.for('nodejs.util.inspect.custom')](): string {
+    return `AforoGraphQlBilling { tenantId: '${this.config.tenantId}', productId: '${this.config.productId}', queued: ${this.queuedCount}, dropped: ${this.droppedCount} }`;
   }
 }
 
@@ -559,41 +526,55 @@ export function aforoApolloPlugin(billing: AforoGraphQlBilling, options: AforoAp
       const start = Date.now();
       return {
         async willSendResponse(rc: any) {
+          // Recorded after the response goes out: willSendResponse only reads
+          // what it needs, and parsing/queueing runs on the next turn.
+          let snapshot: (() => void) | undefined;
           try {
             const query = rc.request?.query as string | undefined;
             if (!query) return;
             const contextValue = rc.contextValue ?? rc.context ?? {};
-            const customerIdExtractor = (billing as any).customerIdExtractor as (ctx: unknown) => string | undefined;
-            const customerId = customerIdExtractor(contextValue);
-            if (!customerId) return;
             const result = rc.response?.body?.singleResult ?? rc.response?.body?.initialResult;
             const errors = (result?.errors || rc.errors) ?? [];
-            let explicit: string | undefined;
-            try {
-              explicit = options.executionStatus?.(rc);
-            } catch {
-              explicit = undefined; // a resolver bug must never break the response
-            }
-            billing.record({
-              customerId,
-              query,
-              operationName: rc.request?.operationName,
-              durationMs: Date.now() - start,
-              hasErrors: graphQlErrorsPresent(errors),
-              executionStatus: explicit,
-              // Spread keeps `data` absent when Apollo omitted it (request
-              // failed before execution) so it derives VALIDATION_FAILED.
-              response: result
-                ? { ...result, errors: result.errors ?? (graphQlErrorsPresent(errors) ? errors : undefined) }
-                : graphQlErrorsPresent(errors)
-                  ? { errors }
-                  : undefined,
-              httpStatus: rc.response?.http?.status,
-              productType: options.productType,
-            });
-          } catch {
-            // Never fail the response due to metering
+            const durationMs = Date.now() - start;
+            const operationName = rc.request?.operationName;
+            const httpStatus = rc.response?.http?.status;
+            snapshot = () => {
+              let explicit: string | undefined;
+              try {
+                explicit = options.executionStatus?.(rc);
+              } catch {
+                explicit = undefined; // a resolver bug must never break metering
+              }
+              billing.record({
+                customerId: billing.customerFor(contextValue),
+                query,
+                operationName,
+                durationMs,
+                hasErrors: graphQlErrorsPresent(errors),
+                executionStatus: explicit,
+                // Spread keeps `data` absent when Apollo omitted it (request
+                // failed before execution) so it derives VALIDATION_FAILED.
+                response: result
+                  ? { ...result, errors: result.errors ?? (graphQlErrorsPresent(errors) ? errors : undefined) }
+                  : graphQlErrorsPresent(errors)
+                    ? { errors }
+                    : undefined,
+                httpStatus,
+                productType: options.productType,
+              });
+            };
+          } catch (err) {
+            console.debug('[aforo-graphql] Apollo metering skipped', err);
+            return;
           }
+          const run = snapshot;
+          setImmediate(() => {
+            try {
+              run();
+            } catch (err) {
+              console.debug('[aforo-graphql] Apollo metering failed', err);
+            }
+          });
         },
       };
     },
@@ -621,15 +602,26 @@ export function defaultComplexityScorer(doc: DocumentNode, _operationName?: stri
   return { complexity: fieldCount + 5 * maxDepth, fieldCount };
 }
 
-function defaultCustomerExtractor(ctx: unknown): string | undefined {
+/**
+ * The x-customer-id header from an Express request or an Apollo context
+ * (`req.headers`, `request.http.headers`, or a `headers` map). Read only
+ * with `trustCustomerHeader: true`.
+ */
+function headerCustomerId(ctx: unknown): string | undefined {
   const c = ctx as any;
   const fromHeader =
+    c?.headers?.['x-customer-id'] ??
     c?.req?.headers?.['x-customer-id'] ??
     c?.request?.http?.headers?.get?.('x-customer-id') ??
-    c?.headers?.['x-customer-id'];
+    c?.request?.headers?.get?.('x-customer-id');
   if (Array.isArray(fromHeader)) return fromHeader[0];
-  if (typeof fromHeader === 'string') return fromHeader;
-  return c?.customerId;
+  return typeof fromHeader === 'string' ? fromHeader : undefined;
+}
+
+function textOrUndefined(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  const text = String(value).trim();
+  return text ? text : undefined;
 }
 
 // ── Execution status ─────────────────────────────────────────────
@@ -780,51 +772,8 @@ function tooLong(field: string, value: unknown, max: number): InvalidField | und
   return { field, problem: `${field} is ${value.length} chars, limit ${max}: ${preview(value)}` };
 }
 
-/** Network errors, 408, 429 and 5xx are transient; every other 4xx (400/401/403/422...) is not. */
-function isRetryableStatus(status: number): boolean {
-  return status === 408 || status === 429 || status >= 500;
-}
 
-/** Retry-After (delta-seconds or HTTP date) in ms, capped at MAX_RETRY_AFTER_MS. */
-function parseRetryAfter(res: Response): number | undefined {
-  const raw = (res as any)?.headers?.get?.('retry-after');
-  if (!raw) return undefined;
-  const secs = Number(raw);
-  if (Number.isFinite(secs) && secs >= 0) return Math.min(secs * 1000, MAX_RETRY_AFTER_MS);
-  const date = Date.parse(raw);
-  if (!Number.isNaN(date)) return Math.min(Math.max(date - Date.now(), 0), MAX_RETRY_AFTER_MS);
-  return undefined;
-}
 
-/**
- * Reads the ingestor's batch response body, if any: the `failed` count, the
- * first 5 `errors[].message` entries, and the batch indexes `errors[]` names.
- */
-async function readBatchResult(
-  res: Response,
-  batchSize: number,
-): Promise<{ failed: number; details: string; indexes: number[] }> {
-  const none = { failed: 0, details: '', indexes: [] };
-  if (typeof (res as any)?.json !== 'function') return none;
-  try {
-    const body: any = unwrapEnvelope(await res.json());
-    const errors: any[] | undefined = Array.isArray(body?.errors) ? body.errors : undefined;
-    const details = errors
-      ? errors.slice(0, 5).map((e: any) => `#${e?.index}: ${e?.message}`).join('; ')
-      : typeof body?.message === 'string' ? body.message : '';
-    const indexes = [
-      ...new Set(
-        (errors ?? [])
-          .map((e: any) => e?.index)
-          .filter((i: unknown): i is number => Number.isInteger(i) && (i as number) >= 0 && (i as number) < batchSize),
-      ),
-    ].sort((a, b) => a - b);
-    const failed = typeof body?.failed === 'number' && body.failed > 0 ? body.failed : 0;
-    return { failed, details, indexes };
-  } catch {
-    return none; // Non-JSON or empty body — nothing to report.
-  }
-}
 
 /**
  * Cut `value` to at most `max` UTF-16 code units — how the ingestor counts
@@ -862,17 +811,4 @@ function sha256Hex(text: string): string {
 
 function randomSuffix(): string {
   return Math.random().toString(36).slice(2, 10);
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-/**
- * The ingestor wraps every 2xx JSON body in `{success, data, meta}`. Returns
- * the inner `data` object when present, else the body unchanged (bare shape).
- */
-function unwrapEnvelope(body: any): any {
-  const data = body && typeof body === 'object' && !Array.isArray(body) ? body.data : undefined;
-  return data && typeof data === 'object' && !Array.isArray(data) ? data : body;
 }

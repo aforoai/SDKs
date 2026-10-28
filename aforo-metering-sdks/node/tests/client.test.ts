@@ -91,7 +91,7 @@ describe('AforoClient', () => {
     client.startSession('sess_2');
     await client.track({ customerId: 'cust_1', metricName: 'api_calls' });
     const result = await client.flush();
-    expect(result).toEqual({ sent: 1, failed: 0 });
+    expect(result).toMatchObject({ sent: 1, failed: 0 });
   });
 
   it('stamps productType: client default API, client option, per-event override', async () => {
@@ -354,14 +354,15 @@ describe('AforoClient', () => {
     expect(body.events[0].occurredAt).toBe(new Date(epoch).toISOString());
   });
 
-  it('should throw after shutdown', async () => {
+  it('does not throw after shutdown: the event is counted as dropped (closed)', async () => {
     await client.shutdown();
 
     await expect(
       client.track({ customerId: 'cust_1', metricName: 'api_calls' })
-    ).rejects.toThrow('shut down');
+    ).resolves.toBeUndefined();
 
     expect(client.isShutdown).toBe(true);
+    expect(client.droppedCount).toBe(1);
   });
 
   it('should flush remaining events on shutdown', async () => {

@@ -141,13 +141,15 @@ func TestIngestContract(t *testing.T) {
 	defer srv.Close()
 
 	b, err := New(Config{
-		TenantID:      "tenant-001",
-		ProductID:     "prod-grpc-001",
-		APIKey:        "sk_grpc_abc",
-		IngestorURL:   srv.URL,
-		ServiceName:   "acme.v1.UserService",
-		FlushCount:    100, // buffer only — Shutdown's final drain does the synchronous flush (no async race)
-		FlushInterval: time.Minute,
+		TenantID:            "tenant-001",
+		ProductID:           "prod-grpc-001",
+		APIKey:              "sk_grpc_abc",
+		IngestorURL:         srv.URL,
+		hooks:               fastHooks(),
+		TrustCustomerHeader: true,
+		ServiceName:         "acme.v1.UserService",
+		FlushCount:          100, // buffer only — Shutdown's final drain does the synchronous flush (no async race)
+		FlushInterval:       time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -202,13 +204,15 @@ func TestIngestContract_ExecutionStatusValues(t *testing.T) {
 	defer srv.Close()
 
 	b, err := New(Config{
-		TenantID:      "tenant-001",
-		ProductID:     "prod-grpc-001",
-		APIKey:        "sk_grpc_abc",
-		IngestorURL:   srv.URL,
-		ServiceName:   "acme.v1.UserService",
-		FlushCount:    100,
-		FlushInterval: time.Minute,
+		TenantID:            "tenant-001",
+		ProductID:           "prod-grpc-001",
+		APIKey:              "sk_grpc_abc",
+		IngestorURL:         srv.URL,
+		hooks:               fastHooks(),
+		TrustCustomerHeader: true,
+		ServiceName:         "acme.v1.UserService",
+		FlushCount:          100,
+		FlushInterval:       time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -349,14 +353,16 @@ func (e *errSink) joined() string {
 func newContractBilling(t *testing.T, url string, sink *errSink, mutate ...func(*Config)) *Billing {
 	t.Helper()
 	cfg := Config{
-		TenantID:      "tenant-001",
-		ProductID:     "prod-001",
-		ServiceName:   "acme.v1.UserService",
-		APIKey:        "sk_contract",
-		IngestorURL:   url,
-		FlushCount:    1,
-		FlushInterval: time.Minute,
-		OnError:       sink.add,
+		TenantID:            "tenant-001",
+		ProductID:           "prod-001",
+		ServiceName:         "acme.v1.UserService",
+		APIKey:              "sk_contract",
+		IngestorURL:         url,
+		hooks:               fastHooks(),
+		TrustCustomerHeader: true,
+		FlushCount:          1,
+		FlushInterval:       time.Minute,
+		OnError:             sink.add,
 	}
 	for _, m := range mutate {
 		m(&cfg)

@@ -8,6 +8,7 @@
 
 import { AforoMqttBilling } from '../index';
 import { EventEmitter } from 'events';
+import { ackingPublish } from '../../test-support/mqtt-fakes';
 
 // ── HTTP capture ────────────────────────────────────────────────────────
 
@@ -147,7 +148,7 @@ describe('wrapAedesBroker', () => {
 describe('wrapMqttClient', () => {
   test('PUBLISH is recorded when client.publish is invoked', async () => {
     const billing = new AforoMqttBilling({ ...config(), flushCount: 1 });
-    const origPublish = jest.fn(() => 'published');
+    const origPublish = ackingPublish('published');
     const client: any = new EventEmitter();
     client.publish = origPublish;
     client.options = { clientId: 'device-123' };
@@ -170,7 +171,7 @@ describe('wrapMqttClient', () => {
   test('CONNECT + DISCONNECT lifecycle fired on connect/close events', async () => {
     const billing = new AforoMqttBilling({ ...config(), flushCount: 100 });
     const client: any = new EventEmitter();
-    client.publish = jest.fn();
+    client.publish = ackingPublish();
     client.options = { clientId: 'c1' };
 
     billing.wrapMqttClient(client, { customerId: 'cust_001' });
@@ -186,7 +187,7 @@ describe('wrapMqttClient', () => {
   test('DELIVER event (on message) is NOT emitted when emitDeliverEvents=false', async () => {
     const billing = new AforoMqttBilling({ ...config(), flushCount: 100 });
     const client: any = new EventEmitter();
-    client.publish = jest.fn();
+    client.publish = ackingPublish();
     client.options = { clientId: 'c1' };
 
     billing.wrapMqttClient(client, { customerId: 'cust_001' });
@@ -200,7 +201,7 @@ describe('wrapMqttClient', () => {
   test('DELIVER event IS emitted when emitDeliverEvents=true', async () => {
     const billing = new AforoMqttBilling({ ...config(), flushCount: 100, emitDeliverEvents: true });
     const client: any = new EventEmitter();
-    client.publish = jest.fn();
+    client.publish = ackingPublish();
     client.options = { clientId: 'c1' };
 
     billing.wrapMqttClient(client, { customerId: 'cust_001' });
@@ -304,7 +305,7 @@ describe('ingest batch contract', () => {
   test('>1000 buffered events are split into requests of <=1000', async () => {
     const billing = new AforoMqttBilling({ ...config(), flushCount: 5000 });
     const client: any = new EventEmitter();
-    client.publish = jest.fn();
+    client.publish = ackingPublish();
     client.options = { clientId: 'c1' };
     billing.wrapMqttClient(client, { customerId: 'cust_001' });
     for (let i = 0; i < 2500; i++) client.publish('t/' + i, 'x', { qos: 1 });
@@ -322,7 +323,7 @@ describe('ingest batch contract', () => {
       onDrop: (events, reason) => drops.push({ events, reason }),
     });
     const longCustomer: any = new EventEmitter();
-    longCustomer.publish = jest.fn();
+    longCustomer.publish = ackingPublish();
     billing.wrapMqttClient(longCustomer, { customerId: 'c'.repeat(65), clientId: 'k'.repeat(300) });
     expect(() => longCustomer.publish('t'.repeat(900), 'x')).not.toThrow();
     await billing.shutdown();
@@ -341,7 +342,7 @@ describe('productType', () => {
   test('defaults to MQTT_BROKER; client option is trimmed + uppercased; per-integration value wins', async () => {
     const def = new AforoMqttBilling({ ...config(), flushCount: 100 });
     const c0: any = new EventEmitter();
-    c0.publish = jest.fn();
+    c0.publish = ackingPublish();
     def.wrapMqttClient(c0, { customerId: 'cust_001' });
     c0.publish('t/1', 'x');
     await def.shutdown();
@@ -349,7 +350,7 @@ describe('productType', () => {
 
     capturedRequests = [];
     const b = new AforoMqttBilling({ ...config(), flushCount: 100, productType: ' agentic_api ' });
-    const mk = () => { const c: any = new EventEmitter(); c.publish = jest.fn(); return c; };
+    const mk = () => { const c: any = new EventEmitter(); c.publish = ackingPublish(); return c; };
     const cDefault = mk(), cCustom = mk(), cBlank = mk();
     b.wrapMqttClient(cDefault, { customerId: 'c_default' });
     b.wrapMqttClient(cCustom, { customerId: 'c_custom', productType: ' custom_type ' });
@@ -372,7 +373,7 @@ describe('productType', () => {
     const reasons: string[] = [];
     const b = new AforoMqttBilling({ ...config(), flushCount: 5000, onDrop: (_e, r) => reasons.push(r) });
     const c: any = new EventEmitter();
-    const upstream = jest.fn();
+    const upstream = ackingPublish();
     c.publish = upstream;
     b.wrapMqttClient(c, { customerId: 'cust_001' });
     c.publish('', 'x');
@@ -408,7 +409,7 @@ describe('batch response handling', () => {
   const meter = async (overrides: Record<string, unknown>, count = 1) => {
     const b = new AforoMqttBilling({ ...config(), flushCount: 100, ...overrides });
     const c: any = new EventEmitter();
-    c.publish = jest.fn();
+    c.publish = ackingPublish();
     b.wrapMqttClient(c, { customerId: 'cust_001' });
     for (let i = 0; i < count; i++) c.publish(`t/${i}`, 'x');
     await b.shutdown();

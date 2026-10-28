@@ -1,0 +1,15 @@
+{
+  "name": "@aforoai/mock-ingestor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Fault-injecting mock of the Aforo usage-ingestor for SDK tests (outage, 429 + Retry-After, slow responses, resets, per-event retryable failures). Zero dependencies.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": { "aforo-mock-ingestor": "./bin/mock-ingestor.mjs" },
+  "exports": { ".": "./src/server.mjs" },
+  "scripts": {
+    "start": "node bin/mock-ingestor.mjs --port 4318",
+    "test": "node --test --test-timeout=30000 test/*.test.mjs"
+  },
+  "engines": { "node": ">=18.0.0" }
+}

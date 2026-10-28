@@ -140,6 +140,7 @@ func TestIngestContract(t *testing.T) {
 		ProductID:     "prod-ws-001",
 		APIKey:        "sk_ws_abc",
 		IngestorURL:   srv.URL,
+		hooks:         fastHooks(),
 		FlushCount:    100, // buffer only — Shutdown's final drain does the synchronous flush (no async race)
 		FlushInterval: time.Minute,
 	})
@@ -148,7 +149,7 @@ func TestIngestContract(t *testing.T) {
 	}
 	connID := b.Open("cust_contract", nil)
 	b.RecordFrame(connID, "SERVER_TO_CLIENT", "TEXT", 42)
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -196,6 +197,7 @@ func TestIngestContract_ExecutionStatusValues(t *testing.T) {
 		ProductID:      "prod-ws-001",
 		APIKey:         "sk_ws_abc",
 		IngestorURL:    srv.URL,
+		hooks:          fastHooks(),
 		PerFrameEvents: true,
 		FlushCount:     100,
 		FlushInterval:  time.Minute,
@@ -208,7 +210,7 @@ func TestIngestContract_ExecutionStatusValues(t *testing.T) {
 	b.RecordFrameWithOptions(connID, "CLIENT_TO_SERVER", "TEXT", 3, EventOptions{ExecutionStatus: "partial"})
 	b.RecordFrame(connID, "CLIENT_TO_SERVER", "TEXT", 3)
 	b.CloseWithOptions(connID, 1011, EventOptions{ExecutionStatus: "   "})
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -350,6 +352,7 @@ func newContractBilling(t *testing.T, url string, sink *errSink, mutate ...func(
 		ProductID:     "prod-001",
 		APIKey:        "sk_contract",
 		IngestorURL:   url,
+		hooks:         fastHooks(),
 		FlushCount:    1,
 		FlushInterval: time.Minute,
 		OnError:       sink.add,
@@ -376,11 +379,14 @@ func eventually(t *testing.T, cond func() bool, d time.Duration) {
 	t.Fatalf("condition not met within %s", d)
 }
 
+// emit records exactly one event (CONNECTION_OPENED). The connection is then
+// untracked so Shutdown does not add a CONNECTION_CLOSED for it; these tests
+// are about the transport, not the connection lifecycle.
 func emit(b *Billing, opts ...EventOptions) {
-	b.Open("cust_1", nil, opts...)
+	b.connections.Delete(b.Open("cust_1", nil, opts...))
 }
 
-func shutdown(b *Billing) error { return b.Shutdown() }
+func shutdown(b *Billing) error { return b.Shutdown(bg) }
 
 func TestContractDefaultProductType(t *testing.T) {
 	srv := &scriptedServer{}

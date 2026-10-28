@@ -13,6 +13,8 @@
  *     apiKey: process.env.AFORO_API_KEY,
  *     ingestorUrl: 'https://api.aforo.ai',
  *     productType: 'MCP_SERVER',     // default
+ *     // Who each call is billed to, from identity your server authenticated:
+ *     customerResolver: (request, extra) => extra?.authInfo?.clientId,
  *   });
  *
  *   server.setRequestHandler(
@@ -25,18 +27,25 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto';
+import { TransportCore, checkBaseUrl, type CoreDropReason, type CoreFlushResult } from './transport-core/core';
+
+/** What onError receives for delivery problems: branch on `kind`, read `events`. */
+export { CoreTransportError, type CoreErrorKind } from './transport-core/core';
 
 /**
- * Why buffered events were permanently dropped by the SDK.
- * - 'retry_exhausted': the batch failed after all 3 flush attempts (ingest outage).
- * - 'rejected': the ingestor rejected the batch with a non-retryable 4xx, or
- *   rejected these events individually inside a batch it otherwise accepted.
- * - 'invalid': the event failed a client-side check (blank toolName, or
- *   agentId / customerId / sessionId over the ingestor's size limit) and was
- *   never buffered or sent. An over-long toolName is truncated, not dropped.
- * (No 'overflow' reason here — the MCP buffer is unbounded between flushes.)
+ * Why events were permanently dropped by the SDK.
+ * - 'rejected': the ingestor refused the batch with a non-retryable 4xx, or
+ *   refused these events individually inside a batch it otherwise accepted.
+ * - 'invalid': the event failed a client-side check (no customer, blank
+ *   toolName, or agentId / customerId / sessionId over the ingestor's size
+ *   limit) and was never queued or sent. An over-long toolName is truncated, not dropped.
+ * - 'overflow': the queue was full (maxQueueSize) and the oldest event made room.
+ * - 'shutdown': still queued when the shutdown deadline passed.
+ * - 'closed': recorded after shutdown().
+ * - 'retry_exhausted': kept for compatibility; an ingest outage no longer
+ *   drops events (they are re-queued with their keys and retried).
  */
-export type McpDropReason = 'retry_exhausted' | 'rejected' | 'invalid';
+export type McpDropReason = CoreDropReason;
 
 /** The ingestor's per-request cap on POST /v1/ingest/batch (IngestBatchRequest). */
 export const MAX_BATCH_EVENTS = 1000;
@@ -64,11 +73,26 @@ export interface AforoMcpConfig {
    */
   productType?: string;
   /**
-   * Customer billed for tool calls that carry no `_meta.customer_id`. When
-   * neither is set, the call's agentId is billed as the customer (the
-   * long-standing default). Also used as the customer of heartbeat events.
+   * One customer billed for every tool call (a server that serves a single
+   * customer). Also the customer of heartbeat events. `wrapToolHandler`
+   * needs one of `customerResolver`, `customerId` or `trustCustomerHeader`.
    */
   customerId?: string;
+  /**
+   * Decides the customer for each tool call from identity your server
+   * authenticated (OAuth token, API-key lookup, session). Receives the request
+   * and the handler's second argument (the MCP SDK's `extra`, with `authInfo`).
+   * May return a Promise; the tool's response is never delayed by it. Return
+   * nothing to leave the call unmetered: its event is dropped as `invalid`,
+   * the tool still runs. When set it wins over every other source.
+   */
+  customerResolver?: CustomerResolver;
+  /**
+   * Bill the customer the MCP client names in `params._meta.customer_id`.
+   * Any client can put any id there, so turn this on only when every client
+   * is trusted. Calls without one fall back to `customerId` when set.
+   */
+  trustCustomerHeader?: boolean;
   /**
    * Agent id used when a request carries no `_meta.agent_id` (MCP_SERVER
    * events require one). Falls back to `"unknown"` when not set.
@@ -79,8 +103,22 @@ export interface AforoMcpConfig {
     idleTimeoutSec?: number;
     maxDurationSec?: number;
   };
+  /** Send queued events at least this often, in ms (default 5000). */
   flushIntervalMs?: number;
+  /** Events per request; reaching it wakes the sender (default 500, max 1000). */
   flushCount?: number;
+  /** Most events held while the ingestor is unreachable (default 10 000); the oldest is dropped past it ('overflow'). */
+  maxQueueSize?: number;
+  /** Retries per batch before the outage breaker opens (default 3). */
+  maxRetries?: number;
+  /** Total deadline per ingest request, in ms (default 10 000). */
+  timeoutMs?: number;
+  /** How long shutdown() keeps sending, in ms (default 5000); what is left is dropped as 'shutdown'. */
+  shutdownTimeoutMs?: number;
+  /** Flush on the process 'beforeExit' event (default true). */
+  flushOnExit?: boolean;
+  /** Allow a plain http:// ingestorUrl on a host other than localhost / 127.0.0.1 / ::1. */
+  allowInsecureHttp?: boolean;
   onError?: (error: Error) => void;
   /**
    * OPT-IN hook invoked with events the SDK is about to lose permanently
@@ -96,9 +134,28 @@ export interface AforoMcpConfig {
   heartbeatIntervalMs?: number;
   /** Whether to send session heartbeats while a session is active (default true). */
   heartbeatEnabled?: boolean;
-  /** Called when the server signals that a session has been killed */
+  /**
+   * Called when the ingestor lists the active session in `killedSessionIds`
+   * (on a heartbeat response or a usage-batch response). The session and its
+   * heartbeats stop first. A throw is reported to onError.
+   */
   onSessionKilled?: (sessionId: string, reason: string) => void;
 }
+
+/**
+ * Returns the customer a tool call is billed to, or nothing to leave it
+ * unmetered. `extra` is whatever the MCP SDK passed the handler as its second
+ * argument (`RequestHandlerExtra`, which carries `authInfo`).
+ */
+export type CustomerResolver = (
+  request: { params: { name: string; arguments?: unknown; _meta?: Record<string, unknown> } },
+  extra: unknown,
+) => string | null | undefined | Promise<string | null | undefined>;
+
+export const MISSING_CUSTOMER_SOURCE =
+  'AforoMcpBilling: no customer source. Set customerResolver (decide from authenticated identity), customerId ' +
+  '(one customer for every call) or trustCustomerHeader: true (bill params._meta.customer_id as the client sends it; ' +
+  'only when every client is trusted).';
 
 /** Per-call overrides for {@link AforoMcpBilling.recordToolInvocation}. */
 export interface RecordToolInvocationOptions {
@@ -116,7 +173,7 @@ export interface StartSessionOptions {
   productType?: string;
 }
 
-const SDK_VERSION = '1.3.2';
+const SDK_VERSION = '2.0.0';
 
 function normalizeProductType(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
@@ -133,19 +190,6 @@ function nonBlank(value: unknown): string | undefined {
 /** Shorten an offending value for a log line. */
 function clip(value: unknown): string {
   return String(value).slice(0, 80);
-}
-
-/** Best-effort server explanation for a rejected request. */
-async function readErrorMessage(response: { json?: () => Promise<unknown> }): Promise<string | undefined> {
-  try {
-    const body = (await response.json?.()) as Record<string, any> | undefined;
-    if (!body || typeof body !== 'object') return undefined;
-    const first = Array.isArray(body.errors) ? body.errors[0] : undefined;
-    const text = first?.message ?? body.detail ?? body.message ?? body.error ?? body.title;
-    return typeof text === 'string' && text ? text.slice(0, 500) : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 /**
@@ -263,20 +307,15 @@ interface BatchIngestResponse {
 
 export class AforoMcpBilling {
   private config: Required<Pick<AforoMcpConfig, 'tenantId' | 'productId' | 'apiKey' | 'ingestorUrl'>>;
-  private buffer: UsageEvent[] = [];
-  private flushTimer: ReturnType<typeof setInterval> | null = null;
-  private flushIntervalMs: number;
-  private flushCount: number;
+  /** Bounded queue, single flusher, retries, breaker and shutdown deadline (contract/TRANSPORT-SPEC.md). */
+  private readonly core: TransportCore<UsageEvent>;
   private onError: (error: Error) => void;
-  private onDrop: ((events: UsageEvent[], reason: McpDropReason) => void) | null;
-
-  // Drop accounting — events permanently lost after flush failure
-  private dropped = 0;
-  private invalidDrops = 0;
   /** Request-derived labels already reported as truncated (one WARN per label). */
   private truncationWarned = new Set<string>();
   private productType: string;
   private defaultCustomerId: string | undefined;
+  private customerResolver: CustomerResolver | undefined;
+  private trustCustomerHeader: boolean;
   private defaultAgentId: string;
 
   // Session / heartbeat state
@@ -299,25 +338,43 @@ export class AforoMcpBilling {
       tenantId: config.tenantId,
       productId: config.productId,
       apiKey: config.apiKey,
-      ingestorUrl: config.ingestorUrl.replace(/\/+$/, ''),
+      ingestorUrl: checkBaseUrl(config.ingestorUrl, config.allowInsecureHttp === true),
     };
-    this.flushIntervalMs = config.flushIntervalMs ?? 5000;
-    this.flushCount = Math.min(Math.max(1, config.flushCount ?? 50), MAX_BATCH_EVENTS);
+    // The key is reachable only through the non-enumerable config, never in inspect()/JSON.
+    Object.defineProperty(this, 'config', { enumerable: false });
     this.productType = normalizeProductType(config.productType) ?? DEFAULT_PRODUCT_TYPE;
     this.defaultCustomerId = nonBlank(config.customerId);
+    if (config.customerResolver !== undefined && typeof config.customerResolver !== 'function') {
+      throw new Error('customerResolver must be a function');
+    }
+    this.customerResolver = config.customerResolver;
+    this.trustCustomerHeader = config.trustCustomerHeader === true;
     this.defaultAgentId = nonBlank(config.agentId) ?? 'unknown';
-    this.onDrop = config.onDrop ?? null;
     this.heartbeatIntervalMs = config.heartbeatIntervalMs ?? 30_000;
     this.heartbeatEnabled = config.heartbeatEnabled ?? true;
     this.onError = config.onError ?? ((err) => console.error('[aforo-mcp] Error:', err.message));
     this.onSessionKilled = config.onSessionKilled ?? null;
 
-    // Start periodic flush timer
-    this.flushTimer = setInterval(() => this.flush(), this.flushIntervalMs);
-    // Unref so the background timer never blocks host-process exit (final flush still needs shutdown()).
-    if (this.flushTimer && typeof this.flushTimer === 'object' && 'unref' in this.flushTimer) {
-      this.flushTimer.unref();
-    }
+    const onDrop = config.onDrop;
+    this.core = new TransportCore<UsageEvent>({
+      baseUrl: this.config.ingestorUrl,
+      apiKey: config.apiKey,
+      allowInsecureHttp: config.allowInsecureHttp,
+      headers: { 'X-Tenant-Id': config.tenantId },
+      userAgent: `aforo-mcp-metering-node/${SDK_VERSION}`,
+      flushCount: config.flushCount,
+      flushIntervalMs: config.flushIntervalMs,
+      maxQueueSize: config.maxQueueSize,
+      maxRetries: config.maxRetries,
+      timeoutMs: config.timeoutMs,
+      shutdownTimeoutMs: config.shutdownTimeoutMs,
+      flushOnExit: config.flushOnExit,
+      logPrefix: '[aforo-mcp]',
+      onError: (err) => this.onError(err),
+      onDrop: onDrop ? (events, reason) => onDrop(events, reason) : undefined,
+      // Usage-batch responses carry killedSessionIds too, not only heartbeat responses.
+      onAccepted: (body) => this.handleKilledSessions(body as BatchIngestResponse | undefined),
+    });
   }
 
   // ─── Session lifecycle / heartbeats ─────────────────────────────────
@@ -355,7 +412,7 @@ export class AforoMcpBilling {
   async endSession(): Promise<void> {
     const end = this.activeSessionId ? this.sendHeartbeat('SESSION_END', { heartbeatType: 'SESSION_END' }) : Promise.resolve();
     this.stopSession();
-    await Promise.all([end, this.flush()]);
+    await Promise.all([end, this.core.flush()]);
   }
 
   private startHeartbeat(): void {
@@ -430,9 +487,15 @@ export class AforoMcpBilling {
         headers: this.headers(),
         body: JSON.stringify({ events: [heartbeat] }),
         signal: AbortSignal.timeout(10000),
+        // Never follow a redirect: it would send the API key to another host.
+        redirect: 'manual',
       });
       if (!response.ok) {
-        this.onError(new Error(`Aforo ingestor returned ${response.status} for session heartbeat — ignored`));
+        const redirected = response.status === 0 || (response.status >= 300 && response.status < 400);
+        this.onError(new Error(
+          `Aforo ingestor returned ${response.status} for session heartbeat — ignored`
+            + (redirected ? ' (redirects are not followed; check ingestorUrl)' : ''),
+        ));
         return;
       }
       try {
@@ -445,12 +508,20 @@ export class AforoMcpBilling {
     }
   }
 
+  /**
+   * Stop the active session when an ingest response (heartbeat or usage
+   * batch) lists it in `killedSessionIds`, then tell the caller. Never throws.
+   */
   private handleKilledSessions(result: BatchIngestResponse | null | undefined): void {
     if (result && Array.isArray(result.killedSessionIds) && this.activeSessionId
         && result.killedSessionIds.includes(this.activeSessionId)) {
       const killedId = this.activeSessionId;
       this.stopSession();
-      this.onSessionKilled?.(killedId, 'SERVER_KILL');
+      try {
+        this.onSessionKilled?.(killedId, 'SERVER_KILL');
+      } catch (err) {
+        this.onError(new Error(`onSessionKilled threw for session ${killedId}: ${err instanceof Error ? err.message : String(err)}`));
+      }
     }
   }
 
@@ -470,29 +541,38 @@ export class AforoMcpBilling {
    * Starts the session (and its heartbeats) from the first tool call that
    * carries a sessionId.
    *
-   * Reads `agent_id`, `session_id` and `customer_id` from `request.params._meta`.
+   * Reads `agent_id` and `session_id` from `request.params._meta`. The
+   * customer comes from `customerResolver`, else `_meta.customer_id` when
+   * `trustCustomerHeader` is on, else `customerId`; throws when none of the
+   * three is configured. Extra handler arguments (the MCP SDK's `extra`) are
+   * passed through to the handler and to the resolver.
    */
-  wrapToolHandler<TReq extends { params: { name: string; arguments?: unknown; _meta?: Record<string, unknown> } }, TRes>(
-    handler: (request: TReq) => Promise<TRes>,
+  wrapToolHandler<TReq extends { params: { name: string; arguments?: unknown; _meta?: Record<string, unknown> } }, TRes, TArgs extends unknown[] = unknown[]>(
+    handler: (request: TReq, ...rest: TArgs) => Promise<TRes>,
     options: WrapToolHandlerOptions<TRes> = {},
-  ): (request: TReq) => Promise<TRes> {
-    return async (request: TReq): Promise<TRes> => {
+  ): (request: TReq, ...rest: TArgs) => Promise<TRes> {
+    if (!this.customerResolver && !this.defaultCustomerId && !this.trustCustomerHeader) {
+      throw new Error(MISSING_CUSTOMER_SOURCE);
+    }
+    return async (request: TReq, ...rest: TArgs): Promise<TRes> => {
       const toolName = request.params.name;
       const meta = request.params._meta;
       const agentId = nonBlank(meta?.agent_id) ?? this.defaultAgentId;
       const sessionId = nonBlank(meta?.session_id);
-      const customerId = nonBlank(meta?.customer_id);
       const startTime = Date.now();
+      // Resolved alongside the handler, so a slow lookup never delays the tool's response.
+      const customer = this.resolveCustomer(request, rest[0]);
 
       // Start the session (and heartbeats) on the first tool call that carries one
       if (sessionId && !this.activeSessionId) {
-        this.startSession(sessionId, { customerId: customerId ?? this.defaultCustomerId ?? agentId });
+        const known = typeof customer === 'string' ? customer : this.defaultCustomerId;
+        this.startSession(sessionId, known ? { customerId: known } : {});
       }
 
       let result: TRes | undefined;
       let error: unknown;
       try {
-        result = await handler(request);
+        result = await handler(request, ...rest);
         return result;
       } catch (err) {
         error = err === undefined ? new Error('tool handler threw undefined') : err;
@@ -500,10 +580,40 @@ export class AforoMcpBilling {
       } finally {
         const durationMs = Date.now() - startTime;
         const status = this.resolveToolStatus(result, error, options.statusResolver);
-        this.recordToolInvocation(toolName, agentId, sessionId, status, durationMs,
-          customerId ? { customerId } : undefined);
+        const record = (customerId: string | undefined) => this.recordToolInvocation(
+          toolName, agentId, sessionId, status, durationMs, customerId ? { customerId } : { customerId: '' });
+        if (customer === undefined || typeof customer === 'string') record(customer);
+        else void customer.then(record);
       }
     };
+  }
+
+  /**
+   * The customer for one call: the resolver's answer, else the trusted
+   * `_meta.customer_id`, else the fixed `customerId`. A string or undefined
+   * when known now; a Promise (never rejecting) when the resolver is async.
+   */
+  private resolveCustomer(request: { params: { name: string; arguments?: unknown; _meta?: Record<string, unknown> } }, extra: unknown): string | undefined | Promise<string | undefined> {
+    if (this.customerResolver) {
+      const onError = (err: unknown) => {
+        this.onError(new Error(`customerResolver failed; the call is not metered: ${err instanceof Error ? err.message : String(err)}`));
+        return undefined;
+      };
+      try {
+        const answer = this.customerResolver(request, extra);
+        if (answer && typeof (answer as Promise<unknown>).then === 'function') {
+          return (answer as Promise<string | null | undefined>).then((v) => nonBlank(v), onError);
+        }
+        return nonBlank(answer);
+      } catch (err) {
+        return onError(err);
+      }
+    }
+    if (this.trustCustomerHeader) {
+      const claimed = nonBlank(request.params._meta?.customer_id);
+      if (claimed) return claimed;
+    }
+    return this.defaultCustomerId;
   }
 
   private resolveToolStatus<TRes>(
@@ -535,8 +645,9 @@ export class AforoMcpBilling {
   /**
    * Record a tool invocation manually (if not using wrapToolHandler).
    *
-   * The customer is `options.customerId`, else the `customerId` config, else
-   * the agentId. `executionStatus` is sent as given: pass one of
+   * The customer is `options.customerId`, else the `customerId` config. With
+   * neither the event is dropped as `invalid` (it is never billed to the
+   * agent). `executionStatus` is sent as given: pass one of
    * {@link EXECUTION_STATUSES} (`wrapToolHandler` always does).
    *
    * Never throws. An event the ingestor would reject -- blank toolName,
@@ -590,9 +701,11 @@ export class AforoMcpBilling {
   ): void {
     const resolvedAgentId = nonBlank(agentId) ?? this.defaultAgentId;
     const resolvedSessionId = nonBlank(sessionId);
-    const customerId = nonBlank(options.customerId) ?? this.defaultCustomerId ?? resolvedAgentId;
+    // An explicit '' (from wrapToolHandler) means "resolved to no customer": no fallback.
+    const customerId = options.customerId === '' ? '' : (nonBlank(options.customerId) ?? this.defaultCustomerId ?? '');
     const productType = normalizeProductType(options.productType) ?? this.productType;
     const problems: string[] = [];
+    if (!customerId) problems.push('no customer: set customerResolver, customerId or trustCustomerHeader, or pass options.customerId');
     if (!nonBlank(toolName)) problems.push(`toolName is blank (got "${clip(toolName)}")`);
     if (resolvedAgentId.length > MAX_AGENT_ID) problems.push(`agentId "${clip(resolvedAgentId)}" exceeds ${MAX_AGENT_ID} chars`);
     if (customerId.length > MAX_CUSTOMER_ID) problems.push(`customerId "${clip(customerId)}" exceeds ${MAX_CUSTOMER_ID} chars`);
@@ -630,172 +743,43 @@ export class AforoMcpBilling {
     };
 
     if (problems.length > 0) {
-      // Not buffered, not sent, not thrown — same shape as every other drop.
-      this.recordDrop([event], 'invalid', problems.join(', '));
+      // Not queued, not sent, not thrown — counted and reported like every other drop.
+      this.core.reportDrop([event], 'invalid', problems.join(', '));
       return;
     }
 
-    this.buffer.push(event);
-
-    if (this.buffer.length >= this.flushCount) {
-      this.flush();
-    }
+    // Never sends here: the core's single flusher does, woken at flushCount.
+    this.core.enqueue(event);
   }
 
   /**
-   * Flush buffered events to Aforo ingestor.
+   * Send everything queued now and wait for it. Runs on the single flusher —
+   * never a second concurrent request. While the ingestor is unreachable the
+   * events stay queued (with their idempotency keys) and are retried.
    */
-  async flush(): Promise<void> {
-    if (this.buffer.length === 0) return;
-
-    const events = [...this.buffer];
-    this.buffer = [];
-
-    // POST /v1/ingest/batch rejects more than MAX_BATCH_EVENTS events with 400
-    // (IngestBatchRequest @Size(max = 1000)), so an oversized flush would lose
-    // every event in it. flushCount above 1000, or a burst between timer
-    // ticks, can leave more than that buffered -- send it in slices.
-    for (let i = 0; i < events.length; i += MAX_BATCH_EVENTS) {
-      await this.sendBatch(events.slice(i, i + MAX_BATCH_EVENTS));
-    }
+  async flush(): Promise<CoreFlushResult> {
+    return this.core.flush();
   }
 
-  private async sendBatch(events: UsageEvent[]): Promise<void> {
-    const url = `${this.config.ingestorUrl}/v1/ingest/batch`;
-    // Serialized once: every retry re-sends the same body, same idempotency keys.
-    const body = JSON.stringify({ events });
-
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      let delayMs = Math.pow(2, attempt - 1) * 1000;
-      try {
-        const response = await fetch(url, {
-          method: 'POST',
-          headers: this.headers(),
-          body,
-          signal: AbortSignal.timeout(10000),
-        });
-
-        if (response.ok) {
-          try {
-            const result = unwrapEnvelope(await response.json()) as BatchIngestResponse;
-            this.handlePartialFailure(events, result);
-            // Check for kill signals from server
-            this.handleKilledSessions(result);
-          } catch {
-            // Response body parsing is best-effort — old servers return empty 202
-          }
-          return;
-        }
-
-        const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
-        if (!retryable) {
-          const detail = await readErrorMessage(response);
-          this.onError(new Error(`Aforo ingestor returned ${response.status}${detail ? ` (${detail})` : ''} — not retrying`));
-          this.recordDrop(events, 'rejected', detail);
-          return;
-        }
-        if (attempt === 3) {
-          this.onError(new Error(`Aforo ingestor returned ${response.status} — retries exhausted, ${events.length} event(s) dropped`));
-          break;
-        }
-        if (response.status === 429) {
-          const retryAfter = response.headers?.get?.('Retry-After');
-          const seconds = retryAfter ? parseInt(retryAfter, 10) : NaN;
-          if (!isNaN(seconds) && seconds >= 0) delayMs = seconds * 1000;
-        }
-      } catch (err) {
-        if (attempt === 3) {
-          this.onError(err instanceof Error ? err : new Error(String(err)));
-          break;
-        }
-      }
-
-      await new Promise(resolve => setTimeout(resolve, delayMs));
-    }
-
-    // All 3 attempts failed (5xx / 408 / 429 or network error) — the batch was
-    // already removed from the buffer, so without this it vanishes silently.
-    this.recordDrop(events, 'retry_exhausted');
-  }
-
-  /**
-   * A 2xx can still report per-event rejections. Those events are dropped with
-   * reason 'rejected': by index when the response names them; otherwise they
-   * are counted and reported, but not handed to onDrop (which ones is unknown).
-   */
-  private handlePartialFailure(events: UsageEvent[], result: BatchIngestResponse | null | undefined): void {
-    if (!result || typeof result !== 'object') return;
-    const seen = new Set<number>();
-    const errors = (Array.isArray(result.errors) ? result.errors : []).filter((e) => {
-      const index = Number(e?.index);
-      if (!Number.isInteger(index) || index < 0 || index >= events.length || seen.has(index)) return false;
-      seen.add(index);
-      return true;
-    });
-    const reported = typeof result.failed === 'number' && result.failed > 0 ? Math.floor(result.failed) : 0;
-    const count = Math.min(events.length, Math.max(reported, errors.length));
-    if (count === 0) return;
-
-    const detail = errors.slice(0, 5).map((e) => `#${e.index}: ${e.message}`).join('; ');
-    this.onError(new Error(`Aforo ingestor rejected ${count} event(s)${detail ? `: ${detail}` : ''}`));
-    if (errors.length === count) {
-      this.recordDrop(errors.map((e) => events[Number(e.index)]), 'rejected', detail);
-    } else {
-      this.dropped += count;
-      console.warn(
-        `[aforo-mcp] Ingestor rejected ${count} of ${events.length} event(s) in a batch` +
-        `${detail ? `: ${detail}` : ''} (${this.dropped} total dropped).`,
-      );
-    }
-  }
-
-  /**
-   * Account for permanently lost events: bump the counter, WARN-log, and
-   * invoke the opt-in onDrop hook (exceptions swallowed — a hook bug must
-   * never break flushing). 'invalid' WARNs are throttled (first, then every
-   * 1000th) so a tight loop of bad events can't storm the log.
-   */
-  private recordDrop(events: UsageEvent[], reason: McpDropReason, detail?: string): void {
-    if (events.length === 0) return;
-    this.dropped += events.length;
-    if (reason === 'invalid') {
-      this.invalidDrops += events.length;
-      if (this.invalidDrops === 1 || this.invalidDrops % 1000 === 0) {
-        console.warn(
-          `[aforo-mcp] Invalid tool invocation dropped — ${detail ?? 'failed validation'} ` +
-          `(${this.invalidDrops} invalid, ${this.dropped} total dropped). It was not sent.`,
-        );
-      }
-    } else {
-      console.warn(
-        `[aforo-mcp] Dropped ${events.length} event(s) — ${reason}` +
-        `${detail ? `: ${detail}` : ''} (${this.dropped} total dropped).`,
-      );
-    }
-    if (this.onDrop) {
-      try {
-        this.onDrop(events, reason);
-      } catch {
-        // swallowed
-      }
-    }
-  }
-
-  /** Total events permanently dropped (failed batches, server-rejected and invalid events) since creation. */
+  /** Total events permanently dropped (every McpDropReason) since creation. */
   get droppedCount(): number {
-    return this.dropped;
+    return this.core.droppedCount;
+  }
+
+  /** Events queued and not yet accepted by the ingestor. */
+  get queuedCount(): number {
+    return this.core.queued;
   }
 
   /**
-   * Stop the heartbeat and flush timers and flush remaining events.
+   * Stop the heartbeat and send what is queued for at most
+   * `shutdownTimeoutMs`. Events still queued at the deadline are dropped as
+   * 'shutdown'. Call endSession() first to send a SESSION_END. The SDK
+   * installs no signal handlers: call this from your own SIGTERM handler.
    */
   async shutdown(): Promise<void> {
     this.stopSession();
-    if (this.flushTimer) {
-      clearInterval(this.flushTimer);
-      this.flushTimer = null;
-    }
-    await this.flush();
+    await this.core.shutdown();
   }
 }
 

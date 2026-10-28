@@ -1,159 +1,213 @@
-import { AforoMcpBilling, UsageEvent, McpDropReason } from '../src/index';
-import { drainFakeTimers, settleWithFakeTimers } from './support/timing';
+/**
+ * Delivery and drop accounting against the repo's fault-injecting mock
+ * ingestor (real HTTP, no fetch stubs): an outage keeps events and re-sends
+ * them with the same keys, a non-retryable 4xx drops them as 'rejected', 401
+ * is an outage, per-event `retryable` failures are re-queued, a slow response
+ * past the request timeout is retried, shutdown honours its deadline, overflow
+ * drops the oldest while the ingestor is down, and only one request is ever in
+ * flight. Retries are disabled (maxRetries: 0) and flushes are explicit, so no
+ * test waits on a backoff timer.
+ */
+import { AforoMcpBilling, type McpDropReason, type UsageEvent } from '../src/index';
+import { startMockIngestor, waitFor, type MockIngestor } from './support/mock-ingestor';
 
-// Mock fetch globally
-const mockFetch = jest.fn();
-global.fetch = mockFetch as any;
+jest.setTimeout(20_000);
 
-// The retry backoff (1s + 2s between the 3 attempts) is a setTimeout. It runs
-// on fake timers and settleWithFakeTimers drives it, so a retry-exhaustion
-// test takes no real time instead of 3 real seconds of its 5-second budget.
-
-describe('AforoMcpBilling — drop observability + onDrop hook', () => {
-  let warnSpy: jest.SpyInstance;
-  let errorSpy: jest.SpyInstance;
+describe('AforoMcpBilling delivery (mock ingestor)', () => {
+  let mock: MockIngestor;
   let created: AforoMcpBilling[];
+  let warn: jest.SpyInstance;
+  let error: jest.SpyInstance;
 
-  beforeEach(() => {
+  beforeAll(async () => { mock = await startMockIngestor(); });
+  afterAll(async () => { await mock.stop(); });
+  beforeEach(async () => {
+    await mock.reset();
     created = [];
-    jest.useFakeTimers();
-    mockFetch.mockReset();
-    warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
-    errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    error = jest.spyOn(console, 'error').mockImplementation(() => {});
   });
-
   afterEach(async () => {
-    // Finish anything a failed test left in flight BEFORE real timers come
-    // back, so a half-done retry can never leak into the next test.
-    try {
-      for (const billing of created) {
-        await settleWithFakeTimers(billing.shutdown(), 'afterEach shutdown()');
-      }
-      await drainFakeTimers('afterEach');
-    } finally {
-      warnSpy.mockRestore();
-      errorSpy.mockRestore();
-      jest.useRealTimers();
-    }
+    await mock.clearFaults();
+    for (const b of created) await b.shutdown();
+    warn.mockRestore();
+    error.mockRestore();
   });
 
-  /** Resolves when flush() — including every retry — has finished. */
-  function flushThroughRetries(billing: AforoMcpBilling): Promise<void> {
-    return settleWithFakeTimers(billing.flush(), 'flush()');
-  }
-
-  function newBilling(overrides: Record<string, unknown> = {}) {
-    const billing = new AforoMcpBilling({
-      tenantId: 'tenant_test',
-      productId: 'prod_test',
-      apiKey: 'test-key',
-      ingestorUrl: 'https://ingest.test.aforo.ai',
-      flushIntervalMs: 3_600_000, // long — control flushing manually
-      flushCount: 100,
-      heartbeatEnabled: false,
-      ...overrides,
-    });
-    created.push(billing);
-    return billing;
-  }
-
-  it('retry exhaustion (network error) drops the batch, counts it, warns, and fires onDrop', async () => {
-    mockFetch.mockRejectedValue(new Error('ECONNREFUSED'));
+  function billing(extra: Record<string, unknown> = {}) {
     const drops: Array<{ events: UsageEvent[]; reason: McpDropReason }> = [];
-    const billing = newBilling({
-      onDrop: (events: UsageEvent[], reason: McpDropReason) => drops.push({ events, reason }),
-    });
-
-    billing.recordToolInvocation('search', 'agent_1', 'sess_1', 'SUCCESS', 12);
-    await flushThroughRetries(billing);
-
-    expect(billing.droppedCount).toBe(1);
-    expect(drops).toHaveLength(1);
-    expect(drops[0].reason).toBe('retry_exhausted');
-    expect(drops[0].events[0].toolName).toBe('search');
-    expect(drops[0].events[0].idempotencyKey).toBeTruthy(); // key preserved for replay
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('retry_exhausted'));
-    expect(mockFetch).toHaveBeenCalledTimes(3); // retry count unchanged
-
-    await settleWithFakeTimers(billing.shutdown(), 'shutdown()');
-  });
-
-  it('retry exhaustion on 5xx (previously fully silent) now drops observably', async () => {
-    mockFetch.mockResolvedValue({ ok: false, status: 503 });
-    const reasons: McpDropReason[] = [];
-    const billing = newBilling({
-      onDrop: (_e: UsageEvent[], reason: McpDropReason) => reasons.push(reason),
-    });
-
-    billing.recordToolInvocation('search', 'agent_1', undefined, 'SUCCESS', 5);
-    await flushThroughRetries(billing);
-
-    expect(billing.droppedCount).toBe(1);
-    expect(reasons).toEqual(['retry_exhausted']);
-    expect(mockFetch).toHaveBeenCalledTimes(3);
-
-    await settleWithFakeTimers(billing.shutdown(), 'shutdown()');
-  });
-
-  it('non-retryable 4xx fires onDrop with reason "rejected" and does not retry', async () => {
-    mockFetch.mockResolvedValue({ ok: false, status: 400 });
-    const reasons: McpDropReason[] = [];
-    const billing = newBilling({
-      onDrop: (_e: UsageEvent[], reason: McpDropReason) => reasons.push(reason),
-    });
-
-    billing.recordToolInvocation('search', 'agent_1', undefined, 'SUCCESS', 5);
-    await flushThroughRetries(billing);
-
-    expect(billing.droppedCount).toBe(1);
-    expect(reasons).toEqual(['rejected']);
-    expect(mockFetch).toHaveBeenCalledTimes(1); // 4xx: no retry, unchanged
-
-    await settleWithFakeTimers(billing.shutdown(), 'shutdown()');
-  });
-
-  it('default (no onDrop): drops are counted + warned; onError behavior unchanged', async () => {
-    mockFetch.mockRejectedValue(new Error('ECONNREFUSED'));
     const errors: Error[] = [];
-    const billing = newBilling({ onError: (e: Error) => errors.push(e) });
-
-    billing.recordToolInvocation('search', 'agent_1', undefined, 'SUCCESS', 5);
-    await flushThroughRetries(billing);
-
-    expect(billing.droppedCount).toBe(1);
-    expect(warnSpy).toHaveBeenCalled();
-    expect(errors).toHaveLength(1); // existing onError still fires exactly once
-
-    await settleWithFakeTimers(billing.shutdown(), 'shutdown()');
-  });
-
-  it('a throwing onDrop hook never breaks flushing', async () => {
-    mockFetch.mockRejectedValue(new Error('ECONNREFUSED'));
-    const billing = newBilling({
-      onDrop: () => {
-        throw new Error('hook bug');
-      },
+    const b = new AforoMcpBilling({
+      tenantId: 'tenant_test', productId: 'prod_test', apiKey: 'sk_test', ingestorUrl: mock.url,
+      customerId: 'cust_1', flushIntervalMs: 3_600_000, heartbeatEnabled: false, maxRetries: 0,
+      flushOnExit: false,
+      onDrop: (events, reason) => drops.push({ events, reason }),
+      onError: (e) => errors.push(e),
+      ...extra,
     });
+    created.push(b);
+    return { b, drops, errors };
+  }
 
-    billing.recordToolInvocation('search', 'agent_1', undefined, 'SUCCESS', 5);
-    await expect(flushThroughRetries(billing)).resolves.toBeUndefined();
-    expect(billing.droppedCount).toBe(1);
+  const record = (b: AforoMcpBilling, n: number) => {
+    for (let i = 0; i < n; i++) b.recordToolInvocation(`tool_${i}`, 'agent_1', 'sess_1', 'SUCCESS', 5);
+  };
 
-    await settleWithFakeTimers(billing.shutdown(), 'shutdown()');
+  test('an outage keeps the events; the next flush delivers them with the same keys', async () => {
+    const { b, drops, errors } = billing();
+    const sentKeys: string[][] = [];
+    const realFetch = global.fetch;
+    const spy = jest.spyOn(global, 'fetch').mockImplementation(async (url: any, init: any) => {
+      sentKeys.push(JSON.parse(init.body).events.map((e: UsageEvent) => e.idempotencyKey));
+      return realFetch(url, init);
+    });
+    await mock.faults([{ status: 503, times: 1 }]);
+    record(b, 3);
+    const first = await b.flush();
+    expect(first).toMatchObject({ sent: 0, requeued: 3, queued: 3 });
+    expect(b.droppedCount).toBe(0);
+    expect(drops).toEqual([]);
+    expect(errors[0].message).toMatch(/unavailable/);
+
+    const second = await b.flush();
+    expect(second).toMatchObject({ sent: 3, queued: 0 });
+    const state = await mock.state();
+    expect(state.requests.map((r) => r.status)).toEqual([503, 202]);
+    expect(sentKeys).toHaveLength(2);
+    expect(sentKeys[1]).toEqual(sentKeys[0]);
+    expect(state.requests[1].idempotencyKeys).toEqual(sentKeys[0]);
+    expect(state.acceptedCount).toBe(3);
+    spy.mockRestore();
   });
 
-  it('happy path is unchanged: no drops, no warns', async () => {
-    mockFetch.mockResolvedValue({ ok: true, status: 202, json: async () => ({}) });
-    const onDrop = jest.fn();
-    const billing = newBilling({ onDrop });
+  test('a network reset is an outage too, not a drop', async () => {
+    const { b, drops } = billing();
+    await mock.faults([{ reset: true, times: 1 }]);
+    record(b, 1);
+    expect(await b.flush()).toMatchObject({ requeued: 1 });
+    expect(drops).toEqual([]);
+    expect(await b.flush()).toMatchObject({ sent: 1 });
+  });
 
-    billing.recordToolInvocation('search', 'agent_1', undefined, 'SUCCESS', 5);
-    await flushThroughRetries(billing);
+  test('401 is treated as an outage (a fixed key must not lose usage) and logged once', async () => {
+    const { b, drops } = billing();
+    await mock.faults([{ status: 401, times: 2 }]);
+    record(b, 1);
+    await b.flush();
+    await b.flush();
+    expect(drops).toEqual([]);
+    expect(error.mock.calls.filter((c) => /API key is wrong or revoked/.test(String(c[0])))).toHaveLength(1);
+    expect(await b.flush()).toMatchObject({ sent: 1 });
+  });
 
-    expect(billing.droppedCount).toBe(0);
-    expect(onDrop).not.toHaveBeenCalled();
-    expect(warnSpy).not.toHaveBeenCalled();
+  test('a non-retryable 4xx drops the batch as "rejected" without retrying', async () => {
+    const { b, drops, errors } = billing({ maxRetries: 3 });
+    await mock.faults([{ status: 422, times: 1 }]);
+    record(b, 2);
+    expect(await b.flush()).toMatchObject({ failed: 2 });
+    expect((await mock.state()).requests).toHaveLength(1);
+    expect(b.droppedCount).toBe(2);
+    expect(drops).toHaveLength(1);
+    expect(drops[0].reason).toBe('rejected');
+    expect(drops[0].events.every((e) => typeof e.idempotencyKey === 'string')).toBe(true);
+    expect(errors.some((e) => /422/.test(e.message))).toBe(true);
+  });
 
-    await settleWithFakeTimers(billing.shutdown(), 'shutdown()');
+  test('per-event failures: retryable ones are re-sent with their keys, the others dropped', async () => {
+    const { b, drops } = billing();
+    await mock.faults([{ perEvent: [{ index: 0, message: 'try later', retryable: true }, { index: 1, message: 'unknown metric', retryable: false }] }]);
+    record(b, 3);
+    const first = await b.flush();
+    expect(first).toMatchObject({ sent: 1, failed: 1, requeued: 1 });
+    expect(drops).toEqual([{ events: [expect.objectContaining({ toolName: 'tool_1' })], reason: 'rejected' }]);
+    const keyOfFirst = (await mock.state()).requests[0].idempotencyKeys[0];
+    await b.flush();
+    const state = await mock.state();
+    expect(state.requests[1].idempotencyKeys).toEqual([keyOfFirst]);
+    expect(state.acceptedCount).toBe(2);
+  });
+
+  test('a response slower than the request timeout is retried, not lost', async () => {
+    const { b, drops } = billing({ timeoutMs: 100 });
+    await mock.faults([{ delayMs: 600, times: 1 }]);
+    record(b, 1);
+    expect(await b.flush()).toMatchObject({ requeued: 1 });
+    expect(drops).toEqual([]);
+    expect(await b.flush()).toMatchObject({ sent: 1 });
+    // The slow answer may also have been accepted: the ingestor deduplicates on the key.
+    expect((await mock.state()).uniqueKeys).toBe(1);
+  });
+
+  test('shutdown with a request in flight stops at its deadline and reports the leftovers', async () => {
+    const { b, drops } = billing({ shutdownTimeoutMs: 300 });
+    await mock.faults([{ hang: true, times: -1 }]);
+    record(b, 2);
+    const started = Date.now();
+    await b.shutdown();
+    expect(Date.now() - started).toBeLessThan(3000);
+    expect(drops).toEqual([{ events: expect.any(Array), reason: 'shutdown' }]);
+    expect(drops[0].events).toHaveLength(2);
+    expect(b.droppedCount).toBe(2);
+    // After shutdown a new call is counted and reported as 'closed', not thrown.
+    b.recordToolInvocation('late', 'agent_1', undefined, 'SUCCESS', 1);
+    expect(drops[1].reason).toBe('closed');
+  });
+
+  test('while the ingestor is down the queue is bounded: the oldest event is dropped as "overflow"', async () => {
+    const { b, drops } = billing({ maxQueueSize: 2 });
+    await mock.faults([{ status: 503, times: -1 }]);
+    record(b, 2);
+    await b.flush();
+    b.recordToolInvocation('newest', 'agent_1', 'sess_1', 'SUCCESS', 1);
+    expect(drops).toEqual([{ events: [expect.objectContaining({ toolName: 'tool_0' })], reason: 'overflow' }]);
+    expect(b.queuedCount).toBe(2);
+  });
+
+  test('one flusher: a burst never has more than one request in flight', async () => {
+    const { b } = billing({ flushCount: 10, flushIntervalMs: 20 });
+    await mock.faults([{ delayMs: 30, times: 5 }]);
+    record(b, 55);
+    await b.flush();
+    await waitFor(async () => (await mock.state()).acceptedCount >= 55, 'all events accepted', 5000).catch(async (e) => {
+      const st = await mock.state();
+      throw new Error(`${e.message}: ${JSON.stringify({ accepted: st.acceptedCount, reqs: st.requests.map((r) => [r.status, r.eventCount]), q: b.queuedCount })}`);
+    });
+    expect((await mock.state()).maxInFlight).toBe(1);
+  });
+
+  test('a throwing onDrop never breaks flushing; the drop is still counted', async () => {
+    const { b } = billing({ onDrop: () => { throw new Error('hook bug'); } });
+    await mock.faults([{ status: 400, times: 1 }]);
+    record(b, 1);
+    await expect(b.flush()).resolves.toMatchObject({ failed: 1 });
+    expect(b.droppedCount).toBe(1);
+  });
+
+  test('happy path: everything accepted, nothing dropped, no warnings', async () => {
+    const { b, drops } = billing();
+    record(b, 4);
+    expect(await b.flush()).toMatchObject({ sent: 4, failed: 0 });
+    expect(drops).toEqual([]);
+    expect(warn).not.toHaveBeenCalled();
+    const state = await mock.state();
+    expect(state.requests[0].apiKeyPresent).toBe(true);
+    expect(state.requests[0].userAgent).toMatch(/^aforo-mcp-metering-node\/2\./);
+  });
+
+  test('refuses a plain-http ingestor on a non-local host unless allowInsecureHttp', () => {
+    const base = { tenantId: 't', productId: 'p', apiKey: 'k', customerId: 'c', flushOnExit: false };
+    expect(() => new AforoMcpBilling({ ...base, ingestorUrl: 'http://ingest.example.com' })).toThrow(/https/);
+    const ok = new AforoMcpBilling({ ...base, ingestorUrl: 'http://ingest.example.com', allowInsecureHttp: true });
+    created.push(ok);
+  });
+
+  test('the API key never appears in inspect(), JSON or a log line', async () => {
+    const { b } = billing({ apiKey: 'sk_secret_value_123' });
+    await mock.faults([{ status: 500, times: 1 }]);
+    record(b, 1);
+    await b.flush();
+    const util = require('util');
+    const seen = [util.inspect(b, { depth: 5 }), JSON.stringify(b), ...warn.mock.calls.flat(), ...error.mock.calls.flat()].map(String).join('\n');
+    expect(seen).not.toContain('sk_secret_value_123');
   });
 });

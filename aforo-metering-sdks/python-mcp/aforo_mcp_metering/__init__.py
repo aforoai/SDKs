@@ -12,6 +12,8 @@ Usage:
         product_id="prod_mcp_001",
         api_key=os.environ["AFORO_API_KEY"],
         ingestor_url="https://api.aforo.ai",
+        # Bill the customer your server authenticated, never a value the client sends.
+        customer_resolver=lambda call: current_session_customer_id(),
     )
 
     @server.call_tool()
@@ -24,6 +26,8 @@ Usage:
 from .client import (
     EXECUTION_STATUSES,
     AforoMcpBilling,
+    CustomerResolver,
+    ToolCall,
     ToolStatusResolver,
     __version__,
     default_tool_status,
@@ -32,6 +36,8 @@ from .client import (
 __all__ = [
     "EXECUTION_STATUSES",
     "AforoMcpBilling",
+    "CustomerResolver",
+    "ToolCall",
     "ToolStatusResolver",
     "__version__",
     "default_tool_status",

@@ -9,6 +9,7 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { parseStreamBuffer } from '../interceptor/MessageInterceptor.js';
+import { buildChildEnv } from '../util/childEnv.js';
 import { logger } from '../util/logger.js';
 import { BaseProxy } from './BaseProxy.js';
 
@@ -17,18 +18,26 @@ export class StdioProxy extends BaseProxy {
   private clientBuffer = '';
   private serverBuffer = '';
   private sessionId: string = '';
+  /** Client messages are handled one after another so a quota check never reorders them. */
+  private clientChain: Promise<void> = Promise.resolve();
 
   async start(): Promise<void> {
-    const { command, args, env } = this.config;
+    const { command, args, env, passEnv } = this.config;
     if (!command) throw new Error('command is required for stdio transport');
 
     this.sessionId = this.sessionManager.getOrCreatePrimary();
     logger.info('Starting stdio proxy', { command, args, sessionId: this.sessionId });
 
+    // The child gets an allowlisted environment: never the proxy's AFORO_* settings (G301).
+    const childEnv = buildChildEnv(process.env, env, passEnv);
+    if (childEnv.withheld.length > 0) {
+      logger.warn('AFORO_* variables are never passed to the MCP server', { withheld: childEnv.withheld });
+    }
+
     // Spawn the MCP server as a child process
     this.child = spawn(command, args ?? [], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, ...env },
+      env: childEnv.env,
     });
 
     if (!this.child.stdin || !this.child.stdout) {
@@ -67,6 +76,7 @@ export class StdioProxy extends BaseProxy {
       this.gracefulShutdown('stdin-end');
     });
 
+    this.markServing();
     logger.info('stdio proxy started');
   }
 
@@ -76,18 +86,17 @@ export class StdioProxy extends BaseProxy {
     this.clientBuffer = remaining;
 
     for (const raw of messages) {
-      // Process message (async quota check if needed)
-      this.handleClientMessage(raw, this.sessionId).then(result => {
-        if (result.forward) {
+      this.clientChain = this.clientChain.then(async () => {
+        try {
+          const result = await this.handleClientMessage(raw, this.sessionId);
+          if (result.forward) this.child?.stdin?.write(result.raw + '\n');
+          // Calls the proxy refused (quota) are answered here.
+          if (result.response) process.stdout.write(result.response + '\n');
+        } catch (err) {
+          // Fail-open — forward even if processing fails
+          logger.error('Client message processing error', { error: (err as Error).message });
           this.child?.stdin?.write(raw + '\n');
-        } else if (result.response) {
-          // Quota denied — send error back to client
-          process.stdout.write(result.response + '\n');
         }
-      }).catch(err => {
-        // Fail-open — forward even if processing fails
-        logger.error('Client message processing error', { error: (err as Error).message });
-        this.child?.stdin?.write(raw + '\n');
       });
     }
   }

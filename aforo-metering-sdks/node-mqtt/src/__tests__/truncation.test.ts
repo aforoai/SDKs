@@ -6,6 +6,7 @@
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'events';
 import { AforoMqttBilling, truncateToLimit, type MqttUsageEvent } from '../index';
+import { ackingPublish } from '../../test-support/mqtt-fakes';
 
 const mockFetch = jest.fn();
 global.fetch = mockFetch as any;
@@ -147,7 +148,7 @@ describe('request-derived mqttTopic / mqttClientId', () => {
       flushCount: 100, emitDeliverEvents: true,
     });
     const client: any = new EventEmitter();
-    const original = jest.fn();
+    const original = ackingPublish();
     client.publish = original;
     b2.wrapMqttClient(client, { customerId: 'cust_001', clientId: 'c1' });
     client.publish('p/' + 'a'.repeat(900), 'x');
@@ -165,7 +166,7 @@ describe('request-derived mqttTopic / mqttClientId', () => {
   test('mqtt.js client: an over-long clientId option is cut to 128 and the event is sent; key from the full id', async () => {
     const id = 'k'.repeat(300);
     const client: any = new EventEmitter();
-    client.publish = jest.fn();
+    client.publish = ackingPublish();
     billing.wrapMqttClient(client, { customerId: 'cust_001', clientId: id });
     client.publish('t/1', 'x');
     client.emit('connect');

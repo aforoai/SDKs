@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aforo-agent-metering"
-version = "0.3.2"
+version = "1.0.0"
 description = "Aforo AI Agent Metering SDK — instrument agent runs (sessions, steps, capability calls) for billing and analytics"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -33,11 +33,12 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Libraries",
 ]
-dependencies = []
+dependencies = ["httpx>=0.25"]
 
 [project.optional-dependencies]
-aiohttp = ["aiohttp>=3.8"]
-httpx = ["httpx>=0.24"]
+# Kept so old install lines keep working; the SDK uses only httpx.
+aiohttp = []
+httpx = []
 test = ["pytest>=7", "pytest-asyncio>=0.21"]
 
 [project.urls]

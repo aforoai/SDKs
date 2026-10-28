@@ -16,6 +16,8 @@ from urllib.parse import urlparse
 
 from aforo_mcp_metering.client import AforoMcpBilling
 
+from .mcp_fakes import use_fake_post
+
 MODULE_KEY = "python-mcp"
 
 FIXTURE = json.loads(
@@ -63,8 +65,9 @@ def test_posts_to_contracted_endpoint_with_contracted_body_shape():
         tenant_id="tenant_test",
         product_id="prod_mcp_001",
         api_key="sk_mcp_abc",
-        ingestor_url="https://ingest.test.aforo.ai",
+        ingestor_url="https://ingest.example.test",
         heartbeat_enabled=False,
+        flush_interval_sec=3600,
     )
 
     captured: list = []
@@ -75,14 +78,28 @@ def test_posts_to_contracted_endpoint_with_contracted_body_shape():
 
     # Intercept at the SDK's own HTTP seam — the URL and serialized body it
     # passes here are exactly what would hit the wire.
-    billing._do_post_with_body = capturing_post  # type: ignore[method-assign]
+    use_fake_post(billing, capturing_post)
 
     billing.record_tool_invocation(
-        "search_documents", "agent_contract", "sess_1", "SUCCESS", 42
+        "search_documents", "agent_contract", "sess_1", "SUCCESS", 42, customer_id="cust_contract"
     )
     asyncio.run(billing.flush())
+    billing.shutdown_sync()
 
     assert captured, "no wire request observed"
     url, _headers, body = captured[0]
     assert urlparse(str(url)).path == endpoint
     assert_body_matches_contract(spec, json.loads(body))
+
+
+def test_transport_defaults_match_the_contract_policy():
+    from aforo_mcp_metering._transport import policy
+
+    tp = FIXTURE["transportPolicy"]
+    assert tp["batch"]["defaultEvents"] == policy.DEFAULT_FLUSH_COUNT
+    assert tp["batch"]["maxEvents"] == policy.MAX_BATCH_EVENTS
+    assert tp["queue"]["defaultCapacity"] == policy.DEFAULT_QUEUE_CAPACITY
+    assert tp["timeouts"]["requestMs"] / 1000 == policy.REQUEST_TIMEOUT_S
+    assert tp["timeouts"]["shutdownMs"] / 1000 == policy.SHUTDOWN_TIMEOUT_S
+    assert tp["retry"]["maxRetries"] == policy.MAX_RETRIES
+    assert tp["compression"]["gzip"] is policy.GZIP is False

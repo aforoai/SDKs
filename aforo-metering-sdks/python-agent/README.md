@@ -2,16 +2,15 @@
 
 Meter AI agent runs from Python: record each capability invocation and reasoning step as an `AI_AGENT` usage event, buffered and batched to Aforo. For agent runtimes such as LangChain, LlamaIndex, CrewAI, AutoGen and FastAPI-hosted agents. Python sibling of `@aforoai/agent-metering` (Node).
 
-**Version:** 0.3.2 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 1.0.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
 ```bash
 pip install aforo-agent-metering
-# pick an async HTTP client (optional — stdlib urllib is the fallback):
-pip install "aforo-agent-metering[aiohttp]"
-pip install "aforo-agent-metering[httpx]"
 ```
+
+The package depends on `httpx`. 1.0.0 changes who is billed when no customer is given; see the [changelog](CHANGELOG.md) before upgrading from 0.x.
 
 From source:
 
@@ -35,7 +34,6 @@ async def main():
         api_key=os.environ["AFORO_API_KEY"],
         # ingestor_url defaults to https://api.aforo.ai
     )
-    await client.start()  # begin the periodic flush task
 
     client.record_capability(   # synchronous: buffers the event
         capability_name="summarize_email",
@@ -47,10 +45,12 @@ async def main():
         execution_duration_ms=510,
     )
 
-    await client.shutdown()     # final flush
+    await client.shutdown()     # sends what is left (also runs at exit)
 
 asyncio.run(main())
 ```
+
+`record_capability` and `record_step` only queue the event; they need no event loop and never block. A background thread sends batches. Nothing has to be started (`start()` still exists and does nothing). Code without an event loop can use `client.flush_sync()` and `client.shutdown_sync()`.
 
 Events POST to `https://api.aforo.ai/v1/ingest/batch` as `{"events": [...]}` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`. No `Authorization` header is sent.
 
@@ -61,10 +61,22 @@ from aforo_agent_metering import AforoAgentClient, wrap_capability_handler
 
 client = AforoAgentClient(...)
 
-@wrap_capability_handler(client, capability_name="summarize_email")
-async def summarize_email(text: str, *, agent_id: str, session_id: str, customer_id: str):
+@wrap_capability_handler(
+    client,
+    capability_name="summarize_email",
+    customer_resolver=lambda args, kwargs: current_user().customer_id,
+)
+async def summarize_email(text: str, *, agent_id: str, session_id: str):
     ...
 ```
+
+The decorator needs to know who to bill. Give it one of:
+
+- `customer_resolver(args, kwargs)` — returns the customer from something your service authenticated.
+- `trust_customer_header=True` — bills the call's `customer_id` keyword argument. Only when that value comes from your own trusted code, not from an end user.
+- `default_customer_id` on the client — bills every call to that customer (single-customer deployments).
+
+With none of these, decorating raises `ValueError`. `agent_id` is read from the call's keyword arguments; a call without one is not sent (reason `invalid`). Before 1.0.0 a missing customer was billed to the `agent_id`, and a missing agent to `"unknown"`.
 
 The decorator times the handler, records one invocation when it finishes, and re-raises whatever the handler raised. Status: returned → `SUCCESS`; `TimeoutError` → `TIMEOUT`; any other exception → `ERROR`; `asyncio.CancelledError` / `KeyboardInterrupt` / `SystemExit` → `CANCELLED`. The handler must be `async def`.
 
@@ -76,14 +88,18 @@ The decorator times the handler, records one invocation when it finishes, and re
 | `product_id` | `str` | — (required) | AI_AGENT product the events bill against; stamped in `metadata.productId`. |
 | `api_key` | `str` | — (required) | Aforo API key, sent as `X-API-Key`. |
 | `ingestor_url` | `str` | `https://api.aforo.ai` | Host; `/v1/ingest/batch` is appended. |
-| `default_customer_id` | `str?` | `None` | `customerId` when a call passes none. Falls back to `agent_id`. |
+| `default_customer_id` | `str?` | `None` | `customerId` when a call passes none. The only fallback: without it, an event with no customer is dropped as `invalid`. |
 | `product_type` | `str` | `"AI_AGENT"` | Top-level `productType` on every event (trimmed + upper-cased). Override per event with `record_capability(..., product_type=...)`. |
-| `flush_count` | `int` | `50` | Buffered events that trigger a flush (clamped to 1000, the ingestor's batch limit). |
-| `flush_interval_sec` | `float` | `5.0` | Periodic flush cadence. Requires `await start()`. |
-| `max_retries` | `int` | `3` | Attempts per batch. |
-| `on_error` | `Callable[[Exception], None]?` | logs a WARN | Called on a permanent batch failure. |
-| `on_drop` | `Callable[[list[dict], str], None]?` | `None` | Opt-in hook for events the SDK loses. |
-| `post_fn` | `PostFn?` | aiohttp → httpx → urllib | HTTP transport override, for tests. |
+| `flush_count` | `int` | `500` | Batch size; a queue this long wakes the sender (clamped to 1000, the ingestor's batch limit). |
+| `flush_interval_sec` | `float` | `5.0` | Seconds between background sends. |
+| `max_queue_size` | `int` | `10000` | Events held in memory. When full, the oldest are dropped with reason `overflow`. |
+| `max_retries` | `int` | `3` | Retries per batch before the circuit breaker pauses sending. The events stay queued. |
+| `timeout_sec` | `float` | `10.0` | Per-request timeout. |
+| `shutdown_timeout_sec` | `float` | `5.0` | Time limit for `shutdown()` and the exit hook. |
+| `allow_insecure_http` | `bool` | `False` | Accept a plain `http://` ingestor that isn't `localhost`. Otherwise `ingestor_url` must be `https://`. |
+| `on_error` | `Callable[[Exception], None]?` | logs at debug | Receives a `TransportError`; branch on `.kind`: `outage` / `auth` (events still queued and retried), `rejected` (the ingestor refused them; message carries its `errors[].message`), `shutdown`, `closed`. `.events` and `.status` say which events and which HTTP status. |
+| `on_drop` | `Callable[[list[dict], str], None]?` | `None` | Opt-in hook for events the SDK loses for good. |
+| `post_fn` | `PostFn?` | `None` (httpx) | Async `(url, headers, body) -> (status, body[, retry_after])` used instead of httpx, for tests. Runs on the sender thread. |
 
 ### Execution status
 
@@ -91,15 +107,17 @@ The decorator times the handler, records one invocation when it finishes, and re
 
 ### Retries and dropped events
 
-Retry: 5xx, 408, 429 and network errors, with `1s / 2s` backoff; a 429 waits for its `Retry-After`. Any other 4xx is not retried.
+One background thread sends, one request at a time, over one pooled connection. Network errors, timeouts, 408, 429, 5xx, 401 and 403 are an outage: the batch is retried with jittered backoff (`Retry-After` read as seconds or an HTTP date, capped at 60 s), then a circuit breaker pauses sending and the events stay queued. Nothing is dropped for being unreachable — only when the queue is full. Any other 4xx drops the batch as `rejected`; a 413 splits it first. Every 5xx is retried, not only 500/502/503/504. A redirect (3xx) is never followed, so the API key cannot reach another host; it is treated like 401/403 and logged at ERROR with the target host. The circuit-breaker pause is full jitter: at most 5 s at first and at least 250 ms, growing to 5 min. Each request's `timeout_sec` covers the whole exchange, including reading the response. A flush during an outage makes one attempt; shutdown keeps retrying until its deadline. An event that cannot be turned into JSON is dropped as `invalid` when it is recorded.
 
 `record_capability` and `record_step` never raise for event content. Every event the SDK cannot deliver is counted in `client.dropped_count`, WARN-logged, and passed to `on_drop(events, reason)`. Dropped events keep their idempotency keys.
 
 | `reason` | When |
 |---|---|
-| `retry_exhausted` | The batch still failed after `max_retries` attempts. |
+| `overflow` | The queue was full (`max_queue_size`); the oldest events were dropped to make room. |
+| `shutdown` | Still queued when `shutdown()` or the exit hook reached `shutdown_timeout_sec`. |
+| `closed` | Recorded after `shutdown()`. |
 | `rejected` | A non-retryable 4xx for the batch (`on_error` gets the ingestor's `errors[].message`), a batch that could not be JSON-encoded, or events the ingestor rejected individually in a `202`. For a `202`, only the events the response names by index are passed to the hook; if it names none, they are counted only. |
-| `invalid` | The SDK refused the event before buffering it: blank `capability_name` / `agent_id` (or `session_id` / `step_type` for a step), `agent_id` over 36 characters, `session_id`, `customer_id` or `capability_name` over 64. Nothing passed to `record_*` or to the decorator is truncated. The one exception: a capability name that `wrap_capability_handler` reads from the wrapped call's `capability_name` kwarg is truncated to 64 and the event is still sent. The WARN names the field and limit; it is logged on the first occurrence and then every 1000th. |
+| `invalid` | The SDK refused the event before queueing it: no customer (none passed and no `default_customer_id`), blank `capability_name` / `agent_id` (or `session_id` / `step_type` for a step), `agent_id` over 36 characters, `session_id`, `customer_id` or `capability_name` over 64 UTF-16 code units. Nothing passed to `record_*` or to the decorator is truncated. The one exception: a capability name that `wrap_capability_handler` reads from the wrapped call's `capability_name` kwarg is truncated to 64 and the event is still sent. The WARN names the field and limit; it is logged on the first occurrence and then every 1000th. |
 
 ## Wire format
 
@@ -113,4 +131,4 @@ Install → construct → record → confirm the event in Aforo: **[USER_GUIDE.m
 
 ## What this doesn't cover
 
-This SDK emits usage events. It does not send session heartbeats, check entitlements or quotas, or price anything — rate plans and per-capability pricing are configured in the Aforo console. `record_capability` / `record_step` only buffer; without `await start()` or an explicit `await flush()` nothing is sent until the buffer reaches `flush_count` inside a running event loop.
+This SDK emits usage events. It does not send session heartbeats, check entitlements or quotas, or price anything — rate plans and per-capability pricing are configured in the Aforo console. A process killed with `SIGKILL` (or out of memory) loses whatever was still queued.

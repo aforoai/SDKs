@@ -70,9 +70,9 @@ def _client(**overrides: Any) -> AforoAgentClient:
         tenant_id="tenant_test",
         product_id="prod_ai_001",
         api_key="sk_agent_abc",
-        ingestor_url="https://ingest.test.aforo.ai",
+        ingestor_url="https://ingest.example.test",
         flush_interval_sec=3600.0,
-        **overrides,
+        **{"default_customer_id": "cust_default", **overrides},
     )
 
 

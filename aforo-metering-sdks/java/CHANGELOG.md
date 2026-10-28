@@ -2,6 +2,40 @@
 
 All notable changes to `ai.aforo:metering` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [2.0.0] - 2026-10-26
+
+Breaking. Wave 5 transport core (contract/TRANSPORT-SPEC.md) and customer identity.
+
+### Changed (breaking)
+- **The servlet filter needs a customer source.** Build it with `AforoServletFilter.builder(client)` and set `customerIdResolver(...)`, `usePrincipalAsCustomerId(true)` or `trustCustomerHeader(true)`; `build()` throws without one. The public constructors and instance setters are gone. In Spring, declare a `CustomerIdResolver` bean or set `aforo.use-principal-as-customer-id` / `aforo.trust-customer-header`, or startup fails. `X-Customer-Id` is no longer read by default: callers of your API set it. **Migration:** add a resolver bean that reads the customer from your authentication.
+- **An outage no longer drops events.** After the retries, the batch goes back to the front of the queue with the same idempotency keys and the sender pauses (5 s, doubling with jitter up to 5 min). 401/403 are treated the same way and logged at `SEVERE`. `FlushResult.failed()` counts only events actually dropped.
+- **`track(...)` never throws.** After `close()` the event is reported as the new `DropReason.CLOSED`.
+- **`close()` honours `shutdownTimeoutMs`** (default 5 s); each request in that window uses `min(timeoutMs, time left)`, and events left at the deadline are reported as the new `DropReason.SHUTDOWN`.
+- `baseUrl` must be `https://` (plain `http://` only for localhost, 127.0.0.1, ::1, or with `allowInsecureHttp(true)`).
+- Defaults: `flushCount` 500 (was 50), `retryBaseMs` 500 (was 1000); `timeoutMs` is now the total request deadline.
+- `RingBuffer` and the package-private `Transport` were removed; the transport lives in `com.aforo.metering.internal.transport` (internal, copied into the variant SDKs).
+- Spring auto-configuration is an `@AutoConfiguration`; every bean is `@ConditionalOnMissingBean`, the filter registers only in servlet web apps, and the client is closed by `AforoClientLifecycle` in Spring's stop phase instead of a JVM shutdown hook.
+
+### Added
+- One background sender thread per client; `track()` wakes it with a compare-and-set and never submits a task (G308). One `HttpClient` per client, shut down on close.
+- Full-jitter retries; `Retry-After` in seconds or HTTP-date, capped at 60 s. A 413 splits the batch; bodies are split at 4 MiB. Events a 2xx marks `retryable: true` are resent with their keys.
+- `AforoOptions`: `breakerCooldownMs`, `allowInsecureHttp`, `registerShutdownHook`; properties `aforo.trust-customer-header`, `max-queue-size`, `timeout-ms`, `shutdown-timeout-ms`, `allow-insecure-http`.
+- `toString()` on options, client and properties never prints the API key.
+- Release: `autoPublish` is off; a person releases the staging deployment on Central.
+
+### Changed (review fixes, 2026-10-27)
+- **`close()` is bounded even with a request in flight.** A request started before `close()` used its full `timeoutMs` and was interrupted only after `shutdownTimeoutMs + 2 s`; its batch was lost uncounted and pending `flush()` calls never returned. It is now cut at the shutdown deadline, its batch is reported as `SHUTDOWN`, pending `flush()` calls complete, and `close()` returns within `shutdownTimeoutMs` plus 500 ms.
+- **`timeoutMs` covers reading the response body.** A server that stalls mid-body or drips one byte at a time is cut off (it used to hold the sender forever).
+- **A 3xx is an outage, never followed:** logged at `SEVERE` with the target host, the batch requeued, the breaker opened. Fix the base URL to deliver.
+- **Per-event `retryable` failures** are resent at most `maxRetries` times with jittered backoff, then treated as an outage; a 2xx that still carries retryable events no longer resets the breaker, so its cooldown grows.
+- **Breaker cooldown** is `max(250 ms, random(0, ceiling))`; it could be 0 ms.
+- **`flush()` while the breaker is open** makes one attempt instead of returning at once. **Shutdown after an outage** keeps retrying with jittered backoff until the deadline instead of waiting out the cooldown.
+- `Retry-After` may be fractional (`1.5`); an event whose serialization recurses (cyclic metadata) is dropped as `INVALID` at `track()` instead of throwing.
+- **Spring:** `AforoClientLifecycle` uses phase `DEFAULT_PHASE - 3072` (`AforoClientLifecycle.PHASE`). The old `DEFAULT_PHASE - 2048` equals Spring Boot's web server stop phase, so the client could close before the server's last requests were metered.
+
+### Added (review fixes, 2026-10-27)
+- `AforoOptions.onError(Consumer<AforoError>)` with `AforoError.kind()` (`OUTAGE`, `AUTH`, `REJECTED`, `SHUTDOWN`, `CLOSED`), `events()`, `status()`, `willRetry()`; `AforoOptions.onAccepted(...)` with the unwrapped 2xx body.
+
 ## [1.1.2] - 2026-10-01
 
 ### Changed

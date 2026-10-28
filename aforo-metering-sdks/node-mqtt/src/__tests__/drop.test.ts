@@ -2,11 +2,12 @@
  * Drop observability + onDrop hook (A+ delivery-guarantee prompt 6 —
  * transport-variant mirror of the core SDK's drop hardening).
  *
- * The buffer is unbounded and drained at flush start, so there is no
- * 'overflow': drops come from retry exhaustion, a rejection by the ingestor,
- * or a failed client-side check ('invalid', covered in billing.test.ts).
- * Retry sleeps are setTimeouts; they run on fake timers and are driven to
- * completion by settleWithFakeTimers, so no real time passes.
+ * 2.x keeps events queued through an ingestor outage; they are lost only
+ * when the shutdown deadline passes (reason 'shutdown'), on a rejection by
+ * the ingestor, or on a failed client-side check ('invalid', covered in
+ * billing.test.ts). Retry sleeps and the shutdown deadline are setTimeouts;
+ * they run on fake timers and are driven to completion by
+ * settleWithFakeTimers, so no real time passes.
  */
 
 import { AforoMqttBilling, type MqttUsageEvent, type DropReason } from '../index';
@@ -72,7 +73,7 @@ describe('AforoMqttBilling — drop observability + onDrop hook', () => {
     await settleWithFakeTimers(billing.shutdown(), 'shutdown() flush');
   }
 
-  it('retry exhaustion (network) drops the batch, counts it, warns, and fires onDrop with keys', async () => {
+  it('network outage: events stay queued until the shutdown deadline, then drop as shutdown with keys', async () => {
     mockFetch.mockRejectedValue(new Error('ECONNREFUSED'));
     const drops: Array<{ events: MqttUsageEvent[]; reason: DropReason }> = [];
     const billing = newBilling({
@@ -85,13 +86,13 @@ describe('AforoMqttBilling — drop observability + onDrop hook', () => {
 
     expect(billing.droppedCount).toBe(2);
     expect(drops).toHaveLength(1);
-    expect(drops[0].reason).toBe('retry_exhausted');
+    expect(drops[0].reason).toBe('shutdown');
     expect(drops[0].events).toHaveLength(2);
     // Events keep their keys — dedup-safe replay is possible
     expect(drops[0].events[0].idempotencyKey).toBeTruthy();
     expect(drops[0].events[0].customerId).toBe('cust_1');
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('retry_exhausted'));
-    expect(mockFetch).toHaveBeenCalledTimes(3); // retry count unchanged
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('shutdown'));
+    expect(mockFetch).toHaveBeenCalled(); // retry counts are covered by the transport-core tests in node/
   });
 
   it('terminal 4xx rejection fires onDrop with reason "rejected"', async () => {
@@ -109,7 +110,7 @@ describe('AforoMqttBilling — drop observability + onDrop hook', () => {
     expect(mockFetch).toHaveBeenCalledTimes(1); // a non-retryable 4xx is not re-sent
   });
 
-  it('terminal 5xx exhaustion fires onDrop with reason "retry_exhausted"', async () => {
+  it('a 5xx outage keeps events queued; the shutdown deadline reports them as "shutdown"', async () => {
     mockFetch.mockResolvedValue({ ok: false, status: 503 });
     const reasons: DropReason[] = [];
     const billing = newBilling({
@@ -120,7 +121,7 @@ describe('AforoMqttBilling — drop observability + onDrop hook', () => {
     await shutdownThroughRetries(billing);
 
     expect(billing.droppedCount).toBe(1);
-    expect(reasons).toEqual(['retry_exhausted']);
+    expect(reasons).toEqual(['shutdown']);
   });
 
   it('default (no onDrop): drop is counted + warned, onError still fires exactly once', async () => {

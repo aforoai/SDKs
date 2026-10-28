@@ -1,6 +1,6 @@
 # grpc-metering-go — User Guide
 
-**Version:** 1.2.2 · **Updated:** 2026-10-01 · **Audience:** Go engineers metering a gRPC server with server interceptors.
+**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Go engineers metering a gRPC server with server interceptors.
 
 ## What you'll build
 
@@ -8,15 +8,15 @@ A gRPC server that emits one Aforo billing event per RPC — service, method, gR
 
 ## Prerequisites
 
-- Go 1.21+ (the module declares `go 1.21`).
+- Go 1.26+ (the module declares `go 1.26.0`: the `golang.org/x/net` release without known vulnerabilities requires it).
 - `google.golang.org/grpc` v1.60.0 (the version this module pins).
 - An Aforo API key (`AFORO_API_KEY`), a `tenant_id`, a `product_id`, and the fully-qualified `service_name`. All four are SDK config — never read from a client header.
-- A customer id reachable from the call context — by default the `x-customer-id` gRPC metadata key.
+- A way to get the Aforo customer for a call from your own authentication (auth interceptor, token subject, mTLS peer).
 - Ingestor base URL — `https://api.aforo.ai`.
 
 ## Step 1 — Add the module
 
-Releases are git tags of the form `aforo-metering-sdks/go-grpc/vX.Y.Z` on github.com/aforoai/SDKs. Use `v1.2.2` or later: `v1.0.0` was tagged from an older copy of this code and lacks the fixes listed in the changelog. Until the `v1.2.2` tag exists, `go get github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc@main` resolves to a pseudo-version of the default branch. To build against a local checkout, clone and `replace`:
+The import path ends in `/v2` (version 2 changed the public API; see the [changelog](CHANGELOG.md)). Releases are git tags `aforo-metering-sdks/go-grpc/v2.X.Y` on github.com/aforoai/SDKs. Until the `v2.0.0` tag exists, build against a local checkout with a `replace`:
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
@@ -24,9 +24,9 @@ git clone https://github.com/aforoai/SDKs.git
 
 ```go
 // go.mod (your service)
-require github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc v1.2.2
+require github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc/v2 v2.0.0
 
-replace github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc => ../SDKs/aforo-metering-sdks/go-grpc
+replace github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc/v2 => ../SDKs/aforo-metering-sdks/go-grpc
 ```
 
 ```bash
@@ -43,7 +43,7 @@ import (
 	"log"
 	"os"
 
-	grpcmetering "github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc"
+	grpcmetering "github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc/v2"
 )
 
 billing, err := grpcmetering.New(grpcmetering.Config{
@@ -59,7 +59,7 @@ if err != nil {
 defer billing.Shutdown(context.Background())
 ```
 
-> ⚠ `Shutdown(ctx)` flushes pending events and waits for the flush loop, bounded by the context — pass a context with a deadline if you don't want shutdown to block indefinitely on a stuck ingestor. Skip it and pending events die with the process.
+> ⚠ `Shutdown(ctx)` sends what is queued, bounded by the earlier of `ctx`'s deadline and `ShutdownTimeout` (5 s). Events still queued then go to `OnDrop` with reason `shutdown` and `Shutdown` returns an error wrapping `ErrShutdownIncomplete`. Call it from your shutdown path; the library installs no signal handler.
 
 ## Step 3 — Register the interceptors
 
@@ -74,9 +74,9 @@ server := grpc.NewServer(
 
 Each interceptor runs the handler, then records one event after it returns. The gRPC status is derived from the handler's error (`status.FromError`); a nil error records `OK`. The method name recorded is the trailing segment of `info.FullMethod` (e.g. `/acme.v1.UserService/GetUser` → `GetUser`); the call type is `UNARY`, `CLIENT_STREAM`, `SERVER_STREAM`, or `BIDI_STREAM`.
 
-## Step 4 — Override customer-id extraction (when it's in a token)
+## Step 4 — Tell the SDK who the customer is
 
-Default reads the `x-customer-id` metadata key. Behind your own auth you typically decode it:
+`CustomerResolver` is required (unless you opt into `TrustCustomerHeader`). Return the customer your server authenticated:
 
 ```go
 import "google.golang.org/grpc/metadata"
@@ -87,7 +87,7 @@ billing, _ := grpcmetering.New(grpcmetering.Config{
 	APIKey:      os.Getenv("AFORO_API_KEY"),
 	IngestorURL: "https://api.aforo.ai",
 	ServiceName: "acme.v1.UserService",
-	CustomerExtractor: func(ctx context.Context) string {
+	CustomerResolver: func(ctx context.Context) string {
 		md, ok := metadata.FromIncomingContext(ctx)
 		if !ok || len(md.Get("authorization")) == 0 {
 			return ""
@@ -97,34 +97,19 @@ billing, _ := grpcmetering.New(grpcmetering.Config{
 })
 ```
 
-Calls where the extractor returns `""` are not metered.
+Calls where the resolver returns `""` are served as usual but not billed; each is counted as `invalid` in `DroppedCount()`. `TrustCustomerHeader: true` instead bills the customer named in the `x-customer-id` metadata — your callers control metadata, so use it only behind a proxy that sets it and strips client values.
 
-## Step 5 — Count messages exactly on streaming RPCs
+## Step 5 — Streaming RPCs are counted for you
 
-The interceptors record `messageCount = 1` per stream — fine for unary, an undercount for streaming. If you bill per message, call `Record()` from inside the handler with the real count:
+`StreamInterceptor` counts the messages each stream actually carried: `messageCount` is received + sent, and the event metadata adds `messagesReceived` and `messagesSent`. You do not need a manual `Record()` for streams.
 
-```go
-func (s *server) ListUsers(req *pb.ListReq, stream pb.UserService_ListUsersServer) error {
-	start := time.Now()
-	n := 0
-	for _, u := range users {
-		if err := stream.Send(u); err != nil {
-			return err
-		}
-		n++
-	}
-	billing.Record(stream.Context(), "ListUsers", "SERVER_STREAM", n, nil, time.Since(start).Milliseconds())
-	return nil
-}
-```
-
-> ⚠ Doing both the `StreamInterceptor` AND a manual `Record()` in the same handler emits **two** events for that RPC (one with count 1 from the interceptor, one with your real count). Pick one path per streaming method: either drop `StreamInterceptor` and `Record()` manually, or accept the interceptor's count-of-1.
+> ⚠ If you also call `Record()` from inside a streaming handler, that RPC emits two events. Use one path per method.
 
 `Record(ctx, method, callType, messageCount, err, durationMs)` — the gRPC status label is derived from the `err` you pass.
 
 ## Step 6 — Verify it landed
 
-The buffer flushes every `FlushInterval` (5s) or when it reaches `FlushCount` (50). Make one RPC, wait ~6 seconds (or `Shutdown()` to force a drain), then check Aforo:
+The sender runs every `FlushInterval` (5s) or when `FlushCount` (500) events are queued. Make one RPC, then call `billing.Flush(ctx)` (or `Shutdown(ctx)`), then check Aforo:
 
 - In the console, open the customer and look for recent `grpc_api.rpc_calls` events.
 - Or query the ingestion API for that tenant + metric.
@@ -152,12 +137,20 @@ Content-Type: application/json
 | `IngestorURL` | `string` | — (required) | Base; `/v1/ingest/batch` is appended. |
 | `ServiceName` | `string` | — (required) | Fully-qualified gRPC service; recorded as `grpcService`. |
 | `ProductType` | `string` | `GRPC_API` | Top-level `productType` on every event; per-event override via `EventOptions`. |
-| `FlushCount` | `int` | `50` | Buffer-size flush threshold. |
-| `FlushInterval` | `time.Duration` | `5s` | Background flush cadence. |
-| `HTTPClient` | `*http.Client` | `&http.Client{Timeout: 10s}` | HTTP client override. |
-| `CustomerExtractor` | `func(context.Context) string` | reads `x-customer-id` metadata | Per-call customer-id resolver. |
-| `OnError` | `func(error)` | no-op | Marshal failures, retry-exhausted drops, non-retryable `4xx` rejections, and partial failures (with the ingestor's `errors[].message`). |
-| `OnDrop` | `func([]map[string]any, DropReason)` | `nil` | Opt-in hook called with events the SDK drops (`retry_exhausted`, `rejected`, `invalid`). See [Dropped events](#dropped-events). |
+| `AllowInsecureHTTP` | `bool` | `false` | `IngestorURL` must be `https://`; plain `http://` is accepted only for `localhost`, `127.0.0.1`, `::1`, or with this set. |
+| `FlushCount` | `int` | `500` | Events per request (max 1000); reaching it wakes the sender. |
+| `FlushInterval` | `time.Duration` | `5s` | The sender also runs on this interval. |
+| `MaxQueueSize` | `int` | `10000` | Queue capacity. When full the **oldest** event is dropped (`overflow`). |
+| `MaxRetries` | `int` | `3` | Retries per batch; a negative value disables retries. |
+| `RetryBase` | `time.Duration` | `500ms` | Full-jitter backoff base (each wait is random up to `min(30s, RetryBase × 2^attempt)`). |
+| `Timeout` | `time.Duration` | `10s` | Total deadline per HTTP request. |
+| `ShutdownTimeout` | `time.Duration` | `5s` | How long `Shutdown` keeps sending. |
+| `HTTPClient` | `*http.Client` | one pooled client | Use your own client for every request; you keep ownership. |
+| `CustomerResolver` | `func(context.Context) string` | — (required unless `TrustCustomerHeader`) | Per-call customer id from your authentication. |
+| `TrustCustomerHeader` | `bool` | `false` | Bill the customer in `CustomerMetadataKey` metadata (default `x-customer-id`). |
+| `OnError` | `func(error)` | no-op | Called when the ingestor rejects a batch or events (messages include its `errors[].message`), when it becomes unreachable (once per outage), when `Shutdown` leaves events unsent, for an event recorded after `Shutdown`, and when an event is invalid. Sending problems arrive as `*TransportError`: use `errors.As` and branch on `Kind` (`KindOutage`, `KindAuth`, `KindRejected`, `KindShutdown`, `KindClosed`); `Events` holds the events concerned. Invalid events arrive as a plain error. Runs on the background sender; it may call `Flush` or `Shutdown`. Never carries the API key. |
+| `OnAccepted` | `func(body json.RawMessage, events []map[string]any)` | nil | Called after every `2xx` with the response's `data` object (envelope removed — for example `killedSessionIds`) and the events of that request. Same goroutine rules as `OnError`; panics are recovered. |
+| `OnDrop` | `func([]map[string]any, DropReason)` | `nil` | Opt-in hook called with events the SDK gives up on (`overflow`, `rejected`, `invalid`, `shutdown`, `closed`). See [Dropped events](#dropped-events). |
 
 gRPC status mapping is the canonical upper-snake name of `status.Code()` (e.g. `codes.Canceled` → `CANCELLED`, `codes.InvalidArgument` → `INVALID_ARGUMENT`): `OK`, `CANCELLED`, `UNKNOWN`, `INVALID_ARGUMENT`, `DEADLINE_EXCEEDED`, `NOT_FOUND`, `ALREADY_EXISTS`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED`, `FAILED_PRECONDITION`, `ABORTED`, `OUT_OF_RANGE`, `UNIMPLEMENTED`, `INTERNAL`, `UNAVAILABLE`, `DATA_LOSS`, `UNAUTHENTICATED`.
 
@@ -167,11 +160,13 @@ An event the SDK cannot deliver is never lost silently. `billing.DroppedCount()`
 
 | `DropReason` | When |
 |---|---|
-| `grpcmetering.DropRetryExhausted` (`retry_exhausted`) | A batch failed all 3 attempts (transport error, `408`, `429`, `5xx`). |
+| `grpcmetering.DropOverflow` (`overflow`) | The queue was full (for example during a long outage); the oldest event was evicted. |
+| `grpcmetering.DropShutdown` (`shutdown`) | Still queued when `Shutdown`'s deadline passed. `Shutdown` returns an error wrapping `ErrShutdownIncomplete`. |
+| `grpcmetering.DropClosed` (`closed`) | Recorded after `Shutdown`. |
 | `grpcmetering.DropRejected` (`rejected`) | The ingestor answered a non-retryable `4xx`, or refused individual events in a `2xx` partial-failure response. In the partial case only the events named by `errors[].index` are passed to `OnDrop`; failures the ingestor does not identify are counted but not attributed to an event. |
 | `grpcmetering.DropInvalid` (`invalid`) | The event failed client-side validation and was never buffered: a blank method, `customerId` over 64 characters, `grpcService` (`Config.ServiceName`) over 255 or `productType` over 20. A method name over 128 is not dropped — it comes from the incoming RPC, so it is truncated to 128 characters without splitting a character, the event is sent, and a WARN is logged once (interceptors and `Record` alike). The invalid-drop WARN log names the field, the limit and the value (throttled: first occurrence, then every 1000th); `OnError` is called too. |
 
-A call with no customer id is not metered and is not a drop. An unknown `executionStatus` is not a drop either: the status is left off (or replaced by the derived one) and the event is sent.
+A call with a blank customer id is not billed: it is dropped as `invalid`, counted in `DroppedCount()` and reported via `OnError`. An unknown `executionStatus` is not a drop either: the status is left off (or replaced by the derived one) and the event is sent.
 
 ```go
 OnDrop: func(events []map[string]any, reason grpcmetering.DropReason) {
@@ -179,7 +174,7 @@ OnDrop: func(events []map[string]any, reason grpcmetering.DropReason) {
 },
 ```
 
-Idempotency keys are minted once, when the event is recorded. Every retry re-sends the same body, so a retried batch is deduplicated by the ingestor.
+Idempotency keys are minted once, when the event is recorded. Every retry and every resend after an outage carries the same key, so the ingestor deduplicates it. `DropRetryExhausted` (`retry_exhausted`) is kept for compatibility but is no longer reported: v2 keeps a failing batch queued instead of dropping it.
 
 ## Execution status
 
@@ -190,10 +185,10 @@ See [Execution status (outcome-based pricing)](README.md#execution-status-outcom
 | Symptom | Cause | Fix |
 |---|---|---|
 | `New` returns an error | A required field (incl. `ServiceName`) is empty | Set all five required fields. |
-| No events for some calls | Extractor returned `""` (no `x-customer-id` metadata) | Ensure the customer id is in the call metadata, or override `CustomerExtractor`. |
+| No events for some calls; `DroppedCount()` grows with `invalid` | `CustomerResolver` returned `""` | Check those calls are authenticated before the metering interceptor runs. |
 | Streaming RPC counts as 1 message | Interceptor default; per-frame counts aren't observed | Call `billing.Record(...)` with the real count (and don't also rely on the interceptor for that method). |
 | One streaming RPC produces two events | Both `StreamInterceptor` and a manual `Record()` fired | Use one path per method. |
-| `DroppedCount()` rises with reason `retry_exhausted` | Flush exhausted its 3 attempts | Set `OnError`; verify `APIKey`, `IngestorURL`, and that the tenant owns the metric. |
+| `OnError` reports "ingestor unavailable" | The ingestor is unreachable or answered `401`/`403` | Nothing is lost while the queue has room; verify `APIKey` and network access to `IngestorURL`. Events beyond `MaxQueueSize` are dropped as `overflow`. |
 | `Shutdown` blocks at exit | Ingestor unreachable while draining | Pass a context with a deadline to `Shutdown(ctx)` so it returns `ctx.Err()` instead of hanging. |
 
 ## What this guide does NOT cover

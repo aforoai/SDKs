@@ -130,7 +130,7 @@ class AforoWsBillingTest {
     // ── Lifecycle: open → close ────────────────────────────────────────
 
     @Test
-    @DisplayName("openConnection emits CONNECTION_OPENED event immediately (PING marker)")
+    @DisplayName("openConnection emits CONNECTION_OPENED immediately (OPEN frame type, connection_opened metric)")
     void openConnectionEmitsOpen() throws Exception {
         try (AforoWsBilling b = baseBuilder().flushCount(1).build()) {
             String connId = b.openConnection("cust_001", Map.of("region", "us-east-1"));
@@ -139,7 +139,8 @@ class AforoWsBillingTest {
         }
         JsonNode ev = requestBodies.get(0).get("events").get(0);
         assertThat(ev.get("productType").asText()).isEqualTo("WEBSOCKET_API");
-        assertThat(ev.get("wsFrameType").asText()).isEqualTo("PING");
+        assertThat(ev.get("wsFrameType").asText()).isEqualTo("OPEN");
+        assertThat(ev.get("metricName").asText()).isEqualTo("websocket_api.connection_opened");
         assertThat(ev.get("messageCount").asInt()).isEqualTo(0);
         assertThat(ev.get("metadata").get("event").asText()).isEqualTo("CONNECTION_OPENED");
         assertThat(ev.get("metadata").get("region").asText()).isEqualTo("us-east-1");
@@ -188,7 +189,7 @@ class AforoWsBillingTest {
             boolean isLifecycle = eventField != null
                     && (eventField.asText().equals("CONNECTION_OPENED")
                         || eventField.asText().equals("CONNECTION_CLOSED"));
-            return !isLifecycle && !type.equals("CLOSE") && !type.equals("PING");
+            return !isLifecycle && !type.equals("CLOSE") && !type.equals("OPEN");
         });
         assertThat(frameMessages).isEmpty();
     }

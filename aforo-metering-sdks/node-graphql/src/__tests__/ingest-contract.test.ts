@@ -71,6 +71,7 @@ describe('ingest contract guard (shared fixture)', () => {
       tenantId: 'tenant-001',
       productId: 'prod-gql-001',
       apiKey: 'sk_gql_abc',
+      customerResolver: (ctx: any) => ctx?.customerId, trustCustomerHeader: true,
       ingestorUrl: 'https://ingest.test.aforo.ai',
     });
 
@@ -118,6 +119,7 @@ describe('ingest contract guard (shared fixture)', () => {
       tenantId: 'tenant-001',
       productId: 'prod-gql-001',
       apiKey: 'sk_gql_abc',
+      customerResolver: (ctx: any) => ctx?.customerId, trustCustomerHeader: true,
       ingestorUrl: 'https://ingest.test.aforo.ai',
     });
     billing.record({

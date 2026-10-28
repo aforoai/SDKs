@@ -187,6 +187,7 @@ def fixture():
         schema_version="v-test",
         flush_count=1,
         flush_interval_sec=60.0,
+        trust_customer_header=True,  # the test client sends x-customer-id
     )
 
     schema = _build_schema()

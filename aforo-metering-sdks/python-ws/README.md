@@ -2,7 +2,7 @@
 
 Meter WebSocket traffic — connection duration, message counts, and bytes — by wrapping a connection from the `websockets` library or a FastAPI/Starlette `WebSocket` route. One open + one close event per connection by default, or one event per frame.
 
-**Version:** 1.2.2 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -15,7 +15,7 @@ pip install "aforo-ws-metering[fastapi]"      # FastAPI / Starlette
 pip install "aforo-ws-metering[httpx]"        # faster HTTP flush than stdlib urllib
 ```
 
-**Install `1.2.2` or later. `1.0.0` on PyPI was built from an older copy of this code and lacks the fixes listed in the changelog.** If `1.2.2` is not on PyPI yet, install from source:
+**Install `2.0.0` or later. `1.0.0` on PyPI was built from an older copy of this code and lacks the fixes listed in the changelog.** If `2.0.0` is not on PyPI yet, install from source:
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
@@ -42,7 +42,7 @@ billing = AforoWsBilling(
 )
 
 async def handler(ws):
-    customer_id = dict(ws.request_headers).get("x-customer-id")
+    customer_id = customer_for_token(ws.request.headers.get("Authorization"))  # your verified auth
     if not customer_id:
         await ws.close(code=4401); return
     async with await track_websockets_connection(billing, ws, customer_id):
@@ -73,7 +73,7 @@ app = FastAPI()
 @app.websocket("/ws")
 async def ws_handler(ws: WebSocket):
     await ws.accept()
-    customer_id = ws.headers.get("x-customer-id")
+    customer_id = customer_for_token(ws.headers.get("authorization"))  # your verified auth
     if not customer_id:
         await ws.close(code=4401); return
     async with await track_starlette_websocket(billing, ws, customer_id):
@@ -86,7 +86,7 @@ Events POST to `https://api.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>
 
 > ⚠ Events are sent to the ingestor's **`/v1/ingest/batch`** path as `{"events": [...]}`, at most 1000 events per request (larger buffers are split). Set `ingestor_url` to the host only — the SDK appends the path.
 
-> `customer_id` is resolved by **your** handler (the examples read `x-customer-id`) and passed into the tracker — read it from a header your gateway sets, not a value the client can spoof. The tracker doesn't meter a connection you don't wrap.
+> **The customer comes from your own auth.** Pass the `customer_id` your handler resolved from verified identity, or `customer_resolver=callable(websocket)`. Reading the `x-customer-id` handshake header needs `trust_customer_header=True` — the client sets that header, so use it only behind a gateway that overwrites it. With none of the three, the helper raises `ValueError`. If the customer resolves to nothing, the connection still works and its events are counted as `invalid` drops. The tracker doesn't meter a connection you don't wrap.
 
 ## Configuration
 
@@ -99,19 +99,25 @@ Constructor arguments for `AforoWsBilling(...)`:
 | `api_key` | `str` | — (required) | Aforo API key, sent to the ingestor as `X-API-Key`. |
 | `ingestor_url` | `str` | — (required) | Host; `/v1/ingest/batch` is appended. |
 | `flush_interval_sec` | `float` | `3.0` | Background flush cadence (daemon thread from construction). |
-| `flush_count` | `int` | `100` | Buffer size that triggers an immediate flush. |
+| `flush_count` | `int` | `500` | Events per request, and the queue size that wakes the sender early (at most 1000). |
 | `per_frame_events` | `bool` | `False` | Emit one event per inbound/outbound frame instead of open+close. |
-| `on_error` | `Callable[[Exception], None]?` | logs | Called on permanent batch failure, and with the ingestor's `errors[].message` when it rejects events. |
-| `on_drop` | `Callable[[list[dict], str], None]?` | `None` | Called with events that will not be delivered and the reason (`invalid`, `rejected`, `retry_exhausted`). See [Dropped events](#dropped-events). Pass by keyword. |
+| `on_error` | `Callable[[Exception], None]?` | logs | Receives a `TransportError`; branch on `.kind`: `outage` / `auth` (events still queued and retried), `rejected` (the ingestor refused them; message carries its `errors[].message`), `shutdown`, `closed`. `.events` and `.status` say which events and which HTTP status. |
+| `on_drop` | `Callable[[list[dict], str], None]?` | `None` | Called with events that will not be delivered and the reason (`overflow`, `rejected`, `invalid`, `shutdown`, `closed`). See [Dropped events](#dropped-events). Pass by keyword. |
 | `product_type` | `str` | `"WEBSOCKET_API"` | Top-level `productType` sent on every event (trimmed and upper-cased; values the SDK does not know are passed through). Override per event with a `productType` key in `push({...})` or `product_type=` on `track_websockets_connection` / `track_starlette_websocket`. |
+| `max_queue_size` | `int` | `10000` | Queue capacity; the oldest event is dropped as `overflow` when full. Keyword-only. |
+| `timeout_sec` | `float` | `10.0` | Total deadline per HTTP request. Keyword-only. |
+| `shutdown_timeout_sec` | `float` | `5.0` | `shutdown()` flushes for at most this long; leftovers are dropped as `shutdown`. Keyword-only. |
+| `connection_idle_timeout_sec` | `float` | `3600.0` | A connection opened through a helper that sees no frames for this long is reported closed (`ABNORMAL_CLOSURE`, `closedBy: "sdk_idle_timeout"`) and forgotten. Connections still open at `shutdown()` are reported closed (`GOING_AWAY`, `closedBy: "sdk_shutdown"`). Keyword-only; negative raises `ValueError`. |
+| `allow_insecure_http` | `bool` | `False` | Allow plain `http://` to a host other than localhost. Keyword-only. |
+| `http_transport`, `transport_options` | | `None` | An `httpx` transport / extra transport-core settings, for tests and unusual networks. Keyword-only. |
 
-Close-code mapping: `WS_CLOSE_REASONS` maps standard close codes (1000–1011) to descriptor labels (`NORMAL_CLOSURE`, `ABNORMAL_CLOSURE`, `POLICY_VIOLATION`, …); an exception inside the handler surfaces as `INTERNAL_ERROR`. Retry is fixed at **3 attempts** (`1s / 2s` backoff between them); 408 and 5xx are retried, 429 waits for `Retry-After` (capped at 60 s), and any other 4xx is not retried and the batch is dropped with reason `rejected`.
+Close-code mapping: `WS_CLOSE_REASONS` maps standard close codes (1000–1011) to descriptor labels (`NORMAL_CLOSURE`, `ABNORMAL_CLOSURE`, `POLICY_VIOLATION`, …); an exception inside the handler surfaces as `INTERNAL_ERROR`. Delivery uses the shared transport core: `push()`/`record()` only queue (bounded by `max_queue_size`, default 10 000; the oldest event is dropped as `overflow` when full) and one background thread sends batches of up to `flush_count` events (default 500, at most 1000; a body over 4 MiB is split). Network errors, timeouts, 408, 429 and 5xx are retried 3 times with full-jitter backoff; `Retry-After` is honoured as seconds or an HTTP date, capped at 60 s. After that, or on 401/403 (logged at ERROR: the API key is wrong or revoked), the batch goes back to the front of the queue with the same idempotency keys and the sender pauses (full jitter, at most 5 s at first and at least 250 ms, growing to 5 min) — an outage loses nothing unless the queue fills. A redirect (3xx) is never followed, so the API key cannot reach another host; it is treated like 401/403 and logged at ERROR with the target host. Events the ingestor marks `retryable` in a 2xx are re-sent with the same keys after the same backoff, at most 3 times. Each request's `timeout_sec` covers the whole exchange, including reading the response. `flush()` during an outage makes one attempt. `shutdown()` keeps retrying until its deadline. An event that cannot be turned into JSON is dropped as `invalid` when you push it. A 413 splits the batch; any other 4xx drops it with reason `rejected`. `shutdown()` (also run at interpreter exit) flushes for at most `shutdown_timeout_sec` (default 5 s). `ingestor_url` must be `https://`; plain `http://` only for localhost / 127.0.0.1 / ::1 or with `allow_insecure_http=True`. The API key is sent only as `X-API-Key` and never appears in `repr()` or logs.
 
 ## Execution status (`executionStatus`)
 
 Each event can carry an execution status. OUTCOME_BASED rate plans bill each event at the weight set for its status; events without one bill at full price.
 
-The SDK doesn't derive one: an event carries a status only when you set it. With the connection helpers, the value you set goes on the `CONNECTION_CLOSED` event; a close with or without an exception sends no status otherwise. Frame events and `CONNECTION_OPENED` carry no status.
+The SDK doesn't derive one: an event carries a status only when you set it. With the connection helpers, the value you set goes on the `CONNECTION_CLOSED` event; a close with or without an exception sends no status otherwise. Frame events and `CONNECTION_OPENED` (frame type `OPEN`, metric `websocket_api.connection_opened`) carry no status.
 
 To send your own value:
 
@@ -135,7 +141,9 @@ An event that will never reach Aforo is counted in `billing.dropped_count`, logg
 |---|---|
 | `invalid` | The event failed a client-side check (a blank `customerId`, one longer than 64 characters, or no `wsConnectionId`). It is not buffered or sent. `push()` does not raise for event content. |
 | `rejected` | The ingestor answered 4xx (other than 408 / 429) for the batch, or refused individual events inside a 202 response. |
-| `retry_exhausted` | Network errors, 5xx, 408 or 429 on all 3 attempts. |
+| `overflow` | The queue was full (usually a long ingest outage); the oldest event was evicted. |
+| `shutdown` | Still queued when `shutdown()` reached `shutdown_timeout_sec`. |
+| `closed` | Sent after `shutdown()`. |
 
 ```python
 def on_drop(events, reason):

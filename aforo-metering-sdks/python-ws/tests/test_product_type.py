@@ -1,8 +1,9 @@
 """productType option + batch response handling: every event carries a
 top-level productType (client default, per-event override, trimmed and
-upper-cased, unknown values passed through); 4xx other than 408/429 is not
-retried, 429 honours Retry-After, and errors[].message from the batch
-response reaches on_error."""
+upper-cased, unknown values passed through); 4xx other than 401/403/408/429
+is not retried, 401/403 and exhausted retries keep the events queued, 429
+honours Retry-After, and errors[].message from the batch response reaches
+on_error."""
 
 from __future__ import annotations
 
@@ -92,7 +93,7 @@ def test_blank_client_product_type_uses_package_default(env):
     assert _events(h)[0]["productType"] == 'WEBSOCKET_API'
 
 
-@pytest.mark.parametrize("status", [400, 401, 403, 422])
+@pytest.mark.parametrize("status", [400, 404, 422])
 def test_4xx_is_not_retried_and_reports_error_messages(env, status):
     h, sleeps, errors = env
     h.responses = [(status, {"accepted": 0, "failed": 1,
@@ -119,26 +120,43 @@ def test_408_and_5xx_are_retried(env, status):
     assert errors == []
 
 
+@pytest.mark.parametrize("status", [401, 403])
+def test_auth_failure_keeps_the_event_and_reports_it(env, status):
+    h, _s, errors = env
+    h.responses = [(status, None, {})]
+    b = _make(errors)
+    _emit(b)
+    assert b.flush() == 1
+    assert b.dropped_count == 0
+    assert len(errors) == 1 and str(status) in str(errors[0])
+    b.shutdown()
+    assert b.dropped_count == 0
+    assert len(h.requests) == 2
+
+
 def test_429_honours_retry_after(env):
     h, sleeps, errors = env
     h.responses = [(429, None, {"Retry-After": "7"}), (202, None, {})]
     b = _make(errors)
     _emit(b)
+    b.flush()
     b.shutdown()
     assert len(h.requests) == 2
     assert sleeps == [7.0]
     assert errors == []
 
 
-def test_exhausted_retries_report_once_without_trailing_sleep(env):
+def test_exhausted_retries_report_once_and_keep_the_event(env):
     h, sleeps, errors = env
-    h.responses = [(503, None, {})] * 3
+    h.responses = [(503, None, {})] * 4
     b = _make(errors)
     _emit(b)
+    b.flush()
     b.shutdown()
-    assert len(h.requests) == 3
-    assert sleeps == [1.0, 2.0]
-    assert len(errors) == 1 and "after 3 attempts" in str(errors[0])
+    assert len(h.requests) == 5  # 1 + 3 retries, then the resend
+    assert len({r["body"]["events"][0]["idempotencyKey"] for r in h.requests}) == 1
+    assert b.dropped_count == 0
+    assert len(errors) == 1 and "unreachable" in str(errors[0])
 
 
 def test_accepted_response_with_failed_events_reports_errors_message(env):

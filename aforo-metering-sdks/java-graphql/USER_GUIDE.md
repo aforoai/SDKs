@@ -1,6 +1,6 @@
 # ai.aforo:graphql-metering — User Guide
 
-**Version:** 1.2.2 · **Updated:** 2026-10-01 · **Audience:** Java engineers running a `graphql-java` server who need per-operation usage metering.
+**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Java engineers running a `graphql-java` server who need per-operation usage metering.
 
 ## What you'll build
 
@@ -11,7 +11,7 @@ A GraphQL server where every operation emits one Aforo billing event carrying it
 - JDK 17 or newer.
 - A `graphql-java` 21+ server you can attach an `Instrumentation` to.
 - An Aforo API key (`AFORO_API_KEY`), a `tenant_id`, and a `product_id` for this GraphQL surface.
-- A way to put the customer id on the GraphQL execution context (the default extractor reads `x-customer-id` / `customerId` from the context `Map`).
+- A way to put the authenticated customer id on the `GraphQLContext` (your HTTP layer does this after it authenticates the request).
 
 ## Step 1 — Build the SDK into your local Maven repo
 
@@ -27,7 +27,7 @@ Add to your service's `pom.xml`:
 <dependency>
   <groupId>ai.aforo</groupId>
   <artifactId>graphql-metering</artifactId>
-  <version>1.2.2</version>
+  <version>2.0.0</version>
 </dependency>
 ```
 
@@ -60,29 +60,26 @@ GraphQL gql = GraphQL.newGraphQL(schema)
 
 ## Step 4 — Put the customer id on the execution context
 
-The default extractor looks for `x-customer-id` (then `customerId`) in the execution context `Map`. Set it when you build the `ExecutionInput`:
+`build()` throws until you choose a customer source. Put the authenticated customer on the `GraphQLContext` when you build the `ExecutionInput`:
 
 ```java
 import graphql.ExecutionInput;
 
 ExecutionInput input = ExecutionInput.newExecutionInput()
         .query(requestQuery)
-        .graphQLContext(java.util.Map.of("x-customer-id", authenticatedCustomerId))
+        .graphQLContext(java.util.Map.of("aforoCustomerId", authenticatedCustomerId))
         .build();
 
 gql.execute(input);
 ```
 
-> ⚠ Resolve `authenticatedCustomerId` from your auth layer (session, verified JWT) — not from a client-supplied request field. An operation with no resolvable customer id is silently not metered, which is the desired behavior for introspection and health queries.
-
-If your customer id lives somewhere else, override the extractor at build time:
+and read it with a resolver when you build the billing instance:
 
 ```java
-.customerIdExtractor(params -> {
-    Map<String, Object> ctx = (Map<String, Object>) params.getContext();
-    return (String) ctx.get("authenticatedUserId");
-})
+.customerResolver(params -> params.getGraphQLContext().get("aforoCustomerId"))
 ```
+
+> ⚠ Resolve `authenticatedCustomerId` from your auth layer (session, verified JWT) — not from a client-supplied request field. An operation with no customer id is answered as usual; its event is counted as `INVALID` and passed to `onDrop`. `trustCustomerHeader(true)` reads the `x-customer-id` / `customerId` entry of the `GraphQLContext` (or a legacy `Map` context) instead of a resolver.
 
 ## Step 5 — Run an operation, then flush and verify
 
@@ -112,18 +109,27 @@ Runtime.getRuntime().addShutdownHook(new Thread(billing::close));
 | `ingestorUrl` | `String` | *(required)* | Host; SDK appends `/v1/ingest/batch`. |
 | `schemaVersion` | `String` | *(none)* | Optional `metadata.schemaVersion`. |
 | `productType` | `String` | `GRAPHQL_API` | Top-level `productType` on every event; trimmed + uppercased. Per call: `record(customerId, query, operationName, durationMs, hasErrors, executionStatus, productType)` (a null/blank override uses the client value). |
-| `flushCount` | `int` | `50` | Events per immediate flush. |
-| `flushIntervalMs` | `long` | `5000` | Background flush cadence (ms). |
-| `customerIdExtractor` | `Function<InstrumentationExecutionParameters, String>` | `x-customer-id` / `customerId` from context | Per-operation customer-id resolution. |
+| `flushCount` | `int` | `500` | Events per request (at most 1000); also how many queued events wake the sender. |
+| `flushIntervalMs` | `long` | `5000` | How often queued events are sent when the batch is not full (ms). |
+| `maxQueueSize` | `int` | `10000` | Queue capacity; when full, the oldest event is dropped as `OVERFLOW`. |
+| `maxRetries` | `int` | `3` | Retries per request on a network error, timeout, 408, 429 or 5xx. |
+| `retryBaseMs` | `long` | `500` | Base of the full-jitter backoff (each wait is random up to `min(30 s, base × 2^attempt)`). |
+| `timeoutMs` | `long` | `10000` | Total deadline of one ingest request (ms). |
+| `shutdownTimeoutMs` | `long` | `5000` | How long `close()` keeps sending; leftovers are reported as `SHUTDOWN`. |
+| `breakerCooldownMs` | `long` | `5000` | Pause after a batch fails every retry or gets 401/403; doubles with jitter up to 5 minutes. |
+| `allowInsecureHttp` | `boolean` | `false` | Accept a plain `http://` `ingestorUrl` on a host other than localhost / 127.0.0.1 / ::1. |
+| `customerResolver` | `CustomerResolver` | *(required unless `trustCustomerHeader`)* | Per-operation customer from your authentication. |
+| `trustCustomerHeader` | `boolean` | `false` | Read the `x-customer-id` / `customerId` context entry. |
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | `IllegalArgumentException: <field> is required` at build | A required builder field (`tenantId` / `productId` / `apiKey` / `ingestorUrl`) is blank | Set all four; they're validated in the constructor. |
-| No events appear, no errors logged | Customer id not on the execution context, so every op is skipped | Put `x-customer-id` on the `graphQLContext` map, or supply a `customerIdExtractor`. |
+| `IllegalStateException: AforoGraphQlBilling needs to know which customer each operation belongs to` | No customer source | Add `.customerResolver(...)`. |
+| No events appear; `Dropping invalid event: customerId is required` | The resolver found no customer | Put the authenticated customer on the `GraphQLContext` before `execute(...)`. |
 | Events POST to a 404 | `ingestorUrl` already includes the path | Pass the host only (`https://api.aforo.ai`); the SDK appends `/v1/ingest/batch`. |
-| `flush exhausted retries — dropped N events` in logs | Network error, 5xx, 408 or 429 on all 3 attempts | Check connectivity to `ingestorUrl`; the batch is reported to `onDrop` with `RETRY_EXHAUSTED`. |
+| `Ingestor unreachable after retries; N event(s) put back in the queue` in logs | Network error, timeout, 5xx, 408 or 429 on every attempt | Check connectivity to `ingestorUrl`. Nothing is lost while the queue has room; events still queued when `close()` hits its deadline go to `onDrop` as `SHUTDOWN`. |
 | `ingestor returned 4xx — not retrying` or `Dropped N event(s) — REJECTED` in logs | Bad key, unknown metric, or an event the ingestor refused; a 4xx other than 408/429 is sent once | Verify the key + `X-Tenant-Id`; ensure the `graphql_api.operations` metric exists in Aforo. The log line carries the ingestor's `errors[].message`. |
 | `Dropping invalid event: ...` in logs, `droppedCount()` grows | The event breaks an ingestor field limit (`DropReason.INVALID`) and was not sent | The message names the field, the limit and the value. See [Dropped events](README.md#dropped-events). |
 | `gqlComplexity` looks too low | Query is anonymous / aliased in a way the parser counts differently | Complexity is `field_count + 5 × max_depth` over the parsed AST; name your operations and inspect `gqlFieldCount` to sanity-check. |

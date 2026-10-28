@@ -19,7 +19,7 @@ func TestMQTTExecutionStatusExplicitOnly(t *testing.T) {
 	b.RecordConnectWithOptions("cust_001", "c1", EventOptions{ExecutionStatus: "timeout"})
 	b.RecordDisconnectWithOptions("cust_001", "c1", EventOptions{ExecutionStatus: "cancelled"})
 	b.RecordConnectWithOptions("", "c1", EventOptions{ExecutionStatus: "SUCCESS"}) // no customer → no event, no panic
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	evs := r.events()
 	want := []any{nil, "ERROR", "SUCCESS", "BLOCKED", nil, "TIMEOUT", "CANCELLED"}
@@ -43,7 +43,7 @@ func TestRecordDeliverWithOptionsSkippedByDefault(t *testing.T) {
 	defer srv.Close()
 	b := newBilling(t, srv, func(c *Config) { c.FlushCount = 100 })
 	b.RecordDeliverWithOptions("cust_001", "c1", "t/1", 0, false, 1, EventOptions{ExecutionStatus: "SUCCESS"})
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 	if n := len(r.events()); n != 0 {
 		t.Fatalf("got %d events, want 0 (DELIVER off by default)", n)
 	}
@@ -57,7 +57,7 @@ func TestUnknownExecutionStatusOmittedEventStillSent(t *testing.T) {
 	b.RecordPublishWithOptions("cust_001", "c1", "t/1", 0, false, 1, EventOptions{ExecutionStatus: "done"})
 	b.RecordPublishWithOptions("cust_001", "c1", "t/2", 0, false, 1, EventOptions{ExecutionStatus: "SUCCESSFUL_OUTCOME_XYZ"})
 	b.RecordPublishWithOptions("cust_001", "c1", "t/3", 0, false, 1, EventOptions{ExecutionStatus: "partial"})
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	evs := r.events()
 	want := []any{nil, nil, "PARTIAL"}

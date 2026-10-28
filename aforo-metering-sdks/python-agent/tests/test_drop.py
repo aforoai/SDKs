@@ -1,11 +1,11 @@
 """Drop observability + opt-in on_drop hook (A+ delivery-guarantee
 prompt 2 mirror).
 
-The client sends each batch with 3× retry (5xx / network) or terminal
-rejection (4xx). Failed batches are counted, WARN-logged, and handed to
-the OPT-IN ``on_drop`` hook so the application can persist + replay
-after recovery. Dropped events retain their idempotency keys so replay
-is dedup-safe on the ingestor side.
+Wave 5: a batch that still fails after 3 retries (5xx / network) stays
+queued and is retried after a pause; a terminal rejection (4xx) drops it.
+Lost events are counted, WARN-logged, and handed to the OPT-IN ``on_drop``
+hook so the application can persist + replay after recovery. Dropped events
+retain their idempotency keys so replay is dedup-safe on the ingestor side.
 """
 
 from __future__ import annotations
@@ -22,9 +22,9 @@ def _client(**overrides: Any) -> AforoAgentClient:
         tenant_id="tenant_test",
         product_id="prod_ai_001",
         api_key="sk_agent_abc",
-        ingestor_url="https://ingest.test.aforo.ai",
+        ingestor_url="https://ingest.example.test",
         flush_interval_sec=3600.0,  # long — control flush manually
-        **overrides,
+        **{"default_customer_id": "cust_default", "transport_options": {"rand": lambda: 0.0}, **overrides},
     )
 
 
@@ -43,31 +43,30 @@ async def _post_status(status: int, body: str = ""):
 
 
 @pytest.mark.asyncio
-async def test_network_failure_after_retries_drops_batch_and_fires_hook(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+async def test_network_failure_keeps_the_batch_and_shutdown_reports_it(
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     drops: List[Tuple[List[Dict[str, Any]], str]] = []
 
     async def failing_post(url: str, headers: Dict[str, str], body: str) -> Tuple[int, str]:
         raise OSError("ECONNREFUSED")
 
-    from aforo_agent_metering import transport as transport_module
-
-    monkeypatch.setattr(transport_module.asyncio, "sleep", _immediate_sleep)
-
     client = _client(
         post_fn=failing_post,
+        shutdown_timeout_sec=0.2,
         on_drop=lambda events, reason: drops.append((events, reason)),
     )
     client.record_capability(capability_name="search", agent_id="agent_1")
 
     with caplog.at_level("WARNING", logger="aforo_agent_metering"):
-        await client.flush()
+        assert await client.flush() == 1  # still queued, not dropped
+        assert client.dropped_count == 0
+        await client.shutdown()
 
     assert client.dropped_count == 1
     assert len(drops) == 1
     events, reason = drops[0]
-    assert reason == "retry_exhausted"
+    assert reason == "shutdown"
     assert events[0]["metadata"]["capability_name"] == "search"
     # Idempotency key preserved — dedup-safe replay after operator persists.
     assert events[0]["idempotencyKey"].startswith("agent:")
@@ -75,26 +74,25 @@ async def test_network_failure_after_retries_drops_batch_and_fires_hook(
 
 
 @pytest.mark.asyncio
-async def test_5xx_response_after_retries_drops_batch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_5xx_outage_then_recovery_loses_nothing() -> None:
     reasons: List[str] = []
-    from aforo_agent_metering import transport as transport_module
+    calls: List[str] = []
 
-    monkeypatch.setattr(transport_module.asyncio, "sleep", _immediate_sleep)
-
-    async def post_503(url: str, headers: Dict[str, str], body: str) -> Tuple[int, str]:
-        return 503, ""
+    async def post_503_then_ok(url: str, headers: Dict[str, str], body: str) -> Tuple[int, str]:
+        calls.append(body)
+        return (503, "") if len(calls) <= 4 else (202, "")
 
     client = _client(
-        post_fn=post_503,
+        post_fn=post_503_then_ok,
         on_drop=lambda events, reason: reasons.append(reason),
     )
     client.record_capability(capability_name="search", agent_id="agent_1")
-    await client.flush()
+    await client.flush()  # 1 + 3 retries, then requeued
+    assert client.dropped_count == 0
+    await client.shutdown()  # sent again at shutdown, same body and key
 
-    assert client.dropped_count == 1
-    assert reasons == ["retry_exhausted"]
+    assert len(calls) == 5 and len(set(calls)) == 1
+    assert client.dropped_count == 0 and reasons == []
 
 
 @pytest.mark.asyncio
@@ -116,6 +114,7 @@ async def test_4xx_response_drops_immediately_with_rejected_reason() -> None:
     assert client.dropped_count == 1
     assert reasons == ["rejected"]
     assert len(errors) == 1
+    await client.shutdown()
 
 
 @pytest.mark.asyncio
