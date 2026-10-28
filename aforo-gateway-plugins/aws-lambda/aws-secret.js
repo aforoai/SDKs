@@ -136,6 +136,9 @@ function getSecretValue(secretId, env = process.env, timeoutMs = REQUEST_TIMEOUT
             timeout: timeoutMs,
         }, (res) => {
             let text = '';
+            // A timeout or reset after the headers destroys the response; without
+            // this listener that 'error' is unhandled and crashes the runtime.
+            res.on('error', reject);
             res.on('data', (c) => { if (text.length < MAX_RESPONSE_BYTES) text += c; });
             res.on('end', () => {
                 let json = null;
@@ -202,6 +205,40 @@ function createSecretSource({ label, secretIdEnv, plainEnv, env = process.env, f
         console.warn(`${label}: ${secretIdEnv} is set, so ${plainEnv} is ignored. Remove ${plainEnv}.`);
     }
 
+    // One fetch at a time; concurrent callers share it.
+    function fetchNow() {
+        if (!inflight) {
+            inflight = Promise.resolve()
+                .then(() => fetch(secretId))
+                .then((raw) => {
+                    value = extractKey(raw);
+                    freshUntil = now() + refreshMs;
+                    coldFailures = 0;
+                    coldError = null;
+                    return value;
+                })
+                .finally(() => { inflight = null; });
+        }
+        return inflight;
+    }
+
+    /**
+     * Drops the cached key and reads the secret again now, for a caller whose
+     * key was refused (401/403: the key was rotated after it was cached).
+     * Resolves to the key Secrets Manager holds now; throws when it cannot be
+     * read (the cached value is not used, it was just refused). With the plain
+     * environment variable there is nothing to reread: resolves to it.
+     */
+    async function refresh() {
+        if (!secretId) return plain;
+        freshUntil = 0;
+        try {
+            return await fetchNow();
+        } catch (err) {
+            throw new Error(`${label}: could not reread ${secretIdEnv} from Secrets Manager: ${err.message}`);
+        }
+    }
+
     async function get() {
         if (!secretId) {
             if (plain && !warned) {
@@ -215,20 +252,8 @@ function createSecretSource({ label, secretIdEnv, plainEnv, env = process.env, f
         if (value === null && !inflight && coldError && now() < coldRetryAt) {
             throw coldError;
         }
-        if (!inflight) {
-            inflight = Promise.resolve()
-                .then(() => fetch(secretId))
-                .then((raw) => {
-                    value = extractKey(raw);
-                    freshUntil = now() + refreshMs;
-                    coldFailures = 0;
-                    coldError = null;
-                    return value;
-                })
-                .finally(() => { inflight = null; });
-        }
         try {
-            return await inflight;
+            return await fetchNow();
         } catch (err) {
             if (value !== null) {
                 console.warn(`${label}: refreshing from Secrets Manager failed (${err.message}); using the cached value`);
@@ -247,7 +272,7 @@ function createSecretSource({ label, secretIdEnv, plainEnv, env = process.env, f
         }
     }
 
-    return { get, configured: Boolean(secretId || plain), fromSecret: Boolean(secretId) };
+    return { get, refresh, configured: Boolean(secretId || plain), fromSecret: Boolean(secretId) };
 }
 
 module.exports = {

@@ -1,6 +1,6 @@
 # Aforo for Apigee X: user guide
 
-**Version:** 3.1.0 · **Updated:** 2026-10-28 · **Audience:** engineers running Apigee X or hybrid who want their API metered and quota-enforced by Aforo without changing their API.
+**Version:** 3.1.1 · **Updated:** 2026-10-28 · **Audience:** engineers running Apigee X or hybrid who want their API metered and quota-enforced by Aforo without changing their API.
 
 Aforo's organization service normally does every step below when you connect your Apigee org in Aforo and deploy a product to it. This guide does it by hand: for a test org, for troubleshooting, or to see exactly what Aforo changes. The [README](README.md) is the reference for every setting.
 
@@ -150,7 +150,11 @@ See the README for why Apigee forces this choice.
 
 ## Token revocation
 
-A revoked Aforo JWT is not checked: with `jwt_validation_enabled`, a valid token is accepted until it expires. Keep JWT lifetimes short. Revoking the end customer's key (the app credential) takes effect on the next call.
+With `jwt_validation_enabled`, a revoked Aforo JWT gets 401 within `jti_cache_seconds` (default 30 s) of its revocation. Set `aforo_org_service_url` (for example `https://org.aforo.ai`) in the KVM; without it the check never gets an answer. By default a check that gets no answer lets the call through; set `jti_check_fallback` to `DENY` to answer 503 instead. `jti_check_enabled = false` switches the check off. The README, "Token revocation", has the details. Revoking the end customer's key (the app credential) takes effect on the next call.
+
+## Upgrading from 3.1.0
+
+Import and deploy `aforo-access` again. If you use `jwt_validation_enabled`, add the KVM key `aforo_org_service_url`: from 3.1.1 the flow checks that the JWT is not revoked, and without the URL every check counts as no answer (the call still goes through by default, and each one is logged). To keep the 3.1.0 behaviour, set `jti_check_enabled` to `false`.
 
 ## Upgrading from 3.0
 

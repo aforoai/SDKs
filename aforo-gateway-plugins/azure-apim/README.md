@@ -2,7 +2,7 @@
 
 Policy fragments that send one usage event to Aforo after each API response: standard API calls, AGENTIC_API calls (W3C `traceparent`) and MCP `tools/call` invocations. Optional fragments add JWT validation, a pre-flight quota check, margin guard and compound metering.
 
-**Version:** 2.3.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.3.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 2.2.0 merges two lines of work: the working repository (APIM-valid fragments, `executionStatus`, exclusions, frozen idempotency keys) and public release 2.1.0 (verified customer identity, metric mappings, `productType`). An install made from either one keeps working; see [CHANGELOG.md](CHANGELOG.md) for the two cases that need a line added.
 
@@ -189,11 +189,11 @@ The three below read **context variables**, like `aforo-metering`. Release 2.1.0
 
 | Fragment | Context variables |
 |---|---|
-| `aforo-compound-metering` | `aforo-compound-enabled` (`true`), `aforo-compound-extraction-paths`, `aforo-compound-dimension-paths`, `aforo-ingestor-url` (`https://api.aforo.ai`). Paths are a JSON object (`{"$.usage.prompt_tokens":"input-tokens"}`) or `jsonPath=metricName` pairs separated by `;`. `correlationId` is the APIM request id. |
+| `aforo-compound-metering` | `aforo-compound-enabled` (`true`), `aforo-compound-extraction-paths`, `aforo-compound-dimension-paths`, `aforo-ingestor-url` (`https://api.aforo.ai`; direct mode only, not needed with `aforo-delivery-mode` `eventhub`). Paths are a JSON object (`{"$.usage.prompt_tokens":"input-tokens"}`) or `jsonPath=metricName` pairs separated by `;`. `correlationId` is the APIM request id. |
 | `aforo-preflight` | `aforo-preflight-enabled` (`true`), `aforo-preflight-url` (`https://api.aforo.ai/api/v1/quota/check`), `aforo-preflight-fallback` (`ALLOW` or `DENY`, used when the check times out, errors or answers anything but 200). Timeout is 1 second. |
 | `aforo-margin-guard` | `aforo-margin-guard-enabled` (`true`), `aforo-margin-guard-url` (pricing-service base URL). No tenant is read: pricing answers for the API key's tenant. |
 
-All three use the same customer rule as `aforo-metering` (`aforo-customer-id`, else the subscription id; margin guard also accepts the verified JWT's `customer_id` / `sub`). None is sent or checked for `OPTIONS` or without a customer. Compound and preflight send `X-API-Key` from the context variable `aforo-api-key` when it exists, else from the Named Value `aforo-api-key`.
+All three use the same customer rule as `aforo-metering` (`aforo-customer-id`, else the subscription id, trimmed, at most 64 characters). To use the verified JWT's `customer_id`, include `aforo-context`, which sets `aforo-customer-id` from it; the JWT's `sub` is never used. Until 2.3.1 margin guard also read the JWT's `customer_id` / `sub` itself and had no length cap, so it could check a customer other than the one billed. None is sent or checked for `OPTIONS` or without a customer. Compound and preflight send `X-API-Key` from the context variable `aforo-api-key` when it exists, else from the Named Value `aforo-api-key`.
 
 `aforo-jwt-validation` references four Named Values, which must exist: `aforo-jwks-uri`, `aforo-jwt-issuer`, `aforo-org-service-url` (org-service base URL reachable from APIM, for the jti revocation check; it was a hardcoded docker-compose hostname before 2.1.0) and, since 2.3.0, `aforo-api-key` and `aforo-tenant-id` (each unless the context variable of the same name is set). The revocation check fails open after 2 seconds unless `aforo-jti-check-fallback` is `DENY` (then 503).
 
@@ -201,7 +201,7 @@ Tenant binding (2.3.0): every tenant's Aforo JWTs are signed with the same key, 
 
 ### Caching and breakers (2.3.0)
 
-The three checks that run before the backend — revocation (`aforo-jwt-validation`), pre-flight quota (`aforo-preflight`) and margin guard (`aforo-margin-guard`) — keep their answer in the APIM cache, so most requests make no outbound call, and stop calling for a while when the service does not answer. One cache entry per token (revocation) or per API key and customer (pre-flight, margin guard) holds both the answer and the breaker state. The API key part is the first 22 characters of the base64 SHA-256 of the key (never the key itself): the ingestor and pricing answer for the key's tenant, so instances with different keys that share an external cache never read each other's answers.
+The three checks that run before the backend — revocation (`aforo-jwt-validation`), pre-flight quota (`aforo-preflight`) and margin guard (`aforo-margin-guard`) — keep their answer in the APIM cache, so most requests make no outbound call, and stop calling for a while when the service does not answer. One cache entry per tenant and token (revocation; since 2.3.1 the key carries the checked tenant) or per API key and customer (pre-flight, margin guard) holds both the answer and the breaker state. The API key part is the first 22 characters of the base64 SHA-256 of the key (never the key itself): the ingestor and pricing answer for the key's tenant, so instances with different keys that share an external cache never read each other's answers.
 
 | Fragment | Kept | Breaker | Settings (context variables) |
 |---|---|---|---|
@@ -209,9 +209,9 @@ The three checks that run before the backend — revocation (`aforo-jwt-validati
 | `aforo-preflight` | ALLOW / WARN: 5 s; DENY: until the ingestor's `retryAfterMs` (5 s if none, max 60 s, so a wallet top-up unblocks within a minute; as Kong 2.8.0), sent as `Retry-After` | 3 failures, then 30 s without a call | `aforo-preflight-cache-seconds`, `aforo-preflight-breaker-failures`, `aforo-preflight-breaker-seconds` |
 | `aforo-margin-guard` | answer: 30 s | 3 failures, then 30 s without a call | `aforo-margin-guard-cache-seconds`, `aforo-margin-guard-breaker-failures`, `aforo-margin-guard-breaker-seconds` |
 
-While a breaker is open each fragment applies its existing no-answer rule: revocation and margin guard let the request through (revocation answers 503 with `aforo-jti-check-fallback=DENY`), pre-flight applies `aforo-preflight-fallback`. A cache time of `0` asks every time; DENY and revoked answers are always kept. A revocation therefore takes effect within `aforo-jti-cache-seconds`.
+Margin guard counts only no answer, a timeout, 408, 429 and 5xx as a breaker failure. Another 4xx is pricing refusing that one request: it is allowed, traced (`aforo-margin-guard`, warning) and the failure count is reset (since 2.3.1; before, one customer id pricing refused could open the breaker for every customer of the key). While a breaker is open each fragment applies its existing no-answer rule: revocation and margin guard let the request through (revocation answers 503 with `aforo-jti-check-fallback=DENY`), pre-flight applies `aforo-preflight-fallback`. A cache time of `0` asks every time; DENY and revoked answers are always kept. A revocation therefore takes effect within `aforo-jti-cache-seconds`.
 
-`aforo-context` caches the subscription-map lookup the same way (`aforo-customer-map-cache-seconds`, default 300; `aforo-customer-map-version` to force a refresh). The map itself is one Named Value of at most 4096 characters, about 100 subscriptions. For more, set `aforo-customer-id` with `set-variable` in each product's policy (one product policy covers every subscription to it), or issue Aforo JWTs carrying `customer_id`.
+`aforo-context` caches the subscription-map lookup the same way (`aforo-customer-map-cache-seconds`, default 300; `aforo-customer-map-version` to force a refresh). Since 2.3.1 the key is `aforo:cust:<tenant>:<version>:<map hash>:<subscription id>`: the tenant is the context variable `aforo-tenant-id`, else the tenant `aforo-jwt-validation` checked, else `-` (the Named Value is not referenced, so installs without it keep saving); the map hash is the first 22 base64 characters of the SHA-256 of the map, so every edit of the map takes effect at once. The map itself is one Named Value of at most 4096 characters, about 100 subscriptions. For more, set `aforo-customer-id` with `set-variable` in each product's policy (one product policy covers every subscription to it), or issue Aforo JWTs carrying `customer_id`.
 
 The Consumption tier has no built-in cache: configure an external Redis cache for the instance, otherwise every lookup misses and each request calls, as in 2.2.0.
 

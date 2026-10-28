@@ -6,6 +6,16 @@ This bundle ships on the Aforo gateway-plugins line; the whole repo is versioned
 
 ## [Unreleased]
 
+## [3.1.1] — 2026-10-28
+
+Redeploy `aforo-access`. With `jwt_validation_enabled`, add the KVM key `aforo_org_service_url` (see "Upgrading from 3.1.0" in the user guide). Not yet verified on a live Apigee org.
+
+### Added
+- **JWT revocation check** (G356; same contract as the Azure APIM fragment `aforo-jwt-validation`): with `jwt_validation_enabled`, `aforo-access` asks organization-service `GET {aforo_org_service_url}/api/v1/public/gateway/token-status?jti=&keyId=&clientId=` with `X-API-Key`, 2 s timeout, for a token carrying `jti` or `key_id` that passed the tenant check. Revoked: 401 `invalid_token` / `Token has been revoked`, not metered. Cached in the environment cache under `aforo-jti` + `tenant|jti|keyId`: not revoked for `jti_cache_seconds` (30), revoked until `exp` (at most 24 h). Breaker per tenant and token: `jti_breaker_failures` (3) unanswered checks, then no call for `jti_breaker_seconds` (30). No answer lets the call through unless `jti_check_fallback = DENY` (503, `Retry-After: 5`). On by default with JWT validation, as on Azure; `jti_check_enabled = false` turns it off. New policies `AforoJwtRevocation{Prepare,LookupCache,CallDecision,Check,Decide,PopulateCache,Unavailable}` and `AforoJwtRevoked`, script `aforo-jwt-revocation.js`; `AforoJwtAssignClaims` also copies `jti`, `client_id` and `exp` (not forwarded upstream). Nine flow tests; the static check that said revocation is not claimed now checks the wiring instead. Needs an organization-service that serves `/api/v1/public/gateway/token-status`.
+
+### Fixed
+- `pubsub-forwarder` runs on Node 22 (`node:22.23.4-slim`, `engines` `>=22`). `@google-cloud/pubsub` 6.2.0 and its dependencies require Node 22; the 3.1.0 image used Node 20.18.1.
+
 ## [3.1.0] — 2026-10-28
 
 Wave 6 W6.4 (G355, G356, G357, G358). No breaking change: redeploy both bundles; the flow hooks stay as they are.

@@ -1,6 +1,6 @@
 'use strict';
 // Runs every Apigee test file; exits non-zero if any fails.
-// Run: node apigee/tests/run-all.cjs   (Node 20+, no npm install)
+// Run: node apigee/tests/run-all.cjs   (Node 22+, no npm install; the Pub/Sub forwarder needs Node 22)
 // The Pub/Sub forwarder tests start aforo-metering-sdks/mock-ingestor; set
 // AFORO_MOCK_INGESTOR when that checkout is not next to this repo.
 const { spawnSync } = require('child_process');

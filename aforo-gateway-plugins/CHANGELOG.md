@@ -4,6 +4,16 @@ This monorepo ships five gateway metering plugins (Kong, Apigee, AWS Lambda, Azu
 
 ## Unreleased
 
+### Wave 6 review fixes (Kong 2.8.1, Apigee 3.1.1, MuleSoft 3.1.1, AWS Lambda 2.5.1, Azure APIM 2.3.1)
+
+- Kong: rate-limit counter keys carry one Redis hash tag per check, so HARD limits work on Redis Cluster / ElastiCache Serverless (the script was refused with CROSSSLOT and failed open); the key-auth credential branch never takes a Kong-jwt `jwt_secrets` row; margin guard does not count a 4xx as a breaker failure and does not send customer ids over 128 characters.
+- Apigee: Aforo JWT revocation is checked with organization-service `GET /api/v1/public/gateway/token-status`, the same contract as Azure (on with `jwt_validation_enabled`; needs the new KVM key `aforo_org_service_url`). The Pub/Sub forwarder runs on Node 22.
+- MuleSoft: an MCP body is read for `tools/call` detection only with a declared `Content-Length` of at most 1 MiB; a chunked body is no longer read whole into memory.
+- AWS Lambda: a 401 / 403 rereads the key secret once and resends; still refused, the invocation fails (it used to drop the batch and return 200). Response errors after headers no longer crash the runtime. Secret ARN parameters require the full ARN.
+- Azure APIM: the Event Hub forwarder resends compound results the ingestor did not store for a temporary reason (BUSY / TIMEOUT / `retryable: true`) instead of dropping them, and counts an all-duplicate redelivery as delivered; compound metering in Event Hub mode no longer needs `aforo-ingestor-url`; map and revocation cache keys are scoped by tenant and the map by its hash; margin guard checks the billed customer and does not count a 4xx as a breaker failure.
+- Demo: the compose file declares `aforo_cache` too.
+- None of this has run on a live gateway. Details in each plugin's CHANGELOG.
+
 ### Kong 2.8.0 (wave 6)
 
 - New shared dict `aforo_cache` for caches, throttles and counters, so they no longer share `aforo_buffer` with events (falls back with one error per worker when not declared).

@@ -61,11 +61,17 @@ async function run() {
         smCalls.push({ target: req.headers['x-amz-target'], body: JSON.parse(body) });
         if (smMode === 'fail') { res.writeHead(400); return res.end(JSON.stringify({ __type: 'AccessDeniedException' })); }
         res.writeHead(200);
-        res.end(JSON.stringify({ SecretString: smMode === 'json' ? '{"apiKey":"sk_live_from_json"}' : 'sk_live_from_secret' }));
+        res.end(JSON.stringify({ SecretString: smMode === 'json' ? '{"apiKey":"sk_live_from_json"}'
+            : smMode === 'rotated' ? 'sk_live_rotated' : 'sk_live_from_secret' }));
     });
     const posts = [];
+    let acceptedKeys = null; // null: accept any key
     const ingest = await listen((req, body, res) => {
         posts.push({ headers: req.headers, body: JSON.parse(body) });
+        if (acceptedKeys && !acceptedKeys.includes(req.headers['x-api-key'])) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            return res.end('{"success":false,"error":{"code":"UNAUTHORIZED"}}');
+        }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true, data: { results: [] } }));
     });
@@ -127,6 +133,47 @@ async function run() {
     ({ handler } = freshRequire('../index'));
     await handler(cwEvent([ENTRY('r6')]), ctx);
     assertEquals(posts[0] && posts[0].headers['x-api-key'], 'plain-key', 'plain key sent');
+
+    console.log('\nKey rotation: a 401 rereads the secret once and resends; still refused, the invocation fails');
+    clearAforoEnv(); posts.length = 0; smCalls.length = 0; smMode = 'ok'; acceptedKeys = null;
+    process.env.AFORO_API_KEY_SECRET_ARN = SECRET_ARN;
+    ({ handler } = freshRequire('../index'));
+    await handler(cwEvent([ENTRY('rot1')]), ctx);
+    assertEquals(posts.length, 1, 'first invocation sent with the cached key');
+    smMode = 'rotated'; acceptedKeys = ['sk_live_rotated']; posts.length = 0;
+    let rot = null;
+    try { rot = await handler(cwEvent([ENTRY('rot2'), ENTRY('rot3')]), ctx); } catch (e) { rot = e; }
+    assert(!(rot instanceof Error), 'rotated key: the invocation succeeds after the reread (' + (rot && rot.message) + ')');
+    assertEquals(posts.length, 2, 'one refused POST, one resend');
+    assertEquals(posts[0].headers['x-api-key'], 'sk_live_from_secret', 'first try with the cached key');
+    assertEquals(posts[1].headers['x-api-key'], 'sk_live_rotated', 'resend with the reread key');
+    assertEquals(JSON.stringify(posts[1].body), JSON.stringify(posts[0].body), 'resend carries the same body (same idempotency keys)');
+    assertEquals(smCalls.length, 2, 'the secret was read again once');
+
+    acceptedKeys = ['someone-else']; posts.length = 0;
+    let refused = null;
+    try { await handler(cwEvent([ENTRY('rot4')]), ctx); } catch (e) { refused = e.message; }
+    assert(refused !== null && /transient/.test(refused), '401 with the current key: the handler throws so Lambda redelivers');
+    assertEquals(posts.length, 1, 'no resend when the secret holds the same key');
+
+    smMode = 'fail'; posts.length = 0;
+    ({ handler } = freshRequire('../index'));
+    smMode = 'ok';
+    acceptedKeys = ['sk_live_rotated'];
+    await handler(cwEvent([ENTRY('rot5')]), ctx).catch(() => {});
+    smMode = 'fail'; posts.length = 0;
+    let readFail = null;
+    try { await handler(cwEvent([ENTRY('rot6')]), ctx); } catch (e) { readFail = e.message; }
+    assert(readFail !== null, '401 and the secret cannot be reread: the handler throws');
+
+    clearAforoEnv(); posts.length = 0; acceptedKeys = ['other'];
+    process.env.AFORO_API_KEY = 'plain-key';
+    ({ handler } = freshRequire('../index'));
+    let plainRefused = null;
+    try { await handler(cwEvent([ENTRY('rot7')]), ctx); } catch (e) { plainRefused = e.message; }
+    assert(plainRefused !== null, 'plain key refused: the handler throws instead of returning 200');
+    assertEquals(posts.length, 1, 'plain key: nothing to reread, one POST');
+    acceptedKeys = null;
 
     console.log('\nG337: key-authorizer.js reads AFORO_TENANT_KEY_SECRET_ARN');
     const introspections = [];

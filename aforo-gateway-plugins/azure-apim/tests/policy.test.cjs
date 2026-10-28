@@ -817,7 +817,9 @@ section('G351 preflight cache + breaker', function () {
 section('G351 revocation cache + breaker', function () {
     const t = readPolicy('jwt-validation-policy.xml');
     const keyFn = compile('aforo-jti-key', t);
-    eq('jti key: jti and key id', run(keyFn, { vars: { 'aforo-jwt-payload': { jti: 'j1', key_id: 'k1' } } }), 'aforo:jti:j1:k1');
+    eq('jti key: tenant, jti and key id', run(keyFn, { vars: { 'aforo-jwt-tenant': 't42', 'aforo-jwt-payload': { jti: 'j1', key_id: 'k1' } } }), 'aforo:jti:t42:j1:k1');
+    check('jti key: two tenants never share an entry',
+        run(keyFn, { vars: { 'aforo-jwt-tenant': 'tA', 'aforo-jwt-payload': { jti: 'j1' } } }) !== run(keyFn, { vars: { 'aforo-jwt-tenant': 'tB', 'aforo-jwt-payload': { jti: 'j1' } } }));
     eq('jti key: no jti and no key id -> no check', run(keyFn, { vars: { 'aforo-jwt-payload': { sub: 's' } } }), '');
     eq('jti key: no payload -> no check', run(keyFn, {}), '');
     eq('jti key: switched off', run(keyFn, { vars: { 'aforo-jwt-payload': { jti: 'j1' }, 'aforo-jti-check-enabled': 'false' } }), '');
@@ -888,11 +890,33 @@ section('G351 margin guard breaker', function () {
     eq('mg state: an answer without verdict is not cached', state('{"allowed":false,"level":"L3_BLOCK"}'), '');
     eq('mg state: failure', state('UNAVAILABLE', 'F:2'), 'OPEN|30');
     eq('mg state: first failure', state('UNAVAILABLE'), 'F:1|30');
+    eq('mg state: a 4xx refusal is not a failure', state('REFUSED:400'), '');
+    eq('mg state: a 4xx refusal resets the failure count', state('REFUSED:404', 'F:2'), 'F:0|30');
     const resultFn = compile('mgResult', t);
     eq('mg result: fresh answer', run(resultFn, { vars: { mgCall: 'true', mgAnswer: '{"verdict":"BLOCK"}' } }), '{"verdict":"BLOCK"}');
     eq('mg result: cached answer', run(resultFn, { vars: { mgCall: 'false', mgAnswer: '', mgCached: 'R:{"verdict":"BLOCK"}' } }), '{"verdict":"BLOCK"}');
     eq('mg result: breaker open fails open', run(resultFn, { vars: { mgCall: 'false', mgAnswer: '', mgCached: 'OPEN' } }), '{"verdict":"ALLOW","currentLevel":"NONE"}');
     eq('mg result: unavailable fails open', run(resultFn, { vars: { mgCall: 'true', mgAnswer: 'UNAVAILABLE' } }), '{"verdict":"ALLOW","currentLevel":"NONE"}');
+    eq('mg result: a 4xx refusal fails open', run(resultFn, { vars: { mgCall: 'true', mgAnswer: 'REFUSED:400' } }), '{"verdict":"ALLOW","currentLevel":"NONE"}');
+    const mgc = codeOf(t);
+    check('mg answer: 4xx except 408 / 429 is REFUSED, not UNAVAILABLE',
+        mgc.indexOf('if (r.StatusCode >= 400 && r.StatusCode < 500 && r.StatusCode != 408 && r.StatusCode != 429) { return "REFUSED:" + r.StatusCode; }') !== -1
+        && mgc.indexOf('REFUSED') < mgc.indexOf('if (r.StatusCode != 200) { return "UNAVAILABLE"; }'));
+    check('mg answer: a refusal is traced', mgc.indexOf('<trace source="aforo-margin-guard" severity="warning">') !== -1);
+    const custFn = compile('mgCustomerId', t);
+    const meterCust = compile('aforo-event-customer', src);
+    [
+        { subscription: 'acme-prod' },
+        { subscription: 'acme-prod', vars: { 'aforo-customer-id': ' cust_1 ' } },
+        { subscription: 'acme-prod', vars: { 'aforo-customer-id': 'c'.repeat(65) } },
+        { subscription: 'acme-prod', vars: { 'aforo-jwt-payload': { customer_id: 'cust_jwt', sub: 'user_9' } } },
+        { vars: { 'aforo-jwt-payload': { sub: 'user_9' } } },
+        {},
+    ].forEach(function (o, i) {
+        eq('mg customer ' + i + ' is the customer aforo-metering bills', run(custFn, o), run(meterCust, o));
+    });
+    eq('mg customer: never the JWT sub', run(custFn, { vars: { 'aforo-jwt-payload': { sub: 'user_9' } } }), '');
+    eq('mg customer: over 64 characters is no customer', run(custFn, { vars: { 'aforo-customer-id': 'c'.repeat(65) } }), '');
     const verdictFn = compile('mgVerdict', t);
     const verdict = function (result) { return run(verdictFn, { vars: { mgResult: result } }); };
     eq('mg verdict: BLOCK', verdict('{"verdict":"BLOCK","currentLevel":"L3_BLOCK"}'), 'BLOCK');
@@ -909,6 +933,22 @@ section('G351 margin guard breaker', function () {
     const code = codeOf(t);
     eq('mg: one cache lookup', (code.match(/<cache-lookup-value /g) || []).length, 1);
     eq('mg: one cache store', (code.match(/<cache-store-value /g) || []).length, 1);
+});
+
+section('compound: aforo-ingestor-url is needed only in direct mode', function () {
+    const t = readPolicy('compound-metering-policy-fragment.xml');
+    const fn = compile('aforo-compound-deliverable', t);
+    eq('direct mode with a URL', run(fn, { vars: { 'aforo-ingestor-url': 'https://api.aforo.ai' } }), 'true');
+    eq('direct mode without a URL', run(fn, { vars: {} }), 'false');
+    eq('direct mode with a blank URL', run(fn, { vars: { 'aforo-ingestor-url': '  ' } }), 'false');
+    eq('eventhub mode without a URL', run(fn, { vars: { 'aforo-delivery-mode': ' EventHub ' } }), 'true');
+    eq('unknown mode without a URL', run(fn, { vars: { 'aforo-delivery-mode': 'kafka' } }), 'false');
+    const code = codeOf(t);
+    check('compound: the send gate reads aforo-compound-deliverable, not aforo-ingestor-url',
+        code.indexOf('GetValueOrDefault<string>("aforo-compound-deliverable", "") == "true"') !== -1
+        && code.indexOf('GetValueOrDefault<string>("aforo-ingestor-url", "").Trim().Length > 0') === -1);
+    check('compound: deliverable is set before the gate',
+        code.indexOf('name="aforo-compound-deliverable"') < code.indexOf('"aforo-compound-deliverable", "") == "true"'));
 });
 
 section('G352 compound skips streaming responses', function () {
@@ -943,12 +983,21 @@ section('G353 subscription map lookup is cached', function () {
     eq('source: subscription map', run(srcFn, { subscription: 's' }), 'map');
     eq('source: nothing', run(srcFn, {}), 'none');
     const keyFn = compile('aforo-customer-map-key', ctxSrc, NV);
-    const mapLen = NV['aforo-subscription-customer-map'].length;
-    eq('map key: version, map length and subscription', run(keyFn, { subscription: 'acme-prod', vars: { 'aforo-customer-source': 'map' } }), 'aforo:cust:1:' + mapLen + ':acme-prod');
-    eq('map key: version from the variable', run(keyFn, { subscription: 'acme-prod', vars: { 'aforo-customer-source': 'map', 'aforo-customer-map-version': ' 7 ' } }), 'aforo:cust:7:' + mapLen + ':acme-prod');
+    const mapHash = function (m) { return require('crypto').createHash('sha256').update(m, 'utf8').digest('base64').slice(0, 22); };
+    const nvHash = mapHash(NV['aforo-subscription-customer-map']);
+    eq('map key: tenant, version, map hash and subscription', run(keyFn, { subscription: 'acme-prod', vars: { 'aforo-customer-source': 'map', 'aforo-tenant-id': 't42' } }), 'aforo:cust:t42:1:' + nvHash + ':acme-prod');
+    eq('map key: tenant from the checked JWT', run(keyFn, { subscription: 'acme-prod', vars: { 'aforo-customer-source': 'map', 'aforo-jwt-tenant': 'tj' } }), 'aforo:cust:tj:1:' + nvHash + ':acme-prod');
+    eq('map key: no tenant known', run(keyFn, { subscription: 'acme-prod', vars: { 'aforo-customer-source': 'map' } }), 'aforo:cust:-:1:' + nvHash + ':acme-prod');
+    eq('map key: version from the variable', run(keyFn, { subscription: 'acme-prod', vars: { 'aforo-customer-source': 'map', 'aforo-customer-map-version': ' 7 ' } }), 'aforo:cust:-:7:' + nvHash + ':acme-prod');
+    check('map key: an edit that keeps the length changes the key',
+        run(keyFn, { subscription: 's', vars: { 'aforo-customer-source': 'map', 'aforo-subscription-customer-map': 's=cust_a' } }) !==
+        run(keyFn, { subscription: 's', vars: { 'aforo-customer-source': 'map', 'aforo-subscription-customer-map': 's=cust_b' } }));
+    check('map key: two tenants with the same map never share an entry',
+        run(keyFn, { subscription: 's', vars: { 'aforo-customer-source': 'map', 'aforo-tenant-id': 'tA' } }) !==
+        run(keyFn, { subscription: 's', vars: { 'aforo-customer-source': 'map', 'aforo-tenant-id': 'tB' } }));
     eq('map key: caching off', run(keyFn, { subscription: 'acme-prod', vars: { 'aforo-customer-source': 'map', 'aforo-customer-map-cache-seconds': '0' } }), '');
     eq('map key: not a map lookup', run(keyFn, { subscription: 'acme-prod', vars: { 'aforo-customer-source': 'jwt' } }), '');
-    eq('map key: a map from a variable changes the key', run(keyFn, { subscription: 'acme-prod', vars: { 'aforo-customer-source': 'map', 'aforo-subscription-customer-map': 'a=b' } }), 'aforo:cust:1:3:acme-prod');
+    eq('map key: a map from a variable changes the key', run(keyFn, { subscription: 'acme-prod', vars: { 'aforo-customer-source': 'map', 'aforo-subscription-customer-map': 'a=b' } }), 'aforo:cust:-:1:' + mapHash('a=b') + ':acme-prod');
     eq('customer: a cache hit is used without parsing', run(ctxCustomer, { subscription: 'acme-prod', vars: { 'aforo-customer-map-cached': 'cust_cached' } }), 'cust_cached');
     eq('customer: a cached miss stays a miss', run(ctxCustomer, { subscription: 'acme-prod', vars: { 'aforo-customer-map-cached': '~' } }), '');
     eq('customer: a JWT claim still wins over the cache', run(ctxCustomer, { subscription: 'acme-prod', vars: { 'aforo-customer-map-cached': 'cust_cached', 'aforo-jwt-payload': { customer_id: 'cust_jwt' } } }), 'cust_jwt');

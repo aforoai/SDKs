@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- 401 for an Aforo JWT that org-service reports as revoked. Not metered. -->
+<RaiseFault name="AforoJwtRevoked" continueOnError="false" enabled="true">
+    <DisplayName>Aforo Access - JWT Revoked (401)</DisplayName>
+    <FaultResponse>
+        <Set>
+            <Headers>
+                <Header name="WWW-Authenticate">Bearer error="invalid_token"</Header>
+            </Headers>
+            <Payload contentType="application/json">{aforo.access.revokedBody}</Payload>
+            <StatusCode>401</StatusCode>
+            <ReasonPhrase>Unauthorized</ReasonPhrase>
+        </Set>
+    </FaultResponse>
+    <IgnoreUnresolvedVariables>true</IgnoreUnresolvedVariables>
+</RaiseFault>

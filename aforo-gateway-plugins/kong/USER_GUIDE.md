@@ -1,6 +1,6 @@
 # kong-plugin-aforo-metering — User Guide
 
-**Version:** 2.7.0 · **Updated:** 2026-10-27 · **Audience:** engineers running Kong Gateway (OSS, Enterprise or Kong Konnect data planes) who want API usage metered into Aforo.
+**Version:** 2.8.1 · **Updated:** 2026-10-28 · **Audience:** engineers running Kong Gateway (OSS, Enterprise or Kong Konnect data planes) who want API usage metered into Aforo.
 
 ## What you'll build
 
@@ -21,10 +21,10 @@ Not yet on LuaRocks, so build it from the rockspec in this folder:
 git clone https://github.com/aforoai/SDKs.git
 cd SDKs/aforo-gateway-plugins/kong
 luarocks install lua-resty-http
-luarocks make kong-plugin-aforo-metering-2.8.0-1.rockspec
+luarocks make kong-plugin-aforo-metering-2.8.1-1.rockspec
 ```
 
-`luarocks make` reads `kong-plugin-aforo-metering-2.8.0-1.rockspec` and installs the `handler`, `schema`, `rate-limit-enforce`, `margin-guard`, `preflight-quota`, `redis-util`, `event-buffer` and `event-util` modules under `kong.plugins.aforo-metering.*`.
+`luarocks make` reads `kong-plugin-aforo-metering-2.8.1-1.rockspec` and installs the `handler`, `schema`, `rate-limit-enforce`, `margin-guard`, `preflight-quota`, `redis-util`, `event-buffer` and `event-util` modules under `kong.plugins.aforo-metering.*`.
 
 Two things that will bite you if you skip them:
 

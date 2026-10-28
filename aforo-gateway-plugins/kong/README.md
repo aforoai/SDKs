@@ -2,7 +2,7 @@
 
 A Kong Gateway plugin that captures API usage events in Kong's `log` phase and batch-forwards them to Aforo for billing and analytics. Metering runs after the response is sent, so it adds no latency to the request path.
 
-**Version:** 2.6.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.8.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -27,7 +27,7 @@ cd SDKs/aforo-gateway-plugins/kong
 luarocks install lua-resty-http
 
 # 3. Build + install the plugin from the rockspec in this folder
-luarocks make kong-plugin-aforo-metering-2.8.0-1.rockspec
+luarocks make kong-plugin-aforo-metering-2.8.1-1.rockspec
 ```
 
 Then tell Kong to load it and reserve the shared memory it uses. In `kong.conf`:
@@ -161,7 +161,8 @@ Every event carries `executionStatus`, from the status the client received: 2xx/
 - **Refused requests do not count** in `HARD` mode, so a client that keeps retrying is let back in as its earlier requests age out. `SOFT` mode counts every request and only adds `X-RateLimit-Warning`.
 - **Headers.** `X-RateLimit-Limit` and `X-RateLimit-Remaining` describe the 60-second tier. `X-RateLimit-Reset` is the seconds until one more request fits when none is left, otherwise the seconds until the current window rolls over. A 429 carries `Retry-After`: the seconds until the next request would be allowed.
 - **Cost per request.** One Redis round trip in steady state: AUTH only on a new connection (pooled connections are kept per host, port, TLS settings and password), the policy cached in `aforo_cache` for 5 seconds, and every tier checked and counted in one `EVALSHA` (`EVAL` the first time Redis sees the script).
-- **When Redis fails** (connect, AUTH, an error reply, a script error) the request is let through and a warning is logged at most once a minute, as before.
+- **When Redis fails** (connect, AUTH, an error reply, a script error) the request is let through and a warning is logged at most once a minute, as before. A refused script (CROSSSLOT included) is logged at error level.
+- **Identity on a Kong-jwt route** (2.8.1): a verified JWT is limited by its `key_id`. Without `key_id` it is not rate limited and a warning says so; the plugin no longer falls back to `kong.client.get_credential()`, which on such a route is the jwt_secrets row whose `.key` is the issuer key every caller shares.
 - **TLS** (2.8.0): `rate_limit_redis_ssl = true` connects over TLS with the certificate verified against `lua_ssl_trusted_certificate` (`rate_limit_redis_ssl_verify`, default `true`) and SNI set to `rate_limit_redis_server_name` (default the host).
 
 ## Pre-flight quota check
@@ -233,11 +234,11 @@ Every option lives under `config.*`. `aforo_endpoint`, `api_key`, and `tenant_id
 | `rate_limit_redis_ssl` | boolean | `false` | Rate-limit Redis over TLS. |
 | `rate_limit_redis_ssl_verify` | boolean | `true` | Verify the rate-limit Redis certificate against `lua_ssl_trusted_certificate`. |
 | `rate_limit_redis_server_name` | string | — | TLS server name for the rate-limit Redis. Defaults to `rate_limit_redis_host`. |
-| `margin_guard_enabled` | boolean | `false` | Before proxying, ask pricing-service whether the tenant (GLOBAL scope) or the customer is margin-blocked or throttled, and answer 429 with `Retry-After` if so. Fails open. Requires `margin_guard_url`. |
+| `margin_guard_enabled` | boolean | `false` | Before proxying, ask pricing-service whether the tenant (GLOBAL scope) or the customer is margin-blocked or throttled, and answer 429 with `Retry-After` if so. Fails open. Requires `margin_guard_url`. A customer id over 128 characters (pricing's limit) is not sent; only GLOBAL is asked. A 4xx answer other than 408 / 429 is logged and let through without counting against the breaker (2.8.1). |
 | `margin_guard_url` | string | — | Pricing-service base URL, e.g. `http://pricing:8083`. The plugin calls pricing's `GET /api/v1/margin-guard/quick-check` with `api_key` as `X-API-Key`; pricing takes the tenant from the key (2.8.0; needs a pricing-service release that serves this path). Required when `margin_guard_enabled` is true. |
 | `margin_guard_cache_ttl` | integer | `30` | How long a BLOCK, or an ALLOW while no throttle is active, is cached, in seconds. THROTTLE, and the ALLOW for a request a throttle let through, are never cached. `0` disables the cache. Throttling is exact only with a pricing-service version that marks a throttle pass (`currentLevel: L2_THROTTLE`); older versions answer it as a plain ALLOW, which is cached. |
 | `margin_guard_timeout_ms` | integer | `300` | Timeout for each call to pricing, in ms (10–5000), connect and TLS handshake included. On timeout the request is let through. Was a fixed 50 ms before 2.8.0. |
-| `margin_guard_breaker_threshold` | integer | `5` | Failures in a row (timeout, error, non-200, no verdict) that open the margin guard circuit breaker; while open, pricing is not called and requests go through at once. Cached answers are still used. `0` turns it off. Shared by all workers, per tenant and pricing URL. |
+| `margin_guard_breaker_threshold` | integer | `5` | Failures in a row (timeout, error, 408, 429, 5xx, no verdict) that open the margin guard circuit breaker; while open, pricing is not called and requests go through at once. Cached answers are still used. `0` turns it off. Shared by all workers, per tenant and pricing URL. |
 | `margin_guard_breaker_cooldown_s` | integer | `10` | Seconds the margin guard breaker stays open before one request probes pricing again; a success closes it. |
 | `preflight_quota_enabled` | boolean | `false` | Ask the ingestor's `POST /api/v1/quota/check` before proxying (rate limit, prepaid wallet, cumulative quota) for the metric the call will be billed to; 429 on `DENY`. Calls that will not be billed are not checked. Off by default: it adds a synchronous call per cache miss. See [Pre-flight quota check](#pre-flight-quota-check). |
 | `preflight_quota_url` | string | origin of `aforo_endpoint` + `/api/v1/quota/check` | Quota-check endpoint. |
@@ -288,5 +289,5 @@ Step-by-step from install to a verified event in Aforo: see [USER_GUIDE.md](USER
 - **No durable buffer.** Events live in the `aforo_buffer` shared dict until they are delivered, in one buffer per destination (`aforo_endpoint` + `tenant_id` + `api_key`). A buffer is only ever delivered with its own endpoint, tenant and key, and events never move to another buffer — not when a plugin's `api_key`, `tenant_id` or `aforo_endpoint` changes either (see [Rotating the Aforo API key](USER_GUIDE.md#rotating-the-aforo-api-key)). What the ingestor could not take is kept and retried every `flush_interval_ms`: timeouts, 5xx, 408, 429, and events a 202 reports as not stored — up to 10,000 events per buffer, or until the dict is full. A destination the ingestor refuses (401/403/404, or 400 for the whole request) keeps only its newest 500 events and is retried with its own key, backing off from twice `flush_interval_ms` to every 5 minutes; events older than 72 hours are dropped (and logged), since the ingestor would refuse them. When the dict runs low, its events, and then those of destinations that are failing, make room for the healthy ones. The plugin's caches never push buffered events out. A batch answered 400 is split in halves so one bad event does not take others with it, and a batch answered 413 is split until the parts are small enough; an event refused on its own is dropped with the reason logged. On a reload or graceful stop each buffer gets one quick last send, and the new workers pick up what is left; a crash or `kill -9` loses whatever is buffered — this is best-effort metering, not a guaranteed-delivery queue.
 - **JWT rate limiting needs pricing-service to publish policies by key id.** The plugin looks a JWT request's policy up under `ratelimit:policy:{tenantId}:keyid:{keyId}`. Until pricing-service writes that key next to `ratelimit:policy:{tenantId}:{keyHash}`, JWT requests find no policy and pass unlimited, as they did before 2.7.0.
 - **Revocation on a classic Redis Cluster needs a proxy.** The revocation lookup sends one `GET` per key (pipelined, one round trip), so ElastiCache Serverless and proxies that route each key to its shard work. The plugin does not follow `MOVED` redirects: pointed at one node of a classic cluster, it gets `MOVED` for keys on other shards, which fails closed (503) unless `jti_redis_fail_mode = open`. The key names (`jti:blocked:<jti>`, `jti:client:<id>`) are written by organization-service without a hash tag.
-- **Rate limiting with Redis Cluster is not supported.** The check runs as one Lua script over a tier's two counter keys, which a cluster refuses when they land in different slots (CROSSSLOT); the plugin then fails open and logs it.
+- **Rate limiting on Redis Cluster and ElastiCache Serverless** (2.8.1): every counter key of one check carries the hash tag `{tenant:scope}` (`ratelimit:count:{tenantId:scope}:{window}:{epochWindow}`), so the one script's keys sit in one slot. Before 2.8.1 they had no hash tag, the cluster refused the script with CROSSSLOT, and the check failed open: HARD limits were never enforced. A CROSSSLOT or other script refusal is now logged at error level, naming HARD limits as not enforced.
 - **Rate-limit, margin-guard and pre-flight quota enforcement need Redis / pricing-service / the ingestor reachable.** All fail open: a timeout or an unreachable dependency lets the request through rather than blocking it (the quota check can be made fail-closed with `preflight_quota_fail_open=false`).

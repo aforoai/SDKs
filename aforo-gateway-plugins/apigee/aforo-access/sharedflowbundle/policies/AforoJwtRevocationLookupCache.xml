@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- The last revocation answer or breaker state for this tenant + token
+     (OK, REVOKED, F:n, OPEN), stored by AforoJwtRevocationPopulateCache. -->
+<LookupCache name="AforoJwtRevocationLookupCache" continueOnError="true">
+    <DisplayName>Aforo Access - JWT Revocation Cache Lookup</DisplayName>
+    <CacheKey>
+        <Prefix>aforo-jti</Prefix>
+        <KeyFragment ref="aforo.access.revocationCacheKey"/>
+    </CacheKey>
+    <Scope>Global</Scope>
+    <AssignTo>aforo.access.revocationCached</AssignTo>
+</LookupCache>

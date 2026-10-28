@@ -4,6 +4,18 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versioning: [SemVer](htt
 
 This function ships on the Aforo gateway-plugins line; the whole repo is versioned and tagged together. The version lives in `package.json`. Entries below are the AWS-Lambda-specific slice of each repo release (see the parent `aforo-gateway-plugins/CHANGELOG.md` for the cross-plugin picture).
 
+## [2.5.1] - not yet released
+
+Fixes from the wave 6 review. Not deployed to AWS.
+
+### Fixed
+- **A rotated key no longer loses batches.** `aws-secret.js` caches the key for 5 minutes, and a 401 / 403 from the ingestor counted as a permanent rejection: the batch was dropped and the handler returned 200, so neither Lambda's redelivery nor the OnFailure queue kept the events. Now a 401 / 403 drops the cached key (`refresh()` on the secret source), rereads the secret once and resends the refused batches with the same bodies (same idempotency keys, so anything that did land is deduplicated). Refused again, the secret unreadable, or the secret still holding the same key: the batches count as transient and the handler throws, so Lambda redelivers and the OnFailure queue keeps them. With the plain `AFORO_API_KEY` there is nothing to reread, so a 401 / 403 throws.
+- **A response that fails after its headers no longer crashes the runtime.** `aws-secret.js` (GetSecretValue), `authorizer.js` (JWKS) and `key-authorizer.js` (introspection) had no `res.on('error')`, so a timeout or reset after the headers was an unhandled error. They now reject; `index.js` and `compound-metering.js` got the same listener, and the JWKS fetch drains a non-2xx body.
+- **Secret ARN parameters require the full ARN.** `AforoApiKeySecretArn` and `AforoTenantKeySecretArn` accepted a partial ARN (no six-character suffix), but the SAM `AWSSecretsManagerGetSecretValuePolicy` grants that exact ARN, so the function was denied every read. The `AllowedPattern` now requires the `-XXXXXX` suffix; the descriptions and README say so.
+- **Margin guard** skips a customer id over 128 characters (pricing answers 400 to it) instead of calling pricing on every request; it has no breaker, so a 4xx was already only logged and let through.
+- `preflight-quota.js`: the `build429Response` comment said a DENY without a wait gets `Retry-After: 60`; the code sends 5 s (`DEFAULT_DENY_RETRY_S`), as the README says.
+- Tests: key rotation through a local Secrets Manager and ingestor (`secret-wiring.test.js`, +8), `refresh()` and a response dying after its headers (`aws-secret.test.js`, +5), the ARN patterns (`template.test.js`, +4), the 128-character margin-guard cap (`margin-guard.test.js`, +1).
+
 ## [2.5.0] - not yet released
 
 ### Runtime

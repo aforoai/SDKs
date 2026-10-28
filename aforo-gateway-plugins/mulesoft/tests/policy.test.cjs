@@ -5,7 +5,7 @@
  * The billing logic (the DataWeave scripts) is executed by
  * dataweave.test.cjs with the DataWeave CLI. This file checks everything
  * around it that a Mule runtime would otherwise be needed for:
- *   1. the package: pom (mule-policy, 3.1.0 = VERSION, public repositories
+ *   1. the package: pom (mule-policy, 3.1.1 = VERSION, public repositories
  *      only), mule-artifact.json, the policy definition (every MC3 property,
  *      defaults, the secret marked sensitive)
  *   2. the template agrees with the definition: every property is read
@@ -67,7 +67,7 @@ const MC3 = [
 
 // ── 1. Package ───────────────────────────────────────────────────────
 const VERSION = read('VERSION').trim();
-eq('VERSION', VERSION, '3.1.0');
+eq('VERSION', VERSION, '3.1.1');
 check('pom packaging is mule-policy', pom.indexOf('<packaging>mule-policy</packaging>') !== -1);
 eq('pom artifactId/version',
     (pom.match(/<artifactId>aforo-metering<\/artifactId>\s*<version>([^<]+)<\/version>/) || [])[1], VERSION);
@@ -187,7 +187,16 @@ targetValues.forEach(function (tv, i) {
         /^targetValue="#\[output application\/java ---/.test(tv), tv);
 });
 check('the MCP request body read names its output type',
-    template.indexOf('variableName="aforoRequestText" value="#[output application/java --- if (') !== -1);
+    template.indexOf('variableName="aforoRequestText" value="#[output application/java --- (payload.^raw') !== -1);
+// The body is read only when mcp-body says so: never on a chunked or undeclared length (G-w6 review).
+eq('the MCP body is read in exactly one place', count(template, 'payload.^raw'), 1);
+check('the MCP body read sits behind the mcp-body decision',
+    template.indexOf('// aforo-script: mcp-body') !== -1 &&
+    template.indexOf('// aforo-script: mcp-body') < template.indexOf('payload.^raw') &&
+    template.indexOf('<when expression="#[vars.aforoMcpBody.read == true]">') !== -1 &&
+    template.indexOf('<when expression="#[vars.aforoMcpBody.read == true]">') < template.indexOf('payload.^raw'));
+check('a body that is not read logs a WARN and the call is still metered',
+    /MCP request body not read \(' \+\+ \(vars\.aforoMcpBody\.reason/.test(template));
 
 const NEXT = '<http-policy:execute-next/>';
 const next = template.indexOf(NEXT);

@@ -84,6 +84,19 @@ test('no host port is published on every interface', () => {
   assert.deepStrictEqual(ports, [], `bound to 0.0.0.0: ${ports.join(', ')}`);
 });
 
+console.log('\nKong shared dicts');
+
+test('the demo declares both aforo_buffer and aforo_cache, as the plugin image does', () => {
+  const m = compose.match(/^\s*KONG_NGINX_HTTP_LUA_SHARED_DICT:\s*"([^"]*)"/m);
+  assert.ok(m, 'KONG_NGINX_HTTP_LUA_SHARED_DICT not set');
+  assert.ok(/(^|;\s*lua_shared_dict\s+)aforo_buffer\s+\d+[km]\b/.test(m[1]), m[1]);
+  assert.ok(/;\s*lua_shared_dict\s+aforo_cache\s+\d+[km]\b/.test(m[1]), 'aforo_cache missing: ' + m[1]);
+  const docker = fs.readFileSync(path.join(DEMO, '..', 'kong', 'Dockerfile'), 'utf8');
+  const img = docker.match(/KONG_NGINX_HTTP_LUA_SHARED_DICT="([^"]*)"/);
+  assert.ok(img, 'Dockerfile value not found');
+  for (const dict of ['aforo_buffer', 'aforo_cache']) assert.ok(img[1].includes(dict), 'Dockerfile lacks ' + dict);
+});
+
 console.log('\nG370: secrets in the served folder');
 
 test('the frontend tokens.json carries no API key', () => {

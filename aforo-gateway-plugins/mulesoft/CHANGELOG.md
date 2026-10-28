@@ -4,6 +4,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [Unreleased]
 
+## [3.1.1] — 2026-10-28
+
+### Fixed
+- The MCP request body was read whenever `Content-Length` was absent (the guard defaulted it to 0), so a chunked `tools/call` request was read whole into memory however large. The body is now read only when the request declares its length (`Content-Length`, no `Transfer-Encoding`) and that length is at most 1 MiB; otherwise the call is metered as a normal request and a WARN names the reason. A non-numeric `Content-Length` is treated the same way (it used to fail the read and log a generic error). New DataWeave script `mcp-body` with 10 fixture cases; structure checks that the body is read in one place, behind that decision.
+
 ## [3.1.0] — 2026-10-28
 
 Wave 6 (W6.5: G359, G361, G362). Configuration properties unchanged; see "Upgrading from 3.0.0" in the user guide. Includes the 3.0.2 fixes below. Not yet verified on a live Anypoint org.

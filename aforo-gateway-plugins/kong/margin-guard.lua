@@ -24,6 +24,10 @@
 -- shared dict no install declared, and a missing margin_guard_url raised on
 -- every request (a 500).
 --
+-- A 4xx other than 408 / 429 (2.8.1) is pricing refusing that request: it is
+-- logged and fails open, but does not count against the breaker. A customer
+-- id over 128 characters (pricing's limit) is not sent: only GLOBAL is asked.
+--
 -- Fail-open: a timeout, an error status, an unreadable answer, a missing URL
 -- or any failure in this module lets the request through.
 --
@@ -71,6 +75,9 @@ local DEFAULT_BREAKER_THRESHOLD = 5
 local DEFAULT_BREAKER_COOLDOWN = 10
 
 -- Same shape as preflight-quota.lua's throttle.
+-- Longest scopeId pricing's quick-check accepts (400 above it).
+local MAX_SCOPE_ID = 128
+
 local function log_throttled(dict, level, key, ...)
     if dict and not dict:safe_add("aforo:warn:" .. key, 1, 60) then return end
     kong.log[level](...)
@@ -143,6 +150,17 @@ local function quick_check(conf, dict, bkey, base_url, tenant_id, scope_type, sc
         breaker_failure(conf, dict, bkey)
         log_throttled(dict, "warn", "mg_unreachable", "[aforo-margin-guard] Check failed: ",
             tostring(err), " -- fail-open ALLOW. Repeats suppressed for 60s.")
+        return nil
+    end
+    if res.status >= 400 and res.status < 500 and res.status ~= 408 and res.status ~= 429 then
+        -- Pricing answered and refused this request (a bad scope id, a key it
+        -- does not accept): it is up, so this is not a breaker failure. Before
+        -- 2.8.1 it was, and the breaker is per tenant, so one customer id
+        -- pricing refused switched the GLOBAL check off for the whole tenant.
+        event_util.breaker_success(dict, bkey)
+        log_throttled(dict, "warn", "mg_refused", "[aforo-margin-guard] Pricing refused the ",
+            scope_type, " check with HTTP ", res.status, " -- fail-open ALLOW, breaker unchanged. ",
+            "Repeats suppressed for 60s.")
         return nil
     end
     if res.status ~= 200 then
@@ -220,7 +238,14 @@ local function check(conf, tenant_id, customer_id)
 
     local scopes = { { "GLOBAL", "global" } }
     if type(customer_id) == "string" and customer_id ~= "" then
-        scopes[2] = { "CUSTOMER", customer_id }
+        if #customer_id > MAX_SCOPE_ID then
+            -- Pricing refuses a scopeId over 128 characters with 400.
+            log_throttled(dict, "warn", "mg_long_customer", "[aforo-margin-guard] Customer id longer than ",
+                MAX_SCOPE_ID, " characters: CUSTOMER scope not checked (GLOBAL still is). ",
+                "Repeats suppressed for 60s.")
+        else
+            scopes[2] = { "CUSTOMER", customer_id }
+        end
     end
 
     local bkey = "aforo:mg:cb:" .. ngx.md5(tenant_id .. "\n" .. base_url)

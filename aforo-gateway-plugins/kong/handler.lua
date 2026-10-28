@@ -833,7 +833,7 @@ end
 
 local AforoMeteringHandler = {
     PRIORITY = 5,    -- Run after most other plugins
-    VERSION  = "2.8.0",
+    VERSION  = "2.8.1",
 }
 
 -- The event buffer and its delivery to the ingestor live in event-buffer.lua.

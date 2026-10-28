@@ -10,7 +10,7 @@ const fs = require('fs');
 const http = require('http');
 const path = require('path');
 const { spawn } = require('child_process');
-const { Forwarder, OutageError, configFromEnv, parseMessages, chunk, parseRetryAfter } = require('../src/forwarder');
+const { Forwarder, OutageError, configFromEnv, parseMessages, chunk, parseRetryAfter, compoundOutcome } = require('../src/forwarder');
 
 const repoRoot = path.resolve(__dirname, '..', '..', '..');
 const MOCK = [
@@ -308,7 +308,7 @@ test('config: https only, key required', function () {
     assert.throws(function () { configFromEnv({ AFORO_API_KEY: 'k', AFORO_MAX_RETRIES: 'many' }); }, /positive integer/);
 });
 
-test('compound events go to the compound batch endpoint; failed results are rejected', async function () {
+test('compound events go to the compound batch endpoint; a permanent failure is rejected', async function () {
     const seen = [];
     const server = http.createServer(function (req, res) {
         let body = '';
@@ -334,5 +334,86 @@ test('compound events go to the compound batch endpoint; failed results are reje
         assert.equal(seen[0].body.events.length, 2);
     } finally {
         server.close();
+    }
+});
+
+// A compound endpoint that answers each request with the next scripted result list.
+async function compoundServer(answers) {
+    const seen = [];
+    const server = http.createServer(function (req, res) {
+        let body = '';
+        req.on('data', function (d) { body += d; });
+        req.on('end', function () {
+            const parsed = JSON.parse(body);
+            seen.push(parsed.events.map(function (e) { return e.correlationId; }));
+            const results = (answers[seen.length - 1] || function (ids) { return ids.map(function (id) { return { correlationId: id, success: true, accepted: 1 }; }); })(seen[seen.length - 1]);
+            res.writeHead(202, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: true, data: { results: results } }));
+        });
+    });
+    await new Promise(function (r) { server.listen(0, '127.0.0.1', r); });
+    return { server: server, seen: seen, url: 'http://127.0.0.1:' + server.address().port };
+}
+const compoundMsg = function (id) { return JSON.stringify({ correlationId: id, customerId: 'cust_1', occurredAt: new Date(0).toISOString(), measurements: [{ metricName: 'input-tokens', quantity: 5 }] }); };
+
+test('compoundOutcome: retryable flag, BUSY / TIMEOUT texts, all-duplicate redelivery', function () {
+    assert.equal(compoundOutcome({ success: true, accepted: 1 }), 'delivered');
+    assert.equal(compoundOutcome({ success: false, retryable: true, errors: ['Server busy, retry the batch'] }), 'retry');
+    assert.equal(compoundOutcome({ success: false, retryable: true, errors: ['db down'] }), 'retry');
+    assert.equal(compoundOutcome({ success: false, errors: ['Server busy, retry the batch'] }), 'retry');
+    assert.equal(compoundOutcome({ success: false, errors: ['Processing timeout'] }), 'retry');
+    assert.equal(compoundOutcome({ success: false, retryable: false, errors: ['Server busy, retry the batch'] }), 'rejected', 'an explicit false wins over the text');
+    assert.equal(compoundOutcome({ success: false, errors: ['unknown metric'] }), 'rejected');
+    assert.equal(compoundOutcome({ success: false, accepted: 0, duplicates: 2, failed: 0 }), 'delivered');
+    assert.equal(compoundOutcome({ success: false, retryable: false, accepted: 0, duplicates: 0, failed: 1 }), 'rejected');
+});
+
+test('compound BUSY / TIMEOUT results are resent with the same correlationIds, then counted', async function () {
+    const srv = await compoundServer([
+        function (ids) { return [
+            { correlationId: ids[0], success: true, accepted: 1 },
+            { correlationId: ids[1], success: false, errors: ['Server busy, retry the batch'] },
+            { correlationId: ids[2], success: false, retryable: true, errors: ['Processing timeout'] },
+            { correlationId: ids[3], success: false, retryable: false, errors: ['unknown metric'] },
+        ]; },
+    ]);
+    try {
+        const f = forwarder({ ingestUrl: srv.url + '/v1/ingest/batch' });
+        const stats = await f.forward(['c1', 'c2', 'c3', 'c4'].map(compoundMsg));
+        assert.deepEqual(srv.seen, [['c1', 'c2', 'c3', 'c4'], ['c2', 'c3']]);
+        assert.equal(stats.accepted, 3);
+        assert.equal(stats.rejected, 1);
+        assert.equal(f.sleeps.length, 1);
+    } finally {
+        srv.server.close();
+    }
+});
+
+test('a redelivered compound event that is all duplicates counts as delivered', async function () {
+    const srv = await compoundServer([
+        function (ids) { return [{ correlationId: ids[0], success: false, accepted: 0, duplicates: 1, failed: 0 }]; },
+    ]);
+    try {
+        const f = forwarder({ ingestUrl: srv.url + '/v1/ingest/batch' });
+        const stats = await f.forward([compoundMsg('c1')]);
+        assert.equal(stats.accepted, 1);
+        assert.equal(stats.rejected, 0);
+        assert.equal(srv.seen.length, 1);
+        assert.ok(!f.logs.some(function (l) { return /dropped/.test(l); }), 'nothing logged as dropped');
+    } finally {
+        srv.server.close();
+    }
+});
+
+test('compound events still busy after the retries end the invocation without a checkpoint', async function () {
+    const busy = function (ids) { return ids.map(function (id) { return { correlationId: id, success: false, retryable: true, errors: ['Server busy, retry the batch'] }; }); };
+    const srv = await compoundServer([busy, busy, busy, busy, busy]);
+    try {
+        const f = forwarder({ ingestUrl: srv.url + '/v1/ingest/batch', maxRetries: 3 });
+        await assert.rejects(f.forward([compoundMsg('c1')]), OutageError);
+        assert.equal(srv.seen.length, 4);
+        srv.seen.forEach(function (ids) { assert.deepEqual(ids, ['c1']); });
+    } finally {
+        srv.server.close();
     }
 });

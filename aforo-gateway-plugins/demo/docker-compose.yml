@@ -45,9 +45,11 @@ services:
       KONG_ADMIN_LISTEN: 127.0.0.1:8001
       KONG_PROXY_ACCESS_LOG: /dev/stdout
       KONG_PROXY_ERROR_LOG: /dev/stderr
-      # handler.lua buffers events here. Without it the plugin loads, proxies
-      # traffic, and silently meters nothing.
-      KONG_NGINX_HTTP_LUA_SHARED_DICT: "aforo_buffer 10m"
+      # handler.lua buffers events in aforo_buffer; caches, throttles and
+      # counters live in aforo_cache (2.8.0). This value replaces the plugin
+      # image's, so it must declare both. Kong injects it after
+      # `lua_shared_dict `, hence the second directive written out.
+      KONG_NGINX_HTTP_LUA_SHARED_DICT: "aforo_buffer 10m; lua_shared_dict aforo_cache 5m"
       # Needed whenever aforo_endpoint is https. Kong's default of 1 is too
       # shallow for a normal certificate chain and every flush fails with
       # "unable to get local issuer certificate" -- which is a depth problem,

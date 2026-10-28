@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Reads the revocation answer (or the cached one): revoked, ok, or no
+     answer (fallback). Sets what AforoJwtRevocationPopulateCache stores.
+     See aforo-jwt-revocation.js. -->
+<Javascript name="AforoJwtRevocationDecide" timeLimit="200" continueOnError="true">
+    <DisplayName>Aforo Access - JWT Revocation Decision</DisplayName>
+    <Properties>
+        <Property name="phase">decide</Property>
+    </Properties>
+    <IncludeURL>jsc://aforo-billing.js</IncludeURL>
+    <ResourceURL>jsc://aforo-jwt-revocation.js</ResourceURL>
+</Javascript>

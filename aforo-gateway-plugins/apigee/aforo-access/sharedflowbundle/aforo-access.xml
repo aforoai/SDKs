@@ -19,6 +19,14 @@
         <Policy>AforoJwtAssignClaims</Policy>
         <Policy>AforoAccessDecide</Policy>
         <Policy>AforoJwtRejected</Policy>
+        <Policy>AforoJwtRevocationPrepare</Policy>
+        <Policy>AforoJwtRevocationLookupCache</Policy>
+        <Policy>AforoJwtRevocationCallDecision</Policy>
+        <Policy>AforoJwtRevocationCheck</Policy>
+        <Policy>AforoJwtRevocationDecide</Policy>
+        <Policy>AforoJwtRevocationPopulateCache</Policy>
+        <Policy>AforoJwtRevoked</Policy>
+        <Policy>AforoJwtRevocationUnavailable</Policy>
         <Policy>AforoQuotaLookupCache</Policy>
         <Policy>AforoQuotaCheck</Policy>
         <Policy>AforoQuotaDecide</Policy>
@@ -32,6 +40,7 @@
         <Resource>jsc://aforo-access-prepare.js</Resource>
         <Resource>jsc://aforo-access.js</Resource>
         <Resource>jsc://aforo-quota-decide.js</Resource>
+        <Resource>jsc://aforo-jwt-revocation.js</Resource>
     </Resources>
     <SharedFlows>
         <SharedFlow>default</SharedFlow>

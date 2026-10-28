@@ -52,6 +52,15 @@ assert(/AWSSecretsManagerGetSecretValuePolicy:\s*\n\s+SecretArn: !Ref AforoTenan
 assert(!/secretsmanager:\*|Resource: '\*'/.test(T), 'no wildcard secret access');
 assert(paramDefault('AforoApiKeySecretArn') === undefined, 'AforoApiKeySecretArn has no default (required)');
 assert(/AllowedPattern: .*secretsmanager/.test(block('AforoApiKeySecretArn')), 'AforoApiKeySecretArn must be a secret ARN');
+for (const name of ['AforoApiKeySecretArn', 'AforoTenantKeySecretArn']) {
+    const m = block(name).match(/AllowedPattern: '([^']+)'/);
+    assert(m, name + ' has an AllowedPattern');
+    const re = new RegExp(m[1]);
+    assert(re.test('arn:aws:secretsmanager:eu-west-1:123456789012:secret:aforo/metering/api-key-AbCdEf'),
+        name + ' accepts a full ARN (with the six-character suffix)');
+    assert(!re.test('arn:aws:secretsmanager:eu-west-1:123456789012:secret:aforo/metering/api-key'),
+        name + ' refuses a partial ARN (the IAM grant would match nothing)');
+}
 const rules = T.slice(T.indexOf('\nRules:'), T.indexOf('\nConditions:'));
 assert(/!Equals \[!Ref AforoApiKey, ''\]/.test(rules), 'a rule refuses a plaintext AforoApiKey');
 assert(/!Equals \[!Ref AforoTenantKey, ''\]/.test(rules), 'a rule refuses a plaintext AforoTenantKey');

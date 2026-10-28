@@ -144,7 +144,11 @@ function httpGet(url) {
         const transport = parsedUrl.protocol === 'https:' ? https : http;
 
         const req = transport.get(url, { timeout: 5000 }, (res) => {
+            // A timeout or reset after the headers destroys the response; without
+            // this listener that 'error' is unhandled and crashes the runtime.
+            res.on('error', reject);
             if (res.statusCode < 200 || res.statusCode >= 300) {
+                res.resume();
                 return reject(new Error(`JWKS fetch failed: HTTP ${res.statusCode} from ${url}`));
             }
             let data = '';

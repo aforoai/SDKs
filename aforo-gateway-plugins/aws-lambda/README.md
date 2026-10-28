@@ -2,9 +2,9 @@
 
 An AWS Lambda function that subscribes to API Gateway CloudWatch access logs, parses each entry, and batch-POSTs usage events to Aforo. It runs off the log stream asynchronously, so it adds nothing to your request path.
 
-**Version:** 2.4.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.5.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
-> Version lives in [`package.json`](package.json) (`"version": "2.4.0"`). It matches the version stated here and in the changelog.
+> Version lives in [`package.json`](package.json) (`"version": "2.5.1"`). It matches the version stated here and in the changelog.
 
 ## Install
 
@@ -106,8 +106,8 @@ The function reads everything from environment variables.
 | Env var | SAM parameter | Default | What it does |
 |---------|---------------|---------|--------------|
 | `AFORO_ENDPOINT` | `AforoEndpoint` | `https://api.aforo.ai/v1/ingest/batch` (template) | Aforo ingestor batch URL. |
-| `AFORO_API_KEY_SECRET_ARN` | `AforoApiKeySecretArn` (required) | — | ARN of the Secrets Manager secret holding the Aforo API key, scope `usage:ingest`, as plain text or JSON `{"apiKey":"…"}`. Read once per container and refreshed every 5 minutes; a failed refresh keeps the last value. Until the first read succeeds, a failed read makes the next invocations fail fast for 5 s (doubling to 60 s, with jitter) instead of each waiting up to 3 s on Secrets Manager. Sent as `X-API-Key`, alone — no `Authorization` header (the ingestor answers 401 to one) and no `X-Tenant-Id`. The tenant is derived from the key. If the secret cannot be read on a cold start, the invocation fails and Lambda retries it (nothing is dropped). |
-| `AFORO_API_KEY` | `AforoApiKey` (must be empty) | — | The key as a plain environment variable. Used only when `AFORO_API_KEY_SECRET_ARN` is unset — Aforo's one-click deploy still sets it. The template refuses a non-empty `AforoApiKey` since 2.4.0. With neither set, every invocation fails rather than sending events without a key. |
+| `AFORO_API_KEY_SECRET_ARN` | `AforoApiKeySecretArn` (required) | — | Full ARN (with the six-character suffix, `…:secret:<name>-AbCdEf`; the template refuses a partial ARN because the IAM grant is for that exact ARN) of the Secrets Manager secret holding the Aforo API key, scope `usage:ingest`, as plain text or JSON `{"apiKey":"…"}`. Read once per container and refreshed every 5 minutes; a failed refresh keeps the last value. Until the first read succeeds, a failed read makes the next invocations fail fast for 5 s (doubling to 60 s, with jitter) instead of each waiting up to 3 s on Secrets Manager. Sent as `X-API-Key`, alone — no `Authorization` header (the ingestor answers 401 to one) and no `X-Tenant-Id`. The tenant is derived from the key. If the secret cannot be read on a cold start, the invocation fails and Lambda retries it (nothing is dropped). A 401 or 403 from the ingestor rereads the secret at once and resends the batch with the new key (a rotated key is in use within one invocation, not 5 minutes); still refused, the invocation fails and Lambda redelivers (2.5.1; before, the batch was dropped with a 200). |
+| `AFORO_API_KEY` | `AforoApiKey` (must be empty) | — | The key as a plain environment variable. Used only when `AFORO_API_KEY_SECRET_ARN` is unset. Aforo's one-click deploy stops setting it with organization-service's W6 installer and aws-cloudformation 3.1.0: it stores the key in `aforo/metering/<function>` and removes this variable on the next deploy. The template refuses a non-empty `AforoApiKey` since 2.4.0. With neither set, every invocation fails rather than sending events without a key. |
 | `METRIC_MAPPINGS` | `MetricMappings` | `[]` | JSON array of `{matchType, value, metricName}` rules, first match wins. `matchType` is `EXACT`, `PREFIX` or `CONTAINS` (plain string comparison). Invalid JSON, or an invalid rule, is logged and ignored. |
 | `METRIC_NAME_PATTERN` | `MetricNamePattern` | *(empty)* | Route-shaped template (`{method}`, `{path}`, `{service}`=stage, `{route}`=resource). Applies only when set, to requests no mapping matches. Every resulting name must be a catalog metric, which route-shaped names rarely are. |
 | `DEFAULT_METRIC` | `DefaultMetric` | `api_calls` | Metric for requests that neither a mapping nor the pattern names. |

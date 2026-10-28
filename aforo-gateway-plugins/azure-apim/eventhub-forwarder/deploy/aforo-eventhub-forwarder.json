@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-  "contentVersion": "2.3.0.0",
+  "contentVersion": "2.3.1.0",
   "metadata": {
     "description": "Aforo APIM Event Hub delivery: an Event Hubs namespace and hub, the APIM logger aforo-metering-logger (managed identity), and the forwarder Function that sends the events to the Aforo ingestor. Deploy into the resource group of the API Management instance."
   },

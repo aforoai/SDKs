@@ -32,11 +32,16 @@
       aforo-margin-guard-enabled  "true" to switch this fragment on
       aforo-margin-guard-url      pricing-service base URL reachable from APIM
 
-    Identity, authenticated sources only:
-      customer: aforo-customer-id when that variable exists (set by you or by
-                aforo-context); else the verified JWT's customer_id claim,
-                else its sub claim (aforo-jwt-payload, which only
-                aforo-jwt-validation sets); else the APIM subscription id.
+    Identity, authenticated sources only. The customer is the one
+    aforo-metering bills, by the same rule: aforo-customer-id when that
+    variable exists (set by you, or by aforo-context from the verified JWT's
+    customer_id claim or the subscription map); else the APIM subscription
+    id; trimmed; over 64 characters = no customer (check skipped, and the
+    call is not metered either). Without aforo-context the JWT is not read
+    here, as aforo-metering does not read it: include aforo-context to bill
+    and check the JWT's customer. Until 2.3.0 this also took the JWT's
+    customer_id or sub directly, so it could check a different customer
+    than the one billed.
       tenant:   not read. Pricing answers for the API key's tenant.
 
     Skipped for OPTIONS, when the customer is empty, and when
@@ -55,7 +60,10 @@
       answer        BLOCK, and ALLOW with no active level, kept for
                     aforo-margin-guard-cache-seconds (default 30; "0" = ask
                     every time). THROTTLE and WARN are never kept.
-      no answer     (timeout 1 s, error, non-200) counts a failure; after
+      refused       a 4xx other than 408 / 429 (since 2.3.1): pricing is up
+                    and refused this request, so the request is allowed,
+                    traced, and the failure count is reset, not raised.
+      no answer     (timeout 1 s, error, 408, 429, 5xx) counts a failure; after
                     aforo-margin-guard-breaker-failures in a row (default 3)
                     no call for aforo-margin-guard-breaker-seconds (default
                     30). The request is allowed (fail open) meanwhile.
@@ -67,14 +75,12 @@
     <choose>
         <when condition="@(context.Variables.GetValueOrDefault<string>("aforo-margin-guard-enabled", "false") == "true" && context.Request.Method != "OPTIONS" && context.Variables.GetValueOrDefault<string>("aforo-margin-guard-url", "").Trim().Length > 0)">
             <set-variable name="mgCustomerId" value="@{
-                if (context.Variables.ContainsKey("aforo-customer-id")) {
-                    return (Convert.ToString(context.Variables["aforo-customer-id"]) ?? "").Trim();
-                }
-                var payload = context.Variables.GetValueOrDefault<object>("aforo-jwt-payload", null) as JObject;
-                var fromJwt = payload == null ? null
-                    : (payload["customer_id"]?.ToString() ?? payload["sub"]?.ToString());
-                if (!string.IsNullOrEmpty(fromJwt)) return fromJwt;
-                return context.Subscription != null ? context.Subscription.Id : "";
+                var c = "";
+                if (context.Variables.ContainsKey("aforo-customer-id")) { c = Convert.ToString(context.Variables["aforo-customer-id"]); }
+                else if (context.Subscription != null) { c = context.Subscription.Id; }
+                if (c == null) { c = ""; }
+                c = c.Trim();
+                return c.Length > 64 ? "" : c;
             }" />
             <set-variable name="mgScope" value="@{
                 var k = context.Variables.ContainsKey("aforo-api-key") ? Convert.ToString(context.Variables["aforo-api-key"]) : "{{aforo-api-key}}";
@@ -128,7 +134,12 @@
                         if (Convert.ToString(context.Variables["mgCall"]) != "true") { return ""; }
                         try {
                             var r = context.Variables.ContainsKey("mgResponse") ? (IResponse)context.Variables["mgResponse"] : null;
-                            if (r == null || r.StatusCode != 200) { return "UNAVAILABLE"; }
+                            if (r == null) { return "UNAVAILABLE"; }
+                            /* A 4xx other than 408 / 429 is pricing refusing this request
+                               (bad id, key not allowed): pricing is up, so it is not a
+                               breaker failure. The request is allowed and traced. */
+                            if (r.StatusCode >= 400 && r.StatusCode < 500 && r.StatusCode != 408 && r.StatusCode != 429) { return "REFUSED:" + r.StatusCode; }
+                            if (r.StatusCode != 200) { return "UNAVAILABLE"; }
                             var text = r.Body.As<string>();
                             JObject.Parse(text);
                             return text;
@@ -140,6 +151,9 @@
                         var lim = Convert.ToString(context.Variables["mgLimits"]).Split(',');
                         var c = context.Variables.ContainsKey("mgCached") ? Convert.ToString(context.Variables["mgCached"]) : "";
                         if (c == null) { c = ""; }
+                        if (a.StartsWith("REFUSED:", StringComparison.Ordinal)) {
+                            return c.StartsWith("F:", StringComparison.Ordinal) ? "F:0|" + lim[2] : "";
+                        }
                         if (a != "UNAVAILABLE") {
                             var keep = false;
                             try {
@@ -162,10 +176,17 @@
                             <cache-store-value key="@("mg:" + Convert.ToString(context.Variables["mgScope"]) + ":" + Convert.ToString(context.Variables["mgCustomerId"]))" value="@{ var s = Convert.ToString(context.Variables["mgState"]); return s.Substring(0, s.LastIndexOf("|")); }" duration="@{ var s = Convert.ToString(context.Variables["mgState"]); return Convert.ToInt32(s.Substring(s.LastIndexOf("|") + 1)); }" />
                         </when>
                     </choose>
+                    <choose>
+                        <when condition="@(Convert.ToString(context.Variables["mgAnswer"]).StartsWith("REFUSED:", StringComparison.Ordinal))">
+                            <trace source="aforo-margin-guard" severity="warning">
+                                <message>@("Margin guard check refused by pricing (HTTP " + Convert.ToString(context.Variables["mgAnswer"]).Substring(8) + "); request allowed, breaker unchanged")</message>
+                            </trace>
+                        </when>
+                    </choose>
                     <set-variable name="mgResult" value="@{
                         var failOpen = "{\"verdict\":\"ALLOW\",\"currentLevel\":\"NONE\"}";
                         var a = Convert.ToString(context.Variables["mgAnswer"]);
-                        if (Convert.ToString(context.Variables["mgCall"]) == "true") { return a == "UNAVAILABLE" ? failOpen : a; }
+                        if (Convert.ToString(context.Variables["mgCall"]) == "true") { return (a == "UNAVAILABLE" || a.StartsWith("REFUSED:", StringComparison.Ordinal)) ? failOpen : a; }
                         var c = context.Variables.ContainsKey("mgCached") ? Convert.ToString(context.Variables["mgCached"]) : "";
                         if (c != null && c.StartsWith("R:", StringComparison.Ordinal)) { return c.Substring(2); }
                         return failOpen;

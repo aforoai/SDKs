@@ -1,6 +1,6 @@
 # Aforo Apigee Pub/Sub forwarder
 
-**Version:** 3.1.0 · Apache-2.0 · ships with the Apigee shared flows 3.1.0
+**Version:** 3.1.1 · Apache-2.0 · ships with the Apigee shared flows 3.1.1
 
 Use this when an ingest outage or a `429` must not cost you usage. In the default `async` mode, `aforo-metering` posts each call's events with a ServiceCallout that nobody waits for: an event the ingestor does not store is lost and nothing logs it. With `delivery_mode = pubsub` the flow publishes each call's events to a Pub/Sub topic instead, and this service reads a pull subscription, sends the events to the Aforo ingestor in batches, and acks a message only after the ingestor accepted (or permanently rejected) its events. While the ingestor is down, messages wait in the subscription (7 days by default) and are redelivered.
 
@@ -101,7 +101,7 @@ Run these in the Google Cloud project of your Apigee X org.
 ## Tests
 
 ```bash
-node --test tests/*.test.js      # no npm install; Node 20+
+node --test tests/*.test.js      # no npm install; Node 22+ (the runtime the service needs)
 ```
 
 They run against the fault-injecting mock ingestor in `aforo-metering-sdks/mock-ingestor/` (set `AFORO_MOCK_INGESTOR` to its `bin/mock-ingestor.mjs` if that repo is not checked out next to this one), and drive the subscriber with a fake subscription: outage → nack → redelivery accepted once per key, 429 `Retry-After` in both forms, 401, redirects, 413 splits, per-event `retryable`, hung and dripping responses, the breaker, one flusher at a time, and shutdown.

@@ -129,6 +129,9 @@ function introspect(key, tenantKey) {
             },
         }, (res) => {
             let data = '';
+            // A timeout or reset after the headers destroys the response; without
+            // this listener that 'error' is unhandled and crashes the runtime.
+            res.on('error', reject);
             res.on('data', (c) => { data += c; });
             res.on('end', () => {
                 if (res.statusCode !== 200) {

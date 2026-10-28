@@ -4,6 +4,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [Unreleased]
 
+## [3.1.0] — not yet released
+
+### `aforo-apigateway-role.yaml`
+
+- **The one-click metering install keeps the Aforo API key in Secrets Manager.** With `AllowMeteringInstall=true`, the Aforo role may `CreateSecret`, `PutSecretValue`, `DescribeSecret`, `DeleteSecret`, `RestoreSecret` and `TagResource` on `secretsmanager:…:secret:aforo/metering/*` in the metering region (statement `MeteringApiKeySecret`); it cannot read a secret back. The execution role `aforo-metering-exec-<ExternalId>` gets `secretsmanager:GetSecretValue` on the same prefix (policy `AforoMeteringApiKeySecret`). organization-service's installer now writes `aforo/metering/<function>` and passes only its ARN (`AFORO_API_KEY_SECRET_ARN`, aws-lambda 2.4.0+); before, the key was a plain `AFORO_API_KEY` environment variable anyone with `lambda:GetFunctionConfiguration` could read.
+
+### Upgrade from 3.0.0
+
+1. Update the stack with this template, same parameters. Until you do, a one-click deploy stops at `secretsmanager:DescribeSecret` and leaves an installed function as it was.
+2. Deploy metering again from Aforo. That stores the key in Secrets Manager and removes `AFORO_API_KEY` from the function. Removing metering schedules the secret for deletion with a 7-day recovery window.
+3. If the connection sets its own `meteringExecutionRoleArn`, allow that role `secretsmanager:GetSecretValue` on `arn:<partition>:secretsmanager:<region>:<account>:secret:aforo/metering/*` first.
+
 ## [3.0.0] — not yet released
 
 Permissions shrink, so this is a major version (G345, G346, G347).

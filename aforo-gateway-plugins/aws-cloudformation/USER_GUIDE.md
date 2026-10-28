@@ -79,6 +79,8 @@ To revoke access: `aws cloudformation delete-stack --region <region> --stack-nam
 | `deploy` fails on `ExternalId` | Not 32–44 letters, digits or hyphens. | Use the UUID Aforo shows. |
 | Aforo cannot connect | `ExternalId` differs from Aforo's, or the ARN pasted is from another stack. | Compare the values; read `AforoRoleArn` again. |
 | Import finds no APIs | The role is scoped to another region. | Redeploy with `ApiGatewayRegion=<your API region>`. |
+| One-click metering fails on `secretsmanager:DescribeSecret` / `CreateSecret` | The stack is older than 3.1.0, which added the Secrets Manager permissions. | Update the stack with the current template (same parameters), then deploy metering again. |
+| Metering Lambda logs `could not read AFORO_API_KEY_SECRET_ARN … AccessDeniedException` | The execution role predates 3.1.0, or the connection uses its own `meteringExecutionRoleArn`. | Update the stack; for your own role, allow `secretsmanager:GetSecretValue` on `aforo/metering/*`. |
 | One-click metering fails on `logs:PutSubscriptionFilter` | The access log group is outside `/aws/apigateway/*` and `API-Gateway-*`. | Redeploy with `AccessLogGroupPrefix=<log group name>`. |
 | Monetized APIs can still be deleted | The deny policy is not attached, or the resource is not tagged. | Pass `AttachToRoles` / `AttachToUsers` / `AttachToGroups`; check the `aforo-monetized` tag. |
 | `InsufficientCapabilitiesException` | The stack creates named IAM resources. | Add `--capabilities CAPABILITY_NAMED_IAM`. |

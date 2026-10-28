@@ -236,7 +236,7 @@ class Forwarder {
             const res = await this.fetch(url, {
                 method: 'POST',
                 redirect: 'manual',
-                headers: { 'Content-Type': 'application/json', 'X-API-Key': this.cfg.apiKey, 'User-Agent': 'aforo-apim-eventhub-forwarder/2.3.0' },
+                headers: { 'Content-Type': 'application/json', 'X-API-Key': this.cfg.apiKey, 'User-Agent': 'aforo-apim-eventhub-forwarder/2.3.1' },
                 body: body,
                 signal: signal,
             });
@@ -312,24 +312,44 @@ class Forwarder {
         await this.deliverUsage(retry, deadline, stats, perEventAttempt + 1);
     }
 
-    async deliverCompound(batch, deadline, stats) {
+    async deliverCompound(batch, deadline, stats, perEventAttempt) {
+        perEventAttempt = perEventAttempt || 0;
         const r = await this.send(this.cfg.compoundUrl, batch, deadline, 'compound batch');
         if (r.kind === 'tooLarge') {
             if (batch.length === 1) { this.reject(stats, batch, 'HTTP 413 for a single compound event'); return; }
             const mid = Math.ceil(batch.length / 2);
-            await this.deliverCompound(batch.slice(0, mid), deadline, stats);
-            await this.deliverCompound(batch.slice(mid), deadline, stats);
+            await this.deliverCompound(batch.slice(0, mid), deadline, stats, perEventAttempt);
+            await this.deliverCompound(batch.slice(mid), deadline, stats, perEventAttempt);
             return;
         }
         if (r.kind === 'rejected') { this.reject(stats, batch, 'HTTP ' + r.res.status); return; }
         const data = unwrap(r.res.json);
         const results = Array.isArray(data.results) ? data.results : [];
-        const failed = results.filter(function (x) { return x && x.success === false; });
-        stats.accepted += batch.length - failed.length;
-        if (failed.length) {
-            const ids = new Set(failed.map(function (x) { return String(x.correlationId); }));
-            this.reject(stats, batch.filter(function (e) { return ids.has(e.correlationId); }), 'compound event rejected by the ingestor');
+        const outcomes = new Map();
+        results.forEach(function (x) {
+            if (!x || x.correlationId === undefined || x.correlationId === null) return;
+            const id = String(x.correlationId);
+            if (!outcomes.has(id)) outcomes.set(id, compoundOutcome(x));
+        });
+        const retry = [];
+        const rejected = [];
+        batch.forEach(function (e) {
+            const o = outcomes.get(String(e.correlationId));
+            if (o === 'retry') retry.push(e);
+            else if (o === 'rejected') rejected.push(e);
+        });
+        stats.accepted += batch.length - retry.length - rejected.length;
+        if (rejected.length) this.reject(stats, rejected, 'compound event rejected by the ingestor');
+        if (!retry.length) return;
+        if (perEventAttempt >= this.cfg.maxRetries) {
+            throw new OutageError(retry.length + ' compound events still retryable after ' + perEventAttempt + ' re-sends');
         }
+        const delay = backoffMs(perEventAttempt, this.cfg, this);
+        if (this.now() + delay >= deadline) throw new OutageError('invocation budget used up before a compound re-send');
+        await this.sleep(delay);
+        // Same events, same correlationIds: the ingestor derives the measurement
+        // keys from them, so a resend only adds what is still missing.
+        await this.deliverCompound(retry, deadline, stats, perEventAttempt + 1);
     }
 
     reject(stats, events, reason) {
@@ -352,8 +372,30 @@ class Forwarder {
     }
 }
 
+// Error texts usage-ingestor's compound batch endpoint gives a result it did
+// not store for a temporary reason (BatchCompoundEventProcessor BUSY / TIMEOUT).
+// Only used when the result has no `retryable` field (an ingestor older than
+// the one that sends it).
+const COMPOUND_TRANSIENT_ERRORS = ['Server busy, retry the batch', 'Processing timeout'];
+
+/**
+ * One compound `results[]` entry -> 'delivered' | 'retry' | 'rejected'.
+ * `retryable: true` resends; without the field the BUSY / TIMEOUT texts do.
+ * A redelivered event whose measurements were all stored before (accepted 0,
+ * duplicates > 0) is delivered, not rejected.
+ */
+function compoundOutcome(x) {
+    if (!x || typeof x !== 'object') return 'delivered';
+    if (x.retryable === true) return 'retry';
+    if (x.success !== false) return 'delivered';
+    if (x.retryable === undefined && Array.isArray(x.errors) &&
+        x.errors.some(function (m) { return COMPOUND_TRANSIENT_ERRORS.indexOf(m) !== -1; })) return 'retry';
+    if (Number(x.duplicates) > 0) return 'delivered';
+    return 'rejected';
+}
+
 function safeHost(location) {
     try { return new URL(location).host; } catch (err) { return 'an unreadable location'; }
 }
 
-module.exports = { MAX_RESPONSE_BYTES, readCapped, Forwarder, OutageError, configFromEnv, validateConfig, parseMessages, chunk, parseRetryAfter, DEFAULTS };
+module.exports = { compoundOutcome, COMPOUND_TRANSIENT_ERRORS, MAX_RESPONSE_BYTES, readCapped, Forwarder, OutageError, configFromEnv, validateConfig, parseMessages, chunk, parseRetryAfter, DEFAULTS };

@@ -60,7 +60,8 @@
       variable aforo-api-key when set, else the Named Value aforo-api-key
       (it must exist; aforo-metering needs it too). The X-Internal-Call
       header sent up to 2.2.0 proved nothing and is gone.
-    - cached in the APIM cache under "aforo:jti:<jti>:<keyId>": "not
+    - cached in the APIM cache under "aforo:jti:<tenant>:<jti>:<keyId>" (the
+      checked tenant, aforo-jwt-tenant): "not
       revoked" for aforo-jti-cache-seconds (default 30, "0" = ask every
       time), "revoked" until the token expires (at most 24 h). A revocation
       therefore takes effect within aforo-jti-cache-seconds.
@@ -225,7 +226,9 @@
         if (jti == null) { jti = ""; }
         if (keyId == null) { keyId = ""; }
         if (jti.Length == 0 && keyId.Length == 0) { return ""; }
-        return "aforo:jti:" + jti + ":" + keyId;
+        var tenant = Convert.ToString(context.Variables.GetValueOrDefault("aforo-jwt-tenant", ""));
+        if (tenant == null) { tenant = ""; }
+        return "aforo:jti:" + tenant + ":" + jti + ":" + keyId;
     }" />
     <set-variable name="aforo-jti-limits" value="@{
         var names = "aforo-jti-cache-seconds,aforo-jti-breaker-failures,aforo-jti-breaker-seconds".Split(',');

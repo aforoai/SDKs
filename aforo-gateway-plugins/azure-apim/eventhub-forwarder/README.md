@@ -1,6 +1,6 @@
 # Aforo APIM Event Hub forwarder
 
-**Version:** 2.3.0 · Apache-2.0 · ships with `azure-apim` 2.3.0
+**Version:** 2.3.1 · Apache-2.0 · ships with `azure-apim` 2.3.1
 
 Use this when an ingest outage or a `429` must not cost you usage. In the default mode the APIM policy posts each event with `send-one-way-request`, which has no retry. In Event Hub mode the policy writes the event to Azure Event Hubs instead, and this Azure Function reads the hub, sends the events to the Aforo ingestor in batches, and moves its checkpoint only after the ingestor accepted them. While the ingestor is down, events wait in the hub (up to 7 days on the Standard tier) and are sent when it is back.
 
@@ -19,7 +19,7 @@ APIM ──log-to-eventhub──► Event Hub ──trigger (batch)──► for
 | 401, 403, any 3xx | the invocation fails at once (a wrong key or URL must not lose usage); redirects are never followed |
 | other 4xx | batch dropped and logged with its keys |
 
-A failed invocation is re-run by the Functions retry policy (`maxRetryCount: -1`, back-off 5 s to 5 min) on the same events; the checkpoint does not move until a run succeeds. Events the ingestor already accepted are sent again on that re-run and deduplicated by the ingestor (the policy freezes `idempotencyKey` and the compound `correlationId` per APIM request). Compound events go to `/api/v1/ingest/compound/batch`.
+A failed invocation is re-run by the Functions retry policy (`maxRetryCount: -1`, back-off 5 s to 5 min) on the same events; the checkpoint does not move until a run succeeds. Events the ingestor already accepted are sent again on that re-run and deduplicated by the ingestor (the policy freezes `idempotencyKey` and the compound `correlationId` per APIM request). Compound events go to `/api/v1/ingest/compound/batch`. A compound result the ingestor did not store for a temporary reason (`retryable: true`; from an ingestor that does not send the field yet, the errors `Server busy, retry the batch` or `Processing timeout`) is resent with the same `correlationId`, within the same retry budget as usage events; still not stored after the retries, the invocation fails and the checkpoint stays. Only a permanent rejection is dropped and logged. A redelivered event whose measurements were all stored before (`accepted` 0, `duplicates` > 0) counts as delivered.
 
 The API key is sent only as `X-API-Key` and never logged.
 
@@ -52,6 +52,8 @@ The API key is sent only as `X-API-Key` and never logged.
    ```
 
    It creates the Event Hubs namespace (SAS keys off), the hub (`aforo-metering`, 4 partitions, 7 days), the consumer group, the APIM logger `aforo-metering-logger`, the Function app (Linux Consumption, Node 20) and both role assignments. With a Key Vault reference, give the Function's identity **Key Vault Secrets User** on the secret.
+
+   On a first deployment the logger step can fail with an authorization error (for example `Unauthorized` or `does not have authorization to perform action 'Microsoft.EventHub/namespaces/eventhubs/...'`): the template creates APIM's **Azure Event Hubs Data Sender** role assignment just before the logger, and Azure can take a few minutes to apply a new role assignment. ARM's `dependsOn` already orders the two; it cannot wait for the assignment to take effect. Run the same `az deployment group create` again after a few minutes: everything already created is left as it is and the logger is created. The template has no sleep or deployment script for this on purpose.
 3. Deploy the code: `cd eventhub-forwarder && npm ci --omit=dev && func azure functionapp publish <app>` (or zip deploy).
 4. In APIM, import `../eventhub-delivery-policy-fragment.xml` as fragment `aforo-metering-eventhub` (format `rawxml`), then:
 
@@ -73,6 +75,7 @@ The API key is sent only as `X-API-Key` and never logged.
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| First `az deployment group create` fails on `aforo-metering-logger` with an authorization error | The Data Sender role assignment created in the same deployment has not taken effect yet | Run the deployment again after a few minutes (step 2). |
 | Saving the policy fails: logger not found | `aforo-metering-logger` does not exist | Deploy the template (step 2) before importing the fragment. |
 | No events reach Aforo, the hub has messages | The Function is not running or cannot read the hub | Check the Function's logs; the identity needs Event Hubs Data Receiver. |
 | Logs show `refused with HTTP 401` and the Function keeps retrying | `AFORO_API_KEY` is wrong or lacks `usage:ingest` | Fix the key; the retried run then delivers everything that waited. |
@@ -85,7 +88,7 @@ The API key is sent only as `X-API-Key` and never logged.
 npm test
 ```
 
-Runs against the fault-injecting mock ingestor in `aforo-metering-sdks/mock-ingestor/` (set `AFORO_MOCK_INGESTOR` to its `bin/mock-ingestor.mjs` if that repo is not checked out next to this one). Covers recovery from an outage with keys unchanged, an outage that outlasts the retries (the invocation fails; the re-run delivers each event once), 429 with `Retry-After` in both forms, 401, redirects, 413 splits, per-event `retryable`, hung and dripping responses, batching, and the compound endpoint.
+Runs against the fault-injecting mock ingestor in `aforo-metering-sdks/mock-ingestor/` (set `AFORO_MOCK_INGESTOR` to its `bin/mock-ingestor.mjs` if that repo is not checked out next to this one). Covers recovery from an outage with keys unchanged, an outage that outlasts the retries (the invocation fails; the re-run delivers each event once), 429 with `Retry-After` in both forms, 401, redirects, 413 splits, per-event `retryable`, hung and dripping responses, batching, and the compound endpoint (BUSY / TIMEOUT resends, all-duplicate redelivery, retries that never clear).
 
 ## What this does not cover
 

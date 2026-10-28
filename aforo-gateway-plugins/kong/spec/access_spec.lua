@@ -136,6 +136,30 @@ local function run_script(src, nkeys, ...)
     end
     return conv(out)
 end
+-- Redis Cluster's slot rule: the hash tag is the text between the first "{"
+-- and the next "}" when that is not empty, else the whole key.
+local function hash_tag(k)
+    local open = string.find(k, "{", 1, true)
+    if open then
+        local close = string.find(k, "}", open + 1, true)
+        if close and close > open + 1 then return string.sub(k, open + 1, close - 1) end
+    end
+    return k
+end
+local eval_key_sets = {}
+local function cluster_slot_error(nkeys, ...)
+    local keys = { ... }
+    local set = {}
+    for i = 1, nkeys do set[i] = keys[i] end
+    table.insert(eval_key_sets, set)
+    if not redis_cluster then return nil end
+    for i = 2, nkeys do
+        if hash_tag(keys[i]) ~= hash_tag(keys[1]) then
+            return "CROSSSLOT Keys in request don't hash to the same slot"
+        end
+    end
+    return nil
+end
 package.loaded["resty.redis"] = {
     new = function()
         local r = {}
@@ -194,12 +218,16 @@ package.loaded["resty.redis"] = {
         function r:eval(src, nkeys, ...)
             table.insert(redis_commands, "eval")
             if redis_eval_error then return nil, redis_eval_error end
+            local slot_err = cluster_slot_error(nkeys, ...)
+            if slot_err then return nil, slot_err end
             redis_scripts[ngx.sha1_bin and ngx.sha1_bin(src) or src] = src
             return run_script(src, nkeys, ...)
         end
         function r:evalsha(sha, nkeys, ...)
             table.insert(redis_commands, "evalsha")
             if redis_eval_error then return nil, redis_eval_error end
+            local slot_err = cluster_slot_error(nkeys, ...)
+            if slot_err then return nil, slot_err end
             for bin, src in pairs(redis_scripts) do
                 if package.loaded["resty.string"].to_hex(bin) == sha then
                     return run_script(src, nkeys, ...)
@@ -902,6 +930,35 @@ describe("access phase", function()
                 assert.equals(429, K.response._exit.status)
             end)
 
+            it("never uses the jwt_secrets credential of a Kong-jwt token without key_id", function()
+                -- Kong's jwt plugin: get_credential() is the jwt_secrets row, whose .key is
+                -- the issuer key every caller shares.
+                local issuer = "shared-issuer-key"
+                policy(issuer, ONE_PER_MINUTE)
+                local token = jwt({ iss = issuer, sub = "u", exp = 1800000900 })
+                for _ = 1, 3 do
+                    K.request._h["Authorization"] = "Bearer " .. token
+                    K.ctx.shared = { authenticated_jwt_token = token }
+                    K.client._credential = { id = "jwt-cred", key = issuer, algorithm = "RS256",
+                                             rsa_public_key = "PEM" }
+                    K.response._exit = nil
+                    assert.is_false(rate_limit.enforce(conf(RL), {}))
+                end
+                assert.is_nil(K.response._exit, "callers of one issuer shared a counter")
+                local warned = false
+                for _, w in ipairs(warnings) do
+                    if string.find(w, "without a verified key_id", 1, true) then warned = true end
+                end
+                assert.is_true(warned, table.concat(warnings, "\n"))
+            end)
+
+            it("does not take a jwt_secrets-shaped credential as an API key even without the JWT marker", function()
+                policy("issuer-2", ONE_PER_MINUTE)
+                K.client._credential = { key = "issuer-2", secret = "s", algorithm = "HS256" }
+                for _ = 1, 2 do assert.is_false(rate_limit.enforce(conf(RL))) end
+                assert.is_nil(K.response._exit)
+            end)
+
             it("never takes the key id of a token whose signature was not verified", function()
                 keyid_policy(ONE_PER_MINUTE)
                 local c = { rate_limit_enabled = true, jwt_validation_enabled = true,
@@ -973,7 +1030,7 @@ describe("access phase", function()
                 local c = conf(RL)
                 rate_limit.enforce(c)
                 for _ = 1, 5 do rate_limit.enforce(c) end
-                local key = "ratelimit:count:tenant-B:hash(sk_live_sw3):60:" .. tostring(W0 / 60)
+                local key = "ratelimit:count:{tenant-B:hash(sk_live_sw3)}:60:" .. tostring(W0 / 60)
                 assert.equals(1, tonumber(redis_store[key]))
                 -- Kept long enough to weigh the whole next window.
                 assert.is_true((redis_ttl[key] or 0) >= 120)
@@ -985,7 +1042,7 @@ describe("access phase", function()
                 K.request._h["Authorization"] = "Bearer sk_live_sw4"
                 local c = conf(RL)
                 for _ = 1, 3 do assert.is_false(rate_limit.enforce(c)) end
-                local key = "ratelimit:count:tenant-B:hash(sk_live_sw4):60:" .. tostring(W0 / 60)
+                local key = "ratelimit:count:{tenant-B:hash(sk_live_sw4)}:60:" .. tostring(W0 / 60)
                 assert.equals(3, tonumber(redis_store[key]))
             end)
         end)
@@ -1011,6 +1068,43 @@ describe("access phase", function()
                 redis_commands = {}
                 rate_limit.enforce(c)
                 assert.same({ "evalsha" }, redis_commands)
+            end)
+
+            it("puts every key of one evaluation in one hash slot (Redis Cluster)", function()
+                local key = "sk_live_slot"
+                policy(key, '{"enforcementMode":"HARD","tiers":['
+                    .. '{"windowSeconds":60,"maxRequests":1},{"windowSeconds":3600,"maxRequests":1000}]}')
+                K.request._h["Authorization"] = "Bearer " .. key
+                eval_key_sets = {}
+                rate_limit.enforce(conf(RL))
+                local set = eval_key_sets[#eval_key_sets]
+                assert.equals(4, #set, "two keys per tier")
+                for _, k in ipairs(set) do
+                    assert.truthy(string.find(k, "^ratelimit:count:{tenant%-B:hash%(sk_live_slot%)}:"), k)
+                    assert.equals(hash_tag(set[1]), hash_tag(k))
+                end
+            end)
+
+            it("enforces HARD limits on Redis Cluster, where a cross-slot script is refused", function()
+                redis_cluster = true
+                policy("sk_live_cl", ONE_PER_MINUTE)
+                K.request._h["Authorization"] = "Bearer sk_live_cl"
+                local c = conf(RL)
+                assert.is_false(rate_limit.enforce(c))
+                assert.is_true(rate_limit.enforce(c), "second request refused")
+                assert.equals(429, K.response._exit.status)
+            end)
+
+            it("logs a CROSSSLOT refusal as such", function()
+                policy("sk_live_cs", ONE_PER_MINUTE)
+                K.request._h["Authorization"] = "Bearer sk_live_cs"
+                redis_eval_error = "CROSSSLOT Keys in request don't hash to the same slot"
+                assert.is_false(rate_limit.enforce(conf(RL)))
+                local found = false
+                for _, w in ipairs(warnings) do
+                    if string.find(w, "CROSSSLOT", 1, true) and string.find(w, "HARD ones included", 1, true) then found = true end
+                end
+                assert.is_true(found, table.concat(warnings, "\n"))
             end)
 
             it("fails open when the check script errors", function()
@@ -1741,6 +1835,40 @@ describe("2.8.0 hardening", function()
             assert.equals(6, #http_requests)
         end)
 
+        it("a 4xx refusal is not a breaker failure, so one bad customer cannot switch GLOBAL off", function()
+            ngx.shared.aforo_cache = ttl_dict()
+            local c = conf(MG)
+            c.margin_guard_breaker_threshold = 1
+            c.margin_guard_cache_ttl = 0
+            for _ = 1, 3 do
+                http_responses = { ALLOW, { status = 400, body = '{"error":"bad scopeId"}' } }
+                assert.is_false(margin_guard.check(c, "tenant-B", "cust-bad"))
+            end
+            assert.equals(6, #http_requests, "a 400 opened the breaker")
+            http_responses = { { status = 200, body = '{"verdict":"BLOCK","currentLevel":"L3_BLOCK"}' } }
+            assert.is_true(margin_guard.check(c, "tenant-B", "cust-ok"), "GLOBAL still enforced")
+        end)
+
+        it("408 and 429 still count as failures", function()
+            ngx.shared.aforo_cache = ttl_dict()
+            local c = conf(MG)
+            c.margin_guard_breaker_threshold = 2
+            http_responses = { { status = 429 }, { status = 408 } }
+            for _ = 1, 3 do margin_guard.check(c, "tenant-B", nil) end
+            assert.equals(2, #http_requests)
+        end)
+
+        it("does not send a customer id over 128 characters; GLOBAL is still asked", function()
+            ngx.shared.aforo_cache = ttl_dict()
+            http_responses = { ALLOW }
+            assert.is_false(margin_guard.check(conf(MG), "tenant-B", string.rep("c", 129)))
+            assert.equals(1, #http_requests)
+            assert.truthy(string.find(http_requests[1].url, "scopeType=GLOBAL", 1, true))
+            http_responses = { ALLOW, ALLOW }
+            margin_guard.check(conf(MG), "tenant-C", string.rep("c", 128))
+            assert.equals(3, #http_requests, "a 128-character id is sent")
+        end)
+
         it("the breaker is per tenant", function()
             ngx.shared.aforo_cache = ttl_dict()
             local c = conf(MG)
@@ -1821,7 +1949,7 @@ describe("2.8.0 hardening", function()
     -- ── G335: compound-metering is not packaged ────────────────────
     describe("package contents (G335)", function()
         it("ships only modules the plugin loads, and every listed file exists", function()
-            local f = assert(io.open("kong-plugin-aforo-metering-2.8.0-1.rockspec", "rb"))
+            local f = assert(io.open("kong-plugin-aforo-metering-2.8.1-1.rockspec", "rb"))
             local src = f:read("*all")
             f:close()
             assert.is_nil(src:find("compound%-metering%.lua"), "compound-metering is still packaged")

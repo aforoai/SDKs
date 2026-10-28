@@ -267,6 +267,67 @@ function lambdaEnv(endpoint, extra = {}) {
         assert.strictEqual(await src.get(), '');
     });
 
+    await test('refresh() rereads at once, inside the refresh interval, and later get() uses the new key', async () => {
+        let n = 0;
+        const src = secret.createSecretSource({
+            label: 't', secretIdEnv: 'S', plainEnv: 'P', env: { S: ARN }, refreshMs: 300000, now: () => 0,
+            fetchSecret: async () => `k${++n}`,
+        });
+        assert.strictEqual(await src.get(), 'k1');
+        assert.strictEqual(await src.refresh(), 'k2');
+        assert.strictEqual(await src.get(), 'k2');
+        assert.strictEqual(n, 2);
+    });
+
+    await test('refresh(): concurrent callers share one fetch', async () => {
+        let n = 0;
+        const src = secret.createSecretSource({
+            label: 't', secretIdEnv: 'S', plainEnv: 'P', env: { S: ARN }, now: () => 0,
+            fetchSecret: async () => { n++; await new Promise((r) => setTimeout(r, 5)); return 'k' + n; },
+        });
+        await src.get();
+        const values = await Promise.all([src.refresh(), src.refresh(), src.refresh()]);
+        assert.deepStrictEqual(values, ['k2', 'k2', 'k2']);
+        assert.strictEqual(n, 2);
+    });
+
+    await test('refresh(): a failed reread throws (the refused cached key is not handed back)', async () => {
+        let n = 0;
+        const src = secret.createSecretSource({
+            label: 't', secretIdEnv: 'S', plainEnv: 'P', env: { S: ARN }, now: () => 0,
+            fetchSecret: async () => { n++; if (n > 1) throw new Error('AccessDenied'); return 'k'; },
+        });
+        await src.get();
+        await assert.rejects(src.refresh(), /could not reread S.*AccessDenied/);
+    });
+
+    await test('refresh() with the plain variable returns it', async () => {
+        const src = secret.createSecretSource({ label: 't', secretIdEnv: 'S', plainEnv: 'P', env: { P: 'plain' } });
+        assert.strictEqual(await src.refresh(), 'plain');
+    });
+
+    await test('getSecretValue: a response that dies after its headers rejects instead of crashing', async () => {
+        const http = require('http');
+        const server = http.createServer((req, res) => {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.write('{"SecretString":');
+            setTimeout(() => res.socket.destroy(), 10);
+        });
+        await new Promise((r) => server.listen(0, '127.0.0.1', r));
+        try {
+            const env = { AWS_ACCESS_KEY_ID: 'a', AWS_SECRET_ACCESS_KEY: 'b', AWS_REGION: 'eu-west-1',
+                AWS_ENDPOINT_URL_SECRETS_MANAGER: `http://127.0.0.1:${server.address().port}` };
+            const hung = new Promise((r) => setTimeout(() => r('hung'), 3000).unref());
+            const outcome = await Promise.race([
+                secret.getSecretValue(ARN, env, 2000).then(() => 'resolved', (e) => 'rejected: ' + e.message),
+                hung,
+            ]);
+            assert.ok(/^rejected/.test(outcome), outcome);
+        } finally {
+            server.close();
+        }
+    });
+
     console.log(`\n── Results: ${passed} passed, ${failed} failed ──`);
     process.exit(failed > 0 ? 1 : 0);
 })();

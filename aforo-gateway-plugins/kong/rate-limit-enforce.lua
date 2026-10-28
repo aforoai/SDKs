@@ -190,6 +190,10 @@ end
 --      every refresh. Claims of a token nothing verified
 --      (jwt_allow_unverified_signature) are never used.
 --   2. key-auth: the credential Kong authenticated -- its .key is the raw key.
+--      Skipped for a verified JWT (Kong's jwt plugin or jwt_validation_enabled)
+--      and for any credential that is a jwt_secrets row: there .key is the
+--      shared issuer key, not the caller's key. Such a request without key_id
+--      is not rate limited and the "jwt without key_id" warning is logged.
 --   3. Authorization: Bearer <raw key>. The scheme is matched case-
 --      insensitively: matching only "Bearer" let "bearer" skip a HARD limit.
 -- For 2 and 3 the policy is looked up by the lowercase SHA-256 hex of the
@@ -202,6 +206,13 @@ local function key_hash_of(raw)
     return str_util.to_hex(hasher:final())
 end
 
+-- A key-auth credential row: a .key and none of the jwt_secrets fields
+-- (secret, algorithm, rsa_public_key). Only its .key is a raw API key.
+local function is_key_auth_credential(cred)
+    if type(cred) ~= "table" or type(cred.key) ~= "string" or cred.key == "" then return false end
+    return cred.secret == nil and cred.algorithm == nil and cred.rsa_public_key == nil
+end
+
 local function request_identity(identity)
     local key_id = identity and identity.key_id
     if type(key_id) == "string" and key_id ~= "" then
@@ -209,8 +220,19 @@ local function request_identity(identity)
                  authenticated = true }
     end
 
+    -- A verified JWT without key_id: never fall through to the credential.
+    -- On a Kong-jwt route kong.client.get_credential() is the jwt_secrets row,
+    -- whose .key is the issuer key every caller of that issuer shares, so its
+    -- hash would put all of them on one counter (and match no policy).
+    local shared = kong.ctx.shared
+    local claims = shared and shared.aforo_jwt_claims
+    if (shared and shared.authenticated_jwt_token)
+        or (type(claims) == "table" and claims.signature_verified == true) then
+        return nil, "jwt"
+    end
+
     local ok, cred = pcall(kong.client.get_credential)
-    if ok and type(cred) == "table" and type(cred.key) == "string" and cred.key ~= "" then
+    if ok and is_key_auth_credential(cred) then
         local h = key_hash_of(cred.key)
         return { lookup = h, key_scope = h, authenticated = true }
     end
@@ -405,10 +427,16 @@ local function enforce(conf, identity)
     local now = ngx.now()
     local hard = enforcement_mode == "HARD"
     local keys, argv = {}, { string.format("%.3f", now), hard and "1" or "0" }
+    -- Every key of one evaluation carries the same Redis hash tag
+    -- {tenant:scope}, so the script's keys sit in one slot on Redis Cluster
+    -- and ElastiCache Serverless. Without it EVALSHA was refused there with
+    -- CROSSSLOT and the check failed open: HARD limits were never enforced.
+    -- The tag always holds a ":", so it is never empty.
+    local tag = "{" .. tenant_id .. ":" .. scope_id .. "}"
     for _, tier in ipairs(tiers) do
         local window = tier.window
         local epoch_window = math.floor(now / window)
-        local base = "ratelimit:count:" .. tenant_id .. ":" .. scope_id .. ":" .. tostring(window) .. ":"
+        local base = "ratelimit:count:" .. tag .. ":" .. tostring(window) .. ":"
         keys[#keys + 1] = base .. tostring(epoch_window)
         keys[#keys + 1] = base .. tostring(epoch_window - 1)
         argv[#argv + 1] = tostring(window)
@@ -433,8 +461,16 @@ local function enforce(conf, identity)
     end
     if type(results) ~= "table" then
         discard_redis(red)
-        log_throttled("warn", "rl_eval", 60, "[aforo-ratelimit] Rate-limit check failed in Redis (",
-            tostring(eval_err), ") -- fail-open, rate limits are NOT enforced. Repeats suppressed for 60s.")
+        local reason = tostring(eval_err)
+        if string.find(reason, "CROSSSLOT", 1, true) then
+            log_throttled("err", "rl_crossslot", 60, "[aforo-ratelimit] Redis refused the rate-limit script with ",
+                "CROSSSLOT (", reason, "): its keys are not in one hash slot. Rate limits, HARD ones included, ",
+                "are NOT enforced (fail-open). Repeats suppressed for 60s.")
+        else
+            log_throttled("err", "rl_eval", 60, "[aforo-ratelimit] Redis refused the rate-limit script (",
+                reason, ") -- fail-open, rate limits, HARD ones included, are NOT enforced. ",
+                "Repeats suppressed for 60s.")
+        end
         return false
     end
     close_redis(red)

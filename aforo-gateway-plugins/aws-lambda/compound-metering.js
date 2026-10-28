@@ -184,6 +184,10 @@ async function flushCompoundEvents(events, config) {
     return new Promise((resolve, reject) => {
         const req = https.request(options, (res) => {
             let body = '';
+            res.on('error', (err) => {
+                console.warn('[aforo-compound] Flush failed:', err.message);
+                resolve(null);
+            });
             res.on('data', (chunk) => body += chunk);
             res.on('end', () => resolve({ status: res.statusCode, body }));
         });

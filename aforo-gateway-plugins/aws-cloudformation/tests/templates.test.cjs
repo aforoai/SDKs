@@ -63,6 +63,25 @@ const pass = statement('PassMeteringExecutionRole');
 assert(/iam:PassedToService: lambda\.amazonaws\.com/.test(pass), 'only the Lambda execution role can be passed, to Lambda only');
 assert(/function:aforo-metering-\*'/.test(statement('MeteringFunction')), 'Lambda actions limited to aforo-metering-*');
 
+console.log('\nW6: the one-click install keeps the Aforo API key in Secrets Manager');
+const secretArn = "'arn:${AWS::Partition}:secretsmanager:${Region}:${AWS::AccountId}:secret:aforo/metering/*'";
+const secret = statement('MeteringApiKeySecret');
+const secretActions = [...secret.matchAll(/- (secretsmanager:\w+)/g)].map((m) => m[1]).sort();
+assert(JSON.stringify(secretActions) === JSON.stringify(['secretsmanager:CreateSecret', 'secretsmanager:DeleteSecret',
+    'secretsmanager:DescribeSecret', 'secretsmanager:PutSecretValue', 'secretsmanager:RestoreSecret',
+    'secretsmanager:TagResource']), `Aforo role: write/describe/delete the secret only (got ${secretActions.join(' ')})`);
+assert(secret.includes(secretArn), 'Aforo role: secrets limited to aforo/metering/* in the metering region');
+const meteringPolicy = block(ROLE, 'MeteringInstall', 10) || ROLE.slice(ROLE.indexOf('PolicyName: AforoMeteringInstall'),
+    ROLE.indexOf('AforoMeteringExecutionRole:'));
+assert(meteringPolicy.includes('MeteringApiKeySecret'), 'secret statement is part of the optional metering policy');
+assert(!/secretsmanager:GetSecretValue/.test(ROLE.slice(0, ROLE.indexOf('AforoMeteringExecutionRole:'))),
+    'Aforo role cannot read the secret back');
+const execRole = ROLE.slice(ROLE.indexOf('  AforoMeteringExecutionRole:'), ROLE.indexOf('\nOutputs:'));
+assert(/Condition: MeteringInstall/.test(execRole), 'execution role only with AllowMeteringInstall');
+assert(/Action: secretsmanager:GetSecretValue/.test(execRole) && execRole.includes(secretArn.replace(/^'|'$/g, "'")),
+    'execution role reads aforo/metering/* secrets');
+assert(!/secretsmanager:\*/.test(roleCode) && !/secret:\*'/.test(roleCode), 'no secretsmanager:* and no secret:* resource');
+
 console.log('\nG347: parameter constraints and the deny policy attachment');
 const ext = block(ROLE, 'ExternalId', 2);
 assert(/MinLength: 32/.test(ext), 'ExternalId MinLength 32');

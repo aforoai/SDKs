@@ -197,7 +197,7 @@ async function checkPreFlightQuota(config, customerId, metricName) {
 /**
  * Build a 429 response for API Gateway Lambda proxy integration.
  * Retry-After is retryAfterMs rounded up to whole seconds (at least 1), or
- * 60 when the decision carries no wait.
+ * DEFAULT_DENY_RETRY_S (5 s) when the decision carries no wait.
  */
 function build429Response(data) {
     const waitMs = Number(data.retryAfterMs);

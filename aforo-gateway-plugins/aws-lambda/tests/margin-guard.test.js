@@ -110,6 +110,16 @@ const cfg = (url, extra = {}) => ({ marginGuardEnabled: true, marginGuardUrl: ur
         assert.strictEqual(r.allowed, true);
     });
 
+    await test('a customer id over 128 characters is not sent (pricing refuses it); 128 is', async () => {
+        const p = await pricing(json({ verdict: 'BLOCK' }));
+        try {
+            assert.strictEqual((await mg.checkMarginGuard('c'.repeat(129), cfg(p.url))).allowed, true);
+            assert.strictEqual(p.calls.length, 0);
+            assert.strictEqual((await mg.checkMarginGuard('d'.repeat(128), cfg(p.url))).verdict, 'BLOCK');
+            assert.strictEqual(p.calls.length, 1);
+        } finally { await p.close(); }
+    });
+
     await test('no API key, disabled, or no customer → no call', async () => {
         const p = await pricing(json({ verdict: 'BLOCK' }));
         try {

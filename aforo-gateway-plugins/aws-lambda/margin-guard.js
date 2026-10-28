@@ -45,6 +45,9 @@ const DEFAULT_TIMEOUT_MS = 200;
 // on read and the least recently used entry is dropped once the cache is full.
 const marginGuardCache = new Map();
 let warnedNoKey = false;
+let warnedLongId = false;
+// Longest scopeId pricing's quick-check accepts (it answers 400 above it).
+const MAX_SCOPE_ID = 128;
 
 function positive(value, fallback) {
     const n = Number(value);
@@ -101,6 +104,15 @@ async function checkMarginGuard(customerId, config) {
         if (!warnedNoKey) {
             warnedNoKey = true;
             console.warn('[aforo-margin-guard] No Aforo API key configured -- margin guard is NOT enforced.');
+        }
+        return ALLOW;
+    }
+
+    if (String(customerId).length > MAX_SCOPE_ID) {
+        if (!warnedLongId) {
+            warnedLongId = true;
+            console.warn(`[aforo-margin-guard] Customer id longer than ${MAX_SCOPE_ID} characters: not checked ` +
+                '(pricing refuses it) -- fail-open ALLOW. Logged once per container.');
         }
         return ALLOW;
     }

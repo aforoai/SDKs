@@ -28,9 +28,11 @@ Parameters:
       ARN of the AWS Secrets Manager secret holding the Aforo API key (scope
       usage:ingest), as plain text or JSON {"apiKey": "..."}. The function may
       read only this secret. Sent as the X-API-Key header; the tenant is
-      derived from the key.
-    AllowedPattern: '^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+$'
-    ConstraintDescription: must be a Secrets Manager secret ARN (arn:aws:secretsmanager:<region>:<account>:secret:<name>)
+      derived from the key. Give the full ARN, ending in the six-character
+      suffix Secrets Manager adds (...:secret:<name>-AbCdEf): the IAM policy
+      grants exactly this ARN, so a partial ARN would deny every read.
+    AllowedPattern: '^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+-[A-Za-z0-9]{6}$'
+    ConstraintDescription: must be a full Secrets Manager secret ARN, including the six-character suffix (arn:aws:secretsmanager:<region>:<account>:secret:<name>-AbCdEf)
   AforoApiKey:
     Type: String
     Description: >-
@@ -190,9 +192,10 @@ Parameters:
     Description: >-
       Authorizer: ARN of the Secrets Manager secret holding the provider's
       Aforo tenant key, used to introspect sk_live_/sk_test_ customer keys.
-      Leave empty to accept JWTs only.
-    AllowedPattern: '^$|^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+$'
-    ConstraintDescription: must be empty or a Secrets Manager secret ARN
+      Leave empty to accept JWTs only. The full ARN, with the six-character
+      suffix (...:secret:<name>-AbCdEf), as for AforoApiKeySecretArn.
+    AllowedPattern: '^$|^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+-[A-Za-z0-9]{6}$'
+    ConstraintDescription: must be empty or a full Secrets Manager secret ARN, including the six-character suffix
     Default: ''
   AforoTenantKey:
     Type: String

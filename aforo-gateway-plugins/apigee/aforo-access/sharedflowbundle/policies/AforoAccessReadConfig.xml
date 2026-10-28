@@ -65,6 +65,25 @@
     <Get assignTo="private.aforo.jwtIssuer">
         <Key><Parameter>aforo_jwt_issuer</Parameter></Key>
     </Get>
+    <!-- Revocation of a verified Aforo JWT (see aforo-jwt-revocation.js) -->
+    <Get assignTo="private.aforo.orgServiceUrl">
+        <Key><Parameter>aforo_org_service_url</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo.jtiCheckEnabled">
+        <Key><Parameter>jti_check_enabled</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo.jtiCheckFallback">
+        <Key><Parameter>jti_check_fallback</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo.jtiCacheSeconds">
+        <Key><Parameter>jti_cache_seconds</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo.jtiBreakerFailures">
+        <Key><Parameter>jti_breaker_failures</Parameter></Key>
+    </Get>
+    <Get assignTo="private.aforo.jtiBreakerSeconds">
+        <Key><Parameter>jti_breaker_seconds</Parameter></Key>
+    </Get>
     <!-- Per API product -->
     <Get assignTo="private.aforo.product.type">
         <Key><Parameter>product_type</Parameter><Parameter ref="verifyapikey.AforoVerifyApiKey.apiproduct.name"/></Key>

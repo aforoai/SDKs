@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Aforo Usage Metering 3.1.0 - Mule 4 custom policy template.
+  Aforo Usage Metering 3.1.1 - Mule 4 custom policy template.
 
   One API call:
     1. Configuration. Every policy property arrives as the attribute value
@@ -321,21 +321,61 @@ var problems =
                 <set-variable variableName="aforoRequestText" value="#[null]"/>
                 <!-- MCP_SERVER: the JSON-RPC body, for tools/call detection. The
                      payload stream is repeatable, so the API still reads it. The
-                     output type is explicit: the request payload is application/json
-                     and the value a Java String (without it no tools/call was ever
-                     seen on a live runtime, so MCP calls were not metered). A failure
-                     is logged, since the call then goes unmetered. -->
+                     body is read only when the request declares its length
+                     (Content-Length, no Transfer-Encoding) and that length is at
+                     most 1 MiB. A chunked request has no declared length, and
+                     Mule offers no way to read just the first 1 MiB of a
+                     repeatable stream from DataWeave without buffering all of
+                     it, so such a body is not read: the call is metered as a
+                     normal request and a WARN says why. The output type is
+                     explicit: the request payload is application/json and the
+                     value a Java String (without it no tools/call was ever seen
+                     on a live runtime). A failure is logged, since the call then
+                     goes unmetered as MCP. -->
                 <choice>
                     <when expression="#[vars.aforoCfg.productType == 'MCP_SERVER' and upper(attributes.method default '') == 'POST']">
-                        <try>
-                            <set-variable variableName="aforoRequestText" value="#[output application/java --- if (((attributes.headers.'content-length' default '0') as Number) > 1048576) null else ((payload.^raw default '') as String {encoding: 'UTF-8'})]"/>
-                            <error-handler>
-                                <on-error-continue type="ANY" logException="false">
-                                    <logger level="WARN" message="#['[aforo-metering] could not read the MCP request body, so its tools/call is not metered: ' ++ (error.description default 'unknown error')]"/>
-                                    <set-variable variableName="aforoRequestText" value="#[null]"/>
-                                </on-error-continue>
-                            </error-handler>
-                        </try>
+                        <ee:transform>
+                            <ee:variables>
+                                <ee:set-variable variableName="aforoMcpBody"><![CDATA[%dw 2.0
+// aforo-script: mcp-body
+// Whether the MCP request body may be read for tools/call detection: only
+// with a declared length (Content-Length, no Transfer-Encoding) of at most
+// 1 MiB. Anything else is not read, so a large or chunked body is never
+// pulled into memory.
+output application/java
+var MAX_BODY = 1048576
+fun header(hs, name) = do {
+  var all = valuesOf((if (hs is Object) hs else {}) filterObject ((v, k) -> (v != null) and (lower(k as String) == lower(name))))
+  var first = all[0]
+  var v = if (first is Array) first[0] else first
+  ---
+  if (v is String) trim(v) else if (v is Number) (v as String) else null
+}
+var te = header(attributes.headers, "transfer-encoding")
+var cl = header(attributes.headers, "content-length")
+---
+if (te != null) {read: false, reason: "the request has Transfer-Encoding and no declared length"}
+else if ((cl == null) or (not (cl matches /[0-9]{1,10}/))) {read: false, reason: "the request has no usable Content-Length"}
+else if ((cl as Number) > MAX_BODY) {read: false, reason: "the request body is over 1 MiB"}
+else {read: true, reason: null}]]></ee:set-variable>
+                            </ee:variables>
+                        </ee:transform>
+                        <choice>
+                            <when expression="#[vars.aforoMcpBody.read == true]">
+                                <try>
+                                    <set-variable variableName="aforoRequestText" value="#[output application/java --- (payload.^raw default '') as String {encoding: 'UTF-8'}]"/>
+                                    <error-handler>
+                                        <on-error-continue type="ANY" logException="false">
+                                            <logger level="WARN" message="#['[aforo-metering] could not read the MCP request body, so its tools/call is not metered: ' ++ (error.description default 'unknown error')]"/>
+                                            <set-variable variableName="aforoRequestText" value="#[null]"/>
+                                        </on-error-continue>
+                                    </error-handler>
+                                </try>
+                            </when>
+                            <otherwise>
+                                <logger level="WARN" message="#['[aforo-metering] MCP request body not read (' ++ (vars.aforoMcpBody.reason default 'unknown') ++ '); the call is metered as a normal request']"/>
+                            </otherwise>
+                        </choice>
                     </when>
                 </choice>
 

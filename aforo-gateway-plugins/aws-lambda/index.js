@@ -699,6 +699,33 @@ async function handler(event, context) {
 
     const results = await Promise.all(batches.map(b => sendToAforo(b, deadline, apiKey)));
 
+    // 401/403: the key was refused. The usual cause is a rotated key still
+    // cached in this container (aws-secret.js keeps it 5 min). Reread the
+    // secret once and resend those batches with the same bodies (same keys, so
+    // a batch that did land is deduplicated). Refused again, or the secret
+    // cannot be read, or it still holds the same key: the batches count as
+    // transient and the handler throws below, so Lambda's redelivery and the
+    // OnFailure queue keep the events instead of dropping them.
+    const refusedIdx = results.map((r, i) => (r.outcome === 'unauthorized' ? i : -1)).filter((i) => i >= 0);
+    if (refusedIdx.length > 0) {
+        let fresh = null;
+        if (AFORO_API_KEY.fromSecret) {
+            try {
+                fresh = await AFORO_API_KEY.refresh();
+            } catch (err) {
+                console.error(`Aforo refused the key and rereading it failed: ${err.message}`);
+            }
+        }
+        if (fresh && fresh !== apiKey) {
+            console.warn(`Aforo refused the cached key; the secret holds a new one. Resending ${refusedIdx.length} batch(es).`);
+            const again = await Promise.all(refusedIdx.map((i) => sendToAforo(batches[i], deadline, fresh)));
+            again.forEach((r, n) => { results[refusedIdx[n]] = r; });
+        } else if (fresh === apiKey) {
+            console.error('Aforo refused the key, and the secret still holds the same key. Check the secret ' +
+                '(it must be an active Aforo API key with usage:ingest).');
+        }
+    }
+
     let totalSent = 0;
     let dropped = 0;
     let transient = 0;
@@ -711,6 +738,7 @@ async function handler(event, context) {
         } else if (r.outcome === 'rejected') {
             dropped += size;
         } else {
+            // 'failed' and 'unauthorized' (still refused after a reread).
             transient += size;
         }
     });
@@ -925,9 +953,13 @@ function detectMcpToolCall(requestBody) {
 }
 
 
-/** 4xx except 408/429 is a permanent rejection: retrying sends the same bytes to the same judgement. */
+/**
+ * 4xx except 408/429 is a permanent rejection: retrying sends the same bytes
+ * to the same judgement. 401 and 403 are not: they judge the key, not the
+ * batch (sendToAforo answers them as 'unauthorized').
+ */
 function isPermanentRejection(status) {
-    return status >= 400 && status < 500 && status !== 408 && status !== 429;
+    return status >= 400 && status < 500 && status !== 408 && status !== 429 && status !== 401 && status !== 403;
 }
 
 /**
@@ -961,6 +993,7 @@ function countRejectedEvents(resBody, events) {
 /**
  * Send one batch. Resolves to { outcome, rejectedEvents }:
  *   'sent'     — 2xx (rejectedEvents = events the ingestor refused individually)
+ *   'unauthorized' — 401/403: the key was refused (the handler rereads it once)
  *   'rejected' — permanent 4xx; dropped and logged, never retried
  *   'failed'   — transient failure that outlived the retries or the deadline
  * The body is serialized ONCE, so every attempt carries the same idempotency
@@ -977,6 +1010,13 @@ async function sendToAforo(events, deadline, apiKey) {
             const res = await doPost(AFORO_ENDPOINT, body, Math.min(REQUEST_TIMEOUT_MS, timeLeft), apiKey);
             if (res.status >= 200 && res.status < 300) {
                 return { outcome: 'sent', rejectedEvents: countRejectedEvents(res.body, events) };
+            }
+            if (res.status === 401 || res.status === 403) {
+                // Not the batch's fault: the key was refused. The handler
+                // rereads the key and resends, or throws so nothing is lost.
+                console.error(`Aforo refused the API key with ${res.status} for a batch of ${events.length} event(s). ` +
+                    `Response: ${String(res.body || '').slice(0, 300)}`);
+                return { outcome: 'unauthorized' };
             }
             if (isPermanentRejection(res.status)) {
                 console.error(`Aforo rejected the batch with ${res.status} — dropping ${events.length} event(s). ` +
@@ -1045,6 +1085,7 @@ function doPost(url, body, timeoutMs, apiKey) {
         const transport = parsedUrl.protocol === 'https:' ? https : http;
         const req = transport.request(options, (res) => {
             let resBody = '';
+            res.on('error', reject);
             res.on('data', (chunk) => { if (resBody.length < MAX_RESPONSE_BYTES) resBody += chunk; });
             res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: resBody }));
         });

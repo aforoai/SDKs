@@ -57,11 +57,15 @@
 
   Subscription map cache (2.3.0). When the customer comes from the map, the
   result (or "not in the map") is kept in the APIM cache under
-  "aforo:cust:<version>:<map length>:<subscription id>" for
+  "aforo:cust:<tenant>:<version>:<map hash>:<subscription id>" for
   aforo-customer-map-cache-seconds (default 300; "0" = parse every time).
-  Changing the map usually changes its length and so the key; for an edit
-  that keeps the length, raise the context variable
-  aforo-customer-map-version (default "1") or wait out the TTL.
+  <tenant> is the context variable aforo-tenant-id, else the tenant that
+  aforo-jwt-validation checked (aforo-jwt-tenant), else "-"; the Named
+  Value is not referenced, so installs without it keep saving. <map hash>
+  is the first 22 base64 characters of the SHA-256 of the map, so any edit
+  of the map changes the key, and two APIM instances sharing an external
+  cache never read each other's entries unless their maps are identical.
+  aforo-customer-map-version (default "1") still forces a new key.
   Consumption tier: without an external Redis cache every request parses.
 
   The map is one Named Value (at most 4096 characters, about 100
@@ -96,7 +100,11 @@
         var map = context.Variables.ContainsKey("aforo-subscription-customer-map")
             ? Convert.ToString(context.Variables["aforo-subscription-customer-map"]) : "";
         if (map == null || map.Trim().Length == 0) { map = "{{aforo-subscription-customer-map}}"; }
-        return "aforo:cust:" + version.Trim() + ":" + map.Length + ":" + context.Subscription.Id;
+        var tenant = context.Variables.ContainsKey("aforo-tenant-id") ? Convert.ToString(context.Variables["aforo-tenant-id"]) : "";
+        if (tenant == null || tenant.Trim().Length == 0) { tenant = context.Variables.ContainsKey("aforo-jwt-tenant") ? Convert.ToString(context.Variables["aforo-jwt-tenant"]) : ""; }
+        if (tenant == null || tenant.Trim().Length == 0 || tenant.Trim().Length > 64) { tenant = "-"; }
+        var h = System.Security.Cryptography.SHA256.Create().ComputeHash(System.Text.Encoding.UTF8.GetBytes(map));
+        return "aforo:cust:" + tenant.Trim() + ":" + version.Trim() + ":" + Convert.ToBase64String(h).Substring(0, 22) + ":" + context.Subscription.Id;
     }" />
     <choose>
         <when condition="@(Convert.ToString(context.Variables["aforo-customer-map-key"]).Length > 0)">

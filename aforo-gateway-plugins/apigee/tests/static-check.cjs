@@ -190,11 +190,34 @@ test('pubsub delivery: PublishMessage to KVM pubsub_topic, continueOnError, only
     assert.ok(fs.existsSync(path.join(ROOT, 'pubsub-forwarder', 'src', 'forwarder.js')), 'the forwarder ships with the bundle');
 });
 
-test('token revocation (jti) is not claimed: no AforoJtiCheck reference, docs say it is not checked (G356)', () => {
-    for (const dir of Object.values(BUNDLES)) {
-        for (const f of walk(dir)) assert.ok(!/AforoJtiCheck|jti-check/i.test(fs.readFileSync(f, 'utf8')), path.relative(ROOT, f));
+test('JWT revocation: org-service token-status, wired after the tenant check and before the quota check', () => {
+    const access = sim.loadBundle(BUNDLES['aforo-access']);
+    const order = access.steps.map((x) => x.name);
+    const want = ['AforoJwtRejected', 'AforoJwtRevocationPrepare', 'AforoJwtRevocationLookupCache',
+        'AforoJwtRevocationCallDecision', 'AforoJwtRevocationCheck', 'AforoJwtRevocationDecide',
+        'AforoJwtRevocationPopulateCache', 'AforoJwtRevoked', 'AforoJwtRevocationUnavailable', 'AforoQuotaLookupCache'];
+    const at = want.map((n) => order.indexOf(n));
+    assert.ok(at.every((i) => i >= 0), 'all steps present: ' + want.join(', '));
+    assert.deepStrictEqual(at.slice().sort((a, b) => a - b), at, 'order: ' + want.join(' > '));
+    const prep = access.steps.find((x) => x.name === 'AforoJwtRevocationPrepare');
+    assert.ok(/private\.aforo\.jwtValidationEnabled = "true"/.test(prep.condition), 'runs only with jwt_validation_enabled');
+    const c = access.policies.AforoJwtRevocationCheck;
+    assert.strictEqual(sim.text(sim.kid(c, 'Timeout')), '2000');
+    assert.strictEqual(sim.text(sim.descendants(c, 'Verb')[0]), 'GET');
+    const headers = sim.descendants(c, 'Header').map((h) => h.attrs.name + '=' + sim.text(h));
+    assert.deepStrictEqual(headers, ['X-API-Key={private.aforo.apiKey}'], 'X-API-Key only, no tenant header');
+    assert.strictEqual(sim.text(sim.descendants(c, 'URL')[0]), '{aforo.access.revocationUrl}');
+    const js = access.resources['jsc://aforo-jwt-revocation.js'];
+    assert.ok(js.indexOf("'/api/v1/public/gateway/token-status'") !== -1, 'token-status path');
+    for (const p of ['AforoJwtRevocationPrepare', 'AforoJwtRevocationCallDecision', 'AforoJwtRevocationDecide']) {
+        assert.strictEqual(sim.text(sim.descendants(access.policies[p], 'Property')[0]),
+            { AforoJwtRevocationPrepare: 'prepare', AforoJwtRevocationCallDecision: 'call', AforoJwtRevocationDecide: 'decide' }[p], p);
     }
-    assert.ok(/revoked (Aforo )?JWT[^.]*not checked/i.test(DOCS), 'README/USER_GUIDE must say revoked tokens are not checked');
+    for (const p of ['AforoJwtRevocationLookupCache', 'AforoJwtRevocationPopulateCache']) {
+        assert.strictEqual(sim.text(sim.kid(sim.kid(access.policies[p], 'CacheKey'), 'Prefix')), 'aforo-jti', p);
+    }
+    assert.ok(/token-status/.test(DOCS) && /jti_check_fallback/.test(DOCS), 'README/USER_GUIDE document the revocation check');
+    assert.ok(!/revoked (Aforo )?JWT[^.]*not checked/i.test(DOCS), 'docs no longer say revocation is not checked');
 });
 
 test('the pre-flight quota check waits at most 1500 ms', () => {

@@ -2,7 +2,7 @@
 
 Two CloudFormation templates: a cross-account role that lets Aforo read your Amazon API Gateway configuration and, if you allow it, install Aforo's metering Lambda; and a policy that blocks deletion of monetized API Gateway resources.
 
-**Version:** 3.0.0 (not yet released) · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 3.1.0 (not yet released) · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## When to reach for this
 
@@ -12,7 +12,7 @@ Use these when you run Amazon API Gateway and connect it to Aforo with a role in
 
 | Template | What it creates |
 |---|---|
-| `aforo-apigateway-role.yaml` | An IAM role Aforo's account can assume with your `ExternalId`. Read: API Gateway `GET` on REST APIs, HTTP APIs and usage plans in one region. Never: API key values, API Gateway writes, log reads. With `AllowMeteringInstall=true` (default): create and update Lambda functions named `aforo-metering-*`, and subscribe them to API Gateway log groups; plus an execution role `aforo-metering-exec-<ExternalId>` that can only write its own logs. |
+| `aforo-apigateway-role.yaml` | An IAM role Aforo's account can assume with your `ExternalId`. Read: API Gateway `GET` on REST APIs, HTTP APIs and usage plans in one region. Never: API key values, API Gateway writes, log reads. With `AllowMeteringInstall=true` (default): create and update Lambda functions named `aforo-metering-*`, write (not read) the Secrets Manager secrets `aforo/metering/*` that hold their Aforo API key, and subscribe them to API Gateway log groups; plus an execution role `aforo-metering-exec-<ExternalId>` that can only write its own logs and read `aforo/metering/*` secrets. |
 | `aforo-monetized-deny-policy.yaml` | A managed policy `aforo-deny-delete-monetized-apis` that denies `apigateway:DELETE` on resources tagged `aforo-monetized=true`, optionally attached to the roles, users and groups you name. |
 
 ## Install
@@ -71,14 +71,15 @@ Output: `PolicyArn`.
 - Change API Gateway (no `POST` / `PUT` / `PATCH` / `DELETE`).
 - Read log events, or subscribe anything to log groups outside the API Gateway prefixes. A subscription's destination is not an IAM condition key; it is limited by what the role can grant: it can add an invoke permission only to `aforo-metering-*` functions, can pass no role to CloudWatch Logs (Kinesis and Firehose destinations need one), and cross-account log destinations are denied.
 - Create or change IAM roles; the only role it can pass is the metering execution role, to Lambda only.
+- Read the Aforo API key back: it can create, update, describe, delete and restore `aforo/metering/*` secrets, but has no `secretsmanager:GetSecretValue`. Only the execution role reads them.
 
 ## Tests
 
-`node aws-cloudformation/tests/templates.test.cjs` (also run by `cd aws-lambda && npm test`). It reads the template text and checks the statements above. `cfn-lint` was not run for 3.0.0.
+`node aws-cloudformation/tests/templates.test.cjs` (also run by `cd aws-lambda && npm test`). It reads the template text and checks the statements above. `cfn-lint` was not run for 3.0.0 or 3.1.0.
 
 ## What this doesn't cover
 
 - **Key and usage-plan provisioning by Aforo.** 1.0.0 granted API Gateway writes for it; Aforo's key provisioning uses access-key connections, not this role, so 3.0.0 drops them.
-- **Secrets Manager.** The one-click metering install still passes the Aforo key as a Lambda environment variable; moving it to Secrets Manager needs a `secretsmanager` permission here and a change in organization-service's installer together.
+- **Customer-managed KMS keys.** The install's secrets use the AWS-managed `aws/secretsmanager` key. A secret you re-encrypt with your own key also needs `kms:Decrypt` on the execution role, which this template does not grant.
 - **SCPs.** Translating the deny policy into a Service Control Policy is your AWS Organizations step.
 - **Tagging.** The deny policy only matches resources already tagged `aforo-monetized=true`.
