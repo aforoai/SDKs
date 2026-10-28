@@ -1,6 +1,6 @@
 # Aforo for MuleSoft — User Guide
 
-**Version:** 3.0.2 · **Updated:** 2026-10-27 · **Audience:** engineers who own an API in Anypoint API Manager and sell it through Aforo.
+**Version:** 3.1.2 · **Updated:** 2026-10-28 · **Audience:** engineers who own an API in Anypoint API Manager and sell it through Aforo.
 
 Normally you do none of this by hand: when you connect your Anypoint org in Aforo and deploy an Aforo product to an API instance, Aforo publishes the policy to your Exchange and applies it with the right configuration. This guide explains what that does, how to do it manually, and how to check it.
 
@@ -51,8 +51,8 @@ Values are rendered into the policy as text. A value must not contain `${` (Mule
 
 ## 4. Install by hand
 
-1. **Build** the jar ([README → Build](README.md#build)), or take `aforo-metering-3.0.2-mule-policy.jar` from the release.
-2. **Publish** it to your Exchange as a policy: groupId = your Anypoint organization id, assetId `aforo-metering`, version `3.0.2`, with `aforo-metering.yaml` as the `policy-definition`. Either `mvn deploy -Danypoint.org.id=<org id>` from `aforo-metering/`, or Exchange → Publish new asset → Policy, uploading both files.
+1. **Build** the jar ([README → Build](README.md#build)), or take `aforo-metering-3.1.2-mule-policy.jar` from the release.
+2. **Publish** it to your Exchange as a policy: groupId = your Anypoint organization id, assetId `aforo-metering`, version `3.1.2`, with `aforo-metering.yaml` as the `policy-definition`. Either `./mvnw deploy -Danypoint.org.id=<org id>` from `aforo-metering/`, or Exchange → Publish new asset → Policy, uploading both files.
 3. **Apply** it in API Manager → your API instance → Policies → Add policy → *Aforo Usage Metering*, filling in the properties above. Put it **first** in the policy order (it is the API's authentication). If browsers call the API, apply MuleSoft's CORS policy before it.
 4. **Map** the product in Aforo (Aforo's deploy records the API instance id against the product).
 
@@ -83,9 +83,17 @@ Your API should not receive an `x-api-key` header. The full checklist, including
 - **MCP**: the agent is no longer `params._meta.agent_id` from the body, the session no longer the request's `Mcp-Session-Id`; batches bill every tool call and protocol messages bill nothing.
 - New: 401/403/429/503 answers, the quota pre-flight, key removal, AI_AGENT events, upstream `X-Aforo-*` headers.
 
-Publish 3.0.0 as a new version of the asset and re-apply it on each API instance; the 2.x configuration is not carried over.
+Publish 3.0.0 (or later) as a new version of the asset and re-apply it on each API instance; the 2.x configuration is not carried over. JWT validation and compound metering are not part of the MuleSoft integration; see the [README](README.md#not-part-of-this-policy).
 
-## 7. Troubleshooting
+## 7. Upgrading from 3.0.0
+
+Publish 3.1.0 as a new version of the asset and update the policy on each API instance to it. The configuration properties are unchanged. What changes:
+
+- Delivery waits a random 0–1 s, then 0–2 s, between attempts instead of a fixed 2 s, and waits for the ingestor's `Retry-After` when it is longer (at most 60 s).
+- Events the ingestor marks `"retryable": true` are re-sent; `"retryable": false` events are dropped even if their message says "could not be stored".
+- The log line for lost usage is now `USAGE NOT DELIVERED (<reason>)`.
+
+## 8. Troubleshooting
 
 All log lines start with `[aforo-metering]`.
 
@@ -98,7 +106,7 @@ All log lines start with `[aforo-metering]`.
 | `quota check unavailable (…): failing OPEN` | quota not enforced while the check fails |
 | `could not remove the x-api-key header before the upstream` | the runtime refused the request rewrite; the call still went through, with the header |
 | `USAGE EVENT REFUSED (permanent, not retried): <metric> <key>: <reason>` | the ingestor rejected an event (unknown metric, unknown customer, missing field) |
-| `USAGE NOT DELIVERED after 3 attempts` | the ingestor did not take the batch; that usage is lost |
+| `USAGE NOT DELIVERED (<reason>)` | the ingestor did not take the batch after 3 attempts (or the delivery failed); that usage is lost |
 | `USAGE DROPPED: 1000 calls' usage is already waiting` | the backlog is full (ingestor down or slow) |
 | `events skipped: unusable X-Aforo-… response header` | your API sent a header Aforo cannot use (too long, control characters) |
 | `metric-mappings rule … skipped` | the rule has no `metricName` or uses an unsupported Lua pattern |

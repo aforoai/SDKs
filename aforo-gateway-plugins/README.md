@@ -1,6 +1,6 @@
 # Aforo Gateway Metering Plugins
 
-**Current versions**: Kong 2.6.0 (2026-10-25); Apigee 3.0.0 (2026-10-22); MuleSoft 3.0.2 (2026-10-27); AWS Lambda 2.3.0 (2026-10-16); Azure APIM 2.2.0 (2026-10-02). Each plugin directory has its own `VERSION` / `CHANGELOG.md` / `USER_GUIDE.md`; `CHANGELOG.md` here is the cross-plugin history. 2.6.0 / 3.0.0 merge the public work after 2.1.0 (Gowtham) with this repository's line.
+**Current versions**: Kong 2.8.2; Apigee 3.1.2; MuleSoft 3.1.2; AWS Lambda 2.5.2; Azure APIM 2.3.2 (all 2026-10-28). Each plugin directory has its own `VERSION` / `CHANGELOG.md` / `USER_GUIDE.md`; `CHANGELOG.md` here is the cross-plugin history. 2.6.0 / 3.0.0 merge the public work after 2.1.0 (Gowtham) with this repository's line.
 
 Gateway plugins that capture API usage events at the edge and forward them to the Aforo usage ingestor service. Each plugin supports Standard API metering, MCP Server tool invocation detection, and W3C Trace Context capture.
 
@@ -27,6 +27,9 @@ A request with no verified customer produces no event, on every plugin. None of 
 | **Kong** | `kong/` | Kong Gateway | access (optional checks) + log (metering) | `cd kong && busted spec/` |
 | **Apigee** | `apigee/` | Google Apigee | Two shared flows: `aforo-access` on `PreProxyFlowHook` (verifies the key, pre-flight quota, 429) and `aforo-metering` on `PostProxyFlowHook` | `node apigee/tests/run-all.cjs` |
 | **AWS** | `aws-lambda/` | AWS API Gateway | CloudWatch Logs (Lambda subscriber) | `cd aws-lambda && npm test` |
+| **Azure APIM** | `azure-apim/` | Azure API Management | Outbound policy fragment | `node azure-apim/tests/policy.test.cjs` (runs the policy expressions against a mock context; no APIM runtime); `node azure-arm-templates/tests/deny-policy.test.cjs`; `npm test` in `azure-apim/eventhub-forwarder/` (mock ingestor) |
+
+| **AWS** | `aws-lambda/` | AWS API Gateway | CloudWatch Logs (Lambda subscriber) | `cd aws-lambda && npm test` (also runs `aws-cloudformation/tests/templates.test.cjs`) |
 | **Azure APIM** | `azure-apim/` | Azure API Management | Outbound policy fragment | `node azure-apim/tests/policy.test.cjs` (runs the policy expressions against a mock context; no APIM runtime) |
 | **MuleSoft** | `mulesoft/aforo-metering/` (Mule 4 custom policy, `mvn clean package`) | MuleSoft Anypoint, Mule 4.4+ runtime | request (key introspection, quota) + async after the response | `node mulesoft/tests/policy.test.cjs` + `mulesoft/tests/run-dataweave.sh` (needs the DataWeave CLI) + `mvn clean package` |
 
@@ -40,7 +43,7 @@ Every plugin POSTs batches to the endpoint you configure, with two headers:
 | `X-API-Key` | Your Aforo API key (`sk_live_…` / `sk_test_…`) |
 | `X-Tenant-Id` | Sent by Kong only. The workspace always comes from the key. |
 
-The setting names differ per gateway (Kong `aforo_endpoint` / `api_key`, AWS `AFORO_ENDPOINT` / `AFORO_API_KEY`, Apigee KVM `aforo_endpoint` / `api_key`, Azure Named Values `aforo-endpoint` / `aforo-api-key`, MuleSoft `aforo-endpoint` / `aforo-api-key`). An endpoint you have already configured is used unchanged. The ingestor also accepts the key as `Authorization: Bearer <key>`, which is what these plugins sent before; `tests/ingest-auth-standard.test.cjs` keeps them on `X-API-Key`.
+The setting names differ per gateway (Kong `aforo_endpoint` / `api_key`, AWS `AFORO_ENDPOINT` / `AFORO_API_KEY_SECRET_ARN` (a Secrets Manager secret since 2.4.0), Apigee KVM `aforo_endpoint` / `api_key`, Azure Named Values `aforo-endpoint` / `aforo-api-key`, MuleSoft `aforo-endpoint` / `aforo-api-key`). An endpoint you have already configured is used unchanged. The ingestor also accepts the key as `Authorization: Bearer <key>`, which is what these plugins sent before; `tests/ingest-auth-standard.test.cjs` keeps them on `X-API-Key`.
 
 ## W3C Trace Context Headers
 

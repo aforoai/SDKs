@@ -10,7 +10,9 @@
   Faults this flow raises reach the client as they are: 401 from
   AforoVerifyApiKey (missing key, invalid key, or a key whose API products do
   not cover this proxy), 401 from AforoJwtValidation / AforoJwtRejected
-  (opt-in), 429 from AforoQuotaExceeded, 503 from AforoQuotaUnavailable
+  (opt-in), 401 from AforoJwtRevoked and 503 from
+  AforoJwtRevocationUnavailable (only with jti_check_fallback = "DENY"),
+  429 from AforoQuotaExceeded, 503 from AforoQuotaUnavailable
   (only with quota_fail_open = "false"). Every other step has
   continueOnError="true": an Aforo outage or a bug here lets the call through
   (fail open) rather than taking the customer's API down.
@@ -58,6 +60,43 @@
     <Step>
         <Name>AforoJwtRejected</Name>
         <Condition>(private.aforo.managedProxy = "true") and (aforo.access.jwtRejected = "true")</Condition>
+    </Step>
+
+    <!-- Revocation of the verified JWT (on with jwt_validation_enabled unless
+         jti_check_enabled = "false"): org-service token-status, cached per
+         tenant + token, with a breaker. 401 when revoked; no answer lets the
+         call through unless jti_check_fallback = "DENY" (503). -->
+    <Step>
+        <Name>AforoJwtRevocationPrepare</Name>
+        <Condition>(private.aforo.managedProxy = "true") and (private.aforo.jwtValidationEnabled = "true")</Condition>
+    </Step>
+    <Step>
+        <Name>AforoJwtRevocationLookupCache</Name>
+        <Condition>aforo.access.revocationCheck = "true"</Condition>
+    </Step>
+    <Step>
+        <Name>AforoJwtRevocationCallDecision</Name>
+        <Condition>aforo.access.revocationCheck = "true"</Condition>
+    </Step>
+    <Step>
+        <Name>AforoJwtRevocationCheck</Name>
+        <Condition>aforo.access.revocationCall = "true"</Condition>
+    </Step>
+    <Step>
+        <Name>AforoJwtRevocationDecide</Name>
+        <Condition>aforo.access.revocationCheck = "true"</Condition>
+    </Step>
+    <Step>
+        <Name>AforoJwtRevocationPopulateCache</Name>
+        <Condition>aforo.access.revocationStore = "true"</Condition>
+    </Step>
+    <Step>
+        <Name>AforoJwtRevoked</Name>
+        <Condition>aforo.access.revocationVerdict = "revoked"</Condition>
+    </Step>
+    <Step>
+        <Name>AforoJwtRevocationUnavailable</Name>
+        <Condition>aforo.access.revocationVerdict = "unavailable"</Condition>
     </Step>
 
     <!-- Pre-flight quota check (enforce_quota__{apiproduct} = "true").

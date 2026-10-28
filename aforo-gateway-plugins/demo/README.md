@@ -74,7 +74,7 @@ inline — otherwise the page and the gateway disagree about which port Kong is 
 call fails with a CORS error that has nothing to do with CORS.
 
 ```bash
-printf 'KONG_PROXY_PORT=8010\nKONG_ADMIN_PORT=8011\nFRONTEND_PORT=3010\n' >> .env
+printf 'KONG_PROXY_PORT=8010\nFRONTEND_PORT=3010\n' >> .env
 node scripts/generate-keys-and-config.js   # re-run so tokens.json picks up the new URL
 docker compose up --build
 ```
@@ -174,6 +174,21 @@ its own.
 The RSA keypair is generated, never committed — nothing here is a usable credential.
 Re-run the generator to reset. `kong/kong.yml`, `tokens.json` and `.tokens.json` are
 generated artifacts and are gitignored.
+
+Ports are published on `127.0.0.1` only. The Kong Admin API has no authentication, so it
+listens on the Kong container's own loopback and is not published at all; reach it with
+`docker compose exec kong curl -s http://127.0.0.1:8001/status`.
+
+`nirmala-frontend/` is the web root, so the generator writes only the three demo tokens and
+the URLs and ids the page needs into `tokens.json`. The ingest API key goes only into
+`kong/kong.yml`, which is mounted into Kong and not served. If you ran an older generator,
+re-run it: an old `tokens.json` held the key.
+
+The generator refuses any `aforo.ai` URL in `DEMO_AFORO_ENDPOINT` or `DEMO_INGESTOR_URL`
+unless `.env` sets `DEMO_ALLOW_PRODUCTION=true`. The demo sends forged, expired and
+over-budget calls on purpose, and against production every one is metered into a real
+tenant. `.env.production.example` ships with `false`; set it yourself. A production run also
+needs a real `DEMO_INGEST_API_KEY`.
 
 `set-budget.sh` writes the budget straight into the ingestor's Redis cache. In production
 that config comes from customer-service; the shortcut keeps the demo to three containers.

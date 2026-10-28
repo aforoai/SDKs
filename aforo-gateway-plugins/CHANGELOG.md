@@ -4,10 +4,68 @@ This monorepo ships five gateway metering plugins (Kong, Apigee, AWS Lambda, Azu
 
 ## Unreleased
 
-### MuleSoft 3.0.2: first live run, every call to Aforo fixed
+### Second wave 6 review fixes (Kong 2.8.2, Apigee 3.1.2, MuleSoft 3.1.2, AWS Lambda 2.5.2, Azure APIM 2.3.2)
 
-- On a live Anypoint org (CloudHub 2.0, Mule 4.13.1) 3.0.0 answered every keyed call with 503 `Access check unavailable`: the policy's `http:request`s stored Aforo's answer with an expression Mule could not give an output type, so introspection, the quota check and ingest all read as "no answer". MCP request bodies failed the same way, so MCP calls were never metered. 3.0.2 names the output type in all five expressions and logs a failure to read an MCP body. See `mulesoft/CHANGELOG.md`.
-- Verified live against production Aforo for all four product types: key check, metering, 429 at hard limits, 403 after a cancelled subscription.
+- Kong: key-auth plus a token this plugin verified without `key_id` is rate limited by the key-auth key again (2.8.1 skipped it). Docs no longer say rate limiting works on Redis Cluster without qualification: it works on ElastiCache Serverless, a per-command cluster proxy or a single-shard Redis; one node of a multi-shard classic cluster fails open.
+- Azure APIM: the Event Hub forwarder counts a compound result as delivered for duplicates only when `failed` is 0; a non-retryable result with `failed` > 0 is a logged rejection. `retryable: true` is resent whatever `success` says.
+- MuleSoft: MCP detection has its own `try` again, so a DataWeave error there is logged and the call metered as a normal request instead of answered 503; "MCP request body not read" logs WARN at most once a minute per reason, DEBUG in between.
+- Apigee: with `jti_cache_seconds` 0 an answer resets the revocation breaker's failure count, so alternating failures no longer open it.
+- AWS Lambda: a refused key rereads the secret at most once per container per 60 s instead of on every invocation.
+- None of this has run on a live gateway. Details in each plugin's CHANGELOG.
+
+### Wave 6 review fixes (Kong 2.8.1, Apigee 3.1.1, MuleSoft 3.1.1, AWS Lambda 2.5.1, Azure APIM 2.3.1)
+
+- Kong: rate-limit counter keys carry one Redis hash tag per check, so HARD limits work on ElastiCache Serverless, a cluster proxy that routes per command, or a single-shard Redis (the script was refused with CROSSSLOT and failed open); one node of a multi-shard classic cluster still answers `MOVED` for other shards' keys and the check fails open; the key-auth credential branch never takes a Kong-jwt `jwt_secrets` row; margin guard does not count a 4xx as a breaker failure and does not send customer ids over 128 characters.
+- Apigee: Aforo JWT revocation is checked with organization-service `GET /api/v1/public/gateway/token-status`, the same contract as Azure (on with `jwt_validation_enabled`; needs the new KVM key `aforo_org_service_url`). The Pub/Sub forwarder runs on Node 22.
+- MuleSoft: an MCP body is read for `tools/call` detection only with a declared `Content-Length` of at most 1 MiB; a chunked body is no longer read whole into memory.
+- AWS Lambda: a 401 / 403 rereads the key secret once and resends; still refused, the invocation fails (it used to drop the batch and return 200). Response errors after headers no longer crash the runtime. Secret ARN parameters require the full ARN.
+- Azure APIM: the Event Hub forwarder resends compound results the ingestor did not store for a temporary reason (BUSY / TIMEOUT / `retryable: true`) instead of dropping them, and counts an all-duplicate redelivery as delivered; compound metering in Event Hub mode no longer needs `aforo-ingestor-url`; map and revocation cache keys are scoped by tenant and the map by its hash; margin guard checks the billed customer and does not count a 4xx as a breaker failure.
+- Demo: the compose file declares `aforo_cache` too.
+- None of this has run on a live gateway. Details in each plugin's CHANGELOG.
+
+### Kong 2.8.0 (wave 6)
+
+- New shared dict `aforo_cache` for caches, throttles and counters, so they no longer share `aforo_buffer` with events (falls back with one error per worker when not declared).
+- JWT validation requires `jwt_issuer` (or `jwt_issuer_check_disabled`); new `jwt_audience`.
+- Revocation lookup is one round trip of pipelined `GET`s (one per key, so it works on Redis Cluster proxies and ElastiCache Serverless) with a 250 ms timeout (`jwt_redis_timeout_ms`), AUTH once per connection; Redis TLS for both Redis checks.
+- Pre-flight quota caches DENY until `Retry-After` (max 60 s), has a circuit breaker and sends `estimatedQuantity`.
+- Margin guard sends `X-API-Key`, has its own timeout (`margin_guard_timeout_ms`, default 300 ms; was a fixed 50 ms) and a circuit breaker.
+- `compound-metering.lua` removed (never called by the plugin).
+- Details and upgrade notes: `kong/CHANGELOG.md`.
+
+### Azure APIM 2.3.0 and ARM templates 2.0.0 (wave 6 W6.3: G348, G350, G351, G352, G353, G354)
+
+- Opt-in Event Hub delivery (`aforo-metering-eventhub` fragment + `azure-apim/eventhub-forwarder/` Function and ARM template): batching, retries and checkpoint-after-accept, so an ingest outage delays usage instead of losing it. Direct `send-one-way-request` stays the default; `aforo-metering` now builds its event into `aforo-event-batch` and sends it once.
+- Revocation and margin-guard calls send `X-API-Key` (no more `X-Internal-Call`); revocation, pre-flight and margin guard are cached with a per-key breaker; the subscription-map lookup is cached.
+- JWT tokens are bound to the configured workspace (Named Value `aforo-tenant-id`, now required by `aforo-jwt-validation`): another workspace's token gets 401 `TENANT_MISMATCH`, and `X-Tenant-Id` upstream is always the configured one. Pre-flight DENY cached at most 60 s; pre-flight and margin-guard caches scoped by a hash of the API key.
+- Compound metering never buffers SSE / streaming / oversized responses.
+- ARM deny policy: `denyAction` on delete, APIs/products matched by `fullName`, service matched by tag, assignment included.
+- Not run on a live APIM instance or Azure subscription. Details: `azure-apim/CHANGELOG.md` 2.3.0, `azure-arm-templates/CHANGELOG.md` 2.0.0.
+
+### Apigee 3.1.0 (W6.4): batched, durable delivery through Pub/Sub
+
+- New opt-in `delivery_mode = pubsub` (Apigee X / hybrid): `AforoMeteringPublish` (PublishMessage) writes each call's events to the topic in KVM `pubsub_topic`; without the key the flow falls back to `async`. New `apigee/pubsub-forwarder/` (Cloud Run): pulls the subscription, sends events in batches of up to 500 / 4 MiB with the transport-spec retries, and acks only after the ingestor accepted them; on an outage it nacks and Pub/Sub redelivers. `async` stays the default. See `apigee/CHANGELOG.md` 3.1.0.
+- Docs: Apigee does not check Aforo JWT revocation (no gateway-callable revocation endpoint exists yet). G355 (request-side checks on the PreProxyFlowHook, non-blocking default delivery) and G357 (margin guard) were already closed by 3.0.0.
+
+### MuleSoft 3.1.0 (W6.5)
+
+- **Includes the 3.0.2 live fixes** (aforoai/SDKs#68): every `targetValue` and the MCP body read name `output application/java`, so calls to Aforo no longer read as "no answer" (503 on every keyed call) and MCP `tools/call` is metered.
+- **Delivery retries follow the SDK transport spec**: full-jitter backoff (base 500 ms, cap 30 s) instead of a fixed 2 s, `Retry-After` honoured (seconds or HTTP date, at most 60 s), per-event `retryable` decides what is re-sent, whole-batch retry only on no answer / 408 / 429 / 500 / 502 / 503 / 504. The wait is a scheduler-timed `until-successful`, not a sleeping thread. See `mulesoft/CHANGELOG.md`.
+- **Docs**: JWT validation is not an Aforo MuleSoft feature (use MuleSoft's JWT Validation policy); compound metering and margin guard are not supported on MuleSoft; one delivery per API call, with in-memory (not durable) retry state.
+- **CI**: the `mulesoft-policy` workflow builds with the pinned `./mvnw` (Maven 3.9.16); the runner's Maven failed with `NoSuchMethodError` on `DefaultMirrorSelector.add`.
+
+### AWS Lambda 2.5.0 and AWS CloudFormation 3.0.0: fail-closed revocation, scoped IAM
+
+- `authorizer.js`: Redis revocation over TLS with AUTH, fails closed; Allow scoped to the stage; recommended authorizer cache 60 s (was 840 s); unknown-`kid` JWKS refetch at most every 30 s. `margin-guard.js`: bounded LRU cache keyed by tenant key. `preflight-quota.js`: status checked, decisions cached, keep-alive. Details and upgrade steps: `aws-lambda/CHANGELOG.md` 2.5.0.
+- `aws-cloudformation/aforo-apigateway-role.yaml` is now the same file organization-service hosts: API Gateway `GET` only on REST APIs, HTTP APIs and usage plans in one region; API key reads denied; subscription filters only on API Gateway log groups; no API Gateway writes, no log reads. `aforo-monetized-deny-policy.yaml` can attach itself to roles, users and groups. Details: `aws-cloudformation/CHANGELOG.md` 3.0.0.
+
+### AWS Lambda 2.4.0: key in Secrets Manager, capped concurrency, filtered logs
+
+- The Aforo API key and the authorizer's tenant key are read from AWS Secrets Manager (`aws-secret.js`); the SAM template refuses the old plaintext parameters. Reserved concurrency (default 10), batch size 500, access-log filter on billable lines, arm64, log retention. Behaviour changes and upgrade steps: `aws-lambda/CHANGELOG.md` 2.4.0.
+
+### Demo stack
+
+- Kong Admin API listens on the container's loopback and is not published; proxy and frontend ports bind to `127.0.0.1`. The served `tokens.json` no longer carries the ingest key. The generator refuses an `aforo.ai` endpoint unless `DEMO_ALLOW_PRODUCTION=true`.
 
 ### AWS Lambda: AI_AGENT and MCP_SERVER through API Gateway
 

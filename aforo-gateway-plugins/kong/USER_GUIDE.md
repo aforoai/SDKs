@@ -1,6 +1,6 @@
 # kong-plugin-aforo-metering — User Guide
 
-**Version:** 2.6.0 · **Updated:** 2026-10-25 · **Audience:** engineers running Kong Gateway (OSS, Enterprise or Kong Konnect data planes) who want API usage metered into Aforo.
+**Version:** 2.8.2 · **Updated:** 2026-10-28 · **Audience:** engineers running Kong Gateway (OSS, Enterprise or Kong Konnect data planes) who want API usage metered into Aforo.
 
 ## What you'll build
 
@@ -21,10 +21,10 @@ Not yet on LuaRocks, so build it from the rockspec in this folder:
 git clone https://github.com/aforoai/SDKs.git
 cd SDKs/aforo-gateway-plugins/kong
 luarocks install lua-resty-http
-luarocks make kong-plugin-aforo-metering-2.6.0-1.rockspec
+luarocks make kong-plugin-aforo-metering-2.8.2-1.rockspec
 ```
 
-`luarocks make` reads `kong-plugin-aforo-metering-2.6.0-1.rockspec` and installs the `handler`, `schema`, `rate-limit-enforce`, `margin-guard`, `preflight-quota`, `compound-metering`, `event-buffer` and `event-util` modules under `kong.plugins.aforo-metering.*`.
+`luarocks make` reads `kong-plugin-aforo-metering-2.8.2-1.rockspec` and installs the `handler`, `schema`, `rate-limit-enforce`, `margin-guard`, `preflight-quota`, `redis-util`, `event-buffer` and `event-util` modules under `kong.plugins.aforo-metering.*`.
 
 Two things that will bite you if you skip them:
 
@@ -43,11 +43,13 @@ docker build -t kong-aforo:3.4 .
 docker run -d --name kong --network=kong-net \
   -e KONG_DATABASE=postgres -e KONG_PG_HOST=kong-database \
   -e KONG_PG_USER=kong -e KONG_PG_PASSWORD=kong \
-  -e KONG_ADMIN_LISTEN=0.0.0.0:8001 \
-  -p 8000:8000 -p 8001:8001 kong-aforo:3.4
+  -e KONG_ADMIN_LISTEN=127.0.0.1:8001 \
+  -p 8000:8000 kong-aforo:3.4
 ```
 
-The `Dockerfile` sets `KONG_PLUGINS` and the `aforo_buffer` shared dict for you. It builds on
+The Admin API listens on the container's loopback only: it has no authentication, so anyone who can reach it can reconfigure the gateway. Call it with `docker exec kong curl -s http://localhost:8001/...`. To reach it from the host, keep it off the network: `-e KONG_ADMIN_LISTEN=0.0.0.0:8001 -p 127.0.0.1:8001:8001`.
+
+The `Dockerfile` sets `KONG_PLUGINS` and the `aforo_buffer` and `aforo_cache` shared dicts for you. It builds on
 `kong:3.4` unless you pass another base, e.g. the Kong Gateway image (Kong ships no open-source image
 after 3.9; see "Supported Kong versions" in the README for what was tested, and for the read-only
 mode of unlicensed Kong Gateway 3.16):
@@ -59,7 +61,7 @@ docker build --build-arg KONG_IMAGE_BASE=kong/kong-gateway:3.16.0.1 -t kong-afor
 Verify:
 
 ```bash
-curl -s http://localhost:8001/ | grep -o aforo-metering
+docker exec kong curl -s http://localhost:8001/ | grep -o aforo-metering
 ```
 
 ### Local development: mounting the plugin from source
@@ -71,12 +73,12 @@ cd SDKs/aforo-gateway-plugins/kong
 docker run -d --name kong --network=kong-net \
   -e KONG_DATABASE=postgres -e KONG_PG_HOST=kong-database \
   -e KONG_PG_USER=kong -e KONG_PG_PASSWORD=kong \
-  -e KONG_ADMIN_LISTEN=0.0.0.0:8001 \
+  -e KONG_ADMIN_LISTEN=127.0.0.1:8001 \
   -v "$PWD:/usr/local/share/lua/5.1/kong/plugins/aforo-metering:ro" \
-  -p 8000:8000 -p 8001:8001 kong-aforo:3.4
+  -p 8000:8000 kong-aforo:3.4
 ```
 
-Still based on `kong-aforo:3.4`, because the mount only replaces the plugin's code — `KONG_PLUGINS` and the `aforo_buffer` shared dict still come from the image.
+Still based on `kong-aforo:3.4`, because the mount only replaces the plugin's code — `KONG_PLUGINS` and the shared dicts still come from the image.
 
 ## Choosing what each endpoint bills as
 
@@ -262,19 +264,23 @@ An upstream with no Aforo code is metered one goal per call. The client's `trace
 `tracestate`, `x-trace-id` and `x-request-id` are still sent in the event's `trace`, so
 you can correlate with your own tracing.
 
-## Step 2 — Register the plugin and the shared buffer
+## Step 2 — Register the plugin and the shared dicts
 
 In `kong.conf`:
 
 ```
 plugins = bundled,aforo-metering
-nginx_http_lua_shared_dict = aforo_buffer 10m
+nginx_http_lua_shared_dict = aforo_buffer 10m; lua_shared_dict aforo_cache 5m
 lua_ssl_verify_depth = 3
 ```
 
+Kong writes the value after `lua_shared_dict `, so the second dict is a second directive inside the same line.
+
 > ⚠ `lua_ssl_verify_depth` is not optional when `aforo_endpoint` is `https://` — which it is in production. Kong defaults it to `1`, too shallow for an ordinary leaf → intermediate → root chain, and every flush then fails with `20: unable to get local issuer certificate`. That message reads like a missing CA bundle and is not one: Kong already trusts the system store via `lua_ssl_trusted_certificate`, so installing certificates changes nothing. Only the depth does. Events are re-buffered rather than lost, so the symptom is a stalled pipeline rather than an outage.
 
-> ⚠ The shared dict is not optional. The log phase buffers events into the `aforo_buffer` dict and a timer flushes them. Without the dict line, every request logs `Shared dict 'aforo_buffer' not available` and the event is dropped. In a raw nginx template the equivalent directive is `lua_shared_dict aforo_buffer 10m;`.
+> ⚠ The `aforo_buffer` dict is not optional. The log phase buffers events into it and a timer flushes them. Without it, every request logs `Shared dict 'aforo_buffer' not available` and the event is dropped. In a raw nginx template the equivalent directives are `lua_shared_dict aforo_buffer 10m;` and `lua_shared_dict aforo_cache 5m;`.
+
+`aforo_cache` (2.8.0) holds everything that is not an event: the pre-flight quota cache and circuit breaker, the margin guard cache, the rate-limit policy cache, the metric mappings, warning throttles and the drop and revocation counters. Keeping them apart means a cache can never take the room buffered events need. Without `aforo_cache` they go to `aforo_buffer` as before 2.8.0, and each worker logs `Shared dict 'aforo_cache' is not declared` once.
 
 Reload:
 
@@ -357,7 +363,7 @@ In the access phase the plugin checks, in order: the token is RS256, the signatu
 
 > `jwt_jwks_uri` works: set it to organization-service's `https://<org host>/.well-known/jwks.json` instead of (or as well as) `jwt_public_key`, and organization-service can rotate its signing key without a Kong config change. The set is cached per worker for `jwt_jwks_cache_ttl` seconds (default 600). A token with an unknown `kid`, or one whose cached key no longer verifies (organization-service makes a new key pair on every start and keeps the `kid`), refreshes it at most every 30 s. While the JWKS cannot be fetched the last good set is used for up to 24 h. With both set, the JWKS key is used first and `jwt_public_key` verifies tokens the JWKS has no key for.
 
-> ⚠ The revocation checks (jti blocklist, revoked `client_id` / `key_id`) refuse the request with 503 when Redis cannot answer, including an error reply such as `NOAUTH`. If the blocklist Redis needs a password, set `jwt_redis_password` (it defaults to `rate_limit_redis_password` on the same Redis). Set `jwt_redis_host`/`jwt_redis_port` to a reachable Redis, or `jti_redis_fail_mode: open` to let requests through (logged and counted) as before.
+> ⚠ The revocation checks (jti blocklist, revoked `client_id` / `key_id`) refuse the request with 503 when Redis cannot answer within `jwt_redis_timeout_ms` (default 250 ms), including an error reply such as `NOAUTH` or `MOVED`. The keys are read with one `GET` each in one pipelined round trip, so ElastiCache Serverless and cluster proxies that route per key work; one node of a classic Redis Cluster does not. If the blocklist Redis needs a password, set `jwt_redis_password` (it defaults to `rate_limit_redis_password` on the same Redis). Set `jwt_redis_host`/`jwt_redis_port` to a reachable Redis, or `jti_redis_fail_mode: open` to let requests through (logged and counted) as before.
 
 > ⚠ `jwt_allow_unverified_signature: true` lets a token through when the plugin has no key to verify it with. Since 2.2.0 that token grants access only. Its claims are not used for `customerId` or `keyId` unless Kong's `jwt` plugin verified the same token. If you relied on this flag for identity, move to model B.
 
@@ -448,7 +454,13 @@ See the full option table in [README.md](README.md#configuration). The three you
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `Shared dict 'aforo_buffer' not available` in logs, no events sent | The `aforo_buffer` shared dict was never declared | Add `nginx_http_lua_shared_dict = aforo_buffer 10m` to `kong.conf` and `kong reload`. |
+| `Shared dict 'aforo_buffer' not available` in logs, no events sent | The `aforo_buffer` shared dict was never declared | Add `nginx_http_lua_shared_dict = aforo_buffer 10m; lua_shared_dict aforo_cache 5m` to `kong.conf` and `kong reload`. |
+| `Shared dict 'aforo_cache' is not declared` once per worker | Upgraded to 2.8.0 without the second dict | Caches share `aforo_buffer` with events until you add `lua_shared_dict aforo_cache 5m` (see Step 2). Nothing else changes. |
+| JWTs answered 500 `ISSUER_NOT_CONFIGURED` | `jwt_validation_enabled` without `jwt_issuer` (2.8.0) | Set `jwt_issuer` to your token issuer (`https://auth.aforo.ai`), or set `jwt_issuer_check_disabled = true` to accept any issuer. |
+| 503 `REVOCATION_CHECK_UNAVAILABLE` after upgrading to 2.8.0 | The revocation lookup now times out after `jwt_redis_timeout_ms` (250 ms for the connect, TLS handshake included, and for the one round trip; was 500 ms per `GET`) | Put Kong near the blocklist Redis, or raise `jwt_redis_timeout_ms`. |
+| 503 `REVOCATION_CHECK_UNAVAILABLE`, log shows `MOVED` | `jwt_redis_host` is one node of a classic Redis Cluster; keys on other shards answer `MOVED` and the plugin does not follow redirects | Point `jwt_redis_host` at ElastiCache Serverless or a cluster proxy that routes per key. |
+| Rate limits not enforced, `[aforo-ratelimit]` error log shows `MOVED` | `rate_limit_redis_host` is one node of a multi-shard classic Redis Cluster; keys on other shards answer `MOVED`, the plugin does not follow redirects, and the check fails open | Point `rate_limit_redis_host` at ElastiCache Serverless, a cluster proxy that routes per command, or a single-shard Redis. |
+| Margin guard never refuses; log shows `Check failed: timeout` or `Pricing check failed N times in a row` | Pricing does not answer within `margin_guard_timeout_ms` (300 ms), and after 5 failures the breaker stops calling it for 10 s | Check `margin_guard_url` reachability; raise `margin_guard_timeout_ms` for a distant pricing host. The breaker settings are `margin_guard_breaker_threshold` / `margin_guard_breaker_cooldown_s`. |
 | Events buffer but never flush | `flush_count` not reached and `flush_interval_ms` not yet elapsed | Wait for the interval, lower `flush_count` to 1 for testing, or send more traffic. |
 | Flush logs `status=401` | Wrong `api_key` or `tenant_id` | Re-check the Aforo API key and tenant; both are sent on the flush (`X-API-Key` + `X-Tenant-Id`). |
 | Events land in Aforo with empty/missing customer | No Kong consumer bound and no JWT claim | Add an auth plugin (key-auth/JWT) with a consumer, or enable `jwt_validation_enabled`. |

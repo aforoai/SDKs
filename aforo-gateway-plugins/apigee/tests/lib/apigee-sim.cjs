@@ -4,7 +4,8 @@
  * shared flows end to end in Node: it reads the bundle XML, evaluates each
  * Step's Condition, and executes the policy types the bundles use
  * (KeyValueMapOperations Get, VerifyAPIKey, VerifyJWT, Javascript,
- * AssignMessage, LookupCache, PopulateCache, ServiceCallout, RaiseFault).
+ * AssignMessage, LookupCache, PopulateCache, ServiceCallout, PublishMessage,
+ * RaiseFault).
  *
  * It is a model, not Apigee. It checks that the flows are wired together
  * correctly (variable names, conditions, which step answers what) and that
@@ -425,6 +426,26 @@ function runServiceCallout(msg, policy) {
     if (!ok && policy.attrs.continueOnError !== 'true') throw new Fault(500, 'callout failed', {}, 'steps.servicecallout.ResponseCodeOutOfRange');
 }
 
+// PublishMessage (Apigee X/hybrid): publishes the rendered <Source> to the
+// rendered <CloudPubSub><Topic>. env.pubsub(req) answers {ok:true} or
+// {error}. Modelled from the policy reference: a failed publish raises a
+// fault, which continueOnError turns into a continue.
+function runPublishMessage(msg, policy) {
+    const get = (n) => msg.get(n);
+    const request = {
+        policy: policy.attrs.name,
+        topic: renderTemplate(text(kid(kid(policy, 'CloudPubSub'), 'Topic')), get),
+        data: renderTemplate(text(kid(policy, 'Source')), get)
+    };
+    msg.publishes = msg.publishes || [];
+    msg.publishes.push(request);
+    const res = msg.env.pubsub ? msg.env.pubsub(request) : { error: 'no Pub/Sub handler' };
+    if (!res || res.error) {
+        if (policy.attrs.continueOnError !== 'true') throw new Fault(500, 'publish failed', {}, 'steps.publishmessage.PublishFailed');
+        msg.prints.push(`[sim] ${policy.attrs.name} publish failed: ${(res && res.error) || 'no answer'}`);
+    }
+}
+
 function runRaiseFault(msg, policy) {
     const set = kid(kid(policy, 'FaultResponse'), 'Set');
     const get = (n) => msg.get(n);
@@ -443,6 +464,7 @@ const EXECUTORS = {
     LookupCache: runLookupCache,
     PopulateCache: runPopulateCache,
     ServiceCallout: runServiceCallout,
+    PublishMessage: runPublishMessage,
     RaiseFault: runRaiseFault
 };
 

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- delivery_mode pubsub (opt-in, Apigee X and hybrid): publishes the call's
+     events ({"events":[...]}, the same body the HTTP modes POST) as one
+     message to the Pub/Sub topic in KVM pubsub_topic
+     (projects/{project}/topics/{topic}). The Aforo Pub/Sub forwarder
+     (apigee/pubsub-forwarder/) reads the subscription, sends the events to the
+     ingestor in batches of up to 500, and acks a message only after the
+     ingestor accepted or permanently rejected its events. While the ingestor
+     is down, messages wait in the subscription and are redelivered.
+
+     Requirements: Apigee X or hybrid, and the shared flow deployed with a
+     Google service account (deployments?serviceAccount=<sa-email>) that has
+     roles/pubsub.publisher on the topic.
+
+     The client waits for this publish (a call to Pub/Sub inside Google
+     Cloud), not for the ingestor. continueOnError: a failed publish never
+     fails the API call; that call's events are then lost, as in async mode. -->
+<PublishMessage name="AforoMeteringPublish" continueOnError="true">
+    <DisplayName>Aforo Metering - Publish Events to Pub/Sub</DisplayName>
+    <Source>{aforo.eventPayload}</Source>
+    <CloudPubSub>
+        <Topic>{private.aforo.pubsubTopic}</Topic>
+    </CloudPubSub>
+</PublishMessage>

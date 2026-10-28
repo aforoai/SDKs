@@ -329,7 +329,21 @@ return {
                         jwt_issuer = {
                             type = "string",
                             default = "https://auth.aforo.ai",
-                            description = "Expected JWT issuer (iss claim). Leave empty to skip issuer check.",
+                            description = "Expected JWT issuer (iss claim). Required with jwt_validation_enabled since 2.8.0: without it JWTs are refused (500 ISSUER_NOT_CONFIGURED) unless jwt_issuer_check_disabled is true.",
+                        },
+                    },
+                    {
+                        jwt_issuer_check_disabled = {
+                            type = "boolean",
+                            default = false,
+                            description = "Accept a JWT from any issuer when jwt_issuer is not set. Off by default: a token signed by a key the plugin trusts is still refused unless its iss matches jwt_issuer.",
+                        },
+                    },
+                    {
+                        jwt_audience = {
+                            type = "array",
+                            elements = { type = "string" },
+                            description = "Accepted audiences. When set, a JWT's aud (string or array) must name one of them and a token without aud is refused (401 INVALID_AUDIENCE). Unset: aud is not checked. Aforo's issuer mints tokens without aud and binds them to the tenant (tenant_id must match).",
                         },
                     },
                     {
@@ -384,6 +398,32 @@ return {
                         },
                     },
                     {
+                        jwt_redis_timeout_ms = {
+                            type = "integer",
+                            default = 250,
+                            between = { 5, 5000 },
+                            description = "Timeout in ms for each step of the revocation lookup (connect including the TLS handshake, then the one round trip of pipelined GETs). On timeout jti_redis_fail_mode applies, so with the default fail mode a Redis slower than this answers 503. Was a fixed 500 ms per GET before 2.8.0.",
+                        },
+                    },
+                    {
+                        jwt_redis_ssl = {
+                            type = "boolean",
+                            description = "Connect to the jti blocklist Redis over TLS. Unset: as rate_limit_redis_ssl when the blocklist uses the rate-limit Redis host and port, else plain.",
+                        },
+                    },
+                    {
+                        jwt_redis_ssl_verify = {
+                            type = "boolean",
+                            description = "Verify the blocklist Redis TLS certificate against lua_ssl_trusted_certificate (default true; on the rate-limit Redis, as rate_limit_redis_ssl_verify). false encrypts without authenticating the server.",
+                        },
+                    },
+                    {
+                        jwt_redis_server_name = {
+                            type = "string",
+                            description = "TLS server name (SNI, and the name the certificate must match) for the blocklist Redis. Defaults to the host.",
+                        },
+                    },
+                    {
                         jti_redis_fail_mode = {
                             type = "string",
                             default = "closed",
@@ -427,6 +467,26 @@ return {
                             description = "Redis timeout in milliseconds (fail-open on timeout)",
                         },
                     },
+                    {
+                        rate_limit_redis_ssl = {
+                            type = "boolean",
+                            default = false,
+                            description = "Connect to the rate-limit Redis over TLS.",
+                        },
+                    },
+                    {
+                        rate_limit_redis_ssl_verify = {
+                            type = "boolean",
+                            default = true,
+                            description = "Verify the rate-limit Redis TLS certificate against lua_ssl_trusted_certificate. false encrypts without authenticating the server.",
+                        },
+                    },
+                    {
+                        rate_limit_redis_server_name = {
+                            type = "string",
+                            description = "TLS server name (SNI, and the name the certificate must match) for the rate-limit Redis. Defaults to rate_limit_redis_host.",
+                        },
+                    },
                     -- Margin guard pre-flight check (calls pricing-service quick-check)
                     {
                         margin_guard_enabled = {
@@ -438,7 +498,7 @@ return {
                     {
                         margin_guard_url = {
                             type = "string",
-                            description = "Pricing-service base URL for the margin guard quick-check, e.g. http://pricing:8083. Kong must reach pricing's internal API (/internal/v1/margin-guard/quick-check, no auth). Required when margin_guard_enabled is true.",
+                            description = "Pricing-service base URL for the margin guard quick-check, e.g. http://pricing:8083. Kong calls pricing's /api/v1/margin-guard/quick-check with api_key as X-API-Key; pricing takes the tenant from the key. Required when margin_guard_enabled is true.",
                         },
                     },
                     {
@@ -446,6 +506,30 @@ return {
                             type = "integer",
                             default = 30,
                             description = "How long an ALLOW or BLOCK answer is cached per tenant and scope, in seconds. THROTTLE is never cached. 0 disables the cache.",
+                        },
+                    },
+                    {
+                        margin_guard_timeout_ms = {
+                            type = "integer",
+                            default = 300,
+                            between = { 10, 5000 },
+                            description = "Timeout for each margin guard call to pricing, in ms (connect including the TLS handshake, send and read). On timeout the request is let through. 300 allows for Kong-to-pricing over the internet.",
+                        },
+                    },
+                    {
+                        margin_guard_breaker_threshold = {
+                            type = "integer",
+                            default = 5,
+                            between = { 0, 1000 },
+                            description = "Consecutive margin guard failures (timeout, error, non-200, no verdict) that open the circuit breaker. While open, pricing is not called and requests are let through at once. 0 turns the breaker off.",
+                        },
+                    },
+                    {
+                        margin_guard_breaker_cooldown_s = {
+                            type = "integer",
+                            default = 10,
+                            between = { 1, 3600 },
+                            description = "Seconds the margin guard breaker stays open before one request probes pricing again.",
                         },
                     },
                     -- Pre-flight quota check (calls the ingestor's /api/v1/quota/check)
@@ -482,14 +566,30 @@ return {
                             type = "integer",
                             default = 1000,
                             between = { 0, 60000 },
-                            description = "How long an ALLOW or WARN is cached per tenant/customer/metric. DENY is never cached, so a top-up unblocks immediately. 0 disables the cache.",
+                            description = "How long an ALLOW or WARN is cached per tenant/customer/metric. A DENY is cached until its Retry-After (at most 60 s, 5 s when the ingestor gives none). 0 disables both caches.",
                         },
                     },
                     {
                         preflight_quota_fail_open = {
                             type = "boolean",
                             default = true,
-                            description = "When the quota check errors, times out or answers non-200, let the request through (true) or refuse it with 503 (false).",
+                            description = "When the quota check errors, times out, answers non-200 or its circuit breaker is open, let the request through (true) or refuse it with 503 (false).",
+                        },
+                    },
+                    {
+                        preflight_quota_breaker_threshold = {
+                            type = "integer",
+                            default = 5,
+                            between = { 0, 1000 },
+                            description = "Consecutive quota-check failures that open the circuit breaker. While open, the check is not called and preflight_quota_fail_open applies at once. 0 turns the breaker off.",
+                        },
+                    },
+                    {
+                        preflight_quota_breaker_cooldown_s = {
+                            type = "integer",
+                            default = 10,
+                            between = { 1, 3600 },
+                            description = "Seconds the breaker stays open before one request probes the quota check again.",
                         },
                     },
                     -- Exclusions
@@ -514,6 +614,19 @@ return {
         },
     },
     entity_checks = {
+        -- JWT validation needs an issuer (2.8.0, G326), or an explicit opt-out.
+        -- A config stored before 2.8.0 still loads; the handler then refuses
+        -- JWTs with 500 ISSUER_NOT_CONFIGURED.
+        { custom_entity_check = {
+            field_sources = { "config" },
+            fn = function(entity)
+                local c = entity.config
+                if type(c) ~= "table" or c.jwt_validation_enabled ~= true then return true end
+                if type(c.jwt_issuer) == "string" and c.jwt_issuer ~= "" then return true end
+                if c.jwt_issuer_check_disabled == true then return true end
+                return nil, "jwt_validation_enabled requires jwt_issuer (or jwt_issuer_check_disabled = true)"
+            end,
+        } },
         -- Without a URL the margin guard has nothing to ask; this used to be
         -- accepted and then raise on every request (a 500).
         { conditional = {

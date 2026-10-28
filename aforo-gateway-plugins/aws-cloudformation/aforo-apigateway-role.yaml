@@ -1,72 +1,259 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: >
-  Aforo API Gateway Integration — creates a cross-account IAM role that allows
-  Aforo to manage API Gateway resources (keys, usage plans, stages) in your
-  AWS account. Uses sts:AssumeRole with ExternalId for confused-deputy protection.
+Description: >-
+  Aforo access to Amazon API Gateway. Creates one IAM role that Aforo's AWS account can
+  assume only with this connection's external ID. The role reads API Gateway configuration
+  (REST and HTTP APIs, stages, authorizers, usage plans) in one region; it cannot read API
+  key values. With AllowMeteringInstall = true it can also install Aforo's metering Lambda
+  (functions named aforo-metering-*), store the Aforo API key it uses in Secrets Manager
+  (secrets named aforo/metering/*) and subscribe it to your API Gateway log groups; set it
+  to false to keep the role read-only.
+
+# Hosted publicly at the URL in aforo.aws.cfn-template-url (default
+# https://aforo-templates.s3.amazonaws.com/aws-apigateway-role.yaml). CloudFormation only
+# loads templates from S3, so a change here must be uploaded there to take effect.
+# The launch URL built by AwsCloudFormationService fills in ExternalId (and AforoAccountId
+# when aforo.aws.account-id is set), and opens the console in the connection's region, so
+# the default ApiGatewayRegion (this stack's region) is the connection's region.
+#
+# The same file is published as aforo-gateway-plugins/aws-cloudformation/aforo-apigateway-role.yaml
+# (and is organization-service src/main/resources/cloudformation/aws-apigateway-role.yaml).
+# Change both together.
 
 Parameters:
   ExternalId:
     Type: String
-    Description: Unique external ID provided by Aforo (prevents confused deputy attacks)
-    AllowedPattern: '[a-f0-9-]+'
-    ConstraintDescription: Must be a valid UUID
-
+    MinLength: 32
+    MaxLength: 44
+    AllowedPattern: '^[A-Za-z0-9-]+$'
+    ConstraintDescription: 32 to 44 letters, digits or hyphens (Aforo generates a UUID).
+    Description: The external ID Aforo generated for this connection. Leave it as it is.
   AforoAccountId:
     Type: String
-    Description: Aforo's AWS account ID (provided automatically)
-    Default: '000000000000'
+    Default: '082424191442'
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID.
+    Description: Aforo's AWS account ID. Leave it as it is.
+  ApiGatewayRegion:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(\*|[a-z]{2}(-[a-z]+)+-\d+)?$'
+    ConstraintDescription: Empty, * or a region code such as us-east-1.
+    Description: >-
+      Region Aforo may read API Gateway in and install the metering Lambda in. Empty means
+      this stack's region. * means every region.
+  AccessLogGroupPrefix:
+    Type: String
+    Default: ''
+    AllowedPattern: '^[\w./#-]{0,500}$'
+    Description: >-
+      Only when your API access logs go to a log group whose name does not start with
+      /aws/apigateway/ or API-Gateway-: that name, or a prefix of it. Aforo can subscribe
+      the metering Lambda only to log groups matching these prefixes.
+  AllowMeteringInstall:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      true lets Aforo's one-click metering create and remove a Lambda function named
+      aforo-metering-*, the Secrets Manager secret aforo/metering/* holding its Aforo API
+      key, and its CloudWatch Logs subscription in this account. false keeps the role
+      read-only; you then install the metering Lambda yourself.
+
+Conditions:
+  MeteringInstall: !Equals [!Ref AllowMeteringInstall, 'true']
+  UseStackRegion: !Equals [!Ref ApiGatewayRegion, '']
+  HasAccessLogGroupPrefix: !Not [!Equals [!Ref AccessLogGroupPrefix, '']]
 
 Resources:
-  AforoApiGatewayRole:
+  AforoRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: aforo-apigateway-role
-      Description: Allows Aforo to manage API Gateway resources for usage metering and key provisioning
+      Description: Lets Aforo read Amazon API Gateway configuration and, when allowed, install its metering Lambda.
       MaxSessionDuration: 3600
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
-              AWS: !Sub 'arn:aws:iam::${AforoAccountId}:root'
-            Action: 'sts:AssumeRole'
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AforoAccountId}:root'
+            Action: sts:AssumeRole
             Condition:
               StringEquals:
-                'sts:ExternalId': !Ref ExternalId
+                sts:ExternalId: !Ref ExternalId
       Policies:
-        - PolicyName: AforoApiGatewayAccess
+        # Read only what the import and capture code reads (AwsApiGatewayProductFetcher,
+        # AwsApiGatewayAdapter): REST APIs, HTTP APIs (/apis) and usage plans, with their
+        # stages, deployments, resources, routes and authorizers.
+        - PolicyName: AforoApiGatewayReadOnly
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Sid: ApiGatewayManagement
+              - Sid: ReadApiConfiguration
                 Effect: Allow
+                Action: apigateway:GET
+                Resource:
+                  - !Sub
+                    - 'arn:${AWS::Partition}:apigateway:${Region}::/restapis'
+                    - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                  - !Sub
+                    - 'arn:${AWS::Partition}:apigateway:${Region}::/restapis/*'
+                    - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                  - !Sub
+                    - 'arn:${AWS::Partition}:apigateway:${Region}::/apis'
+                    - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                  - !Sub
+                    - 'arn:${AWS::Partition}:apigateway:${Region}::/apis/*'
+                    - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                  - !Sub
+                    - 'arn:${AWS::Partition}:apigateway:${Region}::/usageplans'
+                    - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                  - !Sub
+                    - 'arn:${AWS::Partition}:apigateway:${Region}::/usageplans/*'
+                    - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+              # GET /apikeys?includeValues=true and GET /usageplans/{id}/keys return API
+              # key values. Denied in every region, whatever else is attached to the role.
+              - Sid: NeverReadApiKeys
+                Effect: Deny
+                Action: apigateway:GET
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:apigateway:*::/apikeys'
+                  - !Sub 'arn:${AWS::Partition}:apigateway:*::/apikeys/*'
+                  - !Sub 'arn:${AWS::Partition}:apigateway:*::/usageplans/*/keys'
+                  - !Sub 'arn:${AWS::Partition}:apigateway:*::/usageplans/*/keys/*'
+        # One-click metering install (AwsApiGatewayProvisioningAdapter). Everything is
+        # limited to functions named aforo-metering-* and secrets named aforo/metering/*,
+        # and the only role Aforo can hand to Lambda is the execution role below. Aforo
+        # cannot create or change IAM roles, and cannot change API Gateway.
+        - !If
+          - MeteringInstall
+          - PolicyName: AforoMeteringInstall
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Sid: MeteringFunction
+                  Effect: Allow
+                  Action:
+                    - lambda:CreateFunction
+                    - lambda:GetFunction
+                    - lambda:GetFunctionConfiguration
+                    - lambda:UpdateFunctionCode
+                    - lambda:UpdateFunctionConfiguration
+                    - lambda:PutFunctionEventInvokeConfig
+                    - lambda:AddPermission
+                    - lambda:RemovePermission
+                    - lambda:DeleteFunction
+                    - lambda:TagResource
+                  Resource: !Sub
+                    - 'arn:${AWS::Partition}:lambda:${Region}:${AWS::AccountId}:function:aforo-metering-*'
+                    - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                # The Aforo API key the function reads (AFORO_API_KEY_SECRET_ARN), so it is
+                # never a Lambda environment variable. Aforo writes and deletes the secret;
+                # it cannot read it back (no GetSecretValue). RestoreSecret undoes a removal
+                # within its 7-day recovery window when metering is deployed again.
+                - Sid: MeteringApiKeySecret
+                  Effect: Allow
+                  Action:
+                    - secretsmanager:CreateSecret
+                    - secretsmanager:PutSecretValue
+                    - secretsmanager:DescribeSecret
+                    - secretsmanager:DeleteSecret
+                    - secretsmanager:RestoreSecret
+                    - secretsmanager:TagResource
+                  Resource: !Sub
+                    - 'arn:${AWS::Partition}:secretsmanager:${Region}:${AWS::AccountId}:secret:aforo/metering/*'
+                    - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                - Sid: PassMeteringExecutionRole
+                  Effect: Allow
+                  Action: iam:PassRole
+                  Resource: !GetAtt AforoMeteringExecutionRole.Arn
+                  Condition:
+                    StringEquals:
+                      iam:PassedToService: lambda.amazonaws.com
+                # DescribeLogGroups has no resource-level permissions.
+                - Sid: FindAccessLogGroup
+                  Effect: Allow
+                  Action: logs:DescribeLogGroups
+                  Resource: '*'
+                # Only API Gateway log groups. A subscription's destination is not an IAM
+                # condition key; it is limited by what Aforo can grant: the role can add
+                # an invoke permission only to aforo-metering-* functions, and can pass
+                # no role to CloudWatch Logs (needed for Kinesis or Firehose destinations).
+                - Sid: SubscribeToApiGatewayLogs
+                  Effect: Allow
+                  Action:
+                    - logs:PutSubscriptionFilter
+                    - logs:DeleteSubscriptionFilter
+                    - logs:DescribeSubscriptionFilters
+                  Resource:
+                    - !Sub
+                      - 'arn:${AWS::Partition}:logs:${Region}:${AWS::AccountId}:log-group:/aws/apigateway/*'
+                      - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                    - !Sub
+                      - 'arn:${AWS::Partition}:logs:${Region}:${AWS::AccountId}:log-group:API-Gateway-*'
+                      - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                    - !If
+                      - HasAccessLogGroupPrefix
+                      - !Sub
+                        - 'arn:${AWS::Partition}:logs:${Region}:${AWS::AccountId}:log-group:${AccessLogGroupPrefix}*'
+                        - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                      - !Ref AWS::NoValue
+                # Cross-account CloudWatch Logs destinations are never allowed.
+                - Sid: NoLogDestinations
+                  Effect: Deny
+                  Action: logs:PutSubscriptionFilter
+                  Resource: !Sub 'arn:${AWS::Partition}:logs:*:*:destination:*'
+          - !Ref AWS::NoValue
+
+  # What the metering Lambda itself may do: write its own logs and read its Aforo API key
+  # from the aforo/metering/* secrets. Nothing else.
+  # The name is fixed by the external ID so Aforo can find the role without IAM read access.
+  AforoMeteringExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: MeteringInstall
+    Properties:
+      RoleName: !Sub 'aforo-metering-exec-${ExternalId}'
+      Description: Execution role of Aforo's metering Lambda (writes its own logs, reads its Aforo API key secret).
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AforoMeteringLambdaLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
                 Action:
-                  - 'apigateway:GET'
-                  - 'apigateway:POST'
-                  - 'apigateway:PUT'
-                  - 'apigateway:PATCH'
-                  - 'apigateway:DELETE'
-                Resource: !Sub 'arn:aws:apigateway:${AWS::Region}::/*'
-              - Sid: CloudWatchLogsRead
-                Effect: Allow
-                Action:
-                  - 'logs:DescribeLogGroups'
-                  - 'logs:DescribeLogStreams'
-                  - 'logs:GetLogEvents'
-                  - 'logs:PutSubscriptionFilter'
-                  - 'logs:DeleteSubscriptionFilter'
-                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
-      Tags:
-        - Key: aforo-managed
-          Value: 'true'
-        - Key: purpose
-          Value: api-gateway-integration
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub
+                    - 'arn:${AWS::Partition}:logs:${Region}:${AWS::AccountId}:log-group:/aws/lambda/aforo-metering-*'
+                    - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                  - !Sub
+                    - 'arn:${AWS::Partition}:logs:${Region}:${AWS::AccountId}:log-group:/aws/lambda/aforo-metering-*:*'
+                    - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+        # The secret is encrypted with the AWS-managed aws/secretsmanager key, whose key
+        # policy already lets principals in this account decrypt through Secrets Manager.
+        - PolicyName: AforoMeteringApiKeySecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub
+                  - 'arn:${AWS::Partition}:secretsmanager:${Region}:${AWS::AccountId}:secret:aforo/metering/*'
+                  - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
 
 Outputs:
-  RoleArn:
-    Description: IAM Role ARN — paste this into Aforo to complete the integration
-    Value: !GetAtt AforoApiGatewayRole.Arn
-
-  ExternalId:
-    Description: The ExternalId used for this role (for verification)
-    Value: !Ref ExternalId
+  AforoRoleArn:
+    Description: Copy this value into Aforo and click Finish connecting.
+    Value: !GetAtt AforoRole.Arn
+  AforoMeteringExecutionRoleArn:
+    Condition: MeteringInstall
+    Description: Execution role of the metering Lambda. Aforo finds it by name; nothing to copy.
+    Value: !GetAtt AforoMeteringExecutionRole.Arn

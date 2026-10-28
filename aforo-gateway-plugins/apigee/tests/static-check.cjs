@@ -101,7 +101,7 @@ for (const [name, dir] of Object.entries(BUNDLES)) {
 
     test('message templates are plain {variable} references', () => {
         for (const [file, p] of Object.entries(bundle.policies)) {
-            for (const tag of ['Header', 'Payload', 'URL']) {
+            for (const tag of ['Header', 'Payload', 'URL', 'Source', 'Topic']) {
                 for (const e of sim.descendants(p, tag)) {
                     const t = sim.text(e);
                     const stripped = t.replace(sim.TEMPLATE_VAR, '');
@@ -157,6 +157,67 @@ test('flow hooks: aforo-access is a request-path flow, aforo-metering a response
     assert.ok(/PreProxyFlowHook/.test(sim.text(sim.kid(access.manifest, 'Description'))));
     assert.ok(/PostProxyFlowHook/.test(sim.text(sim.kid(metering.manifest, 'Description'))));
     assert.ok(!Object.values(metering.policies).some((p) => p.name === 'RaiseFault'), 'metering never answers the client');
+});
+
+test('request-side checks live only in aforo-access: no VerifyJWT, VerifyAPIKey or quota call in aforo-metering (G355)', () => {
+    const metering = sim.loadBundle(BUNDLES['aforo-metering']);
+    for (const [file, p] of Object.entries(metering.policies)) {
+        assert.ok(!['VerifyJWT', 'VerifyAPIKey', 'RaiseFault', 'LookupCache'].includes(p.name), `${file}: ${p.name} belongs on the request path`);
+    }
+    for (const src of Object.values(metering.resources)) assert.ok(!/quota\/check|margin/i.test(src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')), 'metering script calls a request-side endpoint');
+    const jwt = sim.loadBundle(BUNDLES['aforo-access']).policies.AforoJwtValidation;
+    assert.strictEqual(jwt && jwt.name, 'VerifyJWT');
+});
+
+test('default delivery never waits: only the sync steps are ServiceCallouts with a <Response> (G355)', () => {
+    const metering = sim.loadBundle(BUNDLES['aforo-metering']);
+    for (const step of metering.steps) {
+        const p = metering.policies[step.name];
+        if (p.name !== 'ServiceCallout' || !sim.kid(p, 'Response')) continue;
+        assert.ok(/private\.aforo\.deliveryMode = "sync"/.test(step.condition), `${step.name} waits for the ingestor outside sync mode`);
+    }
+});
+
+test('pubsub delivery: PublishMessage to KVM pubsub_topic, continueOnError, only in pubsub mode (G358)', () => {
+    const metering = sim.loadBundle(BUNDLES['aforo-metering']);
+    const p = metering.policies.AforoMeteringPublish;
+    assert.strictEqual(p.name, 'PublishMessage');
+    assert.strictEqual(p.attrs.continueOnError, 'true');
+    assert.strictEqual(sim.text(sim.kid(sim.kid(p, 'CloudPubSub'), 'Topic')), '{private.aforo.pubsubTopic}');
+    assert.strictEqual(sim.text(sim.kid(p, 'Source')), '{aforo.eventPayload}');
+    const step = metering.steps.find((s) => s.name === 'AforoMeteringPublish');
+    assert.ok(/private\.aforo\.deliveryMode = "pubsub"/.test(step.condition), step.condition);
+    assert.ok(fs.existsSync(path.join(ROOT, 'pubsub-forwarder', 'src', 'forwarder.js')), 'the forwarder ships with the bundle');
+});
+
+test('JWT revocation: org-service token-status, wired after the tenant check and before the quota check', () => {
+    const access = sim.loadBundle(BUNDLES['aforo-access']);
+    const order = access.steps.map((x) => x.name);
+    const want = ['AforoJwtRejected', 'AforoJwtRevocationPrepare', 'AforoJwtRevocationLookupCache',
+        'AforoJwtRevocationCallDecision', 'AforoJwtRevocationCheck', 'AforoJwtRevocationDecide',
+        'AforoJwtRevocationPopulateCache', 'AforoJwtRevoked', 'AforoJwtRevocationUnavailable', 'AforoQuotaLookupCache'];
+    const at = want.map((n) => order.indexOf(n));
+    assert.ok(at.every((i) => i >= 0), 'all steps present: ' + want.join(', '));
+    assert.deepStrictEqual(at.slice().sort((a, b) => a - b), at, 'order: ' + want.join(' > '));
+    const prep = access.steps.find((x) => x.name === 'AforoJwtRevocationPrepare');
+    assert.ok(/private\.aforo\.jwtValidationEnabled = "true"/.test(prep.condition), 'runs only with jwt_validation_enabled');
+    const c = access.policies.AforoJwtRevocationCheck;
+    assert.strictEqual(sim.text(sim.kid(c, 'Timeout')), '2000');
+    assert.strictEqual(sim.text(sim.descendants(c, 'Verb')[0]), 'GET');
+    const headers = sim.descendants(c, 'Header').map((h) => h.attrs.name + '=' + sim.text(h));
+    assert.deepStrictEqual(headers, ['X-API-Key={private.aforo.apiKey}'], 'X-API-Key only, no tenant header');
+    assert.strictEqual(sim.text(sim.descendants(c, 'URL')[0]), '{aforo.access.revocationUrl}');
+    const js = access.resources['jsc://aforo-jwt-revocation.js'];
+    assert.ok(js.indexOf("'/api/v1/public/gateway/token-status'") !== -1, 'token-status path');
+    for (const p of ['AforoJwtRevocationPrepare', 'AforoJwtRevocationCallDecision', 'AforoJwtRevocationDecide']) {
+        assert.strictEqual(sim.text(sim.descendants(access.policies[p], 'Property')[0]),
+            { AforoJwtRevocationPrepare: 'prepare', AforoJwtRevocationCallDecision: 'call', AforoJwtRevocationDecide: 'decide' }[p], p);
+    }
+    for (const p of ['AforoJwtRevocationLookupCache', 'AforoJwtRevocationPopulateCache']) {
+        assert.strictEqual(sim.text(sim.kid(sim.kid(access.policies[p], 'CacheKey'), 'Prefix')), 'aforo-jti', p);
+    }
+    assert.ok(/token-status/.test(DOCS) && /jti_check_fallback/.test(DOCS), 'README/USER_GUIDE document the revocation check');
+    assert.ok(!/revoked (Aforo )?JWT[^.]*not checked/i.test(DOCS), 'docs no longer say revocation is not checked');
 });
 
 test('the pre-flight quota check waits at most 1500 ms', () => {

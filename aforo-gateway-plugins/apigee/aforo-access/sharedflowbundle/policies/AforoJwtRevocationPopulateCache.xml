@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Stores OK (jti_cache_seconds), REVOKED (until the token's exp, at most
+     24 h) or the breaker state F:n / OPEN (jti_breaker_seconds). -->
+<PopulateCache name="AforoJwtRevocationPopulateCache" continueOnError="true">
+    <DisplayName>Aforo Access - JWT Revocation Cache Store</DisplayName>
+    <CacheKey>
+        <Prefix>aforo-jti</Prefix>
+        <KeyFragment ref="aforo.access.revocationCacheKey"/>
+    </CacheKey>
+    <Scope>Global</Scope>
+    <ExpirySettings>
+        <TimeoutInSeconds ref="aforo.access.revocationTtlSec">30</TimeoutInSeconds>
+    </ExpirySettings>
+    <Source>aforo.access.revocationState</Source>
+</PopulateCache>

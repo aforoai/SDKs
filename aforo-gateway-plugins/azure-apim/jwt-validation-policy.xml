@@ -7,7 +7,7 @@
   aforo-context and aforo-margin-guard (both read the verified claims from
   aforo-jwt-payload).
 
-  Named Values this fragment references. All three must exist:
+  Named Values this fragment references. All four must exist:
     aforo-jwks-uri        — passed to openid-config, which expects an OpenID
                             Connect discovery document
                             (.../.well-known/openid-configuration) whose
@@ -17,6 +17,10 @@
                             trailing slash. Used for the jti revocation
                             check. Up to 2.0.x this was hardcoded to a
                             docker-compose hostname.
+    aforo-tenant-id       — the Aforo tenant this APIM instance serves
+                            (2.3.0). The token's tenant_id claim must equal
+                            it, else 401 TENANT_MISMATCH. A context variable
+                            aforo-tenant-id, when set, is used instead.
 
   Usage:
     <inbound>
@@ -31,14 +35,44 @@
 
   Claims extracted and forwarded as upstream headers:
     X-Customer-Id  — customer_id claim (falls back to sub)
-    X-Tenant-Id    — tenant_id claim
+    X-Tenant-Id    — the configured tenant (aforo-tenant-id), which the
+                     token's tenant_id claim has been checked against
     X-Key-Id       — key_id claim
     X-Scopes       — scopes claim (space-separated or array joined)
     X-Environment  — environment claim ("live" or "sandbox")
 
   On validation failure: returns 401 Unauthorized with a JSON body.
-  The revocation check fails open: a timeout (2 s) or a non-200 lets the
-  request through.
+
+  Tenant binding (2.3.0): every tenant's tokens are signed with the same
+  key, so a valid signature does not say which tenant the token is for.
+  A token whose tenant_id claim is missing or differs from aforo-tenant-id
+  gets 401 {"error":"invalid_token","error_description":"TENANT_MISMATCH"},
+  as Kong does. Before 2.3.0 tenant A's token was accepted on tenant B's
+  APIM, sent upstream with X-Tenant-Id: A and metered with B's key.
+
+  Revocation check (jti / key id), 2.3.0:
+    - GET {aforo-org-service-url}/api/v1/public/gateway/token-status
+      ?jti=&keyId=&clientId= on org-service, which answers
+      {"revoked": true|false, "reason"}. Until 2.3.0 the policy called
+      /internal/v1/auth/token-check, which no service served, so every
+      check failed open.
+    - authenticated with the Aforo API key as X-API-Key: the context
+      variable aforo-api-key when set, else the Named Value aforo-api-key
+      (it must exist; aforo-metering needs it too). The X-Internal-Call
+      header sent up to 2.2.0 proved nothing and is gone.
+    - cached in the APIM cache under "aforo:jti:<tenant>:<jti>:<keyId>" (the
+      checked tenant, aforo-jwt-tenant): "not
+      revoked" for aforo-jti-cache-seconds (default 30, "0" = ask every
+      time), "revoked" until the token expires (at most 24 h). A revocation
+      therefore takes effect within aforo-jti-cache-seconds.
+    - breaker per token: after aforo-jti-breaker-failures unanswered checks
+      in a row (default 3) no call for aforo-jti-breaker-seconds (default 30).
+    - no answer (timeout 2 s, error, non-200, breaker open) lets the request
+      through, as before. Set aforo-jti-check-fallback to "DENY" to answer
+      503 instead (what Kong does since 2.4.0).
+    - aforo-jti-check-enabled "false" switches the check off. A token with
+      neither jti nor key_id is never checked.
+    Consumption tier: without an external Redis cache every request asks.
 -->
 <fragment>
     <!--
@@ -97,6 +131,39 @@
         } catch { return null; }
     }"/>
 
+    <!--
+      Tenant binding: the claim must equal the configured tenant. Checked
+      before any identity header is set and before the revocation call.
+    -->
+    <set-variable name="aforo-jwt-tenant" value="@{
+        var t = context.Variables.ContainsKey("aforo-tenant-id") ? Convert.ToString(context.Variables["aforo-tenant-id"]) : "{{aforo-tenant-id}}";
+        if (t == null) { return ""; }
+        return t.Trim();
+    }" />
+    <set-variable name="aforo-jwt-tenant-match" value="@{
+        var want = Convert.ToString(context.Variables["aforo-jwt-tenant"]);
+        if (want == null || want.Length == 0) { return "false"; }
+        var payload = context.Variables.GetValueOrDefault<object>("aforo-jwt-payload", null) as JObject;
+        if (payload == null) { return "false"; }
+        var got = Convert.ToString(payload["tenant_id"]);
+        if (got == null) { return "false"; }
+        return got == want ? "true" : "false";
+    }" />
+    <choose>
+        <when condition="@(Convert.ToString(context.Variables["aforo-jwt-tenant-match"]) != "true")">
+            <return-response>
+                <set-status code="401" reason="Unauthorized"/>
+                <set-header name="Content-Type" exists-action="override">
+                    <value>application/json</value>
+                </set-header>
+                <set-body>{
+                    "error": "invalid_token",
+                    "error_description": "TENANT_MISMATCH"
+                }</set-body>
+            </return-response>
+        </when>
+    </choose>
+
     <set-header name="X-Customer-Id" exists-action="override">
         <value>@{
             var payload = (Newtonsoft.Json.Linq.JObject)context.Variables["aforo-jwt-payload"];
@@ -108,10 +175,7 @@
     </set-header>
 
     <set-header name="X-Tenant-Id" exists-action="override">
-        <value>@{
-            var payload = (Newtonsoft.Json.Linq.JObject)context.Variables["aforo-jwt-payload"];
-            return payload?["tenant_id"]?.ToString() ?? "";
-        }</value>
+        <value>@(Convert.ToString(context.Variables["aforo-jwt-tenant"]))</value>
     </set-header>
 
     <set-header name="X-Key-Id" exists-action="override">
@@ -150,39 +214,128 @@
         B) Accept the window between token revocation and APIM cache expiry
            (~the validate-jwt cache TTL, typically 5-60 minutes).
 
-      Option A is shown below — comment it out to use Option B.
-      The endpoint is org-service's internal token-check API:
-        GET /internal/v1/auth/token-check?jti={jti}&keyId={keyId}
-        Response: { "revoked": true|false }
+      Option A is shown below; aforo-jti-check-enabled "false" gives Option B.
     -->
-    <send-request mode="new" response-variable-name="aforo-jti-check" timeout="2" ignore-error="true">
-        <set-url>@{
+    <set-variable name="aforo-jti-key" value="@{
+        var on = context.Variables.ContainsKey("aforo-jti-check-enabled") ? Convert.ToString(context.Variables["aforo-jti-check-enabled"]) : "";
+        if (on != null && on.Trim().ToLowerInvariant() == "false") { return ""; }
+        var payload = context.Variables.GetValueOrDefault<object>("aforo-jwt-payload", null) as JObject;
+        if (payload == null) { return ""; }
+        var jti = Convert.ToString(payload["jti"]);
+        var keyId = Convert.ToString(payload["key_id"]);
+        if (jti == null) { jti = ""; }
+        if (keyId == null) { keyId = ""; }
+        if (jti.Length == 0 && keyId.Length == 0) { return ""; }
+        var tenant = Convert.ToString(context.Variables.GetValueOrDefault("aforo-jwt-tenant", ""));
+        if (tenant == null) { tenant = ""; }
+        return "aforo:jti:" + tenant + ":" + jti + ":" + keyId;
+    }" />
+    <set-variable name="aforo-jti-limits" value="@{
+        var names = "aforo-jti-cache-seconds,aforo-jti-breaker-failures,aforo-jti-breaker-seconds".Split(',');
+        var defs = "30,3,30".Split(',');
+        var res = "";
+        var i = 0;
+        foreach (var n in names) {
+            var v = context.Variables.ContainsKey(n) ? Convert.ToString(context.Variables[n]) : "";
+            if (v == null) { v = ""; }
+            v = v.Trim();
+            var ok = i == 0 ? System.Text.RegularExpressions.Regex.IsMatch(v, "^[0-9]{1,5}$") : System.Text.RegularExpressions.Regex.IsMatch(v, "^[1-9][0-9]{0,4}$");
+            res = res + (i == 0 ? "" : ",") + (ok ? v : defs[i]);
+            i = i + 1;
+        }
+        return res;
+    }" />
+    <choose>
+        <when condition="@(Convert.ToString(context.Variables["aforo-jti-key"]).Length > 0)">
+            <cache-lookup-value key="@(Convert.ToString(context.Variables["aforo-jti-key"]))" variable-name="aforo-jti-cached" />
+        </when>
+    </choose>
+    <set-variable name="aforo-jti-call" value="@{
+        if (Convert.ToString(context.Variables["aforo-jti-key"]).Length == 0) { return "false"; }
+        var c = context.Variables.ContainsKey("aforo-jti-cached") ? Convert.ToString(context.Variables["aforo-jti-cached"]) : "";
+        if (c == null || c.Length == 0) { return "true"; }
+        if (!c.StartsWith("F:", StringComparison.Ordinal)) { return "false"; }
+        if (!System.Text.RegularExpressions.Regex.IsMatch(c, "^F:[0-9]{1,5}$")) { return "true"; }
+        var lim = Convert.ToString(context.Variables["aforo-jti-limits"]).Split(',');
+        return Convert.ToInt32(c.Substring(2)) < Convert.ToInt32(lim[1]) ? "true" : "false";
+    }" />
+    <!--
+      GET {aforo-org-service-url}/api/v1/public/gateway/token-status?jti=&keyId=&clientId=
+      Response: { "revoked": true|false }, bare or inside { success, data }.
+    -->
+    <choose>
+        <when condition="@(Convert.ToString(context.Variables["aforo-jti-call"]) == "true")">
+            <send-request mode="new" response-variable-name="aforo-jti-check" timeout="2" ignore-error="true">
+                <set-url>@{
+                    var payload = (Newtonsoft.Json.Linq.JObject)context.Variables["aforo-jwt-payload"];
+                    var jti   = payload?["jti"]?.ToString()    ?? "";
+                    var keyId = payload?["key_id"]?.ToString() ?? "";
+                    var clientId = payload?["client_id"]?.ToString() ?? "";
+                    return string.Format(
+                        "{{aforo-org-service-url}}/api/v1/public/gateway/token-status?jti={0}&keyId={1}&clientId={2}",
+                        Uri.EscapeDataString(jti),
+                        Uri.EscapeDataString(keyId),
+                        Uri.EscapeDataString(clientId));
+                }</set-url>
+                <set-method>GET</set-method>
+                <set-header name="X-API-Key" exists-action="override">
+                    <value>@(context.Variables.ContainsKey("aforo-api-key") ? Convert.ToString(context.Variables["aforo-api-key"]) : "{{aforo-api-key}}")</value>
+                </set-header>
+            </send-request>
+        </when>
+    </choose>
+    <set-variable name="aforo-jti-answer" value="@{
+        if (Convert.ToString(context.Variables["aforo-jti-call"]) != "true") { return ""; }
+        try {
+            var response = context.Variables.ContainsKey("aforo-jti-check") ? (IResponse)context.Variables["aforo-jti-check"] : null;
+            if (response == null || response.StatusCode != 200) { return "UNAVAILABLE"; }
+            var body = Newtonsoft.Json.Linq.JObject.Parse(response.Body.As<string>());
+            var data = body["data"] ?? body;
+            var revoked = data["revoked"];
+            if (revoked == null || revoked.Type != JTokenType.Boolean) { return "UNAVAILABLE"; }
+            if (!(bool)revoked) { return "OK"; }
             var payload = (Newtonsoft.Json.Linq.JObject)context.Variables["aforo-jwt-payload"];
-            var jti   = payload?["jti"]?.ToString()    ?? "";
-            var keyId = payload?["key_id"]?.ToString() ?? "";
-            return string.Format(
-                "{{aforo-org-service-url}}/internal/v1/auth/token-check?jti={0}&keyId={1}",
-                Uri.EscapeDataString(jti),
-                Uri.EscapeDataString(keyId));
-        }</set-url>
-        <set-method>GET</set-method>
-        <set-header name="X-Internal-Call" exists-action="override">
-            <value>apim</value>
-        </set-header>
-    </send-request>
+            var exp = payload["exp"];
+            long ttl = 3600;
+            if (exp != null && exp.Type == JTokenType.Integer) { ttl = (long)exp - DateTimeOffset.UtcNow.ToUnixTimeSeconds(); }
+            if (ttl < 1) { ttl = 1; }
+            if (ttl > 86400) { ttl = 86400; }
+            return "REVOKED|" + ttl;
+        } catch { return "UNAVAILABLE"; }
+    }" />
+    <set-variable name="aforo-jti-state" value="@{
+        if (Convert.ToString(context.Variables["aforo-jti-call"]) != "true") { return ""; }
+        var a = Convert.ToString(context.Variables["aforo-jti-answer"]);
+        var lim = Convert.ToString(context.Variables["aforo-jti-limits"]).Split(',');
+        if (a == "OK") { return lim[0] == "0" ? "" : "OK|" + lim[0]; }
+        if (a.StartsWith("REVOKED|", StringComparison.Ordinal)) { return a; }
+        var c = context.Variables.ContainsKey("aforo-jti-cached") ? Convert.ToString(context.Variables["aforo-jti-cached"]) : "";
+        if (c == null) { c = ""; }
+        var n = 1;
+        if (System.Text.RegularExpressions.Regex.IsMatch(c, "^F:[0-9]{1,5}$")) { n = Convert.ToInt32(c.Substring(2)) + 1; }
+        return (n >= Convert.ToInt32(lim[1]) ? "OPEN" : "F:" + n) + "|" + lim[2];
+    }" />
+    <choose>
+        <when condition="@(Convert.ToString(context.Variables["aforo-jti-state"]).Length > 0)">
+            <cache-store-value key="@(Convert.ToString(context.Variables["aforo-jti-key"]))" value="@{ var s = Convert.ToString(context.Variables["aforo-jti-state"]); return s.Substring(0, s.LastIndexOf("|")); }" duration="@{ var s = Convert.ToString(context.Variables["aforo-jti-state"]); return Convert.ToInt32(s.Substring(s.LastIndexOf("|") + 1)); }" />
+        </when>
+    </choose>
+    <set-variable name="aforo-jti-verdict" value="@{
+        var deny = context.Variables.ContainsKey("aforo-jti-check-fallback") ? Convert.ToString(context.Variables["aforo-jti-check-fallback"]) : "";
+        var unavailable = deny != null && deny.Trim().ToUpperInvariant() == "DENY" ? "unavailable" : "ok";
+        var a = Convert.ToString(context.Variables["aforo-jti-answer"]);
+        if (Convert.ToString(context.Variables["aforo-jti-call"]) == "true") {
+            if (a == "OK") { return "ok"; }
+            return a.StartsWith("REVOKED|", StringComparison.Ordinal) ? "revoked" : unavailable;
+        }
+        var c = context.Variables.ContainsKey("aforo-jti-cached") ? Convert.ToString(context.Variables["aforo-jti-cached"]) : "";
+        if (c == null || c.Length == 0 || c == "OK") { return "ok"; }
+        if (c == "REVOKED") { return "revoked"; }
+        return unavailable;
+    }" />
 
     <choose>
-        <when condition="@{
-            var response = (IResponse)context.Variables.GetValueOrDefault(
-                               "aforo-jti-check", null);
-            if (response == null) return false;  /* fail-open on timeout/error */
-            if (response.StatusCode != 200) return false;
-            try {
-                var body = Newtonsoft.Json.Linq.JObject.Parse(
-                               response.Body.As<string>());
-                return body["revoked"]?.ToObject<bool>() == true;
-            } catch { return false; }
-        }">
+        <when condition="@(Convert.ToString(context.Variables["aforo-jti-verdict"]) == "revoked")">
             <return-response>
                 <set-status code="401" reason="Unauthorized"/>
                 <set-header name="Content-Type" exists-action="override">
@@ -191,6 +344,21 @@
                 <set-body>{
                     "error": "invalid_token",
                     "error_description": "Token has been revoked"
+                }</set-body>
+            </return-response>
+        </when>
+        <when condition="@(Convert.ToString(context.Variables["aforo-jti-verdict"]) == "unavailable")">
+            <return-response>
+                <set-status code="503" reason="Service Unavailable"/>
+                <set-header name="Content-Type" exists-action="override">
+                    <value>application/json</value>
+                </set-header>
+                <set-header name="Retry-After" exists-action="override">
+                    <value>5</value>
+                </set-header>
+                <set-body>{
+                    "error": "temporarily_unavailable",
+                    "error_description": "REVOCATION_CHECK_UNAVAILABLE"
                 }</set-body>
             </return-response>
         </when>

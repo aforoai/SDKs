@@ -5,7 +5,9 @@
 -- Nothing here runs on the request path except the push and the scheduling
 -- checks next to it.
 --
--- Shared memory: the aforo_buffer dict (lua_shared_dict aforo_buffer 10m).
+-- Shared memory: the aforo_buffer dict (lua_shared_dict aforo_buffer 10m)
+-- holds events and delivery state only. Warning throttles and drop counters
+-- go to aforo_cache (event-util.cache_dict(), 2.8.0).
 -- One buffer per destination: aforo_endpoint + tenant_id + api_key (hashed).
 -- A buffer is only ever delivered with its own endpoint, tenant and key, and
 -- events never move between buffers -- not when a plugin's settings change
@@ -135,8 +137,9 @@ local MAX_DESTINATIONS = 512
 -- every other per-event error is a judgement on the event itself.
 local TRANSIENT_EVENT_ERROR = "The event could not be stored"
 
+-- Throttle keys are a cache, not buffer state: aforo_cache (2.8.0, G323).
 local function log_throttled(level, key, ttl, ...)
-    local dict = ngx.shared[BUFFER_DICT]
+    local dict = event_util.cache_dict()
     if dict and not dict:safe_add("aforo:warn:" .. key, 1, ttl) then return end
     kong.log[level](...)
 end

@@ -4,13 +4,42 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [Unreleased]
 
-## [3.0.2] — 2026-10-27
+## [3.1.2] — 2026-10-28
 
-First run on a live Anypoint org (trial, CloudHub 2.0, Mule 4.13.1, proxy 2.1.2). 3.0.0 answered every call that carried a key with 503 `Access check unavailable`. 3.0.2 was verified there end to end against production Aforo for all four product types: key check (401 unknown key, 403 other product), metering (API Calls, Tokens Consumed from `X-Aforo-Quantity`, KYC Verifications, one Ledger Query per `tools/call` with tool name and MCP session), 429 at each hard limit, and 403 within 20 s of a subscription being cancelled. (3.0.1, with only the first fix, was published to that test org and never released.)
+Fixes from the second wave 6 review. Configuration properties unchanged. Not yet verified on a live Anypoint org.
 
 ### Fixed
-- **Every call to Aforo failed inside the runtime.** The four `http:request`s (introspection, quota check, the two ingest flushes) stored the answer with `targetValue="#[{status: ..., text: ...}]"` next to `outputMimeType="text/plain"`. Mule cannot pick an output type for that expression ("Unable to infer a output media type as more than one is being used: application/java,text/plain"), the error handler recorded status 0, and the policy treated it as Aforo not answering: 503 on identity, fail-open on quota, events dropped. Each `targetValue` now says `output application/java ---`. The DataWeave CLI tests run the scripts, not the connector attributes, so they never saw it; `policy.test.cjs` now checks every `targetValue` names its output type.
-- **MCP calls were never metered.** Reading the JSON-RPC request body for `tools/call` detection failed the same way, and its error handler swallowed it silently, so every MCP_SERVER call was billed as "nothing billable". The expression now names its output type, and a failure to read the body is logged at WARN (the call is then unmetered).
+- **MCP detection fails open again.** The 3.1.1 `mcp-body` transform sat only inside the access-check `try`, whose handler answers 503 (this policy is the API's authentication and fails closed there). A DataWeave error in that transform therefore refused the call. The MCP detection (the `mcp-body` script, the body read and the warning below) now has its own `try` with `on-error-continue`: an error is logged at WARN and the call is metered as a normal request.
+- **"MCP request body not read" is throttled.** A client that always sends chunked `tools/call` bodies logged that WARN on every call. It now logs at WARN at most once a minute per reason, using the same per-kind throttle as the other warnings (the `aforo-state` object store), and at DEBUG in between.
+- Tests: five structure checks (the `try`, its handler, the throttle); `policy.test.cjs` 224/224, DataWeave 190/190.
+
+## [3.1.1] — 2026-10-28
+
+### Fixed
+- The MCP request body was read whenever `Content-Length` was absent (the guard defaulted it to 0), so a chunked `tools/call` request was read whole into memory however large. The body is now read only when the request declares its length (`Content-Length`, no `Transfer-Encoding`) and that length is at most 1 MiB; otherwise the call is metered as a normal request and a WARN names the reason. A non-numeric `Content-Length` is treated the same way (it used to fail the read and log a generic error). New DataWeave script `mcp-body` with 10 fixture cases; structure checks that the body is read in one place, behind that decision.
+
+## [3.1.0] — 2026-10-28
+
+Wave 6 (W6.5: G359, G361, G362). Configuration properties unchanged; see "Upgrading from 3.0.0" in the user guide. Includes the 3.0.2 fixes below. Not yet verified on a live Anypoint org.
+
+### Changed
+- **Delivery retries follow the transport spec** (`aforo-metering-sdks/contract/TRANSPORT-SPEC.md`): full-jitter backoff between attempts (base 500 ms, cap 30 s: a random 0–1 s before attempt 2, 0–2 s before attempt 3) instead of a fixed 2 s; the ingestor's `Retry-After` (delta-seconds, fractional allowed, or an HTTP date; unreadable values ignored) is used when longer, at most 60 s. The wait is an `until-successful` whose `millisBetweenRetries` the delivery script sets, so it runs on the runtime's scheduler and holds no thread. Attempts run in a `foreach` of 3.
+- Per-event `retryable` from the ingestor decides what is re-sent; the "The event could not be stored" message prefix is only the fallback when the flag is absent.
+- Whole-batch retry on no answer, 408, 429 and every 5xx, as the transport spec says; any other status is logged and dropped.
+- A connection error or timeout on the ingest call is caught on that call (`HTTP:CONNECTIVITY`, `HTTP:TIMEOUT`) and retried like a 5xx, with the cause in the log; any other error ends the delivery at once.
+- Log line `USAGE NOT DELIVERED after 3 attempts` is now `USAGE NOT DELIVERED (<reason>)`.
+
+### Documentation
+- README "Not part of this policy": JWT validation is not an Aforo MuleSoft feature (use MuleSoft's JWT Validation policy); compound metering and margin guard are not supported on MuleSoft. The installed policy calls no margin-guard or token-revocation endpoint.
+- README "Delivery": one delivery per API call (a custom policy has no timer to batch calls); the per-call object store entry is in-memory retry state and the backlog count, not a durable queue; 401/403 from the ingestor lose usage; no 413 split.
+
+## [3.0.2] — 2026-10-27
+
+Released from the SDKs repo (aforoai/SDKs#68, commit `62165dd`) after the first live Anypoint run (CloudHub 2.0, Mule 4.13.1); organization-service bundles it. 3.1.0 includes these fixes.
+
+### Fixed
+- **Every call to Aforo failed inside the runtime.** The four `http:request`s (introspection, quota check, the two ingest flushes) stored the answer with `targetValue="#[{...}]"` next to `outputMimeType="text/plain"`; Mule could not pick an output type, the error handler recorded status 0, and the policy answered 503 on identity, failed open on quota and dropped events. Each `targetValue` now starts `output application/java ---`, and `policy.test.cjs` checks it.
+- **MCP calls were never metered.** Reading the `tools/call` request body failed the same way and was swallowed. The expression names its output type, and a failed read is logged at WARN.
 
 ## [3.0.0] — 2026-10-22
 

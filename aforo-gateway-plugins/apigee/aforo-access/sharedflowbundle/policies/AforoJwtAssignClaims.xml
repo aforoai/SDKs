@@ -18,6 +18,19 @@
         <Name>aforo.jwt.key_id</Name>
         <Ref>jwt.AforoJwtValidation.decoded.claim.key_id</Ref>
     </AssignVariable>
+    <!-- For the revocation check only; not forwarded upstream. -->
+    <AssignVariable>
+        <Name>aforo.jwt.jti</Name>
+        <Ref>jwt.AforoJwtValidation.decoded.claim.jti</Ref>
+    </AssignVariable>
+    <AssignVariable>
+        <Name>aforo.jwt.client_id</Name>
+        <Ref>jwt.AforoJwtValidation.decoded.claim.client_id</Ref>
+    </AssignVariable>
+    <AssignVariable>
+        <Name>aforo.jwt.exp</Name>
+        <Ref>jwt.AforoJwtValidation.decoded.claim.exp</Ref>
+    </AssignVariable>
     <AssignVariable>
         <Name>aforo.jwt.scopes</Name>
         <Ref>jwt.AforoJwtValidation.decoded.claim.scopes</Ref>

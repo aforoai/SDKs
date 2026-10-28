@@ -414,11 +414,36 @@ describe("aforo-metering handler", function()
                             if redis_state.connect_err then return nil, redis_state.connect_err end
                             return true
                         end,
-                        get = function(_, key)
+                        init_pipeline = function(self) self._p = {} end,
+                        cancel_pipeline = function(self) self._p = nil end,
+                        commit_pipeline = function(self)
+                            local p = self._p or {}
+                            self._p = nil
+                            if redis_state.get_err then return nil, redis_state.get_err end
+                            local out = {}
+                            for i, key in ipairs(p) do
+                                out[i] = redis_state.revoked[key] and "1" or ngx.null
+                            end
+                            return out
+                        end,
+                        get = function(self, key)
+                            if self._p then table.insert(self._p, key); return end
                             if redis_state.get_err then return nil, redis_state.get_err end
                             if redis_state.revoked[key] then return "1" end
                             return ngx.null
                         end,
+                        mget = function(_, ...)
+                            if redis_state.get_err then return nil, redis_state.get_err end
+                            if select("#", ...) > 1 then
+                                return nil, "CROSSSLOT Keys in request don't hash to the same slot"
+                            end
+                            local out = {}
+                            for i, key in ipairs({ ... }) do
+                                out[i] = redis_state.revoked[key] and "1" or ngx.null
+                            end
+                            return out
+                        end,
+                        close = function() return true end,
                         set_keepalive = function() return true end,
                     }
                 end,
@@ -1055,7 +1080,7 @@ describe("aforo-metering handler", function()
             assert.equals(503, mock_kong.response._exit.status)
         end)
 
-        it("caches ALLOW per tenant/customer/metric but never DENY", function()
+        it("caches ALLOW per tenant/customer/metric, and DENY until its Retry-After (2.8.0)", function()
             with_customer("cust_a")
             http_mock.responses = { { status = 200, body = '{"decision":"ALLOW"}' } }
             access(conf())
@@ -1069,7 +1094,9 @@ describe("aforo-metering handler", function()
             }
             access(conf())
             access(conf())
-            assert.equals(3, #http_mock.requests)
+            -- The second DENY comes from the cache (G333; before 2.8.0 it asked again).
+            assert.equals(2, #http_mock.requests)
+            assert.equals(429, mock_kong.response._exit.status)
         end)
 
         it("skips the check when no verified customer is known", function()
@@ -1605,7 +1632,7 @@ describe("iso8601_utc (occurredAt wire format)", function()
         assert.equals("2026-09-30T16:15:10.000Z", handler._iso8601_utc(1790784909.9996))
     end)
     it("no event sends a numeric occurredAt", function()
-        for _, file in ipairs({ "handler.lua", "compound-metering.lua" }) do
+        for _, file in ipairs({ "handler.lua" }) do
             local f = io.open("../" .. file, "rb") or io.open(file, "rb")
             assert.is_not_nil(f, file .. " must be readable")
             local src = f:read("*all")

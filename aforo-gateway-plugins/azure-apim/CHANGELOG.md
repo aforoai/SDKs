@@ -4,6 +4,66 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [Unreleased]
 
+## [2.3.2] - 2026-10-28
+
+Fixes from the second wave 6 review. Not run on a live APIM instance or Azure subscription. Redeploy the Event Hub forwarder; the policy files are unchanged except for the version.
+
+### Fixed
+- **Event Hub forwarder, compound results with `duplicates` and `failed`**: a result with `duplicates` > 0 counted as delivered even when `failed` > 0, so a measurement the ingestor refused for good was neither stored nor logged. Delivered now needs `failed` 0. A result with `failed` > 0 that is not retryable is a rejection (logged with its key and counted), also when `success` is true and part of the event was stored. A result with `retryable: true` is still resent whatever `success` says (usage-ingestor answers `success: true, retryable: true` for an event it stored only part of). Seven new assertions and one flow test; `npm test` 28/28.
+
+## [2.3.1] - 2026-10-28
+
+Fixes from the wave 6 review. Not run on a live APIM instance or Azure subscription.
+
+### Fixed
+- **Event Hub forwarder, compound events**: every compound result with `success: false` was dropped and the checkpoint moved past it, including the ones the ingestor returns for a full queue (`Server busy, retry the batch`) and the batch deadline (`Processing timeout`). Those events were lost. The forwarder now resends a result marked `retryable: true`, or, from an ingestor that does not send that field yet, one with either of those two errors, with the same `correlationId` and within the same retry budget as usage events (`AFORO_MAX_RETRIES`, the invocation budget). Still not stored after the retries, the invocation fails and the checkpoint stays. A redelivered event whose measurements were all stored before (`accepted` 0, `duplicates` > 0) counts as delivered instead of "dropped". Four new tests.
+- **Compound metering in Event Hub mode** sent nothing unless `aforo-ingestor-url` was set, although only the forwarder posts in that mode. The gate is now the context variable `aforo-compound-deliverable`: true in `eventhub` mode, otherwise true when `aforo-ingestor-url` is set.
+- **Cache keys**: the subscription-map key was `aforo:cust:<version>:<map length>:<subscription id>`, so an edit of the map that kept its length served the old customer until the TTL ran out, and two APIM instances sharing an external cache could read each other's entry for the same subscription name. It is now `aforo:cust:<tenant>:<version>:<map hash>:<subscription id>` (tenant from the context variable `aforo-tenant-id`, else the tenant `aforo-jwt-validation` checked, else `-`; map hash = first 22 base64 characters of its SHA-256). The revocation key `aforo:jti:<jti>:<keyId>` is now `aforo:jti:<tenant>:<jti>:<keyId>`. Existing entries are no longer read and expire on their own. `aforo-context` still references only its five Named Values.
+- **Margin guard checks the customer that is billed**: it read `aforo-customer-id`, else the JWT's `customer_id`, else the JWT's `sub`, else the subscription id, with no length cap, while `aforo-metering` bills `aforo-customer-id`, else the subscription id, capped at 64 characters. It now uses exactly the metering rule (same source order, trim, 64-character cap). To check and bill the JWT's `customer_id`, include `aforo-context`. Behaviour change for installs that used `aforo-jwt-validation` without `aforo-context`: margin guard now checks the subscription id, which is what those installs bill.
+- **Margin guard breaker**: every non-200 answer counted as a breaker failure, so a 4xx for one request (for example pricing's 400 for an id it refuses) could open the breaker and switch the check off for every customer of the key. A 4xx other than 408 / 429 is now allowed, traced and resets the failure count; only no answer, a timeout, 408, 429 and 5xx count.
+
+### Docs
+- `eventhub-forwarder/README.md`: a first deployment of `deploy/aforo-eventhub-forwarder.json` can fail on the APIM logger while the new Data Sender role assignment takes effect; running the same deployment again fixes it. The template is unchanged (`dependsOn` already orders them; no sleep or deployment script is added).
+
+## [2.3.0] - 2026-10-27
+
+Wave 6 W6.3 (gaps G348, G350, G351, G352, G353; G354 is in `azure-arm-templates` 2.0.0). Nothing here has run on a live APIM instance or Azure subscription; the checks are `node azure-apim/tests/policy.test.cjs`, `node azure-arm-templates/tests/deny-policy.test.cjs` and `npm test` in `eventhub-forwarder/` (against the mock ingestor).
+
+### Added
+
+- **Event Hub delivery (G348).** New fragment `aforo-metering-eventhub` (`eventhub-delivery-policy-fragment.xml`) and the forwarder Function `eventhub-forwarder/` with an ARM template (`eventhub-forwarder/deploy/aforo-eventhub-forwarder.json`: Event Hubs namespace + hub + consumer group, the APIM logger `aforo-metering-logger` on the instance's managed identity, the Function on its own identity, both role assignments). Opt-in with the context variable `aforo-delivery-mode` = `eventhub`. The forwarder follows the SDK transport rules (batches of 500 / 4 MiB, full-jitter retries, `Retry-After`, 413 split, 401/403/3xx as an outage, per-event `retryable`) and throws on an outage so the Functions retry policy re-runs the batch without moving the checkpoint.
+- **Cache and breaker** on the revocation check, the pre-flight quota check and the margin guard (G351), and on the `aforo-context` subscription-map lookup (G353). See the README, "Caching and breakers".
+- `aforo-jti-check-fallback` (`ALLOW` default, `DENY` = 503 `REVOCATION_CHECK_UNAVAILABLE`), `aforo-jti-check-enabled`.
+- `aforo-compound-max-body-bytes` (default 1 MiB).
+
+### Changed
+
+- **`aforo-metering` builds the event into `aforo-event-batch` and sends it with ONE `send-one-way-request`** after the gate (was one send per branch). Body, headers, keys and Named Values are unchanged; the direct send is still the default. `org-service` bundles this file (one-click deploy) and needs the new copy (see Upgrade).
+- **Revocation and margin-guard calls carry the Aforo API key as `X-API-Key` (G350).** The revocation call no longer sends `X-Internal-Call: apim`, which any client could send and proved nothing. Both now reference the Named Value `aforo-api-key` (or the context variable of that name), so `aforo-jwt-validation` and `aforo-margin-guard` refuse to save on an instance that does not have it.
+- **Revocation and margin guard call public, key-authenticated endpoints (G332).** Revocation: org-service `GET /api/v1/public/gateway/token-status?jti=&keyId=&clientId=` (was `/internal/v1/auth/token-check`, which no service served, so every check failed open); the token's `client_id` claim is sent too. Margin guard: pricing `GET /api/v1/margin-guard/quick-check?scopeType=CUSTOMER&scopeId=` (was `/internal/v1/margin-guard/quick-check`, refused by public hosts); no tenant id or `X-Tenant-Id` is sent, pricing takes the tenant from the key. Needs org-service branch `jayaforo/w6.7-gateway-token-status` and pricing branch `jayaforo/w6.7-public-margin-check`.
+- **Margin guard reads `verdict`** (`ALLOW` / `WARN` / `THROTTLE` / `BLOCK`, bare or inside `data`). It read `allowed` / `level` / `throttleRate`, which pricing never sent, so nothing was ever blocked. `THROTTLE` is pricing's per-request decision: always a 429 (`Retry-After: 1`), never cached, no local dice. Only `BLOCK` and an `ALLOW` with no active level are cached; `BLOCK`'s `Retry-After` is the cache window. `WARN` sets `X-Margin-Guard-Warning: margin-low` on the backend request.
+- Pre-flight DENY answers carry the ingestor's `retryAfterMs` as `Retry-After` (was always 60). A DENY is kept at most 60 s (a wallet top-up must unblock quickly) and 5 s when the answer has no `retryAfterMs`, as Kong 2.8.0.
+- **`aforo-jwt-validation` binds the token to the tenant.** organization-service signs every tenant's tokens with one key, so a valid signature did not stop tenant A's token on tenant B's APIM: it was forwarded with `X-Tenant-Id: A` and metered with B's key for A's customer. The token's `tenant_id` claim must now equal `aforo-tenant-id` (Named Value, or the context variable of that name), else 401 `TENANT_MISMATCH` (as Kong). The `X-Tenant-Id` sent upstream is always the configured tenant. Checked before identity headers are set and before the revocation call.
+- **Pre-flight and margin-guard cache keys are scoped to the API key**: `aforo:pf:<scope>:<customer>` and `mg:<scope>:<customer>`, `<scope>` = first 22 characters of the base64 SHA-256 of `aforo-api-key`. The pre-flight key had no tenant scope; the margin-guard key used the JWT's `tenant_id` while pricing answers for the key's tenant. `aforo-margin-guard` no longer reads `aforo-tenant-id` or the JWT tenant, and no longer skips when no tenant resolves.
+- `eventhub-forwarder` reads the ingestor's answer up to 256 KiB and stops there (it buffered the whole body). A 2xx answer over the cap is retried with the same keys instead of being counted as accepted.
+- Revocation: an answer without a boolean `revoked` (bare or inside `{success, data}`) counts as no answer. A token with neither `jti` nor `key_id` is not checked.
+- **`aforo-compound-metering` never reads a streaming response (G352)**: `text/event-stream`, `*ndjson*` / `*stream*` types, chunked non-JSON without a `Content-Length`, or bodies over the cap. It writes a trace instead. `llm-emit-token-metric` was not used: it writes to Azure Monitor, not to Aforo. The compound `correlationId` is still the request id (Rule #21).
+- The compound event is built into `aforo-compound-event`; with Event Hub delivery it is written by `aforo-metering-eventhub` instead of sent.
+
+### Known limits (server side, not fixed here)
+
+- The revocation endpoint `GET /internal/v1/auth/token-check` does not exist in organization-service, so the check never gets an answer and fails open (now cheaply, behind the breaker). `X-API-Key` is sent so that the endpoint, when it is built on a public path behind the API-key filter, can authenticate the caller.
+- `GET /internal/v1/margin-guard/quick-check` (pricing-service) is an internal path: public hosts refuse `/internal/**`, and inside the cluster it checks `X-Internal-Api-Key` (when RBAC is on), not `X-API-Key`. It also takes the tenant from a query parameter. A customer APIM cannot reach it today.
+
+### Upgrade
+
+1. Re-import every fragment you use (format `rawxml`).
+2. `aforo-jwt-validation` and `aforo-margin-guard` now need the Named Value `aforo-api-key`. An install that runs `aforo-metering` already has it.
+   `aforo-jwt-validation` also needs the Named Value `aforo-tenant-id` (your Aforo tenant id) unless you set the context variable of that name before the include. APIM refuses to save the fragment without it, and every token whose `tenant_id` is not that tenant now gets 401 `TENANT_MISMATCH`.
+3. Consumption tier: add an external Redis cache to get the caching; without one, behaviour is as in 2.2.0 (every request calls).
+4. Event Hub delivery (optional): deploy `eventhub-forwarder/deploy/aforo-eventhub-forwarder.json`, zip-deploy `eventhub-forwarder/`, import `eventhub-delivery-policy-fragment.xml` as `aforo-metering-eventhub`, set `aforo-delivery-mode` = `eventhub` and include the fragment. Steps: `eventhub-forwarder/README.md`.
+5. Behaviour you may notice: a revocation now takes up to 30 s (`aforo-jti-cache-seconds`) to apply on a token that was checked just before; a pre-flight ALLOW is reused for 5 s and a DENY for at most 60 s.
+
 ## [2.2.0] - 2026-10-02
 
 Merges the working repository's line (APIM-valid `rawxml` fragments, `executionStatus`, exclusions, frozen keys, AGENTIC_API detection, `tests/`, `scripts/verify-on-apim.sh`) with public release 2.1.0 (verified identity, metric mappings, `productType`, OPTIONS skip, JWT fixes). Mirror work by Gowtham and Eswar. Nothing here has run on a live APIM instance; `node azure-apim/tests/policy.test.cjs` and `scripts/verify-on-apim.sh` are the checks.

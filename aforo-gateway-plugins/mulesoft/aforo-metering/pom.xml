@@ -5,7 +5,7 @@
   api-gateway-custom-policy-archetype.
 
   Build:    mvn clean package
-            -> target/aforo-metering-3.0.2-mule-policy.jar
+            -> target/aforo-metering-3.1.2-mule-policy.jar
             Everything resolves from MuleSoft's public repository
             (repository.mulesoft.org) and Maven Central: no Anypoint or
             Nexus EE credentials. Dependency versions are pinned, so two
@@ -29,7 +29,7 @@
 
     <groupId>${anypoint.org.id}</groupId>
     <artifactId>aforo-metering</artifactId>
-    <version>3.0.2</version>
+    <version>3.1.2</version>
     <!-- Same number as ../VERSION; tests/policy.test.cjs fails when they differ. -->
 
     <name>Aforo Usage Metering</name>

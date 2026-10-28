@@ -13,8 +13,13 @@
 #   docker run -d --name kong --network=kong-net \
 #     -e KONG_DATABASE=postgres -e KONG_PG_HOST=kong-database \
 #     -e KONG_PG_USER=kong -e KONG_PG_PASSWORD=kong \
-#     -e KONG_ADMIN_LISTEN=0.0.0.0:8001 \
-#     -p 8000:8000 -p 8001:8001 kong-aforo:3.4
+#     -e KONG_ADMIN_LISTEN=127.0.0.1:8001 \
+#     -p 8000:8000 kong-aforo:3.4
+#
+# The Admin API stays on the container's loopback: it has no authentication,
+# and anyone who reaches it can reconfigure the gateway. Use it with
+# `docker exec kong curl -s localhost:8001/...`, or publish it to the host's
+# loopback only (-e KONG_ADMIN_LISTEN=0.0.0.0:8001 -p 127.0.0.1:8001:8001).
 #
 # Other Kong versions: pass the base image. Kong ships no open-source image
 # after 3.9; the Kong Gateway (Enterprise) image runs without a license in free
@@ -45,17 +50,21 @@ USER root
 # rockspec passed as a path.
 COPY . /tmp/aforo-plugin/
 RUN cd /tmp/aforo-plugin \
-    && luarocks make kong-plugin-aforo-metering-2.6.0-1.rockspec \
+    && luarocks make kong-plugin-aforo-metering-2.8.2-1.rockspec \
     && rm -rf /tmp/aforo-plugin
 
 USER kong
 
 ENV KONG_PLUGINS=bundled,aforo-metering
 
-# handler.lua buffers events in ngx.shared.aforo_buffer. Without this dict the
-# plugin loads and proxies traffic but silently meters nothing -- every log-phase
-# call bails out with "Shared dict 'aforo_buffer' not found".
-ENV KONG_NGINX_HTTP_LUA_SHARED_DICT="aforo_buffer 10m"
+# Two shared dicts. aforo_buffer holds the buffered events; without it the
+# plugin loads and proxies traffic but meters nothing ("Shared dict
+# 'aforo_buffer' not found"). aforo_cache (2.8.0) holds the caches, warning
+# throttles and counters, so they never take room from events; without it they
+# fall back to aforo_buffer and each worker logs one error.
+# Kong injects the value after `lua_shared_dict `, so the second dict is a
+# second directive in the same value.
+ENV KONG_NGINX_HTTP_LUA_SHARED_DICT="aforo_buffer 10m; lua_shared_dict aforo_cache 5m"
 
 # Required for an https aforo_endpoint -- i.e. every production deployment.
 #

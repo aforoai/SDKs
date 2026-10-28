@@ -6,6 +6,43 @@ This bundle ships on the Aforo gateway-plugins line; the whole repo is versioned
 
 ## [Unreleased]
 
+## [3.1.2] — 2026-10-28
+
+Fixes from the second wave 6 review. Redeploy `aforo-access`; no KVM change. Not yet verified on a live Apigee org.
+
+### Fixed
+- **Revocation breaker with `jti_cache_seconds` = 0.** An answer stored nothing in that case, so an earlier failure count (`F:n`) stayed in the cache and failures with answers in between still added up to `jti_breaker_failures` and opened the breaker. An answer now rewrites a failure count as `F:0` (kept for `jti_breaker_seconds`), as the Azure margin guard does. With caching on, the `OK` entry already replaced it.
+- Tests: two flow tests (one fails on 3.1.1); flow tests 74/74.
+
+## [3.1.1] — 2026-10-28
+
+Redeploy `aforo-access`. With `jwt_validation_enabled`, add the KVM key `aforo_org_service_url` (see "Upgrading from 3.1.0" in the user guide). Not yet verified on a live Apigee org.
+
+### Added
+- **JWT revocation check** (G356; same contract as the Azure APIM fragment `aforo-jwt-validation`): with `jwt_validation_enabled`, `aforo-access` asks organization-service `GET {aforo_org_service_url}/api/v1/public/gateway/token-status?jti=&keyId=&clientId=` with `X-API-Key`, 2 s timeout, for a token carrying `jti` or `key_id` that passed the tenant check. Revoked: 401 `invalid_token` / `Token has been revoked`, not metered. Cached in the environment cache under `aforo-jti` + `tenant|jti|keyId`: not revoked for `jti_cache_seconds` (30), revoked until `exp` (at most 24 h). Breaker per tenant and token: `jti_breaker_failures` (3) unanswered checks, then no call for `jti_breaker_seconds` (30). No answer lets the call through unless `jti_check_fallback = DENY` (503, `Retry-After: 5`). On by default with JWT validation, as on Azure; `jti_check_enabled = false` turns it off. New policies `AforoJwtRevocation{Prepare,LookupCache,CallDecision,Check,Decide,PopulateCache,Unavailable}` and `AforoJwtRevoked`, script `aforo-jwt-revocation.js`; `AforoJwtAssignClaims` also copies `jti`, `client_id` and `exp` (not forwarded upstream). Nine flow tests; the static check that said revocation is not claimed now checks the wiring instead. Needs an organization-service that serves `/api/v1/public/gateway/token-status`.
+
+### Fixed
+- `pubsub-forwarder` runs on Node 22 (`node:22.23.4-slim`, `engines` `>=22`). `@google-cloud/pubsub` 6.2.0 and its dependencies require Node 22; the 3.1.0 image used Node 20.18.1.
+
+## [3.1.0] — 2026-10-28
+
+Wave 6 W6.4 (G355, G356, G357, G358). No breaking change: redeploy both bundles; the flow hooks stay as they are.
+
+### Added
+- **`delivery_mode = pubsub`** (Apigee X / hybrid, opt-in; G358): `AforoMeteringPublish` (PublishMessage) writes each call's events to the topic in the new KVM key `pubsub_topic`. Without the key the flow uses `async`. The shared flow must be deployed with a service account that has `roles/pubsub.publisher`.
+- **`pubsub-forwarder/`**: a Cloud Run service that reads a pull subscription, sends the events in batches of up to 500 events / 4 MiB, honours `Retry-After`, splits on 413, re-sends per-event `retryable` errors with the same keys, and acks a message only after the ingestor accepted or permanently rejected it. On an outage it nacks (Pub/Sub redelivers) and pauses with a jittered breaker. Same delivery logic as the Azure Event Hub forwarder.
+- Tests: three pubsub flow tests and two fallback ones; static checks that request-side checks stay in `aforo-access`, that only `sync` waits for the ingestor, the PublishMessage wiring, and that no file claims a jti check; 31 forwarder tests (mock ingestor and a fake subscription), run by `run-all.cjs`.
+
+### Fixed
+- `pubsub-forwarder` reads the ingestor's answer up to 256 KiB and stops there (it used to buffer the whole body). A 2xx answer over the cap is retried with the same keys instead of being counted as accepted.
+
+### Docs
+- Token revocation (G356): the docs now say that a revoked Aforo JWT is not checked on Apigee. No Aforo service offers a gateway-callable revocation lookup yet, so nothing is wired.
+
+### Already fixed in 3.0.0 (recorded here for the wave 6 review)
+- G355: JWT validation and the quota check run in `aforo-access` (PreProxyFlowHook); `async` is the default, so metering never holds the response unless `sync` is chosen.
+- G357: margin guard was removed from the Apigee flows, so its uncached, unauthenticated call is gone.
+
 ## [3.0.0] — 2026-10-21
 
 The Apigee path rebuilt to match the Kong plugin. There are now two shared flows: `aforo-access` (new, PreProxyFlowHook) and `aforo-metering` (PostProxyFlowHook). This repo is again the single source of truth; it starts from org-service's newer bundled copy (aforo-gateway-plugins@04f5165) and the unmerged `sync/gateway-plugins-2026-10-02` work. **Breaking**: see "Upgrading from 2.x" in the user guide. Not yet verified on a live Apigee org.

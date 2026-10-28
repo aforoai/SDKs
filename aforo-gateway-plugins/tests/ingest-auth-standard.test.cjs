@@ -18,6 +18,10 @@ const senders = [
   'azure-apim/outbound-policy.xml',
   'azure-apim/compound-metering-policy-fragment.xml',
   'azure-apim/preflight-quota-policy-fragment.xml',
+  // 2.3.0 (G350): the revocation and margin-guard calls carry the key too.
+  'azure-apim/jwt-validation-policy.xml',
+  'azure-apim/margin-guard-policy-fragment.xml',
+  'azure-apim/eventhub-forwarder/src/forwarder.js',
 ];
 // MuleSoft's template moved during packaging work; accept either location.
 const mule = ['mulesoft/template.xml', 'mulesoft/aforo-metering/src/main/mule/template.xml']

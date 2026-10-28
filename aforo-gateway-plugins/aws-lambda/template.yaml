@@ -8,18 +8,74 @@ Description: >
   MCP_SERVER products (set UpstreamUrl or UpstreamFunction) and the
   aforo-key-authorizer (DeployKeyAuthorizer=true), which accepts both customer
   keys (sk_live_/sk_test_) and Aforo client-credential JWTs.
+  Aforo keys are read from AWS Secrets Manager, never from an environment
+  variable (2.4.0).
+
+Globals:
+  Function:
+    # Node.js built-ins only, so the code runs unchanged on Graviton.
+    Architectures:
+      - arm64
 
 Parameters:
   AforoEndpoint:
     Type: String
     Description: Aforo usage ingestor batch endpoint URL
     Default: https://api.aforo.ai/v1/ingest/batch
+  AforoApiKeySecretArn:
+    Type: String
+    Description: >-
+      ARN of the AWS Secrets Manager secret holding the Aforo API key (scope
+      usage:ingest), as plain text or JSON {"apiKey": "..."}. The function may
+      read only this secret. Sent as the X-API-Key header; the tenant is
+      derived from the key. Give the full ARN, ending in the six-character
+      suffix Secrets Manager adds (...:secret:<name>-AbCdEf): the IAM policy
+      grants exactly this ARN, so a partial ARN would deny every read.
+    AllowedPattern: '^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+-[A-Za-z0-9]{6}$'
+    ConstraintDescription: must be a full Secrets Manager secret ARN, including the six-character suffix (arn:aws:secretsmanager:<region>:<account>:secret:<name>-AbCdEf)
   AforoApiKey:
     Type: String
     Description: >-
-      Aforo API key with scope usage:ingest. Sent as the X-API-Key header;
-      the tenant is derived from the key (no tenant id is configured).
+      Removed in 2.4.0 - must stay empty. The key used to land in a plaintext
+      Lambda environment variable; put it in Secrets Manager and pass
+      AforoApiKeySecretArn instead.
     NoEcho: true
+    Default: ''
+  SecretsKmsKeyArn:
+    Type: String
+    Description: >-
+      Optional. ARN of the customer-managed KMS key the Aforo secrets are
+      encrypted with. Leave empty for the AWS-managed aws/secretsmanager key.
+    Default: ''
+  ReservedConcurrency:
+    Type: Number
+    Description: >-
+      Reserved concurrency for aforo-metering. Caps how many copies run at
+      once (and how hard they hit the ingestor) and keeps metering from using
+      the account's whole pool. Throttled log batches are retried by Lambda.
+      0 reserves nothing - use it in accounts whose concurrency quota is too
+      small to reserve from (Lambda keeps 100 unreserved).
+    Default: 10
+    MinValue: 0
+  FlushCount:
+    Type: Number
+    Description: Max events per POST to the ingestor. The ingestor rejects more than 1000.
+    Default: 500
+    MinValue: 1
+    MaxValue: 1000
+  AccessLogFilterPattern:
+    Type: String
+    Description: >-
+      CloudWatch Logs filter on ApiGatewayLogGroupName. The default forwards
+      only lines that can bill - access-log entries carrying customerId or
+      caller, and aforo-metering-proxy records. Set to an empty string to
+      forward everything while debugging an access-log format.
+    Default: '?"customerId" ?"caller" ?"aforoUsage"'
+  LogRetentionDays:
+    Type: Number
+    Description: Days to keep the logs of the functions in this stack.
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
   ApiGatewayLogGroupName:
     Type: String
     Description: CloudWatch log group for API Gateway access logs
@@ -131,11 +187,20 @@ Parameters:
     Description: Deploy aforo-key-authorizer (key-authorizer.js).
     Default: 'false'
     AllowedValues: ['true', 'false']
+  AforoTenantKeySecretArn:
+    Type: String
+    Description: >-
+      Authorizer: ARN of the Secrets Manager secret holding the provider's
+      Aforo tenant key, used to introspect sk_live_/sk_test_ customer keys.
+      Leave empty to accept JWTs only. The full ARN, with the six-character
+      suffix (...:secret:<name>-AbCdEf), as for AforoApiKeySecretArn.
+    AllowedPattern: '^$|^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+-[A-Za-z0-9]{6}$'
+    ConstraintDescription: must be empty or a full Secrets Manager secret ARN, including the six-character suffix
+    Default: ''
   AforoTenantKey:
     Type: String
     Description: >-
-      Authorizer: the provider's Aforo tenant key, used to introspect
-      sk_live_/sk_test_ customer keys. Leave empty to accept JWTs only.
+      Removed in 2.4.0 - must stay empty. Use AforoTenantKeySecretArn.
     NoEcho: true
     Default: ''
   AuthorizerTenantId:
@@ -153,26 +218,71 @@ Parameters:
     Description: 'Authorizer - required iss claim.'
     Default: https://auth.aforo.ai
 
+Rules:
+  # 2.4.0 removed the plaintext key parameters. Refuse them instead of
+  # silently ignoring a key the operator thinks is in use.
+  NoPlaintextAforoKeys:
+    Assertions:
+      - Assert: !Equals [!Ref AforoApiKey, '']
+        AssertDescription: >-
+          AforoApiKey is no longer supported: it put the key in a plaintext
+          Lambda environment variable. Store the key in AWS Secrets Manager,
+          pass its ARN as AforoApiKeySecretArn and set AforoApiKey to an empty
+          string. See CHANGELOG 2.4.0.
+      - Assert: !Equals [!Ref AforoTenantKey, '']
+        AssertDescription: >-
+          AforoTenantKey is no longer supported. Store the tenant key in AWS
+          Secrets Manager, pass its ARN as AforoTenantKeySecretArn and set
+          AforoTenantKey to an empty string. See CHANGELOG 2.4.0.
+
 Conditions:
   HasUpstreamUrl: !Not [!Equals [!Ref UpstreamUrl, '']]
   HasUpstreamFunction: !Not [!Equals [!Ref UpstreamFunction, '']]
   DeployProxy: !Or [!Condition HasUpstreamUrl, !Condition HasUpstreamFunction]
   DeployAuthorizer: !Equals [!Ref DeployKeyAuthorizer, 'true']
+  HasTenantKeySecret: !Not [!Equals [!Ref AforoTenantKeySecretArn, '']]
+  HasSecretsKmsKey: !Not [!Equals [!Ref SecretsKmsKeyArn, '']]
+  HasReservedConcurrency: !Not [!Equals [!Ref ReservedConcurrency, '0']]
 
 Resources:
+  # A name of its own, not /aws/lambda/aforo-metering: Lambda created that one
+  # on first invoke in stacks before 2.4.0, so claiming it would fail the
+  # update with "already exists".
+  AforoMeteringLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aforo/lambda/aforo-metering
+      RetentionInDays: !Ref LogRetentionDays
+
   AforoMeteringFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: aforo-metering
       Handler: index.handler
-      Runtime: nodejs20.x
+      Runtime: nodejs24.x
       Timeout: 30
       MemorySize: 256
       Description: Aforo usage metering - processes API Gateway access logs
+      ReservedConcurrentExecutions: !If [HasReservedConcurrency, !Ref ReservedConcurrency, !Ref AWS::NoValue]
+      LoggingConfig:
+        LogGroup: !Ref AforoMeteringLogGroup
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref AforoApiKeySecretArn
+        - !If
+          - HasSecretsKmsKey
+          - Statement:
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !Ref SecretsKmsKeyArn
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub secretsmanager.${AWS::Region}.amazonaws.com
+          - !Ref AWS::NoValue
       Environment:
         Variables:
           AFORO_ENDPOINT: !Ref AforoEndpoint
-          AFORO_API_KEY: !Ref AforoApiKey
+          AFORO_API_KEY_SECRET_ARN: !Ref AforoApiKeySecretArn
           METRIC_MAPPINGS: !Ref MetricMappings
           DEFAULT_METRIC: !Ref DefaultMetric
           METRIC_NAME_PATTERN: !Ref MetricNamePattern
@@ -184,7 +294,7 @@ Resources:
           AFORO_TENANT_ID: !Ref AforoTenantId
           MCP_METRIC: !Ref McpMetric
           TOKEN_METRIC: !Ref TokenMetric
-          FLUSH_COUNT: '50'
+          FLUSH_COUNT: !Ref FlushCount
           INCLUDE_METADATA: 'true'
       # Delivery guarantee: when a batch fails transiently (network, 5xx,
       # 408, 429) after the in-handler retries, the handler THROWS instead
@@ -237,7 +347,7 @@ Resources:
     Properties:
       LogGroupName: !Ref ApiGatewayLogGroupName
       FilterName: aforo-metering-filter
-      FilterPattern: ''
+      FilterPattern: !Ref AccessLogFilterPattern
       DestinationArn: !GetAtt AforoMeteringFunction.Arn
 
   # ── aforo-metering-proxy: API Gateway Lambda proxy integration ──
@@ -250,7 +360,7 @@ Resources:
     Condition: DeployProxy
     Properties:
       LogGroupName: /aws/lambda/aforo-metering-proxy
-      RetentionInDays: 14
+      RetentionInDays: !Ref LogRetentionDays
 
   AforoMeteringProxyFunction:
     Type: AWS::Serverless::Function
@@ -259,7 +369,7 @@ Resources:
     Properties:
       FunctionName: aforo-metering-proxy
       Handler: metering-proxy.handler
-      Runtime: nodejs20.x
+      Runtime: nodejs24.x
       Timeout: 29
       MemorySize: 256
       Description: Aforo metering proxy - forwards to the upstream and logs one usage record per call
@@ -315,19 +425,44 @@ Resources:
       DestinationArn: !GetAtt AforoMeteringFunction.Arn
 
   # ── aforo-key-authorizer: TOKEN authorizer (customer keys + client-credential JWTs) ──
+  AforoKeyAuthorizerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DeployAuthorizer
+    Properties:
+      LogGroupName: /aforo/lambda/aforo-key-authorizer
+      RetentionInDays: !Ref LogRetentionDays
+
   AforoKeyAuthorizerFunction:
     Type: AWS::Serverless::Function
     Condition: DeployAuthorizer
     Properties:
       FunctionName: aforo-key-authorizer
       Handler: key-authorizer.handler
-      Runtime: nodejs20.x
+      Runtime: nodejs24.x
       Timeout: 10
       MemorySize: 256
       Description: Aforo authorizer - customer keys (introspection) and client-credential JWTs (JWKS)
+      LoggingConfig:
+        LogGroup: !Ref AforoKeyAuthorizerLogGroup
+      Policies:
+        - !If
+          - HasTenantKeySecret
+          - AWSSecretsManagerGetSecretValuePolicy:
+              SecretArn: !Ref AforoTenantKeySecretArn
+          - !Ref AWS::NoValue
+        - !If
+          - HasSecretsKmsKey
+          - Statement:
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !Ref SecretsKmsKeyArn
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub secretsmanager.${AWS::Region}.amazonaws.com
+          - !Ref AWS::NoValue
       Environment:
         Variables:
-          AFORO_TENANT_KEY: !Ref AforoTenantKey
+          AFORO_TENANT_KEY_SECRET_ARN: !Ref AforoTenantKeySecretArn
           AFORO_TENANT_ID: !Ref AuthorizerTenantId
           AFORO_JWKS_URL: !Ref AforoJwksUrl
           AFORO_JWT_ISSUER: !Ref AforoJwtIssuer
@@ -351,6 +486,9 @@ Outputs:
   FunctionName:
     Description: Name of the Lambda function
     Value: !Ref AforoMeteringFunction
+  FunctionLogGroup:
+    Description: Log group of the metering function (its own logs, not the access logs)
+    Value: !Ref AforoMeteringLogGroup
   FailureQueueUrl:
     Description: >-
       SQS queue receiving failed invocation records after all retries

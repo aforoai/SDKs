@@ -11,6 +11,7 @@
     <Policies>
         <Policy>AforoMeteringBuildEvents</Policy>
         <Policy>AforoMeteringSendAsync</Policy>
+        <Policy>AforoMeteringPublish</Policy>
         <Policy>AforoMeteringSendEvent</Policy>
         <Policy>AforoMeteringCheckDelivery</Policy>
         <Policy>AforoMeteringSendEventRetry1</Policy>

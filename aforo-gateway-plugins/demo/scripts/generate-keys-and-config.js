@@ -66,7 +66,8 @@ const CONFIG = {
   readMetric: env('DEMO_READ_METRIC', 'api_calls'),
   orderMetric: env('DEMO_ORDER_METRIC', 'api_calls'),
   // Presented to the ingestor as X-API-Key. Must be scoped usage:ingest,
-  // which is what maps to METERING_AGENT and authorises ingestion.
+  // which is what maps to METERING_AGENT and authorises ingestion. Written
+  // only into kong/kong.yml -- never into a file the browser can fetch.
   ingestApiKey: env('DEMO_INGEST_API_KEY', 'demo-ingest-key'),
   // productType stamped on every event; the ingestor requires it.
   productType: env('DEMO_PRODUCT_TYPE', 'API'),
@@ -83,14 +84,17 @@ const CONFIG = {
  * auth bug. Failing here, naming the exact variables, costs one run and saves
  * that whole investigation.
  */
-const REQUIRED = ['tenantId', 'customerId', 'teamId', 'keyId', 'subscriptionId'];
+const REQUIRED = ['tenantId', 'customerId', 'teamId', 'keyId', 'subscriptionId', 'ingestApiKey'];
 const missing = REQUIRED.filter((k) => String(CONFIG[k] || '').startsWith('YOUR_'));
 if (missing.length) {
   const varNames = { tenantId: 'DEMO_TENANT_ID', customerId: 'DEMO_CUSTOMER_ID',
                      teamId: 'DEMO_TEAM_ID', keyId: 'DEMO_KEY_ID',
-                     subscriptionId: 'DEMO_SUBSCRIPTION_ID' };
+                     subscriptionId: 'DEMO_SUBSCRIPTION_ID', ingestApiKey: 'DEMO_INGEST_API_KEY' };
   console.error('\nRefusing to generate: these still hold placeholder values.\n');
-  for (const k of missing) console.error(`  ${varNames[k]}  (currently ${CONFIG[k]})`);
+  // Never echo the ingest key, even a placeholder one: print only the name.
+  for (const k of missing) {
+    console.error(k === 'ingestApiKey' ? `  ${varNames[k]}` : `  ${varNames[k]}  (currently ${CONFIG[k]})`);
+  }
   console.error(`
 Set them in .env, then re-run.
 
@@ -100,6 +104,33 @@ Set them in .env, then re-run.
 Where each value comes from is in README.md, "Where to find these values".
 DEMO_TEAM_ID is the one people skip: without it usage still bills correctly,
 but team budgets never apply and summary-by-team stays empty.
+`);
+  process.exit(1);
+}
+
+/*
+ * Refuse Aforo production unless the operator says so (G370).
+ *
+ * The demo mints tokens with a throwaway key and sends traffic on purpose --
+ * forged, expired and over-budget calls included. Pointed at production by
+ * accident (a copied .env.production), it meters into a real tenant. So any
+ * aforo.ai host -- the ingest endpoint Kong sends to, or the ingestor URL the
+ * browser calls -- needs DEMO_ALLOW_PRODUCTION=true, set by hand.
+ */
+function isAforoProduction(url) {
+  let host;
+  try { host = new URL(url).hostname.toLowerCase(); } catch { return false; }
+  return host === 'aforo.ai' || host.endsWith('.aforo.ai');
+}
+
+const PRODUCTION_CHECKED = { aforoEndpoint: 'DEMO_AFORO_ENDPOINT', ingestorUrl: 'DEMO_INGESTOR_URL' };
+const productionHits = Object.entries(PRODUCTION_CHECKED).filter(([k]) => isAforoProduction(CONFIG[k]));
+if (productionHits.length && String(env('DEMO_ALLOW_PRODUCTION', '')).trim().toLowerCase() !== 'true') {
+  console.error('\nRefusing to generate: these point at Aforo production.\n');
+  for (const [k, name] of productionHits) console.error(`  ${name}  (${CONFIG[k]})`);
+  console.error(`
+The demo sends deliberately bad and over-budget traffic. If you really mean to
+run it against production, set DEMO_ALLOW_PRODUCTION=true in .env and re-run.
 `);
   process.exit(1);
 }
@@ -218,9 +249,22 @@ ${indent(publicKey, 12)}
 fs.mkdirSync(path.join(ROOT, 'kong'), { recursive: true });
 fs.writeFileSync(path.join(ROOT, 'kong', 'kong.yml'), kongYml);
 
-const tokens = { valid: token, expired, forged, claims, config: CONFIG };
-fs.writeFileSync(path.join(ROOT, 'nirmala-frontend', 'tokens.json'), JSON.stringify(tokens, null, 2));
-fs.writeFileSync(path.join(ROOT, 'scripts', '.tokens.json'), JSON.stringify(tokens, null, 2));
+/*
+ * nirmala-frontend/ is the nginx web root: anything written there is readable
+ * by anyone who can reach :3000 (G370). It gets the three demo tokens and only
+ * the config fields the page reads -- never the ingest API key, which lives in
+ * kong/kong.yml (mounted into Kong, not served). scripts/.tokens.json, read by
+ * test-flow.sh, carries no secret either.
+ */
+const BROWSER_CONFIG = ['kongUrl', 'ingestorUrl', 'tenantId', 'teamId', 'customerId', 'keyId'];
+const SECRET_CONFIG = ['ingestApiKey'];
+const pick = (obj, keys) => Object.fromEntries(keys.map((k) => [k, obj[k]]));
+const omit = (obj, keys) => Object.fromEntries(Object.entries(obj).filter(([k]) => !keys.includes(k)));
+
+const browserTokens = { valid: token, expired, forged, config: pick(CONFIG, BROWSER_CONFIG) };
+const scriptTokens = { valid: token, expired, forged, claims, config: omit(CONFIG, SECRET_CONFIG) };
+fs.writeFileSync(path.join(ROOT, 'nirmala-frontend', 'tokens.json'), JSON.stringify(browserTokens, null, 2));
+fs.writeFileSync(path.join(ROOT, 'scripts', '.tokens.json'), JSON.stringify(scriptTokens, null, 2));
 
 console.log('Wrote kong/kong.yml, nirmala-frontend/tokens.json, scripts/.tokens.json');
 console.log(`  tenant=${CONFIG.tenantId} customer=${CONFIG.customerId} key_id=${CONFIG.keyId}`);

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- GET {aforo_org_service_url}/api/v1/public/gateway/token-status
+     ?jti=&keyId=&clientId= with X-API-Key (the tenant comes from the key).
+     Answers {"revoked": true|false, "reason"}. Waits at most 2000 ms (the
+     Azure fragment's timeout; Apigee takes only a literal here).
+     continueOnError="true": no answer is read by AforoJwtRevocationDecide. -->
+<ServiceCallout name="AforoJwtRevocationCheck" continueOnError="true">
+    <DisplayName>Aforo Access - JWT Revocation Check</DisplayName>
+    <Request variable="aforo.access.revocationRequest" clearPayload="true">
+        <IgnoreUnresolvedVariables>true</IgnoreUnresolvedVariables>
+        <Set>
+            <Headers>
+                <Header name="X-API-Key">{private.aforo.apiKey}</Header>
+            </Headers>
+            <Verb>GET</Verb>
+        </Set>
+    </Request>
+    <Response>aforo.access.revocationResponse</Response>
+    <Timeout>2000</Timeout>
+    <HTTPTargetConnection>
+        <Properties>
+            <Property name="connect.timeout.millis">2000</Property>
+            <Property name="io.timeout.millis">2000</Property>
+        </Properties>
+        <URL>{aforo.access.revocationUrl}</URL>
+    </HTTPTargetConnection>
+</ServiceCallout>

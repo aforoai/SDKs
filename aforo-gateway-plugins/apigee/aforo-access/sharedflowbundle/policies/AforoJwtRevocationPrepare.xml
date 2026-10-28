@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Whether the verified Aforo JWT's revocation is checked, and the cache key
+     tenant|jti|keyId. See aforo-jwt-revocation.js. -->
+<Javascript name="AforoJwtRevocationPrepare" timeLimit="200" continueOnError="true">
+    <DisplayName>Aforo Access - JWT Revocation Prepare</DisplayName>
+    <Properties>
+        <Property name="phase">prepare</Property>
+    </Properties>
+    <IncludeURL>jsc://aforo-billing.js</IncludeURL>
+    <ResourceURL>jsc://aforo-jwt-revocation.js</ResourceURL>
+</Javascript>

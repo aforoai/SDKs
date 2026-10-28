@@ -7,9 +7,17 @@
  *
  * Environment variables:
  *   AFORO_ENDPOINT       — Aforo ingestor batch URL (…/v1/ingest/batch)
- *   AFORO_API_KEY        — Aforo API key (scope usage:ingest). Sent as
+ *   AFORO_API_KEY_SECRET_ARN — ARN of the AWS Secrets Manager secret holding
+ *                          the Aforo API key (scope usage:ingest), as plain
+ *                          text or JSON {"apiKey": "..."}. Read once per
+ *                          container, refreshed every 5 minutes. Sent as
  *                          X-API-Key. The tenant is derived from the key; no
  *                          tenant header is sent.
+ *   AFORO_API_KEY        — The same key as a plain environment variable. Used
+ *                          only when AFORO_API_KEY_SECRET_ARN is unset (stacks
+ *                          from before 2.4.0, organization-service's one-click
+ *                          deploy). Anyone who can read the function's
+ *                          configuration can read it; prefer the secret.
  *   METRIC_MAPPINGS      — JSON array of endpoint→metric rules, first match
  *                          wins: [{"matchType":"PREFIX","value":"/v1/sms",
  *                          "metricName":"sms_sent"}]. matchType is EXACT,
@@ -24,7 +32,7 @@
  *                          event whose metric is not in the Aforo catalog;
  *                          the Lambda cannot know the catalog.
  *   QUANTITY_SOURCE      — "1" (count) or "response_size"
- *   FLUSH_COUNT          — Max events per batch (default 50, capped at 1000 —
+ *   FLUSH_COUNT          — Max events per batch (default 500, capped at 1000 —
  *                          the ingestor rejects larger batches with 400)
  *   INCLUDE_METADATA     — "false" to omit request metadata
  *   MCP_ENABLED          — "true" to enable MCP JSON-RPC detection
@@ -89,9 +97,14 @@ const https = require('https');
 const http = require('http');
 const zlib = require('zlib');
 const crypto = require('crypto');
+const { createSecretSource } = require('./aws-secret');
 
 const AFORO_ENDPOINT = process.env.AFORO_ENDPOINT || '';
-const AFORO_API_KEY = process.env.AFORO_API_KEY || '';
+const AFORO_API_KEY = createSecretSource({
+    label: 'Aforo API key',
+    secretIdEnv: 'AFORO_API_KEY_SECRET_ARN',
+    plainEnv: 'AFORO_API_KEY',
+});
 // Never sent to the ingestor (the tenant comes from the API key). Kept only
 // because it is part of the frozen MCP idempotency-key shape and an EMF
 // property; unset is fine.
@@ -106,7 +119,7 @@ const QUANTITY_SOURCE = process.env.QUANTITY_SOURCE || '1';
 // batch), so FLUSH_COUNT is clamped to that however it is configured.
 const MAX_BATCH_EVENTS = 1000;
 const FLUSH_COUNT = Math.min(MAX_BATCH_EVENTS,
-    Math.max(1, parseInt(process.env.FLUSH_COUNT || '50', 10) || 50));
+    Math.max(1, parseInt(process.env.FLUSH_COUNT || '500', 10) || 500));
 const INCLUDE_METADATA = process.env.INCLUDE_METADATA !== 'false';
 const MCP_ENABLED = process.env.MCP_ENABLED === 'true';
 const PRODUCT_TYPE = normalizeProductType(process.env.PRODUCT_TYPE);
@@ -169,6 +182,11 @@ const MAX_TOOL_NAME_LENGTH = 64;
 // platform kills it.
 const REQUEST_TIMEOUT_MS = 10000;
 const DEADLINE_SAFETY_MS = 1500;
+// A refused key rereads the secret at most once per container per this many
+// milliseconds. A key that stays refused (revoked, wrong secret) would
+// otherwise call GetSecretValue on every invocation, bypassing the cache.
+const FORCED_KEY_REFRESH_MIN_MS = 60000;
+let lastForcedKeyRefreshAt = -Infinity;
 const MAX_ATTEMPTS = 3;
 
 /** Trim + upper-case a configured productType; "API" when unset or blank. */
@@ -664,6 +682,15 @@ async function handler(event, context) {
         return { statusCode: 200, body: 'No events after filtering' };
     }
 
+    // Read the key before sending anything. Not configured, or Secrets Manager
+    // unreachable on a cold start: throw, so Lambda's async retry redelivers
+    // the log payload (and the OnFailure queue keeps it) instead of posting
+    // without a key and having the ingestor drop the batch with 401.
+    if (!AFORO_API_KEY.configured) {
+        throw new Error('Aforo API key is not configured: set AFORO_API_KEY_SECRET_ARN');
+    }
+    const apiKey = await AFORO_API_KEY.get();
+
     const batches = [];
     for (let i = 0; i < usageEvents.length; i += FLUSH_COUNT) {
         batches.push(usageEvents.slice(i, i + FLUSH_COUNT));
@@ -675,7 +702,42 @@ async function handler(event, context) {
         ? context.getRemainingTimeInMillis() : 30000;
     const deadline = Date.now() + remaining - DEADLINE_SAFETY_MS;
 
-    const results = await Promise.all(batches.map(b => sendToAforo(b, deadline)));
+    const results = await Promise.all(batches.map(b => sendToAforo(b, deadline, apiKey)));
+
+    // 401/403: the key was refused. The usual cause is a rotated key still
+    // cached in this container (aws-secret.js keeps it 5 min). Reread the
+    // secret once and resend those batches with the same bodies (same keys, so
+    // a batch that did land is deduplicated), at most once a minute per
+    // container (FORCED_KEY_REFRESH_MIN_MS). Refused again, or the secret
+    // cannot be read, or it still holds the same key: the batches count as
+    // transient and the handler throws below, so Lambda's redelivery and the
+    // OnFailure queue keep the events instead of dropping them.
+    const refusedIdx = results.map((r, i) => (r.outcome === 'unauthorized' ? i : -1)).filter((i) => i >= 0);
+    if (refusedIdx.length > 0) {
+        let fresh = null;
+        const now = Date.now();
+        if (AFORO_API_KEY.fromSecret && now - lastForcedKeyRefreshAt < FORCED_KEY_REFRESH_MIN_MS) {
+            // Reread less than a minute ago: fail now, keep the events for
+            // Lambda's redelivery, and leave Secrets Manager alone.
+            console.error(`Aforo refused the key; the secret was reread ${Math.round((now - lastForcedKeyRefreshAt) / 1000)}s ` +
+                `ago, so it is not reread again for up to ${FORCED_KEY_REFRESH_MIN_MS / 1000}s.`);
+        } else if (AFORO_API_KEY.fromSecret) {
+            lastForcedKeyRefreshAt = now;
+            try {
+                fresh = await AFORO_API_KEY.refresh();
+            } catch (err) {
+                console.error(`Aforo refused the key and rereading it failed: ${err.message}`);
+            }
+        }
+        if (fresh && fresh !== apiKey) {
+            console.warn(`Aforo refused the cached key; the secret holds a new one. Resending ${refusedIdx.length} batch(es).`);
+            const again = await Promise.all(refusedIdx.map((i) => sendToAforo(batches[i], deadline, fresh)));
+            again.forEach((r, n) => { results[refusedIdx[n]] = r; });
+        } else if (fresh === apiKey) {
+            console.error('Aforo refused the key, and the secret still holds the same key. Check the secret ' +
+                '(it must be an active Aforo API key with usage:ingest).');
+        }
+    }
 
     let totalSent = 0;
     let dropped = 0;
@@ -689,6 +751,7 @@ async function handler(event, context) {
         } else if (r.outcome === 'rejected') {
             dropped += size;
         } else {
+            // 'failed' and 'unauthorized' (still refused after a reread).
             transient += size;
         }
     });
@@ -903,9 +966,13 @@ function detectMcpToolCall(requestBody) {
 }
 
 
-/** 4xx except 408/429 is a permanent rejection: retrying sends the same bytes to the same judgement. */
+/**
+ * 4xx except 408/429 is a permanent rejection: retrying sends the same bytes
+ * to the same judgement. 401 and 403 are not: they judge the key, not the
+ * batch (sendToAforo answers them as 'unauthorized').
+ */
 function isPermanentRejection(status) {
-    return status >= 400 && status < 500 && status !== 408 && status !== 429;
+    return status >= 400 && status < 500 && status !== 408 && status !== 429 && status !== 401 && status !== 403;
 }
 
 /**
@@ -939,12 +1006,13 @@ function countRejectedEvents(resBody, events) {
 /**
  * Send one batch. Resolves to { outcome, rejectedEvents }:
  *   'sent'     — 2xx (rejectedEvents = events the ingestor refused individually)
+ *   'unauthorized' — 401/403: the key was refused (the handler rereads it once)
  *   'rejected' — permanent 4xx; dropped and logged, never retried
  *   'failed'   — transient failure that outlived the retries or the deadline
  * The body is serialized ONCE, so every attempt carries the same idempotency
  * keys.
  */
-async function sendToAforo(events, deadline) {
+async function sendToAforo(events, deadline, apiKey) {
     const body = JSON.stringify({ events });
     let retryAfterMs = null;
 
@@ -952,9 +1020,16 @@ async function sendToAforo(events, deadline) {
         const timeLeft = deadline - Date.now();
         if (timeLeft <= 0) break;
         try {
-            const res = await doPost(AFORO_ENDPOINT, body, Math.min(REQUEST_TIMEOUT_MS, timeLeft));
+            const res = await doPost(AFORO_ENDPOINT, body, Math.min(REQUEST_TIMEOUT_MS, timeLeft), apiKey);
             if (res.status >= 200 && res.status < 300) {
                 return { outcome: 'sent', rejectedEvents: countRejectedEvents(res.body, events) };
+            }
+            if (res.status === 401 || res.status === 403) {
+                // Not the batch's fault: the key was refused. The handler
+                // rereads the key and resends, or throws so nothing is lost.
+                console.error(`Aforo refused the API key with ${res.status} for a batch of ${events.length} event(s). ` +
+                    `Response: ${String(res.body || '').slice(0, 300)}`);
+                return { outcome: 'unauthorized' };
             }
             if (isPermanentRejection(res.status)) {
                 console.error(`Aforo rejected the batch with ${res.status} — dropping ${events.length} event(s). ` +
@@ -1000,7 +1075,7 @@ function parseRetryAfter(value) {
 // without buffering an unbounded body.
 const MAX_RESPONSE_BYTES = 262144;
 
-function doPost(url, body, timeoutMs) {
+function doPost(url, body, timeoutMs, apiKey) {
     return new Promise((resolve, reject) => {
         const parsedUrl = new URL(url);
         const options = {
@@ -1015,7 +1090,7 @@ function doPost(url, body, timeoutMs) {
                 // this header; an Authorization: Bearer is parsed as a JWT and
                 // rejected 401 — alone or alongside. The tenant comes from the
                 // key, so no X-Tenant-Id is sent.
-                'X-API-Key': AFORO_API_KEY,
+                'X-API-Key': apiKey,
             },
             timeout: timeoutMs,
         };
@@ -1023,6 +1098,7 @@ function doPost(url, body, timeoutMs) {
         const transport = parsedUrl.protocol === 'https:' ? https : http;
         const req = transport.request(options, (res) => {
             let resBody = '';
+            res.on('error', reject);
             res.on('data', (chunk) => { if (resBody.length < MAX_RESPONSE_BYTES) resBody += chunk; });
             res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: resBody }));
         });
@@ -1062,4 +1138,5 @@ module.exports = {
     parseStatusOutcomes,
     parseStatusCodeList,
     FLUSH_COUNT,
+    FORCED_KEY_REFRESH_MIN_MS,
 };

@@ -35,4 +35,5 @@ page — see "Why Kong does not return 402" in the parent README.
 ## Generated file
 
 `tokens.json` is written by `scripts/generate-keys-and-config.js` and gitignored. Without
-it the page loads but has no tokens to send.
+it the page loads but has no tokens to send. This folder is the web root, so the file holds
+only the three demo tokens and the URLs and ids the page reads — never the ingest API key.

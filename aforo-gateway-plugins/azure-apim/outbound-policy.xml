@@ -147,16 +147,22 @@
   (azure-apim/tests/policy.test.cjs) - keep it that way: var
   declarations, foreach, if, no casts, no generics, no lambdas.
 
-  NO RETRY HERE — DELIBERATE (A+ prompt 4 deferral). send-one-way-request
-  is fire-and-forget: it exposes no failure signal a retry policy could
-  gate on, and an unconditional retry would duplicate-send every request.
-  The observable alternative (send-request) WAITS for the ingest response
-  inside this outbound section, which runs BEFORE the client receives the
-  API response — that would add ingest latency (up to full timeout during
-  an ingest outage) to every customer request. Do NOT "fix" this by
-  switching to send-request. Durable delivery for APIM is a transport
-  change (log-to-eventhub + forwarder), tracked in docs/TODO.md. The
-  frozen key above makes any redelivery path dedup-safe when it lands.
+  Delivery (2.3.0). Both event shapes are built into the context variable
+  aforo-event-batch (cleared first, so a value set earlier is never sent);
+  ONE send-one-way-request after the gate posts it. Two modes, chosen by
+  the context variable aforo-delivery-mode:
+    direct (default, absent, anything but "eventhub"): send-one-way-request
+      as in 2.2.0. Fire-and-forget: no retry, no batching; an ingest 5xx or
+      429 loses that request's event. Do NOT switch to send-request: it
+      waits for the ingest answer before the client gets the API response.
+    eventhub: nothing is sent here. Include aforo-metering-eventhub
+      (eventhub-delivery-policy-fragment.xml) right after this fragment;
+      it writes the batch to Event Hub with log-to-eventhub, and the
+      forwarder Function (eventhub-forwarder/) batches, retries and
+      checkpoints only after the ingestor accepts. Without that include,
+      eventhub mode sends nothing.
+  This file references no logger, so it still saves on an instance
+  without Event Hub. The frozen key above makes redelivery dedup-safe.
 
   Excluded requests (aforo-skip = "true") match no branch: nothing
   is built and nothing is sent.
@@ -205,6 +211,12 @@
   API + AGENTIC_API). Omitted when not determinable.
 -->
 <fragment>
+  <set-variable name="aforo-event-batch" value="@(string.Empty)" />
+  <set-variable name="aforo-delivery" value="@{
+    var m = context.Variables.ContainsKey("aforo-delivery-mode") ? Convert.ToString(context.Variables["aforo-delivery-mode"]) : "";
+    if (m == null) { m = ""; }
+    return m.Trim().ToLowerInvariant() == "eventhub" ? "eventhub" : "direct";
+  }" />
   <set-variable name="aforo-idempotency-key-base" value="@(context.RequestId.ToString())" />
   <set-variable name="aforo-execution-status" value="@{
     var s = context.Response != null ? context.Response.StatusCode : 0;
@@ -370,16 +382,7 @@
 <trace source="aforo-metering" severity="information"><message>Not metered: the configured aforo-product-type needs fields this gateway cannot supply</message></trace>
 </when>
 <when condition="@(Convert.ToString(context.Variables["aforo-mcp-call"]).Length > 0)">
-<send-one-way-request mode="new">
-<set-url>{{aforo-endpoint}}</set-url>
-<set-method>POST</set-method>
-<set-header name="Content-Type" exists-action="override">
-<value>application/json</value>
-</set-header>
-<set-header name="X-API-Key" exists-action="override">
-<value>{{aforo-api-key}}</value>
-</set-header>
-<set-body>@{
+<set-variable name="aforo-event-batch" value="@{
   var call = Convert.ToString(context.Variables["aforo-mcp-call"]);
   var cut = call.IndexOf("\n");
   var agentId = call.Substring(0, cut);
@@ -425,23 +428,13 @@
     ((JObject)((JArray)evt["events"])[0]).Add("executionStatus", mcpOutcome);
   }
   return evt.ToString();
-}</set-body>
-</send-one-way-request>
+}" />
 </when>
 <when condition="@(Convert.ToString(context.Variables["aforo-event-metric"]).Length == 0)">
 <trace source="aforo-metering" severity="warning"><message>Not metered: the metric name is empty or longer than 255 characters (check aforo-metric-mappings and aforo-default-metric)</message></trace>
 </when>
 <otherwise>
-<send-one-way-request mode="new">
-<set-url>{{aforo-endpoint}}</set-url>
-<set-method>POST</set-method>
-<set-header name="Content-Type" exists-action="override">
-<value>application/json</value>
-</set-header>
-<set-header name="X-API-Key" exists-action="override">
-<value>{{aforo-api-key}}</value>
-</set-header>
-<set-body>@{
+<set-variable name="aforo-event-batch" value="@{
   var path = context.Request.Url.Path;
   var method = context.Request.Method;
   var statusCode = context.Response.StatusCode;
@@ -509,10 +502,24 @@
     new JProperty("events", new JArray(eventObj))
   );
   return evt.ToString();
-}</set-body>
-</send-one-way-request>
+}" />
 </otherwise>
 </choose>
+    </when>
+  </choose>
+  <choose>
+    <when condition="@(Convert.ToString(context.Variables["aforo-event-batch"]).Length > 0 && Convert.ToString(context.Variables["aforo-delivery"]) == "direct")">
+<send-one-way-request mode="new">
+<set-url>{{aforo-endpoint}}</set-url>
+<set-method>POST</set-method>
+<set-header name="Content-Type" exists-action="override">
+<value>application/json</value>
+</set-header>
+<set-header name="X-API-Key" exists-action="override">
+<value>{{aforo-api-key}}</value>
+</set-header>
+<set-body>@(Convert.ToString(context.Variables["aforo-event-batch"]))</set-body>
+</send-one-way-request>
     </when>
   </choose>
 </fragment>

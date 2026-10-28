@@ -19,6 +19,8 @@ const METERING = sim.loadBundle(path.join(ROOT, 'sharedflowbundle'));
 const INGEST_URL = 'https://api.aforo.ai/v1/ingest/batch';
 const QUOTA_URL = 'https://api.aforo.ai/api/v1/quota/check';
 const TENANT = 'tenant-1';
+const ORG_URL = 'https://org.aforo.ai';
+const TOKEN_STATUS = ORG_URL + '/api/v1/public/gateway/token-status';
 
 const PRODUCTS = {
     'payments-product': {
@@ -80,11 +82,14 @@ function newEnv(opts) {
         quota: opts.quota || (() => ({ status: 200, body: JSON.stringify({ success: true, data: { decision: 'ALLOW' } }) })),
         ingest: opts.ingest || ((req) => ({ status: 202, body: JSON.stringify({ success: true, data: { accepted: JSON.parse(req.body).events.length, failed: 0, errors: [] } }) })),
         jwt: opts.jwt,
+        tokenStatus: opts.tokenStatus || (() => ({ status: 200, body: JSON.stringify({ revoked: false, reason: null }) })),
+        pubsub: opts.pubsub || (() => ({ ok: true })),
         log: [],
         http(req) {
             this.log.push(req);
             if (req.url === QUOTA_URL) return this.quota(req);
             if (req.url === INGEST_URL) return this.ingest(req);
+            if (req.url.indexOf(TOKEN_STATUS + '?') === 0) return this.tokenStatus(req);
             return { error: 'unknown url ' + req.url };
         }
     };
@@ -106,6 +111,7 @@ function call(env, req) {
         'request.verb': req.verb || 'GET',
         'messageid': req.messageid || ('msg-' + seq),
         'client.received.start.timestamp': String(env.clock.now),
+        'system.timestamp': String(env.clock.now),
         'request.content': req.body === undefined ? null : req.body
     };
     for (const [k, v] of Object.entries(req.headers || {})) vars['request.header.' + k] = v;
@@ -137,7 +143,10 @@ function call(env, req) {
     const mine = env.log.slice(before);
     out.quotaCalls = mine.filter((r) => r.url === QUOTA_URL);
     out.ingestCalls = mine.filter((r) => r.url === INGEST_URL);
-    out.events = out.ingestCalls.length ? JSON.parse(out.ingestCalls[0].body).events : [];
+    out.revocationCalls = mine.filter((r) => r.url.indexOf(TOKEN_STATUS) === 0);
+    out.publishes = msg.publishes || [];
+    out.events = out.ingestCalls.length ? JSON.parse(out.ingestCalls[0].body).events
+        : (out.publishes.length ? JSON.parse(out.publishes[0].data).events : []);
     return out;
 }
 
@@ -605,6 +614,60 @@ test('async (default): one send, nothing waited for, nothing read back', () => {
     assert.strictEqual(r.msg.get('aforo.calloutResponse.status.code'), null);
 });
 
+const TOPIC = 'projects/my-gcp-project/topics/aforo-metering';
+
+test('pubsub: one Pub/Sub message per call with the events, no HTTP send', () => {
+    const r = call(newEnv({ kvm: { delivery_mode: 'pubsub', pubsub_topic: TOPIC } }), { headers: KEY, messageid: 'ps-1' });
+    assert.strictEqual(r.ingestCalls.length, 0);
+    assert.strictEqual(r.publishes.length, 1);
+    assert.strictEqual(r.publishes[0].topic, TOPIC);
+    const events = JSON.parse(r.publishes[0].data).events;
+    assert.strictEqual(events.length, 1);
+    assert.strictEqual(events[0].idempotencyKey, 'ps-1', 'key frozen to messageid, so a redelivered message deduplicates');
+    assert.strictEqual(events[0].customerId, 'cust-1');
+});
+
+test('pubsub: MCP batch is one message carrying every tools/call event', () => {
+    const env = newEnv({ kvm: { delivery_mode: 'pubsub', pubsub_topic: TOPIC } });
+    const body = JSON.stringify([
+        { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'a' } },
+        { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'b' } }
+    ]);
+    const r = call(env, { proxy: 'mcp-proxy', verb: 'POST', suffix: '', body, headers: { 'x-api-key': 'client-secret-mcp' } });
+    assert.strictEqual(r.publishes.length, 1);
+    assert.strictEqual(JSON.parse(r.publishes[0].data).events.length, 2);
+});
+
+test('pubsub: a failed publish never fails the call', () => {
+    const r = call(newEnv({ kvm: { delivery_mode: 'pubsub', pubsub_topic: TOPIC }, pubsub: () => ({ error: 'PERMISSION_DENIED' }) }), { headers: KEY });
+    assert.strictEqual(r.meteringFault, null);
+    assert.strictEqual(r.publishes.length, 1);
+    assert.strictEqual(r.ingestCalls.length, 0);
+});
+
+test('pubsub without pubsub_topic: falls back to async HTTP delivery, nothing published', () => {
+    const r = call(newEnv({ kvm: { delivery_mode: 'pubsub' } }), { headers: KEY });
+    assert.strictEqual(r.publishes.length, 0);
+    assert.strictEqual(r.ingestCalls.length, 1);
+    assert.strictEqual(r.ingestCalls[0].waits, false);
+});
+
+test('async and sync never publish to Pub/Sub, even with pubsub_topic set', () => {
+    for (const mode of [undefined, 'async', 'sync']) {
+        const kvm = { pubsub_topic: TOPIC };
+        if (mode) kvm.delivery_mode = mode;
+        const r = call(newEnv({ kvm }), { headers: KEY });
+        assert.strictEqual(r.publishes.length, 0, String(mode));
+        assert.strictEqual(r.ingestCalls.length >= 1, true, String(mode));
+    }
+});
+
+test('refused or unmetered calls publish nothing', () => {
+    const env = newEnv({ kvm: { delivery_mode: 'pubsub', pubsub_topic: TOPIC } });
+    assert.strictEqual(call(env, {}).publishes.length, 0, 'missing key: 401');
+    assert.strictEqual(call(env, { headers: KEY, suffix: '/health' }).publishes.length, 0, 'excluded path');
+});
+
 // ─────────────────────────────────────────────────────────────────────────
 section('Optional Aforo JWT');
 
@@ -629,6 +692,151 @@ test('jwt_validation_enabled: no token 401; token for another tenant 401', () =>
     const r = call(env, { headers: Object.assign({ authorization: 'Bearer other' }, KEY) });
     assert.strictEqual(r.accessFault.status, 401);
     assert.strictEqual(JSON.parse(r.accessFault.body).error, 'invalid_token');
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+section('JWT revocation (token-status, same contract as Azure APIM)');
+
+const JWT_KVM = { jwt_validation_enabled: 'true', aforo_jwks_uri: 'u', aforo_jwt_issuer: 'i', aforo_org_service_url: ORG_URL + '/' };
+const EXP = Math.floor(1760000000000 / 1000) + 600;
+function jwtEnv(opts) {
+    opts = opts || {};
+    return newEnv({
+        kvm: Object.assign({}, JWT_KVM, opts.kvm || {}),
+        jwt: (token) => ({
+            good: { tenant_id: TENANT, jti: 'jti-1', key_id: 'key-7', client_id: 'cli 1', exp: EXP },
+            nojti: { tenant_id: TENANT },
+            other: { tenant_id: 'tenant-2', jti: 'jti-9' }
+        })[token] || null,
+        tokenStatus: opts.tokenStatus
+    });
+}
+const BEARER = (t) => Object.assign({ authorization: 'Bearer ' + (t || 'good') }, KEY);
+
+test('not revoked: one GET with X-API-Key and the claims, cached for jti_cache_seconds, then asked again', () => {
+    const env = jwtEnv();
+    const r1 = call(env, { headers: BEARER() });
+    assert.strictEqual(r1.accessFault, null);
+    assert.strictEqual(r1.revocationCalls.length, 1);
+    const c = r1.revocationCalls[0];
+    assert.strictEqual(c.method, 'GET');
+    assert.strictEqual(c.url, TOKEN_STATUS + '?jti=jti-1&keyId=key-7&clientId=cli%201');
+    assert.deepStrictEqual(c.headers, { 'X-API-Key': 'ak_tenant_ingest' });
+    assert.strictEqual(r1.events.length, 1, 'metered');
+    assert.strictEqual(call(env, { headers: BEARER() }).revocationCalls.length, 0, 'cache hit');
+    env.clock.now += 31000;
+    assert.strictEqual(call(env, { headers: BEARER() }).revocationCalls.length, 1, 'asked again after 30 s');
+});
+
+test('revoked: 401 invalid_token, not metered, kept until exp', () => {
+    let calls = 0;
+    const env = jwtEnv({ tokenStatus: () => { calls++; return { status: 200, body: JSON.stringify({ success: true, data: { revoked: true, reason: 'TOKEN_REVOKED' } }) }; } });
+    const r = call(env, { headers: BEARER(), errorFlowMetering: false });
+    assert.strictEqual(r.accessFault.status, 401);
+    assert.deepStrictEqual(JSON.parse(r.accessFault.body), { error: 'invalid_token', error_description: 'Token has been revoked' });
+    assert.strictEqual(r.upstreamCalled, false);
+    assert.strictEqual(r.ingestCalls.length, 0);
+    env.clock.now += 500 * 1000;
+    assert.strictEqual(call(env, { headers: BEARER() }).accessFault.status, 401);
+    assert.strictEqual(calls, 1, 'answered from the cache until exp');
+    env.clock.now += 200 * 1000;
+    call(env, { headers: BEARER() });
+    assert.strictEqual(calls, 2, 'asked again after exp');
+});
+
+test('no answer: fail open; three failures open the breaker for 30 s', () => {
+    let calls = 0;
+    const env = jwtEnv({ tokenStatus: () => { calls++; return { status: 503, body: '' }; } });
+    for (let i = 0; i < 3; i++) {
+        const r = call(env, { headers: BEARER() });
+        assert.strictEqual(r.accessFault, null, 'let through ' + i);
+        assert.strictEqual(r.events.length, 1);
+    }
+    assert.strictEqual(calls, 3);
+    const r4 = call(env, { headers: BEARER() });
+    assert.strictEqual(r4.accessFault, null);
+    assert.strictEqual(calls, 3, 'breaker open: no call');
+    assert.ok(r4.msg.prints.some((p) => /revocation check: no answer \(breaker open/.test(p)), r4.msg.prints.join('\n'));
+    env.clock.now += 31000;
+    call(env, { headers: BEARER() });
+    assert.strictEqual(calls, 4, 'asked again after the breaker window');
+});
+
+test('a timeout and an unreadable body count as no answer; an answer resets nothing it should not', () => {
+    const answers = [{ error: 'timeout' }, { status: 200, body: 'nope' }, { status: 200, body: '{"revoked":"no"}' }, { status: 200, body: '{"revoked":false}' }];
+    let i = 0;
+    const env = jwtEnv({ kvm: { jti_breaker_failures: '5' }, tokenStatus: () => answers[i++] });
+    for (let n = 0; n < 4; n++) assert.strictEqual(call(env, { headers: BEARER() }).accessFault, null);
+    assert.strictEqual(i, 4);
+    assert.strictEqual(call(env, { headers: BEARER() }).revocationCalls.length, 0, 'the OK answer is cached');
+});
+
+test('jti_check_fallback = DENY: no answer is a 503 with Retry-After 5, not metered', () => {
+    const env = jwtEnv({ kvm: { jti_check_fallback: 'deny' }, tokenStatus: () => ({ error: 'connection refused' }) });
+    const r = call(env, { headers: BEARER() });
+    assert.strictEqual(r.accessFault.status, 503);
+    assert.strictEqual(r.accessFault.headers['Retry-After'], '5');
+    assert.deepStrictEqual(JSON.parse(r.accessFault.body), { error: 'temporarily_unavailable', error_description: 'REVOCATION_CHECK_UNAVAILABLE' });
+    assert.strictEqual(r.ingestCalls.length, 0);
+});
+
+test('not checked: jti_check_enabled = false, a token without jti or key_id, a token for another tenant', () => {
+    const off = jwtEnv({ kvm: { jti_check_enabled: 'false' } });
+    assert.strictEqual(call(off, { headers: BEARER() }).revocationCalls.length, 0);
+    const env = jwtEnv();
+    const r = call(env, { headers: BEARER('nojti') });
+    assert.strictEqual(r.accessFault, null);
+    assert.strictEqual(r.revocationCalls.length, 0);
+    const other = call(env, { headers: BEARER('other') });
+    assert.strictEqual(other.accessFault.status, 401);
+    assert.strictEqual(JSON.parse(other.accessFault.body).error_description, 'The token was not issued for this tenant');
+    assert.strictEqual(other.revocationCalls.length, 0, 'the tenant check runs first');
+    const plain = newEnv();
+    assert.strictEqual(call(plain, { headers: KEY }).revocationCalls.length, 0, 'jwt_validation off: never');
+});
+
+test('aforo_org_service_url missing: no call; ALLOW lets through and logs, DENY answers 503', () => {
+    const allow = jwtEnv({ kvm: { aforo_org_service_url: '' } });
+    const r = call(allow, { headers: BEARER() });
+    assert.strictEqual(r.accessFault, null);
+    assert.strictEqual(r.revocationCalls.length, 0);
+    assert.ok(r.msg.prints.some((p) => /aforo_org_service_url is not set/.test(p)));
+    const deny = jwtEnv({ kvm: { aforo_org_service_url: '', jti_check_fallback: 'DENY' } });
+    assert.strictEqual(call(deny, { headers: BEARER() }).accessFault.status, 503);
+});
+
+test('the cache key is per tenant and token', () => {
+    const env = jwtEnv();
+    call(env, { headers: BEARER() });
+    assert.ok(env.cache.has('aforo-jti__' + TENANT + '|jti-1|key-7'), [...env.cache.keys()].join(', '));
+    assert.strictEqual(env.cache.get('aforo-jti__' + TENANT + '|jti-1|key-7').value, 'OK');
+});
+
+test('jti_cache_seconds = 0: asks every time', () => {
+    const env = jwtEnv({ kvm: { jti_cache_seconds: '0' } });
+    call(env, { headers: BEARER() });
+    assert.strictEqual(call(env, { headers: BEARER() }).revocationCalls.length, 1);
+});
+
+test('jti_cache_seconds = 0: an answer resets the failure count, so alternating failures never open the breaker', () => {
+    let i = 0;
+    const env = jwtEnv({ kvm: { jti_cache_seconds: '0' }, tokenStatus: () => (i++ % 2 === 0
+        ? { status: 503, body: '' }
+        : { status: 200, body: '{"revoked":false}' }) });
+    for (let n = 0; n < 8; n++) {
+        const r = call(env, { headers: BEARER() });
+        assert.strictEqual(r.accessFault, null);
+        assert.strictEqual(r.revocationCalls.length, 1, 'asked on call ' + n + ' (breaker never opened)');
+    }
+    const entry = env.cache.get('aforo-jti__' + TENANT + '|jti-1|key-7');
+    assert.strictEqual(entry.value, 'F:0', 'the last answer reset the count');
+});
+
+test('jti_cache_seconds = 0: failures in a row still open the breaker', () => {
+    let calls = 0;
+    const env = jwtEnv({ kvm: { jti_cache_seconds: '0' }, tokenStatus: () => { calls++; return { status: 503, body: '' }; } });
+    for (let n = 0; n < 4; n++) call(env, { headers: BEARER() });
+    assert.strictEqual(calls, 3, 'breaker open after three');
 });
 
 report('apigee flow tests');

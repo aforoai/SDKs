@@ -1,66 +1,54 @@
 # Aforo Azure ARM Templates
 
-An Azure Resource Manager template that defines an Azure Policy denying deletion of API Management resources tagged as monetized by Aforo.
+An Azure Resource Manager template that defines and assigns an Azure Policy blocking deletion of the API Management resources Aforo bills on.
 
-**Version:** 1.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## When to reach for this
 
-Reach for this when you run Azure API Management and want a guardrail against accidentally deleting an APIM API or product that Aforo is actively billing on. It deploys an Azure Policy definition that **denies** delete operations on APIM APIs and products tagged `aforo-monetized=true`. Removal becomes a two-step you can't fat-finger: clear the monetized tag in Aforo first, then delete.
+Reach for this when you run Azure API Management and want a guardrail against deleting an APIM API or product that Aforo is billing on. The policy uses the `denyAction` effect: a `DELETE` on a protected resource is refused with `403`, and removal becomes a two-step you can't fat-finger — take the resource off the list, then delete.
 
-This is infrastructure-as-code you deploy into your own Azure subscription. There is no package to install and no metering here — APIM metering runs in the separate `azure-apim` policy fragments.
+There is no metering here; APIM metering runs in the `azure-apim` policy fragments.
 
 | Template | What it creates |
 |---|---|
-| `aforo-monetized-deny-policy.json` | An Azure Policy definition `aforo-deny-delete-monetized` (effect: `deny`) covering `Microsoft.ApiManagement/service/apis` and `.../products` tagged `aforo-monetized=true`. |
+| `aforo-monetized-deny-policy.json` | The policy definition `aforo-deny-delete-monetized` (effect `denyAction`, action `delete`) and its assignment at subscription scope. |
+
+## What it protects
+
+- **APIs and products you list** in `protectedResources`, as `<apim-service-name>/<api-or-product-id>` (the resource's `fullName`, for example `contoso-apim/orders-api`). APIM APIs and products do not support ARM tags, so they are matched by name.
+- **APIM services tagged `aforo-monetized=true`** (ARM tag on the `Microsoft.ApiManagement/service` resource), when `protectMonetizedServices` is `true` (default).
+
+Azure Policy does not block a child that is deleted together with its parent: deleting the APIM service deletes its APIs. That is why the service-level rule exists. A resource-group delete is not blocked by a policy in mode `All`; use a resource lock on the group for that.
 
 ## Install
-
-This is an ARM template, not a package. The repo is **not yet published** publicly; deploy the JSON directly.
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
 cd SDKs/aforo-gateway-plugins/azure-arm-templates
-```
 
-## Quickstart
-
-Deploy the policy definition at subscription scope, then assign it (deny policies only enforce once assigned):
-
-```bash
-# 1. Create the policy definition from the template's resource.
 az deployment sub create \
   --location eastus \
-  --template-file aforo-monetized-deny-policy.json
-
-# 2. Assign it so the deny effect takes hold.
-az policy assignment create \
-  --name aforo-deny-delete-monetized \
-  --policy aforo-deny-delete-monetized \
-  --scope "/subscriptions/<subscription-id>"
+  --template-file aforo-monetized-deny-policy.json \
+  --parameters protectedResources='["contoso-apim/orders-api","contoso-apim/gold"]'
 ```
 
 ## Configuration
 
-The template takes no parameters — the matched resource types and the `aforo-monetized=true` tag condition are fixed in the policy rule.
-
-| Field | Value | What it does |
+| Parameter | Default | |
 |---|---|---|
-| Policy name | `aforo-deny-delete-monetized` | The definition's name; reference it when assigning. |
-| `policyType` | `Custom` | A custom (not built-in) policy definition. |
-| `mode` | `All` | Evaluates resource types that don't support tags/location too. |
-| Matched types | `Microsoft.ApiManagement/service/apis`, `.../products` | The APIM resources protected. |
-| Tag condition | `tags['aforo-monetized'] == 'true'` | Only tagged resources are protected. |
-| Effect | `deny` on `actionType == delete` | Blocks the delete. |
+| `protectedResources` | `[]` | `<apim-service-name>/<api-or-product-id>` values |
+| `protectMonetizedServices` | `true` | also protect APIM services tagged `aforo-monetized=true` |
+| `enforcementMode` | `Default` | `DoNotEnforce` to evaluate without blocking |
 
-> ⚠ A policy **definition** does nothing until it's **assigned** to a scope. Step 2 of the quickstart is not optional — without the assignment the deny never fires.
+The assignment is created at subscription scope. To narrow it, delete it and assign the definition yourself with `az policy assignment create --scope <resource-group-id>`.
 
 ## Walk me through it
 
-Deploy the definition → assign it at the right scope → confirm a delete on a tagged resource is blocked: [USER_GUIDE.md](USER_GUIDE.md).
+[USER_GUIDE.md](USER_GUIDE.md).
 
 ## What this doesn't cover
 
-- **The metering itself.** APIM usage events come from the `azure-apim` policy fragments, not this template.
-- **Tagging resources.** Aforo applies `aforo-monetized=true` when a product is monetized; this policy only acts on already-tagged resources.
-- **Removing the guardrail to delete.** Clear the `aforo-monetized` tag in Aforo before deleting a protected resource — that's the intended workflow, not a bypass.
+- **The metering itself** — `azure-apim`.
+- **Keeping the list in step with Aforo.** Aforo does not update `protectedResources` for you; redeploy with the new list when a product starts or stops being billed.
+- **Resource-group deletion** (see above).

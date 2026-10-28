@@ -1,4 +1,4 @@
-# Aforo Usage Metering — policy definition (Mule 4 custom policy, 3.0.2).
+# Aforo Usage Metering — policy definition (Mule 4 custom policy, 3.1.2).
 #
 # API Manager renders the configuration form from this file, and Aforo's
 # deploy (organization-service) writes these properties on every API

@@ -34,9 +34,11 @@ end
 local rate_limit = require_sibling("rate-limit-enforce")
 local margin_guard = require_sibling("margin-guard")
 local preflight_quota = require_sibling("preflight-quota")
+local redis_util = require_sibling("redis-util")
+local unpack = unpack or table.unpack  -- luacheck: ignore 143
 
--- uuid() and iso8601_utc() live in event-util.lua, shared with
--- compound-metering.lua; see there for why each is the way it is.
+-- uuid() and iso8601_utc() live in event-util.lua; see there for why each is
+-- the way it is.
 local event_util = require_sibling("event-util")
 local event_buffer = require_sibling("event-buffer")
 local uuid = event_util.uuid
@@ -113,11 +115,10 @@ local function parse_jwt(token)
     return claims, header
 end
 
--- Shared dict backing the event buffer and the warning throttle below.
--- Declared here, above its first use: as a local defined further down it was
--- invisible to warn_throttled, which then silently resolved a nil global and
--- fell back to logging every time -- the throttle looked applied and did nothing.
-local BUFFER_DICT = "aforo_buffer"
+-- Warning throttles, revocation counters and the metric mappings live in the
+-- aforo_cache dict (event_util.cache_dict(): aforo_cache, else aforo_buffer
+-- with one error per worker). Events stay in aforo_buffer (event-buffer.lua).
+-- 2.8.0, G323: they used to share aforo_buffer with the events.
 
 -- Rate-limit a repeating warning to once per interval (2026-09-03).
 --
@@ -132,7 +133,7 @@ local BUFFER_DICT = "aforo_buffer"
 -- logging when the dict is unavailable: losing a warning entirely is worse than
 -- repeating it.
 local function warn_throttled(key, ttl, ...)
-    local dict = ngx.shared[BUFFER_DICT]
+    local dict = event_util.cache_dict()
     if not dict then
         kong.log.warn(...)
         return
@@ -168,7 +169,7 @@ end
 --   open: let it through, log (throttled) and count it.
 --
 -- Counted in two places:
---   1. shared dict "aforo_revocation_unavailable:<check>:<outcome>"
+--   1. shared dict "aforo_revocation_unavailable:<check>:<outcome>" (aforo_cache)
 --   2. Prometheus aforo_metering_revocation_check_unavailable_total{check,outcome}
 --      when Kong's prometheus plugin is loaded. Every touch is pcall-guarded.
 -- check = "jti" | "client", outcome = "closed" (refused) | "open" (let through).
@@ -199,7 +200,7 @@ local function get_prometheus_revocation_counter()
 end
 
 local function record_revocation_unavailable(check, outcome)
-    local dict = ngx.shared[BUFFER_DICT]
+    local dict = event_util.cache_dict()
     if dict then
         dict:incr(REVOCATION_UNAVAILABLE_PREFIX .. check .. ":" .. outcome, 1, 0)
     end
@@ -262,45 +263,98 @@ local function revocation_reason(conf, claims)
     if #lookups == 0 then return nil end
 
     -- Prefer dedicated jwt_redis_* config; fall back to rate_limit_redis_*.
-    -- The password goes with the server: rate_limit_redis_password is only
-    -- borrowed when the blocklist lives on the rate-limit Redis, so a
-    -- password-less blocklist Redis is not sent a password it would refuse.
+    -- The password and the TLS settings go with the server: the rate-limit
+    -- ones are only borrowed when the blocklist lives on the rate-limit
+    -- Redis, so a different blocklist Redis is not sent a password it would
+    -- refuse.
     local rl_host = conf.rate_limit_redis_host or "127.0.0.1"
     local rl_port = conf.rate_limit_redis_port or 6379
     local host = non_empty_string(conf.jwt_redis_host) or rl_host
     local port = conf.jwt_redis_port or rl_port
+    local same_server = (host == rl_host and port == rl_port)
     local password = non_empty_string(conf.jwt_redis_password)
-    if not password and host == rl_host and port == rl_port then
+    if not password and same_server then
         password = non_empty_string(conf.rate_limit_redis_password)
     end
-
-    local red = require("resty.redis"):new()
-    red:set_timeout(500)
-    local ok, err = red:connect(host, port)
-    if ok and password then
-        ok, err = red:auth(password)
-        if not ok then err = "AUTH failed: " .. tostring(err) end
+    -- jwt_redis_ssl has no default: unset means "as the rate-limit Redis"
+    -- on the same server, else plain.
+    local ssl = conf.jwt_redis_ssl
+    local ssl_verify = conf.jwt_redis_ssl_verify
+    local server_name = non_empty_string(conf.jwt_redis_server_name)
+    if ssl == nil or ssl == ngx.null then
+        ssl = same_server and conf.rate_limit_redis_ssl == true
+        if same_server and ssl then
+            if ssl_verify == nil or ssl_verify == ngx.null then
+                ssl_verify = conf.rate_limit_redis_ssl_verify
+            end
+            server_name = server_name or non_empty_string(conf.rate_limit_redis_server_name)
+        end
     end
-    if not ok then
-        if red.close then pcall(red.close, red) end
-        return revocation_unavailable(conf, lookups, 1, host, port, "connect: " .. tostring(err))
+
+    -- One connection, one round trip (2.8.0, G327): AUTH only on a new
+    -- connection (redis-util), then one GET per key, pipelined. Before 2.8.0
+    -- each key was its own GET with a 500 ms timeout and AUTH was sent on
+    -- every request, so a slow Redis cost up to 2 s per request.
+    --
+    -- Not MGET: organization-service writes jti:blocked:<jti> and
+    -- jti:client:<id> without a common hash tag, so on Redis Cluster and
+    -- ElastiCache Serverless the keys land in different slots and an MGET is
+    -- refused with CROSSSLOT -- which, failing closed, answered every JWT
+    -- request 503. Pipelined single-key GETs are still one round trip and
+    -- each is routed by itself on a proxy that routes per key. A classic
+    -- cluster node answers a key it does not own with MOVED; that error
+    -- reply is "Redis could not answer" (jti_redis_fail_mode), never
+    -- "not revoked".
+    local red, err = redis_util.connect({
+        host = host, port = port, password = password,
+        timeout_ms = conf.jwt_redis_timeout_ms or 250,
+        ssl = ssl == true, ssl_verify = ssl_verify, server_name = server_name,
+    })
+    if not red then
+        return revocation_unavailable(conf, lookups, 1, host, port, tostring(err))
     end
 
+    red:init_pipeline(#lookups)
+    for _, lookup in ipairs(lookups) do
+        red:get(lookup[1])
+    end
+    local values, perr = red:commit_pipeline()
+    if type(values) ~= "table" then
+        -- A broken connection or a timeout: no evidence either way. Do not
+        -- put a connection in an unknown state back into the pool.
+        redis_util.discard(red)
+        return revocation_unavailable(conf, lookups, 1, host, port,
+            "get: " .. tostring(perr or "no reply"))
+    end
+    -- A value is proof of revocation whatever the other keys answered. A key
+    -- that could not be read (an error reply such as { false, "MOVED ..." },
+    -- a missing answer, anything GET does not return) matters only when no
+    -- key holds a value: then that check could not run. The connection read
+    -- every reply, so it goes back to the pool either way.
+    local unreadable = {}
     for i, lookup in ipairs(lookups) do
-        local val, gerr = red:get(lookup[1])
+        local val = values[i]
         if type(val) == "string" then
-            red:set_keepalive(10000, 10)
+            redis_util.release(red)
             return lookup[2]
         end
         if val ~= ngx.null then
-            -- An error reply or a broken connection: no evidence either way.
-            -- Do not put a connection in an unknown state back into the pool.
-            if red.close then pcall(red.close, red) end
-            return revocation_unavailable(conf, lookups, i, host, port,
-                "get: " .. tostring(gerr or "no reply"))
+            local why = "unexpected reply"
+            if type(val) == "table" and val[1] == false then
+                why = tostring(val[2])
+            elseif val == nil then
+                why = "no reply"
+            end
+            unreadable[#unreadable + 1] = { lookup = lookup, why = why }
         end
     end
-    red:set_keepalive(10000, 10)
+    redis_util.release(red)
+    if #unreadable > 0 then
+        local failed = {}
+        for i, u in ipairs(unreadable) do failed[i] = u.lookup end
+        return revocation_unavailable(conf, failed, 1, host, port,
+            "get " .. unreadable[1].lookup[1] .. ": " .. unreadable[1].why)
+    end
     return nil
 end
 
@@ -327,7 +381,7 @@ end
 --      the token's kid, else conf.jwt_public_key (PEM, public key only)
 --   4. exp (required, numeric) and nbf (when present), with
 --      JWT_CLOCK_SKEW_SECONDS of leeway
---   5. iss, when conf.jwt_issuer is set
+--   5. iss (required unless jwt_issuer_check_disabled), aud when conf.jwt_audience is set
 --   6. tenant_id equals conf.tenant_id (Gowtham, 2026-10-12): org-service signs
 --      every tenant's tokens with one key, so a valid signature alone does not
 --      say which tenant the token is for
@@ -684,11 +738,50 @@ local function validate_jwt(token, conf)
         end
     end
 
-    -- 4. Issuer check
-    if non_empty_string(conf.jwt_issuer) and claims.iss ~= conf.jwt_issuer then
+    -- 4. Issuer. Required (2.8.0, G326): before, a blank jwt_issuer skipped
+    -- the check, so a token from any issuer whose key verified was accepted.
+    -- Without jwt_issuer the plugin now refuses JWTs (500, the gateway is
+    -- misconfigured, not the caller) unless jwt_issuer_check_disabled is set
+    -- on purpose. The schema refuses that combination for new configs.
+    local issuer = non_empty_string(conf.jwt_issuer)
+    if not issuer then
+        if conf.jwt_issuer_check_disabled ~= true then
+            warn_throttled("jwt_no_issuer", 60,
+                "[aforo-metering] jwt_validation_enabled is set but jwt_issuer is not: JWTs are ",
+                "refused with 500 ISSUER_NOT_CONFIGURED. Set jwt_issuer (Aforo: https://auth.aforo.ai), ",
+                "or set jwt_issuer_check_disabled = true to accept any issuer. Repeats suppressed for 60s.")
+            return { valid = false, reason = "ISSUER_NOT_CONFIGURED", status = 500 }
+        end
+    elseif claims.iss ~= issuer then
         kong.log.warn("[aforo-metering] JWT issuer mismatch: got '", tostring(claims.iss),
-            "', expected '", conf.jwt_issuer, "'")
+            "', expected '", issuer, "'")
         return { valid = false, reason = "INVALID_ISSUER" }
+    end
+
+    -- 4b. Audience (2.8.0, G326). With jwt_audience set, the token's aud (a
+    -- string or an array of strings) must name one of them; a token without
+    -- aud is refused. Unset: aud is not checked -- Aforo's issuer
+    -- (organization-service) mints tokens without aud and binds them to the
+    -- tenant instead (step 5).
+    local audiences = conf.jwt_audience
+    if type(audiences) == "table" and #audiences > 0 then
+        local aud = raw.aud
+        local list = (type(aud) == "string" and { aud }) or (type(aud) == "table" and aud) or {}
+        local matched = false
+        for _, a in ipairs(list) do
+            if type(a) == "string" then
+                for _, want in ipairs(audiences) do
+                    if a == want then matched = true; break end
+                end
+            end
+            if matched then break end
+        end
+        if not matched then
+            warn_throttled("jwt_audience", 60,
+                "[aforo-metering] JWT rejected: aud does not name any of jwt_audience. ",
+                "Repeats suppressed for 60s.")
+            return { valid = false, reason = "INVALID_AUDIENCE" }
+        end
     end
 
     -- 5. Tenant binding (Gowtham, 2026-10-12). Without it a token minted for
@@ -740,7 +833,7 @@ end
 
 local AforoMeteringHandler = {
     PRIORITY = 5,    -- Run after most other plugins
-    VERSION  = "2.6.0",
+    VERSION  = "2.8.2",
 }
 
 -- The event buffer and its delivery to the ingestor live in event-buffer.lua.
@@ -1234,9 +1327,8 @@ end
 --     re-attributing live traffic to default_metric, which is a revenue bug that
 --     looks like nothing at all.
 --
--- Cached in the existing aforo_buffer dict on purpose: requiring a second
--- lua_shared_dict would add a deployment step operators forget, and a missing
--- dict already costs this plugin all of its metering.
+-- Cached in aforo_cache (2.8.0, G323; aforo_buffer until 2.7.0, and still
+-- when aforo_cache is not declared -- see event_util.cache_dict()).
 --
 -- Keyed by tenant_id + mappings_url (2026-10-12 fix). The cache used to be one
 -- global key, so with two plugin instances the second tenant's traffic was
@@ -1249,7 +1341,7 @@ end
 local function fetch_mappings(premature, conf)
     if premature then return end
 
-    local dict = ngx.shared[BUFFER_DICT]
+    local dict = event_util.cache_dict()
     if not dict then return end
 
     local httpc = http.new()
@@ -1302,7 +1394,7 @@ end
 local function maybe_refresh_mappings(conf)
     if not conf.mappings_url or conf.mappings_url == "" then return end
 
-    local dict = ngx.shared[BUFFER_DICT]
+    local dict = event_util.cache_dict()
     if not dict then return end
 
     local key = mappings_key(conf)
@@ -1340,7 +1432,7 @@ local function mapping_matches(path, rule)
 end
 
 local function metric_from_cached_mappings(conf, path)
-    local dict = ngx.shared[BUFFER_DICT]
+    local dict = event_util.cache_dict()
     if not dict then return nil end
     if not conf.mappings_url or conf.mappings_url == "" then return nil end
     local raw = dict:get(mappings_key(conf))
@@ -1651,6 +1743,26 @@ local function resolve_customer_id(conf, consumer, headers)  -- luacheck: ignore
         return usable_customer_id(consumer.custom_id)
             or usable_customer_id(consumer.username)
             or usable_customer_id(consumer.id)
+    end
+    return nil
+end
+
+-- The Aforo API-key id of a token whose signature was verified, for rate
+-- limiting (2.7.0, G328): this plugin's own check (jwt_validation_enabled,
+-- signature_verified) first, else a token Kong's jwt plugin verified. A token
+-- let through by jwt_allow_unverified_signature names no key. Returns nil
+-- when there is none.
+local function verified_key_id()
+    local claims = kong.ctx.shared and kong.ctx.shared.aforo_jwt_claims
+    if type(claims) == "table" then
+        if claims.signature_verified == true then
+            return non_empty_string(claims.key_id)
+        end
+        return nil
+    end
+    local kong_claims = verified_jwt_claims()
+    if kong_claims then
+        return non_empty_string(claim_string(kong_claims.key_id))
     end
     return nil
 end
@@ -2011,6 +2123,13 @@ function AforoMeteringHandler:access(conf)
                 error_description = result.reason,
             }, { ["Retry-After"] = "1" })
         end
+        if not result.valid and result.status == 500 then
+            -- The plugin is misconfigured (no jwt_issuer); fail closed.
+            return kong.response.exit(500, {
+                error             = "server_error",
+                error_description = result.reason,
+            })
+        end
         if not result.valid then
             kong.log.warn("[aforo-metering] JWT rejected (", result.reason, ")")
             return kong.response.exit(401, {
@@ -2040,15 +2159,19 @@ function AforoMeteringHandler:access(conf)
     -- there. In the access phase kong.response.exit only records the
     -- response, so carrying on would run the later checks -- and could answer
     -- twice.
-    if rate_limit.enforce(conf) then
-        return
-    end
-
+    --
     -- resolve_customer_id() prefers the JWT-validated claim stashed above;
     -- falls back to Kong consumer identity (credential-bound). Never reads
     -- request headers or query params — those sources were removed 2026-04-23.
+    -- Resolved before the rate limit so PER_CUSTOMER counts the same verified
+    -- customer the log phase bills.
     local consumer = kong.client.get_consumer()
     local customer_id = resolve_customer_id(conf, consumer)
+
+    if conf.rate_limit_enabled and rate_limit.enforce(conf, {
+            key_id = verified_key_id(), customer_id = customer_id }) then
+        return
+    end
 
     -- Pre-flight quota check against the ingestor (2026-09-21). The module was
     -- written and packaged in the rockspec but never called, so quotas and
@@ -2060,8 +2183,14 @@ function AforoMeteringHandler:access(conf)
     -- and nothing for a request that will not be billed: an MCP initialize
     -- or tools/list is never refused for a spent tool-call quota.
     if conf.preflight_quota_enabled then
+        -- The quantity known before the upstream answers (2.8.0, G334): a
+        -- fixed numeric quantity_source. Response-derived quantities
+        -- (quantity_header, response_size) are not known yet; the ingestor
+        -- then assumes 1.
+        local source = conf.quantity_source
+        local qty = (source ~= "response_size") and tonumber(source) or nil
         for _, metric in ipairs(preflight_metrics(conf, product_type, consumer)) do
-            if preflight_quota.check(conf, customer_id, metric) then
+            if preflight_quota.check(conf, customer_id, metric, qty) then
                 return  -- answered 429/503; skip the remaining checks
             end
         end
