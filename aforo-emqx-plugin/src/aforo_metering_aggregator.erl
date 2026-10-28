@@ -46,7 +46,9 @@
     record/5,
     close_windows/1,
     close_windows/2,
+    close_open_windows/2,
     close_all/0,
+    reconfigure/0,
     open_keys/0,
     settings/0,
     excluded/1
@@ -56,7 +58,7 @@
 -define(EMITTED, aforo_metering_agg_emitted).
 -define(SETTINGS, {?MODULE, settings}).
 -define(GRACE_MS, 1000).
--define(SDK_VERSION, <<"2.0.0">>).
+-define(SDK_VERSION, <<"2.0.1">>).
 %% IngestUsageEventRequest.mqttTopic is @Size(max = 500). Truncating at
 %% 500 bytes keeps it within 500 UTF-16 code units.
 -define(MAX_TOPIC_BYTES, 500).
@@ -72,7 +74,14 @@ init() ->
     %% oldest open window (used when pruning emission counters).
     ensure(?TAB, [named_table, public, ordered_set, {write_concurrency, true}, {read_concurrency, true}]),
     ensure(?EMITTED, [named_table, public, set]),
-    persistent_term:put(?SETTINGS, #{
+    persistent_term:put(?SETTINGS, current_settings(#{
+        node => atom_to_binary(node(), utf8),
+        incarnation => crypto:strong_rand_bytes(16)
+    })),
+    ok.
+
+current_settings(Identity) ->
+    Identity#{
         window_ms => aforo_metering_config:aggregation_window_ms(),
         by_topic => aforo_metering_config:aggregate_by_topic(),
         max_keys => aforo_metering_config:max_aggregation_keys(),
@@ -80,11 +89,29 @@ init() ->
         exclude => [binary:split(F, <<"/">>, [global])
                     || F <- aforo_metering_config:exclude_topics()],
         tenant => aforo_metering_config:tenant_id(),
-        product => aforo_metering_config:product_id(),
-        node => atom_to_binary(node(), utf8),
-        incarnation => crypto:strong_rand_bytes(16)
-    }),
-    ok.
+        product => aforo_metering_config:product_id()
+    }.
+
+%% Re-read the settings after a config change (flusher process only, so
+%% no tick interleaves). The node and incarnation stay: the idempotency
+%% keys of usage already counted must not change. Returns `reshaped'
+%% when the window length or the topic dimension changed -- the caller
+%% then closes the windows opened under the old shape at once
+%% (close_open_windows/2), sending them as partial windows. A hook that
+%% read the old settings an instant before the swap can still add to an
+%% old-shape row after that; the row keeps its count and closes on a
+%% later tick (its metadata names the new window length). Counts are
+%% never lost or doubled: a row emitted twice gets a new emission
+%% number, so a new idempotency key.
+-spec reconfigure() -> unchanged | reshaped.
+reconfigure() ->
+    Old = settings(),
+    New = current_settings(maps:with([node, incarnation], Old)),
+    persistent_term:put(?SETTINGS, New),
+    case maps:with([window_ms, by_topic], Old) =:= maps:with([window_ms, by_topic], New) of
+        true -> unchanged;
+        false -> reshaped
+    end.
 
 ensure(Name, Opts) ->
     case ets:info(Name) of
@@ -193,6 +220,19 @@ close_windows(NowMs, Limit) ->
         0 -> NowMs;
         _ -> NowMs - WindowMs - ?GRACE_MS
     end,
+    close_upto(Cutoff, NowMs, Limit).
+
+%% Close every window that has started, finished or not (used when the
+%% window shape changes). Rows still waiting for a customer stay pending
+%% as usual; rows beyond Limit stay in the table and close on later ticks.
+-spec close_open_windows(integer(), non_neg_integer() | infinity) ->
+    {[map()], non_neg_integer()}.
+close_open_windows(_NowMs, 0) -> {[], 0};
+close_open_windows(NowMs, Limit) ->
+    close_upto(NowMs, NowMs, Limit).
+
+close_upto(Cutoff, NowMs, Limit) ->
+    #{window_ms := WindowMs} = settings(),
     Rows = ets:select(?TAB, [{{{'$1', '_', '_', '_', '_'}, '_', '_'},
                               [{'=<', '$1', Cutoff}], ['$_']}]),
     PendingMax = aforo_metering_config:pending_max_ms(),

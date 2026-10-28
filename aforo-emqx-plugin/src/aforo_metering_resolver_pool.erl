@@ -29,7 +29,7 @@
 
 -include("aforo_metering_emqx.hrl").
 
--export([start_link/0, request/4, stats/0]).
+-export([start_link/0, request/4, stats/0, reconfigure/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(SWEEP_MS, 30000).
@@ -58,6 +58,14 @@ request(Tenant, ClientId, Inputs, Ref) ->
 stats() ->
     gen_server:call(?MODULE, stats).
 
+%% Apply the current config snapshot. A larger pool starts queued
+%% lookups at once; a smaller one lets running lookups finish. Lookups
+%% already queued are kept even when the queue is now over its size
+%% (new ones are refused until it is back under).
+-spec reconfigure() -> ok.
+reconfigure() ->
+    gen_server:call(?MODULE, reconfigure, 5000).
+
 init([]) ->
     process_flag(trap_exit, true),
     erlang:send_after(?SWEEP_MS, self(), sweep),
@@ -66,6 +74,10 @@ init([]) ->
 
 handle_call(stats, _From, St) ->
     {reply, #{queued => maps:size(St#st.queued), running => maps:size(St#st.running)}, St};
+handle_call(reconfigure, _From, St) ->
+    St1 = St#st{max_workers = aforo_metering_config:http_resolver_workers(),
+                max_queue = aforo_metering_config:http_resolver_queue_size()},
+    {reply, ok, dispatch(St1)};
 handle_call(_Req, _From, St) ->
     {reply, {error, unknown_call}, St}.
 

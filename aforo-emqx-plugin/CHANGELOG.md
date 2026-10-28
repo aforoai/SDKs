@@ -4,12 +4,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [Unreleased]
 
-- Run 2.0.0 inside a real EMQX 5.7+ broker (hooks, `client_attrs`, plugin config through `emqx_conf`) — not yet done.
+- Run 2.0.1 inside a real EMQX 5.7+ broker (install of the package, hooks, `client_attrs`, plugin config and `on_config_changed`) — not yet done.
 - Load test (10K msg/sec sustained, 100K peak per node) — not yet run.
-- CI pipeline (rebar3 compile + eunit + ct), GPG-signed release tarballs, marketplace publish — not yet built.
+- GPG-signed release packages, marketplace publish — not yet built. (CI now runs eunit and builds the package.)
 - HTTP endpoint exposing `aforo_metering:health/0` — needs a separate dashboard plugin module.
 
 See [`TODO.md`](TODO.md) for the full production-hardening checklist.
+
+## [2.0.1] — 2026-10-28
+
+**Breaking for 2.0.0 configs** (2.0.0 never read them — see below). Tested on plain Erlang/OTP; **not run inside a real EMQX broker**.
+
+### Fixed
+
+- **Every setting was silently ignored.** 2.0.0 read each key with `emqx_conf:get([aforo_metering, Key], Default)`. `emqx_conf` holds EMQX's own config tree, which has no `aforo_metering` root, so every call returned its default: usage went out as `tenant_default` / `prod_mqtt_default` with an empty API key, whatever the operator configured. The plugin now reads its config the way EMQX plugins do: `emqx_plugin_helper:get_config(<<"aforo_metering-2.0.1">>)`, which calls `emqx_plugins:get_config/1` and accepts both its return shapes (`{ok, Map}` before EMQX 5.9, `Map` from 5.9). If EMQX cannot return the config, the plugin logs `aforo_metering could not read its plugin config` and refuses to start.
+- **The package could not be installed.** 2.0.0 built a plain relx tarball (`rebar3 tar`) with no `release.json`, which `emqx ctl plugins install` needs. The build now follows the official EMQX plugin template: `rebar3 emqx_plugrel tar` → `_build/default/emqx_plugrel/aforo_metering-2.0.1.tar.gz` with `release.json` (compatibility `emqx ~> 5.7`), `README.md` and the apps `aforo_metering`, `emqx_plugin_helper` and `jsone`. The EMQX headers come from `emqx_plugin_helper`, so building no longer needs an EMQX source tree; `emqx` is no longer listed as an application dependency (it is the host, not something the package can carry).
+- **`${AFORO_API_KEY}` was never substituted.** EMQX does not resolve environment variables in plugin config; the shipped sample sent the literal text as the key. The plugin now refuses `${…}` values with a message saying where to set the key.
+
+### Added
+
+- `priv/config.hocon` (the defaults EMQX installs) and `priv/config_schema.avsc` (Avro schema: every setting with type and default; `tenant_id`, `product_id`, `api_key`, `ingestor_url` required; `api_key` and `customer_resolver_http_authorization` declared as password inputs). EMQX checks every change against the schema; the build checks the defaults against it.
+- `on_config_changed/2` on `aforo_metering_app` (EMQX 5.8+): a config change made through the Dashboard or `PUT /api/v5/plugins/aforo_metering-2.0.1/config` is validated and applied to the running plugin with nothing queued dropped — key/URL/TLS/timeouts on the next request (a paused delivery is retried at once, keeping the idempotency keys), batch size, interval and queue size in the flusher (a smaller queue is reached by sending, not evicting), aggregation settings and `exclude_topics` (a new window length or topic dimension sends the open windows at once as partial windows), resolver pool size. Refused: anything `validate` refuses, and a change of `tenant_id` / `product_id` while running. On 5.9+ a refused change is not saved; 5.8 saves it regardless (the running plugin keeps its config and logs the reason); 5.7 has no callback — restart the plugin.
+- `on_health_check/1` (EMQX 5.9+): reports a missing CA bundle and a paused delivery.
+- Startup refuses an empty or placeholder `tenant_id` (`tenant_default`), `product_id` (`prod_mqtt_default`), `api_key` (empty, `${…}`, `sk_live_...`) and an empty `ingestor_url`, and names unknown config keys in a warning. The config is logged at start with secrets masked.
+
+### Changed
+
+- **The config is top-level keys**, not an `aforo_metering { ... }` block (a wrapped config is refused with a message). It lives in `$EMQX_DATA_DIR/plugins/aforo_metering/config.hocon` and is changed through the Dashboard or REST API, not by editing a file in the release.
+- `exclude_topics` and the aggregation settings can change at runtime (were read at start only).
+- `emqx ctl plugins install` takes the name-version (`aforo_metering-2.0.1`) of a package in the plugin directory, not a file path; the README and user guide were wrong about this.
+- `sdkVersion` in event metadata and the User-Agent are `2.0.1`. Licence in `aforo_metering.app.src` corrected to Apache-2.0 (it said MIT; the repository is Apache-2.0).
+
+### Upgrading from 2.0.0
+
+Install the 2.0.1 package, then set `tenant_id`, `product_id` and `api_key` (and anything you changed in 2.0.0's `aforo_metering.hocon`) through the Dashboard or REST API, as top-level keys. Your 2.0.0 settings were never in effect, so check what 2.0.0 sent before trusting its usage history: it went out under `tenant_default` with an empty key, which the ingestor refuses, so expect none to have been accepted.
 
 ## [2.0.0] — 2026-10-27
 

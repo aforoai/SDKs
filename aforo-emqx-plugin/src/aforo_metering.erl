@@ -24,6 +24,8 @@
     cleanup/0,
     health/0,
     flush_now/0,
+    on_config_changed/2,
+    on_health_check/1,
     %% Hook callbacks
     on_client_connected/3,
     on_client_disconnected/4,
@@ -33,7 +35,7 @@
     on_session_unsubscribed/4
 ]).
 
--define(VERSION, <<"2.0.0">>).
+-define(VERSION, <<"2.0.1">>).
 
 %%--------------------------------------------------------------------
 %% Lifecycle (aforo_metering_app)
@@ -71,7 +73,8 @@ load() ->
         aggregate_by_topic => aforo_metering_config:aggregate_by_topic(),
         flush_count => aforo_metering_config:flush_count(),
         flush_interval_ms => aforo_metering_config:flush_interval_ms(),
-        max_buffer_size => aforo_metering_config:max_buffer_size()
+        max_buffer_size => aforo_metering_config:max_buffer_size(),
+        config => aforo_metering_config:redacted(aforo_metering_config:snapshot())
     }),
     ok.
 
@@ -115,6 +118,123 @@ health() ->
 -spec flush_now() -> ok.
 flush_now() ->
     aforo_metering_flusher:flush().
+
+%%--------------------------------------------------------------------
+%% EMQX plugin callbacks (called through aforo_metering_app)
+%%--------------------------------------------------------------------
+
+%% EMQX 5.8+ calls this on every node when the plugin config is changed
+%% through the Dashboard or `PUT /api/v5/plugins/{name-vsn}/config',
+%% also while the plugin is installed but stopped. On 5.9+ returning
+%% `{error, Reason}' rejects the change (it is not saved); 5.8 ignores
+%% the return value and saves the change anyway, so a refused change is
+%% also logged at error and the running plugin keeps its current config.
+%% (5.7 has no callback: restart the plugin after a change.)
+%%
+%% NewConfig has already passed priv/config_schema.avsc. Checks here are
+%% the same on every node (no file or network checks -- see
+%% aforo_metering_config:validate/1); node-local problems show in
+%% on_health_check/1.
+%%
+%% While running, the change is applied in place, nothing queued is
+%% dropped:
+%%   * delivery settings (URL, key, CA, timeouts, retries) take effect
+%%     on the next request, and a paused delivery is retried at once;
+%%   * flush_count / flush_interval_ms / max_buffer_size and the
+%%     aggregation settings are applied inside the flusher between
+%%     ticks; a new window length or topic dimension closes the open
+%%     windows at once (sent as partial windows);
+%%   * the http resolver pool takes the new worker and queue sizes;
+%%     customers already resolved stay cached until their connection
+%%     ends, so publishers stay attributed.
+%% tenant_id and product_id cannot change while running: usage already
+%% counted belongs to the old ones. Stop the plugin, change them, start.
+-spec on_config_changed(map(), map()) -> ok | {error, binary()}.
+on_config_changed(_OldConfig, NewConfig) when is_map(NewConfig) ->
+    Candidate = aforo_metering_config:normalize(NewConfig),
+    case aforo_metering_config:validate(Candidate) of
+        {error, Reasons} ->
+            [?SLOG(error, #{msg => "aforo_metering rejected a config change", reason => R})
+             || R <- Reasons],
+            {error, join(Reasons)};
+        ok ->
+            case is_running() of
+                false ->
+                    ok = aforo_metering_config:put_snapshot(Candidate),
+                    ?SLOG(info, #{msg => "aforo_metering config stored; applied when the plugin starts"}),
+                    ok;
+                true ->
+                    apply_running(Candidate)
+            end
+    end;
+on_config_changed(_OldConfig, _NewConfig) ->
+    {error, <<"the plugin config must be a map">>}.
+
+apply_running(Candidate) ->
+    Current = aforo_metering_config:snapshot(),
+    Changed = [K || {K, _, _} <- aforo_metering_config:spec(),
+                    maps:get(K, Current, undefined) =/= maps:get(K, Candidate, undefined)],
+    Identity = [K || K <- [tenant_id, product_id], lists:member(K, Changed),
+                     value(K, Current) =/= value(K, Candidate)],
+    case Identity of
+        [] when Changed =:= [] ->
+            ok = aforo_metering_config:put_snapshot(Candidate),
+            ok;
+        [] ->
+            ok = aforo_metering_config:put_snapshot(Candidate),
+            Shape = try aforo_metering_flusher:reconfigure() of
+                        {ok, S} -> S
+                    catch C1:R1 ->
+                        ?SLOG(error, #{msg => "aforo_metering flusher did not take the new config; "
+                                              "it applies when the flusher restarts",
+                                       class => C1, reason => R1}),
+                        unknown
+                    end,
+            try aforo_metering_resolver_pool:reconfigure()
+            catch C2:R2 ->
+                ?SLOG(error, #{msg => "aforo_metering resolver pool did not take the new config; "
+                                      "it applies when the pool restarts",
+                               class => C2, reason => R2})
+            end,
+            ?SLOG(info, #{msg => "aforo_metering config applied", changed => Changed,
+                          windows => Shape}),
+            ok;
+        _ ->
+            Reason = <<"tenant_id and product_id cannot change while the plugin is running ",
+                       "(usage already counted belongs to the current ones); stop the plugin, ",
+                       "change them, then start it">>,
+            ?SLOG(error, #{msg => "aforo_metering rejected a config change", reason => Reason,
+                           keys => Identity}),
+            {error, Reason}
+    end.
+
+value(K, Conf) ->
+    case maps:get(K, Conf, <<>>) of
+        V when is_binary(V) -> string:trim(V);
+        V when is_list(V) -> string:trim(unicode:characters_to_binary(V));
+        V -> V
+    end.
+
+%% EMQX 5.9+ calls this when the plugin's info is requested.
+-spec on_health_check(map()) -> ok | {error, binary()}.
+on_health_check(_Options) ->
+    case aforo_metering_config:check_environment() of
+        {error, Reasons} -> {error, join(Reasons)};
+        ok ->
+            Status = try aforo_metering_flusher:status() catch _:_ -> undefined end,
+            case Status of
+                undefined -> ok;
+                #{circuit := open, consecutive_failures := N, queue_depth := Q} ->
+                    {error, iolist_to_binary(io_lib:format(
+                        "delivery to the Aforo ingestor is paused after ~b failed sends; "
+                        "~b usage events queued", [N, Q]))};
+                _ -> ok
+            end
+    end.
+
+is_running() -> whereis(aforo_metering_flusher) =/= undefined.
+
+join(Reasons) -> iolist_to_binary(lists:join(<<"; ">>, Reasons)).
 
 %%--------------------------------------------------------------------
 %% Hook callbacks

@@ -24,7 +24,14 @@
 %%%     successful send resets n;
 %%%   * `drain/1' (plugin stop) closes every window, then keeps sending
 %%%     until the queue is empty or the shutdown deadline passes; what is
-%%%     left is counted as dropped.
+%%%     left is counted as dropped;
+%%%   * `reconfigure/0' (a config change while running) applies the new
+%%%     settings in this process, between ticks: batch size, interval and
+%%%     queue size; the aggregation settings (a changed window shape
+%%%     closes the open windows at once); a paused delivery is retried at
+%%%     once so a fixed API key or URL takes effect. Nothing queued is
+%%%     dropped: a smaller `max_buffer_size' is reached by sending, not by
+%%%     evicting.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(aforo_metering_flusher).
@@ -32,7 +39,7 @@
 
 -include("aforo_metering_emqx.hrl").
 
--export([start_link/0, start_link/1, wake/0, flush/0, drain/1, status/0]).
+-export([start_link/0, start_link/1, wake/0, flush/0, drain/1, status/0, reconfigure/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 -export([cooldown_ms/2]).
 
@@ -44,7 +51,11 @@
 -record(st, {
     q = queue:new(),
     len = 0 :: non_neg_integer(),
+    %% Effective cap. Above target_max only after max_buffer_size was
+    %% lowered with more than that queued; it then falls back to
+    %% target_max as the queue drains (relax_cap/1), so nothing is evicted.
     max_len :: pos_integer(),
+    target_max :: pos_integer(),
     batch :: pos_integer(),
     interval :: pos_integer(),
     inflight = undefined :: undefined | {pid(), reference(), [map()]},
@@ -90,13 +101,20 @@ drain(TimeoutMs) ->
 status() ->
     gen_server:call(?MODULE, status, 2000).
 
+%% Apply the current config snapshot (aforo_metering:on_config_changed/2).
+-spec reconfigure() -> {ok, unchanged | reshaped}.
+reconfigure() ->
+    gen_server:call(?MODULE, reconfigure, 10000).
+
 %%--------------------------------------------------------------------
 
 init(TransportOpts) ->
     process_flag(trap_exit, true),
     Flag = atomics:new(1, []),
     persistent_term:put(?WAKE_FLAG, Flag),
-    St = #st{max_len = aforo_metering_config:max_buffer_size(),
+    Max = aforo_metering_config:max_buffer_size(),
+    St = #st{max_len = Max,
+             target_max = Max,
              batch = aforo_metering_config:flush_count(),
              interval = aforo_metering_config:flush_interval_ms(),
              transport_opts = TransportOpts},
@@ -120,6 +138,22 @@ handle_call(flush, From, St0) ->
         true -> {reply, ok, St2};
         false -> {noreply, maybe_send(St2#st{flush_waiters = [From | St2#st.flush_waiters]})}
     end;
+handle_call(reconfigure, _From, St0) ->
+    Shape = aforo_metering_aggregator:reconfigure(),
+    Target = aforo_metering_config:max_buffer_size(),
+    St1 = relax_cap(St0#st{batch = aforo_metering_config:flush_count(),
+                           interval = aforo_metering_config:flush_interval_ms(),
+                           target_max = Target,
+                           max_len = max(St0#st.max_len, Target)}),
+    St2 = case Shape of
+        reshaped -> close_open_windows(St1);
+        unchanged -> St1
+    end,
+    %% A pause (breaker open) is cut short: the change may be the fix
+    %% (new API key, URL or CA). The backoff count is kept, so a send
+    %% that fails again pauses for longer.
+    St3 = St2#st{open_until = undefined, auth_logged = false},
+    {reply, {ok, Shape}, maybe_send(St3)};
 handle_call({drain, TimeoutMs}, _From, St) ->
     Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
     {Reply, St1} = do_drain(St, Deadline),
@@ -131,7 +165,7 @@ handle_cast(_Msg, St) ->
     {noreply, St}.
 
 handle_info(tick, St0) ->
-    St1 = maybe_send(close_windows(St0)),
+    St1 = maybe_send(close_windows(relax_cap(St0))),
     erlang:send_after(St1#st.interval, self(), tick),
     {noreply, St1};
 handle_info(wake, St0) ->
@@ -177,14 +211,26 @@ terminate(Reason, St) ->
 %% failed send never pushes freshly closed events out. The rest stay in
 %% the counter table until the next tick.
 close_windows(St) ->
-    InFlight = case St#st.inflight of
-        {_, _, Batch} -> length(Batch);
-        undefined -> 0
-    end,
-    Room = max(0, St#st.max_len - St#st.len - InFlight),
     {Events, _Unresolved} = aforo_metering_aggregator:close_windows(
-                              erlang:system_time(millisecond), Room),
+                              erlang:system_time(millisecond), room(St)),
     enqueue(Events, St).
+
+%% After a change of window shape: every started window, within the room.
+close_open_windows(St) ->
+    {Events, _Unresolved} = aforo_metering_aggregator:close_open_windows(
+                              erlang:system_time(millisecond), room(St)),
+    enqueue(Events, St).
+
+room(St) -> max(0, St#st.max_len - St#st.len - inflight_len(St)).
+
+inflight_len(#st{inflight = {_, _, Batch}}) -> length(Batch);
+inflight_len(#st{inflight = undefined}) -> 0.
+
+%% Bring a raised cap back down towards target_max, never below what is
+%% held (queued + in flight).
+relax_cap(St = #st{max_len = Max, target_max = Target}) when Max =< Target -> St;
+relax_cap(St = #st{target_max = Target}) ->
+    St#st{max_len = max(Target, St#st.len + inflight_len(St))}.
 
 enqueue(Events, St) ->
     St1 = lists:foldl(fun(E, S) -> S#st{q = queue:in(E, S#st.q), len = S#st.len + 1} end,
@@ -240,7 +286,7 @@ maybe_send(St) ->
     end.
 
 after_send(St0) ->
-    St = reply_waiters(St0),
+    St = reply_waiters(relax_cap(St0)),
     case St#st.open_until of
         undefined when St#st.len > 0 -> maybe_send(St);
         _ -> St

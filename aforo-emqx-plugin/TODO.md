@@ -59,12 +59,13 @@ Eliminates the race window in the previous single-table design where `ets:foldl`
 Replaced items 1, 2 and 5 below: one aggregator (hooks bump `ets:update_counter/4`), one flusher gen_server owning the queue and the single in-flight request, the SDK transport rules, TLS verification, identity from EMQX authentication (`client_attrs`), async http resolver with a negative cache. See CHANGELOG 2.0.0.
 
 Open:
-- [ ] Load 2.0.0 into a real EMQX 5.7+ broker and check: hooks fire with the ClientInfo shape assumed, `client_attrs` from JWT/HTTP authn reaches `client.connected`, and `emqx_conf:get([aforo_metering, Key])` actually returns the plugin's HOCON values (carried over from 0.1.0, never verified).
+- [x] Config read from the wrong place: 2.0.0 used `emqx_conf:get([aforo_metering, Key])`, which never held the plugin's settings, so every key fell back to its default. Fixed in 2.0.1 (`emqx_plugin_helper:get_config/1`, emqx_plugrel package with `release.json`, `priv/config.hocon` + `priv/config_schema.avsc`, `on_config_changed/2`).
+- [ ] Load 2.0.1 into real EMQX brokers (5.7, 5.8, 5.9+) and check: `emqx ctl plugins install` accepts the package; the config set through the Dashboard / REST API reaches `aforo_metering_config` (both `emqx_plugins:get_config/1` shapes); `on_config_changed/2` is called and applied (and refused changes rejected on 5.9+); hooks fire with the ClientInfo shape assumed; `client_attrs` from JWT/HTTP authn reaches `client.connected`; the bundled `jsone` coexists with EMQX's own copy.
 - [ ] Customers of clients connected before the plugin started are unknown on `message.publish` (no ClientInfo there); look them up through EMQX's channel registry.
 - [ ] The copy in `aforo-nextgen-docker/emqx-plugin-aforo-metering/` is still the 0.1.0 code; sync it after this lands.
 - [ ] Product decision: the MQTT_BROKER descriptor templates "Messages Published" / "Retained Messages" use COUNT; with aggregation on they must be SUM on quantity (or the default window set to 0).
 - [ ] At shutdown, a batch cut off mid-send is counted wholly as dropped even if part of it arrived (accounting only; the ingestor dedups any re-send).
-- [ ] Hot reload of aggregation settings / `exclude_topics` (read at start today).
+- [x] Hot reload of aggregation settings / `exclude_topics` — 2.0.1 `on_config_changed/2` (EMQX 5.8+).
 
 ## 6. Load Test
 
@@ -88,7 +89,7 @@ Open:
 
 ## 8. Release Engineering
 
-- [ ] CI pipeline: rebar3 compile + eunit + ct on every push
+- [x] CI pipeline: eunit + `rebar3 emqx_plugrel tar` (release.json checked) on every push (2.0.1)
 - [ ] Release tarball signing (GPG)
 - [ ] Publish to EMQ X marketplace (or internal registry)
 - [ ] Upgrade path: support online upgrade from 1.0.0 → 1.x (`code_change/3`)

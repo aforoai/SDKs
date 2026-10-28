@@ -199,20 +199,55 @@ jobs:
         run: ./mvnw -B -ntp clean package
 
   emqx-erlang:
-    name: EMQX plugin (rebar3 compile)
+    name: EMQX plugin (eunit + plugin package)
     runs-on: ubuntu-latest
-    # Informational: a standalone EMQX plugin build may need the EMQX umbrella to
-    # resolve the `emqx` dep. Keep it visible without blocking the gate.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+      # OTP 26 = the oldest OTP of the EMQX versions the plugin supports
+      # (EMQX 5.7/5.8); beams built on it load on 5.9+ (OTP 27) too.
       - uses: erlef/setup-beam@v1
         with:
           otp-version: '26'
-          rebar3-version: '3'
-      - name: rebar3 compile
+          rebar3-version: '3.24'
+      # The mock-ingestor suites start aforo-metering-sdks/mock-ingestor.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: rebar3 eunit
         working-directory: aforo-emqx-plugin
-        run: rebar3 compile
+        env:
+          AFORO_MOCK_INGESTOR: ${{ github.workspace }}/aforo-metering-sdks/mock-ingestor
+        run: rebar3 eunit
+      - name: rebar3 emqx_plugrel tar (checks priv/config.hocon against the Avro schema)
+        working-directory: aforo-emqx-plugin
+        # emqx_plugrel uses `maybe' expressions; OTP 26 needs the feature flag.
+        env:
+          ERL_FLAGS: -enable-feature maybe_expr
+        run: rebar3 emqx_plugrel tar
+      - name: package contains release.json, config and schema
+        working-directory: aforo-emqx-plugin/_build/default/emqx_plugrel
+        run: |
+          set -euo pipefail
+          VSN=$(sed -n 's/.*{vsn, "\([^"]*\)"}.*/\1/p' ../../../src/aforo_metering.app.src)
+          PKG="aforo_metering-${VSN}"
+          tar tzf "${PKG}.tar.gz" > files.txt
+          for f in "${PKG}/release.json" "${PKG}/README.md" \
+                   "${PKG}/${PKG}/priv/config.hocon" "${PKG}/${PKG}/priv/config_schema.avsc"; do
+            grep -qx "$f" files.txt || { echo "::error::missing $f in ${PKG}.tar.gz"; exit 1; }
+          done
+          tar xzf "${PKG}.tar.gz" -O "${PKG}/release.json" | python3 -c '
+          import json, sys
+          r = json.load(sys.stdin)
+          assert r["name"] == "aforo_metering", r
+          assert r["rel_vsn"] == sys.argv[1], r
+          assert r["with_config_schema"] is True, r
+          print("release.json OK:", r["rel_apps"])
+          ' "$VSN"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aforo-emqx-plugin-package
+          path: aforo-emqx-plugin/_build/default/emqx_plugrel/aforo_metering-*.tar.gz
+          if-no-files-found: error
 
   gateway-config:
     name: Gateway config validation (XML / YAML / JSON)
@@ -275,9 +310,9 @@ jobs:
   ci-success:
     name: CI success
     # One stable check to require in branch protection — green only if every
-    # blocking job above passed. (emqx-erlang is informational, not required.)
+    # blocking job above passed.
     if: always()
-    needs: [contract, go, node, python, java, kong-lua, kong-busted, gateway-plugin-tests, gateway-config]
+    needs: [contract, go, node, python, java, kong-lua, kong-busted, gateway-plugin-tests, gateway-config, emqx-erlang]
     runs-on: ubuntu-latest
     steps:
       - name: Verify required jobs succeeded

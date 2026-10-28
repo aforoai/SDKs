@@ -209,7 +209,7 @@ http_lookup(ClientId, {Username, Attrs}) ->
                           <<"clientAttrs">> => Attrs,
                           <<"tenantId">> => aforo_metering_config:tenant_id()}),
     %% The Aforo ingest API key is never sent to the mapping service.
-    Headers = case aforo_metering_config:get(customer_resolver_http_authorization, <<>>) of
+    Headers = case aforo_metering_config:http_resolver_authorization() of
         <<>> -> [];
         "" -> [];
         Auth -> [{"Authorization", to_list(Auth)}]

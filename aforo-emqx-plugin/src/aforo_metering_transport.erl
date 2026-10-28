@@ -46,7 +46,7 @@
 -define(MAX_DELAY_MS, 30000).
 -define(RETRY_AFTER_MAX_MS, 60000).
 -define(TARGET_BODY_BYTES, 4194304).
--define(USER_AGENT, "aforo-emqx-plugin/2.0.0").
+-define(USER_AGENT, "aforo-emqx-plugin/2.0.1").
 
 -type result() :: #{sent := non_neg_integer(),
                     rejected := [map()],
@@ -76,7 +76,7 @@ send(Events, Opts0) ->
     send_batches(Batches, Opts, empty()).
 
 %% Only build the config-backed defaults the caller did not pass (tests
-%% pass everything and never touch emqx_conf).
+%% pass everything and never read the config snapshot).
 default_opts_lazy(Opts) ->
     Needed = [url, api_key, tenant, batch_size, timeout_ms, max_retries, deadline,
               sleep, rand, http],

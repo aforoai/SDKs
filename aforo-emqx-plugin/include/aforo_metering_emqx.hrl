@@ -1,39 +1,19 @@
 %%%-------------------------------------------------------------------
-%%% EMQX headers, or stand-ins when building without EMQX.
+%%% EMQX headers.
 %%%
-%%% Inside an EMQX build the real headers are used. The `test' profile
-%%% defines AFORO_NO_EMQX so the eunit suites compile and run on a plain
-%%% Erlang/OTP install with no EMQX source tree. The stand-ins copy the
-%%% shapes the plugin relies on:
-%%%   * #message{} -- field names and defaults from
-%%%     emqx/apps/emqx_utils/include/emqx_message.hrl (EMQX master,
-%%%     read 2026-10-27);
-%%%   * ?HP_LOWEST -- 0 in emqx/apps/emqx/include/emqx_hooks.hrl;
-%%%   * ?SLOG(Level, Map) -- forwarded to OTP logger.
-%%% Nothing in the plugin depends on any other EMQX header content.
-%%% The non-test branch includes exactly what the plugin included before
-%%% (emqx.hrl + logger.hrl).
+%%% Taken from emqx_plugin_helper (the dependency the official EMQX
+%%% plugin template uses), which vendors the EMQX headers a plugin needs:
+%%%   * #message{}  -- emqx_message.hrl (via emqx.hrl);
+%%%   * ?HP_LOWEST  -- emqx_hooks.hrl;
+%%%   * ?SLOG/2     -- logger.hrl (forwards to OTP logger).
+%%% The headers are plain Erlang, so the plugin compiles, and its eunit
+%%% suites run, on Erlang/OTP alone -- no EMQX source tree.
 %%%-------------------------------------------------------------------
--ifdef(AFORO_NO_EMQX).
+-ifndef(AFORO_METERING_EMQX_HRL).
+-define(AFORO_METERING_EMQX_HRL, true).
 
--record(message, {
-    id :: binary() | undefined,
-    qos = 0,
-    from :: atom() | binary() | undefined,
-    flags = #{},
-    headers = #{},
-    topic :: binary() | undefined,
-    payload :: iodata() | undefined,
-    timestamp :: integer() | undefined,
-    extra = #{} :: term()
-}).
-
--define(HP_LOWEST, 0).
--define(SLOG(Level, Data), logger:log(Level, Data)).
-
--else.
-
--include_lib("emqx/include/emqx.hrl").
--include_lib("emqx/include/logger.hrl").
+-include_lib("emqx_plugin_helper/include/emqx.hrl").
+-include_lib("emqx_plugin_helper/include/emqx_hooks.hrl").
+-include_lib("emqx_plugin_helper/include/logger.hrl").
 
 -endif.
