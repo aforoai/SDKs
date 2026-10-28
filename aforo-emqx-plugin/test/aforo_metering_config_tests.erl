@@ -271,10 +271,16 @@ hard_coded_versions_match_test() ->
               {"CHANGELOG.md", "## \\[([0-9.]+)\\]"},
               {"../VERSIONING.md", "`aforo-emqx-plugin/` \\| `([0-9.]+)`"}],
     [begin
-         {ok, Bin} = file:read_file(filename:join(Root, File)),
-         case re:run(Bin, Re, [{capture, all_but_first, list}]) of
-             {match, [Found]} -> ?assertEqual({File, AppVsn}, {File, Found});
-             nomatch -> ?assertEqual({File, found}, {File, nomatch})
+         case file:read_file(filename:join(Root, File)) of
+             {ok, Bin} ->
+                 case re:run(Bin, Re, [{capture, all_but_first, list}]) of
+                     {match, [Found]} -> ?assertEqual({File, AppVsn}, {File, Found});
+                     nomatch -> ?assertEqual({File, found}, {File, nomatch})
+                 end;
+             %% ../VERSIONING.md lives in the SDKs repo root, outside the
+             %% plugin directory; a copy of the plugin elsewhere has no such file.
+             {error, enoent} when File =:= "../VERSIONING.md" ->
+                 ok
          end
      end || {File, Re} <- Checks],
     %% and the running code agrees with its source
