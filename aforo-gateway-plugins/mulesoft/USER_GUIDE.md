@@ -1,6 +1,6 @@
 # Aforo for MuleSoft — User Guide
 
-**Version:** 3.1.1 · **Updated:** 2026-10-28 · **Audience:** engineers who own an API in Anypoint API Manager and sell it through Aforo.
+**Version:** 3.1.2 · **Updated:** 2026-10-28 · **Audience:** engineers who own an API in Anypoint API Manager and sell it through Aforo.
 
 Normally you do none of this by hand: when you connect your Anypoint org in Aforo and deploy an Aforo product to an API instance, Aforo publishes the policy to your Exchange and applies it with the right configuration. This guide explains what that does, how to do it manually, and how to check it.
 
@@ -51,8 +51,8 @@ Values are rendered into the policy as text. A value must not contain `${` (Mule
 
 ## 4. Install by hand
 
-1. **Build** the jar ([README → Build](README.md#build)), or take `aforo-metering-3.1.1-mule-policy.jar` from the release.
-2. **Publish** it to your Exchange as a policy: groupId = your Anypoint organization id, assetId `aforo-metering`, version `3.1.1`, with `aforo-metering.yaml` as the `policy-definition`. Either `./mvnw deploy -Danypoint.org.id=<org id>` from `aforo-metering/`, or Exchange → Publish new asset → Policy, uploading both files.
+1. **Build** the jar ([README → Build](README.md#build)), or take `aforo-metering-3.1.2-mule-policy.jar` from the release.
+2. **Publish** it to your Exchange as a policy: groupId = your Anypoint organization id, assetId `aforo-metering`, version `3.1.2`, with `aforo-metering.yaml` as the `policy-definition`. Either `./mvnw deploy -Danypoint.org.id=<org id>` from `aforo-metering/`, or Exchange → Publish new asset → Policy, uploading both files.
 3. **Apply** it in API Manager → your API instance → Policies → Add policy → *Aforo Usage Metering*, filling in the properties above. Put it **first** in the policy order (it is the API's authentication). If browsers call the API, apply MuleSoft's CORS policy before it.
 4. **Map** the product in Aforo (Aforo's deploy records the API instance id against the product).
 

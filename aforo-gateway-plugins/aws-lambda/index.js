@@ -182,6 +182,11 @@ const MAX_TOOL_NAME_LENGTH = 64;
 // platform kills it.
 const REQUEST_TIMEOUT_MS = 10000;
 const DEADLINE_SAFETY_MS = 1500;
+// A refused key rereads the secret at most once per container per this many
+// milliseconds. A key that stays refused (revoked, wrong secret) would
+// otherwise call GetSecretValue on every invocation, bypassing the cache.
+const FORCED_KEY_REFRESH_MIN_MS = 60000;
+let lastForcedKeyRefreshAt = -Infinity;
 const MAX_ATTEMPTS = 3;
 
 /** Trim + upper-case a configured productType; "API" when unset or blank. */
@@ -702,14 +707,22 @@ async function handler(event, context) {
     // 401/403: the key was refused. The usual cause is a rotated key still
     // cached in this container (aws-secret.js keeps it 5 min). Reread the
     // secret once and resend those batches with the same bodies (same keys, so
-    // a batch that did land is deduplicated). Refused again, or the secret
+    // a batch that did land is deduplicated), at most once a minute per
+    // container (FORCED_KEY_REFRESH_MIN_MS). Refused again, or the secret
     // cannot be read, or it still holds the same key: the batches count as
     // transient and the handler throws below, so Lambda's redelivery and the
     // OnFailure queue keep the events instead of dropping them.
     const refusedIdx = results.map((r, i) => (r.outcome === 'unauthorized' ? i : -1)).filter((i) => i >= 0);
     if (refusedIdx.length > 0) {
         let fresh = null;
-        if (AFORO_API_KEY.fromSecret) {
+        const now = Date.now();
+        if (AFORO_API_KEY.fromSecret && now - lastForcedKeyRefreshAt < FORCED_KEY_REFRESH_MIN_MS) {
+            // Reread less than a minute ago: fail now, keep the events for
+            // Lambda's redelivery, and leave Secrets Manager alone.
+            console.error(`Aforo refused the key; the secret was reread ${Math.round((now - lastForcedKeyRefreshAt) / 1000)}s ` +
+                `ago, so it is not reread again for up to ${FORCED_KEY_REFRESH_MIN_MS / 1000}s.`);
+        } else if (AFORO_API_KEY.fromSecret) {
+            lastForcedKeyRefreshAt = now;
             try {
                 fresh = await AFORO_API_KEY.refresh();
             } catch (err) {
@@ -1125,4 +1138,5 @@ module.exports = {
     parseStatusOutcomes,
     parseStatusCodeList,
     FLUSH_COUNT,
+    FORCED_KEY_REFRESH_MIN_MS,
 };

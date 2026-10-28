@@ -818,4 +818,25 @@ test('jti_cache_seconds = 0: asks every time', () => {
     assert.strictEqual(call(env, { headers: BEARER() }).revocationCalls.length, 1);
 });
 
+test('jti_cache_seconds = 0: an answer resets the failure count, so alternating failures never open the breaker', () => {
+    let i = 0;
+    const env = jwtEnv({ kvm: { jti_cache_seconds: '0' }, tokenStatus: () => (i++ % 2 === 0
+        ? { status: 503, body: '' }
+        : { status: 200, body: '{"revoked":false}' }) });
+    for (let n = 0; n < 8; n++) {
+        const r = call(env, { headers: BEARER() });
+        assert.strictEqual(r.accessFault, null);
+        assert.strictEqual(r.revocationCalls.length, 1, 'asked on call ' + n + ' (breaker never opened)');
+    }
+    const entry = env.cache.get('aforo-jti__' + TENANT + '|jti-1|key-7');
+    assert.strictEqual(entry.value, 'F:0', 'the last answer reset the count');
+});
+
+test('jti_cache_seconds = 0: failures in a row still open the breaker', () => {
+    let calls = 0;
+    const env = jwtEnv({ kvm: { jti_cache_seconds: '0' }, tokenStatus: () => { calls++; return { status: 503, body: '' }; } });
+    for (let n = 0; n < 4; n++) call(env, { headers: BEARER() });
+    assert.strictEqual(calls, 3, 'breaker open after three');
+});
+
 report('apigee flow tests');

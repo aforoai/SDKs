@@ -236,7 +236,7 @@ class Forwarder {
             const res = await this.fetch(url, {
                 method: 'POST',
                 redirect: 'manual',
-                headers: { 'Content-Type': 'application/json', 'X-API-Key': this.cfg.apiKey, 'User-Agent': 'aforo-apim-eventhub-forwarder/2.3.1' },
+                headers: { 'Content-Type': 'application/json', 'X-API-Key': this.cfg.apiKey, 'User-Agent': 'aforo-apim-eventhub-forwarder/2.3.2' },
                 body: body,
                 signal: signal,
             });
@@ -380,16 +380,21 @@ const COMPOUND_TRANSIENT_ERRORS = ['Server busy, retry the batch', 'Processing t
 
 /**
  * One compound `results[]` entry -> 'delivered' | 'retry' | 'rejected'.
- * `retryable: true` resends; without the field the BUSY / TIMEOUT texts do.
- * A redelivered event whose measurements were all stored before (accepted 0,
- * duplicates > 0) is delivered, not rejected.
+ * `retryable: true` resends whatever `success` says: usage-ingestor answers
+ * `success: true, retryable: true` for an event it stored only part of
+ * because of a temporary failure. Without the field the BUSY / TIMEOUT texts
+ * resend. A redelivered event whose measurements were all stored before
+ * (duplicates > 0, failed 0) is delivered. An event with failed > 0 that is
+ * not retryable is a rejection, whatever `success` says: some of its
+ * measurements will never be stored.
  */
 function compoundOutcome(x) {
     if (!x || typeof x !== 'object') return 'delivered';
     if (x.retryable === true) return 'retry';
-    if (x.success !== false) return 'delivered';
-    if (x.retryable === undefined && Array.isArray(x.errors) &&
+    if (x.retryable === undefined && x.success === false && Array.isArray(x.errors) &&
         x.errors.some(function (m) { return COMPOUND_TRANSIENT_ERRORS.indexOf(m) !== -1; })) return 'retry';
+    if (Number(x.failed) > 0) return 'rejected';
+    if (x.success !== false) return 'delivered';
     if (Number(x.duplicates) > 0) return 'delivered';
     return 'rejected';
 }

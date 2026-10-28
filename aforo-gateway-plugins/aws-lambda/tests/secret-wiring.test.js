@@ -166,6 +166,36 @@ async function run() {
     try { await handler(cwEvent([ENTRY('rot6')]), ctx); } catch (e) { readFail = e.message; }
     assert(readFail !== null, '401 and the secret cannot be reread: the handler throws');
 
+    console.log('\nA key that stays refused rereads the secret at most once a minute per container');
+    clearAforoEnv(); posts.length = 0; smCalls.length = 0; smMode = 'ok'; acceptedKeys = ['someone-else'];
+    process.env.AFORO_API_KEY_SECRET_ARN = SECRET_ARN;
+    const realNow = Date.now;
+    let clock = 1800000000000;
+    Date.now = () => clock;
+    try {
+        const idx = freshRequire('../index');
+        assertEquals(idx.FORCED_KEY_REFRESH_MIN_MS, 60000, 'the minimum interval is 60 s');
+        let errs = 0;
+        for (let n = 0; n < 5; n++) {
+            clock += 1000;
+            try { await idx.handler(cwEvent([ENTRY('stuck' + n)]), ctx); } catch (e) { errs++; }
+        }
+        assertEquals(errs, 5, 'every refused invocation throws (events kept for redelivery)');
+        assertEquals(posts.length, 5, 'one POST per invocation, no resend with the same key');
+        assertEquals(smCalls.length, 2, 'one cold read plus one forced reread, not one per invocation');
+        clock += 60000;
+        try { await idx.handler(cwEvent([ENTRY('stuck-later')]), ctx); } catch (e) { errs++; }
+        assertEquals(smCalls.length, 3, 'a minute later the secret is reread once more');
+        smMode = 'rotated'; acceptedKeys = ['sk_live_rotated']; posts.length = 0;
+        clock += 61000;
+        let ok = null;
+        try { ok = await idx.handler(cwEvent([ENTRY('after')]), ctx); } catch (e) { ok = e; }
+        assert(!(ok instanceof Error), 'after the interval a rotated key is picked up and the resend succeeds');
+        assertEquals(posts.length, 2, 'refused POST, then the resend with the new key');
+    } finally {
+        Date.now = realNow;
+    }
+
     clearAforoEnv(); posts.length = 0; acceptedKeys = ['other'];
     process.env.AFORO_API_KEY = 'plain-key';
     ({ handler } = freshRequire('../index'));

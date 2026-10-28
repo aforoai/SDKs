@@ -1,6 +1,6 @@
 # kong-plugin-aforo-metering — User Guide
 
-**Version:** 2.8.1 · **Updated:** 2026-10-28 · **Audience:** engineers running Kong Gateway (OSS, Enterprise or Kong Konnect data planes) who want API usage metered into Aforo.
+**Version:** 2.8.2 · **Updated:** 2026-10-28 · **Audience:** engineers running Kong Gateway (OSS, Enterprise or Kong Konnect data planes) who want API usage metered into Aforo.
 
 ## What you'll build
 
@@ -21,10 +21,10 @@ Not yet on LuaRocks, so build it from the rockspec in this folder:
 git clone https://github.com/aforoai/SDKs.git
 cd SDKs/aforo-gateway-plugins/kong
 luarocks install lua-resty-http
-luarocks make kong-plugin-aforo-metering-2.8.1-1.rockspec
+luarocks make kong-plugin-aforo-metering-2.8.2-1.rockspec
 ```
 
-`luarocks make` reads `kong-plugin-aforo-metering-2.8.1-1.rockspec` and installs the `handler`, `schema`, `rate-limit-enforce`, `margin-guard`, `preflight-quota`, `redis-util`, `event-buffer` and `event-util` modules under `kong.plugins.aforo-metering.*`.
+`luarocks make` reads `kong-plugin-aforo-metering-2.8.2-1.rockspec` and installs the `handler`, `schema`, `rate-limit-enforce`, `margin-guard`, `preflight-quota`, `redis-util`, `event-buffer` and `event-util` modules under `kong.plugins.aforo-metering.*`.
 
 Two things that will bite you if you skip them:
 
@@ -459,6 +459,7 @@ See the full option table in [README.md](README.md#configuration). The three you
 | JWTs answered 500 `ISSUER_NOT_CONFIGURED` | `jwt_validation_enabled` without `jwt_issuer` (2.8.0) | Set `jwt_issuer` to your token issuer (`https://auth.aforo.ai`), or set `jwt_issuer_check_disabled = true` to accept any issuer. |
 | 503 `REVOCATION_CHECK_UNAVAILABLE` after upgrading to 2.8.0 | The revocation lookup now times out after `jwt_redis_timeout_ms` (250 ms for the connect, TLS handshake included, and for the one round trip; was 500 ms per `GET`) | Put Kong near the blocklist Redis, or raise `jwt_redis_timeout_ms`. |
 | 503 `REVOCATION_CHECK_UNAVAILABLE`, log shows `MOVED` | `jwt_redis_host` is one node of a classic Redis Cluster; keys on other shards answer `MOVED` and the plugin does not follow redirects | Point `jwt_redis_host` at ElastiCache Serverless or a cluster proxy that routes per key. |
+| Rate limits not enforced, `[aforo-ratelimit]` error log shows `MOVED` | `rate_limit_redis_host` is one node of a multi-shard classic Redis Cluster; keys on other shards answer `MOVED`, the plugin does not follow redirects, and the check fails open | Point `rate_limit_redis_host` at ElastiCache Serverless, a cluster proxy that routes per command, or a single-shard Redis. |
 | Margin guard never refuses; log shows `Check failed: timeout` or `Pricing check failed N times in a row` | Pricing does not answer within `margin_guard_timeout_ms` (300 ms), and after 5 failures the breaker stops calling it for 10 s | Check `margin_guard_url` reachability; raise `margin_guard_timeout_ms` for a distant pricing host. The breaker settings are `margin_guard_breaker_threshold` / `margin_guard_breaker_cooldown_s`. |
 | Events buffer but never flush | `flush_count` not reached and `flush_interval_ms` not yet elapsed | Wait for the interval, lower `flush_count` to 1 for testing, or send more traffic. |
 | Flush logs `status=401` | Wrong `api_key` or `tenant_id` | Re-check the Aforo API key and tenant; both are sent on the flush (`X-API-Key` + `X-Tenant-Id`). |

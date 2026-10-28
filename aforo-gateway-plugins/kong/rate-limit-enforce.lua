@@ -190,10 +190,12 @@ end
 --      every refresh. Claims of a token nothing verified
 --      (jwt_allow_unverified_signature) are never used.
 --   2. key-auth: the credential Kong authenticated -- its .key is the raw key.
---      Skipped for a verified JWT (Kong's jwt plugin or jwt_validation_enabled)
---      and for any credential that is a jwt_secrets row: there .key is the
---      shared issuer key, not the caller's key. Such a request without key_id
---      is not rate limited and the "jwt without key_id" warning is logged.
+--      Skipped when Kong's jwt plugin verified the token and for any
+--      credential that is a jwt_secrets row: there .key is the shared issuer
+--      key, not the caller's key. A request whose token this plugin verified
+--      (jwt_validation_enabled) without key_id still uses a key-auth
+--      credential when it has one. A JWT request left without a key is not
+--      rate limited and the "jwt without key_id" warning is logged.
 --   3. Authorization: Bearer <raw key>. The scheme is matched case-
 --      insensitively: matching only "Bearer" let "bearer" skip a HARD limit.
 -- For 2 and 3 the policy is looked up by the lowercase SHA-256 hex of the
@@ -220,21 +222,29 @@ local function request_identity(identity)
                  authenticated = true }
     end
 
-    -- A verified JWT without key_id: never fall through to the credential.
-    -- On a Kong-jwt route kong.client.get_credential() is the jwt_secrets row,
-    -- whose .key is the issuer key every caller of that issuer shares, so its
-    -- hash would put all of them on one counter (and match no policy).
+    -- A token Kong's jwt plugin verified, without key_id: never fall through
+    -- to the credential. On a Kong-jwt route kong.client.get_credential() is
+    -- the jwt_secrets row, whose .key is the issuer key every caller of that
+    -- issuer shares, so its hash would put all of them on one counter (and
+    -- match no policy).
     local shared = kong.ctx.shared
-    local claims = shared and shared.aforo_jwt_claims
-    if (shared and shared.authenticated_jwt_token)
-        or (type(claims) == "table" and claims.signature_verified == true) then
+    if shared and shared.authenticated_jwt_token then
         return nil, "jwt"
     end
+
+    -- This plugin's own verified JWT (jwt_validation_enabled) without key_id:
+    -- a key-auth credential on the same request is still the caller's key, so
+    -- it is limited by that key. Without one the request is not rate limited.
+    local claims = shared and shared.aforo_jwt_claims
+    local own_verified_jwt = type(claims) == "table" and claims.signature_verified == true
 
     local ok, cred = pcall(kong.client.get_credential)
     if ok and is_key_auth_credential(cred) then
         local h = key_hash_of(cred.key)
         return { lookup = h, key_scope = h, authenticated = true }
+    end
+    if own_verified_jwt then
+        return nil, "jwt"
     end
 
     local auth = kong.request.get_header("Authorization")
@@ -428,9 +438,11 @@ local function enforce(conf, identity)
     local hard = enforcement_mode == "HARD"
     local keys, argv = {}, { string.format("%.3f", now), hard and "1" or "0" }
     -- Every key of one evaluation carries the same Redis hash tag
-    -- {tenant:scope}, so the script's keys sit in one slot on Redis Cluster
-    -- and ElastiCache Serverless. Without it EVALSHA was refused there with
-    -- CROSSSLOT and the check failed open: HARD limits were never enforced.
+    -- {tenant:scope}, so the script's keys sit in one slot. With it the check
+    -- works on ElastiCache Serverless, a proxy that routes per command, or a
+    -- single-shard Redis; without it EVALSHA was refused there with CROSSSLOT
+    -- and failed open. MOVED is not followed: one node of a multi-shard
+    -- classic cluster still fails open for keys on other shards.
     -- The tag always holds a ":", so it is never empty.
     local tag = "{" .. tenant_id .. ":" .. scope_id .. "}"
     for _, tier in ipairs(tiers) do

@@ -4,6 +4,14 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versioning: [SemVer](htt
 
 This function ships on the Aforo gateway-plugins line; the whole repo is versioned and tagged together. The version lives in `package.json`. Entries below are the AWS-Lambda-specific slice of each repo release (see the parent `aforo-gateway-plugins/CHANGELOG.md` for the cross-plugin picture).
 
+## [2.5.2] - not yet released
+
+Fixes from the second wave 6 review. Not deployed to AWS.
+
+### Fixed
+- **A key that stays refused no longer calls Secrets Manager on every invocation.** Since 2.5.1 a 401 / 403 forces a reread of the secret (`refresh()`), which skips the 5-minute cache and the failure backoff. A revoked key or a wrong secret therefore made one `GetSecretValue` call per invocation. The forced reread now happens at most once per container per 60 seconds (`FORCED_KEY_REFRESH_MIN_MS`); in between, a refused batch makes the invocation fail at once (Lambda redelivers, the OnFailure queue keeps the events). A reread that finds a new key still resends the refused batches with it.
+- Tests: one secret-wiring test (fails on 2.5.1); `npm test` all suites pass.
+
 ## [2.5.1] - not yet released
 
 Fixes from the wave 6 review. Not deployed to AWS.

@@ -6,12 +6,21 @@ The Kong plugin has one version: the rockspec's. `handler.lua`'s `VERSION` const
 
 ## [Unreleased]
 
+## [2.8.2] — 2026-10-28
+
+Fixes from the second wave 6 review. Redeploy the plugin; no configuration change.
+
+### Fixed
+- **Key-auth plus the plugin's own JWT without `key_id` was not rate limited** (regression in 2.8.1). 2.8.1 skipped the key-auth credential whenever a verified JWT was present, including a token this plugin verified (`jwt_validation_enabled`). Now only a token Kong's jwt plugin verified skips the credential (there it is the shared jwt_secrets row). With the plugin's own JWT and no `key_id`, a key-auth credential on the request is used; without one the request is not rate limited and the "without a verified key_id" warning is logged.
+- **Docs: Redis Cluster.** The 2.8.1 notes said rate limiting works on Redis Cluster. It works on ElastiCache Serverless, a proxy that routes each command to its shard, or a single-shard Redis. The plugin does not follow `MOVED`, so one node of a multi-shard classic cluster still fails open for keys on other shards. README, user guide (new troubleshooting row) and the 2.8.1 entry are corrected.
+- Tests: two rate-limit identity specs (one fails on 2.8.1). busted 370/370 on LuaJIT 2.1.
+
 ## [2.8.1] — 2026-10-28
 
 Fixes from the wave 6 review. Redeploy the plugin; no configuration change.
 
 ### Fixed
-- **Rate limiting on Redis Cluster / ElastiCache Serverless.** One EVALSHA touches every tier's counter keys, and those keys had no hash tag, so a cluster refused the script with CROSSSLOT and the check failed open with a throttled warning: HARD limits were never enforced there. Counter keys are now `ratelimit:count:{tenantId:scope}:{window}:{epochWindow}` (one hash tag per check). Nothing else reads them; the old keys expire on their own, so counts restart once at upgrade. A CROSSSLOT refusal now has its own error-level log line that says HARD limits are not enforced; other script refusals log at error level too.
+- **Rate limiting on ElastiCache Serverless and cluster proxies.** One EVALSHA touches every tier's counter keys, and those keys had no hash tag, so a cluster refused the script with CROSSSLOT and the check failed open with a throttled warning: HARD limits were never enforced there. Counter keys are now `ratelimit:count:{tenantId:scope}:{window}:{epochWindow}` (one hash tag per check). Nothing else reads them; the old keys expire on their own, so counts restart once at upgrade. A CROSSSLOT refusal now has its own error-level log line that says HARD limits are not enforced; other script refusals log at error level too. This works on ElastiCache Serverless, a proxy that routes each command to its shard, or a single-shard Redis. The plugin does not follow `MOVED`: connected to one node of a multi-shard classic cluster, keys on other shards still fail open (see 2.8.2).
 - **Rate-limit identity on Kong-jwt routes.** With no verified `key_id`, the plugin fell back to `kong.client.get_credential()`, which on a route protected by Kong's jwt plugin is the jwt_secrets row; its `.key` is the issuer key shared by every caller of that issuer. The credential branch now runs only for key-auth credentials and never for a verified JWT, so the "JWT request without a verified key_id" warning applies.
 - **Margin guard breaker.** Every non-200 answer counted as a breaker failure, including pricing's 400 for a `scopeId` over 128 characters; the breaker is per tenant, so one bad customer id switched the GLOBAL check off for the whole tenant. A 4xx other than 408 / 429 is now logged and fails open without counting, and a customer id over 128 characters is not sent (GLOBAL is still asked).
 - Tests: CROSSSLOT-aware Redis mock (all keys of one EVAL must share a hash tag in cluster mode), three rate-limit specs, two identity specs, three margin-guard specs. busted 368/368 on LuaJIT 2.1.

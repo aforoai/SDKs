@@ -25,7 +25,9 @@
  * Cache entry (environment cache, prefix aforo-jti):
  *   OK       not revoked, for jti_cache_seconds (default 30; 0 = ask every time)
  *   REVOKED  until the token's exp (at most 24 h; 1 h without exp)
- *   F:n      n unanswered checks in a row, for jti_breaker_seconds (default 30)
+ *   F:n      n unanswered checks in a row, for jti_breaker_seconds (default 30);
+ *            an answer resets it (OK replaces it; with jti_cache_seconds 0
+ *            it is rewritten as F:0)
  *   OPEN     jti_breaker_failures (default 3) reached: no call for
  *            jti_breaker_seconds
  * No answer (timeout 2 s, connection error, non-200, unreadable body, breaker
@@ -130,6 +132,13 @@ function decide() {
         if (a === 'OK') {
             result = 'ok';
             if (lim[0] !== '0') { store = 'OK'; ttl = parseInt(lim[0], 10); }
+            else if (c.indexOf('F:') === 0) {
+                // Nothing to cache, but an earlier failure count must go:
+                // otherwise failures with answers in between still add up
+                // and open the breaker.
+                store = 'F:0';
+                ttl = parseInt(lim[2], 10);
+            }
         } else if (a.indexOf('REVOKED|') === 0) {
             result = 'revoked';
             store = 'REVOKED';

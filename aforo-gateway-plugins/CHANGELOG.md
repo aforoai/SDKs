@@ -4,9 +4,18 @@ This monorepo ships five gateway metering plugins (Kong, Apigee, AWS Lambda, Azu
 
 ## Unreleased
 
+### Second wave 6 review fixes (Kong 2.8.2, Apigee 3.1.2, MuleSoft 3.1.2, AWS Lambda 2.5.2, Azure APIM 2.3.2)
+
+- Kong: key-auth plus a token this plugin verified without `key_id` is rate limited by the key-auth key again (2.8.1 skipped it). Docs no longer say rate limiting works on Redis Cluster without qualification: it works on ElastiCache Serverless, a per-command cluster proxy or a single-shard Redis; one node of a multi-shard classic cluster fails open.
+- Azure APIM: the Event Hub forwarder counts a compound result as delivered for duplicates only when `failed` is 0; a non-retryable result with `failed` > 0 is a logged rejection. `retryable: true` is resent whatever `success` says.
+- MuleSoft: MCP detection has its own `try` again, so a DataWeave error there is logged and the call metered as a normal request instead of answered 503; "MCP request body not read" logs WARN at most once a minute per reason, DEBUG in between.
+- Apigee: with `jti_cache_seconds` 0 an answer resets the revocation breaker's failure count, so alternating failures no longer open it.
+- AWS Lambda: a refused key rereads the secret at most once per container per 60 s instead of on every invocation.
+- None of this has run on a live gateway. Details in each plugin's CHANGELOG.
+
 ### Wave 6 review fixes (Kong 2.8.1, Apigee 3.1.1, MuleSoft 3.1.1, AWS Lambda 2.5.1, Azure APIM 2.3.1)
 
-- Kong: rate-limit counter keys carry one Redis hash tag per check, so HARD limits work on Redis Cluster / ElastiCache Serverless (the script was refused with CROSSSLOT and failed open); the key-auth credential branch never takes a Kong-jwt `jwt_secrets` row; margin guard does not count a 4xx as a breaker failure and does not send customer ids over 128 characters.
+- Kong: rate-limit counter keys carry one Redis hash tag per check, so HARD limits work on ElastiCache Serverless, a cluster proxy that routes per command, or a single-shard Redis (the script was refused with CROSSSLOT and failed open); one node of a multi-shard classic cluster still answers `MOVED` for other shards' keys and the check fails open; the key-auth credential branch never takes a Kong-jwt `jwt_secrets` row; margin guard does not count a 4xx as a breaker failure and does not send customer ids over 128 characters.
 - Apigee: Aforo JWT revocation is checked with organization-service `GET /api/v1/public/gateway/token-status`, the same contract as Azure (on with `jwt_validation_enabled`; needs the new KVM key `aforo_org_service_url`). The Pub/Sub forwarder runs on Node 22.
 - MuleSoft: an MCP body is read for `tools/call` detection only with a declared `Content-Length` of at most 1 MiB; a chunked body is no longer read whole into memory.
 - AWS Lambda: a 401 / 403 rereads the key secret once and resends; still refused, the invocation fails (it used to drop the batch and return 200). Response errors after headers no longer crash the runtime. Secret ARN parameters require the full ARN.

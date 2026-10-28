@@ -1,14 +1,14 @@
 package = "kong-plugin-aforo-metering"
-version = "2.8.1-1"
+version = "2.8.2-1"
 
 -- Released from the public repository github.com/aforoai/SDKs, where the plugin
 -- lives in aforo-gateway-plugins/kong/ and is tagged kong-vX.Y.Z. `dir` points
 -- LuaRocks at that subdirectory of the clone, so the module paths below are
 -- relative to this file. From a checkout (either repository), run
--- `luarocks make kong-plugin-aforo-metering-2.8.1-1.rockspec` in this directory.
+-- `luarocks make kong-plugin-aforo-metering-2.8.2-1.rockspec` in this directory.
 source = {
     url = "git+https://github.com/aforoai/SDKs.git",
-    tag = "kong-v2.8.1",
+    tag = "kong-v2.8.2",
     dir = "SDKs/aforo-gateway-plugins/kong",
 }
 

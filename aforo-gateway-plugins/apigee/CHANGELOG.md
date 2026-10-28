@@ -6,6 +6,14 @@ This bundle ships on the Aforo gateway-plugins line; the whole repo is versioned
 
 ## [Unreleased]
 
+## [3.1.2] — 2026-10-28
+
+Fixes from the second wave 6 review. Redeploy `aforo-access`; no KVM change. Not yet verified on a live Apigee org.
+
+### Fixed
+- **Revocation breaker with `jti_cache_seconds` = 0.** An answer stored nothing in that case, so an earlier failure count (`F:n`) stayed in the cache and failures with answers in between still added up to `jti_breaker_failures` and opened the breaker. An answer now rewrites a failure count as `F:0` (kept for `jti_breaker_seconds`), as the Azure margin guard does. With caching on, the `OK` entry already replaced it.
+- Tests: two flow tests (one fails on 3.1.1); flow tests 74/74.
+
 ## [3.1.1] — 2026-10-28
 
 Redeploy `aforo-access`. With `jwt_validation_enabled`, add the KVM key `aforo_org_service_url` (see "Upgrading from 3.1.0" in the user guide). Not yet verified on a live Apigee org.

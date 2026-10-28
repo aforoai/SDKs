@@ -4,6 +4,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [Unreleased]
 
+## [3.1.2] — 2026-10-28
+
+Fixes from the second wave 6 review. Configuration properties unchanged. Not yet verified on a live Anypoint org.
+
+### Fixed
+- **MCP detection fails open again.** The 3.1.1 `mcp-body` transform sat only inside the access-check `try`, whose handler answers 503 (this policy is the API's authentication and fails closed there). A DataWeave error in that transform therefore refused the call. The MCP detection (the `mcp-body` script, the body read and the warning below) now has its own `try` with `on-error-continue`: an error is logged at WARN and the call is metered as a normal request.
+- **"MCP request body not read" is throttled.** A client that always sends chunked `tools/call` bodies logged that WARN on every call. It now logs at WARN at most once a minute per reason, using the same per-kind throttle as the other warnings (the `aforo-state` object store), and at DEBUG in between.
+- Tests: five structure checks (the `try`, its handler, the throttle); `policy.test.cjs` 224/224, DataWeave 190/190.
+
 ## [3.1.1] — 2026-10-28
 
 ### Fixed

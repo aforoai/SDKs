@@ -1,6 +1,6 @@
 # Aforo for Apigee X: user guide
 
-**Version:** 3.1.1 · **Updated:** 2026-10-28 · **Audience:** engineers running Apigee X or hybrid who want their API metered and quota-enforced by Aforo without changing their API.
+**Version:** 3.1.2 · **Updated:** 2026-10-28 · **Audience:** engineers running Apigee X or hybrid who want their API metered and quota-enforced by Aforo without changing their API.
 
 Aforo's organization service normally does every step below when you connect your Apigee org in Aforo and deploy a product to it. This guide does it by hand: for a test org, for troubleshooting, or to see exactly what Aforo changes. The [README](README.md) is the reference for every setting.
 

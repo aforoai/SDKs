@@ -952,6 +952,30 @@ describe("access phase", function()
                 assert.is_true(warned, table.concat(warnings, "\n"))
             end)
 
+            it("limits by the key-auth credential when this plugin's own JWT has no key_id", function()
+                -- key-auth + jwt_validation_enabled, token without key_id: the
+                -- key-auth key is still the caller's key (as in 2.8.0; 2.8.1 skipped it).
+                policy("sk_live_ka", ONE_PER_MINUTE)
+                K.client._credential = { id = "ka-cred", key = "sk_live_ka" }
+                assert.is_nil(access_with(jwt(aforo_claims({ key_id = "" })), jwt_rl()))
+                local exit = access_with(jwt(aforo_claims({ key_id = "", jti = "jti-2" })), jwt_rl())
+                assert.is_not_nil(exit, "key-auth + own JWT without key_id was not rate limited")
+                assert.equals(429, exit.status)
+            end)
+
+            it("skips this plugin's own JWT without key_id when there is no key-auth credential", function()
+                policy("sk_live_unused", ONE_PER_MINUTE)
+                for i = 1, 3 do
+                    K.response._exit = nil
+                    assert.is_nil(access_with(jwt(aforo_claims({ key_id = "", jti = "j" .. i })), jwt_rl()))
+                end
+                local warned = false
+                for _, w in ipairs(warnings) do
+                    if string.find(w, "without a verified key_id", 1, true) then warned = true end
+                end
+                assert.is_true(warned, table.concat(warnings, "\n"))
+            end)
+
             it("does not take a jwt_secrets-shaped credential as an API key even without the JWT marker", function()
                 policy("issuer-2", ONE_PER_MINUTE)
                 K.client._credential = { key = "issuer-2", secret = "s", algorithm = "HS256" }
@@ -1949,7 +1973,7 @@ describe("2.8.0 hardening", function()
     -- ── G335: compound-metering is not packaged ────────────────────
     describe("package contents (G335)", function()
         it("ships only modules the plugin loads, and every listed file exists", function()
-            local f = assert(io.open("kong-plugin-aforo-metering-2.8.1-1.rockspec", "rb"))
+            local f = assert(io.open("kong-plugin-aforo-metering-2.8.2-1.rockspec", "rb"))
             local src = f:read("*all")
             f:close()
             assert.is_nil(src:find("compound%-metering%.lua"), "compound-metering is still packaged")

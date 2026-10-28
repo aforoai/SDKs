@@ -5,7 +5,7 @@
  * The billing logic (the DataWeave scripts) is executed by
  * dataweave.test.cjs with the DataWeave CLI. This file checks everything
  * around it that a Mule runtime would otherwise be needed for:
- *   1. the package: pom (mule-policy, 3.1.1 = VERSION, public repositories
+ *   1. the package: pom (mule-policy, 3.1.2 = VERSION, public repositories
  *      only), mule-artifact.json, the policy definition (every MC3 property,
  *      defaults, the secret marked sensitive)
  *   2. the template agrees with the definition: every property is read
@@ -67,7 +67,7 @@ const MC3 = [
 
 // ── 1. Package ───────────────────────────────────────────────────────
 const VERSION = read('VERSION').trim();
-eq('VERSION', VERSION, '3.1.1');
+eq('VERSION', VERSION, '3.1.2');
 check('pom packaging is mule-policy', pom.indexOf('<packaging>mule-policy</packaging>') !== -1);
 eq('pom artifactId/version',
     (pom.match(/<artifactId>aforo-metering<\/artifactId>\s*<version>([^<]+)<\/version>/) || [])[1], VERSION);
@@ -197,6 +197,24 @@ check('the MCP body read sits behind the mcp-body decision',
     template.indexOf('<when expression="#[vars.aforoMcpBody.read == true]">') < template.indexOf('payload.^raw'));
 check('a body that is not read logs a WARN and the call is still metered',
     /MCP request body not read \(' \+\+ \(vars\.aforoMcpBody\.reason/.test(template));
+// MCP detection fails open (second review): its own try, inside the
+// fail-closed access-check try, so a DataWeave error never answers 503.
+{
+    const mcpWhen = template.indexOf("<when expression=\"#[vars.aforoCfg.productType == 'MCP_SERVER' and upper(attributes.method default '') == 'POST']\">");
+    const tryOpen = template.lastIndexOf('<try>', mcpWhen);
+    const ownHandler = template.indexOf('MCP tools/call detection failed, the call is metered as a normal request', mcpWhen);
+    const accessHandler = template.indexOf("access check failed, answering 503");
+    check('the MCP detection has its own try, opened right before it', mcpWhen !== -1 && tryOpen !== -1 &&
+        /^\s*$/.test(template.slice(tryOpen + 5, template.lastIndexOf('<choice>', mcpWhen))));
+    check('its handler continues, logs at WARN and clears the body', ownHandler > mcpWhen && ownHandler < accessHandler &&
+        /<on-error-continue type="ANY" logException="false">\s*<logger level="WARN" message="#\['\[aforo-metering\] MCP tools\/call detection failed/.test(template) &&
+        template.indexOf('<set-variable variableName="aforoRequestText" value="#[null]"/>', ownHandler) < template.indexOf('</try>', ownHandler));
+    check('the mcp-body script is inside that try', template.indexOf('// aforo-script: mcp-body') > tryOpen &&
+        template.indexOf('// aforo-script: mcp-body') < ownHandler);
+    check('a body that is not read logs WARN once a minute per reason, DEBUG in between',
+        template.indexOf("value=\"#['warn|mcp-body|' ++ (vars.aforoMcpBody.reason default 'unknown')]\"") !== -1 &&
+        /<logger level="DEBUG" message="#\['\[aforo-metering\] MCP request body not read/.test(template));
+}
 
 const NEXT = '<http-policy:execute-next/>';
 const next = template.indexOf(NEXT);
@@ -344,7 +362,7 @@ check('delivery is bounded: 16 at once, 1000 waiting',
     count(template, '<async maxConcurrency="16">') === 2 &&
     count(template, '<when expression="#[1000 > sizeOf(vars.aforoPendingKeys default [])]">') === 2);
 check('the transient ingest error text matches the ingestor', template.indexOf('var TRANSIENT = "The event could not be stored"') !== -1);
-check('warnings are throttled to one a minute per kind', count(template, '>= 60000]">') === 4);
+check('warnings are throttled to one a minute per kind', count(template, '>= 60000]">') === 5);
 
 // ── 5. METER BLOCK copies ────────────────────────────────────────────
 {

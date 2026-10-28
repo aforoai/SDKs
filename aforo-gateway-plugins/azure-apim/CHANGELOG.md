@@ -4,6 +4,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [Unreleased]
 
+## [2.3.2] - 2026-10-28
+
+Fixes from the second wave 6 review. Not run on a live APIM instance or Azure subscription. Redeploy the Event Hub forwarder; the policy files are unchanged except for the version.
+
+### Fixed
+- **Event Hub forwarder, compound results with `duplicates` and `failed`**: a result with `duplicates` > 0 counted as delivered even when `failed` > 0, so a measurement the ingestor refused for good was neither stored nor logged. Delivered now needs `failed` 0. A result with `failed` > 0 that is not retryable is a rejection (logged with its key and counted), also when `success` is true and part of the event was stored. A result with `retryable: true` is still resent whatever `success` says (usage-ingestor answers `success: true, retryable: true` for an event it stored only part of). Seven new assertions and one flow test; `npm test` 28/28.
+
 ## [2.3.1] - 2026-10-28
 
 Fixes from the wave 6 review. Not run on a live APIM instance or Azure subscription.

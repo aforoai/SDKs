@@ -1,6 +1,6 @@
 # aforo-metering-lambda — User Guide
 
-**Version:** 2.5.1 · **Updated:** 2026-10-28 · **Audience:** engineers running AWS API Gateway who want API usage metered into Aforo from CloudWatch access logs.
+**Version:** 2.5.2 · **Updated:** 2026-10-28 · **Audience:** engineers running AWS API Gateway who want API usage metered into Aforo from CloudWatch access logs.
 
 ## What you'll build
 
@@ -221,7 +221,7 @@ Full env-var / SAM-parameter table is in [README.md](README.md#configuration). Y
 | `could not read … from Secrets Manager` on every invocation for a few seconds after a first failure | After a failed first read the function fails fast for 5 s (doubling to 60 s) rather than calling Secrets Manager each time | Fix the permission or the endpoint; the next attempt after the backoff picks it up. |
 | `authorizer.js` denies every call with `TENANT_NOT_CONFIGURED`, or `TENANT_MISMATCH` in the log | `AFORO_TENANT_ID` is unset, or the token was issued for another Aforo workspace | Set `AFORO_TENANT_ID` to your workspace id; tokens must be issued for that workspace. |
 | `Parameter 'AforoApiKeySecretArn' must match pattern` | A partial ARN (without the six-character suffix Secrets Manager adds) | Use the full ARN from `aws secretsmanager describe-secret --secret-id <name> --query ARN`. Since 2.5.1 the template refuses a partial ARN: the IAM grant is for that exact ARN, so the function could never read the secret. |
-| Batches rejected with 401 / 403 after a key rotation | The function reread the secret once and the ingestor still refused the key | The invocation fails and Lambda redelivers; fix the secret (an active key with `usage:ingest`). Nothing is dropped (2.5.1). |
+| Batches rejected with 401 / 403 after a key rotation | The function reread the secret once and the ingestor still refused the key | The invocation fails and Lambda redelivers; fix the secret (an active key with `usage:ingest`). Nothing is dropped (2.5.1). The secret is reread at most once a minute per container, so a fixed secret is picked up within a minute (2.5.2). |
 | `Parameters: [AforoApiKeySecretArn] must have values` or the `NoPlaintextAforoKeys` rule fails | Upgrading a stack deployed before 2.4.0 | Create the secret and redeploy with `AforoApiKeySecretArn=<arn> AforoApiKey=''` (CHANGELOG 2.4.0, "Upgrade"). |
 | `Aforo rejected the batch with 400` | A malformed batch | The response body in the log names the field. The batch is dropped, not retried. |
 | `Aforo accepted the batch but rejected N event(s)` | An unregistered metric name, or a `customerId` that is not an Aforo customer | Register the metric / fix `METRIC_MAPPINGS` / `DEFAULT_METRIC`; check the JWT's `customer_id` claim. The log line lists each rejected event's reason. |

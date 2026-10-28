@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Aforo Usage Metering 3.1.1 - Mule 4 custom policy template.
+  Aforo Usage Metering 3.1.2 - Mule 4 custom policy template.
 
   One API call:
     1. Configuration. Every policy property arrives as the attribute value
@@ -332,11 +332,17 @@ var problems =
                      value a Java String (without it no tools/call was ever seen
                      on a live runtime). A failure is logged, since the call then
                      goes unmetered as MCP. -->
-                <choice>
-                    <when expression="#[vars.aforoCfg.productType == 'MCP_SERVER' and upper(attributes.method default '') == 'POST']">
-                        <ee:transform>
-                            <ee:variables>
-                                <ee:set-variable variableName="aforoMcpBody"><![CDATA[%dw 2.0
+                <!-- MCP detection fails open: any error in it (the mcp-body
+                     script, the body read, the warning throttle) is logged at
+                     WARN and the call is metered as a normal request. Without
+                     this try an error here reached the access-check handler
+                     below and answered 503. -->
+                <try>
+                    <choice>
+                        <when expression="#[vars.aforoCfg.productType == 'MCP_SERVER' and upper(attributes.method default '') == 'POST']">
+                            <ee:transform>
+                                <ee:variables>
+                                    <ee:set-variable variableName="aforoMcpBody"><![CDATA[%dw 2.0
 // aforo-script: mcp-body
 // Whether the MCP request body may be read for tools/call detection: only
 // with a declared length (Content-Length, no Transfer-Encoding) of at most
@@ -358,26 +364,51 @@ if (te != null) {read: false, reason: "the request has Transfer-Encoding and no 
 else if ((cl == null) or (not (cl matches /[0-9]{1,10}/))) {read: false, reason: "the request has no usable Content-Length"}
 else if ((cl as Number) > MAX_BODY) {read: false, reason: "the request body is over 1 MiB"}
 else {read: true, reason: null}]]></ee:set-variable>
-                            </ee:variables>
-                        </ee:transform>
-                        <choice>
-                            <when expression="#[vars.aforoMcpBody.read == true]">
-                                <try>
-                                    <set-variable variableName="aforoRequestText" value="#[output application/java --- (payload.^raw default '') as String {encoding: 'UTF-8'}]"/>
-                                    <error-handler>
-                                        <on-error-continue type="ANY" logException="false">
-                                            <logger level="WARN" message="#['[aforo-metering] could not read the MCP request body, so its tools/call is not metered: ' ++ (error.description default 'unknown error')]"/>
-                                            <set-variable variableName="aforoRequestText" value="#[null]"/>
-                                        </on-error-continue>
-                                    </error-handler>
-                                </try>
-                            </when>
-                            <otherwise>
-                                <logger level="WARN" message="#['[aforo-metering] MCP request body not read (' ++ (vars.aforoMcpBody.reason default 'unknown') ++ '); the call is metered as a normal request']"/>
-                            </otherwise>
-                        </choice>
-                    </when>
-                </choice>
+                                </ee:variables>
+                            </ee:transform>
+                            <choice>
+                                <when expression="#[vars.aforoMcpBody.read == true]">
+                                    <try>
+                                        <set-variable variableName="aforoRequestText" value="#[output application/java --- (payload.^raw default '') as String {encoding: 'UTF-8'}]"/>
+                                        <error-handler>
+                                            <on-error-continue type="ANY" logException="false">
+                                                <logger level="WARN" message="#['[aforo-metering] could not read the MCP request body, so its tools/call is not metered: ' ++ (error.description default 'unknown error')]"/>
+                                                <set-variable variableName="aforoRequestText" value="#[null]"/>
+                                            </on-error-continue>
+                                        </error-handler>
+                                    </try>
+                                </when>
+                                <otherwise>
+                                    <!-- WARN at most once a minute per reason (as the
+                                         other warnings), DEBUG in between: a client
+                                         that always sends chunked bodies would
+                                         otherwise log on every call. -->
+                                    <set-variable variableName="aforoMcpWarnKey" value="#['warn|mcp-body|' ++ (vars.aforoMcpBody.reason default 'unknown')]"/>
+                                    <os:retrieve key="#[vars.aforoMcpWarnKey]" objectStore="{{{policyId}}}-aforo-state" target="aforoWarnedAt">
+                                        <os:default-value>#[0]</os:default-value>
+                                    </os:retrieve>
+                                    <choice>
+                                        <when expression="#[(vars.aforoStartMs - (vars.aforoWarnedAt default 0)) >= 60000]">
+                                            <logger level="WARN" message="#['[aforo-metering] MCP request body not read (' ++ (vars.aforoMcpBody.reason default 'unknown') ++ '); the call is metered as a normal request. Repeats are logged at DEBUG for 60s.']"/>
+                                            <os:store key="#[vars.aforoMcpWarnKey]" objectStore="{{{policyId}}}-aforo-state">
+                                                <os:value>#[vars.aforoStartMs]</os:value>
+                                            </os:store>
+                                        </when>
+                                        <otherwise>
+                                            <logger level="DEBUG" message="#['[aforo-metering] MCP request body not read (' ++ (vars.aforoMcpBody.reason default 'unknown') ++ '); the call is metered as a normal request']"/>
+                                        </otherwise>
+                                    </choice>
+                                </otherwise>
+                            </choice>
+                        </when>
+                    </choice>
+                    <error-handler>
+                        <on-error-continue type="ANY" logException="false">
+                            <logger level="WARN" message="#['[aforo-metering] MCP tools/call detection failed, the call is metered as a normal request: ' ++ (error.description default 'unknown error')]"/>
+                            <set-variable variableName="aforoRequestText" value="#[null]"/>
+                        </on-error-continue>
+                    </error-handler>
+                </try>
 
                 <ee:transform>
                     <ee:variables>

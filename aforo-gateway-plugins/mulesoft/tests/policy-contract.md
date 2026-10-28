@@ -1,11 +1,11 @@
-# MuleSoft policy 3.1.1 — live contract checklist
+# MuleSoft policy 3.1.2 — live contract checklist
 
 `dataweave.test.cjs` runs the policy's DataWeave under the DataWeave CLI and `policy.test.cjs` checks the template's structure. Neither runs a Mule runtime: custom policies need the Enterprise runtime with API Gateway. Run this checklist on a **test API instance** before rolling 3.0.0 out, and after any runtime upgrade.
 
 ## Setup
 
 - A test API instance (a basic-endpoint proxy is enough) whose upstream echoes the request headers and can be told which response headers and status to return, e.g. a small mock that answers `X-Aforo-*` headers from query parameters.
-- `aforo-metering` 3.1.1 applied with `aforo-endpoint`, `aforo-api-key` (scope `usage:ingest`), `aforo-tenant-id` and `aforo-product-id` for a test product; `quota-enabled: true`.
+- `aforo-metering` 3.1.2 applied with `aforo-endpoint`, `aforo-api-key` (scope `usage:ingest`), `aforo-tenant-id` and `aforo-product-id` for a test product; `quota-enabled: true`.
 - Keys from Aforo: `KEY` (subscribed to the product), `KEY_OTHER` (active, another product), `KEY_NONE` (active, `productIds: []`), `KEY_REVOKED`, and for an AI_AGENT / MCP product an agent client secret (48 lowercase hex).
 - Access to the tenant's ingested events in Aforo and to the runtime's log.
 
@@ -46,7 +46,7 @@
 | 21 | MCP_SERVER, batch with 2 `tools/call` + `tools/list` | 2 events, `toolName` each, `agentId` = the customer, `sessionId` = the upstream's `Mcp-Session-Id` |
 | 22 | MCP_SERVER, `initialize` / `tools/list` / `ping` alone | allowed even when the customer is at a hard limit; no event |
 | 23 | MCP_SERVER, body with `params._meta.agent_id: spoof` | `agentId` is not `spoof` |
-| 23b | MCP_SERVER, `tools/call` sent chunked (`curl -H "Transfer-Encoding: chunked" --data-binary @call.json`) | the API answers normally; one ordinary event (no `toolName`); WARN `MCP request body not read (the request has Transfer-Encoding and no declared length)` |
+| 23b | MCP_SERVER, `tools/call` sent chunked (`curl -H "Transfer-Encoding: chunked" --data-binary @call.json`) | the API answers normally; one ordinary event (no `toolName`); WARN `MCP request body not read (the request has Transfer-Encoding and no declared length)`; a second chunked call within 60 s logs that line at DEBUG only |
 | 24 | `metric-mappings` `[{"pathPattern":"^/v1/search","metricName":"searches"}]`, call `/v1/search?q=x` | `metricName` searches; quota checked for searches |
 
 ## Delivery

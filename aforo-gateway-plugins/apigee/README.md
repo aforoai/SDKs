@@ -6,7 +6,7 @@ Two Apigee shared flows that meter every call to your API in Aforo, enforce your
 - **`aforo-metering`** on the environment's **PostProxyFlowHook**: builds the call's usage events and sends them to Aforo.
 - **`pubsub-forwarder/`** (optional, for `delivery_mode = pubsub`): a Cloud Run service that reads the events from Pub/Sub and delivers them in batches, so an ingest outage loses nothing.
 
-**Version:** 3.1.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 3.1.2 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 Target: **Apigee X and hybrid** (`apigee.googleapis.com/v1/organizations/{org}`). The bundles use only policies Apigee Edge also has, but they are built and documented for X. Apigee bundles have no version field, so the version lives in [`VERSION`](VERSION).
 
@@ -146,7 +146,7 @@ Since 3.1.1, with `jwt_validation_enabled` the flow also checks that a verified 
 - `GET {aforo_org_service_url}/api/v1/public/gateway/token-status?jti=&keyId=&clientId=` with `X-API-Key: {api_key}` (org-service takes the tenant from the key), timeout 2 s. The answer is `{"revoked": true|false, "reason"}`, bare or inside `{success, data}`.
 - Runs only for a token that carries `jti` or `key_id` and is for this `tenant_id` (a token for another tenant has already got 401).
 - Cached in the environment cache under `aforo-jti` + `tenant|jti|keyId`: "not revoked" for `jti_cache_seconds` (default 30), "revoked" until the token's `exp` (at most 24 h). A revocation therefore takes effect within `jti_cache_seconds`.
-- Breaker per tenant and token: after `jti_breaker_failures` (default 3) checks in a row without an answer (timeout, error, non-200, unreadable body) no call for `jti_breaker_seconds` (default 30).
+- Breaker per tenant and token: after `jti_breaker_failures` (default 3) checks in a row without an answer (timeout, error, non-200, unreadable body) no call for `jti_breaker_seconds` (default 30). Any answer resets the count, also with `jti_cache_seconds` 0 (3.1.2).
 - Revoked: 401 `{"error":"invalid_token","error_description":"Token has been revoked"}`, not metered.
 - No answer or open breaker: the call goes through, unless `jti_check_fallback` is `DENY`; then 503 `{"error":"temporarily_unavailable","error_description":"REVOCATION_CHECK_UNAVAILABLE"}` with `Retry-After: 5`.
 - `jti_check_enabled = false` switches it off. Without `aforo_org_service_url` every check counts as no answer (and is logged).

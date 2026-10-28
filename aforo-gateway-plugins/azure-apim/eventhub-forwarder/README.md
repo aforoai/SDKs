@@ -1,6 +1,6 @@
 # Aforo APIM Event Hub forwarder
 
-**Version:** 2.3.1 · Apache-2.0 · ships with `azure-apim` 2.3.1
+**Version:** 2.3.2 · Apache-2.0 · ships with `azure-apim` 2.3.2
 
 Use this when an ingest outage or a `429` must not cost you usage. In the default mode the APIM policy posts each event with `send-one-way-request`, which has no retry. In Event Hub mode the policy writes the event to Azure Event Hubs instead, and this Azure Function reads the hub, sends the events to the Aforo ingestor in batches, and moves its checkpoint only after the ingestor accepted them. While the ingestor is down, events wait in the hub (up to 7 days on the Standard tier) and are sent when it is back.
 
@@ -19,7 +19,7 @@ APIM ──log-to-eventhub──► Event Hub ──trigger (batch)──► for
 | 401, 403, any 3xx | the invocation fails at once (a wrong key or URL must not lose usage); redirects are never followed |
 | other 4xx | batch dropped and logged with its keys |
 
-A failed invocation is re-run by the Functions retry policy (`maxRetryCount: -1`, back-off 5 s to 5 min) on the same events; the checkpoint does not move until a run succeeds. Events the ingestor already accepted are sent again on that re-run and deduplicated by the ingestor (the policy freezes `idempotencyKey` and the compound `correlationId` per APIM request). Compound events go to `/api/v1/ingest/compound/batch`. A compound result the ingestor did not store for a temporary reason (`retryable: true`; from an ingestor that does not send the field yet, the errors `Server busy, retry the batch` or `Processing timeout`) is resent with the same `correlationId`, within the same retry budget as usage events; still not stored after the retries, the invocation fails and the checkpoint stays. Only a permanent rejection is dropped and logged. A redelivered event whose measurements were all stored before (`accepted` 0, `duplicates` > 0) counts as delivered.
+A failed invocation is re-run by the Functions retry policy (`maxRetryCount: -1`, back-off 5 s to 5 min) on the same events; the checkpoint does not move until a run succeeds. Events the ingestor already accepted are sent again on that re-run and deduplicated by the ingestor (the policy freezes `idempotencyKey` and the compound `correlationId` per APIM request). Compound events go to `/api/v1/ingest/compound/batch`. A compound result the ingestor did not fully store for a temporary reason (`retryable: true`, whatever `success` says: a partly stored event comes back as `success: true, retryable: true`; from an ingestor that does not send the field yet, the errors `Server busy, retry the batch` or `Processing timeout`) is resent with the same `correlationId`, within the same retry budget as usage events; still not stored after the retries, the invocation fails and the checkpoint stays. Only a permanent rejection is dropped and logged: a result with `failed` > 0 that is not retryable counts as one even if part of the event was stored. A redelivered event whose measurements were all stored before (`duplicates` > 0, `failed` 0) counts as delivered.
 
 The API key is sent only as `X-API-Key` and never logged.
 

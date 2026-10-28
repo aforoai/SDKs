@@ -365,6 +365,15 @@ test('compoundOutcome: retryable flag, BUSY / TIMEOUT texts, all-duplicate redel
     assert.equal(compoundOutcome({ success: false, retryable: false, errors: ['Server busy, retry the batch'] }), 'rejected', 'an explicit false wins over the text');
     assert.equal(compoundOutcome({ success: false, errors: ['unknown metric'] }), 'rejected');
     assert.equal(compoundOutcome({ success: false, accepted: 0, duplicates: 2, failed: 0 }), 'delivered');
+    // Duplicates do not hide a measurement that failed for good.
+    assert.equal(compoundOutcome({ success: false, accepted: 0, duplicates: 2, failed: 1 }), 'rejected');
+    assert.equal(compoundOutcome({ success: false, accepted: 1, duplicates: 1, failed: 1, errors: ['unknown metric'] }), 'rejected');
+    // Partly stored with a temporary failure: resent even though success is true.
+    assert.equal(compoundOutcome({ success: true, accepted: 1, failed: 1, retryable: true }), 'retry');
+    assert.equal(compoundOutcome({ success: true, accepted: 1, duplicates: 1, failed: 1, retryable: true }), 'retry');
+    // Partly stored, the rest failed for good: a rejection (logged, counted).
+    assert.equal(compoundOutcome({ success: true, accepted: 1, failed: 1, retryable: false }), 'rejected');
+    assert.equal(compoundOutcome({ success: true, accepted: 1, failed: 1 }), 'rejected');
     assert.equal(compoundOutcome({ success: false, retryable: false, accepted: 0, duplicates: 0, failed: 1 }), 'rejected');
 });
 
@@ -400,6 +409,26 @@ test('a redelivered compound event that is all duplicates counts as delivered', 
         assert.equal(stats.rejected, 0);
         assert.equal(srv.seen.length, 1);
         assert.ok(!f.logs.some(function (l) { return /dropped/.test(l); }), 'nothing logged as dropped');
+    } finally {
+        srv.server.close();
+    }
+});
+
+test('a partly stored compound event (success true, retryable true) is resent; duplicates with a failure are rejected', async function () {
+    const srv = await compoundServer([
+        function (ids) { return [
+            { correlationId: ids[0], success: true, accepted: 1, failed: 1, retryable: true, errors: ['db down'] },
+            { correlationId: ids[1], success: false, accepted: 0, duplicates: 1, failed: 1, errors: ['unknown metric'] },
+        ]; },
+        function (ids) { return [{ correlationId: ids[0], success: false, accepted: 0, duplicates: 1, failed: 0 }]; },
+    ]);
+    try {
+        const f = forwarder({ ingestUrl: srv.url + '/v1/ingest/batch' });
+        const stats = await f.forward([compoundMsg('c1'), compoundMsg('c2')]);
+        assert.deepEqual(srv.seen, [['c1', 'c2'], ['c1']]);
+        assert.equal(stats.accepted, 1);
+        assert.equal(stats.rejected, 1);
+        assert.ok(f.logs.some(function (l) { return /dropped 1 event/.test(l) && /c2/.test(l); }), f.logs.join('\n'));
     } finally {
         srv.server.close();
     }
