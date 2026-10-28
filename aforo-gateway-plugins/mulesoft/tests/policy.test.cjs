@@ -177,6 +177,18 @@ function wellFormed(xml) {
 eq('template.xml is well-formed XML', wellFormed(template), null);
 eq('mule-artifact.json is JSON', (function () { try { JSON.parse(read('aforo-metering/mule-artifact.json')); return null; } catch (e) { return e.message; } })(), null);
 
+// A targetValue next to outputMimeType="text/plain" must name its output type: without it Mule
+// cannot infer one ("more than one is being used: application/java,text/plain"), the request's
+// error handler swallows that, and every call to Aforo reads as "no answer" (3.0.0, live, 2026-10-27).
+const targetValues = template.match(/targetValue="#\[[^"]*"/g) || [];
+eq('four Aforo calls store their answer with targetValue', targetValues.length, 4);
+targetValues.forEach(function (tv, i) {
+    check('targetValue ' + (i + 1) + ' names its output type (output application/java ---)',
+        /^targetValue="#\[output application\/java ---/.test(tv), tv);
+});
+check('the MCP request body read names its output type',
+    template.indexOf('variableName="aforoRequestText" value="#[output application/java --- if (') !== -1);
+
 const NEXT = '<http-policy:execute-next/>';
 const next = template.indexOf(NEXT);
 eq('exactly one execute-next', count(template, NEXT), 1);
@@ -271,8 +283,8 @@ requestsFull.forEach(function (r, i) {
     const label = 'outbound call ' + (i + 1);
     check(label + ' uses the policy http config, no redirects, own target',
         r.indexOf('config-ref="{{{policyId}}}-aforo-http"') !== -1 && r.indexOf('followRedirects="false"') !== -1 &&
-        /target="aforo\w+"/.test(r) && (r.indexOf('targetValue="#[{status: attributes.statusCode, text: (payload default \'\') as String}]"') !== -1 ||
-            r.indexOf('targetValue="#[{status: attributes.statusCode, text: (payload default \'\') as String, retryAfter: attributes.headers.\'retry-after\' default null}]"') !== -1));
+        /target="aforo\w+"/.test(r) && (r.indexOf('targetValue="#[output application/java --- {status: attributes.statusCode, text: (payload default \'\') as String}]"') !== -1 ||
+            r.indexOf('targetValue="#[output application/java --- {status: attributes.statusCode, text: (payload default \'\') as String, retryAfter: attributes.headers.\'retry-after\' default null}]"') !== -1));
     check(label + ' reads every status itself (validator 100..599)', r.indexOf('<http:success-status-code-validator values="100..599"/>') !== -1);
     check(label + ' sends its own body, never the API payload', r.indexOf('<http:body>') !== -1);
 });

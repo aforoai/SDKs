@@ -6,7 +6,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [3.1.0] — 2026-10-28
 
-Wave 6 (W6.5: G359, G361, G362). Configuration properties unchanged; see "Upgrading from 3.0.0" in the user guide. Not yet verified on a live Anypoint org.
+Wave 6 (W6.5: G359, G361, G362). Configuration properties unchanged; see "Upgrading from 3.0.0" in the user guide. Includes the 3.0.2 fixes below. Not yet verified on a live Anypoint org.
 
 ### Changed
 - **Delivery retries follow the transport spec** (`aforo-metering-sdks/contract/TRANSPORT-SPEC.md`): full-jitter backoff between attempts (base 500 ms, cap 30 s: a random 0–1 s before attempt 2, 0–2 s before attempt 3) instead of a fixed 2 s; the ingestor's `Retry-After` (delta-seconds, fractional allowed, or an HTTP date; unreadable values ignored) is used when longer, at most 60 s. The wait is an `until-successful` whose `millisBetweenRetries` the delivery script sets, so it runs on the runtime's scheduler and holds no thread. Attempts run in a `foreach` of 3.
@@ -18,6 +18,14 @@ Wave 6 (W6.5: G359, G361, G362). Configuration properties unchanged; see "Upgrad
 ### Documentation
 - README "Not part of this policy": JWT validation is not an Aforo MuleSoft feature (use MuleSoft's JWT Validation policy); compound metering and margin guard are not supported on MuleSoft. The installed policy calls no margin-guard or token-revocation endpoint.
 - README "Delivery": one delivery per API call (a custom policy has no timer to batch calls); the per-call object store entry is in-memory retry state and the backlog count, not a durable queue; 401/403 from the ingestor lose usage; no 413 split.
+
+## [3.0.2] — 2026-10-27
+
+Released from the SDKs repo (aforoai/SDKs#68, commit `62165dd`) after the first live Anypoint run (CloudHub 2.0, Mule 4.13.1); organization-service bundles it. 3.1.0 includes these fixes.
+
+### Fixed
+- **Every call to Aforo failed inside the runtime.** The four `http:request`s (introspection, quota check, the two ingest flushes) stored the answer with `targetValue="#[{...}]"` next to `outputMimeType="text/plain"`; Mule could not pick an output type, the error handler recorded status 0, and the policy answered 503 on identity, failed open on quota and dropped events. Each `targetValue` now starts `output application/java ---`, and `policy.test.cjs` checks it.
+- **MCP calls were never metered.** Reading the `tools/call` request body failed the same way and was swallowed. The expression names its output type, and a failed read is logged at WARN.
 
 ## [3.0.0] — 2026-10-22
 

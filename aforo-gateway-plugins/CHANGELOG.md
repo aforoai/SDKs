@@ -30,6 +30,7 @@ This monorepo ships five gateway metering plugins (Kong, Apigee, AWS Lambda, Azu
 
 ### MuleSoft 3.1.0 (W6.5)
 
+- **Includes the 3.0.2 live fixes** (aforoai/SDKs#68): every `targetValue` and the MCP body read name `output application/java`, so calls to Aforo no longer read as "no answer" (503 on every keyed call) and MCP `tools/call` is metered.
 - **Delivery retries follow the SDK transport spec**: full-jitter backoff (base 500 ms, cap 30 s) instead of a fixed 2 s, `Retry-After` honoured (seconds or HTTP date, at most 60 s), per-event `retryable` decides what is re-sent, whole-batch retry only on no answer / 408 / 429 / 500 / 502 / 503 / 504. The wait is a scheduler-timed `until-successful`, not a sleeping thread. See `mulesoft/CHANGELOG.md`.
 - **Docs**: JWT validation is not an Aforo MuleSoft feature (use MuleSoft's JWT Validation policy); compound metering and margin guard are not supported on MuleSoft; one delivery per API call, with in-memory (not durable) retry state.
 - **CI**: the `mulesoft-policy` workflow builds with the pinned `./mvnw` (Maven 3.9.16); the runner's Maven failed with `NoSuchMethodError` on `DefaultMirrorSelector.add`.
