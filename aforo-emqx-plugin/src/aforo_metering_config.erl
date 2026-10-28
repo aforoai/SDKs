@@ -66,7 +66,7 @@
 %% A candidate config under validation (process dictionary of the caller).
 -define(CANDIDATE, {?MODULE, candidate}).
 %% Used only when the application spec is not loaded (never inside EMQX).
--define(FALLBACK_VSN, "2.0.2").
+-define(FALLBACK_VSN, "2.0.3").
 
 %% Values shipped in earlier versions' sample configs. A plugin running on
 %% them would bill a tenant that does not exist.

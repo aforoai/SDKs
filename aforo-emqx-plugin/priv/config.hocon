@@ -1,9 +1,9 @@
-## Aforo MQTT Metering plugin -- default configuration (2.0.2)
+## Aforo MQTT Metering plugin -- default configuration (2.0.3)
 ##
 ## EMQX copies this file to $EMQX_DATA_DIR/plugins/aforo_metering/config.hocon
 ## when the plugin is installed. Change it through the Dashboard
 ## (Plugins -> aforo_metering -> Configure) or the REST API
-## (PUT /api/v5/plugins/aforo_metering-2.0.2/config); every change is
+## (PUT /api/v5/plugins/aforo_metering-2.0.3/config); every change is
 ## checked against priv/config_schema.avsc and by the plugin itself.
 ## EMQX 5.8+ applies a change to the running plugin; on 5.7, restart it.
 ##

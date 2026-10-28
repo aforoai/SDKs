@@ -1,6 +1,6 @@
 # aforo_metering — User Guide
 
-**Version:** 2.0.2 (EXPERIMENTAL) · **Updated:** 2026-10-28 · **Audience:** platform/infra engineers running an EMQX 5.x broker who need per-tenant MQTT metering for Aforo billing.
+**Version:** 2.0.3 (EXPERIMENTAL) · **Updated:** 2026-10-28 · **Audience:** platform/infra engineers running an EMQX 5.x broker who need per-tenant MQTT metering for Aforo billing.
 
 ## What you'll build
 
@@ -137,7 +137,7 @@ Usage is counted per minute: the window closes one second after the minute ends 
 
 ```erlang
 aforo_metering:health().
-%% => #{plugin => <<"aforo_metering">>, version => <<"2.0.2">>,
+%% => #{plugin => <<"aforo_metering">>, version => <<"2.0.3">>,
 %%      tenant_id => <<"tenant_acme">>, buffer_depth => 0,
 %%      open_aggregation_keys => 0, circuit_state => <<"closed">>,
 %%      counters => #{'aforo.metering.events.buffered' => 3,

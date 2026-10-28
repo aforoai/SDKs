@@ -39,7 +39,7 @@
 -export([bad_keys/1, rejects_on_error/0, parse_vsn/1]).
 -endif.
 
--define(VERSION, <<"2.0.2">>).
+-define(VERSION, <<"2.0.3">>).
 
 %%--------------------------------------------------------------------
 %% Lifecycle (aforo_metering_app)
@@ -62,12 +62,12 @@ prepare() ->
     end.
 
 load() ->
-    emqx_hooks:add('client.connected',     {?MODULE, on_client_connected, []},     ?HP_LOWEST),
-    emqx_hooks:add('client.disconnected',  {?MODULE, on_client_disconnected, []},  ?HP_LOWEST),
-    emqx_hooks:add('message.publish',      {?MODULE, on_message_publish, []},      ?HP_LOWEST),
-    emqx_hooks:add('message.delivered',    {?MODULE, on_message_delivered, []},    ?HP_LOWEST),
-    emqx_hooks:add('session.subscribed',   {?MODULE, on_session_subscribed, []},   ?HP_LOWEST),
-    emqx_hooks:add('session.unsubscribed', {?MODULE, on_session_unsubscribed, []}, ?HP_LOWEST),
+    emqx_hooks:add('client.connected',     {?MODULE, on_client_connected, [#{}]},     ?HP_LOWEST),
+    emqx_hooks:add('client.disconnected',  {?MODULE, on_client_disconnected, [#{}]},  ?HP_LOWEST),
+    emqx_hooks:add('message.publish',      {?MODULE, on_message_publish, [#{}]},      ?HP_LOWEST),
+    emqx_hooks:add('message.delivered',    {?MODULE, on_message_delivered, [#{}]},    ?HP_LOWEST),
+    emqx_hooks:add('session.subscribed',   {?MODULE, on_session_subscribed, [#{}]},   ?HP_LOWEST),
+    emqx_hooks:add('session.unsubscribed', {?MODULE, on_session_unsubscribed, [#{}]}, ?HP_LOWEST),
     ?SLOG(info, #{
         msg => "aforo_metering plugin loaded",
         version => ?VERSION,
@@ -334,10 +334,13 @@ rejects_on_error() ->
     end.
 
 emqx_version() ->
-    Vsn = case application:get_key(emqx, vsn) of
-        {ok, V} -> V;
+    %% emqx_release:version() is the broker release (5.9.1); the emqx
+    %% application vsn is an internal app version (5.5.x on 5.8/5.9), so it is
+    %% only a fallback for brokers without emqx_release.
+    Vsn = case (try emqx_release:version() catch _:_ -> undefined end) of
         undefined ->
-            try emqx_release:version() catch _:_ -> undefined end
+            case application:get_key(emqx, vsn) of {ok, V} -> V; undefined -> undefined end;
+        R -> R
     end,
     parse_vsn(Vsn).
 

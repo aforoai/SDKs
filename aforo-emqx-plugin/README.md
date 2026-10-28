@@ -2,7 +2,7 @@
 
 A broker-level EMQX 5.x plugin (Erlang/rebar3) that hooks the broker's connect / disconnect / publish / deliver / subscribe / unsubscribe events, counts them per customer per minute, and ships the totals to Aforo's ingestor. Meter MQTT traffic for billing without touching any device or client SDK.
 
-**Version:** 2.0.2 · **EXPERIMENTAL** · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.0.3 · **EXPERIMENTAL** · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 > ⚠ **Experimental.** This plugin has not been load-tested or run inside a real EMQX broker by Aforo. Its eunit suites run on plain Erlang/OTP (EMQX headers from `emqx_plugin_helper`, a stand-in for EMQX's `emqx_plugins` config store) and against the Aforo mock ingestor. Production-hardening items (load test, release-engineering/CI, dashboard health endpoint) are tracked in [`TODO.md`](TODO.md).
 
@@ -100,7 +100,7 @@ A minute of publishing by one customer becomes one usage event:
       "mqttEventType": "PUBLISH",
       "mqttTopic": "#",
       "dataBytes": 234752,
-      "metadata": { "sdkVersion": "2.0.2", "productId": "prod_mqtt_iot_telemetry",
+      "metadata": { "sdkVersion": "2.0.3", "productId": "prod_mqtt_iot_telemetry",
                     "aggregationWindowSeconds": 60, "messageCount": 1834 }
     }
   ]
