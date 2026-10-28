@@ -4,6 +4,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [Unreleased]
 
+## [3.0.2] — 2026-10-27
+
+First run on a live Anypoint org (trial, CloudHub 2.0, Mule 4.13.1, proxy 2.1.2). 3.0.0 answered every call that carried a key with 503 `Access check unavailable`. 3.0.2 was verified there end to end against production Aforo for all four product types: key check (401 unknown key, 403 other product), metering (API Calls, Tokens Consumed from `X-Aforo-Quantity`, KYC Verifications, one Ledger Query per `tools/call` with tool name and MCP session), 429 at each hard limit, and 403 within 20 s of a subscription being cancelled. (3.0.1, with only the first fix, was published to that test org and never released.)
+
+### Fixed
+- **Every call to Aforo failed inside the runtime.** The four `http:request`s (introspection, quota check, the two ingest flushes) stored the answer with `targetValue="#[{status: ..., text: ...}]"` next to `outputMimeType="text/plain"`. Mule cannot pick an output type for that expression ("Unable to infer a output media type as more than one is being used: application/java,text/plain"), the error handler recorded status 0, and the policy treated it as Aforo not answering: 503 on identity, fail-open on quota, events dropped. Each `targetValue` now says `output application/java ---`. The DataWeave CLI tests run the scripts, not the connector attributes, so they never saw it; `policy.test.cjs` now checks every `targetValue` names its output type.
+- **MCP calls were never metered.** Reading the JSON-RPC request body for `tools/call` detection failed the same way, and its error handler swallowed it silently, so every MCP_SERVER call was billed as "nothing billable". The expression now names its output type, and a failure to read the body is logged at WARN (the call is then unmetered).
+
 ## [3.0.0] — 2026-10-22
 
 The MuleSoft path rebuilt to match the Kong plugin (proven in prod) and the Apigee 3.0.0 shared flows. **Breaking**: see "Upgrading from 2.x" in the user guide. Not yet verified on a live Anypoint org.

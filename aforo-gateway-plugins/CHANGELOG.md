@@ -4,6 +4,11 @@ This monorepo ships five gateway metering plugins (Kong, Apigee, AWS Lambda, Azu
 
 ## Unreleased
 
+### MuleSoft 3.0.2: first live run, every call to Aforo fixed
+
+- On a live Anypoint org (CloudHub 2.0, Mule 4.13.1) 3.0.0 answered every keyed call with 503 `Access check unavailable`: the policy's `http:request`s stored Aforo's answer with an expression Mule could not give an output type, so introspection, the quota check and ingest all read as "no answer". MCP request bodies failed the same way, so MCP calls were never metered. 3.0.2 names the output type in all five expressions and logs a failure to read an MCP body. See `mulesoft/CHANGELOG.md`.
+- Verified live against production Aforo for all four product types: key check, metering, 429 at hard limits, 403 after a cancelled subscription.
+
 ### AWS Lambda: AI_AGENT and MCP_SERVER through API Gateway
 
 - **`key-authorizer.js` accepts Aforo client-credential JWTs** (`POST /oauth/token`). RS256 only, verified with Node's `crypto` against the JWKS at `AFORO_JWKS_URL` (cached 1 h, one rate-limited refetch on an unknown `kid`); `exp` / `nbf` / `iat` with 30 s leeway; `iss` == `AFORO_JWT_ISSUER`; `tenant_id` == the new `AFORO_TENANT_ID` (required; unset refuses every JWT). A JWKS failure fails closed (500) and is not cached. The context adds `subscriptionIds`, `agentId` (from the `agent_id` claim) and `authType`. The `sk_live_` / `sk_test_` path is unchanged apart from `authType: "key"`.

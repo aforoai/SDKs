@@ -92,8 +92,15 @@ jobs:
           "$RUNNER_TEMP/runtime/bin/pip" install "$(find dist -maxdepth 1 -name '*.whl' | head -1)"
           python -m venv "$RUNNER_TEMP/tools"
           "$RUNNER_TEMP/tools/bin/pip" install pip-audit==2.10.1 cyclonedx-bom==7.5.0
-          site=$("$RUNNER_TEMP/runtime/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
-          "$RUNNER_TEMP/tools/bin/pip-audit" --strict --progress-spinner off --path "$site"
+          # Audit the wheel's pinned runtime dependencies. Not --path on the whole
+          # site-packages: with --strict that fails on our own not-yet-published
+          # version ("not found on PyPI"), and it flags the venv's bootstrap
+          # setuptools, which customers do not get from us. pip freeze omits
+          # pip/setuptools/wheel by default; --exclude drops our own package.
+          own=$(basename "$(find dist -maxdepth 1 -name '*.whl' | head -1)" | cut -d- -f1)
+          "$RUNNER_TEMP/runtime/bin/pip" freeze --exclude "$own" > "$RUNNER_TEMP/runtime-deps.txt"
+          cat "$RUNNER_TEMP/runtime-deps.txt"
+          "$RUNNER_TEMP/tools/bin/pip-audit" --strict --progress-spinner off --no-deps --disable-pip -r "$RUNNER_TEMP/runtime-deps.txt"
           "$RUNNER_TEMP/tools/bin/cyclonedx-py" environment "$RUNNER_TEMP/runtime/bin/python" -o "$RUNNER_TEMP/sbom.cdx.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

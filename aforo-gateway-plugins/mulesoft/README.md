@@ -2,7 +2,7 @@
 
 One custom policy, **`aforo-metering`**, that Aforo applies to an API instance in Anypoint API Manager. On every call it checks the end customer's **Aforo API key**, refuses a customer whose hard limit is used up (**429**), lets the call through, and sends the call's usage to Aforo after the response. Your API needs no Aforo code.
 
-**Version:** 3.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 3.0.2 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 Target: **Mule 4 runtimes as API gateways** (CloudHub, CloudHub 2.0, Runtime Fabric, hybrid), Mule 4.4 or later, Java 8, 11 or 17. Flex Gateway is not covered (it needs a separate PDK policy).
 
@@ -14,7 +14,7 @@ Aforo's organization service does this when you connect your Anypoint org and de
 
 | What | Where | Notes |
 |---|---|---|
-| Policy asset `aforo-metering` **3.0.0** | your org's Exchange, groupId = your **Anypoint organization id** | the jar `aforo-metering-3.0.0-mule-policy.jar` plus its definition [`aforo-metering.yaml`](aforo-metering/aforo-metering.yaml) (classifier `policy-definition`) |
+| Policy asset `aforo-metering` **3.0.2** | your org's Exchange, groupId = your **Anypoint organization id** | the jar `aforo-metering-3.0.2-mule-policy.jar` plus its definition [`aforo-metering.yaml`](aforo-metering/aforo-metering.yaml) (classifier `policy-definition`) |
 | The policy, applied to each API instance | API Manager, per API instance (and environment) | with the [configuration properties](USER_GUIDE.md#configuration-properties) for the Aforo product it sells: `aforo-product-id`, `product-type`, metrics, quota |
 | The product ↔ API instance mapping | Aforo, `gateway_product_meterings` | provider `mulesoft`, `gateway_resource_id` = the API instance id |
 
@@ -105,7 +105,7 @@ Every event carries `customerId`, `metricName`, `quantity`, `idempotencyKey` (a 
 ```bash
 cd aforo-gateway-plugins/mulesoft/aforo-metering
 docker run --rm -v "$PWD":/src -v "$HOME/.m2":/root/.m2 -w /src maven:3.9-eclipse-temurin-17 mvn -B -ntp clean package
-# -> target/aforo-metering-3.0.0-mule-policy.jar
+# -> target/aforo-metering-3.0.2-mule-policy.jar
 ```
 
 Everything resolves from MuleSoft's public repository (`repository.mulesoft.org/releases`) and Maven Central: no Anypoint or Nexus EE credentials. The policy bundles the HTTP connector 1.10.3, the ObjectStore connector 1.2.2, the Java module 1.2.16 and the secure configuration property module 1.2.7. `mvn deploy -Danypoint.org.id=<org id>` publishes the jar and the definition to your Exchange (credentials in `~/.m2/settings.xml`, server id `exchange-server`).
