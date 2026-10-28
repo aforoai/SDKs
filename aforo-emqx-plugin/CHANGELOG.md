@@ -11,6 +11,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 See [`TODO.md`](TODO.md) for the full production-hardening checklist.
 
+## [2.0.3] — 2026-10-28
+
+First run inside real EMQX brokers (5.8.6 / OTP 26 and 5.9.1 / OTP 27, wave 6 test plan W6.6).
+
+### Fixed
+
+- **Every hook crashed with `undef`, so nothing was metered.** `load/0` registered the hooks with an
+  empty argument list (`{?MODULE, on_message_publish, []}`) while every callback takes a trailing `_Env`
+  argument, and EMQX appends the registered arguments to the hook's own. The hooks are now registered
+  with `[#{}]`. The eunit suite called the callbacks directly with an Env, so it never went through
+  EMQX's dispatch.
+- **EMQX 5.9 was detected as 5.8.** `emqx_version/0` read `application:get_key(emqx, vsn)` first, which
+  is the emqx application version (5.5.x on 5.8 and 5.9), not the release. On 5.9 a refused config change
+  was then treated as saved: the running plugin applied it, and an invalid change raised a false
+  "next start will fail". It now reads `emqx_release:version()` first and falls back to the app vsn.
+
 ## [2.0.2] — 2026-10-28
 
 Fixes from the review of 2.0.1. Tested on plain Erlang/OTP; **not run inside a real EMQX broker**.

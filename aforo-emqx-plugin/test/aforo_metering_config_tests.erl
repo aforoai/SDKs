@@ -10,7 +10,7 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(C, aforo_metering_config).
--define(VSN, "2.0.2").
+-define(VSN, "2.0.3").
 
 %% What EMQX hands over: binary keys, values as HOCON/Avro JSON decoded.
 emqx_conf() ->
