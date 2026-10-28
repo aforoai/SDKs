@@ -6,7 +6,10 @@ Description: >-
   key values. With AllowMeteringInstall = true it can also install Aforo's metering Lambda
   (functions named aforo-metering-*), store the Aforo API key it uses in Secrets Manager
   (secrets named aforo/metering/*) and subscribe it to your API Gateway log groups; set it
-  to false to keep the role read-only.
+  to false to keep the role read-only. With AllowGatewayOrchestration = true (default
+  false) it can also manage API Gateway usage plans and API keys for Gateway Orchestration,
+  read API Gateway CloudWatch metrics, and create Kinesis Data Firehose streams named
+  aforo-gateway-* fed from your API Gateway log groups (push ingestion).
 
 # Hosted publicly at the URL in aforo.aws.cfn-template-url (default
 # https://aforo-templates.s3.amazonaws.com/aws-apigateway-role.yaml). CloudFormation only
@@ -58,11 +61,71 @@ Parameters:
       aforo-metering-*, the Secrets Manager secret aforo/metering/* holding its Aforo API
       key, and its CloudWatch Logs subscription in this account. false keeps the role
       read-only; you then install the metering Lambda yourself.
+  AllowGatewayOrchestration:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Only for a connection that has no access keys. true lets Aforo's Gateway
+      Orchestration create, update and delete API Gateway usage plans and API keys (and read
+      the values of the keys it manages), read API Gateway CloudWatch metrics, and create a
+      Kinesis Data Firehose stream named aforo-gateway-* with a subscription on your API
+      Gateway log groups (push ingestion). false keeps none of these.
+  FirehoseBackupBucketArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(arn:aws[a-z-]*:s3:::[a-z0-9][a-z0-9.-]{1,61}[a-z0-9])?$'
+    ConstraintDescription: Empty or an S3 bucket ARN such as arn:aws:s3:::my-bucket.
+    Description: >-
+      Only with AllowGatewayOrchestration = true. An existing S3 bucket in this account for
+      the records Firehose cannot deliver to Aforo. When set, the stack creates the two
+      service roles push ingestion needs (Firehose writes this bucket; CloudWatch Logs puts
+      records into aforo-gateway-* streams) and outputs their ARNs. Leave FirehoseRoleArn and
+      CloudWatchLogsRoleArn empty when you set this.
+  FirehoseRoleArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(arn:aws[a-z-]*:iam::\d{12}:role/[\w+=,.@/-]{1,512})?$'
+    ConstraintDescription: Empty or an IAM role ARN.
+    Description: >-
+      Only with AllowGatewayOrchestration = true and your own roles: the role Kinesis Data
+      Firehose assumes to write the backup bucket. Aforo may pass this role to Firehose only.
+  CloudWatchLogsRoleArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(arn:aws[a-z-]*:iam::\d{12}:role/[\w+=,.@/-]{1,512})?$'
+    ConstraintDescription: Empty or an IAM role ARN.
+    Description: >-
+      Only with AllowGatewayOrchestration = true and your own roles: the role CloudWatch Logs
+      assumes to put records into the Firehose stream. Aforo may pass this role to CloudWatch
+      Logs only.
+
+Rules:
+  CreatedOrOwnEventRoles:
+    RuleCondition: !Not [!Equals [!Ref FirehoseBackupBucketArn, '']]
+    Assertions:
+      - Assert: !And
+          - !Equals [!Ref FirehoseRoleArn, '']
+          - !Equals [!Ref CloudWatchLogsRoleArn, '']
+        AssertDescription: >-
+          With FirehoseBackupBucketArn set the stack creates the Firehose and CloudWatch Logs
+          roles; leave FirehoseRoleArn and CloudWatchLogsRoleArn empty.
 
 Conditions:
   MeteringInstall: !Equals [!Ref AllowMeteringInstall, 'true']
   UseStackRegion: !Equals [!Ref ApiGatewayRegion, '']
   HasAccessLogGroupPrefix: !Not [!Equals [!Ref AccessLogGroupPrefix, '']]
+  GatewayOrchestration: !Equals [!Ref AllowGatewayOrchestration, 'true']
+  HasFirehoseBackupBucket: !Not [!Equals [!Ref FirehoseBackupBucketArn, '']]
+  CreateEventRoles: !And [!Condition GatewayOrchestration, !Condition HasFirehoseBackupBucket]
+  HasFirehoseRoleArn: !Not [!Equals [!Ref FirehoseRoleArn, '']]
+  HasCloudWatchLogsRoleArn: !Not [!Equals [!Ref CloudWatchLogsRoleArn, '']]
+  PassFirehoseRole: !And
+    - !Condition GatewayOrchestration
+    - !Or [!Condition HasFirehoseBackupBucket, !Condition HasFirehoseRoleArn]
+  PassCloudWatchLogsRole: !And
+    - !Condition GatewayOrchestration
+    - !Or [!Condition HasFirehoseBackupBucket, !Condition HasCloudWatchLogsRoleArn]
 
 Resources:
   AforoRole:
@@ -112,13 +175,23 @@ Resources:
                     - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
               # GET /apikeys?includeValues=true and GET /usageplans/{id}/keys return API
               # key values. Denied in every region, whatever else is attached to the role.
+              # With AllowGatewayOrchestration = true, Gateway Orchestration reads the keys
+              # it manages (GET /apikeys/{id}, GET /usageplans/{id}/keys), so those two are
+              # no longer denied; listing every key (GET /apikeys) and GET
+              # /usageplans/{id}/keys/{keyId} stay denied.
               - Sid: NeverReadApiKeys
                 Effect: Deny
                 Action: apigateway:GET
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:apigateway:*::/apikeys'
-                  - !Sub 'arn:${AWS::Partition}:apigateway:*::/apikeys/*'
-                  - !Sub 'arn:${AWS::Partition}:apigateway:*::/usageplans/*/keys'
+                  - !If
+                    - GatewayOrchestration
+                    - !Ref AWS::NoValue
+                    - !Sub 'arn:${AWS::Partition}:apigateway:*::/apikeys/*'
+                  - !If
+                    - GatewayOrchestration
+                    - !Ref AWS::NoValue
+                    - !Sub 'arn:${AWS::Partition}:apigateway:*::/usageplans/*/keys'
                   - !Sub 'arn:${AWS::Partition}:apigateway:*::/usageplans/*/keys/*'
         # One-click metering install (AwsApiGatewayProvisioningAdapter). Everything is
         # limited to functions named aforo-metering-* and secrets named aforo/metering/*,
@@ -177,7 +250,9 @@ Resources:
                 # Only API Gateway log groups. A subscription's destination is not an IAM
                 # condition key; it is limited by what Aforo can grant: the role can add
                 # an invoke permission only to aforo-metering-* functions, and can pass
-                # no role to CloudWatch Logs (needed for Kinesis or Firehose destinations).
+                # no role to CloudWatch Logs (needed for Kinesis or Firehose destinations)
+                # unless AllowGatewayOrchestration = true, which allows passing exactly one
+                # role to CloudWatch Logs for aforo-gateway-* Firehose streams.
                 - Sid: SubscribeToApiGatewayLogs
                   Effect: Allow
                   Action:
@@ -202,6 +277,125 @@ Resources:
                   Effect: Deny
                   Action: logs:PutSubscriptionFilter
                   Resource: !Sub 'arn:${AWS::Partition}:logs:*:*:destination:*'
+          - !Ref AWS::NoValue
+        # Gateway Orchestration and push ingestion for a connection that has no access keys
+        # (organization-service AwsApiGatewayProvisioningAdapter, AwsApiGatewayEnforcementAdapter,
+        # AwsApiGatewayEventAdapter). Exactly the calls those adapters make, nothing more.
+        # GET /usageplans, /usageplans/{id} and /restapis/{id} are already allowed by
+        # ReadApiConfiguration.
+        - !If
+          - GatewayOrchestration
+          - PolicyName: AforoGatewayOrchestration
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                # CreateUsagePlan, CreateApiKey, CreateUsagePlanKey.
+                - Sid: CreateUsagePlansAndKeys
+                  Effect: Allow
+                  Action: apigateway:POST
+                  Resource:
+                    - !Sub
+                      - 'arn:${AWS::Partition}:apigateway:${Region}::/usageplans'
+                      - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                    - !Sub
+                      - 'arn:${AWS::Partition}:apigateway:${Region}::/usageplans/*/keys'
+                      - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                    - !Sub
+                      - 'arn:${AWS::Partition}:apigateway:${Region}::/apikeys'
+                      - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                # UpdateUsagePlan (quota, throttle, stages, add/remove keys) and UpdateApiKey
+                # (enable, disable, name).
+                - Sid: UpdateUsagePlansAndKeys
+                  Effect: Allow
+                  Action: apigateway:PATCH
+                  Resource:
+                    - !Sub
+                      - 'arn:${AWS::Partition}:apigateway:${Region}::/usageplans/*'
+                      - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                    - !Sub
+                      - 'arn:${AWS::Partition}:apigateway:${Region}::/apikeys/*'
+                      - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                # DeleteUsagePlan, DeleteApiKey.
+                - Sid: DeleteUsagePlansAndKeys
+                  Effect: Allow
+                  Action: apigateway:DELETE
+                  Resource:
+                    - !Sub
+                      - 'arn:${AWS::Partition}:apigateway:${Region}::/usageplans/*'
+                      - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                    - !Sub
+                      - 'arn:${AWS::Partition}:apigateway:${Region}::/apikeys/*'
+                      - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                # GetApiKey (enforcement status) and GetUsagePlanKeys (listKeys). Both return
+                # key values; NeverReadApiKeys stops denying them under this opt-in.
+                - Sid: ReadManagedApiKeys
+                  Effect: Allow
+                  Action: apigateway:GET
+                  Resource:
+                    - !Sub
+                      - 'arn:${AWS::Partition}:apigateway:${Region}::/apikeys/*'
+                      - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                    - !Sub
+                      - 'arn:${AWS::Partition}:apigateway:${Region}::/usageplans/*/keys'
+                      - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                # Pull ingestion reads AWS/ApiGateway metrics. GetMetricData has no
+                # resource-level permissions.
+                - Sid: ReadApiGatewayMetrics
+                  Effect: Allow
+                  Action: cloudwatch:GetMetricData
+                  Resource: '*'
+                # Push ingestion: one stream per connection, aforo-gateway-<id>.
+                - Sid: ManageEventDeliveryStreams
+                  Effect: Allow
+                  Action:
+                    - firehose:CreateDeliveryStream
+                    - firehose:DescribeDeliveryStream
+                    - firehose:UpdateDestination
+                    - firehose:DeleteDeliveryStream
+                  Resource: !Sub
+                    - 'arn:${AWS::Partition}:firehose:${Region}:${AWS::AccountId}:deliverystream/aforo-gateway-*'
+                    - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                # The subscription that feeds the stream, on API Gateway log groups only.
+                - Sid: SubscribeEventStream
+                  Effect: Allow
+                  Action:
+                    - logs:PutSubscriptionFilter
+                    - logs:DeleteSubscriptionFilter
+                  Resource:
+                    - !Sub
+                      - 'arn:${AWS::Partition}:logs:${Region}:${AWS::AccountId}:log-group:/aws/apigateway/*'
+                      - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                    - !Sub
+                      - 'arn:${AWS::Partition}:logs:${Region}:${AWS::AccountId}:log-group:API-Gateway-*'
+                      - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                    - !If
+                      - HasAccessLogGroupPrefix
+                      - !Sub
+                        - 'arn:${AWS::Partition}:logs:${Region}:${AWS::AccountId}:log-group:${AccessLogGroupPrefix}*'
+                        - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                      - !Ref AWS::NoValue
+                # The only role Aforo can hand to Firehose: the one created below, or yours.
+                - !If
+                  - PassFirehoseRole
+                  - Sid: PassFirehoseRole
+                    Effect: Allow
+                    Action: iam:PassRole
+                    Resource: !If [HasFirehoseRoleArn, !Ref FirehoseRoleArn, !GetAtt AforoFirehoseDeliveryRole.Arn]
+                    Condition:
+                      StringEquals:
+                        iam:PassedToService: firehose.amazonaws.com
+                  - !Ref AWS::NoValue
+                # The only role Aforo can hand to CloudWatch Logs.
+                - !If
+                  - PassCloudWatchLogsRole
+                  - Sid: PassCloudWatchLogsRole
+                    Effect: Allow
+                    Action: iam:PassRole
+                    Resource: !If [HasCloudWatchLogsRoleArn, !Ref CloudWatchLogsRoleArn, !GetAtt AforoLogsToFirehoseRole.Arn]
+                    Condition:
+                      StringEquals:
+                        iam:PassedToService: logs.amazonaws.com
+                  - !Ref AWS::NoValue
           - !Ref AWS::NoValue
 
   # What the metering Lambda itself may do: write its own logs and read its Aforo API key
@@ -249,6 +443,72 @@ Resources:
                   - 'arn:${AWS::Partition}:secretsmanager:${Region}:${AWS::AccountId}:secret:aforo/metering/*'
                   - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
 
+  # Push ingestion's two service roles, created when FirehoseBackupBucketArn is set with
+  # AllowGatewayOrchestration = true. Neither can be assumed by Aforo.
+  # Firehose assumes this one to write records it cannot deliver to the backup bucket.
+  AforoFirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Condition: CreateEventRoles
+    Properties:
+      Description: Assumed by Kinesis Data Firehose (aforo-gateway-* streams) to write undeliverable records to the backup bucket.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: AforoFirehoseBackupBucket
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !Ref FirehoseBackupBucketArn
+                  - !Sub '${FirehoseBackupBucketArn}/*'
+
+  # CloudWatch Logs assumes this one to put API Gateway log events into the stream.
+  AforoLogsToFirehoseRole:
+    Type: AWS::IAM::Role
+    Condition: CreateEventRoles
+    Properties:
+      Description: Assumed by CloudWatch Logs in this account to put API Gateway log events into aforo-gateway-* Firehose streams.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringLike:
+                aws:SourceArn: !Sub
+                  - 'arn:${AWS::Partition}:logs:${Region}:${AWS::AccountId}:*'
+                  - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+      Policies:
+        - PolicyName: AforoPutToEventStream
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - firehose:PutRecord
+                  - firehose:PutRecordBatch
+                Resource: !Sub
+                  - 'arn:${AWS::Partition}:firehose:${Region}:${AWS::AccountId}:deliverystream/aforo-gateway-*'
+                  - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+
 Outputs:
   AforoRoleArn:
     Description: Copy this value into Aforo and click Finish connecting.
@@ -257,3 +517,15 @@ Outputs:
     Condition: MeteringInstall
     Description: Execution role of the metering Lambda. Aforo finds it by name; nothing to copy.
     Value: !GetAtt AforoMeteringExecutionRole.Arn
+  FirehoseRoleArn:
+    Condition: CreateEventRoles
+    Description: Paste into the Aforo connection field firehoseRoleArn.
+    Value: !GetAtt AforoFirehoseDeliveryRole.Arn
+  CloudWatchLogsRoleArn:
+    Condition: CreateEventRoles
+    Description: Paste into the Aforo connection field cloudWatchLogsRoleArn.
+    Value: !GetAtt AforoLogsToFirehoseRole.Arn
+  FirehoseBackupBucketArn:
+    Condition: CreateEventRoles
+    Description: Paste into the Aforo connection field firehoseBackupBucketArn.
+    Value: !Ref FirehoseBackupBucketArn

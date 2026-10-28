@@ -4,6 +4,10 @@ This monorepo ships five gateway metering plugins (Kong, Apigee, AWS Lambda, Azu
 
 ## Unreleased
 
+### AWS CloudFormation 3.2.0: opt-in Gateway Orchestration for role-only connections
+
+- `aws-cloudformation/aforo-apigateway-role.yaml` has a new parameter `AllowGatewayOrchestration` (default `false`, which grants exactly what 3.1.0 granted). With `true`, a connection that has only the role (no access keys) can use Gateway Orchestration (usage plans and API keys), pull CloudWatch metrics and push ingestion through a Firehose stream `aforo-gateway-*`; `FirehoseBackupBucketArn` makes the stack create the Firehose and CloudWatch Logs service roles too. Not run in a live AWS account. Details: `aws-cloudformation/CHANGELOG.md` 3.2.0.
+
 ### Second wave 6 review fixes (Kong 2.8.2, Apigee 3.1.2, MuleSoft 3.1.2, AWS Lambda 2.5.2, Azure APIM 2.3.2)
 
 - Kong: key-auth plus a token this plugin verified without `key_id` is rate limited by the key-auth key again (2.8.1 skipped it). Docs no longer say rate limiting works on Redis Cluster without qualification: it works on ElastiCache Serverless, a per-command cluster proxy or a single-shard Redis; one node of a multi-shard classic cluster fails open.
