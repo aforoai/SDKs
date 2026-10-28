@@ -1,6 +1,6 @@
 # Aforo Gateway Metering Plugins
 
-**Current versions**: Kong 2.6.0 (2026-10-25); Apigee 3.0.0 and MuleSoft 3.0.0 (2026-10-22); AWS Lambda 2.3.0 (2026-10-16); Azure APIM 2.2.0 (2026-10-02). Each plugin directory has its own `VERSION` / `CHANGELOG.md` / `USER_GUIDE.md`; `CHANGELOG.md` here is the cross-plugin history. 2.6.0 / 3.0.0 merge the public work after 2.1.0 (Gowtham) with this repository's line.
+**Current versions**: Kong 2.6.0 (2026-10-25); Apigee 3.0.0 (2026-10-22); MuleSoft 3.0.2 (2026-10-27); AWS Lambda 2.3.0 (2026-10-16); Azure APIM 2.2.0 (2026-10-02). Each plugin directory has its own `VERSION` / `CHANGELOG.md` / `USER_GUIDE.md`; `CHANGELOG.md` here is the cross-plugin history. 2.6.0 / 3.0.0 merge the public work after 2.1.0 (Gowtham) with this repository's line.
 
 Gateway plugins that capture API usage events at the edge and forward them to the Aforo usage ingestor service. Each plugin supports Standard API metering, MCP Server tool invocation detection, and W3C Trace Context capture.
 
