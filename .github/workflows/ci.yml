@@ -201,6 +201,10 @@ jobs:
   emqx-erlang:
     name: EMQX plugin (eunit + plugin package)
     runs-on: ubuntu-latest
+    # rebar3 loads the emqx_plugrel plugin (which uses `maybe') for every
+    # command, eunit included; OTP 26 needs the feature flag to load it.
+    env:
+      ERL_FLAGS: -enable-feature maybe_expr
     steps:
       - uses: actions/checkout@v4
       # OTP 26 = the oldest OTP of the EMQX versions the plugin supports
@@ -220,9 +224,6 @@ jobs:
         run: rebar3 eunit
       - name: rebar3 emqx_plugrel tar (checks priv/config.hocon against the Avro schema)
         working-directory: aforo-emqx-plugin
-        # emqx_plugrel uses `maybe' expressions; OTP 26 needs the feature flag.
-        env:
-          ERL_FLAGS: -enable-feature maybe_expr
         run: rebar3 emqx_plugrel tar
       - name: package contains release.json, config and schema
         working-directory: aforo-emqx-plugin/_build/default/emqx_plugrel

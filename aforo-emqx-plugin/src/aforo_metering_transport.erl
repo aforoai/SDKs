@@ -46,7 +46,7 @@
 -define(MAX_DELAY_MS, 30000).
 -define(RETRY_AFTER_MAX_MS, 60000).
 -define(TARGET_BODY_BYTES, 4194304).
--define(USER_AGENT, "aforo-emqx-plugin/2.0.1").
+-define(USER_AGENT, "aforo-emqx-plugin/2.0.2").
 
 -type result() :: #{sent := non_neg_integer(),
                     rejected := [map()],

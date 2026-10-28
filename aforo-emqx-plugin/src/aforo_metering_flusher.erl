@@ -26,8 +26,9 @@
 %%%     until the queue is empty or the shutdown deadline passes; what is
 %%%     left is counted as dropped;
 %%%   * `reconfigure/0' (a config change while running) applies the new
-%%%     settings in this process, between ticks: batch size, interval and
-%%%     queue size; the aggregation settings (a changed window shape
+%%%     settings in this process, between ticks: batch size, interval
+%%%     (the pending tick is cancelled and rescheduled on the new
+%%%     interval) and queue size; the aggregation settings (a changed window shape
 %%%     closes the open windows at once); a paused delivery is retried at
 %%%     once so a fixed API key or URL takes effect. Nothing queued is
 %%%     dropped: a smaller `max_buffer_size' is reached by sending, not by
@@ -58,6 +59,10 @@
     target_max :: pos_integer(),
     batch :: pos_integer(),
     interval :: pos_integer(),
+    %% The pending tick (erlang:start_timer/3). A stale tick -- one whose
+    %% timer was cancelled by reconfigure but had already fired -- does
+    %% not match and is ignored, so there is only ever one tick cycle.
+    tick_ref = undefined :: undefined | reference(),
     inflight = undefined :: undefined | {pid(), reference(), [map()]},
     failures = 0 :: non_neg_integer(),
     open_until = undefined :: undefined | integer(),
@@ -118,8 +123,7 @@ init(TransportOpts) ->
              batch = aforo_metering_config:flush_count(),
              interval = aforo_metering_config:flush_interval_ms(),
              transport_opts = TransportOpts},
-    erlang:send_after(St#st.interval, self(), tick),
-    {ok, St}.
+    {ok, schedule_tick(St)}.
 
 handle_call(status, _From, St) ->
     {reply, #{queue_depth => St#st.len,
@@ -141,10 +145,17 @@ handle_call(flush, From, St0) ->
 handle_call(reconfigure, _From, St0) ->
     Shape = aforo_metering_aggregator:reconfigure(),
     Target = aforo_metering_config:max_buffer_size(),
-    St1 = relax_cap(St0#st{batch = aforo_metering_config:flush_count(),
-                           interval = aforo_metering_config:flush_interval_ms(),
-                           target_max = Target,
-                           max_len = max(St0#st.max_len, Target)}),
+    Interval = aforo_metering_config:flush_interval_ms(),
+    %% A new interval takes effect now, not after the old tick fires
+    %% (with 600000 -> 1000 the next send would otherwise wait up to ten
+    %% minutes).
+    St0a = case Interval =:= St0#st.interval of
+        true -> St0;
+        false -> schedule_tick(cancel_tick(St0#st{interval = Interval}))
+    end,
+    St1 = relax_cap(St0a#st{batch = aforo_metering_config:flush_count(),
+                            target_max = Target,
+                            max_len = max(St0a#st.max_len, Target)}),
     St2 = case Shape of
         reshaped -> close_open_windows(St1);
         unchanged -> St1
@@ -164,10 +175,11 @@ handle_call(_Req, _From, St) ->
 handle_cast(_Msg, St) ->
     {noreply, St}.
 
-handle_info(tick, St0) ->
-    St1 = maybe_send(close_windows(relax_cap(St0))),
-    erlang:send_after(St1#st.interval, self(), tick),
-    {noreply, St1};
+handle_info({timeout, Ref, tick}, St0 = #st{tick_ref = Ref}) ->
+    St1 = maybe_send(close_windows(relax_cap(St0#st{tick_ref = undefined}))),
+    {noreply, schedule_tick(St1)};
+handle_info({timeout, _StaleRef, tick}, St) ->
+    {noreply, St};
 handle_info(wake, St0) ->
     reset_wake(),
     {noreply, maybe_send(close_windows(St0))};
@@ -201,6 +213,14 @@ terminate(Reason, St) ->
     end,
     try persistent_term:erase(?WAKE_FLAG) catch _:_ -> ok end,
     ok.
+
+schedule_tick(St) ->
+    St#st{tick_ref = erlang:start_timer(St#st.interval, self(), tick)}.
+
+cancel_tick(St = #st{tick_ref = undefined}) -> St;
+cancel_tick(St = #st{tick_ref = Ref}) ->
+    _ = erlang:cancel_timer(Ref, [{async, true}, {info, false}]),
+    St#st{tick_ref = undefined}.
 
 %%--------------------------------------------------------------------
 %% Queue

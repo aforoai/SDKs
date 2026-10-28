@@ -9,8 +9,17 @@
 %%% checking with the https match function and SNI. Redirects are never
 %%% followed: the API key must not reach another host.
 %%%
-%%% Requests run on a dedicated httpc profile (`aforo_metering') so they
-%%% reuse connections and do not share a pool with other EMQX code.
+%%% Requests run on a dedicated httpc profile so they reuse connections
+%%% and do not share a pool with other EMQX code. httpc keeps a
+%%% keep-alive connection per host and port, and an open TLS connection
+%%% keeps the certificate check it passed when it was opened: a request
+%%% with new `ssl' options still goes out on it. So when the TLS or URL
+%%% settings change (`reset_connections/0', from on_config_changed) new
+%%% requests move to a fresh profile -- two names alternate,
+%%% `aforo_metering' and `aforo_metering_b' -- and the old one, with its
+%%% open connections, is stopped once a request started on it can no
+%%% longer be running (connect timeout + request timeout + 5 s).
+%%% Requests already in flight finish on the old profile.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(aforo_metering_http).
@@ -18,6 +27,7 @@
 -export([
     start_profile/0,
     stop_profile/0,
+    reset_connections/0,
     profile/0,
     system_cacerts/0,
     ssl_options/1,
@@ -25,24 +35,70 @@
 ]).
 
 -define(PROFILE, aforo_metering).
+-define(PROFILE_B, aforo_metering_b).
+-define(CURRENT, {?MODULE, profile}).
+-define(RETIRE_MARGIN_MS, 5000).
 
-profile() -> ?PROFILE.
+%% The profile new requests use.
+-spec profile() -> atom().
+profile() -> persistent_term:get(?CURRENT, ?PROFILE).
 
 -spec start_profile() -> ok.
 start_profile() ->
     _ = application:ensure_all_started(inets),
     _ = application:ensure_all_started(ssl),
-    case inets:start(httpc, [{profile, ?PROFILE}]) of
+    start_one(profile()).
+
+-spec stop_profile() -> ok.
+stop_profile() ->
+    stop_one(?PROFILE),
+    stop_one(?PROFILE_B),
+    _ = persistent_term:erase(?CURRENT),
+    ok.
+
+%% Send new requests on a fresh profile, so no connection opened under
+%% the previous TLS / URL settings is reused; stop the previous profile
+%% once nothing started on it can still be running.
+-spec reset_connections() -> ok.
+reset_connections() ->
+    _ = application:ensure_all_started(inets),
+    _ = application:ensure_all_started(ssl),
+    Old = profile(),
+    New = other(Old),
+    %% New may still exist from an earlier reset; start it empty.
+    stop_one(New),
+    ok = start_one(New),
+    persistent_term:put(?CURRENT, New),
+    Grace = aforo_metering_config:connect_timeout_ms()
+            + max(aforo_metering_config:request_timeout_ms(),
+                  aforo_metering_config:http_resolver_timeout_ms())
+            + ?RETIRE_MARGIN_MS,
+    _ = spawn(fun() -> retire(Old, Grace) end),
+    ok.
+
+%% Skipped if Old became current again meanwhile (a second reset
+%% restarted it empty).
+retire(Old, Grace) ->
+    timer:sleep(Grace),
+    case profile() of
+        Old -> ok;
+        _ -> stop_one(Old)
+    end.
+
+other(?PROFILE) -> ?PROFILE_B;
+other(_) -> ?PROFILE.
+
+start_one(P) ->
+    case inets:start(httpc, [{profile, P}]) of
         {ok, _} -> ok;
         {error, {already_started, _}} -> ok
     end,
     ok = httpc:set_options([{max_sessions, 4}, {max_keep_alive_length, 100},
-                            {keep_alive_timeout, 60000}], ?PROFILE),
+                            {keep_alive_timeout, 60000}], P),
     ok.
 
--spec stop_profile() -> ok.
-stop_profile() ->
-    try inets:stop(httpc, ?PROFILE) catch _:_ -> ok end,
+stop_one(P) ->
+    try inets:stop(httpc, P) catch _:_ -> ok end,
     ok.
 
 -spec system_cacerts() -> {ok, list()} | {error, term()}.
@@ -106,7 +162,7 @@ request_post(Url, Headers, Body, TimeoutMs) ->
                 {ssl, ssl_options(UrlS)}],
     try
         httpc:request(post, {UrlS, Headers, "application/json", iolist_to_binary(Body)},
-                      HttpOpts, [{body_format, binary}], ?PROFILE)
+                      HttpOpts, [{body_format, binary}], profile())
     catch C:R -> {error, {C, R}}
     end.
 

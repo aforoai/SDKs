@@ -2,7 +2,7 @@
 
 A broker-level EMQX 5.x plugin (Erlang/rebar3) that hooks the broker's connect / disconnect / publish / deliver / subscribe / unsubscribe events, counts them per customer per minute, and ships the totals to Aforo's ingestor. Meter MQTT traffic for billing without touching any device or client SDK.
 
-**Version:** 2.0.1 · **EXPERIMENTAL** · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.0.2 · **EXPERIMENTAL** · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 > ⚠ **Experimental.** This plugin has not been load-tested or run inside a real EMQX broker by Aforo. Its eunit suites run on plain Erlang/OTP (EMQX headers from `emqx_plugin_helper`, a stand-in for EMQX's `emqx_plugins` config store) and against the Aforo mock ingestor. Production-hardening items (load test, release-engineering/CI, dashboard health endpoint) are tracked in [`TODO.md`](TODO.md).
 
@@ -26,25 +26,25 @@ The build follows the official [EMQX plugin template](https://github.com/emqx/em
 git clone https://github.com/aforoai/SDKs.git
 cd SDKs/aforo-emqx-plugin
 rebar3 emqx_plugrel tar
-# emits: _build/default/emqx_plugrel/aforo_metering-2.0.1.tar.gz
-#        (release.json, README.md, aforo_metering-2.0.1, emqx_plugin_helper-5.9.1, jsone-1.8.1)
+# emits: _build/default/emqx_plugrel/aforo_metering-2.0.2.tar.gz
+#        (release.json, README.md, aforo_metering-2.0.2, emqx_plugin_helper-5.9.1, jsone-1.8.1)
 
 rebar3 eunit   # needs only Erlang/OTP (and node, for the mock-ingestor tests)
 ```
 
 The build checks `priv/config.hocon` (the defaults EMQX installs) against `priv/config_schema.avsc` and fails if they disagree.
 
-Install it with the Dashboard (**Plugins → Install Plugin**, upload the `.tar.gz`), the REST API (`POST /api/v5/plugins/install`), or the CLI. On EMQX 5.9+ a Dashboard/API upload must be allowed first: `emqx ctl plugins allow aforo_metering-2.0.1`. The CLI installs a package already copied into the node's plugin directory (`plugins.install_dir`, default `$EMQX_ROOT/plugins`):
+Install it with the Dashboard (**Plugins → Install Plugin**, upload the `.tar.gz`), the REST API (`POST /api/v5/plugins/install`), or the CLI. On EMQX 5.9+ a Dashboard/API upload must be allowed first: `emqx ctl plugins allow aforo_metering-2.0.2`. The CLI installs a package already copied into the node's plugin directory (`plugins.install_dir`, default `$EMQX_ROOT/plugins`):
 
 ```bash
-cp aforo_metering-2.0.1.tar.gz /opt/emqx/plugins/
-emqx ctl plugins install aforo_metering-2.0.1
+cp aforo_metering-2.0.2.tar.gz /opt/emqx/plugins/
+emqx ctl plugins install aforo_metering-2.0.2
 # configure it (see Quickstart step 2), then:
-emqx ctl plugins start aforo_metering-2.0.1
+emqx ctl plugins start aforo_metering-2.0.2
 emqx ctl plugins list
 ```
 
-The plugin is addressed by its name and version, `aforo_metering-2.0.1`, everywhere (CLI, REST paths). Until `tenant_id`, `product_id` and `api_key` are set it refuses to start and logs why.
+The plugin is addressed by its name and version, `aforo_metering-2.0.2`, everywhere (CLI, REST paths). Until `tenant_id`, `product_id` and `api_key` are set it refuses to start and logs why.
 
 ## Quickstart
 
@@ -60,10 +60,10 @@ The plugin is addressed by its name and version, `aforo_metering-2.0.1`, everywh
 
    ```bash
    EMQX=http://localhost:18083/api/v5
-   curl -s -u "$EMQX_API_KEY:$EMQX_API_SECRET" "$EMQX/plugins/aforo_metering-2.0.1/config" > aforo.json
+   curl -s -u "$EMQX_API_KEY:$EMQX_API_SECRET" "$EMQX/plugins/aforo_metering-2.0.2/config" > aforo.json
    # edit aforo.json: tenant_id, product_id, api_key (and anything else), then:
    curl -s -u "$EMQX_API_KEY:$EMQX_API_SECRET" -X PUT -H 'Content-Type: application/json' \
-        --data @aforo.json "$EMQX/plugins/aforo_metering-2.0.1/config"
+        --data @aforo.json "$EMQX/plugins/aforo_metering-2.0.2/config"
    ```
 
    ```json
@@ -77,11 +77,11 @@ The plugin is addressed by its name and version, `aforo_metering-2.0.1`, everywh
 
    | EMQX | On a config change |
    |---|---|
-   | 5.9+ | The plugin checks it on every node and applies it to the running plugin. A change it refuses is rejected with the reason; nothing is saved. |
-   | 5.8 | Applied the same way, but EMQX saves the change even when the plugin refuses it. The running plugin keeps its config and logs `aforo_metering rejected a config change`; the next start uses the saved config if it is valid and refuses it otherwise. |
-   | 5.7 | No callback: restart the plugin (`emqx ctl plugins restart aforo_metering-2.0.1`). |
+   | 5.9+ | Each node checks the change and applies it to the running plugin, then EMQX saves it. A change the plugin refuses (an invalid value, or a new `tenant_id` / `product_id` while running) is rejected as a whole with the reason; nothing is applied or saved. The change is applied **before** EMQX saves it: if the save then fails, the running plugin keeps the new values until its next restart, which reads the saved (old) config. EMQX runs the callback on each node separately and does not undo the other nodes when one refuses or fails, so nodes of a cluster can end up running different configs — after a change, check `aforo_metering` in every node's log. |
+   | 5.8 | EMQX ignores the plugin's answer and **saves every change, even one the plugin refuses**. An invalid value is never applied: the running plugin keeps its config, logs `aforo_metering refused a config change that EMQX saved anyway` at error level with the keys at fault, sets the gauge `aforo.metering.config.invalid` to 1 and reports the problem as `config_problem` in `aforo_metering:health()`. **The next start of the plugin will fail** (`aforo_metering refused to start`) until those keys are fixed; fix them with another change, which clears the gauge. A new `tenant_id` / `product_id` while running is saved too: the plugin applies the other keys of that change, keeps running on the current tenant and product (logged at error level, gauge set) and switches at the next stop/start. |
+   | 5.7 | No callback: restart the plugin (`emqx ctl plugins restart aforo_metering-2.0.2`). The config is read and checked at start only; an invalid one stops the start. |
 
-   While running, a change applies without losing queued usage: a new API key, URL or CA is used on the next request and a paused delivery is retried at once; a new queue size is reached by sending, not evicting; a new window length or topic dimension sends the open windows at once as partial windows. `tenant_id` and `product_id` cannot change while running (usage already counted belongs to the current ones): stop the plugin, change them, start it.
+   While running, a change applies without losing queued usage: a new API key, URL or CA is used on the next request and a paused delivery is retried at once; a new URL, CA or `allow_insecure_http` also moves new requests to fresh connections (connections already open were checked against the old CA and would otherwise be reused); a new `flush_interval_ms` takes effect at once; a new queue size is reached by sending, not evicting; a new window length or topic dimension sends the open windows at once as partial windows. `tenant_id` and `product_id` cannot change while running (usage already counted belongs to the current ones): stop the plugin, change them, start it. Replacing the CA file's contents under the same `ca_cert_file` path is not a config change: restart the plugin, or point `ca_cert_file` at the new file.
 
 3. In Aforo, define the billable units for `mqtt_broker.*` with **SUM** aggregation on quantity. Each usage event carries the number of messages in its window as `quantity`; a COUNT unit would count one per window.
 
@@ -100,7 +100,7 @@ A minute of publishing by one customer becomes one usage event:
       "mqttEventType": "PUBLISH",
       "mqttTopic": "#",
       "dataBytes": 234752,
-      "metadata": { "sdkVersion": "2.0.1", "productId": "prod_mqtt_iot_telemetry",
+      "metadata": { "sdkVersion": "2.0.2", "productId": "prod_mqtt_iot_telemetry",
                     "aggregationWindowSeconds": 60, "messageCount": 1834 }
     }
   ]
@@ -148,6 +148,8 @@ A client with no resolvable customer is not billed; its events are counted as `a
 ## Configuration
 
 Top-level keys of the plugin config. Defaults are those in `priv/config.hocon`, `priv/config_schema.avsc` and `aforo_metering_config:spec/0` (a test keeps the three equal). Settings with no default are required; the plugin refuses to start until they are set.
+
+Changing them on a running broker: see the EMQX 5.7 / 5.8 / 5.9+ table under [Quickstart](#quickstart) step 2. In short, 5.9+ rejects a change the plugin refuses; **5.8 saves it anyway** (the plugin keeps running on its previous config, flags `aforo.metering.config.invalid` and logs the keys, and its next start fails until they are fixed); 5.7 reads the config at start only.
 
 | Option | Type | Default | What it does |
 |---|---|---|---|

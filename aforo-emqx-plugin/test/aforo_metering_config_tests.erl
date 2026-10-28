@@ -10,7 +10,7 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(C, aforo_metering_config).
--define(VSN, "2.0.1").
+-define(VSN, "2.0.2").
 
 %% What EMQX hands over: binary keys, values as HOCON/Avro JSON decoded.
 emqx_conf() ->
@@ -253,6 +253,45 @@ versions_match_test() ->
     %% emqx_plugrel packs exactly these: every runtime dependency outside
     %% OTP and EMQX must be listed.
     ?assertEqual([aforo_metering, emqx_plugin_helper, jsone], Apps).
+
+%% Every version string written into the code or the docs by hand equals
+%% the app vsn: the plugin version in health/0, sdkVersion in every usage
+%% event, the User-Agent, the fallback name-vsn and the docs' headers.
+hard_coded_versions_match_test() ->
+    _ = application:load(aforo_metering),
+    {ok, AppVsn} = application:get_key(aforo_metering, vsn),
+    Root = app_root(),
+    Checks = [{"src/aforo_metering.erl", "-define\\(VERSION, <<\"([^\"]+)\">>\\)"},
+              {"src/aforo_metering_aggregator.erl", "-define\\(SDK_VERSION, <<\"([^\"]+)\">>\\)"},
+              {"src/aforo_metering_transport.erl", "-define\\(USER_AGENT, \"aforo-emqx-plugin/([^\"]+)\"\\)"},
+              {"src/aforo_metering_config.erl", "-define\\(FALLBACK_VSN, \"([^\"]+)\"\\)"},
+              {"README.md", "\\*\\*Version:\\*\\* ([0-9.]+)"},
+              {"USER_GUIDE.md", "\\*\\*Version:\\*\\* ([0-9.]+)"},
+              {"priv/config.hocon", "default configuration \\(([0-9.]+)\\)"},
+              {"CHANGELOG.md", "## \\[([0-9.]+)\\]"},
+              {"../VERSIONING.md", "`aforo-emqx-plugin/` \\| `([0-9.]+)`"}],
+    [begin
+         {ok, Bin} = file:read_file(filename:join(Root, File)),
+         case re:run(Bin, Re, [{capture, all_but_first, list}]) of
+             {match, [Found]} -> ?assertEqual({File, AppVsn}, {File, Found});
+             nomatch -> ?assertEqual({File, found}, {File, nomatch})
+         end
+     end || {File, Re} <- Checks],
+    %% and the running code agrees with its source
+    {ok, Sent} = transport_user_agent(),
+    ?assertEqual("aforo-emqx-plugin/" ++ AppVsn, Sent).
+
+transport_user_agent() ->
+    Self = self(),
+    Http = fun(_Url, Headers, _Body, _T) ->
+        Self ! {ua, proplists:get_value("User-Agent", Headers)},
+        {ok, {{"HTTP/1.1", 202, "x"}, [], <<"{}">>}}
+    end,
+    _ = aforo_metering_transport:send([#{<<"idempotencyKey">> => <<"k">>}],
+        #{url => <<"http://127.0.0.1:9/x">>, api_key => <<"k">>, tenant => <<"t">>,
+          batch_size => 10, timeout_ms => 1000, max_retries => 0, deadline => infinity,
+          sleep => fun(_) -> ok end, rand => fun(_) -> 0 end, http => Http}),
+    receive {ua, UA} -> {ok, UA} after 1000 -> error end.
 
 %% rebar3 runs eunit from the project root.
 app_root() ->

@@ -66,7 +66,7 @@
 %% A candidate config under validation (process dictionary of the caller).
 -define(CANDIDATE, {?MODULE, candidate}).
 %% Used only when the application spec is not loaded (never inside EMQX).
--define(FALLBACK_VSN, "2.0.1").
+-define(FALLBACK_VSN, "2.0.2").
 
 %% Values shipped in earlier versions' sample configs. A plugin running on
 %% them would bill a tenant that does not exist.
@@ -131,7 +131,7 @@ secret_keys() -> [api_key, customer_resolver_http_authorization].
 %% Loading
 %%--------------------------------------------------------------------
 
-%% "aforo_metering-2.0.1": the plugin's identity in EMQX.
+%% "aforo_metering-2.0.2": the plugin's identity in EMQX.
 -spec name_vsn() -> binary().
 name_vsn() ->
     Vsn = case application:get_key(?APP, vsn) of

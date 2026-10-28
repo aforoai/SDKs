@@ -1,6 +1,6 @@
 {application, aforo_metering, [
     {description, "Aforo MQTT Metering Plugin for EMQX"},
-    {vsn, "2.0.1"},
+    {vsn, "2.0.2"},
     {registered, [aforo_metering_sup, aforo_metering_flusher, aforo_metering_resolver_pool]},
     {mod, {aforo_metering_app, []}},
     {applications, [

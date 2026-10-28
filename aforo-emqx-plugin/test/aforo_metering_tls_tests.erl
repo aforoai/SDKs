@@ -150,3 +150,70 @@ ip_literal_matching_ip_san_succeeds_test() ->
     tls_case({ip, <<127, 0, 0, 1>>}, "127.0.0.1", fun(Pem) -> #{ca_cert_file => list_to_binary(Pem)} end, fun(Url) ->
         ?assertMatch({ok, {{_, 200, _}, _, _}}, ?H:request_post(Url, [], <<"{}">>, 5000))
     end).
+
+%% ── 2.0.2: a changed CA reaches connections already open ─────────────
+
+%% A keep-alive TLS server: answers every request on a connection.
+start_keepalive_tls_server(ServerOpts) ->
+    Parent = self(),
+    Pid = spawn(fun() ->
+        {ok, L} = ssl:listen(0, [binary, {active, false}, {reuseaddr, true} | ServerOpts]),
+        {ok, {_, Port}} = ssl:sockname(L),
+        Parent ! {self(), Port},
+        keepalive_loop(L)
+    end),
+    receive {Pid, Port} -> {Pid, Port} after 5000 -> error(no_tls_server) end.
+
+keepalive_loop(L) ->
+    case ssl:transport_accept(L) of
+        {ok, T} ->
+            spawn(fun() ->
+                case ssl:handshake(T, 5000) of
+                    {ok, S} -> serve_keepalive(S);
+                    _ -> ok
+                end
+            end),
+            keepalive_loop(L);
+        _ -> ok
+    end.
+
+serve_keepalive(S) ->
+    case ssl:recv(S, 0, 10000) of
+        {ok, _} ->
+            ok = ssl:send(S, <<"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                               "Connection: keep-alive\r\n\r\n{}">>),
+            serve_keepalive(S);
+        _ -> ssl:close(S)
+    end.
+
+%% The CA is switched to one that does not sign the server certificate.
+%% httpc reuses the open connection (its TLS check was done at connect
+%% time), so the new CA only takes effect after reset_connections/0 --
+%% which on_config_changed calls when ca_cert_file changes.
+ca_change_reaches_open_connections_test() ->
+    _ = application:ensure_all_started(ssl),
+    {ServerOpts, RootDer} = test_pki("localhost"),
+    {_OtherOpts, OtherRootDer} = test_pki("localhost"),
+    {Pid, Port} = start_keepalive_tls_server(ServerOpts),
+    Good = write_pem(RootDer),
+    Wrong = write_pem(OtherRootDer),
+    Url = "https://localhost:" ++ integer_to_list(Port) ++ "/v1/ingest/batch",
+    aforo_test_util:with_config(#{ca_cert_file => list_to_binary(Good)}),
+    ok = ?H:start_profile(),
+    try
+        ?assertMatch({ok, {{_, 200, _}, _, _}}, ?H:request_post(Url, [], <<"{}">>, 5000)),
+        aforo_test_util:with_config(#{ca_cert_file => list_to_binary(Wrong)}),
+        %% the open connection is reused: the old check still holds
+        ?assertMatch({ok, {{_, 200, _}, _, _}}, ?H:request_post(Url, [], <<"{}">>, 5000)),
+        ok = ?H:reset_connections(),
+        ?assertMatch({error, _}, ?H:request_post(Url, [], <<"{}">>, 5000)),
+        aforo_test_util:with_config(#{ca_cert_file => list_to_binary(Good)}),
+        ok = ?H:reset_connections(),
+        ?assertMatch({ok, {{_, 200, _}, _, _}}, ?H:request_post(Url, [], <<"{}">>, 5000))
+    after
+        ?H:stop_profile(),
+        exit(Pid, kill),
+        file:delete(Good),
+        file:delete(Wrong),
+        aforo_test_util:reset_config()
+    end.

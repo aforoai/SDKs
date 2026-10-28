@@ -35,7 +35,11 @@
     on_session_unsubscribed/4
 ]).
 
--define(VERSION, <<"2.0.1">>).
+-ifdef(TEST).
+-export([bad_keys/1, rejects_on_error/0, parse_vsn/1]).
+-endif.
+
+-define(VERSION, <<"2.0.2">>).
 
 %%--------------------------------------------------------------------
 %% Lifecycle (aforo_metering_app)
@@ -46,6 +50,7 @@
 prepare() ->
     case aforo_metering_config:validate() of
         ok ->
+            clear_config_problem(),
             ok = aforo_metering_http:start_profile(),
             ok = aforo_metering_metrics:init(),
             aforo_metering_metrics:set_circuit_state(closed),
@@ -111,6 +116,7 @@ health() ->
         open_aggregation_keys => aforo_metering_aggregator:open_keys(),
         cache_size      => aforo_metering_cache:size(),
         circuit_state   => atom_to_binary(maps:get(circuit, Status, closed), utf8),
+        config_problem  => case config_problem() of undefined -> null; P -> P end,
         counters        => maps:from_list(aforo_metering_metrics:get_all())
     }.
 
@@ -125,21 +131,38 @@ flush_now() ->
 
 %% EMQX 5.8+ calls this on every node when the plugin config is changed
 %% through the Dashboard or `PUT /api/v5/plugins/{name-vsn}/config',
-%% also while the plugin is installed but stopped. On 5.9+ returning
-%% `{error, Reason}' rejects the change (it is not saved); 5.8 ignores
-%% the return value and saves the change anyway, so a refused change is
-%% also logged at error and the running plugin keeps its current config.
-%% (5.7 has no callback: restart the plugin after a change.)
+%% also while the plugin is installed but stopped. (5.7 has no callback:
+%% restart the plugin after a change.)
+%%
+%% What EMQX does with the return value differs by version:
+%%   * 5.9+: `{error, Reason}' rejects the change -- it is not saved and
+%%     the caller gets the reason. An accepted change is applied here
+%%     BEFORE EMQX saves it; if the save then fails, the running plugin
+%%     has the new config until the next restart, which reads the saved
+%%     (old) one.
+%%   * 5.8: the return value is ignored and the change is saved anyway.
+%%     A refused change is therefore logged at error level, naming the
+%%     keys, the gauge `aforo.metering.config.invalid' is set to 1 and
+%%     health/0 reports it: the next start will fail until it is fixed.
+%%     The running plugin keeps its config -- an invalid config is never
+%%     applied.
+%% EMQX's version is read from the `emqx' application; an unknown
+%% version is treated like 5.8 (see rejects_on_error/0).
 %%
 %% NewConfig has already passed priv/config_schema.avsc. Checks here are
 %% the same on every node (no file or network checks -- see
 %% aforo_metering_config:validate/1); node-local problems show in
-%% on_health_check/1.
+%% on_health_check/1. EMQX calls this on each node separately and does
+%% not roll the other nodes back when one refuses or fails, so on a 5.9
+%% cluster nodes can end up running different configs; check every
+%% node's log after a change.
 %%
 %% While running, the change is applied in place, nothing queued is
 %% dropped:
 %%   * delivery settings (URL, key, CA, timeouts, retries) take effect
-%%     on the next request, and a paused delivery is retried at once;
+%%     on the next request, and a paused delivery is retried at once; a
+%%     change of URL, CA or allow_insecure_http also moves new requests
+%%     to fresh connections (aforo_metering_http:reset_connections/0);
 %%   * flush_count / flush_interval_ms / max_buffer_size and the
 %%     aggregation settings are applied inside the flusher between
 %%     ticks; a new window length or topic dimension closes the open
@@ -148,16 +171,21 @@ flush_now() ->
 %%     customers already resolved stay cached until their connection
 %%     ends, so publishers stay attributed.
 %% tenant_id and product_id cannot change while running: usage already
-%% counted belongs to the old ones. Stop the plugin, change them, start.
+%% counted belongs to the old ones. On 5.9+ a change of either is
+%% rejected as a whole. On 5.8 (which saves it anyway) every other key
+%% of the change is applied, the running plugin keeps its tenant and
+%% product, and the error log says the new ones take effect at the next
+%% stop/start -- so later changes keep applying instead of being
+%% refused until a restart.
 -spec on_config_changed(map(), map()) -> ok | {error, binary()}.
 on_config_changed(_OldConfig, NewConfig) when is_map(NewConfig) ->
     Candidate = aforo_metering_config:normalize(NewConfig),
     case aforo_metering_config:validate(Candidate) of
         {error, Reasons} ->
-            [?SLOG(error, #{msg => "aforo_metering rejected a config change", reason => R})
-             || R <- Reasons],
+            refuse_invalid(Reasons),
             {error, join(Reasons)};
         ok ->
+            clear_config_problem(),
             case is_running() of
                 false ->
                     ok = aforo_metering_config:put_snapshot(Candidate),
@@ -170,18 +198,102 @@ on_config_changed(_OldConfig, NewConfig) when is_map(NewConfig) ->
 on_config_changed(_OldConfig, _NewConfig) ->
     {error, <<"the plugin config must be a map">>}.
 
-apply_running(Candidate) ->
+refuse_invalid(Reasons) ->
+    Keys = bad_keys(Reasons),
+    case rejects_on_error() of
+        true ->
+            ?SLOG(error, #{msg => "aforo_metering rejected a config change; EMQX does not save it",
+                           keys => Keys, reasons => Reasons});
+        false ->
+            Problem = iolist_to_binary(
+                ["EMQX saved a config change the plugin refused (keys: ",
+                 lists:join(<<", ">>, [atom_to_binary(K, utf8) || K <- Keys]),
+                 "); the plugin keeps running on its current config, but its next start ",
+                 "will fail until the config is fixed: ", join(Reasons)]),
+            set_config_problem(Problem),
+            ?SLOG(error, #{msg => "aforo_metering refused a config change that EMQX saved anyway "
+                                  "(EMQX 5.8 ignores the refusal). The running plugin keeps its "
+                                  "current config; the NEXT START WILL FAIL until these keys are fixed",
+                           keys => Keys, reasons => Reasons})
+    end.
+
+%% The setting each refusal is about -- the first setting name it
+%% mentions as a whole word ("ingestor_url uses http:// ... or set
+%% allow_insecure_http = true" is about ingestor_url) -- for the log.
+-spec bad_keys([binary()]) -> [atom()].
+bad_keys(Reasons) ->
+    Names = [{K, atom_to_binary(K, utf8)} || {K, _, _} <- aforo_metering_config:spec()],
+    Keys = lists:foldl(
+        fun(Reason, Acc) ->
+            Hits = lists:sort([{Pos, K} || {K, W} <- Names, Pos <- word_positions(Reason, W)]),
+            case Hits of
+                [{_, K} | _] -> case lists:member(K, Acc) of true -> Acc; false -> Acc ++ [K] end;
+                [] -> Acc
+            end
+        end, [], Reasons),
+    case Keys of
+        [] -> ['$config'];
+        _ -> Keys
+    end.
+
+word_positions(Text, Word) ->
+    [Pos || {Pos, Len} <- binary:matches(Text, Word),
+            not word_char(Text, Pos - 1), not word_char(Text, Pos + Len)].
+
+word_char(Text, I) when I < 0; I >= byte_size(Text) -> false;
+word_char(Text, I) ->
+    C = binary:at(Text, I),
+    (C >= $a andalso C =< $z) orelse (C >= $0 andalso C =< $9) orelse C =:= $_.
+
+apply_running(Candidate0) ->
     Current = aforo_metering_config:snapshot(),
+    Identity = [K || K <- [tenant_id, product_id], value(K, Current) =/= value(K, Candidate0)],
+    IdentityReason = <<"tenant_id and product_id cannot change while the plugin is running ",
+                       "(usage already counted belongs to the current ones); stop the plugin, ",
+                       "change them, then start it">>,
+    case Identity =/= [] andalso rejects_on_error() of
+        true ->
+            %% 5.9+: the whole change is rejected and not saved.
+            ?SLOG(error, #{msg => "aforo_metering rejected a config change", reason => IdentityReason,
+                           keys => Identity}),
+            {error, IdentityReason};
+        false ->
+            %% Keep the running identity; apply everything else.
+            Candidate = maps:merge(Candidate0, maps:with([tenant_id, product_id], Current)),
+            apply_keys(Current, Candidate),
+            case Identity of
+                [] -> ok;
+                _ ->
+                    set_config_problem(iolist_to_binary(
+                        ["EMQX saved a new ", lists:join(<<" and ">>, [atom_to_binary(K, utf8) || K <- Identity]),
+                         "; the running plugin keeps the current one until it is stopped and started"])),
+                    ?SLOG(error, #{msg => "aforo_metering cannot change tenant_id / product_id while "
+                                          "running; EMQX saved the change anyway (EMQX 5.8). The other "
+                                          "changed keys were applied; usage keeps going to the current "
+                                          "tenant and product. Stop and start the plugin to switch.",
+                                   keys => Identity,
+                                   running => maps:with([tenant_id, product_id], Current)}),
+                    {error, IdentityReason}
+            end
+    end.
+
+apply_keys(Current, Candidate) ->
     Changed = [K || {K, _, _} <- aforo_metering_config:spec(),
                     maps:get(K, Current, undefined) =/= maps:get(K, Candidate, undefined)],
-    Identity = [K || K <- [tenant_id, product_id], lists:member(K, Changed),
-                     value(K, Current) =/= value(K, Candidate)],
-    case Identity of
-        [] when Changed =:= [] ->
-            ok = aforo_metering_config:put_snapshot(Candidate),
-            ok;
-        [] ->
-            ok = aforo_metering_config:put_snapshot(Candidate),
+    ok = aforo_metering_config:put_snapshot(Candidate),
+    case Changed of
+        [] -> ok;
+        _ ->
+            case lists:any(fun(K) -> lists:member(K, Changed) end, connection_keys()) of
+                true ->
+                    try aforo_metering_http:reset_connections()
+                    catch C0:R0 ->
+                        ?SLOG(error, #{msg => "aforo_metering could not reset its HTTP connections; "
+                                              "open connections keep the previous TLS settings until "
+                                              "they close", class => C0, reason => R0})
+                    end;
+                false -> ok
+            end,
             Shape = try aforo_metering_flusher:reconfigure() of
                         {ok, S} -> S
                     catch C1:R1 ->
@@ -198,15 +310,12 @@ apply_running(Candidate) ->
             end,
             ?SLOG(info, #{msg => "aforo_metering config applied", changed => Changed,
                           windows => Shape}),
-            ok;
-        _ ->
-            Reason = <<"tenant_id and product_id cannot change while the plugin is running ",
-                       "(usage already counted belongs to the current ones); stop the plugin, ",
-                       "change them, then start it">>,
-            ?SLOG(error, #{msg => "aforo_metering rejected a config change", reason => Reason,
-                           keys => Identity}),
-            {error, Reason}
+            ok
     end.
+
+%% Settings an open (keep-alive) connection was made under.
+connection_keys() ->
+    [ingestor_url, ca_cert_file, allow_insecure_http, customer_resolver_http_url].
 
 value(K, Conf) ->
     case maps:get(K, Conf, <<>>) of
@@ -215,12 +324,54 @@ value(K, Conf) ->
         V -> V
     end.
 
+%% True when EMQX honours `{error, _}' from on_config_changed (5.9+).
+%% 5.8 (and anything older or unknown) saves the change regardless.
+-spec rejects_on_error() -> boolean().
+rejects_on_error() ->
+    case emqx_version() of
+        {Major, Minor} -> {Major, Minor} >= {5, 9};
+        unknown -> false
+    end.
+
+emqx_version() ->
+    Vsn = case application:get_key(emqx, vsn) of
+        {ok, V} -> V;
+        undefined ->
+            try emqx_release:version() catch _:_ -> undefined end
+    end,
+    parse_vsn(Vsn).
+
+parse_vsn(V) when is_binary(V) -> parse_vsn(binary_to_list(V));
+parse_vsn([C | Rest]) when C =:= $e; C =:= $v -> parse_vsn(Rest);
+parse_vsn(V) when is_list(V) ->
+    case string:split(V, ".", all) of
+        [Ma, Mi | _] ->
+            try {list_to_integer(Ma), list_to_integer(string:trim(Mi, trailing, "-abcdefghijklmnopqrstuvwxyz"))}
+            catch _:_ -> unknown
+            end;
+        _ -> unknown
+    end;
+parse_vsn(_) -> unknown.
+
+-define(CONFIG_PROBLEM, {?MODULE, config_problem}).
+
+set_config_problem(Text) ->
+    persistent_term:put(?CONFIG_PROBLEM, Text),
+    aforo_metering_metrics:set_config_invalid(true).
+
+clear_config_problem() ->
+    _ = persistent_term:erase(?CONFIG_PROBLEM),
+    aforo_metering_metrics:set_config_invalid(false).
+
+config_problem() -> persistent_term:get(?CONFIG_PROBLEM, undefined).
+
 %% EMQX 5.9+ calls this when the plugin's info is requested.
 -spec on_health_check(map()) -> ok | {error, binary()}.
 on_health_check(_Options) ->
-    case aforo_metering_config:check_environment() of
-        {error, Reasons} -> {error, join(Reasons)};
-        ok ->
+    case {config_problem(), aforo_metering_config:check_environment()} of
+        {Problem, _} when is_binary(Problem) -> {error, Problem};
+        {_, {error, Reasons}} -> {error, join(Reasons)};
+        {_, ok} ->
             Status = try aforo_metering_flusher:status() catch _:_ -> undefined end,
             case Status of
                 undefined -> ok;

@@ -4,12 +4,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [Unreleased]
 
-- Run 2.0.1 inside a real EMQX 5.7+ broker (install of the package, hooks, `client_attrs`, plugin config and `on_config_changed`) — not yet done.
+- Run 2.0.2 inside a real EMQX 5.7+ broker (install of the package, hooks, `client_attrs`, plugin config and `on_config_changed`) — not yet done.
 - Load test (10K msg/sec sustained, 100K peak per node) — not yet run.
 - GPG-signed release packages, marketplace publish — not yet built. (CI now runs eunit and builds the package.)
 - HTTP endpoint exposing `aforo_metering:health/0` — needs a separate dashboard plugin module.
 
 See [`TODO.md`](TODO.md) for the full production-hardening checklist.
+
+## [2.0.2] — 2026-10-28
+
+Fixes from the review of 2.0.1. Tested on plain Erlang/OTP; **not run inside a real EMQX broker**.
+
+### Fixed
+
+- **EMQX 5.8: one refused `tenant_id` / `product_id` change blocked every later change.** 5.8 ignores `on_config_changed`'s answer and saves the change anyway, so the saved config kept the new tenant while the plugin ran on the old one, and every later change was refused until a restart. On 5.8 the plugin now applies every other key of such a change, keeps running on the current tenant and product, logs at error level that the switch needs a stop/start, and returns `{error, _}`. On 5.9+ (which honours the answer) the change is still rejected as a whole. The EMQX version is read from the `emqx` application; an unknown version is treated like 5.8.
+- **EMQX 5.8: a refused config was saved and the next start failed with no warning at change time.** The plugin still never applies it, and now logs `aforo_metering refused a config change that EMQX saved anyway` at error level naming the keys at fault and saying the next start will fail, sets the new gauge `aforo.metering.config.invalid` to 1, and reports the problem as `config_problem` in `health/0` and in `on_health_check/1`. The next valid change (or a start) clears it.
+- **A shorter `flush_interval_ms` waited out the old tick** (up to 10 minutes with the maximum interval). The flusher now cancels the pending tick and schedules one on the new interval at once.
+- **A new `ca_cert_file` (or URL / `allow_insecure_http`) did not reach open connections.** httpc reused keep-alive connections whose TLS check was done under the old CA. Such a change now moves new requests to a fresh httpc profile (two alternate); the old one is stopped once nothing started on it can still be running. Requests in flight finish on the old one.
+- `rebar.config` named a test module that does not exist (`aforo_metering_version_tests`).
+
+### Added
+
+- `hard_coded_versions_match_test`: every hand-written version string (`?VERSION`, `?SDK_VERSION`, `?USER_AGENT`, `?FALLBACK_VSN`, README, user guide, `priv/config.hocon`, changelog, VERSIONING.md) equals the app `vsn`, and the User-Agent actually sent carries it.
+- CI sets `ERL_FLAGS=-enable-feature maybe_expr` for the whole EMQX job: rebar3 loads the `emqx_plugrel` plugin (which uses `maybe`) for `eunit` too, and OTP 26 needs the flag to load it.
+- Docs: how EMQX 5.7 / 5.8 / 5.9+ treat a config change, that 5.9+ applies a change before saving it (a failed save reverts at the next restart), and that cluster nodes can end up with different configs.
 
 ## [2.0.1] — 2026-10-28
 

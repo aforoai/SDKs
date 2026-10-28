@@ -24,6 +24,10 @@
 %%%
 %%% Gauges (persistent_term-backed, set/circuit_state/get_circuit_state):
 %%%   aforo.metering.circuit.state            — 0 = closed, 1 = half_open, 2 = open
+%%%   aforo.metering.config.invalid           — 1 = EMQX saved a config change the
+%%%                                             plugin refused (EMQX 5.8 saves it
+%%%                                             anyway); the next start will fail
+%%%                                             until it is fixed. 0 otherwise.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(aforo_metering_metrics).
@@ -35,6 +39,8 @@
     inc/2,
     set_circuit_state/1,
     circuit_state/0,
+    set_config_invalid/1,
+    config_invalid/0,
     get_all/0
 ]).
 
@@ -55,6 +61,7 @@
 ]).
 
 -define(CIRCUIT_STATE_KEY, {?MODULE, circuit_state}).
+-define(CONFIG_INVALID_KEY, {?MODULE, config_invalid}).
 
 -spec init() -> ok.
 init() ->
@@ -119,10 +126,18 @@ set_circuit_state(_)         -> ok.
 circuit_state() ->
     persistent_term:get(?CIRCUIT_STATE_KEY, 0).
 
+-spec set_config_invalid(boolean()) -> ok.
+set_config_invalid(true)  -> persistent_term:put(?CONFIG_INVALID_KEY, 1), ok;
+set_config_invalid(false) -> _ = persistent_term:erase(?CONFIG_INVALID_KEY), ok.
+
+-spec config_invalid() -> 0 | 1.
+config_invalid() -> persistent_term:get(?CONFIG_INVALID_KEY, 0).
+
 -spec get_all() -> [{atom(), non_neg_integer()}].
 get_all() ->
     Counters = [{Name, safe_value(Name)} || Name <- ?COUNTERS],
-    [{'aforo.metering.circuit.state', circuit_state()} | Counters].
+    [{'aforo.metering.circuit.state', circuit_state()},
+     {'aforo.metering.config.invalid', config_invalid()} | Counters].
 
 -ifdef(AFORO_NO_EMQX).
 safe_value(Name) -> val(Name).

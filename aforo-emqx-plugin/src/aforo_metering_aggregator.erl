@@ -58,7 +58,7 @@
 -define(EMITTED, aforo_metering_agg_emitted).
 -define(SETTINGS, {?MODULE, settings}).
 -define(GRACE_MS, 1000).
--define(SDK_VERSION, <<"2.0.1">>).
+-define(SDK_VERSION, <<"2.0.2">>).
 %% IngestUsageEventRequest.mqttTopic is @Size(max = 500). Truncating at
 %% 500 bytes keeps it within 500 UTF-16 code units.
 -define(MAX_TOPIC_BYTES, 500).

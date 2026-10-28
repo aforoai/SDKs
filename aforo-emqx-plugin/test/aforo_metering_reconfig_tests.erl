@@ -294,3 +294,148 @@ app_module_exports_callbacks_test() ->
     {module, _} = code:ensure_loaded(aforo_metering_app),
     ?assert(erlang:function_exported(aforo_metering_app, on_config_changed, 2)),
     ?assert(erlang:function_exported(aforo_metering_app, on_health_check, 1)).
+
+%%--------------------------------------------------------------------
+%% 2.0.2: what EMQX does with the return value (5.8 vs 5.9+)
+%%--------------------------------------------------------------------
+
+%% Pretend to run inside EMQX of version Vsn (the plugin reads the
+%% `emqx' application's vsn).
+with_emqx(Vsn, Fun) ->
+    ok = application:load({application, emqx, [{vsn, Vsn}, {description, "test stand-in"},
+                                                {modules, []}, {registered, []},
+                                                {applications, [kernel, stdlib]}]}),
+    try Fun() after application:unload(emqx) end.
+
+config_invalid() -> aforo_metering_metrics:config_invalid().
+
+%% 5.8 saves a refused identity change anyway. The other keys of that
+%% change are applied, the running tenant is kept, and the NEXT change
+%% (whose config still carries the saved new tenant) is applied too --
+%% before 2.0.2 every later change was refused until a restart.
+identity_change_on_58_applies_other_keys_test() ->
+    {Http, _Log, _} = fake(),
+    with_emqx("5.8.4", fun() ->
+        running(#{}, Http, fun() ->
+            ?assertNot(?M:rejects_on_error()),
+            {error, R} = ?M:on_config_changed(#{}, emqx(#{<<"tenant_id">> => <<"tenant_new">>,
+                                                          <<"flush_count">> => 7})),
+            ?assertNotEqual(nomatch, binary:match(R, <<"stop the plugin">>)),
+            ?assertEqual(<<"tenant_t">>, ?C:tenant_id()),
+            ?assertEqual(7, ?C:flush_count()),
+            ?assertEqual(7, maps:get(flush_count, ?A:settings())),
+            ?assertEqual(1, config_invalid()),
+            ?assertMatch(#{config_problem := <<"EMQX saved a new tenant_id", _/binary>>}, ?M:health()),
+            %% the saved config now has tenant_new; a later change applies
+            {error, _} = ?M:on_config_changed(#{}, emqx(#{<<"tenant_id">> => <<"tenant_new">>,
+                                                          <<"flush_count">> => 9})),
+            ?assertEqual(9, ?C:flush_count()),
+            ?assertEqual(<<"tenant_t">>, ?C:tenant_id()),
+            %% the identity is changed back: nothing pending any more
+            ok = ?M:on_config_changed(#{}, emqx(#{<<"flush_count">> => 9})),
+            ?assertEqual(0, config_invalid())
+        end)
+    end).
+
+%% 5.9+ honours the refusal: nothing of the change is applied.
+identity_change_on_59_rejected_whole_test() ->
+    {Http, _Log, _} = fake(),
+    with_emqx("5.9.1", fun() ->
+        running(#{}, Http, fun() ->
+            ?assert(?M:rejects_on_error()),
+            Before = ?C:flush_count(),
+            {error, _} = ?M:on_config_changed(#{}, emqx(#{<<"product_id">> => <<"prod_new">>,
+                                                          <<"flush_count">> => 7})),
+            ?assertEqual(Before, ?C:flush_count()),
+            ?assertEqual(<<"prod_p">>, ?C:product_id()),
+            ?assertEqual(0, config_invalid())
+        end)
+    end).
+
+%% 5.8 saves an invalid config anyway: never applied, reported (gauge,
+%% health, error log naming the key), cleared by the next valid change.
+invalid_config_on_58_reported_test() ->
+    with_emqx("5.8.0", fun() ->
+        ok = ?C:put_snapshot(?C:normalize(emqx(#{}))),
+        try
+            Bad = emqx(#{<<"ingestor_url">> => <<"http://ingestor.example/v1/ingest/batch">>}),
+            {error, _} = ?M:on_config_changed(#{}, Bad),
+            ?assertEqual(<<"http://127.0.0.1:9/v1/ingest/batch">>, ?C:ingestor_url()),
+            ?assertEqual(1, config_invalid()),
+            {error, Health} = ?M:on_health_check(#{}),
+            ?assertNotEqual(nomatch, binary:match(Health, <<"keys: ingestor_url)">>)),
+            ?assertNotEqual(nomatch, binary:match(Health, <<"next start will fail">>)),
+            ok = ?M:on_config_changed(#{}, emqx(#{})),
+            ?assertEqual(0, config_invalid()),
+            ?assertEqual(ok, ?M:on_health_check(#{}))
+        after
+            ?C:clear_overrides(),
+            aforo_metering_metrics:set_config_invalid(false)
+        end
+    end).
+
+invalid_config_on_59_not_flagged_test() ->
+    with_emqx("e5.9.0", fun() ->
+        ok = ?C:put_snapshot(?C:normalize(emqx(#{}))),
+        try
+            {error, _} = ?M:on_config_changed(#{}, emqx(#{<<"api_key">> => <<>>})),
+            ?assertEqual(0, config_invalid())
+        after ?C:clear_overrides()
+        end
+    end).
+
+bad_keys_whole_words_test() ->
+    ?assertEqual([customer_resolver_http_url],
+                 ?M:bad_keys([<<"customer_resolver_http_url uses http:// for a non-local host">>])),
+    ?assertEqual([tenant_id, api_key],
+                 ?M:bad_keys([<<"tenant_id is not set">>, <<"api_key is a placeholder">>])),
+    ?assertEqual(['$config'], ?M:bad_keys([<<"something else">>])).
+
+parse_vsn_test_() ->
+    [?_assertEqual({5, 8}, ?M:parse_vsn("5.8.4")),
+     ?_assertEqual({5, 9}, ?M:parse_vsn("e5.9.0")),
+     ?_assertEqual({5, 10}, ?M:parse_vsn(<<"v5.10.0-rc.1">>)),
+     ?_assertEqual(unknown, ?M:parse_vsn(undefined)),
+     ?_assertEqual(unknown, ?M:parse_vsn("x"))].
+
+%% No emqx application (plain OTP): treated like 5.8.
+unknown_version_is_58_test() ->
+    ?assertNot(?M:rejects_on_error()).
+
+%% A shorter flush_interval_ms is used at once, not after the old tick.
+interval_change_reschedules_tick_test_() ->
+    {timeout, 30, fun() ->
+        {Http, Log, _} = fake(),
+        Cfg = #{<<"aggregation_window_seconds">> => 0, <<"flush_interval_ms">> => 600000},
+        running(Cfg, Http, fun() ->
+            pub(1),
+            timer:sleep(300),
+            ?assertEqual([], delivered(Log)),
+            ok = ?M:on_config_changed(#{}, emqx(Cfg#{<<"flush_interval_ms">> => 100})),
+            ?assert(wait_until(fun() -> length(delivered(Log)) =:= 1 end, 2000)),
+            pub(2),
+            ?assert(wait_until(fun() -> length(delivered(Log)) =:= 2 end, 2000))
+        end)
+    end}.
+
+%% A changed URL / CA moves new requests to fresh connections; other
+%% changes keep the open ones.
+connection_reset_on_tls_change_test() ->
+    {Http, _Log, _} = fake(),
+    running(#{}, Http, fun() ->
+        ok = aforo_metering_http:start_profile(),
+        try
+            P0 = aforo_metering_http:profile(),
+            ok = ?M:on_config_changed(#{}, emqx(#{<<"flush_count">> => 5})),
+            ?assertEqual(P0, aforo_metering_http:profile()),
+            ok = ?M:on_config_changed(#{}, emqx(#{<<"flush_count">> => 5,
+                                                  <<"ca_cert_file">> => <<"/etc/ssl/x.pem">>})),
+            P1 = aforo_metering_http:profile(),
+            ?assertNotEqual(P0, P1),
+            ok = ?M:on_config_changed(#{}, emqx(#{<<"flush_count">> => 5,
+                                                  <<"ca_cert_file">> => <<"/etc/ssl/x.pem">>,
+                                                  <<"ingestor_url">> => <<"http://localhost:9/v1/ingest/batch">>})),
+            ?assertEqual(P0, aforo_metering_http:profile())
+        after aforo_metering_http:stop_profile()
+        end
+    end).
