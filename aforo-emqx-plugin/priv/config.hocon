@@ -1,0 +1,122 @@
+## Aforo MQTT Metering plugin -- default configuration (2.0.2)
+##
+## EMQX copies this file to $EMQX_DATA_DIR/plugins/aforo_metering/config.hocon
+## when the plugin is installed. Change it through the Dashboard
+## (Plugins -> aforo_metering -> Configure) or the REST API
+## (PUT /api/v5/plugins/aforo_metering-2.0.2/config); every change is
+## checked against priv/config_schema.avsc and by the plugin itself.
+## EMQX 5.8+ applies a change to the running plugin; on 5.7, restart it.
+##
+## tenant_id, product_id and api_key are empty here on purpose: the
+## plugin refuses to start until they are set, and logs every reason
+## ("aforo_metering refused to start").
+
+## Required: Aforo tenant identifier (sent as the X-Tenant-Id header).
+tenant_id = ""
+
+## Required: the Aforo product id this broker is registered as.
+product_id = ""
+
+## Required: Aforo API key, scope usage:ingest. Sent as the X-API-Key
+## header only -- never as Authorization: Bearer, never to any other host.
+## EMQX does not substitute environment variables (${VAR}) in plugin
+## config: set the key itself through the Dashboard or the REST API.
+api_key = ""
+
+## Aforo usage-ingestor batch endpoint. Must be https://. Plain http://
+## is accepted only for localhost / 127.0.0.1 / ::1, or with
+## allow_insecure_http = true.
+ingestor_url = "https://api.aforo.ai/v1/ingest/batch"
+
+## TLS. Server certificates are always verified (CA + hostname).
+## Empty = the operating system's trust store (public_key:cacerts_get/0).
+## Set a PEM file for a private CA.
+ca_cert_file = ""
+## Allow http:// to a non-loopback host (the API key travels unencrypted).
+allow_insecure_http = false
+
+## ── Aggregation ──────────────────────────────────────────────────
+## Broker events are counted per (customer, metric[, topic]) per window
+## and sent as ONE usage event whose quantity is the message count.
+## Billable units on mqtt_broker.* metrics must aggregate with SUM (on
+## quantity): a COUNT unit would count one per window.
+## 0 = no aggregation: one usage event per broker event (quantity 1).
+aggregation_window_seconds = 60
+## Keep the topic as a dimension (one event per topic per window).
+## Off by default: IoT topics often embed device ids, so the number of
+## events would follow the number of topics. When off, mqttTopic is "#".
+aggregate_by_topic = false
+## Upper bound on open (customer, metric, topic, window) counters. A new
+## key over the cap is dropped and counted (aforo.metering.aggregation.keys_dropped).
+max_aggregation_keys = 100000
+
+## ── Delivery ─────────────────────────────────────────────────────
+## Usage events per request (max 1000, the ingestor's limit). One
+## request is in flight at a time.
+flush_count = 500
+## How often windows are closed and the queue is sent.
+flush_interval_ms = 3000
+## Usage events queued for sending (including the batch in flight).
+## Closed windows that don't fit wait in the counter table until there
+## is room; a re-queued batch that overflows drops the OLDEST events and
+## counts them (aforo.metering.events.dropped).
+max_buffer_size = 50000
+## Total deadline per request (connect + headers + body), and connect alone.
+request_timeout_ms = 10000
+connect_timeout_ms = 5000
+## Retries for network errors, timeouts, 408, 429 and 5xx (full-jitter
+## backoff, Retry-After honoured). After that the batch is re-queued and
+## sending pauses (5 s doubling to 5 min).
+max_retries = 3
+## On plugin stop, keep sending for at most this long; the rest is dropped and counted.
+shutdown_timeout_ms = 5000
+
+## Emit mqtt_broker.deliver for every fan-out delivery.
+## Off by default — high volume. Only enable when the billing model
+## needs per-subscriber delivery counts.
+emit_deliver = false
+
+## MQTT topic filters (+ and #) that are not metered. $SYS/ and $share/
+## are always skipped.
+exclude_topics = ["$SYS/#", "$share/#"]
+
+## ── Customer identity ────────────────────────────────────────────
+## "client_attrs" (default, EMQX 5.7.0+): read one client attribute set
+##     by EMQX authentication -- a `client_attrs` claim in a JWT that
+##     EMQX's JWT authenticator verified, or `client_attrs` in your HTTP
+##     authenticator's response. Do not ALSO set this attribute from
+##     mqtt.client_attrs_init using a client-supplied field.
+## "http": POST {clientId, username, clientAttrs, tenantId} to your
+##     mapping service (async, cached; the Aforo API key is never sent
+##     to it). clientId/username are what the client sent; map from
+##     clientAttrs (set by EMQX authentication).
+## "username" | "clientid_prefix" | "jwt_unverified": values the MQTT
+##     client chooses. Refused unless unsafe_trust_client_identity = true.
+customer_resolver = "client_attrs"
+
+## Client attribute that holds the Aforo customer id (client_attrs resolver).
+customer_resolver_client_attr = "aforo_customer_id"
+
+## Only set to true when broker authentication already pins the value
+## the chosen resolver reads (e.g. each username belongs to one customer
+## and EMQX checks its password). Otherwise a client can bill its traffic
+## to another customer.
+unsafe_trust_client_identity = false
+
+## clientid_prefix resolver: clientids `cust<sep><id><sep><rest>` -> <id>.
+customer_resolver_clientid_separator = "_"
+
+## jwt_unverified resolver: claim to read. The token's signature is NOT checked.
+customer_resolver_jwt_claim = "sub"
+
+## http resolver.
+customer_resolver_http_url = ""
+## Optional Authorization header value for the mapping service.
+customer_resolver_http_authorization = ""
+customer_resolver_http_timeout_ms = 1000
+customer_resolver_http_workers = 4
+customer_resolver_http_queue_size = 10000
+## How long a "no customer" answer (or a failed lookup) is cached.
+customer_resolver_negative_ttl_seconds = 30
+## Usage recorded while a lookup is pending is held this long, then dropped.
+customer_resolver_pending_max_seconds = 300

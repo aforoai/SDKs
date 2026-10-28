@@ -1,28 +1,31 @@
 %%%-------------------------------------------------------------------
 %%% @doc
-%%% Aforo MQTT Metering Plugin for EMQ X 5.x
+%%% Aforo MQTT Metering Plugin for EMQX 5.x
 %%%
-%%% Registers hooks on publish/subscribe/unsubscribe/connect/disconnect
-%%% events, buffers billing events in ETS, and flushes them in batches
-%%% to the Aforo usage ingestor.
+%%% Registers hooks on connect / disconnect / publish / deliver /
+%%% subscribe / unsubscribe. Each hook resolves the customer (from the
+%%% identity EMQX authentication established, by default) and bumps a
+%%% per-window counter; aforo_metering_flusher turns closed windows into
+%%% usage events and sends them to the Aforo ingestor.
 %%%
-%%% Config is read from priv/emqx_plugins/aforo_metering.hocon at start.
+%%% Hooks never send, never block on the network and never touch the
+%%% outgoing queue. A hook that fails is caught so metering can never
+%%% break message delivery.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(aforo_metering).
 
--include_lib("emqx/include/emqx.hrl").
--include_lib("emqx/include/logger.hrl").
+-include("aforo_metering_emqx.hrl").
 
 -export([
+    prepare/0,
     load/0,
     unload/0,
+    cleanup/0,
     health/0,
-    %% Called by timer:apply_interval/4 in start_flush_timer/0. It applies
-    %% ?MODULE:flush_now() from another process, which only reaches exported
-    %% functions: unexported, every interval tick crashed with undef and a
-    %% partial batch (fewer than flush_count events) was never flushed at all.
     flush_now/0,
+    on_config_changed/2,
+    on_health_check/1,
     %% Hook callbacks
     on_client_connected/3,
     on_client_disconnected/4,
@@ -32,43 +35,56 @@
     on_session_unsubscribed/4
 ]).
 
--define(SDK_VERSION, <<"1.0.0">>).
-%% The ingestor rejects batches of more than 1000 events (IngestBatchRequest).
--define(MAX_BATCH_SIZE, 1000).
--define(MAX_ATTEMPTS, 3).
-
 -ifdef(TEST).
--export([classify_response/1, chunk/2, has_customer/1]).
+-export([bad_keys/1, rejects_on_error/0, parse_vsn/1]).
 -endif.
 
+-define(VERSION, <<"2.0.2">>).
+
 %%--------------------------------------------------------------------
-%% Load/unload (called by aforo_metering_app on plugin start/stop)
+%% Lifecycle (aforo_metering_app)
 %%--------------------------------------------------------------------
 
+%% Before the supervision tree starts: refuse a bad configuration.
+-spec prepare() -> ok | {error, term()}.
+prepare() ->
+    case aforo_metering_config:validate() of
+        ok ->
+            clear_config_problem(),
+            ok = aforo_metering_http:start_profile(),
+            ok = aforo_metering_metrics:init(),
+            aforo_metering_metrics:set_circuit_state(closed),
+            ok;
+        {error, Reasons} ->
+            [?SLOG(error, #{msg => "aforo_metering refused to start: invalid configuration",
+                            reason => R}) || R <- Reasons],
+            {error, {invalid_config, Reasons}}
+    end.
+
 load() ->
-    ok = aforo_metering_buffer:init(),
-    ok = aforo_metering_cache:init(),
-    ok = aforo_metering_metrics:init(),
-    aforo_metering_metrics:set_circuit_state(closed),
     emqx_hooks:add('client.connected',     {?MODULE, on_client_connected, []},     ?HP_LOWEST),
     emqx_hooks:add('client.disconnected',  {?MODULE, on_client_disconnected, []},  ?HP_LOWEST),
     emqx_hooks:add('message.publish',      {?MODULE, on_message_publish, []},      ?HP_LOWEST),
     emqx_hooks:add('message.delivered',    {?MODULE, on_message_delivered, []},    ?HP_LOWEST),
     emqx_hooks:add('session.subscribed',   {?MODULE, on_session_subscribed, []},   ?HP_LOWEST),
     emqx_hooks:add('session.unsubscribed', {?MODULE, on_session_unsubscribed, []}, ?HP_LOWEST),
-    start_flush_timer(),
     ?SLOG(info, #{
         msg => "aforo_metering plugin loaded",
-        tenant_id => tenant_id(),
-        product_id => product_id(),
-        flush_count => flush_count(),
-        flush_interval_ms => flush_interval_ms(),
-        max_buffer_size => max_buffer_size(),
-        circuit_failure_threshold => circuit_failure_threshold(),
-        customer_resolver => get_cfg(customer_resolver, <<"username">>)
+        version => ?VERSION,
+        tenant_id => aforo_metering_config:tenant_id(),
+        product_id => aforo_metering_config:product_id(),
+        customer_resolver => aforo_metering_config:customer_resolver(),
+        aggregation_window_ms => aforo_metering_config:aggregation_window_ms(),
+        aggregate_by_topic => aforo_metering_config:aggregate_by_topic(),
+        flush_count => aforo_metering_config:flush_count(),
+        flush_interval_ms => aforo_metering_config:flush_interval_ms(),
+        max_buffer_size => aforo_metering_config:max_buffer_size(),
+        config => aforo_metering_config:redacted(aforo_metering_config:snapshot())
     }),
     ok.
 
+%% Stop accepting events, then send what is left within
+%% shutdown_timeout_ms (open windows included).
 unload() ->
     emqx_hooks:del('client.connected',     {?MODULE, on_client_connected}),
     emqx_hooks:del('client.disconnected',  {?MODULE, on_client_disconnected}),
@@ -76,515 +92,410 @@ unload() ->
     emqx_hooks:del('message.delivered',    {?MODULE, on_message_delivered}),
     emqx_hooks:del('session.subscribed',   {?MODULE, on_session_subscribed}),
     emqx_hooks:del('session.unsubscribed', {?MODULE, on_session_unsubscribed}),
-    stop_flush_timer(),
-    flush_now(),
-    aforo_metering_buffer:delete(),
-    ?SLOG(info, #{msg => "aforo_metering plugin unloaded"}),
+    Result = try aforo_metering_flusher:drain(aforo_metering_config:shutdown_timeout_ms())
+             catch C:R -> {error, {C, R}}
+             end,
+    ?SLOG(info, #{msg => "aforo_metering plugin unloaded", drain => Result}),
     ok.
 
-%% Health-check entry point — returns a status map suitable for exposure
-%% via an EMQ X dashboard plugin endpoint or a custom HTTP route. Reports
-%% buffer depth, circuit state, and counter snapshot.
+cleanup() ->
+    aforo_metering_aggregator:delete(),
+    aforo_metering_http:stop_profile().
+
 -spec health() -> map().
 health() ->
-    Counters = aforo_metering_metrics:get_all(),
-    CircuitState = case aforo_metering_metrics:circuit_state() of
-        0 -> <<"closed">>;
-        1 -> <<"half_open">>;
-        2 -> <<"open">>;
-        _ -> <<"unknown">>
-    end,
+    Status = try aforo_metering_flusher:status() catch _:_ -> #{} end,
     #{
-        plugin            => <<"aforo_metering">>,
-        version           => ?SDK_VERSION,
-        tenant_id         => tenant_id(),
-        product_id        => product_id(),
-        ingestor_url      => list_to_binary(ingestor_url()),
-        buffer_depth      => aforo_metering_buffer:size_active(),
-        max_buffer_size   => max_buffer_size(),
-        cache_size        => aforo_metering_cache:size(),
-        circuit_state     => CircuitState,
-        counters          => maps:from_list(Counters)
+        plugin          => <<"aforo_metering">>,
+        version         => ?VERSION,
+        tenant_id       => aforo_metering_config:tenant_id(),
+        product_id      => aforo_metering_config:product_id(),
+        ingestor_url    => aforo_metering_config:ingestor_url(),
+        buffer_depth    => maps:get(queue_depth, Status, 0),
+        max_buffer_size => aforo_metering_config:max_buffer_size(),
+        open_aggregation_keys => aforo_metering_aggregator:open_keys(),
+        cache_size      => aforo_metering_cache:size(),
+        circuit_state   => atom_to_binary(maps:get(circuit, Status, closed), utf8),
+        config_problem  => case config_problem() of undefined -> null; P -> P end,
+        counters        => maps:from_list(aforo_metering_metrics:get_all())
     }.
+
+%% Close finished windows and send now.
+-spec flush_now() -> ok.
+flush_now() ->
+    aforo_metering_flusher:flush().
+
+%%--------------------------------------------------------------------
+%% EMQX plugin callbacks (called through aforo_metering_app)
+%%--------------------------------------------------------------------
+
+%% EMQX 5.8+ calls this on every node when the plugin config is changed
+%% through the Dashboard or `PUT /api/v5/plugins/{name-vsn}/config',
+%% also while the plugin is installed but stopped. (5.7 has no callback:
+%% restart the plugin after a change.)
+%%
+%% What EMQX does with the return value differs by version:
+%%   * 5.9+: `{error, Reason}' rejects the change -- it is not saved and
+%%     the caller gets the reason. An accepted change is applied here
+%%     BEFORE EMQX saves it; if the save then fails, the running plugin
+%%     has the new config until the next restart, which reads the saved
+%%     (old) one.
+%%   * 5.8: the return value is ignored and the change is saved anyway.
+%%     A refused change is therefore logged at error level, naming the
+%%     keys, the gauge `aforo.metering.config.invalid' is set to 1 and
+%%     health/0 reports it: the next start will fail until it is fixed.
+%%     The running plugin keeps its config -- an invalid config is never
+%%     applied.
+%% EMQX's version is read from the `emqx' application; an unknown
+%% version is treated like 5.8 (see rejects_on_error/0).
+%%
+%% NewConfig has already passed priv/config_schema.avsc. Checks here are
+%% the same on every node (no file or network checks -- see
+%% aforo_metering_config:validate/1); node-local problems show in
+%% on_health_check/1. EMQX calls this on each node separately and does
+%% not roll the other nodes back when one refuses or fails, so on a 5.9
+%% cluster nodes can end up running different configs; check every
+%% node's log after a change.
+%%
+%% While running, the change is applied in place, nothing queued is
+%% dropped:
+%%   * delivery settings (URL, key, CA, timeouts, retries) take effect
+%%     on the next request, and a paused delivery is retried at once; a
+%%     change of URL, CA or allow_insecure_http also moves new requests
+%%     to fresh connections (aforo_metering_http:reset_connections/0);
+%%   * flush_count / flush_interval_ms / max_buffer_size and the
+%%     aggregation settings are applied inside the flusher between
+%%     ticks; a new window length or topic dimension closes the open
+%%     windows at once (sent as partial windows);
+%%   * the http resolver pool takes the new worker and queue sizes;
+%%     customers already resolved stay cached until their connection
+%%     ends, so publishers stay attributed.
+%% tenant_id and product_id cannot change while running: usage already
+%% counted belongs to the old ones. On 5.9+ a change of either is
+%% rejected as a whole. On 5.8 (which saves it anyway) every other key
+%% of the change is applied, the running plugin keeps its tenant and
+%% product, and the error log says the new ones take effect at the next
+%% stop/start -- so later changes keep applying instead of being
+%% refused until a restart.
+-spec on_config_changed(map(), map()) -> ok | {error, binary()}.
+on_config_changed(_OldConfig, NewConfig) when is_map(NewConfig) ->
+    Candidate = aforo_metering_config:normalize(NewConfig),
+    case aforo_metering_config:validate(Candidate) of
+        {error, Reasons} ->
+            refuse_invalid(Reasons),
+            {error, join(Reasons)};
+        ok ->
+            clear_config_problem(),
+            case is_running() of
+                false ->
+                    ok = aforo_metering_config:put_snapshot(Candidate),
+                    ?SLOG(info, #{msg => "aforo_metering config stored; applied when the plugin starts"}),
+                    ok;
+                true ->
+                    apply_running(Candidate)
+            end
+    end;
+on_config_changed(_OldConfig, _NewConfig) ->
+    {error, <<"the plugin config must be a map">>}.
+
+refuse_invalid(Reasons) ->
+    Keys = bad_keys(Reasons),
+    case rejects_on_error() of
+        true ->
+            ?SLOG(error, #{msg => "aforo_metering rejected a config change; EMQX does not save it",
+                           keys => Keys, reasons => Reasons});
+        false ->
+            Problem = iolist_to_binary(
+                ["EMQX saved a config change the plugin refused (keys: ",
+                 lists:join(<<", ">>, [atom_to_binary(K, utf8) || K <- Keys]),
+                 "); the plugin keeps running on its current config, but its next start ",
+                 "will fail until the config is fixed: ", join(Reasons)]),
+            set_config_problem(Problem),
+            ?SLOG(error, #{msg => "aforo_metering refused a config change that EMQX saved anyway "
+                                  "(EMQX 5.8 ignores the refusal). The running plugin keeps its "
+                                  "current config; the NEXT START WILL FAIL until these keys are fixed",
+                           keys => Keys, reasons => Reasons})
+    end.
+
+%% The setting each refusal is about -- the first setting name it
+%% mentions as a whole word ("ingestor_url uses http:// ... or set
+%% allow_insecure_http = true" is about ingestor_url) -- for the log.
+-spec bad_keys([binary()]) -> [atom()].
+bad_keys(Reasons) ->
+    Names = [{K, atom_to_binary(K, utf8)} || {K, _, _} <- aforo_metering_config:spec()],
+    Keys = lists:foldl(
+        fun(Reason, Acc) ->
+            Hits = lists:sort([{Pos, K} || {K, W} <- Names, Pos <- word_positions(Reason, W)]),
+            case Hits of
+                [{_, K} | _] -> case lists:member(K, Acc) of true -> Acc; false -> Acc ++ [K] end;
+                [] -> Acc
+            end
+        end, [], Reasons),
+    case Keys of
+        [] -> ['$config'];
+        _ -> Keys
+    end.
+
+word_positions(Text, Word) ->
+    [Pos || {Pos, Len} <- binary:matches(Text, Word),
+            not word_char(Text, Pos - 1), not word_char(Text, Pos + Len)].
+
+word_char(Text, I) when I < 0; I >= byte_size(Text) -> false;
+word_char(Text, I) ->
+    C = binary:at(Text, I),
+    (C >= $a andalso C =< $z) orelse (C >= $0 andalso C =< $9) orelse C =:= $_.
+
+apply_running(Candidate0) ->
+    Current = aforo_metering_config:snapshot(),
+    Identity = [K || K <- [tenant_id, product_id], value(K, Current) =/= value(K, Candidate0)],
+    IdentityReason = <<"tenant_id and product_id cannot change while the plugin is running ",
+                       "(usage already counted belongs to the current ones); stop the plugin, ",
+                       "change them, then start it">>,
+    case Identity =/= [] andalso rejects_on_error() of
+        true ->
+            %% 5.9+: the whole change is rejected and not saved.
+            ?SLOG(error, #{msg => "aforo_metering rejected a config change", reason => IdentityReason,
+                           keys => Identity}),
+            {error, IdentityReason};
+        false ->
+            %% Keep the running identity; apply everything else.
+            Candidate = maps:merge(Candidate0, maps:with([tenant_id, product_id], Current)),
+            apply_keys(Current, Candidate),
+            case Identity of
+                [] -> ok;
+                _ ->
+                    set_config_problem(iolist_to_binary(
+                        ["EMQX saved a new ", lists:join(<<" and ">>, [atom_to_binary(K, utf8) || K <- Identity]),
+                         "; the running plugin keeps the current one until it is stopped and started"])),
+                    ?SLOG(error, #{msg => "aforo_metering cannot change tenant_id / product_id while "
+                                          "running; EMQX saved the change anyway (EMQX 5.8). The other "
+                                          "changed keys were applied; usage keeps going to the current "
+                                          "tenant and product. Stop and start the plugin to switch.",
+                                   keys => Identity,
+                                   running => maps:with([tenant_id, product_id], Current)}),
+                    {error, IdentityReason}
+            end
+    end.
+
+apply_keys(Current, Candidate) ->
+    Changed = [K || {K, _, _} <- aforo_metering_config:spec(),
+                    maps:get(K, Current, undefined) =/= maps:get(K, Candidate, undefined)],
+    ok = aforo_metering_config:put_snapshot(Candidate),
+    case Changed of
+        [] -> ok;
+        _ ->
+            case lists:any(fun(K) -> lists:member(K, Changed) end, connection_keys()) of
+                true ->
+                    try aforo_metering_http:reset_connections()
+                    catch C0:R0 ->
+                        ?SLOG(error, #{msg => "aforo_metering could not reset its HTTP connections; "
+                                              "open connections keep the previous TLS settings until "
+                                              "they close", class => C0, reason => R0})
+                    end;
+                false -> ok
+            end,
+            Shape = try aforo_metering_flusher:reconfigure() of
+                        {ok, S} -> S
+                    catch C1:R1 ->
+                        ?SLOG(error, #{msg => "aforo_metering flusher did not take the new config; "
+                                              "it applies when the flusher restarts",
+                                       class => C1, reason => R1}),
+                        unknown
+                    end,
+            try aforo_metering_resolver_pool:reconfigure()
+            catch C2:R2 ->
+                ?SLOG(error, #{msg => "aforo_metering resolver pool did not take the new config; "
+                                      "it applies when the pool restarts",
+                               class => C2, reason => R2})
+            end,
+            ?SLOG(info, #{msg => "aforo_metering config applied", changed => Changed,
+                          windows => Shape}),
+            ok
+    end.
+
+%% Settings an open (keep-alive) connection was made under.
+connection_keys() ->
+    [ingestor_url, ca_cert_file, allow_insecure_http, customer_resolver_http_url].
+
+value(K, Conf) ->
+    case maps:get(K, Conf, <<>>) of
+        V when is_binary(V) -> string:trim(V);
+        V when is_list(V) -> string:trim(unicode:characters_to_binary(V));
+        V -> V
+    end.
+
+%% True when EMQX honours `{error, _}' from on_config_changed (5.9+).
+%% 5.8 (and anything older or unknown) saves the change regardless.
+-spec rejects_on_error() -> boolean().
+rejects_on_error() ->
+    case emqx_version() of
+        {Major, Minor} -> {Major, Minor} >= {5, 9};
+        unknown -> false
+    end.
+
+emqx_version() ->
+    Vsn = case application:get_key(emqx, vsn) of
+        {ok, V} -> V;
+        undefined ->
+            try emqx_release:version() catch _:_ -> undefined end
+    end,
+    parse_vsn(Vsn).
+
+parse_vsn(V) when is_binary(V) -> parse_vsn(binary_to_list(V));
+parse_vsn([C | Rest]) when C =:= $e; C =:= $v -> parse_vsn(Rest);
+parse_vsn(V) when is_list(V) ->
+    case string:split(V, ".", all) of
+        [Ma, Mi | _] ->
+            try {list_to_integer(Ma), list_to_integer(string:trim(Mi, trailing, "-abcdefghijklmnopqrstuvwxyz"))}
+            catch _:_ -> unknown
+            end;
+        _ -> unknown
+    end;
+parse_vsn(_) -> unknown.
+
+-define(CONFIG_PROBLEM, {?MODULE, config_problem}).
+
+set_config_problem(Text) ->
+    persistent_term:put(?CONFIG_PROBLEM, Text),
+    aforo_metering_metrics:set_config_invalid(true).
+
+clear_config_problem() ->
+    _ = persistent_term:erase(?CONFIG_PROBLEM),
+    aforo_metering_metrics:set_config_invalid(false).
+
+config_problem() -> persistent_term:get(?CONFIG_PROBLEM, undefined).
+
+%% EMQX 5.9+ calls this when the plugin's info is requested.
+-spec on_health_check(map()) -> ok | {error, binary()}.
+on_health_check(_Options) ->
+    case {config_problem(), aforo_metering_config:check_environment()} of
+        {Problem, _} when is_binary(Problem) -> {error, Problem};
+        {_, {error, Reasons}} -> {error, join(Reasons)};
+        {_, ok} ->
+            Status = try aforo_metering_flusher:status() catch _:_ -> undefined end,
+            case Status of
+                undefined -> ok;
+                #{circuit := open, consecutive_failures := N, queue_depth := Q} ->
+                    {error, iolist_to_binary(io_lib:format(
+                        "delivery to the Aforo ingestor is paused after ~b failed sends; "
+                        "~b usage events queued", [N, Q]))};
+                _ -> ok
+            end
+    end.
+
+is_running() -> whereis(aforo_metering_flusher) =/= undefined.
+
+join(Reasons) -> iolist_to_binary(lists:join(<<"; ">>, Reasons)).
 
 %%--------------------------------------------------------------------
 %% Hook callbacks
 %%--------------------------------------------------------------------
 
 on_client_connected(ClientInfo, ConnInfo, _Env) ->
-    case aforo_customer_id(ClientInfo, ConnInfo) of
-        undefined -> ok;
-        CustomerId ->
-            buffer_event(CustomerId, #{
-                <<"mqttEventType">> => <<"CONNECT">>,
-                <<"mqttClientId">>  => clientid(ClientInfo),
-                <<"mqttTopic">>     => <<>>,
-                <<"mqttQos">>       => 0,
-                <<"mqttRetained">>  => false,
-                <<"dataBytes">>     => 0
-            })
-    end,
+    safe(fun() ->
+        Customer = aforo_metering_customer_resolver:resolve_connect(ClientInfo, ConnInfo),
+        record(Customer, ClientInfo, <<"CONNECT">>, <<>>, 0, 0, false)
+    end),
     ok.
 
-on_client_disconnected(ClientInfo, Reason, ConnInfo, _Env) ->
-    case aforo_customer_id(ClientInfo, ConnInfo) of
-        undefined -> ok;
-        CustomerId ->
-            buffer_event(CustomerId, #{
-                <<"mqttEventType">> => <<"DISCONNECT">>,
-                <<"mqttClientId">>  => clientid(ClientInfo),
-                <<"mqttTopic">>     => <<>>,
-                <<"mqttQos">>       => 0,
-                <<"mqttRetained">>  => false,
-                <<"dataBytes">>     => 0,
-                <<"disconnectReason">> => iolist_to_binary(io_lib:format("~p", [Reason]))
-            })
-    end,
-    %% Always invalidate the cache on disconnect — customer-id resolution
-    %% may change before the next CONNECT (e.g. JWT rotation, role change).
-    aforo_metering_customer_resolver:invalidate(ClientInfo),
+on_client_disconnected(ClientInfo, _Reason, ConnInfo, _Env) ->
+    safe(fun() ->
+        Customer = aforo_metering_customer_resolver:resolve(ClientInfo),
+        record(Customer, ClientInfo, <<"DISCONNECT">>, <<>>, 0, 0, false),
+        aforo_metering_customer_resolver:on_disconnect(ClientInfo, ConnInfo)
+    end),
     ok.
 
-on_message_publish(Message = #message{from = From, topic = Topic, payload = Payload, qos = QoS, flags = Flags}, _Env) ->
-    case is_system_topic(Topic) of
-        true  -> {ok, Message};
+on_message_publish(Message = #message{from = From, topic = Topic, payload = Payload,
+                                      qos = QoS, flags = Flags}, _Env) ->
+    case is_system_topic(Topic) orelse not is_binary(From) of
+        true -> ok;
         false ->
-            CustomerId = resolve_customer_from_from(From),
-            case CustomerId of
-                undefined -> {ok, Message};
-                _ ->
-                    buffer_event(CustomerId, #{
-                        <<"mqttEventType">> => <<"PUBLISH">>,
-                        <<"mqttClientId">>  => From,
-                        <<"mqttTopic">>     => Topic,
-                        <<"mqttQos">>       => QoS,
-                        <<"mqttRetained">>  => maps:get(retain, Flags, false),
-                        <<"dataBytes">>     => payload_size(Payload)
-                    }),
-                    {ok, Message}
-            end
-    end.
+            safe(fun() ->
+                %% message.publish only carries the clientid; the cache was
+                %% filled at client.connected.
+                Customer = aforo_metering_customer_resolver:lookup(From),
+                record(Customer, #{clientid => From}, <<"PUBLISH">>, Topic,
+                       payload_size(Payload), QoS, maps:get(retain, Flags, false))
+            end)
+    end,
+    {ok, Message}.
 
-on_message_delivered(ClientInfo, Message = #message{topic = Topic, payload = Payload, qos = QoS, flags = Flags}, _Env) ->
-    case emit_deliver_enabled() of
+on_message_delivered(ClientInfo, Message = #message{topic = Topic, payload = Payload,
+                                                    qos = QoS, flags = Flags}, _Env) ->
+    case aforo_metering_config:emit_deliver() andalso not is_system_topic(Topic) of
         false -> ok;
-        true  ->
-            case aforo_customer_id(ClientInfo, #{}) of
-                undefined -> ok;
-                CustomerId ->
-                    buffer_event(CustomerId, #{
-                        <<"mqttEventType">> => <<"DELIVER">>,
-                        <<"mqttClientId">>  => clientid(ClientInfo),
-                        <<"mqttTopic">>     => Topic,
-                        <<"mqttQos">>       => QoS,
-                        <<"mqttRetained">>  => maps:get(retain, Flags, false),
-                        <<"dataBytes">>     => payload_size(Payload)
-                    })
-            end
+        true ->
+            safe(fun() ->
+                Customer = aforo_metering_customer_resolver:resolve(ClientInfo),
+                record(Customer, ClientInfo, <<"DELIVER">>, Topic, payload_size(Payload),
+                       QoS, maps:get(retain, Flags, false))
+            end)
     end,
     {ok, Message}.
 
 on_session_subscribed(ClientInfo, Topic, SubOpts, _Env) ->
-    case aforo_customer_id(ClientInfo, #{}) of
-        undefined -> ok;
-        CustomerId ->
-            buffer_event(CustomerId, #{
-                <<"mqttEventType">> => <<"SUBSCRIBE">>,
-                <<"mqttClientId">>  => clientid(ClientInfo),
-                <<"mqttTopic">>     => Topic,
-                <<"mqttQos">>       => maps:get(qos, SubOpts, 0),
-                <<"mqttRetained">>  => false,
-                <<"dataBytes">>     => 0
-            })
-    end,
+    is_system_topic(Topic) orelse safe(fun() ->
+        Customer = aforo_metering_customer_resolver:resolve(ClientInfo),
+        record(Customer, ClientInfo, <<"SUBSCRIBE">>, Topic, 0, maps:get(qos, SubOpts, 0), false)
+    end),
     ok.
 
 on_session_unsubscribed(ClientInfo, Topic, _SubOpts, _Env) ->
-    case aforo_customer_id(ClientInfo, #{}) of
-        undefined -> ok;
-        CustomerId ->
-            buffer_event(CustomerId, #{
-                <<"mqttEventType">> => <<"UNSUBSCRIBE">>,
-                <<"mqttClientId">>  => clientid(ClientInfo),
-                <<"mqttTopic">>     => Topic,
-                <<"mqttQos">>       => 0,
-                <<"mqttRetained">>  => false,
-                <<"dataBytes">>     => 0
-            })
+    is_system_topic(Topic) orelse safe(fun() ->
+        Customer = aforo_metering_customer_resolver:resolve(ClientInfo),
+        record(Customer, ClientInfo, <<"UNSUBSCRIBE">>, Topic, 0, 0, false)
+    end),
+    ok.
+
+%%--------------------------------------------------------------------
+%% Recording
+%%--------------------------------------------------------------------
+
+%% Customer: binary (resolved), pending (async lookup running -- held
+%% under the clientid until it answers) or undefined (no customer: the
+%% event cannot be billed, so it is counted and dropped here).
+record(undefined, _ClientInfo, _Type, _Topic, _Bytes, _QoS, _Retain) ->
+    aforo_metering_metrics:inc('aforo.metering.events.unresolved', 1),
+    aforo_metering_metrics:inc('aforo.metering.events.dropped', 1),
+    ok;
+record(Customer, ClientInfo, Type, Topic, Bytes, QoS, Retain) ->
+    ClientId = clientid(ClientInfo),
+    Owner = case Customer of
+        pending -> {client, ClientId};
+        C -> {customer, C}
     end,
+    _ = aforo_metering_aggregator:record(Owner, Type, topic(Topic), Bytes,
+                                         #{clientid => ClientId, qos => QoS, retain => Retain}),
     ok.
 
-%%--------------------------------------------------------------------
-%% Customer-ID resolution — delegates to the pluggable resolver module.
-%% Backend selected via the `aforo_metering.customer_resolver` config knob:
-%%   username | clientid_prefix | jwt | http
-%% Cached per (tenant, clientid) — see aforo_metering_cache.
-%%--------------------------------------------------------------------
-
-aforo_customer_id(ClientInfo, ConnInfo) ->
-    aforo_metering_customer_resolver:resolve(ClientInfo, ConnInfo).
-
-resolve_customer_from_from(From) when is_binary(From) ->
-    %% On message.publish the hook only receives the client identifier
-    %% (not the full ClientInfo). Look up via the cache — populated on
-    %% client.connected, so this is normally a hit.
-    case aforo_metering_cache:get(tenant_id(), From) of
-        {ok, CustomerId} -> CustomerId;
-        not_found -> undefined  % unknown publisher; skip metering
-    end;
-resolve_customer_from_from(_) -> undefined.
-
-%%--------------------------------------------------------------------
-%% Buffering + flushing
-%%--------------------------------------------------------------------
-
-%% Refuse an event that can never be accepted (2026-09-21), mirroring the Kong
-%% plugin. The ingestor rejects a blank customerId and validates a batch as a
-%% whole, so one such event fails the request and takes every well-formed event
-%% batched with it down too. Nothing later can supply the missing value, so it is
-%% dropped here, where the loss is limited to the event actually at fault. The
-%% resolvers return `undefined' for "no customer", but a backend (the http one
-%% especially) can still hand back an empty string.
-buffer_event(CustomerId, Extra) ->
-    case has_customer(CustomerId) of
-        true  -> do_buffer_event(CustomerId, Extra);
-        false ->
-            aforo_metering_metrics:inc('aforo.metering.events.dropped', 1),
-            ok
+safe(Fun) ->
+    try Fun()
+    catch C:R:St ->
+        ?SLOG(warning, #{msg => "aforo_metering hook failed; event not metered",
+                         class => C, reason => R, stacktrace => St}),
+        aforo_metering_metrics:inc('aforo.metering.events.dropped', 1),
+        ok
     end.
-
-has_customer(undefined) -> false;
-has_customer(null) -> false;
-has_customer(<<>>) -> false;
-has_customer("") -> false;
-has_customer(B) when is_binary(B) -> string:trim(B) =/= <<>>;
-has_customer(L) when is_list(L) -> string:trim(L) =/= "";
-has_customer(_) -> false.
-
-do_buffer_event(CustomerId, Extra) ->
-    Now = erlang:system_time(millisecond),
-    IdempKey = iolist_to_binary([
-        "mqtt:", tenant_id(), ":",
-        maps:get(<<"mqttClientId">>, Extra, <<>>), ":",
-        maps:get(<<"mqttEventType">>, Extra, <<>>), ":",
-        maps:get(<<"mqttTopic">>, Extra, <<>>), ":",
-        integer_to_binary(Now), ":",
-        random_suffix()
-    ]),
-    Event = maps:merge(#{
-        <<"customerId">>     => CustomerId,
-        <<"metricName">>     => <<"mqtt_broker.",
-                                  (string:to_lower(binary_to_list(maps:get(<<"mqttEventType">>, Extra, <<"publish">>))))/binary>>,
-        <<"quantity">>       => 1,
-        <<"occurredAt">>     => iso8601(Now),
-        <<"idempotencyKey">> => IdempKey,
-        <<"productType">>    => <<"MQTT_BROKER">>,
-        <<"metadata">>       => #{
-            <<"sdkVersion">> => ?SDK_VERSION,
-            <<"productId">>  => product_id()
-        }
-    }, Extra),
-    %% Apply retention cap BEFORE inserting — bounded memory under sustained ingestor failure.
-    enforce_retention_cap(),
-    aforo_metering_buffer:insert(Event),
-    aforo_metering_metrics:inc('aforo.metering.events.buffered', 1),
-    maybe_flush_by_count().
-
-%% Drop the oldest half of the buffer when it exceeds max_buffer_size.
-%% Operates on the currently-active table (writers never block).
-enforce_retention_cap() ->
-    Max = max_buffer_size(),
-    Size = aforo_metering_buffer:size_active(),
-    case Size >= Max of
-        true ->
-            ToDrop = max(1, Size div 2),
-            %% Drain into a list, drop the oldest portion, requeue the rest.
-            All = aforo_metering_buffer:swap_and_drain(),
-            Kept = drop_oldest_n(All, ToDrop),
-            lists:foreach(fun aforo_metering_buffer:insert/1, Kept),
-            aforo_metering_metrics:inc('aforo.metering.events.dropped', ToDrop),
-            maybe_log_drop(ToDrop, Size, Max);
-        false -> ok
-    end.
-
-%% Drop N oldest events from a list. Buffer maintains insertion order
-%% so head = oldest.
-drop_oldest_n(List, 0) -> List;
-drop_oldest_n([], _) -> [];
-drop_oldest_n([_ | Rest], N) -> drop_oldest_n(Rest, N - 1).
-
-maybe_log_drop(Dropped, Size, Max) ->
-    Now = erlang:system_time(second),
-    LastLogged = persistent_term:get({?MODULE, last_drop_log}, 0),
-    case Now - LastLogged of
-        Diff when Diff >= 60 ->
-            persistent_term:put({?MODULE, last_drop_log}, Now),
-            ?SLOG(warning, #{
-                msg => "aforo_metering buffer cap reached, oldest events dropped",
-                dropped => Dropped, buffer_size => Size, max => Max
-            });
-        _ -> ok
-    end.
-
-maybe_flush_by_count() ->
-    case aforo_metering_buffer:size_active() >= flush_count() of
-        true  -> spawn(fun flush_now/0);
-        false -> ok
-    end.
-
-flush_now() ->
-    case aforo_metering_buffer:swap_and_drain() of
-        []     -> ok;
-        Events -> ship_to_ingestor(Events)
-    end.
-
-ship_to_ingestor(Events) ->
-    %% Circuit breaker — when open, skip the POST and re-buffer the events
-    %% (subject to the retention cap). When half-open, send a single probe.
-    case circuit_state() of
-        open ->
-            aforo_metering_metrics:inc('aforo.metering.flush.error', 1),
-            requeue_events(Events),
-            ok;
-        State ->
-            %% Belt and braces for buffer_event's guard: anything already in the
-            %% buffer without a customer would fail its whole batch.
-            {Sendable, Blank} = lists:partition(
-                fun(E) -> has_customer(maps:get(<<"customerId">>, E, undefined)) end, Events),
-            case Blank of
-                [] -> ok;
-                _  -> aforo_metering_metrics:inc('aforo.metering.events.dropped', length(Blank))
-            end,
-            ship_batches(State, chunk(Sendable, ?MAX_BATCH_SIZE))
-    end.
-
-%% The ingestor rejects a batch of more than 1000 events with 400. flush_count
-%% defaults to 500, but a flush drains the WHOLE buffer -- up to max_buffer_size
-%% (50000) after an outage -- so without slicing, the first flush after the
-%% ingestor recovered would be one oversized request, rejected outright.
-ship_batches(_State, []) ->
-    ok;
-ship_batches(State, [Batch | Rest]) ->
-    Body = jsone:encode(#{<<"events">> => Batch}),
-    case ship_with_retry(ingestor_url(), ingest_headers(), Body, ?MAX_ATTEMPTS) of
-        ok ->
-            on_flush_success(State),
-            aforo_metering_metrics:inc('aforo.metering.events.flushed', length(Batch)),
-            ship_batches(closed_if_probe(State), Rest);
-        {error, {rejected, Code, RespBody}} ->
-            %% Drop on a permanent rejection; only retry what retrying can fix.
-            %% A 4xx means the ingestor understood the batch and refused it, so
-            %% re-queueing sends identical bytes to an identical judgement --
-            %% forever, and dragging every good event queued behind it down
-            %% too. Logged at error with the response body so a dropped batch
-            %% says why. The ingestor answered, so this is not an availability
-            %% failure and does not count toward opening the circuit.
-            ?SLOG(error, #{
-                msg => "aforo_metering ingestor rejected batch, dropping it",
-                status => Code,
-                dropped => length(Batch),
-                response => truncate(RespBody, 500)
-            }),
-            aforo_metering_metrics:inc('aforo.metering.flush.error', 1),
-            aforo_metering_metrics:inc('aforo.metering.events.dropped', length(Batch)),
-            on_flush_success(State),
-            ship_batches(closed_if_probe(State), Rest);
-        {error, Reason} ->
-            %% Transient (5xx, 408, 429, timeout, connection refused): keep
-            %% this batch and everything after it, and stop -- the next slice
-            %% would only fail the same way. This is the failure the circuit
-            %% breaker counts; before 2026-09-21 ship_with_retry reported `ok'
-            %% here, so exhausted retries counted as sent, the events were
-            %% discarded, and the circuit could never open.
-            ?SLOG(error, #{
-                msg => "aforo_metering flush failed, events re-queued",
-                reason => Reason,
-                requeued => length(Batch) + lists:sum([length(B) || B <- Rest])
-            }),
-            aforo_metering_metrics:inc('aforo.metering.flush.error', 1),
-            on_flush_failure(),
-            requeue_events(lists:append([Batch | Rest]))
-    end.
-
-%% After a successful half-open probe the circuit is closed for later slices.
-closed_if_probe(half_open) -> closed;
-closed_if_probe(State) -> State.
-
-%% X-API-Key, not Authorization: Bearer (2026-09-21), matching the Kong fix.
-%% The ingestor authenticates keys through aforo-common's ApiKeyAuthFilter,
-%% which reads X-API-Key and nothing else. Sent ALONE: a key in an
-%% Authorization: Bearer header is parsed as a JWT, fails, and the request is
-%% rejected 401 before the API-key filter runs -- even when X-API-Key is also
-%% present.
-ingest_headers() ->
-    [
-        {"X-API-Key",   binary_to_list(api_key())},
-        {"X-Tenant-Id", binary_to_list(tenant_id())}
-    ].
-
-chunk([], _N) -> [];
-chunk(List, N) when length(List) =< N -> [List];
-chunk(List, N) ->
-    {Head, Tail} = lists:split(N, List),
-    [Head | chunk(Tail, N)].
-
-truncate(Bin, Max) when is_binary(Bin), byte_size(Bin) > Max -> binary:part(Bin, 0, Max);
-truncate(Bin, _Max) when is_binary(Bin) -> Bin;
-truncate(List, Max) when is_list(List) -> truncate(iolist_to_binary(List), Max);
-truncate(Other, _Max) -> Other.
-
-%% Put events back into the buffer (subject to retention cap).
-requeue_events(Events) ->
-    %% Apply retention cap once for the whole batch — saves N evaluations.
-    enforce_retention_cap(),
-    lists:foreach(fun aforo_metering_buffer:insert/1, Events),
-    ok.
-
-%%--------------------------------------------------------------------
-%% Circuit breaker — closed -> open after N consecutive failures, then
-%% half-open after cooldown. Implemented with persistent_term for low
-%% contention; suitable for the < 1 KHz state transitions we expect.
-%%--------------------------------------------------------------------
-
-circuit_state() ->
-    case persistent_term:get({?MODULE, circuit}, closed) of
-        closed -> closed;
-        {open_until, Until} ->
-            case erlang:system_time(second) >= Until of
-                true ->
-                    persistent_term:put({?MODULE, circuit}, half_open),
-                    aforo_metering_metrics:set_circuit_state(half_open),
-                    half_open;
-                false ->
-                    open
-            end;
-        half_open -> half_open;
-        Other -> Other
-    end.
-
-on_flush_success(State) ->
-    case State of
-        half_open ->
-            ?SLOG(info, #{msg => "aforo_metering circuit closed (probe succeeded)"}),
-            persistent_term:put({?MODULE, consecutive_failures}, 0),
-            persistent_term:put({?MODULE, circuit}, closed),
-            aforo_metering_metrics:set_circuit_state(closed);
-        closed ->
-            persistent_term:put({?MODULE, consecutive_failures}, 0),
-            ok;
-        _ -> ok
-    end.
-
-on_flush_failure() ->
-    Failures = persistent_term:get({?MODULE, consecutive_failures}, 0) + 1,
-    persistent_term:put({?MODULE, consecutive_failures}, Failures),
-    case Failures >= circuit_failure_threshold() of
-        true ->
-            CooldownUntil = erlang:system_time(second) + circuit_cooldown_seconds(),
-            persistent_term:put({?MODULE, circuit}, {open_until, CooldownUntil}),
-            aforo_metering_metrics:set_circuit_state(open),
-            ?SLOG(warning, #{
-                msg => "aforo_metering circuit opened",
-                failures => Failures,
-                cooldown_seconds => circuit_cooldown_seconds()
-            });
-        false -> ok
-    end.
-
-%% Returns ok, {error, {rejected, Code, Body}} for a permanent 4xx, or
-%% {error, Reason} once a transient failure has used up its attempts.
-ship_with_retry(Url, Headers, Body, AttemptsLeft) ->
-    Result = httpc:request(post, {Url, Headers, "application/json", Body},
-                           [{timeout, 10000}], [{body_format, binary}]),
-    case classify_response(Result) of
-        ok ->
-            aforo_metering_metrics:inc('aforo.metering.flush.success', 1),
-            ok;
-        {rejected, _Code, _RespBody} = Rejected ->
-            %% Same bytes, same judgement: retrying a 4xx only delays the drop.
-            {error, Rejected};
-        {transient, Reason} when AttemptsLeft > 1 ->
-            aforo_metering_metrics:inc('aforo.metering.flush.retry', 1),
-            ?SLOG(warning, #{msg => "aforo_metering flush retry", reason => Reason,
-                             attempts_left => AttemptsLeft - 1}),
-            %% 1s, 2s between the three attempts. The old schedule also slept
-            %% 8s after the final attempt, before giving up.
-            timer:sleep(trunc(math:pow(2, ?MAX_ATTEMPTS - AttemptsLeft)) * 1000),
-            ship_with_retry(Url, Headers, Body, AttemptsLeft - 1);
-        {transient, Reason} ->
-            ?SLOG(error, #{msg => "aforo_metering flush exhausted retries", reason => Reason}),
-            {error, Reason}
-    end.
-
-%% 2xx is success. 4xx is a permanent rejection, except 408 and 429, which
-%% explicitly invite a retry. Everything else -- 5xx, timeouts, connection
-%% errors -- is transient. Same rule as the Kong plugin.
-classify_response({ok, {{_, Code, _}, _, _}}) when Code >= 200, Code < 300 ->
-    ok;
-classify_response({ok, {{_, Code, _}, _, RespBody}})
-  when Code >= 400, Code < 500, Code =/= 408, Code =/= 429 ->
-    {rejected, Code, RespBody};
-classify_response({ok, {{_, Code, _}, _, _}}) ->
-    {transient, {http_status, Code}};
-classify_response({error, Reason}) ->
-    {transient, Reason};
-classify_response(Other) ->
-    {transient, Other}.
-
-start_flush_timer() ->
-    {ok, _} = timer:apply_interval(flush_interval_ms(), ?MODULE, flush_now, []),
-    ok.
-
-stop_flush_timer() ->
-    ok. %% timer:apply_interval references held by the supervisor — cleaned up on app stop
 
 %%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------
 
-clientid(ClientInfo) -> maps:get(clientid, ClientInfo, <<"unknown">>).
+clientid(ClientInfo) ->
+    case maps:get(clientid, ClientInfo, <<>>) of
+        B when is_binary(B) -> B;
+        A when is_atom(A) -> atom_to_binary(A, utf8);
+        L when is_list(L) -> unicode:characters_to_binary(L);
+        _ -> <<>>
+    end.
+
+topic(T) when is_binary(T) -> T;
+topic(_) -> <<>>.
 
 payload_size(undefined) -> 0;
 payload_size(P) when is_binary(P) -> byte_size(P);
 payload_size(P) when is_list(P)   -> iolist_size(P);
 payload_size(_) -> 0.
 
-is_system_topic(<<"$SYS/", _/binary>>) -> true;
-is_system_topic(<<"$share/", _/binary>>) -> true;
-is_system_topic(_) -> false.
-
-random_suffix() ->
-    list_to_binary(
-      [case rand:uniform(36) of
-         N when N =< 10 -> $0 + N - 1;
-         N              -> $a + N - 11
-       end || _ <- lists:seq(1, 8)]).
-
-iso8601(Millis) ->
-    {{Y, Mo, D}, {H, Mi, S}} = calendar:system_time_to_universal_time(Millis, millisecond),
-    iolist_to_binary(io_lib:format("~4..0B-~2..0B-~2..0BT~2..0B:~2..0B:~2..0B.~3..0BZ",
-                                   [Y, Mo, D, H, Mi, S, Millis rem 1000])).
-
-%%--------------------------------------------------------------------
-%% Config accessors (driven by hocon config under [aforo_metering])
-%%--------------------------------------------------------------------
-
-tenant_id()         -> get_cfg(tenant_id,         <<"tenant_default">>).
-product_id()        -> get_cfg(product_id,        <<"prod_mqtt_default">>).
-api_key()           -> get_cfg(api_key,           <<"">>).
-%% /v1/ingest/batch, not /v1/ingest/events (2026-09-21). The plugin POSTs
-%% {"events": [...]}, which is the batch endpoint's contract; /v1/ingest/events
-%% is the single-event, Apigee-format endpoint. And api.aforo.ai (the
-%% public gateway in front of the ingestor), not ingestor.aforo.ai: the
-%% latter resolves to a static CloudFront/S3 site that answers a POST with
-%% a 301, so no event ever reached the ingestor.
-ingestor_url()      -> binary_to_list(get_cfg(ingestor_url, <<"https://api.aforo.ai/v1/ingest/batch">>)).
-flush_count()       -> get_cfg(flush_count,       500).
-flush_interval_ms() -> get_cfg(flush_interval_ms, 3000).
-emit_deliver_enabled() -> get_cfg(emit_deliver, false).
-max_buffer_size()      -> get_cfg(max_buffer_size, 50000).
-circuit_failure_threshold() -> get_cfg(circuit_failure_threshold, 5).
-circuit_cooldown_seconds()  -> get_cfg(circuit_cooldown_seconds, 60).
-
-get_cfg(Key, Default) ->
-    try emqx_conf:get([aforo_metering, Key], Default) catch _:_ -> Default end.
+is_system_topic(Topic) -> aforo_metering_aggregator:excluded(Topic).

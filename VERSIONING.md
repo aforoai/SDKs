@@ -42,7 +42,7 @@ Each artifact versions independently. A Kong-plugin patch does not bump the Node
 | `python-agent` | `0.3.2` | none |
 | `mcp-test-server`, `agent-test-server` (internal, not published) | `0.1.0` | — |
 | `aforo-gateway-plugins/` — `kong`, `aws-lambda`, `apigee`, `azure-apim`, `mulesoft` | `2.2.0` | GitHub Releases `2.1.0` (`2.2.0` after the release tags are pushed) |
-| `aforo-emqx-plugin/` | `0.1.0` (experimental) | — |
+| `aforo-emqx-plugin/` | `2.0.2` (experimental) | — |
 | `aforo-gateway-plugins/aws-cloudformation`, `aforo-gateway-plugins/azure-arm-templates` | `1.0.0` | — |
 
 The published `1.0.0` SDK artifacts predate the first sync from the working repo and must not be used; a published version can never be reused, so each module's next release is the version in the middle column. The gateway plugins sit at `2.2.0` here (`2.0.0` was their security-hardened release; `2.2.0` merges the internal line into `2.1.0`). The gateway plugins, the SDKs and the EMQX plugin are independent lines, not a single repo-wide version.

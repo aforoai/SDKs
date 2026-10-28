@@ -1,0 +1,370 @@
+{
+  "type": "record",
+  "name": "AforoMeteringConfig",
+  "namespace": "ai.aforo.emqx",
+  "doc": "Aforo MQTT Metering plugin (aforo_metering) configuration. tenant_id, product_id, api_key and ingestor_url have no default and are required; api_key and customer_resolver_http_authorization are secrets.",
+  "fields": [
+    {
+      "name": "tenant_id",
+      "type": "string",
+      "$ui": {
+        "component": "input",
+        "flex": 12,
+        "label": "Tenant id",
+        "description": "Aforo tenant id, sent as the X-Tenant-Id header. Required.",
+        "required": true
+      }
+    },
+    {
+      "name": "product_id",
+      "type": "string",
+      "$ui": {
+        "component": "input",
+        "flex": 12,
+        "label": "Product id",
+        "description": "Aforo product id this broker is registered as. Required.",
+        "required": true
+      }
+    },
+    {
+      "name": "api_key",
+      "type": "string",
+      "$ui": {
+        "component": "input-password",
+        "flex": 12,
+        "label": "API key",
+        "description": "Aforo API key with scope usage:ingest, sent as X-API-Key. Required. Secret.",
+        "required": true
+      }
+    },
+    {
+      "name": "ingestor_url",
+      "type": "string",
+      "$ui": {
+        "component": "input",
+        "flex": 12,
+        "label": "Ingestor URL",
+        "description": "Usage-ingestor batch endpoint. https:// (http:// only for localhost or with allow_insecure_http).",
+        "required": true
+      }
+    },
+    {
+      "name": "ca_cert_file",
+      "type": "string",
+      "default": "",
+      "$ui": {
+        "component": "input",
+        "flex": 12,
+        "label": "CA bundle file",
+        "description": "PEM CA bundle on each node; empty = the OS trust store.",
+        "required": false
+      }
+    },
+    {
+      "name": "allow_insecure_http",
+      "type": "boolean",
+      "default": false,
+      "$ui": {
+        "component": "switch",
+        "flex": 12,
+        "label": "Allow insecure http",
+        "description": "Allow http:// to a non-loopback host (the API key travels unencrypted).",
+        "required": false
+      }
+    },
+    {
+      "name": "aggregation_window_seconds",
+      "type": "int",
+      "default": 60,
+      "$ui": {
+        "component": "input-number",
+        "flex": 12,
+        "label": "Aggregation window (s)",
+        "description": "Seconds per usage event; 0 = one usage event per broker event. 0-3600.",
+        "required": false
+      }
+    },
+    {
+      "name": "aggregate_by_topic",
+      "type": "boolean",
+      "default": false,
+      "$ui": {
+        "component": "switch",
+        "flex": 12,
+        "label": "Aggregate by topic",
+        "description": "Keep the MQTT topic as a dimension (one event per topic per window).",
+        "required": false
+      }
+    },
+    {
+      "name": "max_aggregation_keys",
+      "type": "int",
+      "default": 100000,
+      "$ui": {
+        "component": "input-number",
+        "flex": 12,
+        "label": "Max open counters",
+        "description": "Cap on open (customer, metric, topic, window) counters; new keys over it are dropped and counted.",
+        "required": false
+      }
+    },
+    {
+      "name": "flush_count",
+      "type": "int",
+      "default": 500,
+      "$ui": {
+        "component": "input-number",
+        "flex": 12,
+        "label": "Events per request",
+        "description": "Usage events per request (1-1000).",
+        "required": false
+      }
+    },
+    {
+      "name": "flush_interval_ms",
+      "type": "int",
+      "default": 3000,
+      "$ui": {
+        "component": "input-number",
+        "flex": 12,
+        "label": "Flush interval (ms)",
+        "description": "How often windows are closed and the queue is sent.",
+        "required": false
+      }
+    },
+    {
+      "name": "max_buffer_size",
+      "type": "int",
+      "default": 50000,
+      "$ui": {
+        "component": "input-number",
+        "flex": 12,
+        "label": "Queue size",
+        "description": "Usage events queued for sending, including the batch in flight.",
+        "required": false
+      }
+    },
+    {
+      "name": "request_timeout_ms",
+      "type": "int",
+      "default": 10000,
+      "$ui": {
+        "component": "input-number",
+        "flex": 12,
+        "label": "Request timeout (ms)",
+        "description": "Total deadline per request.",
+        "required": false
+      }
+    },
+    {
+      "name": "connect_timeout_ms",
+      "type": "int",
+      "default": 5000,
+      "$ui": {
+        "component": "input-number",
+        "flex": 12,
+        "label": "Connect timeout (ms)",
+        "description": "Connect deadline per request.",
+        "required": false
+      }
+    },
+    {
+      "name": "max_retries",
+      "type": "int",
+      "default": 3,
+      "$ui": {
+        "component": "input-number",
+        "flex": 12,
+        "label": "Retries",
+        "description": "Retries for network errors, timeouts, 408, 429 and 5xx before the batch is re-queued (0-10).",
+        "required": false
+      }
+    },
+    {
+      "name": "shutdown_timeout_ms",
+      "type": "int",
+      "default": 5000,
+      "$ui": {
+        "component": "input-number",
+        "flex": 12,
+        "label": "Shutdown timeout (ms)",
+        "description": "On plugin stop, keep sending for at most this long.",
+        "required": false
+      }
+    },
+    {
+      "name": "emit_deliver",
+      "type": "boolean",
+      "default": false,
+      "$ui": {
+        "component": "switch",
+        "flex": 12,
+        "label": "Meter deliveries",
+        "description": "Emit mqtt_broker.deliver for every fan-out delivery. High volume.",
+        "required": false
+      }
+    },
+    {
+      "name": "exclude_topics",
+      "type": {
+        "type": "array",
+        "items": "string"
+      },
+      "default": [
+        "$SYS/#",
+        "$share/#"
+      ],
+      "$ui": {
+        "component": "input-array",
+        "flex": 12,
+        "label": "Excluded topics",
+        "description": "MQTT topic filters (+, #) that are not metered. $SYS/ and $share/ are always skipped.",
+        "required": false
+      }
+    },
+    {
+      "name": "customer_resolver",
+      "type": "string",
+      "default": "client_attrs",
+      "$ui": {
+        "component": "input",
+        "flex": 12,
+        "label": "Customer source",
+        "description": "client_attrs (set by EMQX authentication), http (your mapping service), or username / clientid_prefix / jwt_unverified (client-chosen; need unsafe_trust_client_identity).",
+        "required": false
+      }
+    },
+    {
+      "name": "customer_resolver_client_attr",
+      "type": "string",
+      "default": "aforo_customer_id",
+      "$ui": {
+        "component": "input",
+        "flex": 12,
+        "label": "Client attribute",
+        "description": "Client attribute that holds the Aforo customer id (client_attrs).",
+        "required": false
+      }
+    },
+    {
+      "name": "unsafe_trust_client_identity",
+      "type": "boolean",
+      "default": false,
+      "$ui": {
+        "component": "switch",
+        "flex": 12,
+        "label": "Trust client identity",
+        "description": "Allow username / clientid_prefix / jwt_unverified. Only when broker authentication pins the value.",
+        "required": false
+      }
+    },
+    {
+      "name": "customer_resolver_clientid_separator",
+      "type": "string",
+      "default": "_",
+      "$ui": {
+        "component": "input",
+        "flex": 12,
+        "label": "Client id separator",
+        "description": "clientid_prefix: cust<sep><id><sep><rest> -> <id>.",
+        "required": false
+      }
+    },
+    {
+      "name": "customer_resolver_jwt_claim",
+      "type": "string",
+      "default": "sub",
+      "$ui": {
+        "component": "input",
+        "flex": 12,
+        "label": "JWT claim",
+        "description": "jwt_unverified: claim to read (signature NOT checked).",
+        "required": false
+      }
+    },
+    {
+      "name": "customer_resolver_http_url",
+      "type": "string",
+      "default": "",
+      "$ui": {
+        "component": "input",
+        "flex": 12,
+        "label": "Mapping service URL",
+        "description": "http resolver: URL of your mapping service (same https rule).",
+        "required": false
+      }
+    },
+    {
+      "name": "customer_resolver_http_authorization",
+      "type": "string",
+      "default": "",
+      "$ui": {
+        "component": "input-password",
+        "flex": 12,
+        "label": "Mapping service Authorization",
+        "description": "Optional Authorization header for the mapping service. Secret.",
+        "required": false
+      }
+    },
+    {
+      "name": "customer_resolver_http_timeout_ms",
+      "type": "int",
+      "default": 1000,
+      "$ui": {
+        "component": "input-number",
+        "flex": 12,
+        "label": "Lookup timeout (ms)",
+        "description": "Deadline per mapping-service lookup.",
+        "required": false
+      }
+    },
+    {
+      "name": "customer_resolver_http_workers",
+      "type": "int",
+      "default": 4,
+      "$ui": {
+        "component": "input-number",
+        "flex": 12,
+        "label": "Lookup workers",
+        "description": "Mapping-service lookups in flight (1-64).",
+        "required": false
+      }
+    },
+    {
+      "name": "customer_resolver_http_queue_size",
+      "type": "int",
+      "default": 10000,
+      "$ui": {
+        "component": "input-number",
+        "flex": 12,
+        "label": "Lookup queue",
+        "description": "Queued lookups; over it a lookup is refused and cached as a miss.",
+        "required": false
+      }
+    },
+    {
+      "name": "customer_resolver_negative_ttl_seconds",
+      "type": "int",
+      "default": 30,
+      "$ui": {
+        "component": "input-number",
+        "flex": 12,
+        "label": "Miss cache (s)",
+        "description": "How long a 'no customer' answer or a failed lookup is cached.",
+        "required": false
+      }
+    },
+    {
+      "name": "customer_resolver_pending_max_seconds",
+      "type": "int",
+      "default": 300,
+      "$ui": {
+        "component": "input-number",
+        "flex": 12,
+        "label": "Pending lookup max (s)",
+        "description": "How long usage waits for a pending lookup before it is dropped.",
+        "required": false
+      }
+    }
+  ]
+}

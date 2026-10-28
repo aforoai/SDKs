@@ -1,146 +1,183 @@
 # aforo_metering — User Guide
 
-**Version:** 0.1.0 (EXPERIMENTAL) · **Updated:** 2026-06-29 · **Audience:** platform/infra engineers running an EMQX 5.x broker who need per-tenant MQTT metering for Aforo billing.
+**Version:** 2.0.2 (EXPERIMENTAL) · **Updated:** 2026-10-28 · **Audience:** platform/infra engineers running an EMQX 5.x broker who need per-tenant MQTT metering for Aforo billing.
 
 ## What you'll build
 
-An EMQX 5.x node with the `aforo_metering` plugin installed and started, reporting connect/publish/subscribe traffic to Aforo's ingestor. By the end you'll have published one MQTT message and confirmed the matching `mqtt_broker.publish` event reached Aforo.
+An EMQX 5.x node with the `aforo_metering` plugin installed and started, reporting connect/publish/subscribe traffic to Aforo's ingestor. By the end you'll have published MQTT messages and confirmed the matching `mqtt_broker.publish` usage event reached Aforo.
 
 ## Prerequisites
 
-- **EMQX 5.x** running locally or on a node you can install plugins onto. (The plugin uses EMQX 5.x hook APIs — it will not load on 4.x.)
-- **Erlang/OTP + rebar3** to build the release tarball. Match the OTP version your EMQX build expects.
+- **EMQX 5.7.0 or later** for the default `client_attrs` resolver (earlier 5.x releases don't set client attributes from authentication). The plugin uses EMQX 5.x hook APIs — it will not load on 4.x.
+- **Erlang/OTP and rebar3** of the major version your EMQX runs (OTP 26 for EMQX 5.7–5.8, OTP 27 for 5.9+). No EMQX source tree: the headers come from the `emqx_plugin_helper` dependency.
+- **EMQX REST API credentials** (an API key/secret from Dashboard → System → API Keys) or Dashboard access, to configure the plugin.
 - An **Aforo API key**, **tenant ID**, and **product ID** for an MQTT-broker product. The three values you need: `ingestor_url`, `api_key`, `tenant_id` (`product_id` rides along in event metadata).
-- A `customer_id` strategy: by default the plugin uses the MQTT CONNECT username. Decide this before you go live (Step 4).
+- **EMQX authentication that identifies the customer** — JWT or HTTP authentication setting a `client_attrs` attribute (Step 4). The plugin will not bill a value the client chooses unless you opt in by name.
+- **Billable units with SUM aggregation** on the `mqtt_broker.*` metrics you price: each usage event carries a window's message count as `quantity`.
 
-## Step 1 — Build the release tarball
+## Step 1 — Build the plugin package
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
 cd SDKs/aforo-emqx-plugin
-rebar3 compile
-rebar3 tar
+rebar3 emqx_plugrel tar
 ```
 
-This emits `_build/default/rel/aforo_metering/aforo_metering-1.0.0.tar.gz`.
+This emits `_build/default/emqx_plugrel/aforo_metering-2.0.2.tar.gz` with a `release.json` that EMQX reads at install. The package name, the release version and the plugin `vsn` are all `2.0.2`; EMQX addresses the plugin as `aforo_metering-2.0.2`. Don't edit config before packaging — configure it on the broker (Step 3).
 
-> ⚠ The tarball filename carries the `relx` release version (`1.0.0`), not the plugin's `vsn` (`0.1.0`). They're independent. `emqx ctl plugins list` reports the `vsn` — `0.1.0` — which is the version that matters for "what's running."
+## Step 2 — Install
 
-## Step 2 — Configure before you package (recommended)
+```bash
+# Dashboard: Plugins → Install Plugin → upload the .tar.gz.
+#   On EMQX 5.9+ allow the upload first: emqx ctl plugins allow aforo_metering-2.0.2
+# Or via CLI on the node (the package must be in plugins.install_dir, default $EMQX_ROOT/plugins):
+cp aforo_metering-2.0.2.tar.gz /opt/emqx/plugins/
+emqx ctl plugins install aforo_metering-2.0.2
+```
 
-The config file `priv/emqx_plugins/aforo_metering.hocon` is copied into the release by the `overlay` in `rebar.config`. Edit it **before** `rebar3 tar` so the tarball ships with your values, or edit `etc/plugins/aforo_metering.hocon` on the node afterward and restart the plugin.
+Installing copies the plugin's default config (`priv/config.hocon`) to `$EMQX_DATA_DIR/plugins/aforo_metering/config.hocon` and loads its schema (`priv/config_schema.avsc`). The defaults leave `tenant_id`, `product_id` and `api_key` empty, so the plugin will not start yet.
 
-```hocon
-aforo_metering {
-  tenant_id    = "tenant_acme"
-  product_id   = "prod_mqtt_iot_telemetry"
-  api_key      = "${AFORO_API_KEY}"
-  ingestor_url = "https://api.aforo.ai/v1/ingest/batch"
+## Step 3 — Configure and start
 
-  flush_count       = 500
-  flush_interval_ms = 3000
-  emit_deliver      = false
-  exclude_topics    = ["$SYS/#", "$share/#"]
+Set the required values through the Dashboard's plugin settings form, or with the REST API — read the config, edit it, write the whole object back:
+
+```bash
+EMQX=http://localhost:18083/api/v5
+AUTH="$EMQX_API_KEY:$EMQX_API_SECRET"
+curl -s -u "$AUTH" "$EMQX/plugins/aforo_metering-2.0.2/config" > aforo.json
+```
+
+```json
+{
+  "tenant_id": "tenant_acme",
+  "product_id": "prod_mqtt_iot_telemetry",
+  "api_key": "sk_live_…",
+  "ingestor_url": "https://api.aforo.ai/v1/ingest/batch",
+  "customer_resolver": "client_attrs",
+  "customer_resolver_client_attr": "aforo_customer_id",
+  "aggregation_window_seconds": 60,
+  "flush_count": 500,
+  "flush_interval_ms": 3000,
+  "emit_deliver": false
 }
 ```
 
-> ⚠ Keep `api_key` out of the file. Use `${AFORO_API_KEY}` and set the env var on the EMQX node — the HOCON `${VAR}` substitution reads the broker process environment, so it must be exported in the EMQX node's environment, not just your shell.
-
-## Step 3 — Install and start
+(keep the other keys `aforo.json` already has), then:
 
 ```bash
-# Dashboard: Plugins → Install From File → upload the tarball → Start.
-# Or via CLI on the node:
-emqx ctl plugins install aforo_metering-1.0.0.tar.gz
-emqx ctl plugins start aforo_metering
-emqx ctl plugins list      # confirm aforo_metering shows running, vsn 0.1.0
+curl -s -u "$AUTH" -X PUT -H 'Content-Type: application/json' \
+     --data @aforo.json "$EMQX/plugins/aforo_metering-2.0.2/config"
+emqx ctl plugins start aforo_metering-2.0.2
+emqx ctl plugins list      # confirm aforo_metering-2.0.2 is running
 ```
 
-On load the plugin logs a structured line with the live config — grep the EMQX log for `aforo_metering plugin loaded` to confirm `tenant_id`, `product_id`, `flush_count`, and `customer_resolver` are what you set:
+> ⚠ EMQX does not substitute environment variables in plugin config. Put the key itself in the config; the plugin refuses empty, placeholder and `${…}` values. The config is stored in each node's data directory — restrict access to it.
 
-```bash
-grep "aforo_metering plugin loaded" /path/to/emqx/log/emqx.log
-```
+The plugin checks the configuration at start and refuses to load on a missing or placeholder `tenant_id` / `product_id` / `api_key`, on a client-chosen identity source without `unsafe_trust_client_identity = true`, on an `http://` URL to a non-local host, or when no CA certificates are available. Each reason is logged as `aforo_metering refused to start: invalid configuration`.
 
-## Step 4 — Choose how a client maps to a customer
+**Changing the config later.** On EMQX 5.8+ a change made through the Dashboard or REST API is applied to the running plugin with no usage lost (new key/URL/CA on the next request, on fresh connections for a new URL or CA; a paused delivery retried at once; a new flush interval at once; open windows sent as partial windows when the window length changes). What happens to a change the plugin refuses depends on the EMQX version:
 
-A metered event needs a `customerId`. A client whose customer ID can't be resolved is **not metered** (silently skipped) — so getting this right is the difference between billing and dropping data. Set `customer_resolver`:
-
-| `customer_resolver` | Where the customer ID comes from | Extra config |
+| EMQX | Refused change (invalid value) | New `tenant_id` / `product_id` while running |
 |---|---|---|
-| `username` (default) | MQTT CONNECT username | — |
-| `clientid_prefix` | `cust_<id>_<rest>` parsed from the client ID | `customer_resolver_clientid_separator` (default `_`) |
-| `jwt` | A claim in the JWT carried in MQTT 5 CONNECT Authentication-Data | `customer_resolver_jwt_claim` (default `sub`) |
-| `http` | POST `{clientId, username, tenantId}` to your auth service; reads `customerId` from the response | `customer_resolver_http_url` |
+| 5.9+ | Rejected with the reason; nothing applied or saved. | Rejected as a whole; nothing applied or saved. |
+| 5.8 | **Saved anyway** (5.8 ignores the plugin's answer) but never applied. Logged at error (`refused a config change that EMQX saved anyway`, with the keys), gauge `aforo.metering.config.invalid` = 1, `config_problem` in `aforo_metering:health()`. **The next start fails until you fix those keys** with another change. | Saved; the other keys of the change are applied, the plugin keeps the current tenant/product until it is stopped and started (logged at error, gauge set). |
+| 5.7 | No callback: restart the plugin (`emqx ctl plugins restart aforo_metering-2.0.2`); the config is checked at start. | Same: takes effect at the restart. |
 
-> ⚠ On `message.publish` the hook only receives the client identifier, not full CONNECT info, so the publisher's customer ID is read from the connect-time cache. A client that publishes without ever firing `client.connected` (rare, but possible with persistent sessions across a plugin restart) is skipped. Resolution is cached per `(tenant, clientid)` and invalidated on disconnect.
+On 5.9+ an accepted change is applied before EMQX saves it; if the save fails, the running plugin keeps the new values until it restarts and then reads the saved (old) config. Each node checks and applies the change on its own and EMQX does not undo the other nodes when one fails, so cluster nodes can run different configs — check every node's log after a change.
+
+## Step 4 — Let EMQX authentication say who the customer is
+
+A usage event needs a `customerId`. The plugin takes it from what EMQX authentication verified, so a device cannot bill its traffic to someone else.
+
+**JWT authentication (EMQX 5.7.0+).** Configure EMQX's JWT authenticator and issue tokens with a `client_attrs` claim. EMQX verifies the signature before the claim becomes a client attribute:
+
+```json
+{ "sub": "sensor-42", "exp": 1830000000, "client_attrs": { "aforo_customer_id": "cust_acme" } }
+```
+
+**HTTP authentication.** Return the attribute in the success response:
+
+```json
+{ "result": "allow", "client_attrs": { "aforo_customer_id": "cust_acme" } }
+```
+
+> ⚠ Don't also populate `aforo_customer_id` through `mqtt.client_attrs_init` from a field the client sends (username, client id, user property). That makes the value client-chosen again.
+
+Other resolvers:
+
+| `customer_resolver` | Where the customer ID comes from | Needs |
+|---|---|---|
+| `client_attrs` (default) | Client attribute set by EMQX authentication | `customer_resolver_client_attr` (default `aforo_customer_id`) |
+| `http` | Your mapping service: POST `{clientId, username, clientAttrs, tenantId}`, reads `customerId` (map from `clientAttrs`, which EMQX authentication set) | `customer_resolver_http_url`; optional `customer_resolver_http_authorization` |
+| `username` | MQTT CONNECT username | `unsafe_trust_client_identity = true` |
+| `clientid_prefix` | `cust_<id>_<rest>` parsed from the client ID | `unsafe_trust_client_identity = true` |
+| `jwt_unverified` | A claim in MQTT 5 Authentication-Data, **signature not checked** | `unsafe_trust_client_identity = true` |
+
+Set `unsafe_trust_client_identity = true` only when broker authentication already ties that value to one customer (for example, username/password authentication where each username belongs to one customer).
+
+The `http` resolver runs in a worker pool, never in the client's process: CONNECT does not wait for your service. Usage recorded while a lookup is pending is held under the client ID (up to `customer_resolver_pending_max_seconds`) and attributed when the answer arrives; a reconnect waits for its own answer (it never inherits the previous connection's customer). "No customer" answers and failed lookups are cached for `customer_resolver_negative_ttl_seconds`, then retried — also from `message.publish`, so a device that only publishes recovers after a mapping-service blip.
+
+> ⚠ On `message.publish` the hook only receives the client identifier, so the publisher's customer comes from the connect-time cache. A client that publishes without `client.connected` firing after the plugin started (persistent sessions across a plugin restart) is not billed until it reconnects; its messages count as `aforo.metering.events.unresolved`.
 
 ## Step 5 — Send a test message and verify it landed
 
-Publish one message (any MQTT client; `mosquitto_pub` shown). Use a username that your resolver maps to a known customer:
+Publish a few messages with a client whose authentication sets the customer (any MQTT client; `mosquitto_pub` with a JWT as the password is shown):
 
 ```bash
-mosquitto_pub \
-  -h localhost -p 1883 \
-  -u "device-user-7" -P "<mqtt-password>" \
-  -i "sensor-42" \
-  -t "sensors/temp" \
-  -m '{"c":22.5}'
+for i in 1 2 3; do
+  mosquitto_pub -h localhost -p 1883 \
+    -i "sensor-42" -u "sensor-42" -P "<jwt with client_attrs>" \
+    -t "sensors/temp" -m '{"c":22.5}'
+done
 ```
 
-Wait up to `flush_interval_ms` (3s) — or publish `flush_count` (500) messages to force an immediate flush. Then confirm the event reached Aforo two ways:
+Usage is counted per minute: the window closes one second after the minute ends and is sent on the next flush tick (`flush_interval_ms`). Wait about a minute, or call `aforo_metering:flush_now().` from the remote console to close finished windows and send immediately. Then confirm the event reached Aforo two ways:
 
 **a) From the broker — the health map:** Call `aforo_metering:health/0` from an EMQX remote console (`emqx remote_console`):
 
 ```erlang
 aforo_metering:health().
-%% => #{plugin => <<"aforo_metering">>, version => <<"1.0.0">>,
+%% => #{plugin => <<"aforo_metering">>, version => <<"2.0.2">>,
 %%      tenant_id => <<"tenant_acme">>, buffer_depth => 0,
-%%      circuit_state => <<"closed">>,
-%%      counters => #{'aforo.metering.events.flushed' => 1,
-%%                    'aforo.metering.flush.success' => 1, ...}}
+%%      open_aggregation_keys => 0, circuit_state => <<"closed">>,
+%%      counters => #{'aforo.metering.events.buffered' => 3,
+%%                    'aforo.metering.events.flushed' => 3, ...}}
 ```
 
-`events.flushed` ≥ 1 and `circuit_state => <<"closed">>` means the batch was accepted. (`version` here is the `?SDK_VERSION` event-contract string, not the plugin `vsn`.)
+`events.buffered` counts broker events recorded; `events.flushed` counts usage events the ingestor accepted (one per customer, metric and window). `circuit_state => <<"closed">>` means delivery is not paused.
 
-**b) In Aforo:** Open the tenant's usage/ingestion view and filter to `metricName = mqtt_broker.publish` for `productId = prod_mqtt_iot_telemetry`. You should see one event for `customerId = device-user-7` with `mqttTopic = sensors/temp` and `dataBytes` matching your payload size.
+**b) In Aforo:** Open the tenant's usage/ingestion view and filter to `metricName = mqtt_broker.publish` for `productId = prod_mqtt_iot_telemetry`. You should see one event for `customerId = cust_acme` with `quantity = 3`, `mqttTopic = #` and `dataBytes` equal to the summed payload sizes.
 
-If `buffer_depth` keeps climbing and `flush.success` stays at 0, the ingestor isn't accepting the batch — go to Troubleshooting.
+If `buffer_depth` keeps climbing and `events.flushed` stays at 0, the ingestor isn't accepting the batch — go to Troubleshooting.
 
 ## Configuration reference
 
-| Option | Type | Default | What it does |
-|---|---|---|---|
-| `tenant_id` | string | `"tenant_default"` | `X-Tenant-Id` header value. |
-| `product_id` | string | `"prod_mqtt_default"` | Stamped into `metadata.productId`. |
-| `api_key` | string | `""` | Ingestor API key (scope `usage:ingest`), sent as `X-API-Key`. Use `${AFORO_API_KEY}`. |
-| `ingestor_url` | string | `https://api.aforo.ai/v1/ingest/batch` | Ingestor batch endpoint. Override per environment, keeping the `/v1/ingest/batch` path. |
-| `flush_count` | integer | `500` | Buffered-event count that triggers a flush. |
-| `flush_interval_ms` | integer | `3000` | Max ms between partial-batch flushes. |
-| `emit_deliver` | boolean | `false` | One event per fan-out delivery. High volume. |
-| `exclude_topics` | list | `["$SYS/#", "$share/#"]` | Topic filters to skip. |
-| `max_buffer_size` | integer | `50000` | ETS cap; oldest 50% dropped + counted on overflow. |
-| `circuit_failure_threshold` | integer | `5` | Consecutive failures before the circuit opens. |
-| `circuit_cooldown_seconds` | integer | `60` | Open-circuit cooldown before a half-open probe. |
-| `customer_resolver` | string | `"username"` | `username` \| `clientid_prefix` \| `jwt` \| `http`. |
-| `customer_resolver_clientid_separator` | string | `"_"` | Separator for `clientid_prefix`. |
-| `customer_resolver_jwt_claim` | string | `"sub"` | JWT claim for the `jwt` resolver. |
-| `customer_resolver_http_url` | string | `""` | Auth-service URL for the `http` resolver. |
+Every key, with defaults, is listed in the [README](README.md#configuration), commented in `priv/config.hocon` and typed in `priv/config_schema.avsc`.
+
+How a change reaches the running plugin, and what EMQX 5.7, 5.8 and 5.9+ do with a change the plugin refuses, is in **Changing the config later** under Step 3.
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| No events in Aforo, `events.buffered` is 0 | The publisher's customer ID didn't resolve — clients with no resolvable customer ID are not metered. | Confirm the MQTT username (or your chosen resolver source) maps to a customer. Check the resolver config matches how your devices connect. |
-| `events.buffered` climbs, `flush.success` stays 0 | Ingestor unreachable or rejecting the batch (bad `api_key`, wrong `ingestor_url`, network). | Check the EMQX log for `aforo_metering flush retry`. Verify `api_key` resolved (it's `${AFORO_API_KEY}` — is the var exported on the node?) and `ingestor_url` is reachable from the broker. |
-| `circuit_state => <<"open">>` in `health/0` | `circuit_failure_threshold` consecutive flush failures tripped the breaker. | Fix the underlying ingestor/auth problem. After `circuit_cooldown_seconds` the circuit half-opens and probes; one success closes it. |
-| `events.dropped` is non-zero | Buffer hit `max_buffer_size` during a sustained flush outage; oldest 50% dropped to bound memory. | Restore ingestor connectivity. Raise `max_buffer_size` if your outage window needs more headroom — but it's a memory trade-off, not free. |
-| `${AFORO_API_KEY}` shows up literally / 401 from ingestor | The env var wasn't set in the **EMQX node's** environment when HOCON resolved it. | Export `AFORO_API_KEY` for the broker process (systemd unit, container env, or `emqx.conf` env) and restart the plugin. |
-| Plugin won't load on EMQX 4.x | The hooks (`?HP_LOWEST`, `emqx_hooks:add/4`) are EMQX 5.x APIs. | Run on EMQX 5.x. There is no 4.x build. |
-| Publish events missing but connect/subscribe present | Persistent sessions surviving a plugin restart can publish before re-firing `client.connected`, so the publisher isn't in the cache. | Restart affected clients, or use a resolver (`clientid_prefix` / `jwt`) that doesn't depend on the connect-time cache. |
+| Plugin won't start; log shows `aforo_metering refused to start` | `tenant_id`, `product_id` or `api_key` is not set (or still a placeholder), the config still uses the 2.0.0 `aforo_metering { }` wrapper, or the configuration names a client-chosen identity source without `unsafe_trust_client_identity`, uses `customer_resolver = "jwt"` (removed in 2.0.0), uses `http://` for a non-local host, or no CA certificates are available. | Fix what the logged reason names. For JWT, configure EMQX's JWT authenticator with a `client_attrs` claim and use `client_attrs`. |
+| `events.unresolved` climbs, nothing in Aforo | Clients connect without the customer attribute (authentication doesn't set `client_attrs.aforo_customer_id`), or the http resolver answers "none". | Check the token / HTTP-auth response carries `client_attrs`. In the remote console, `aforo_metering_customer_resolver:lookup(<<"sensor-42">>).` shows what the plugin resolved. |
+| `events.buffered` climbs, `events.flushed` stays 0 | Ingestor unreachable or rejecting the batch (bad `api_key`, wrong `ingestor_url`, network, TLS). | Check the EMQX log for `aforo_metering delivery paused` and `aforo_metering ingestor rejected batch`. Verify `api_key` and `ingestor_url` in the plugin config and that the URL is reachable from the node. |
+| Log: `ingestor refused the API key` | 401/403 from the ingestor. Usage is kept and re-sent. | Fix the key; delivery resumes on the next attempt with nothing lost (until `max_buffer_size` is reached). |
+| Log: `answered with a redirect, which is never followed` | `ingestor_url` points at a host that redirects. | Use the final URL (`https://api.aforo.ai/v1/ingest/batch`). |
+| TLS errors (`unknown_ca`, `hostname_check_failed`) | The ingestor's certificate isn't trusted, or doesn't match the host. | For a private CA set `ca_cert_file`; make sure `ingestor_url` uses the certificate's host name. |
+| Billed quantity looks ~60× too low | The billable unit uses COUNT. Each usage event is a window total. | Use SUM on quantity, or set `aggregation_window_seconds = 0` (one event per message). |
+| `circuit_state => <<"open">>` in `health/0` | The last send ended in an outage. Sending pauses 5 s, doubling up to 5 min. | Fix the cause; `aforo_metering:flush_now().` forces one attempt now. |
+| `events.dropped` is non-zero | Queue overflow during an outage, a rejected batch, `max_aggregation_keys` reached, or the shutdown deadline. | The log says which. Raise `max_buffer_size` / `max_aggregation_keys` if you need headroom — a memory trade-off. |
+| Log: `aforo_metering could not read its plugin config` | EMQX could not hand the plugin its config (not installed through EMQX, or the config file is unreadable). | Reinstall through EMQX (Step 2) and set the config through the Dashboard or REST API. |
+| Log: `aforo_metering rejected a config change` | The new config is invalid (reason logged), or it changes `tenant_id` / `product_id` while the plugin runs. | Fix the reason; for tenant/product, stop the plugin, change them, start it. |
+| Log: `aforo_metering refused a config change that EMQX saved anyway`, or `aforo.metering.config.invalid` = 1 (EMQX 5.8) | 5.8 saved a config the plugin refused. The plugin still runs on its previous config, but its next start will fail. | Fix the keys the log names with another config change (the gauge returns to 0). |
+| Log: `aforo_metering cannot change tenant_id / product_id while running` (EMQX 5.8) | 5.8 saved a new tenant/product; the plugin keeps the current ones. | Stop and start the plugin to switch, or change them back. |
+| Plugin won't load on EMQX 4.x | The hooks are EMQX 5.x APIs. | Run on EMQX 5.x (5.7.0+ for `client_attrs`). |
 
 ## What this guide does NOT cover
 
 - **Production hardening status.** Load testing, CI, GPG-signed releases, online upgrade (`code_change/3`), and a dashboard health endpoint are tracked in [`TODO.md`](TODO.md) — several are unbuilt. This guide gets you to a working PoC, not a hardened production rollout.
 - **The metrics module internals.** `aforo_metering_metrics` wires counters through `emqx_metrics`, scrapeable at `/api/v5/prometheus/stats` — but configuring your Prometheus/Grafana stack is your monitoring stack's concern.
-- **EMQX clustering specifics.** Each node runs its own buffer and ships independently; cross-node aggregation is the ingestor's job, not the plugin's.
+- **EMQX clustering specifics.** Each node aggregates and ships its own clients' traffic. Keys include the node name, so two nodes never collide; adding the totals across nodes is the ingestor's job.
+- **A run inside a real EMQX broker.** 2.0.2 is tested on plain Erlang/OTP (EMQX headers from `emqx_plugin_helper`, a stand-in for EMQX's plugin-config store) and against the Aforo mock ingestor. EMQX's own install, schema check and callback dispatch have not been exercised.
