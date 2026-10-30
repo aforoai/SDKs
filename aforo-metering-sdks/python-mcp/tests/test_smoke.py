@@ -171,7 +171,7 @@ def test_invalid_invocations_are_dropped_as_invalid_never_truncated(caplog):
     billing.record_tool_invocation("t" * 64, "a" * 36, session_id="s" * 64, customer_id="c" * 64)
     (ev,) = billing._buffer
     assert len(ev["toolName"]) == 64 and len(ev["agentId"]) == 36
-    assert ev["metadata"]["sdkVersion"] == "2.0.0"
+    assert ev["metadata"]["sdkVersion"] == "2.1.0"
     assert billing.dropped_count == 5
     billing.shutdown_sync(timeout=0)
 

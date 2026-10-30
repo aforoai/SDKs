@@ -30,6 +30,7 @@ items)`` receives the unwrapped body of every accepted batch.
 from __future__ import annotations
 
 import atexit
+import gzip
 import json
 import logging
 import os
@@ -50,6 +51,7 @@ from .policy import (
     BREAKER_FLOOR_S,
     BREAKER_INITIAL_S,
     BREAKER_MAX_S,
+    COMPRESSION_MIN_BYTES,
     CONNECT_TIMEOUT_S,
     DEFAULT_FLUSH_COUNT,
     DEFAULT_FLUSH_INTERVAL_S,
@@ -211,19 +213,25 @@ class TransportCore:
         rand: Optional[Callable[[], float]] = None,
         http_transport: Optional[httpx.BaseTransport] = None,
         register_atexit: bool = True,
+        compression: str = "gzip",
     ) -> None:
         if not isinstance(api_key, str) or not api_key.strip():
             raise ValueError("api_key is required")
+        if compression not in ("gzip", "none"):
+            raise ValueError('compression must be "gzip" or "none"')
+        self._gzip = compression == "gzip"
         self._url = validate_base_url(base_url, allow_insecure_http) + path
         self._name = name
         self._log = logger or logging.getLogger("aforo.transport")
         self._api_key = api_key
+        extra = {k: v for k, v in (extra_headers or {}).items() if k.lower() != "content-encoding"}
         self._headers = {
             "Content-Type": "application/json",
             "User-Agent": user_agent,
-            **(extra_headers or {}),
+            **extra,
             "X-API-Key": api_key,
         }
+        self._gzip_headers = {**self._headers, "Content-Encoding": "gzip"}
         try:
             count = int(flush_count)
         except (TypeError, ValueError):
@@ -732,7 +740,19 @@ class TransportCore:
             total = min(total, max(0.0, deadline - self._clock()))
         return max(total, 0.001)
 
-    def _exchange(self, body: bytes, deadline: Optional[float], override: Optional[float] = None) -> _Answer:
+    def _encode(self, body: bytes) -> "tuple[bytes, bool]":
+        """gzip ``body`` when compression is on and it is at least COMPRESSION_MIN_BYTES
+        (wave 8, G269). A compression failure sends the JSON as it is."""
+        if not self._gzip or len(body) < COMPRESSION_MIN_BYTES:
+            return body, False
+        try:
+            return gzip.compress(body, compresslevel=6), True
+        except Exception:
+            self._log.debug("[%s] gzip failed, sending uncompressed", self._name, exc_info=True)
+            return body, False
+
+    def _exchange(self, body: bytes, deadline: Optional[float], override: Optional[float] = None,
+                  gzipped: bool = False) -> _Answer:
         """One POST. ``timeout`` is a total deadline for the whole exchange:
         connecting, sending, the response headers and reading the body. Every
         phase gets only the time that is left, and the body is read in pieces
@@ -765,7 +785,7 @@ class TransportCore:
         resp: Optional[httpx.Response] = None
         try:
             request = self._http.build_request(
-                "POST", self._url, content=body, headers=self._headers,
+                "POST", self._url, content=body, headers=self._gzip_headers if gzipped else self._headers,
                 timeout=httpx.Timeout(total, connect=min(self._connect_timeout, total)),
                 extensions={"trace": trace})
             timeouts["timeout"] = request.extensions.get("timeout")
@@ -792,6 +812,8 @@ class TransportCore:
 
     def _post(self, entries: List[_Entry], body: bytes, deadline: Optional[float],
               single_attempt: bool = False) -> bool:
+        # Compressed once; every retry sends the same bytes.
+        body, gzipped = self._encode(body)
         attempt = 0
         while True:
             if deadline is None and self._closed:
@@ -805,7 +827,7 @@ class TransportCore:
             retry_after: Optional[float] = None
             with self._lock:
                 self._in_flight = entries
-            answer = self._exchange(body, deadline)
+            answer = self._exchange(body, deadline, gzipped=gzipped)
             with self._lock:
                 self._in_flight = None
                 abandoned = self._abandoned

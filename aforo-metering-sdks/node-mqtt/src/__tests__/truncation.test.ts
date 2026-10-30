@@ -7,12 +7,13 @@ import { createHash } from 'node:crypto';
 import { EventEmitter } from 'events';
 import { AforoMqttBilling, truncateToLimit, type MqttUsageEvent } from '../index';
 import { ackingPublish } from '../../test-support/mqtt-fakes';
+import { bodyJson } from '../../test-support/request-body';
 
 const mockFetch = jest.fn();
 global.fetch = mockFetch as any;
 
 const sha256 = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex');
-const sent = (): MqttUsageEvent[] => mockFetch.mock.calls.flatMap((c) => JSON.parse(c[1].body).events);
+const sent = (): MqttUsageEvent[] => mockFetch.mock.calls.flatMap((c) => bodyJson(c[1]).events);
 const tick = () => new Promise((r) => setImmediate(r));
 const wholeCharacterEnd = (text: string) => {
   const last = text.charCodeAt(text.length - 1);

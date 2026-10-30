@@ -9,6 +9,7 @@
 import { AforoMqttBilling } from '../index';
 import { EventEmitter } from 'events';
 import { ackingPublish } from '../../test-support/mqtt-fakes';
+import { bodyJson } from '../../test-support/request-body';
 
 // ── HTTP capture ────────────────────────────────────────────────────────
 
@@ -18,7 +19,7 @@ beforeEach(() => {
   capturedRequests = [];
   global.fetch = jest.fn(async (input: any, init: any = {}) => {
     let body: any = init.body;
-    try { body = JSON.parse(init.body); } catch { /* ignore */ }
+    try { body = bodyJson(init); } catch { /* ignore */ }
     capturedRequests.push({ url: String(input), init, body });
     return { ok: true, status: 200, statusText: 'OK' } as unknown as Response;
   }) as any;
@@ -401,7 +402,7 @@ describe('batch response handling', () => {
   } as unknown as Response);
   const respondWith = (next: () => Response) => {
     global.fetch = jest.fn(async (input: any, init: any = {}) => {
-      capturedRequests.push({ url: String(input), init, body: JSON.parse(init.body) });
+      capturedRequests.push({ url: String(input), init, body: bodyJson(init) });
       return next();
     }) as any;
   };

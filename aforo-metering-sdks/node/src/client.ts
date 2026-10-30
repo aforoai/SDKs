@@ -4,7 +4,7 @@ import { generateRandomKey } from './idempotency.js';
 import { describeLimitViolation } from './limits.js';
 
 /** Package version, sent in User-Agent. Keep in step with package.json. */
-export const SDK_VERSION = '2.0.0';
+export const SDK_VERSION = '2.1.0';
 const DEFAULT_BASE_URL = 'https://api.aforo.ai';
 const DEFAULT_PRODUCT_TYPE = 'API';
 const DEFAULT_SESSION_PRODUCT_TYPE = 'AI_AGENT';
@@ -78,6 +78,7 @@ export class AforoClient {
       baseUrl,
       apiKey: options.apiKey,
       allowInsecureHttp: options.allowInsecureHttp,
+      compression: options.compression,
       userAgent: `aforo-node/${SDK_VERSION}`,
       flushCount: options.flushCount,
       flushIntervalMs: options.flushInterval,

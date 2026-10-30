@@ -97,9 +97,10 @@ class AforoMetering:
         )
         allow_http = self._kwargs.get("allow_insecure_http",
                                       bool(app.config.get("AFORO_ALLOW_INSECURE_HTTP", False)))
+        compression = self._kwargs.get("compression", app.config.get("AFORO_COMPRESSION", "gzip"))
         self._client = AforoClient(
             api_key=api_key, base_url=base_url, product_type=self._product_type,
-            allow_insecure_http=allow_http,
+            allow_insecure_http=allow_http, compression=compression,
         )
         app.before_request(self._before_request)
         app.after_request(self._after_request)

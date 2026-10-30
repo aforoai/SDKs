@@ -105,7 +105,7 @@ class RequestLabelTruncationTest {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         port = server.getAddress().getPort();
         server.createContext("/", exchange -> {
-            JsonNode body = mapper.readTree(exchange.getRequestBody().readAllBytes());
+            JsonNode body = mapper.readTree(com.aforo.testsupport.RequestBodies.read(exchange));
             body.get("events").forEach(received::add);
             exchange.sendResponseHeaders(202, -1);
             exchange.close();

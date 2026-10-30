@@ -28,7 +28,7 @@ import java.util.logging.Logger;
 public final class AforoMqttBilling implements AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(AforoMqttBilling.class.getName());
-    private static final String SDK_VERSION = "2.0.0";
+    private static final String SDK_VERSION = "2.1.0";
     private static final int MAX_IDEMPOTENCY_KEY = 255;
     /** Ingestor limits on the labels taken from the MQTT packet. */
     static final int MAX_MQTT_TOPIC = 500;
@@ -59,6 +59,7 @@ public final class AforoMqttBilling implements AutoCloseable {
                 .baseUrl(require(b.ingestorUrl, "ingestorUrl"))
                 .apiKey(apiKey)
                 .allowInsecureHttp(b.allowInsecureHttp)
+                .compression(b.compression)
                 .header("X-Tenant-Id", tenantId)
                 .userAgent("aforo-java-mqtt/" + SDK_VERSION)
                 .flushCount(b.flushCount)
@@ -481,6 +482,7 @@ public final class AforoMqttBilling implements AutoCloseable {
         private long shutdownTimeoutMs = TransportConfig.DEFAULT_SHUTDOWN_TIMEOUT_MS;
         private long breakerCooldownMs = TransportConfig.DEFAULT_BREAKER_INITIAL_MS;
         private boolean allowInsecureHttp;
+        private String compression = "gzip";
         private BiConsumer<java.util.List<Map<String, Object>>, DropReason> onDrop;
         private java.util.function.Consumer<MeteringError> onError;
         private BiConsumer<Map<String, Object>, java.util.List<Map<String, Object>>> onAccepted;
@@ -513,6 +515,8 @@ public final class AforoMqttBilling implements AutoCloseable {
         public Builder breakerCooldownMs(long n) { this.breakerCooldownMs = n; return this; }
         /** Allow a plain http:// ingestor URL on a host other than localhost. Off by default: the API key is in every request. */
         public Builder allowInsecureHttp(boolean b) { this.allowInsecureHttp = b; return this; }
+        /** "gzip" (default): batches of 1 KiB or more are sent with Content-Encoding: gzip (needs usage-ingestor wave 8 or later); "none": always plain JSON. */
+        public Builder compression(String c) { this.compression = c; return this; }
         /**
          * Opt-in hook receiving events that were permanently dropped (retry
          * exhaustion, a terminal rejection, or an event that breaks an ingestor

@@ -66,6 +66,7 @@ public class AforoMeteringAutoConfiguration {
         if (props.getTimeoutMs() > 0) options.timeoutMs(props.getTimeoutMs());
         if (props.getShutdownTimeoutMs() >= 0) options.shutdownTimeoutMs(props.getShutdownTimeoutMs());
         options.allowInsecureHttp(props.isAllowInsecureHttp());
+        options.compression(props.getCompression());
         return new AforoClient(options);
     }
 

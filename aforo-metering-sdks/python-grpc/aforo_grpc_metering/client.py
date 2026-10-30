@@ -43,7 +43,7 @@ from ._transport import (
 )
 from ._transport import policy as _policy
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 logger = logging.getLogger("aforo_grpc_metering")
 
 # POST /v1/ingest/batch takes 1..1000 events per request.
@@ -293,6 +293,7 @@ class AforoGrpcBilling:
         timeout_sec: float = _policy.REQUEST_TIMEOUT_S,
         shutdown_timeout_sec: float = _policy.SHUTDOWN_TIMEOUT_S,
         allow_insecure_http: bool = False,
+        compression: str = "gzip",
         http_transport: Any = None,
         transport_options: Optional[Dict[str, Any]] = None,
         trust_customer_header: bool = False,
@@ -326,6 +327,7 @@ class AforoGrpcBilling:
             timeout=timeout_sec,
             shutdown_timeout=shutdown_timeout_sec,
             allow_insecure_http=allow_insecure_http,
+            compression=compression,
             on_drop=on_drop,
             on_error=self._safe_on_error,
             extra_headers={"X-Tenant-Id": tenant_id},

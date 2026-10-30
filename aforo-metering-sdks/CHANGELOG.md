@@ -5,6 +5,35 @@ released by git tag; their in-code `sdkVersion` constant is bumped here so
 events report the right version. Publishing is a DevOps step — merging to
 `main` does not release anything.
 
+## 2.1.0 — 2026-10-30 (wave 8: request compression, G269)
+
+All packages 2.0.0 → 2.1.0 (aforo-agent-metering 1.0.0 → 1.1.0); Go modules are released by tag (PUBLISHING.md).
+
+**gzip on by default.** Every transport core (Node, Go, Python, Java) sends a
+batch body of 1 KiB or more with `Content-Encoding: gzip`; smaller bodies stay
+plain JSON. The body is compressed once and retries resend the same bytes; the
+4 MiB split is still decided on the uncompressed JSON; a compression failure
+sends plain JSON. JSON events compress 5–10×, so egress and request bytes drop
+by the same factor.
+
+**Needs usage-ingestor wave 8.** The ingestor decodes gzip from wave 8
+(`GzipRequestFilter`); an older ingestor reads a gzip body as JSON and answers
+400. Deploy the ingestor first, then publish these SDKs (DevOps runbook
+`runbooks/2026-10-29-wave8-devops-release.md`).
+
+**Turning it off.** `compression: 'none'` (Node), `Compression: "none"` (Go),
+`compression="none"` (Python; Django `AFORO_COMPRESSION`, Flask
+`AFORO_COMPRESSION` / `compression=`), `.compression("none")` (Java;
+Spring `aforo.compression`). `Content-Encoding` can no longer be set
+through extra headers. python-agent's `post_fn` hook always receives plain JSON
+text (compression is off when it is used). Node uses synchronous zlib through
+`process.getBuiltinModule` where available (Node 20.16+ / 22.3+) and
+`CompressionStream` otherwise.
+
+**Contract.** `transportPolicy.compression` is now `{gzip: true, minBytes: 1024,
+decodedMaxBytes: 16777216}`. The mock ingestor decodes gzip with the same cap
+and answers other codings with 415, as the ingestor does.
+
 ## Unreleased — 2026-10-26 (wave 5: every SDK gets a new major)
 
 Every module changes its public API, so every published module gets a new

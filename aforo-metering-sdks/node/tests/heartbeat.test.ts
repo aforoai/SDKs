@@ -12,6 +12,7 @@
  */
 
 import { AforoClient } from '../src/client';
+import { bodyJson } from './helpers/request-body';
 
 const mockFetch = jest.fn();
 global.fetch = mockFetch as any;
@@ -39,7 +40,7 @@ describe('AforoClient — session heartbeats', () => {
   });
 
   const heartbeatBodies = () => mockFetch.mock.calls
-    .map((c) => JSON.parse(c[1].body))
+    .map((c) => bodyJson(c[1]))
     .filter((b) => b.events[0].metricName === 'system.session.heartbeat');
 
   it('startSession sends an immediate heartbeat, then one every 30s — each alone, never buffered', () => {
@@ -141,7 +142,7 @@ describe('AforoClient — session heartbeats', () => {
     const client = newClient();
     client.startSession('sess_hb_redirect');
     await client.endSession();
-    const heartbeatCalls = mockFetch.mock.calls.filter((c) => JSON.parse(c[1].body).events[0].metricName === 'system.session.heartbeat');
+    const heartbeatCalls = mockFetch.mock.calls.filter((c) => bodyJson(c[1]).events[0].metricName === 'system.session.heartbeat');
     expect(heartbeatCalls.length).toBeGreaterThan(0);
     for (const c of heartbeatCalls) expect(c[1].redirect).toBe('manual');
     await client.shutdown();

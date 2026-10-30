@@ -90,6 +90,10 @@ func New(cfg Config) (*Client, error) {
 	if err := ValidateBaseURL(cfg.BaseURL, cfg.AllowInsecureHTTP); err != nil {
 		return nil, err
 	}
+	cfg.Compression = strings.ToLower(strings.TrimSpace(cfg.Compression))
+	if cfg.Compression != "" && cfg.Compression != "gzip" && cfg.Compression != "none" {
+		return nil, fmt.Errorf("aforo: Compression must be \"gzip\" or \"none\"")
+	}
 	cfg.applyDefaults()
 	c := &Client{
 		cfg:      cfg,

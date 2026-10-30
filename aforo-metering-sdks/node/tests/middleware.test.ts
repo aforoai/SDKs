@@ -1,5 +1,6 @@
 import { expressMiddleware } from '../src/middleware/express';
 import { EventEmitter } from 'events';
+import { bodyJson } from './helpers/request-body';
 
 // Mock fetch globally
 const mockFetch = jest.fn();
@@ -64,7 +65,7 @@ describe('expressMiddleware', () => {
     await new Promise((r) => setTimeout(r, 100));
 
     expect(mockFetch).toHaveBeenCalled();
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     expect(body.events[0].customerId).toBe('cust_123');
     // Default metric is a catalog metric, not a route-shaped name the ingestor rejects
     expect(body.events[0].metricName).toBe('api_calls');
@@ -92,7 +93,7 @@ describe('expressMiddleware', () => {
 
     await new Promise((r) => setTimeout(r, 100));
 
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     expect(body.events[0].metricName).toBe('sms_sent');
   });
 
@@ -159,7 +160,7 @@ describe('expressMiddleware', () => {
 
     await new Promise((r) => setTimeout(r, 100));
 
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     expect(body.events[0].customerId).toBe('header-cust-456');
   });
 
@@ -227,7 +228,7 @@ describe('expressMiddleware', () => {
 
     await new Promise((r) => setTimeout(r, 100));
 
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     expect(body.events[0].metricName).toBe('custom.post');
   });
 
@@ -251,7 +252,7 @@ describe('expressMiddleware', () => {
 
     await new Promise((r) => setTimeout(r, 100));
 
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     expect(body.events[0].quantity).toBe(42);
   });
 
@@ -291,7 +292,7 @@ describe('expressMiddleware', () => {
     res.emit('finish');
     await new Promise((r) => setTimeout(r, 100));
 
-    const ev = JSON.parse(mockFetch.mock.calls[0][1].body).events[0];
+    const ev = bodyJson(mockFetch.mock.calls[0][1]).events[0];
     expect(ev).toMatchObject({ productType: 'AGENTIC_API', endpointPath: '/api/items', httpMethod: 'POST', statusCode: 201 });
     expect(typeof ev.responseTimeMs).toBe('number');
   });
@@ -308,7 +309,7 @@ describe('expressMiddleware', () => {
     res.emit('finish');
     await new Promise((r) => setTimeout(r, 100));
 
-    const ev = JSON.parse(mockFetch.mock.calls[0][1].body).events[0];
+    const ev = bodyJson(mockFetch.mock.calls[0][1]).events[0];
     expect(ev.productType).toBe('API');
     expect(ev.endpointPath).toHaveLength(512);
   });

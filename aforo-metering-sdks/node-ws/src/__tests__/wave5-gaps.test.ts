@@ -5,6 +5,7 @@
 import { EventEmitter } from 'events';
 import { inspect } from 'util';
 import { AforoWsBilling, type DropReason } from '../index';
+import { bodyJson } from '../../test-support/request-body';
 
 const KEY = 'sk_ws_wave5_secret';
 const mockFetch = jest.fn();
@@ -17,7 +18,7 @@ class FakeWs extends EventEmitter {
 }
 
 const ok = () => ({ ok: true, status: 202, headers: new Map(), text: async () => '{"success":true,"data":{"accepted":1,"failed":0,"errors":[]}}' });
-const sent = () => mockFetch.mock.calls.flatMap((c) => JSON.parse(c[1].body).events);
+const sent = () => mockFetch.mock.calls.flatMap((c) => bodyJson(c[1]).events);
 
 function billing(extra: Record<string, unknown> = {}) {
   return new AforoWsBilling({

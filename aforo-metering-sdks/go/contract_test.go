@@ -12,7 +12,6 @@ package metering
 import (
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -128,7 +127,7 @@ func TestIngestContract(t *testing.T) {
 	var paths []string
 	var bodies [][]byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
+		b, _ := readRequestBody(r)
 		mu.Lock()
 		paths = append(paths, r.URL.Path)
 		bodies = append(bodies, b)
@@ -173,7 +172,7 @@ func TestIngestContract_ExecutionStatusSentOnlyWhenSet(t *testing.T) {
 	var mu sync.Mutex
 	var bodies [][]byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
+		b, _ := readRequestBody(r)
 		mu.Lock()
 		bodies = append(bodies, b)
 		mu.Unlock()
@@ -277,7 +276,7 @@ type captureServer struct {
 }
 
 func (s *captureServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	raw, _ := io.ReadAll(r.Body)
+	raw, _ := readRequestBody(r)
 	var body map[string]any
 	_ = json.Unmarshal(raw, &body)
 	s.mu.Lock()

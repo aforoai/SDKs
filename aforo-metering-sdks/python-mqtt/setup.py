@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="aforo-mqtt-metering",
-    version="2.0.0",
+    version="2.1.0",
     description="Aforo MQTT Metering SDK — paho-mqtt and aiomqtt client wrappers that meter PUBLISH/SUBSCRIBE/CONNECT/DISCONNECT events.",
     long_description=open("README.md").read() if __import__("os").path.exists("README.md") else "",
     long_description_content_type="text/markdown",

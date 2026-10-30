@@ -44,7 +44,7 @@ class IngestContractTest {
     void setUp() throws IOException {
         captureServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         captureServer.createContext("/", (HttpExchange ex) -> {
-            byte[] body = ex.getRequestBody().readAllBytes();
+            byte[] body = com.aforo.testsupport.RequestBodies.read(ex);
             synchronized (capturedPaths) {
                 capturedPaths.add(ex.getRequestURI().getPath());
                 try {

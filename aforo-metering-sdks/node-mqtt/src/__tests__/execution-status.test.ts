@@ -6,13 +6,14 @@
 import { AforoMqttBilling } from '../index';
 import { EventEmitter } from 'events';
 import { ackingPublish } from '../../test-support/mqtt-fakes';
+import { bodyJson } from '../../test-support/request-body';
 
 let bodies: any[];
 
 beforeEach(() => {
   bodies = [];
   global.fetch = jest.fn(async (_input: any, init: any = {}) => {
-    bodies.push(JSON.parse(init.body));
+    bodies.push(bodyJson(init));
     return { ok: true, status: 202 } as unknown as Response;
   }) as any;
 });

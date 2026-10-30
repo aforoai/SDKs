@@ -4,13 +4,14 @@
  */
 import { inspect } from 'util';
 import { AforoGrpcBilling, type DropReason } from '../index';
+import { bodyJson } from '../../test-support/request-body';
 
 const KEY = 'sk_grpc_wave5_secret';
 const mockFetch = jest.fn();
 global.fetch = mockFetch as any;
 
 const ok = () => ({ ok: true, status: 202, headers: new Map(), text: async () => '{"success":true,"data":{"accepted":1,"failed":0,"errors":[]}}' });
-const sent = () => mockFetch.mock.calls.flatMap((c) => JSON.parse(c[1].body).events);
+const sent = () => mockFetch.mock.calls.flatMap((c) => bodyJson(c[1]).events);
 
 function call(md: Record<string, string> = {}, extra: Record<string, unknown> = {}) {
   return { metadata: { getMap: () => md }, ...extra } as any;

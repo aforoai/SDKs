@@ -51,7 +51,8 @@ test('outage then recovery: nothing lost, accepted keys are the originals', asyn
   expect(state.uniqueKeys).toBe(5);
   expect(state.duplicates).toBe(0);
   expect(drops).toEqual([]);
-  expect(state.requests.every((r) => r.contentEncoding === null)).toBe(true);
+  // Plain JSON under 1 KiB, gzip at or above it (wave 8, G269); never another coding.
+  expect(state.requests.every((r) => r.contentEncoding === null || r.contentEncoding === 'gzip')).toBe(true);
   expect(state.requests[0].userAgent).toMatch(/^aforo-graphql-metering\//);
   await b.shutdown();
 });

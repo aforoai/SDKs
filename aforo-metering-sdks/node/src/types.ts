@@ -31,6 +31,12 @@ export interface AforoOptions {
 
   /** Allow a plain http:// baseUrl on a non-local host. Default false. */
   allowInsecureHttp?: boolean;
+  /**
+   * Request compression: 'gzip' (default) sends batches of 1 KiB or more with
+   * Content-Encoding: gzip (needs usage-ingestor wave 8 or later); 'none'
+   * always sends plain JSON.
+   */
+  compression?: 'gzip' | 'none';
 
   /**
    * Default product type stamped on every event (top-level `productType`).

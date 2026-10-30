@@ -72,7 +72,7 @@ def test_values_at_the_limit_are_accepted_and_not_truncated() -> None:
     event = client._buffer[0]
     assert event["agentId"] == "a" * 36 and event["customerId"] == "x" * 64
     assert event["metadata"]["capability_name"] == "c" * 64
-    assert event["metadata"]["sdkVersion"] == __version__ == "1.0.0"
+    assert event["metadata"]["sdkVersion"] == __version__ == "1.1.0"
 
 
 def test_invalid_step_is_dropped_not_raised() -> None:

@@ -30,7 +30,7 @@ class AforoClientCallbacksTest {
     void start() throws IOException {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/v1/ingest/batch", ex -> {
-            ex.getRequestBody().readAllBytes();
+            com.aforo.testsupport.RequestBodies.read(ex);
             byte[] body = (answer.get() == null ? "" : answer.get()).getBytes(StandardCharsets.UTF_8);
             ex.getResponseHeaders().add("Content-Type", "application/json");
             ex.sendResponseHeaders(status.get(), body.length == 0 ? -1 : body.length);
@@ -102,7 +102,7 @@ class AforoClientCallbacksTest {
         AtomicReference<String> sent = new AtomicReference<>();
         server.removeContext("/v1/ingest/batch");
         server.createContext("/v1/ingest/batch", ex -> {
-            sent.set(new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            sent.set(new String(com.aforo.testsupport.RequestBodies.read(ex), StandardCharsets.UTF_8));
             ex.sendResponseHeaders(202, -1);
             ex.close();
         });

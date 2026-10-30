@@ -646,8 +646,10 @@
     ],
     "dropReasonNotes": "retry_exhausted is kept for API compatibility; with requeue-and-open-breaker it is only reported when the client is closed and requeue is impossible. 'closed' = track() after close (no exception). 'shutdown' = still queued when the shutdown deadline passed.",
     "compression": {
-      "gzip": false,
-      "reason": "The ingestor does not decode Content-Encoding: gzip request bodies (grep for GZIPInputStream / Content-Encoding on usage-ingestor main b71d9a0 and origin/jayaforo/w4.4 finds request decompression nowhere; only exports are gzipped). A gzip body would be read as JSON and rejected with 400. Turn this on only after the ingestor decodes it (docs/TODO.md: ingestor-gzip-request-bodies)."
+      "gzip": true,
+      "minBytes": 1024,
+      "decodedMaxBytes": 16777216,
+      "reason": "usage-ingestor decodes Content-Encoding: gzip on the JSON ingest endpoints (GzipRequestFilter, wave 8, G269), with the decoded body capped at maxRequestBodyBytes (413 past it). SDKs gzip batch bodies of minBytes or more; smaller bodies go plain. Any other coding is answered 415 with Accept-Encoding: gzip. Every SDK has an option to turn compression off (compression = none)."
     },
     "security": {
       "baseUrlScheme": "https",

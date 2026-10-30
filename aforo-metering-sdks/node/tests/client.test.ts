@@ -1,4 +1,5 @@
 import { AforoClient } from '../src/client';
+import { bodyJson } from './helpers/request-body';
 
 // Mock fetch globally
 const mockFetch = jest.fn();
@@ -34,7 +35,7 @@ describe('AforoClient', () => {
     await client.track({ customerId: 'cust_1', metricName: 'api_calls', quantity: 1 });
     await client.endSession();
 
-    const bodies = mockFetch.mock.calls.map((c) => JSON.parse(c[1].body));
+    const bodies = mockFetch.mock.calls.map((c) => bodyJson(c[1]));
     expect(mockFetch).toHaveBeenCalledTimes(3);
     for (const [url] of mockFetch.mock.calls) {
       expect(url).toBe('https://ingest.test.aforo.ai/v1/ingest/batch');
@@ -70,7 +71,7 @@ describe('AforoClient', () => {
       expect(mockFetch).toHaveBeenCalledTimes(1);
       jest.advanceTimersByTime(30_000);
       expect(mockFetch).toHaveBeenCalledTimes(2);
-      const periodic = JSON.parse(mockFetch.mock.calls[1][1].body).events[0];
+      const periodic = bodyJson(mockFetch.mock.calls[1][1]).events[0];
       expect(periodic.sessionBoundary).toBe('HEARTBEAT');
       expect(periodic.productType).toBe('AI_AGENT');
 
@@ -99,13 +100,13 @@ describe('AforoClient', () => {
     await client.track({ customerId: 'c', metricName: 'api_calls', productType: ' graphql_api ' });
     await client.track({ customerId: 'c', metricName: 'api_calls', productType: 'SOMETHING_NEW' });
     await client.flush();
-    const events = JSON.parse(mockFetch.mock.calls[0][1].body).events;
+    const events = bodyJson(mockFetch.mock.calls[0][1]).events;
     expect(events.map((e: any) => e.productType)).toEqual(['API', 'GRAPHQL_API', 'SOMETHING_NEW']);
 
     const c2 = new AforoClient({ apiKey: 'k', baseUrl: 'https://x.test', productType: 'agentic_api', flushInterval: 60_000 });
     await c2.track({ customerId: 'c', metricName: 'api_calls' });
     await c2.flush();
-    expect(JSON.parse(mockFetch.mock.calls[1][1].body).events[0].productType).toBe('AGENTIC_API');
+    expect(bodyJson(mockFetch.mock.calls[1][1]).events[0].productType).toBe('AGENTIC_API');
     await c2.shutdown();
   });
 
@@ -146,7 +147,7 @@ describe('AforoClient', () => {
       await c.track({ customerId: 'c', metricName: 'api_calls' });
     }
     await c.flush();
-    const sizes = mockFetch.mock.calls.map((call) => JSON.parse(call[1].body).events.length);
+    const sizes = mockFetch.mock.calls.map((call) => bodyJson(call[1]).events.length);
     expect(Math.max(...sizes)).toBeLessThanOrEqual(1000);
     expect(sizes.reduce((a, b) => a + b, 0)).toBe(2500);
     await c.shutdown();
@@ -180,7 +181,7 @@ describe('AforoClient', () => {
     await new Promise((r) => setTimeout(r, 50));
 
     expect(mockFetch).toHaveBeenCalledTimes(1);
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     expect(body.events).toHaveLength(5);
   });
 
@@ -202,7 +203,7 @@ describe('AforoClient', () => {
     await client.track({ customerId: 'cust_1', metricName: 'api_calls', quantity: 1 });
     await client.flush();
 
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
     expect(body.events[0].idempotencyKey).toMatch(uuidRe);
     expect(body.events[1].idempotencyKey).toMatch(uuidRe);
@@ -229,7 +230,7 @@ describe('AforoClient', () => {
       await client.track({ customerId: 'cust_1', metricName: 'api_calls', quantity: 1 });
       await client.flush();
 
-      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      const body = bodyJson(mockFetch.mock.calls[0][1]);
       expect(body.events).toHaveLength(2);
       // Identical customer, metric, quantity AND occurredAt — the frozen clock
       // guarantees the exact input the old SHA-256 default hashed.
@@ -257,7 +258,7 @@ describe('AforoClient', () => {
     });
     await client.flush();
 
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     expect(body.events.map((e: { idempotencyKey: string }) => e.idempotencyKey)).toEqual([
       'caller-owned-key',
       'caller-owned-key',
@@ -272,7 +273,7 @@ describe('AforoClient', () => {
     });
     await client.flush();
 
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     expect(body.events[0].idempotencyKey).toBe('my-custom-key');
   });
 
@@ -285,7 +286,7 @@ describe('AforoClient', () => {
     });
     await client.flush();
 
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     expect(body.events[0].metadata).toEqual({ model: 'gpt-4o', feature: 'chat' });
   });
 
@@ -297,7 +298,7 @@ describe('AforoClient', () => {
     });
     await client.flush();
 
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     expect(body.events[0].executionStatus).toBe('TIMEOUT');
   });
 
@@ -309,7 +310,7 @@ describe('AforoClient', () => {
       await client.track({ customerId: 'cust_1', metricName: 'api_calls', executionStatus: 'hitl_required' });
       await client.flush();
 
-      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      const body = bodyJson(mockFetch.mock.calls[0][1]);
       expect(body.events).toHaveLength(3);
       expect('executionStatus' in body.events[0]).toBe(false);
       expect(body.events[0].quantity).toBe(3);
@@ -327,7 +328,7 @@ describe('AforoClient', () => {
     await client.track({ customerId: 'cust_1', metricName: 'api_calls', executionStatus: '   ' });
     await client.flush();
 
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     expect(body.events).toHaveLength(2);
     expect('executionStatus' in body.events[0]).toBe(false);
     expect('executionStatus' in body.events[1]).toBe(false);
@@ -337,7 +338,7 @@ describe('AforoClient', () => {
     await client.track({ customerId: 'cust_1', metricName: 'api_calls' });
     await client.flush();
 
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     expect(body.events[0].quantity).toBe(1);
   });
 
@@ -350,7 +351,7 @@ describe('AforoClient', () => {
     });
     await client.flush();
 
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     expect(body.events[0].occurredAt).toBe(new Date(epoch).toISOString());
   });
 
@@ -372,7 +373,7 @@ describe('AforoClient', () => {
     await client.shutdown();
 
     expect(mockFetch).toHaveBeenCalledTimes(1);
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     expect(body.events).toHaveLength(2);
   });
 

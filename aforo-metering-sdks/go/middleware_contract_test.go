@@ -1,6 +1,7 @@
 package metering
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -26,7 +27,7 @@ func meteredRequests(t *testing.T, opts MiddlewareOptions, reqs ...*http.Request
 		var body struct {
 			Events []capturedEvent `json:"events"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = json.NewDecoder(bytes.NewReader(mustReadRequestBody(r))).Decode(&body)
 		mu.Lock()
 		events = append(events, body.Events...)
 		mu.Unlock()
@@ -159,7 +160,7 @@ func TestChiMiddleware_SharesOneCallerOwnedClient(t *testing.T) {
 		var body struct {
 			Events []capturedEvent `json:"events"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = json.NewDecoder(bytes.NewReader(mustReadRequestBody(r))).Decode(&body)
 		mu.Lock()
 		got = append(got, body.Events...)
 		mu.Unlock()

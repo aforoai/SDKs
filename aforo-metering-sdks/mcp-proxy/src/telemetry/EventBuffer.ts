@@ -28,6 +28,12 @@ export interface EventBufferConfig {
   apiKey: string;
   tenantId: string;
   allowInsecureHttp?: boolean;
+  /**
+   * Request compression: 'gzip' (default) sends batches of 1 KiB or more with
+   * Content-Encoding: gzip (needs usage-ingestor wave 8 or later); 'none'
+   * always sends plain JSON.
+   */
+  compression?: 'gzip' | 'none';
   /** Events per request; reaching it wakes the flusher (default 500, max 1000). */
   flushCount?: number;
   /** Flush at least this often, in ms (default 5000). */
@@ -55,6 +61,7 @@ export class EventBuffer {
       baseUrl: config.baseUrl,
       apiKey: config.apiKey,
       allowInsecureHttp: config.allowInsecureHttp,
+      compression: config.compression,
       headers: { 'X-Tenant-Id': config.tenantId },
       userAgent: `aforo-mcp-proxy/${PROXY_VERSION}`,
       flushCount: config.flushCount,

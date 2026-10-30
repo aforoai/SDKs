@@ -44,7 +44,7 @@ class IngestBatchContractTest {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         port = server.getAddress().getPort();
         server.createContext("/", exchange -> {
-            String raw = new String(exchange.getRequestBody().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            String raw = new String(com.aforo.testsupport.RequestBodies.read(exchange), java.nio.charset.StandardCharsets.UTF_8);
             captured.add(new Captured(exchange.getRequestURI().getPath(),
                     exchange.getRequestHeaders().getFirst("X-API-Key"), raw, mapper.readTree(raw)));
             int status = failuresBeforeSuccess.getAndDecrement() > 0 ? failureStatus.get() : 202;

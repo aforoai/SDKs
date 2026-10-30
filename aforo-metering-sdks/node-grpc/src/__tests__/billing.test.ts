@@ -8,6 +8,7 @@
 
 import { AforoGrpcBilling, GRPC_STATUS } from '../index';
 import { settleWithFakeTimers } from '../../test-support/timing';
+import { bodyJson } from '../../test-support/request-body';
 
 // ── Test setup ───────────────────────────────────────────────────────────
 
@@ -32,7 +33,7 @@ beforeEach(() => {
 
   global.fetch = jest.fn(async (input: any, init: any = {}) => {
     let body: any = init.body;
-    try { body = JSON.parse(init.body); } catch { /* leave as-is */ }
+    try { body = bodyJson(init); } catch { /* leave as-is */ }
     capturedRequests.push({ url: String(input), init, body });
     if (typeof nextFetchResponse === 'function') return nextFetchResponse();
     return nextFetchResponse;

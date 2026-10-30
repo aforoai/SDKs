@@ -39,7 +39,7 @@ from ._transport import (
 )
 from ._transport import policy as _policy
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 #: Async HTTP call signature accepted by ``post_fn``: (url, headers, body) ->
 #: (status, body_text) or (status, body_text, retry_after_header).
@@ -270,7 +270,11 @@ class AforoAgentClient:
             re-submitting them is dedup-safe. Exceptions are caught.
         post_fn: Optional async ``(url, headers, body) -> (status, body[,
             retry_after])`` used instead of the built-in HTTP client (tests,
-            custom stacks). It runs on the sender thread.
+            custom stacks). It runs on the sender thread. ``body`` is the JSON
+            text, so compression is off when ``post_fn`` is used.
+        compression: ``"gzip"`` (default) sends batches of 1 KiB or more with
+            ``Content-Encoding: gzip`` (needs usage-ingestor wave 8 or later);
+            ``"none"`` always sends plain JSON.
     """
 
     def __init__(
@@ -292,6 +296,7 @@ class AforoAgentClient:
         timeout_sec: float = _policy.REQUEST_TIMEOUT_S,
         shutdown_timeout_sec: float = _policy.SHUTDOWN_TIMEOUT_S,
         allow_insecure_http: bool = False,
+        compression: str = "gzip",
         http_transport: Any = None,
         transport_options: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -313,7 +318,8 @@ class AforoAgentClient:
         self.flush_interval_sec = flush_interval_sec
         self.max_retries = max_retries
         self.on_error = on_error or (lambda e: logger.debug("[aforo-agent] %s", e))
-        if http_transport is None and post_fn is not None:
+        via_post_fn = http_transport is None and post_fn is not None
+        if via_post_fn:
             http_transport = _PostFnTransport(post_fn)
         self._core = TransportCore(
             api_key=api_key,
@@ -329,6 +335,9 @@ class AforoAgentClient:
             max_retries=max_retries,
             shutdown_timeout=shutdown_timeout_sec,
             allow_insecure_http=allow_insecure_http,
+            # A custom post_fn receives the JSON as text (its documented contract), so
+            # it never gets gzip bytes.
+            compression="none" if via_post_fn else compression,
             on_drop=on_drop,
             on_error=self._safe_on_error,
             extra_headers={"X-Tenant-Id": tenant_id},

@@ -53,6 +53,12 @@ export interface AforoWsConfig {
   productType?: string;
   /** Allow a plain http:// ingestorUrl on a non-local host. Default false (https required). */
   allowInsecureHttp?: boolean;
+  /**
+   * Request compression: 'gzip' (default) sends batches of 1 KiB or more with
+   * Content-Encoding: gzip (needs usage-ingestor wave 8 or later); 'none'
+   * always sends plain JSON.
+   */
+  compression?: 'gzip' | 'none';
   /** Events per request (default 500, max 1000). Reaching it wakes the background sender. */
   flushCount?: number;
   /** The background sender also runs this often, in ms (default 5000). */
@@ -184,7 +190,7 @@ interface MinimalWss {
   on(event: 'connection', fn: (ws: MinimalWs, req: any) => void): void;
 }
 
-const SDK_VERSION = '2.0.0';
+const SDK_VERSION = '2.1.0';
 /** Default for AforoWsConfig.connectionIdleTimeoutMs: one hour. */
 export const DEFAULT_CONNECTION_IDLE_TIMEOUT_MS = 60 * 60 * 1000;
 
@@ -269,6 +275,7 @@ export class AforoWsBilling {
       baseUrl: config.ingestorUrl,
       apiKey: config.apiKey,
       allowInsecureHttp: config.allowInsecureHttp,
+      compression: config.compression,
       headers: { 'X-Tenant-Id': config.tenantId },
       userAgent: `aforo-ws-metering/${SDK_VERSION}`,
       flushCount: config.flushCount,

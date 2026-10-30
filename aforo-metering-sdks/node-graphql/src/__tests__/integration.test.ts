@@ -30,6 +30,7 @@ import {
   waitFor,
   type FetchTracker,
 } from '../../test-support/timing';
+import { requestText } from '../../test-support/request-body';
 
 let graphqlPkg: any;
 try {
@@ -73,7 +74,7 @@ async function setup(): Promise<Fixture> {
     req.on('data', (c) => chunks.push(c));
     req.on('end', () => {
       try {
-        const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || 'null');
+        const body = JSON.parse(requestText(req.headers['content-encoding'], Buffer.concat(chunks)) || 'null');
         captured.push({ url: String(req.url), body, headers: { ...req.headers } });
       } catch {
         captured.push({ url: String(req.url), body: null, headers: { ...req.headers } });

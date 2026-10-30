@@ -17,6 +17,7 @@ from aforo_grpc_metering.client import (
     _sha256_hex,
     _utf16_length,
 )
+from gzip_body import request_bytes
 
 ASTRAL = "\U0001F600"
 
@@ -32,7 +33,7 @@ def sent(monkeypatch):
     factory = mod.TransportCore
 
     def handle(request):
-        batches.append(_json.loads(request.content)["events"])
+        batches.append(_json.loads(request_bytes(request))["events"])
         return _httpx.Response(202, json={"data": {"failed": 0}})
 
     monkeypatch.setattr(mod, "TransportCore",

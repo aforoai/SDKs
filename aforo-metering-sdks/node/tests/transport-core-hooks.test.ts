@@ -4,6 +4,7 @@
  * Injected fetch / sleep / random only: nothing here waits on the wall clock.
  */
 import { TransportCore, CoreTransportError, CoreFetch, CoreResponse, CoreSleep } from '../src/transport-core/core';
+import { bodyJson } from './helpers/request-body';
 
 interface Ev {
   idempotencyKey: string;
@@ -43,7 +44,7 @@ function make(
   let calls = 0;
   const fetch: CoreFetch = async (_url, init) => {
     calls++;
-    return answer(calls, JSON.parse(init.body).events as Ev[]);
+    return answer(calls, bodyJson(init).events as Ev[]);
   };
   const core = new TransportCore<Ev>({
     baseUrl: 'https://ingest.example',

@@ -17,4 +17,4 @@ __all__ = [
     "normalize_execution_status",
     "outcome_from_grpc_status",
 ]
-__version__ = "2.0.0"
+__version__ = "2.1.0"

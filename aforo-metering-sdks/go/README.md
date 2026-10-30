@@ -141,7 +141,7 @@ Each event carries `endpointPath` (normalized, no query string), `httpMethod`, `
 - A `2xx` answer can refuse single events in `errors[]`: those marked `retryable` are resent after the normal backoff, at most `MaxRetries` times and then handled as an outage; the others are dropped as `rejected`. `errors[]` counts even when `failed` is missing or 0.
 - `Flush(ctx)` asks the sender to send everything now and waits, and makes one attempt even while the sender is pausing after an outage. During an outage it returns `ErrIngestUnavailable`; the events stay queued.
 - `Close(ctx)` stops accepting events and sends until the earlier of `ctx`'s deadline and `ShutdownTimeout`. An unreachable ingestor is retried with backoff until the deadline, and each request in that window is cut off at it. Events still queued then are reported as `shutdown` and `Close` returns an error wrapping `ErrShutdownIncomplete`. A second `Close` returns the first one's result.
-- Requests send `Content-Type: application/json`, `X-API-Key` and `User-Agent: aforo-go/2.0.0`, and no `Content-Encoding` (the ingestor does not decode gzip request bodies yet).
+- Requests send `Content-Type: application/json`, `X-API-Key` and `User-Agent: aforo-go/2.0.0`, and, for batches of 1 KiB or more, `Content-Encoding: gzip` (needs usage-ingestor wave 8 or later; `Compression: "none"` turns it off).
 
 ## Dropped events
 

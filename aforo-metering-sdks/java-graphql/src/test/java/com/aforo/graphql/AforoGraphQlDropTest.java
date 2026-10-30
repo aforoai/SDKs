@@ -35,7 +35,7 @@ class AforoGraphQlDropTest {
         server = HttpServer.create(new InetSocketAddress(0), 0);
         server.createContext("/", ex -> {
             hits.incrementAndGet();
-            ex.getRequestBody().readAllBytes();
+            com.aforo.testsupport.RequestBodies.read(ex);
             ex.sendResponseHeaders(status.get(), -1);
             ex.close();
         });

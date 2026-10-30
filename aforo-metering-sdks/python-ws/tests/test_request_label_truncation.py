@@ -10,6 +10,7 @@ import pytest
 
 from aforo_ws_metering import client as mod
 from aforo_ws_metering.client import AforoWsBilling, _truncate_utf16, _utf16_length
+from gzip_body import request_bytes
 
 ASTRAL = "\U0001F600"
 
@@ -29,7 +30,7 @@ def _transport():
     import httpx
 
     def handle(request):
-        _BATCHES.append(json.loads(request.content)["events"])
+        _BATCHES.append(json.loads(request_bytes(request))["events"])
         return httpx.Response(202, json={"data": {"failed": 0}})
 
     return httpx.MockTransport(handle)

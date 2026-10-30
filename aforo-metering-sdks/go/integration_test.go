@@ -236,7 +236,8 @@ func TestMock_401IsAnOutageKeepingEvents(t *testing.T) {
 	}
 }
 
-func TestMock_NoContentEncodingAndUserAgent(t *testing.T) {
+// A one-event body is under the 1 KiB gzip threshold, so it goes plain (wave 8, G269).
+func TestMock_SmallBodyPlainAndUserAgent(t *testing.T) {
 	m := startMockIngestor(t)
 	c, _ := mockClient(t, m)
 	trackN(t, c, 1, "ua")
@@ -244,10 +245,29 @@ func TestMock_NoContentEncodingAndUserAgent(t *testing.T) {
 	st := m.state(t)
 	r := st.Requests[0]
 	if r.ContentEncoding != nil {
-		t.Fatalf("Content-Encoding sent: %v", *r.ContentEncoding)
+		t.Fatalf("Content-Encoding sent for a small body: %v", *r.ContentEncoding)
 	}
 	if r.UserAgent == nil || *r.UserAgent != "aforo-go/"+sdkVersion {
 		t.Fatalf("User-Agent = %v", r.UserAgent)
+	}
+}
+
+// A full batch is gzip-encoded and the mock ingestor (which decodes it like
+// usage-ingestor's GzipRequestFilter) accepts every event (wave 8, G269).
+func TestMock_LargeBatchGzip(t *testing.T) {
+	m := startMockIngestor(t)
+	c, _ := mockClient(t, m)
+	trackN(t, c, 200, "gz")
+	if _, err := c.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	st := m.state(t)
+	r := st.Requests[0]
+	if r.ContentEncoding == nil || *r.ContentEncoding != "gzip" {
+		t.Fatalf("Content-Encoding = %v, want gzip", r.ContentEncoding)
+	}
+	if st.UniqueKeys != 200 {
+		t.Fatalf("mock accepted %d unique keys, want 200", st.UniqueKeys)
 	}
 }
 

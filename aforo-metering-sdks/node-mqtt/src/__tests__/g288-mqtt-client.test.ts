@@ -11,12 +11,13 @@
  */
 import { EventEmitter } from 'events';
 import { AforoMqttBilling, CoreTransportError } from '../index';
+import { bodyJson } from '../../test-support/request-body';
 
 let captured: any[];
 beforeEach(() => {
   captured = [];
   global.fetch = jest.fn(async (_input: any, init: any = {}) => {
-    captured.push(JSON.parse(init.body));
+    captured.push(bodyJson(init));
     return { ok: true, status: 202, headers: { get: () => null }, text: async () => '' } as unknown as Response;
   }) as any;
 });

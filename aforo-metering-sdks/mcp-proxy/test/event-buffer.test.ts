@@ -27,7 +27,7 @@ function makeEvent(toolName: string): ProxyUsageEvent {
     sessionId: 'session_1',
     executionStatus: 'SUCCESS',
     executionDurationMs: 100,
-    metadata: { proxy: true, proxyVersion: '2.0.0', transport: 'stdio', productId: 'prod_1' },
+    metadata: { proxy: true, proxyVersion: '2.1.0', transport: 'stdio', productId: 'prod_1' },
   };
 }
 

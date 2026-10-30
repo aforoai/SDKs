@@ -1,6 +1,7 @@
 import { AforoClient } from '../src/client';
 import { MAX_LENGTHS, describeLimitViolation } from '../src/limits';
 import { DropReason, ResolvedEvent } from '../src/types';
+import { bodyJson } from './helpers/request-body';
 
 const mockFetch = jest.fn();
 global.fetch = mockFetch as any;
@@ -24,7 +25,7 @@ let warnSpy: jest.SpyInstance;
 async function flushedCustomerIds(client: AforoClient): Promise<string[]> {
   await client.flush();
   return mockFetch.mock.calls
-    .flatMap((call) => JSON.parse(call[1].body).events)
+    .flatMap((call) => bodyJson(call[1]).events)
     .map((event: { customerId: string }) => event.customerId);
 }
 

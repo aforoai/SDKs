@@ -6,6 +6,7 @@
 // schemas.ingestEvent and transportPolicy.batch, plus POST /api/v1/quota/check.
 // Tests script faults over /__control/* and read back what was received.
 
+import zlib from 'node:zlib';
 import http from 'node:http';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -225,9 +226,23 @@ export async function startMockIngestor(opts = {}) {
       record.bytes = total;
       // Record what was sent before any fault is applied, so a test can
       // prove a retried batch carried the same keys as the failed attempt.
-      if (buf && !record.contentEncoding) {
+      // Like usage-ingestor's GzipRequestFilter (wave 8): gzip is decoded with the same
+      // size cap on the decoded body; identity or no header is plain; anything else is 415.
+      const coding = String(record.contentEncoding ?? '').trim().toLowerCase();
+      let decoded = buf;
+      let decodeError = null;
+      if (buf && (coding === 'gzip' || coding === 'x-gzip')) {
         try {
-          const peek = JSON.parse(buf.toString('utf8'));
+          decoded = zlib.gunzipSync(buf, { maxOutputLength: rules.maxRequestBodyBytes });
+        } catch (err) {
+          decoded = null;
+          decodeError = err && err.code === 'ERR_BUFFER_TOO_LARGE' ? 'too-large' : 'corrupt';
+        }
+      }
+      record.decodedBytes = decoded ? decoded.length : null;
+      if (decoded && (coding === '' || coding === 'identity' || coding === 'gzip' || coding === 'x-gzip')) {
+        try {
+          const peek = JSON.parse(decoded.toString('utf8'));
           if (Array.isArray(peek?.events)) {
             record.eventCount = peek.events.length;
             record.idempotencyKeys = peek.events.map((e) => e?.idempotencyKey ?? null);
@@ -279,13 +294,18 @@ export async function startMockIngestor(opts = {}) {
       const key = req.headers['x-api-key'];
       if (!key || (opts.apiKey && key !== opts.apiKey)) return reply(401, problem(401, 'Unauthorized', 'missing or invalid X-API-Key'));
       if (over) return reply(413, problem(413, 'Payload Too Large', `request body exceeds ${rules.maxRequestBodyBytes} bytes`));
-      if (record.contentEncoding) return reply(400, problem(400, 'Bad Request', 'Content-Encoding is not supported; send plain JSON'));
+      if (coding !== '' && coding !== 'identity' && coding !== 'gzip' && coding !== 'x-gzip') {
+        return reply(415, problem(415, 'Unsupported Content-Encoding', 'Send the body uncompressed or with Content-Encoding: gzip.'),
+          { 'Accept-Encoding': 'gzip' });
+      }
+      if (decodeError === 'too-large') return reply(413, problem(413, 'Payload Too Large', `request body exceeds ${rules.maxRequestBodyBytes} bytes`));
+      if (decodeError) return reply(400, problem(400, 'Bad Request', 'malformed gzip body'));
       if (!String(record.contentType ?? '').toLowerCase().includes('application/json')) {
         return reply(415, problem(415, 'Unsupported Media Type', 'Content-Type must be application/json'));
       }
       let parsed;
       try {
-        parsed = JSON.parse(buf.toString('utf8'));
+        parsed = JSON.parse(decoded.toString('utf8'));
       } catch {
         return reply(400, problem(400, 'Bad Request', 'malformed JSON'));
       }

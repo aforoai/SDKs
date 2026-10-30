@@ -182,6 +182,12 @@ export interface AforoAgentConfig {
   flushOnExit?: boolean;
   /** Allow a plain http:// endpoint on a host other than localhost / 127.0.0.1 / ::1. */
   allowInsecureHttp?: boolean;
+  /**
+   * Request compression: 'gzip' (default) sends batches of 1 KiB or more with
+   * Content-Encoding: gzip (needs usage-ingestor wave 8 or later); 'none'
+   * always sends plain JSON.
+   */
+  compression?: 'gzip' | 'none';
   /** `productType` on every event. Default `AI_AGENT`. */
   productType?: string;
   /** Called for every delivery problem. When unset, problems are logged via `logger`. */
@@ -283,7 +289,7 @@ export interface AgentEventInput {
 
 const DEFAULT_ENDPOINT = 'https://api.aforo.ai/v1/ingest/batch';
 const DEFAULT_PRODUCT_TYPE = 'AI_AGENT';
-const SDK_VERSION = '2.0.0';
+const SDK_VERSION = '2.1.0';
 /** IngestUsageEventRequest @Size limits. */
 const LIMITS = {
   customerId: 64,
@@ -547,6 +553,7 @@ export class AforoAgent {
       path: url.pathname + url.search,
       apiKey: config.apiKey,
       allowInsecureHttp: config.allowInsecureHttp,
+      compression: config.compression,
       userAgent: `aforo-agent-metering-node/${SDK_VERSION}`,
       flushCount: config.maxBatchSize ?? config.flushBatchSize,
       flushIntervalMs: config.flushIntervalMs,

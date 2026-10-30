@@ -13,6 +13,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { AforoClient } from '../src/client';
+import { bodyJson } from './helpers/request-body';
 
 const MODULE_KEY = 'node';
 
@@ -84,12 +85,12 @@ describe('ingest contract guard (shared fixture)', () => {
     const [url, options] = mockFetch.mock.calls[0];
     expect(new URL(String(url)).pathname).toBe(endpoint);
     expect(options.method).toBe('POST');
-    assertBodyMatchesContract(spec, JSON.parse(options.body));
+    assertBodyMatchesContract(spec, bodyJson(options));
     // Auth: X-API-Key only (the server accepts it for every key type).
     expect(options.headers['X-API-Key']).toBe('test-key');
     expect(options.headers['Authorization']).toBeUndefined();
     // The production ingestor requires an explicit top-level productType.
-    expect(JSON.parse(options.body)[spec.batchKey][0].productType).toBe('API');
+    expect(bodyJson(options)[spec.batchKey][0].productType).toBe('API');
   });
 
   it('sends executionStatus as a contracted optional event field only when set', async () => {
@@ -109,7 +110,7 @@ describe('ingest contract guard (shared fixture)', () => {
     await client.track({ customerId: 'cust_contract', metricName: 'api_calls' });
     await client.shutdown();
 
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     assertBodyMatchesContract(spec, body);
     const [withStatus, withoutStatus] = body[spec.batchKey];
     expect(withStatus.executionStatus).toBe('TIMEOUT');

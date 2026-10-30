@@ -23,6 +23,7 @@ import {
   parseRetryAfter,
 } from '../src/transport-core/core';
 import { startMockIngestor, MockIngestor, waitFor } from './support/mock-ingestor';
+import { bodyJson } from './helpers/request-body';
 
 jest.setTimeout(30_000);
 
@@ -104,7 +105,7 @@ function rig(
   const logs: Rig['logs'] = [];
   const { sleep, delays } = instantSleep();
   const fetch: CoreFetch = async (_url, init) => {
-    const events = JSON.parse(init.body).events as Ev[];
+    const events = bodyJson(init).events as Ev[];
     calls.push({ keys: events.map((e) => e.idempotencyKey), redirect: (init as { redirect?: string }).redirect });
     return answer(calls.length, events, init.signal);
   };

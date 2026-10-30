@@ -11,6 +11,7 @@ import AforoAgent, {
   EXECUTION_STATUSES,
   resolveEndpoint,
 } from './index';
+import { bodyJson } from '../test-support/request-body';
 
 type Reply = { status: number; body?: unknown; headers?: Record<string, string> } | Error;
 
@@ -24,7 +25,7 @@ interface Call {
 function mockFetch(script: Reply[] = []) {
   const calls: Call[] = [];
   const fetchImpl = jest.fn(async (url: any, init: any) => {
-    const body = JSON.parse(init.body);
+    const body = bodyJson(init);
     calls.push({ url: String(url), headers: init.headers, body });
     const next = script.shift();
     if (next instanceof Error) throw next;

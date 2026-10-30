@@ -7,6 +7,7 @@
 
 import { AforoGraphQlBilling, defaultComplexityScorer } from '../index';
 import { parse } from 'graphql';
+import { bodyJson } from '../../test-support/request-body';
 
 // ── HTTP capture (same shape as the gRPC test) ──────────────────────────
 
@@ -22,7 +23,7 @@ beforeEach(() => {
   nextFetchResponse = okResponse();
   global.fetch = jest.fn(async (input: any, init: any = {}) => {
     let body: any = init.body;
-    try { body = JSON.parse(init.body); } catch { /* ignore */ }
+    try { body = bodyJson(init); } catch { /* ignore */ }
     capturedRequests.push({ url: String(input), init, body });
     if (typeof nextFetchResponse === 'function') return nextFetchResponse();
     return nextFetchResponse;

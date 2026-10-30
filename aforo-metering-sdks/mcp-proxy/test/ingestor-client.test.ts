@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import { IngestorClient } from '../src/telemetry/IngestorClient.js';
 import { loadConfig } from '../src/config.js';
 import type { ProxyUsageEvent } from '../src/types.js';
+import { bodyJson } from '../test-support/request-body';
 
 const realFetch = globalThis.fetch;
 
@@ -44,7 +45,7 @@ describe('IngestorClient', () => {
     assert.equal(calls[0].url, 'https://x.test/v1/ingest/batch');
     assert.equal(calls[0].init.headers['X-API-Key'], 'k');
     assert.equal(calls[0].init.headers.Authorization, undefined);
-    assert.equal(JSON.parse(calls[0].init.body).events.length, 1);
+    assert.equal(bodyJson(calls[0].init).events.length, 1);
 
     stubFetch([new Error('network down')]);
     assert.equal(await client.sendSingle(event()), null); // swallowed

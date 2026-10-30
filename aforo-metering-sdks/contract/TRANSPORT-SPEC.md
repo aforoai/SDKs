@@ -46,8 +46,15 @@ makes the copies one implementation.
 - Default `flushCount` = 500 events per request, clamped to `batch.maxEvents` (1000).
 - A batch whose JSON body would exceed `batch.targetRequestBodyBytes` (4 MiB) is
   split before sending. The ingestor's hard cap is 16 MiB (`maxRequestBodyBytes`).
-- No `Content-Encoding`: the ingestor does not decode gzip request bodies yet
-  (`transportPolicy.compression`).
+- Compression (wave 8, G269; `transportPolicy.compression`): a batch body of
+  1 KiB (`minBytes`) or more is sent gzip-encoded with `Content-Encoding: gzip`;
+  smaller bodies go plain. The body is compressed once and every retry sends the
+  same bytes. The size split above is decided on the uncompressed JSON. A
+  compression failure sends the JSON plain, never drops the batch. Callers can
+  turn it off (`compression: 'none'` / `Compression: "none"` /
+  `compression="none"` / `.compression("none")`) and cannot set
+  `Content-Encoding` through extra headers. usage-ingestor decodes gzip (decoded
+  body capped at 16 MiB, 413 past it) and answers any other coding with 415.
 
 ### HTTP (G268, G269, G270, G284)
 

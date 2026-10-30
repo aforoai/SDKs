@@ -71,6 +71,12 @@ export interface AforoGraphQlConfig {
   trustCustomerHeader?: boolean;
   /** Allow a plain http:// ingestorUrl on a non-local host. Default false (https required). */
   allowInsecureHttp?: boolean;
+  /**
+   * Request compression: 'gzip' (default) sends batches of 1 KiB or more with
+   * Content-Encoding: gzip (needs usage-ingestor wave 8 or later); 'none'
+   * always sends plain JSON.
+   */
+  compression?: 'gzip' | 'none';
   /** Queue capacity (default 10 000). The oldest event is dropped on overflow. */
   maxQueueSize?: number;
   /** Retries per batch before the breaker opens (default 3). */
@@ -110,7 +116,7 @@ export interface AforoGraphQlConfig {
  */
 export type DropReason = 'overflow' | 'retry_exhausted' | 'rejected' | 'invalid' | 'shutdown' | 'closed';
 
-const SDK_VERSION = '2.0.0';
+const SDK_VERSION = '2.1.0';
 /** Default top-level `productType` for this SDK. */
 export const DEFAULT_PRODUCT_TYPE = 'GRAPHQL_API';
 /** usage-ingestor limits (IngestUsageEventRequest). */
@@ -256,6 +262,7 @@ export class AforoGraphQlBilling {
       baseUrl: config.ingestorUrl,
       apiKey: config.apiKey,
       allowInsecureHttp: config.allowInsecureHttp,
+      compression: config.compression,
       headers: { 'X-Tenant-Id': config.tenantId },
       userAgent: `aforo-graphql-metering/${SDK_VERSION}`,
       flushCount: config.flushCount,

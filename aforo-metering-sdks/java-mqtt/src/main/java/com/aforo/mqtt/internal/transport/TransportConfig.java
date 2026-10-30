@@ -34,6 +34,8 @@ public final class TransportConfig {
     public static final long DEFAULT_BREAKER_INITIAL_MS = 5_000;
     public static final long DEFAULT_BREAKER_MAX_MS = 300_000;
     public static final int TARGET_REQUEST_BODY_BYTES = 4 * 1024 * 1024;
+    /** Bodies smaller than this are sent plain: gzip's header and dictionary cost more than they save. */
+    public static final int COMPRESSION_MIN_BYTES = 1024;
 
     private static final Set<String> LOOPBACK_HOSTS = Set.of("localhost", "127.0.0.1", "::1", "[::1]");
 
@@ -52,6 +54,8 @@ public final class TransportConfig {
     final long breakerInitialMs;
     final long breakerMaxMs;
     final int targetBodyBytes;
+    /** True: batches of COMPRESSION_MIN_BYTES or more are sent gzip-encoded (wave 8, G269). */
+    final boolean gzip;
     final String threadName;
     final String loggerName;
     final String logPrefix;
@@ -78,6 +82,11 @@ public final class TransportConfig {
         this.breakerInitialMs = Math.max(0, b.breakerInitialMs);
         this.breakerMaxMs = Math.max(this.breakerInitialMs, b.breakerMaxMs);
         this.targetBodyBytes = Math.max(1024, b.targetBodyBytes);
+        String compression = b.compression == null ? "gzip" : b.compression.trim().toLowerCase(java.util.Locale.ROOT);
+        if (!compression.equals("gzip") && !compression.equals("none")) {
+            throw new IllegalArgumentException("compression must be \"gzip\" or \"none\"");
+        }
+        this.gzip = compression.equals("gzip");
         this.threadName = b.threadName;
         this.loggerName = b.loggerName;
         this.logPrefix = b.logPrefix;
@@ -150,6 +159,7 @@ public final class TransportConfig {
         private long breakerInitialMs = DEFAULT_BREAKER_INITIAL_MS;
         private long breakerMaxMs = DEFAULT_BREAKER_MAX_MS;
         private int targetBodyBytes = TARGET_REQUEST_BODY_BYTES;
+        private String compression = "gzip";
         private String threadName = "aforo-metering-flush";
         private String loggerName = TransportCore.class.getName();
         private String logPrefix = "[aforo]";
@@ -157,9 +167,12 @@ public final class TransportConfig {
         public Builder baseUrl(String v) { this.baseUrl = v; return this; }
         public Builder apiKey(String v) { this.apiKey = v; return this; }
         public Builder allowInsecureHttp(boolean v) { this.allowInsecureHttp = v; return this; }
-        /** A header sent with every request (for example {@code X-Tenant-Id}). Never the API key. */
+        /**
+         * A header sent with every request (for example {@code X-Tenant-Id}). Never the API key;
+         * {@code Content-Encoding} is set by the core and cannot be given here.
+         */
         public Builder header(String name, String value) {
-            if (name != null && value != null) extraHeaders.put(name, value);
+            if (name != null && value != null && !name.equalsIgnoreCase("Content-Encoding")) extraHeaders.put(name, value);
             return this;
         }
         public Builder userAgent(String v) { if (v != null && !v.isBlank()) this.userAgent = v; return this; }
@@ -174,6 +187,12 @@ public final class TransportConfig {
         public Builder breakerInitialMs(long v) { this.breakerInitialMs = v; return this; }
         public Builder breakerMaxMs(long v) { this.breakerMaxMs = v; return this; }
         public Builder targetBodyBytes(int v) { this.targetBodyBytes = v; return this; }
+        /**
+         * {@code "gzip"} (default): batches of 1 KiB or more are sent with
+         * {@code Content-Encoding: gzip} (needs usage-ingestor wave 8 or later).
+         * {@code "none"}: always plain JSON.
+         */
+        public Builder compression(String v) { this.compression = v; return this; }
         public Builder threadName(String v) { if (v != null && !v.isBlank()) this.threadName = v; return this; }
         public Builder loggerName(String v) { if (v != null && !v.isBlank()) this.loggerName = v; return this; }
         public Builder logPrefix(String v) { if (v != null) this.logPrefix = v; return this; }

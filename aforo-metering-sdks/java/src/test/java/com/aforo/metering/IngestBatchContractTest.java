@@ -39,7 +39,7 @@ class IngestBatchContractTest {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/", ex -> {
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
-            ex.getRequestBody().transferTo(buf);
+            buf.writeBytes(com.aforo.testsupport.RequestBodies.read(ex));
             paths.add(ex.getRequestURI().getPath());
             authHeaders.add(String.valueOf(ex.getRequestHeaders().getFirst("Authorization")));
             apiKeyHeaders.add(ex.getRequestHeaders().getFirst("X-API-Key"));
@@ -199,7 +199,7 @@ class IngestBatchContractTest {
         server.stop(0);
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/", ex -> {
-            ex.getRequestBody().readAllBytes();
+            com.aforo.testsupport.RequestBodies.read(ex);
             byte[] resp = ("{\"success\":true,\"data\":{\"accepted\":2,\"duplicates\":0,\"failed\":1,"
                     + "\"errors\":[{\"index\":1,\"message\":\"Unknown metric\"}]}}").getBytes();
             ex.sendResponseHeaders(202, resp.length);

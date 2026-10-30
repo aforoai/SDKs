@@ -29,6 +29,7 @@ public class AforoOptions {
     private long shutdownTimeoutMs = 5_000;
     private long breakerCooldownMs = 5_000;
     private boolean allowInsecureHttp = false;
+    private String compression = "gzip";
     private boolean registerShutdownHook = true;
     private BiConsumer<List<ResolvedEvent>, DropReason> onDrop;
     private Consumer<AforoError> onError;
@@ -53,6 +54,7 @@ public class AforoOptions {
     public long getShutdownTimeoutMs() { return shutdownTimeoutMs; }
     public long getBreakerCooldownMs() { return breakerCooldownMs; }
     public boolean isAllowInsecureHttp() { return allowInsecureHttp; }
+    public String getCompression() { return compression; }
     public boolean isRegisterShutdownHook() { return registerShutdownHook; }
     public BiConsumer<List<ResolvedEvent>, DropReason> getOnDrop() { return onDrop; }
     public Consumer<AforoError> getOnError() { return onError; }
@@ -95,6 +97,8 @@ public class AforoOptions {
      * Off by default: the API key is sent with every request.
      */
     public AforoOptions allowInsecureHttp(boolean allowInsecureHttp) { this.allowInsecureHttp = allowInsecureHttp; return this; }
+    /** "gzip" (default): batches of 1 KiB or more are sent with Content-Encoding: gzip (needs usage-ingestor wave 8 or later); "none": always plain JSON. */
+    public AforoOptions compression(String compression) { this.compression = compression; return this; }
 
     /**
      * Register a JVM shutdown hook that calls {@link AforoClient#close()} (default {@code true}).
