@@ -29,6 +29,7 @@ import {
   waitFor,
   type FetchTracker,
 } from '../../test-support/timing';
+import { requestText } from '../../test-support/request-body';
 
 let WSServer: any;
 let WSClient: any;
@@ -82,7 +83,7 @@ async function setup(perFrameEvents = false): Promise<Fixture> {
     req.on('data', (c) => chunks.push(c));
     req.on('end', () => {
       try {
-        const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || 'null');
+        const body = JSON.parse(requestText(req.headers['content-encoding'], Buffer.concat(chunks)) || 'null');
         captured.push({ url: String(req.url), body });
       } catch {
         captured.push({ url: String(req.url), body: null });

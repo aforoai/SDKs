@@ -40,7 +40,7 @@ class AforoMqttBillingTest {
         port = server.getAddress().getPort();
         server.createContext("/", exchange -> {
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
-            exchange.getRequestBody().transferTo(buf);
+            buf.writeBytes(com.aforo.testsupport.RequestBodies.read(exchange));
             requestBodies.add(buf.size() == 0 ? mapper.nullNode() : mapper.readTree(buf.toByteArray()));
             exchange.sendResponseHeaders(204, -1);
             exchange.close();

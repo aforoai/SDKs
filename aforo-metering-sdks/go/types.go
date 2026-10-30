@@ -61,6 +61,11 @@ type Options struct {
 	// localhost, 127.0.0.1 or ::1. Leave it off in production.
 	AllowInsecureHTTP bool
 
+	// Compression is "gzip" (default: batches of 1 KiB or more are sent with
+	// Content-Encoding: gzip; needs usage-ingestor wave 8 or later) or "none"
+	// (always plain JSON).
+	Compression string
+
 	FlushCount      int           // Events per request. Default: 500 (clamped to 1000, the ingestor batch limit)
 	FlushInterval   time.Duration // Default: 5s
 	MaxQueueSize    int           // Default: 10000. When full the oldest event is dropped (DropOverflow)

@@ -131,6 +131,7 @@ func newTransport(cfg Config) (*ingest.Client, error) {
 		UserAgent:         "aforo-go-graphql/" + sdkVersion,
 		Headers:           map[string]string{"X-Tenant-Id": cfg.TenantID},
 		AllowInsecureHTTP: cfg.AllowInsecureHTTP,
+		Compression:       cfg.Compression,
 		HTTPClient:        cfg.HTTPClient,
 		Timeout:           cfg.Timeout,
 		FlushCount:        cfg.FlushCount,

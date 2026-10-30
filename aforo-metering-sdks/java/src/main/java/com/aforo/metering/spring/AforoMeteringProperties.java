@@ -49,6 +49,8 @@ public class AforoMeteringProperties {
 
     /** Allow plain http:// on a host other than localhost. Off by default. */
     private boolean allowInsecureHttp = false;
+    /** "gzip" (default): batches of 1 KiB or more are sent with Content-Encoding: gzip (needs usage-ingestor wave 8 or later); "none": always plain JSON. */
+    private String compression = "gzip";
 
     public String getApiKey() { return apiKey; }
     public void setApiKey(String apiKey) { this.apiKey = apiKey; }
@@ -90,6 +92,8 @@ public class AforoMeteringProperties {
 
     public boolean isAllowInsecureHttp() { return allowInsecureHttp; }
     public void setAllowInsecureHttp(boolean allowInsecureHttp) { this.allowInsecureHttp = allowInsecureHttp; }
+    public String getCompression() { return compression; }
+    public void setCompression(String compression) { this.compression = compression; }
 
     /** The API key is never included. */
     @Override

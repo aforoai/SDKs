@@ -1,6 +1,8 @@
 package ingest
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -79,12 +81,14 @@ func (d *drops) byReason(r DropReason) []Event {
 }
 
 type server struct {
-	mu       sync.Mutex
-	inFlight int
-	maxIn    int
-	batches  [][]string // idempotency keys per request
-	handle   func(w http.ResponseWriter, keys []string, n int)
-	calls    atomic.Int32
+	encodings []string // Content-Encoding of each request ("" when none)
+	wire      [][]byte // each request body as sent
+	mu        sync.Mutex
+	inFlight  int
+	maxIn     int
+	batches   [][]string // idempotency keys per request
+	handle    func(w http.ResponseWriter, keys []string, n int)
+	calls     atomic.Int32
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -101,6 +105,19 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		} `json:"events"`
 	}
 	raw, _ := io.ReadAll(r.Body)
+	s.mu.Lock()
+	s.encodings = append(s.encodings, r.Header.Get("Content-Encoding"))
+	s.wire = append(s.wire, raw)
+	s.mu.Unlock()
+	if r.Header.Get("Content-Encoding") == "gzip" {
+		// Decoded like usage-ingestor's GzipRequestFilter (wave 8).
+		zr, err := gzip.NewReader(bytes.NewReader(raw))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		raw, _ = io.ReadAll(zr)
+	}
 	_ = json.Unmarshal(raw, &body)
 	keys := make([]string, len(body.Events))
 	for i, e := range body.Events {

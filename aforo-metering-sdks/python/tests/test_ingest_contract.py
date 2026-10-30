@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 
 
 from aforo.client import AforoClient
+from .gzip_body import request_bytes
 
 MODULE_KEY = "python"
 
@@ -65,7 +66,7 @@ class _Capture:
         import httpx
 
         def handle(request):
-            body = json.loads(request.content)
+            body = json.loads(request_bytes(request))
             cls.captured.append((str(request.url), body, dict(request.headers)))
             return httpx.Response(202, json={"data": {"accepted": len(body["events"]), "failed": 0}})
 
@@ -178,7 +179,8 @@ def test_transport_defaults_match_the_contract_policy():
     assert breaker["initial"] / 1000 == policy.BREAKER_INITIAL_S
     assert breaker["max"] / 1000 == policy.BREAKER_MAX_S
     assert breaker["multiplier"] == policy.BREAKER_MULTIPLIER
-    assert tp["compression"]["gzip"] is policy.GZIP is False
+    assert tp["compression"]["gzip"] is policy.GZIP is True
+    assert tp["compression"]["minBytes"] == policy.COMPRESSION_MIN_BYTES
     assert set(tp["security"]["plainHttpAllowedHosts"]) == set(policy.PLAIN_HTTP_HOSTS)
     assert tuple(tp["dropReasons"]) == policy.DROP_REASONS
 

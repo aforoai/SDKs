@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="aforo-mcp-metering",
-    version="2.0.0",
+    version="2.1.0",
     description="Aforo MCP Server Metering SDK — automatic billing for MCP tool handlers",
     license="Apache-2.0",
     packages=find_packages(),

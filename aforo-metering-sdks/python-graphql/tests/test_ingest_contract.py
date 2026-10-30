@@ -27,6 +27,7 @@ import pytest
 
 from aforo_graphql_metering import client as mod
 from aforo_graphql_metering.client import AforoGraphQlBilling
+from gzip_body import request_bytes
 
 MODULE_KEY = "python-graphql"
 
@@ -75,7 +76,7 @@ class _CapturingClient:
         import httpx
 
         def handle(request):
-            body = json.loads(request.content)
+            body = json.loads(request_bytes(request))
             cls.captured.append((str(request.url), body, dict(request.headers)))
             return httpx.Response(202, json={"data": {"accepted": len(body["events"]), "failed": 0}})
 
@@ -310,4 +311,5 @@ def test_transport_defaults_match_the_contract_policy():
     assert tp["timeouts"]["shutdownMs"] / 1000 == policy.SHUTDOWN_TIMEOUT_S
     assert tp["retry"]["maxRetries"] == policy.MAX_RETRIES
     assert tp["retry"]["retryAfter"]["maxMs"] / 1000 == policy.RETRY_AFTER_MAX_S
-    assert tp["compression"]["gzip"] is policy.GZIP is False
+    assert tp["compression"]["gzip"] is policy.GZIP is True
+    assert tp["compression"]["minBytes"] == policy.COMPRESSION_MIN_BYTES

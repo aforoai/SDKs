@@ -1,4 +1,5 @@
 import { AforoMcpBilling } from '../src/index';
+import { bodyJson } from './helpers/request-body';
 
 const bare = { tenantId: 't', productId: 'p', apiKey: 'k', ingestorUrl: 'https://ingestor.example' };
 const cfg = { ...bare, customerId: 'cust_1' };
@@ -43,7 +44,7 @@ const okFetch = (body: unknown = { accepted: 1, duplicates: 0, failed: 0 }) => j
   status: 202,
   json: async () => body,
 });
-const bodiesOf = (fetchMock: jest.Mock) => fetchMock.mock.calls.map((c: any[]) => JSON.parse(c[1].body));
+const bodiesOf = (fetchMock: jest.Mock) => fetchMock.mock.calls.map((c: any[]) => bodyJson(c[1]));
 
 describe('AforoMcpBilling session heartbeats', () => {
   afterEach(() => jest.useRealTimers());
@@ -139,7 +140,7 @@ describe('AforoMcpBilling session heartbeats', () => {
     await billing.shutdown();
     expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('heartbeat') }));
     expect(fetchMock).toHaveBeenCalledTimes(2); // failed heartbeat (once) + the usage batch
-    const usage = JSON.parse(fetchMock.mock.calls[1][1].body).events;
+    const usage = bodyJson(fetchMock.mock.calls[1][1]).events;
     expect(usage.map((e: any) => e.metricName)).toEqual(['mcp_server.tool_invocations']);
   });
 
@@ -328,7 +329,7 @@ describe('AforoMcpBilling productType, attribution and validation', () => {
     billing.recordToolInvocation('t'.repeat(64), 'a'.repeat(36), 's'.repeat(64), 'SUCCESS', 1, { customerId: 'c'.repeat(64) });
     await billing.shutdown();
     expect(billing.droppedCount).toBe(0);
-    expect(JSON.parse(fetchMock.mock.calls[0][1].body).events).toHaveLength(1);
+    expect(bodyJson(fetchMock.mock.calls[0][1]).events).toHaveLength(1);
   });
 });
 
@@ -432,7 +433,7 @@ describe('AforoMcpBilling batch flush', () => {
       'https://ingestor.example/v1/ingest/batch',
       'https://ingestor.example/v1/ingest/batch',
     ]);
-    const bodies = calls.map((c: any[]) => JSON.parse(c[1].body));
+    const bodies = calls.map((c: any[]) => bodyJson(c[1]));
     expect(bodies.map((b: any) => b.events.length)).toEqual([1000, 1000, 500]);
     expect(calls[0][1].headers['X-API-Key']).toBe('k');
     expect(calls[0][1].headers.Authorization).toBeUndefined();

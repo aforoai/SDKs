@@ -47,7 +47,7 @@ class AforoGrpcBillingTest {
         port = server.getAddress().getPort();
         server.createContext("/", exchange -> {
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
-            exchange.getRequestBody().transferTo(buf);
+            buf.writeBytes(com.aforo.testsupport.RequestBodies.read(exchange));
             JsonNode body = buf.size() == 0 ? null : mapper.readTree(buf.toByteArray());
             requests.add(new CapturedRequest(
                     exchange.getRequestMethod(),

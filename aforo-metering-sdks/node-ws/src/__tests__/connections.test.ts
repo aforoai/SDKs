@@ -6,6 +6,7 @@
  */
 import { EventEmitter } from 'events';
 import { AforoWsBilling, WsUsageEvent, DropReason } from '../index';
+import { bodyJson } from '../../test-support/request-body';
 
 class FakeWs extends EventEmitter {
   readyState = 1;
@@ -17,7 +18,7 @@ let sent: WsUsageEvent[];
 beforeEach(() => {
   sent = [];
   global.fetch = jest.fn(async (_url: any, init: any) => {
-    const events = JSON.parse(init.body).events as WsUsageEvent[];
+    const events = bodyJson(init).events as WsUsageEvent[];
     sent.push(...events);
     return new Response(JSON.stringify({ success: true, data: { accepted: events.length, duplicates: 0, failed: 0, errors: [] } }), { status: 202 });
   }) as any;

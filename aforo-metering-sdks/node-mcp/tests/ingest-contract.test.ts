@@ -11,6 +11,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { AforoMcpBilling } from '../src/index';
+import { bodyJson } from './helpers/request-body';
 
 const MODULE_KEY = 'node-mcp';
 
@@ -81,12 +82,12 @@ describe('ingest contract guard (shared fixture)', () => {
     const [url, options] = mockFetch.mock.calls[0];
     expect(new URL(String(url)).pathname).toBe(endpoint);
     expect(options.method).toBe('POST');
-    assertBodyMatchesContract(spec, JSON.parse(options.body));
+    assertBodyMatchesContract(spec, bodyJson(options));
     // Auth: X-API-Key only (the server accepts it for every key type).
     expect(options.headers['X-API-Key']).toBe('sk_mcp_abc');
     expect(options.headers['Authorization']).toBeUndefined();
     // The production ingestor requires an explicit top-level productType.
-    const usage = JSON.parse(options.body)[spec.batchKey].find((e: any) => e.metricName !== 'system.session.heartbeat');
+    const usage = bodyJson(options)[spec.batchKey].find((e: any) => e.metricName !== 'system.session.heartbeat');
     expect(usage.productType).toBe('MCP_SERVER');
   });
 });

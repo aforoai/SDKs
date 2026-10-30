@@ -65,7 +65,7 @@ class AforoWsIntegrationTest {
     void setUp() throws IOException, InterruptedException {
         captureServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         captureServer.createContext("/", (HttpExchange ex) -> {
-            byte[] body = ex.getRequestBody().readAllBytes();
+            byte[] body = com.aforo.testsupport.RequestBodies.read(ex);
             synchronized (capturedBodies) {
                 try {
                     if (body.length > 0) {

@@ -39,7 +39,7 @@ function dtoFrom(c, mutate = (n, lines) => lines) {
   return parts.join('\n\n');
 }
 
-function tree(c, { dto, batchMax = c.transportPolicy.batch.maxEvents, cap = c.transportPolicy.batch.maxRequestBodyBytes, retryable = true, extraMapping = '' } = {}) {
+function tree(c, { dto, batchMax = c.transportPolicy.batch.maxEvents, cap = c.transportPolicy.batch.maxRequestBodyBytes, retryable = true, extraMapping = '', gzip = c.transportPolicy.compression.gzip } = {}) {
   const root = mkdtempSync(path.join(tmpdir(), 'ingestor-'));
   const base = path.join(root, PKG);
   for (const d of ['controller', 'dto', 'config']) mkdirSync(path.join(base, d), { recursive: true });
@@ -51,6 +51,8 @@ function tree(c, { dto, batchMax = c.transportPolicy.batch.maxEvents, cap = c.tr
   writeFileSync(path.join(base, 'dto/IngestBatchRequest.java'), `    @NotEmpty\n    @Size(max = ${batchMax}, message = "Maximum")\n    private List<IngestUsageEventRequest> events;`);
   writeFileSync(path.join(base, 'config/RequestBodySizeLimitFilter.java'), `@Value("\${aforo.ingestion.max-request-body-bytes:${cap}}") long maxBytes`);
   writeFileSync(path.join(base, 'dto/IngestBatchResponse.java'), retryable ? '        private boolean retryable;' : '        private String message;');
+  // usage-ingestor decodes gzip in config/GzipRequestFilter (wave 8, G269).
+  if (gzip) writeFileSync(path.join(base, 'config/GzipRequestFilter.java'), 'GZIPInputStream');
   return root;
 }
 
@@ -66,6 +68,12 @@ function check(opts) {
 test('a tree built from the contract is in step', () => {
   const { findings } = check();
   assert.deepEqual(findings, []);
+});
+
+test('gzip promised by the contract but no decompression in the ingestor is drift', () => {
+  assert.ok(contract.transportPolicy.compression.gzip);
+  const r = check({ gzip: false });
+  assert.deepEqual(r.findings, ['transportPolicy.compression.gzip is true but the ingestor has no request decompression']);
 });
 
 test('a changed @Size is drift', () => {

@@ -8,7 +8,6 @@ package graphqlmetering
 import (
 	"bytes"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -26,7 +25,7 @@ type recorder struct {
 }
 
 func (r *recorder) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	raw, _ := io.ReadAll(req.Body)
+	raw, _ := readRequestBody(req)
 	req.Body.Close()
 	var body map[string]any
 	_ = json.Unmarshal(raw, &body)
@@ -230,7 +229,7 @@ func TestMiddlewareCapturesGraphQLPost(t *testing.T) {
 
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Upstream server should still see the body
-		body, _ := io.ReadAll(r.Body)
+		body, _ := readRequestBody(r)
 		if !strings.Contains(string(body), "query Test") {
 			t.Errorf("upstream missing body: %s", body)
 		}

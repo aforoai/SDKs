@@ -7,13 +7,14 @@ from __future__ import annotations
 import asyncio
 
 import httpx
+from .gzip_body import request_bytes
 
 
 def use_fake_post(billing, fake_post) -> None:
     def handle(request: httpx.Request) -> httpx.Response:
         headers = {k.decode(): v.decode() for k, v in request.headers.raw}
         try:
-            result = asyncio.run(fake_post(str(request.url), headers, request.content.decode("utf-8")))
+            result = asyncio.run(fake_post(str(request.url), headers, request_bytes(request).decode("utf-8")))
         except (OSError, ConnectionError) as exc:
             raise httpx.ConnectError(str(exc), request=request)
         status, body = result[0], result[1]

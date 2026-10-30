@@ -63,7 +63,8 @@ test('outage then recovery: nothing lost, keys unchanged', async () => {
   expect(state.requests.filter((r) => r.status === 202).map((r) => r.idempotencyKeys)).toEqual([keys]);
   expect(state.requests.length).toBe(4); // 3 attempts during the outage + the recovery probe
   expect(drops).toEqual([]);
-  expect(state.requests.every((r) => r.contentEncoding === null && r.apiKeyPresent)).toBe(true);
+  // Plain JSON under 1 KiB, gzip at or above it (wave 8, G269); never another coding.
+  expect(state.requests.every((r) => (r.contentEncoding === null || r.contentEncoding === 'gzip') && r.apiKeyPresent)).toBe(true);
   expect(state.requests[0].userAgent).toMatch(/^aforo-node\//);
   await c.shutdown();
 });

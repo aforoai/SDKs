@@ -7,13 +7,14 @@
  * Events kept for a retry are not drops.
  */
 import AforoAgent, { type AforoAgentConfig, type DropReason, type IngestEvent } from './index';
+import { bodyJson } from '../test-support/request-body';
 
 type Reply = { status: number; body?: unknown } | Error;
 
 function scripted(script: Reply[]) {
   const calls: Array<{ events: IngestEvent[] }> = [];
   const fetchImpl = jest.fn(async (_url: unknown, init: any) => {
-    const body = JSON.parse(init.body);
+    const body = bodyJson(init);
     calls.push(body);
     const next = script.shift();
     if (next instanceof Error) throw next;

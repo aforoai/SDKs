@@ -12,6 +12,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import AforoAgent, { EXECUTION_STATUSES } from './index';
+import { bodyJson } from '../test-support/request-body';
 
 const MODULE_KEY = 'node-agent';
 
@@ -81,7 +82,7 @@ describe('ingest contract guard (shared fixture)', () => {
     expect(new URL(String(url)).pathname).toBe(endpoint);
     expect(new URL(String(url)).host).toBe('api.aforo.ai');
     expect(options.method).toBe('POST');
-    const body = JSON.parse(options.body);
+    const body = bodyJson(options);
     assertBodyMatchesContract(spec, body);
     // Auth: X-API-Key only (a non-JWT Bearer is rejected by the ingestor).
     expect(options.headers['X-API-Key']).toBe('sk_agent_abc');

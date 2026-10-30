@@ -67,6 +67,11 @@ class AforoOptions:
     then are dropped with reason ``shutdown``."""
 
     allow_insecure_http: bool = False
+
+    compression: str = "gzip"
+    """``"gzip"`` (default): batches of 1 KiB or more are sent with
+    ``Content-Encoding: gzip`` (wave 8, G269; needs usage-ingestor wave 8 or
+    later). ``"none"``: always plain JSON."""
     """Allow a plain ``http://`` base_url on a host other than localhost."""
 
     on_drop: Optional[Callable[[list["ResolvedEvent"], DropReason], None]] = None
@@ -227,6 +232,7 @@ class MiddlewareOptions:
     flush_interval: float = 5.0
     max_queue_size: int = 10_000
     allow_insecure_http: bool = False
+    compression: str = "gzip"
 
 
 # Canonical execution statuses accepted by the usage-ingestor (mirrors

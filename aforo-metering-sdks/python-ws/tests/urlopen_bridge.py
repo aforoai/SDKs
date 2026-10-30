@@ -19,14 +19,15 @@ import urllib.error
 import urllib.request
 
 import httpx
+from gzip_body import plain_headers, request_bytes
 
 
 def install(monkeypatch, client_module) -> None:
     core_cls = client_module.TransportCore
 
     def handle(request: httpx.Request) -> httpx.Response:
-        req = urllib.request.Request(str(request.url), data=request.content,
-                                     headers=dict(request.headers), method=request.method)
+        req = urllib.request.Request(str(request.url), data=request_bytes(request),
+                                     headers=plain_headers(request), method=request.method)
         try:
             resp = urllib.request.urlopen(req, timeout=10)
         except urllib.error.HTTPError as err:

@@ -127,7 +127,7 @@ func TestOversizedBodyIsNotBufferedAndHandlerGetsItAll(t *testing.T) {
 		if cr.n > 2048 {
 			t.Errorf("middleware read %d bytes before the handler ran", cr.n)
 		}
-		raw, _ := io.ReadAll(r.Body)
+		raw, _ := readRequestBody(r)
 		seen = len(raw)
 	}))
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/graphql", cr))

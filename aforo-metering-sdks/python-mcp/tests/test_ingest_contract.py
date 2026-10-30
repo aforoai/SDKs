@@ -102,4 +102,5 @@ def test_transport_defaults_match_the_contract_policy():
     assert tp["timeouts"]["requestMs"] / 1000 == policy.REQUEST_TIMEOUT_S
     assert tp["timeouts"]["shutdownMs"] / 1000 == policy.SHUTDOWN_TIMEOUT_S
     assert tp["retry"]["maxRetries"] == policy.MAX_RETRIES
-    assert tp["compression"]["gzip"] is policy.GZIP is False
+    assert tp["compression"]["gzip"] is policy.GZIP is True
+    assert tp["compression"]["minBytes"] == policy.COMPRESSION_MIN_BYTES

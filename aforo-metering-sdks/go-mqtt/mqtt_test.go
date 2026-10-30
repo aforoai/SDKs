@@ -10,7 +10,6 @@ import (
 	"context"
 	"encoding/json"
 	"github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt/v2/internal/ingest"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -29,7 +28,7 @@ type rec struct {
 }
 
 func (r *rec) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	raw, _ := io.ReadAll(req.Body)
+	raw, _ := readRequestBody(req)
 	req.Body.Close()
 	var body map[string]any
 	_ = json.Unmarshal(raw, &body)

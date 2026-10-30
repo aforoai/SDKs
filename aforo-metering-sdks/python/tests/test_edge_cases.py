@@ -22,6 +22,7 @@ from aforo._transport import TransportCore, TransportError
 from aforo._transport.core import _Entry
 
 from .fakes import FakeClock, ScriptedServer, event, wait_until
+from .gzip_body import request_bytes
 
 SECRET = "sk_live_supersecret_key_value"
 
@@ -55,7 +56,7 @@ def mock_core(url, drops=None, errors=None, **kw) -> TransportCore:
 
 
 def retryable_answer(request: httpx.Request) -> httpx.Response:
-    n = len(json.loads(request.content)["events"])
+    n = len(json.loads(request_bytes(request))["events"])
     return httpx.Response(202, json={"data": {"accepted": 0, "failed": n, "errors": [
         {"index": i, "message": "busy", "retryable": True} for i in range(n)]}})
 
@@ -279,7 +280,7 @@ def test_unsent_half_of_a_split_batch_is_reported_when_close_gives_up():
     calls = []
 
     def handler(request):
-        n = len(json.loads(request.content)["events"])
+        n = len(json.loads(request_bytes(request))["events"])
         calls.append(n)
         if len(calls) == 1:
             release.wait(10)  # the first half hangs past the shutdown deadline
@@ -411,7 +412,7 @@ def test_on_accepted_gets_the_unwrapped_body_and_the_events():
     seen = []
 
     def answer(request):
-        n = len(json.loads(request.content)["events"])
+        n = len(json.loads(request_bytes(request))["events"])
         return httpx.Response(202, json={"success": True, "data": {
             "accepted": n, "failed": 0, "killedSessionIds": ["s-1"]}})
 

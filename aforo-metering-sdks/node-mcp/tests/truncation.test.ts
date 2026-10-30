@@ -6,12 +6,13 @@
  */
 import { createHash } from 'node:crypto';
 import { AforoMcpBilling, truncateToLimit, type UsageEvent } from '../src/index';
+import { bodyJson } from './helpers/request-body';
 
 const mockFetch = jest.fn();
 global.fetch = mockFetch as any;
 
 const sha256 = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex');
-const sent = (): UsageEvent[] => mockFetch.mock.calls.flatMap((c) => JSON.parse(c[1].body).events);
+const sent = (): UsageEvent[] => mockFetch.mock.calls.flatMap((c) => bodyJson(c[1]).events);
 
 describe('request-derived toolName', () => {
   let warn: jest.SpyInstance;

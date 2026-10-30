@@ -42,8 +42,11 @@ BREAKER_MULTIPLIER = 2.0
 #: Hosts that may use plain http:// without ``allow_insecure_http``.
 PLAIN_HTTP_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
-#: The ingestor does not decode Content-Encoding request bodies yet.
-GZIP = False
+#: Batches are gzip-encoded by default (wave 8, G269); usage-ingestor decodes them.
+GZIP = True
+
+#: Bodies smaller than this are sent plain: gzip's header and dictionary cost more than they save.
+COMPRESSION_MIN_BYTES = 1024
 
 #: How much of a response body the core reads (the ingestor's bodies are small).
 MAX_RESPONSE_BODY_BYTES = 1024 * 1024

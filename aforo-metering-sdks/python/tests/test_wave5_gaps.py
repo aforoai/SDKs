@@ -8,13 +8,14 @@ import httpx
 import pytest
 
 from aforo import AforoClient, AforoOptions, MiddlewareOptions
+from .gzip_body import request_bytes
 
 
 def _ok_transport(requests):
     def handle(request):
         import json
 
-        body = json.loads(request.content)
+        body = json.loads(request_bytes(request))
         requests.append(body)
         return httpx.Response(202, json={"data": {"accepted": len(body["events"]), "failed": 0}})
 

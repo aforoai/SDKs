@@ -21,7 +21,7 @@ and when its stdin closes, so a crashed test runner does not leave it running.
 
 | Method + path | Behaviour |
 |---|---|
-| `POST /v1/ingest/batch`, `POST /api/v1/ingest/batch` | 401 without `X-API-Key`, 413 over `transportPolicy.batch.maxRequestBodyBytes`, 400 on `Content-Encoding` (the real ingestor does not decode it), 415 without `application/json`, 400 on malformed JSON / empty / over 1000 events. Otherwise 202 `{success, data: {accepted, duplicates, failed, errors[{index, message, retryable}], killedSessionIds}, meta}` with per-event schema validation (lengths in UTF-16 code units) and dedup on `idempotencyKey` per API key. |
+| `POST /v1/ingest/batch`, `POST /api/v1/ingest/batch` | 401 without `X-API-Key`, 413 over `transportPolicy.batch.maxRequestBodyBytes`, `Content-Encoding: gzip` decoded with the same cap on the decoded body (413 past it, 400 when not gzip), 415 with `Accept-Encoding: gzip` for any other coding (as usage-ingestor's `GzipRequestFilter`, wave 8), 415 without `application/json`, 400 on malformed JSON / empty / over 1000 events. Otherwise 202 `{success, data: {accepted, duplicates, failed, errors[{index, message, retryable}], killedSessionIds}, meta}` with per-event schema validation (lengths in UTF-16 code units) and dedup on `idempotencyKey` per API key. |
 | `POST /api/v1/quota/check` | 200 `{success, data: {decision, reason, ...}}`; decision set with `/__control/quota`. |
 
 ## Control API

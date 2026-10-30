@@ -227,6 +227,7 @@ public final class TransportCore<E> implements AutoCloseable {
     private final Logger log;
     private final String prefix;
     private final Map<String, String> headers;
+    private final Map<String, String> gzipHeaders;
 
     private final ReentrantLock queueLock = new ReentrantLock();
     private final ArrayDeque<Entry<E>> queue = new ArrayDeque<>();
@@ -303,6 +304,9 @@ public final class TransportCore<E> implements AutoCloseable {
         h.put("User-Agent", config.userAgent);
         h.put("X-API-Key", config.apiKey);
         this.headers = Collections.unmodifiableMap(h);
+        Map<String, String> gz = new LinkedHashMap<>(h);
+        gz.put("Content-Encoding", "gzip");
+        this.gzipHeaders = Collections.unmodifiableMap(gz);
         this.flusher = new Thread(this::runFlusher, config.threadName);
         this.flusher.setDaemon(true);
         this.flusher.start();
@@ -704,8 +708,30 @@ public final class TransportCore<E> implements AutoCloseable {
         return right;
     }
 
+    /**
+     * The request bytes for {@code json}: gzip when compression is on and the body is at least
+     * {@link TransportConfig#COMPRESSION_MIN_BYTES} (wave 8, G269), else the UTF-8 JSON. A
+     * compression failure sends the JSON plain, never drops the batch.
+     */
+    private byte[] encode(String json, boolean[] gzipped) {
+        byte[] raw = json.getBytes(StandardCharsets.UTF_8);
+        if (!config.gzip || raw.length < TransportConfig.COMPRESSION_MIN_BYTES) return raw;
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(Math.max(64, raw.length / 4));
+        try (java.util.zip.GZIPOutputStream gz = new java.util.zip.GZIPOutputStream(out)) {
+            gz.write(raw);
+        } catch (IOException e) {
+            log.log(Level.FINE, prefix + " gzip failed, sending uncompressed", e);
+            return raw;
+        }
+        gzipped[0] = true;
+        return out.toByteArray();
+    }
+
     private Result sendWithRetries(List<Entry<E>> part) {
-        String body = body(part);
+        // Compressed once; every retry sends the same bytes.
+        boolean[] gzipped = {false};
+        byte[] body = encode(body(part), gzipped);
+        Map<String, String> requestHeaders = gzipped[0] ? gzipHeaders : headers;
         Result r = new Result();
         int maxRetries = singleAttempt ? 0 : config.maxRetries;
         for (int attempt = 0; ; attempt++) {
@@ -720,7 +746,7 @@ public final class TransportCore<E> implements AutoCloseable {
             HttpSender.Response resp = null;
             String failure;
             try {
-                resp = sender.post(config.ingestUri, headers, body, timeout);
+                resp = sender.postBytes(config.ingestUri, requestHeaders, body, timeout);
                 failure = null;
             } catch (IOException e) {
                 failure = e.getClass().getSimpleName();

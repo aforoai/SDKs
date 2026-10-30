@@ -119,6 +119,12 @@ export interface AforoMcpConfig {
   flushOnExit?: boolean;
   /** Allow a plain http:// ingestorUrl on a host other than localhost / 127.0.0.1 / ::1. */
   allowInsecureHttp?: boolean;
+  /**
+   * Request compression: 'gzip' (default) sends batches of 1 KiB or more with
+   * Content-Encoding: gzip (needs usage-ingestor wave 8 or later); 'none'
+   * always sends plain JSON.
+   */
+  compression?: 'gzip' | 'none';
   onError?: (error: Error) => void;
   /**
    * OPT-IN hook invoked with events the SDK is about to lose permanently
@@ -173,7 +179,7 @@ export interface StartSessionOptions {
   productType?: string;
 }
 
-const SDK_VERSION = '2.0.0';
+const SDK_VERSION = '2.1.0';
 
 function normalizeProductType(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
@@ -360,6 +366,7 @@ export class AforoMcpBilling {
       baseUrl: this.config.ingestorUrl,
       apiKey: config.apiKey,
       allowInsecureHttp: config.allowInsecureHttp,
+      compression: config.compression,
       headers: { 'X-Tenant-Id': config.tenantId },
       userAgent: `aforo-mcp-metering-node/${SDK_VERSION}`,
       flushCount: config.flushCount,

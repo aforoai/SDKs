@@ -1,5 +1,6 @@
 import { koaMiddleware } from '../src/middleware/koa';
 import { fastifyPlugin } from '../src/middleware/fastify';
+import { bodyJson } from './helpers/request-body';
 
 const mockFetch = jest.fn();
 global.fetch = mockFetch as any;
@@ -39,7 +40,7 @@ describe('koaMiddleware', () => {
     const mw = koaMiddleware({ apiKey: 'k', trustCustomerHeader: true, clientOptions });
     await mw(koaCtx('GET', { 'x-customer-id': 'cust_1' }), async () => {});
     await tick();
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     expect(body.events[0]).toMatchObject({ customerId: 'cust_1', metricName: 'api_calls' });
   });
 
@@ -62,7 +63,7 @@ describe('fastifyPlugin', () => {
     await runFastify({ apiKey: 'k', trustCustomerHeader: true, clientOptions, metricName: () => 'otp_delivered' },
       { url: '/api/data', method: 'POST', headers: { 'x-customer-id': 'cust_2' } });
     await tick();
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     expect(body.events[0]).toMatchObject({ customerId: 'cust_2', metricName: 'otp_delivered' });
   });
 
@@ -91,7 +92,7 @@ describe('customer, quantity and metadata options', () => {
     });
     await mw(koaCtx('GET', {}), async () => {});
     await tick();
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     expect(body.events[0]).toMatchObject({ customerId: 'cust_fn', quantity: 3, metadata: { plan: 'pro' } });
   });
 
@@ -110,7 +111,7 @@ describe('customer, quantity and metadata options', () => {
       customerId: 'cust_static', quantity: 2, metadata: () => ({ region: 'eu' }),
     }, { url: '/api/data', method: 'GET', headers: {} });
     await tick();
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     expect(body.events[0]).toMatchObject({ customerId: 'cust_static', quantity: 2, metadata: { region: 'eu' } });
   });
 
@@ -134,7 +135,7 @@ describe('productType, HTTP fields and quantity <= 0', () => {
     const mw = koaMiddleware({ apiKey: 'k', trustCustomerHeader: true, clientOptions, productType: 'agentic_api' });
     await mw({ ...koaCtx('POST', { 'x-customer-id': 'cust_1' }), path: '/api/data', status: 201 }, async () => {});
     await tick();
-    const ev = JSON.parse(mockFetch.mock.calls[0][1].body).events[0];
+    const ev = bodyJson(mockFetch.mock.calls[0][1]).events[0];
     expect(ev).toMatchObject({ productType: 'AGENTIC_API', endpointPath: '/api/data', httpMethod: 'POST', statusCode: 201 });
     expect(typeof ev.responseTimeMs).toBe('number');
   });
@@ -153,7 +154,7 @@ describe('productType, HTTP fields and quantity <= 0', () => {
       { url: '/api/data?x=1', method: 'GET', headers: { 'x-customer-id': 'cust_1' } },
       { statusCode: 200, elapsedTime: 12.6 }, resolve));
     await tick();
-    const ev = JSON.parse(mockFetch.mock.calls[0][1].body).events[0];
+    const ev = bodyJson(mockFetch.mock.calls[0][1]).events[0];
     expect(ev).toMatchObject({ productType: 'API', endpointPath: '/api/data', httpMethod: 'GET', statusCode: 200, responseTimeMs: 13 });
   });
 

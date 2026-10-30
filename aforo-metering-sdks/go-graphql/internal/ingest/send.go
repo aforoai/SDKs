@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -48,9 +49,10 @@ func encodeBatch(events []Event) []byte {
 // sendBatch posts one batch with retries. 413 splits it; 2xx per-event
 // failures go back to the queue (retryable) or are reported (not retryable).
 func (c *Client) sendBatch(ctx context.Context, events []Event) sendOutcome {
-	body := encodeBatch(events)
+	// Compressed once; every retry sends the same bytes.
+	body, gzipped := c.encodeBody(encodeBatch(events))
 	for attempt := 0; ; attempt++ {
-		status, header, respBody, err := c.post(ctx, body)
+		status, header, respBody, err := c.post(ctx, body, gzipped)
 		if err == nil && status >= 300 && status < 400 {
 			// Never followed (the key must not reach another host): an outage,
 			// logged at ERROR with the target host. Fixing the base URL recovers.
@@ -132,7 +134,28 @@ func redirectHost(location string) string {
 // cut off at Timeout (or the shutdown deadline, whichever is first). A body
 // cut off on a 2xx is returned as an error: the batch is retried with the
 // same keys (the ingestor deduplicates) rather than guessed delivered.
-func (c *Client) post(ctx context.Context, body []byte) (int, http.Header, []byte, error) {
+// encodeBody gzips json when compression is on and the body is at least
+// CompressionMinBytes (wave 8, G269). A compression failure sends the JSON as
+// it is, never drops the batch.
+func (c *Client) encodeBody(json []byte) ([]byte, bool) {
+	if c.cfg.Compression != "gzip" || len(json) < CompressionMinBytes {
+		return json, false
+	}
+	var b bytes.Buffer
+	b.Grow(len(json) / 4)
+	w := gzip.NewWriter(&b)
+	if _, err := w.Write(json); err != nil {
+		c.logf("DEBUG: gzip failed, sending uncompressed: %v", err)
+		return json, false
+	}
+	if err := w.Close(); err != nil {
+		c.logf("DEBUG: gzip failed, sending uncompressed: %v", err)
+		return json, false
+	}
+	return b.Bytes(), true
+}
+
+func (c *Client) post(ctx context.Context, body []byte, gzipped bool) (int, http.Header, []byte, error) {
 	rctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(rctx, http.MethodPost, c.url, bytes.NewReader(body))
@@ -143,6 +166,11 @@ func (c *Client) post(ctx context.Context, body []byte) (int, http.Header, []byt
 		req.Header.Set(k, v)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if gzipped {
+		req.Header.Set("Content-Encoding", "gzip")
+	} else {
+		req.Header.Del("Content-Encoding")
+	}
 	req.Header.Set("X-API-Key", c.cfg.APIKey)
 	if c.cfg.UserAgent != "" {
 		req.Header.Set("User-Agent", c.cfg.UserAgent)

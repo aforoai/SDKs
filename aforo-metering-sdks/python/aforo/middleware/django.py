@@ -100,6 +100,7 @@ class AforoMeteringMiddleware:
         self._client = AforoClient(
             api_key=api_key, base_url=base_url, product_type=self._product_type,
             allow_insecure_http=bool(getattr(settings, "AFORO_ALLOW_INSECURE_HTTP", False)),
+            compression=getattr(settings, "AFORO_COMPRESSION", "gzip"),
         )
         self._exclude_paths = getattr(settings, "AFORO_EXCLUDE_PATHS", _DEFAULT_EXCLUDE)
         self._exclude_status_codes = getattr(settings, "AFORO_EXCLUDE_STATUS_CODES", [])

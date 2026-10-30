@@ -10,6 +10,7 @@
  */
 import { AforoMcpBilling, type McpDropReason, type UsageEvent } from '../src/index';
 import { startMockIngestor, waitFor, type MockIngestor } from './support/mock-ingestor';
+import { bodyJson } from './helpers/request-body';
 
 jest.setTimeout(20_000);
 
@@ -58,7 +59,7 @@ describe('AforoMcpBilling delivery (mock ingestor)', () => {
     const sentKeys: string[][] = [];
     const realFetch = global.fetch;
     const spy = jest.spyOn(global, 'fetch').mockImplementation(async (url: any, init: any) => {
-      sentKeys.push(JSON.parse(init.body).events.map((e: UsageEvent) => e.idempotencyKey));
+      sentKeys.push(bodyJson(init).events.map((e: UsageEvent) => e.idempotencyKey));
       return realFetch(url, init);
     });
     await mock.faults([{ status: 503, times: 1 }]);

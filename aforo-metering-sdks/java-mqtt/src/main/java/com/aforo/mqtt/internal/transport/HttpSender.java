@@ -61,6 +61,29 @@ public interface HttpSender extends AutoCloseable {
     Response post(URI uri, Map<String, String> headers, String body, long timeoutMs)
             throws IOException, InterruptedException;
 
+    /**
+     * POSTs raw bytes (the core uses this for every batch; wave 8, G269). The default is for
+     * senders that work on text, such as test fakes: a gzip body is decoded and handed to
+     * {@link #post(URI, Map, String, long)} without the {@code Content-Encoding} header, so a
+     * text sender always sees the JSON. The JDK sender overrides it and sends the bytes as they are.
+     */
+    default Response postBytes(URI uri, Map<String, String> headers, byte[] body, long timeoutMs)
+            throws IOException, InterruptedException {
+        String encoding = null;
+        Map<String, String> plain = new java.util.LinkedHashMap<>();
+        for (Map.Entry<String, String> h : headers.entrySet()) {
+            if (h.getKey().equalsIgnoreCase("Content-Encoding")) encoding = h.getValue();
+            else plain.put(h.getKey(), h.getValue());
+        }
+        byte[] json = body;
+        if ("gzip".equalsIgnoreCase(encoding)) {
+            try (java.util.zip.GZIPInputStream in = new java.util.zip.GZIPInputStream(new java.io.ByteArrayInputStream(body))) {
+                json = in.readAllBytes();
+            }
+        }
+        return post(uri, java.util.Collections.unmodifiableMap(plain), new String(json, StandardCharsets.UTF_8), timeoutMs);
+    }
+
     @Override
     void close();
 
@@ -90,10 +113,16 @@ public interface HttpSender extends AutoCloseable {
         @Override
         public Response post(URI uri, Map<String, String> headers, String body, long timeoutMs)
                 throws IOException, InterruptedException {
+            return postBytes(uri, headers, body.getBytes(StandardCharsets.UTF_8), timeoutMs);
+        }
+
+        @Override
+        public Response postBytes(URI uri, Map<String, String> headers, byte[] body, long timeoutMs)
+                throws IOException, InterruptedException {
             long deadline = Math.max(1, timeoutMs);
             HttpRequest.Builder b = HttpRequest.newBuilder(uri)
                     .timeout(Duration.ofMillis(deadline))
-                    .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8));
+                    .POST(HttpRequest.BodyPublishers.ofByteArray(body));
             headers.forEach(b::header);
             CompletableFuture<HttpResponse<String>> exchange =
                     client.sendAsync(b.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));

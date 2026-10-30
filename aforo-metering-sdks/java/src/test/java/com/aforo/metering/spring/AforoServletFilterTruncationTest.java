@@ -49,7 +49,7 @@ class AforoServletFilterTruncationTest {
     void setUp() throws Exception {
         server = HttpServer.create(new InetSocketAddress(0), 0);
         server.createContext("/", exchange -> {
-            JsonNode body = mapper.readTree(exchange.getRequestBody().readAllBytes());
+            JsonNode body = mapper.readTree(com.aforo.testsupport.RequestBodies.read(exchange));
             body.get("events").forEach(received::add);
             exchange.sendResponseHeaders(202, -1);
             exchange.close();

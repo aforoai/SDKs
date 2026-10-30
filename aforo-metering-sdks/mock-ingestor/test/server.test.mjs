@@ -1,3 +1,4 @@
+import zlib from 'node:zlib';
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -73,11 +74,30 @@ test('per-event validation follows the contract schema (UTF-16 lengths, required
   assert.ok(body.data.errors.every((e) => e.retryable === false));
 });
 
-test('batch over maxEvents is 400; Content-Encoding is refused like the real ingestor', async () => {
+test('batch over maxEvents is 400', async () => {
   const { maxEvents } = loadContract();
   const big = Array.from({ length: maxEvents + 1 }, (_, i) => event(i));
   assert.equal((await post(big)).status, 400);
-  assert.equal((await post([event(1)], { 'Content-Encoding': 'gzip' })).status, 400);
+});
+
+test('gzip bodies are decoded like the real ingestor; other codings are 415', async () => {
+  const gz = zlib.gzipSync(JSON.stringify({ events: [event(1), event(2)] }));
+  const ok = await post(null, { 'Content-Encoding': 'gzip' }, gz);
+  assert.equal(ok.status, 202);
+  assert.equal((await ok.json()).data.accepted, 2);
+  const s = await state();
+  assert.deepEqual(s.requests.at(-1).idempotencyKeys, ['k-1', 'k-2']);
+  assert.equal(s.requests.at(-1).contentEncoding, 'gzip');
+
+  const br = await post([event(3)], { 'Content-Encoding': 'br' });
+  assert.equal(br.status, 415);
+  assert.equal(br.headers.get('accept-encoding'), 'gzip');
+  assert.equal((await post(null, { 'Content-Encoding': 'gzip' }, 'not gzip')).status, 400);
+
+  // A small body that inflates past the request limit is 413, as on the ingestor.
+  const { maxRequestBodyBytes } = loadContract();
+  const bomb = zlib.gzipSync(Buffer.alloc(maxRequestBodyBytes + 1, 0x20));
+  assert.equal((await post(null, { 'Content-Encoding': 'gzip' }, bomb)).status, 413);
 });
 
 test('scripted outage: N failures with Retry-After, then recovery', async () => {

@@ -13,7 +13,7 @@ import (
 )
 
 // sdkVersion is sent in the User-Agent header; keep it equal to VERSION.
-const sdkVersion = "2.0.0"
+const sdkVersion = "2.1.0"
 
 // AforoClient is the main entry point for the Aforo metering SDK.
 //
@@ -40,6 +40,7 @@ func NewClient(opts Options) (*AforoClient, error) {
 		APIKey:            opts.APIKey,
 		UserAgent:         "aforo-go/" + sdkVersion,
 		AllowInsecureHTTP: opts.AllowInsecureHTTP,
+		Compression:       opts.Compression,
 		HTTPClient:        opts.HTTPClient,
 		Timeout:           opts.Timeout,
 		FlushCount:        opts.FlushCount,

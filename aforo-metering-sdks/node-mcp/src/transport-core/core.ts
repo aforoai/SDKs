@@ -10,7 +10,7 @@
  * Self-contained on purpose: no imports (not even relative ones, so every
  * module format and test runner that receives the copy can load it), only
  * Node built-ins reached through globals (`fetch`, `AbortSignal`, `Buffer`,
- * timers). Target ES2020.
+ * timers, `process.getBuiltinModule` for zlib). Target ES2020.
  *
  * What it does, per client:
  *   - one bounded FIFO queue (evict-oldest, reported as 'overflow');
@@ -91,7 +91,7 @@ export interface CoreResponse {
 /** The subset of fetch the core calls. Injectable for tests. */
 export type CoreFetch = (
   url: string,
-  init: { method: string; headers: Record<string, string>; body: string; signal: AbortSignal; redirect: 'manual' },
+  init: { method: string; headers: Record<string, string>; body: string | Uint8Array; signal: AbortSignal; redirect: 'manual' },
 ) => Promise<CoreResponse>;
 
 /** Sleep that ends early (resolving) when `signal` aborts. Injectable for tests. */
@@ -140,6 +140,13 @@ export interface TransportCoreOptions<E extends CoreEvent> {
   shutdownTimeoutMs?: number;
   /** Split a batch whose JSON body exceeds this many bytes. Default 4 MiB. */
   targetRequestBodyBytes?: number;
+  /**
+   * Request compression. 'gzip' (default) sends bodies of 1 KiB or more with
+   * Content-Encoding: gzip; 'none' always sends plain JSON. gzip needs an
+   * ingestor that decodes it (usage-ingestor wave 8 and later) and a runtime
+   * with CompressionStream (Node 18+); without one the body is sent plain.
+   */
+  compression?: 'gzip' | 'none';
   /** Flush on the process 'beforeExit' event (within shutdownTimeoutMs). Default true. */
   flushOnExit?: boolean;
   /** Receives events that are lost for good. A throw is caught and logged. */
@@ -207,6 +214,29 @@ export const CORE_DEFAULTS = Object.freeze({
   shutdownTimeoutMs: 5000,
   targetRequestBodyBytes: 4 * 1024 * 1024,
 });
+
+/** Bodies smaller than this are sent plain: gzip's header and dictionary cost more than they save. */
+export const COMPRESSION_MIN_BYTES = 1024;
+
+/**
+ * gzip of `text` (UTF-8), or null when the runtime cannot compress. Synchronous through
+ * `process.getBuiltinModule('node:zlib')` where it exists (Node 20.16+ / 22.3+), so no
+ * background work is involved (fake timers in a caller's tests keep working); otherwise
+ * CompressionStream (Node 18+, browsers, edge runtimes).
+ */
+async function gzipText(text: string): Promise<Uint8Array | null> {
+  const proc = typeof process !== 'undefined' ? (process as any) : undefined;
+  const zlib = typeof proc?.getBuiltinModule === 'function' ? proc.getBuiltinModule('node:zlib') : undefined;
+  if (zlib && typeof zlib.gzipSync === 'function') {
+    return new Uint8Array(zlib.gzipSync(text));
+  }
+  const CS = (globalThis as any).CompressionStream;
+  const BlobCtor = (globalThis as any).Blob;
+  const ResponseCtor = (globalThis as any).Response;
+  if (typeof CS !== 'function' || typeof BlobCtor !== 'function' || typeof ResponseCtor !== 'function') return null;
+  const stream = new BlobCtor([text]).stream().pipeThrough(new CS('gzip'));
+  return new Uint8Array(await new ResponseCtor(stream).arrayBuffer());
+}
 
 const RETRY_STATUSES: ReadonlySet<number> = new Set([408, 429, 500, 502, 503, 504]);
 const AUTH_STATUSES: ReadonlySet<number> = new Set([401, 403]);
@@ -499,6 +529,9 @@ export class TransportCore<E extends CoreEvent> {
   private readonly timeoutMs: number;
   private readonly shutdownTimeoutMs: number;
   private readonly targetBytes: number;
+  private readonly gzip: boolean;
+  /** Headers for a gzip body: the same map plus Content-Encoding. */
+  private readonly gzipHeaders: Record<string, string>;
   private readonly fetchFn: CoreFetch;
   private readonly clock: () => number;
   private readonly sleepFn: CoreSleep;
@@ -566,8 +599,14 @@ export class TransportCore<E extends CoreEvent> {
         delete this.headers[name];
       }
     }
-    // The key lives only in this non-enumerable header map.
+    this.gzipHeaders = { ...this.headers, 'Content-Encoding': 'gzip' };
+    // The key lives only in these non-enumerable header maps.
     Object.defineProperty(this, 'headers', { enumerable: false });
+    Object.defineProperty(this, 'gzipHeaders', { enumerable: false });
+    if (options.compression !== undefined && options.compression !== 'gzip' && options.compression !== 'none') {
+      throw new Error(`Aforo compression must be 'gzip' or 'none'`);
+    }
+    this.gzip = options.compression !== 'none';
 
     this.flushCount = Math.max(1, Math.min(Math.floor(options.flushCount ?? CORE_DEFAULTS.flushCount), CORE_DEFAULTS.maxBatchEvents));
     this.flushIntervalMs = Math.max(1, options.flushIntervalMs ?? CORE_DEFAULTS.flushIntervalMs);
@@ -1013,7 +1052,9 @@ export class TransportCore<E extends CoreEvent> {
   }
 
   /** One chunk, with retries. Never throws. */
-  private async sendWithRetry(chunk: E[], body: string): Promise<SendOutcome> {
+  private async sendWithRetry(chunk: E[], json: string): Promise<SendOutcome> {
+    // Compressed once; every retry sends the same bytes.
+    const { body, headers } = await this.encode(json);
     let lastReason = 'no attempt';
     let lastStatus: number | undefined;
     for (let attempt = 0; ; attempt++) {
@@ -1023,7 +1064,7 @@ export class TransportCore<E extends CoreEvent> {
       let retryAfterMs: number | undefined;
       let response: CoreResponse | undefined;
       try {
-        response = await this.post(body, requestTimeout);
+        response = await this.post(body, headers, requestTimeout);
       } catch (err) {
         if (this.closedFlag && this.pastDeadline) return { kind: 'deadline' };
         lastReason = `network error: ${errorText(err)}`;
@@ -1079,7 +1120,24 @@ export class TransportCore<E extends CoreEvent> {
     }
   }
 
-  private async post(body: string, timeoutMs: number): Promise<CoreResponse> {
+  /**
+   * The request body and headers for `json`: gzip with Content-Encoding when compression is on
+   * and the body is at least COMPRESSION_MIN_BYTES, else the JSON as it is. A compression failure
+   * sends plain JSON (logged at debug), never drops the batch.
+   */
+  private async encode(json: string): Promise<{ body: string | Uint8Array; headers: Record<string, string> }> {
+    if (this.gzip && byteLength(json) >= COMPRESSION_MIN_BYTES) {
+      try {
+        const gz = await gzipText(json);
+        if (gz) return { body: gz, headers: this.gzipHeaders };
+      } catch (err) {
+        this.logDebug(`gzip failed, sending uncompressed: ${errorText(err)}`);
+      }
+    }
+    return { body: json, headers: this.headers };
+  }
+
+  private async post(body: string | Uint8Array, headers: Record<string, string>, timeoutMs: number): Promise<CoreResponse> {
     const controller = new AbortController();
     const timeoutSignal: AbortSignal = (AbortSignal as any).timeout(timeoutMs);
     const onTimeout = () => controller.abort((timeoutSignal as any).reason);
@@ -1090,7 +1148,7 @@ export class TransportCore<E extends CoreEvent> {
     try {
       const response = await untilAborted(
         Promise.resolve().then(() =>
-          this.fetchFn(this.url, { method: 'POST', headers: this.headers, body, signal: controller.signal, redirect: 'manual' }),
+          this.fetchFn(this.url, { method: 'POST', headers, body, signal: controller.signal, redirect: 'manual' }),
         ),
         controller.signal,
       );

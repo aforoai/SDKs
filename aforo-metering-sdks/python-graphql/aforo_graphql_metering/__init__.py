@@ -19,4 +19,4 @@ __all__ = [
     "outcome_from_graphql_result",
     "outcome_from_http_status",
 ]
-__version__ = "2.0.0"
+__version__ = "2.1.0"

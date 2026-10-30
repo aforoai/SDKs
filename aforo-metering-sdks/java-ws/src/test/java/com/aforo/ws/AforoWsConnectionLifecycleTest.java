@@ -35,7 +35,7 @@ class AforoWsConnectionLifecycleTest {
     void start() throws IOException {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/", ex -> {
-            JsonNode body = MAPPER.readTree(new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            JsonNode body = MAPPER.readTree(new String(com.aforo.testsupport.RequestBodies.read(ex), StandardCharsets.UTF_8));
             body.get("events").forEach(events::add);
             ex.sendResponseHeaders(204, -1);
             ex.close();

@@ -122,7 +122,7 @@ Exported symbols: `AforoMqttBilling` (with `wrapAedesBroker` / `wrapMqttClient` 
 
 ## Delivery
 
-One background sender per client sends one request at a time; recording an event only queues it. If the ingestor is unreachable, keeps answering 408/429/5xx after the retries, or answers 401/403 (a wrong or revoked key — logged as an error), the batch goes back to the front of the queue with its idempotency keys and sending pauses (5 s, doubling to 5 min, randomized). New events keep queueing up to `maxQueueSize`; the first successful request resumes sending, and the ingestor deduplicates the re-sent keys. A 413 splits the batch. Request bodies are plain JSON (the ingestor does not decode gzip). `flush()` sends what is queued now; `shutdown()` sends for at most `shutdownTimeoutMs` — call it from your own SIGTERM handler.
+One background sender per client sends one request at a time; recording an event only queues it. If the ingestor is unreachable, keeps answering 408/429/5xx after the retries, or answers 401/403 (a wrong or revoked key — logged as an error), the batch goes back to the front of the queue with its idempotency keys and sending pauses (5 s, doubling to 5 min, randomized). New events keep queueing up to `maxQueueSize`; the first successful request resumes sending, and the ingestor deduplicates the re-sent keys. A 413 splits the batch. Batches of 1 KiB or more are sent gzip-encoded (`Content-Encoding: gzip`, needs usage-ingestor wave 8 or later); set `compression: 'none'` to always send plain JSON. `flush()` sends what is queued now; `shutdown()` sends for at most `shutdownTimeoutMs` — call it from your own SIGTERM handler.
 
 ## Execution status
 

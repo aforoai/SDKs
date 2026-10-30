@@ -30,6 +30,9 @@ const (
 	DefaultFlushCount      = 500
 	MaxBatchEvents         = 1000
 	DefaultTargetBodyBytes = 4 << 20
+	// CompressionMinBytes: bodies smaller than this are sent plain; gzip's
+	// header and dictionary cost more than they save (wave 8, G269).
+	CompressionMinBytes    = 1024
 	DefaultMaxQueueSize    = 10_000
 	DefaultFlushInterval   = 5 * time.Second
 	DefaultTimeout         = 10 * time.Second
@@ -88,7 +91,7 @@ type Config struct {
 	APIKey    string // sent only as X-API-Key
 	UserAgent string // "aforo-<module>/<version>"
 	// Headers are added to every request (for example X-Tenant-Id). They
-	// cannot replace Content-Type, X-API-Key or User-Agent.
+	// cannot replace Content-Type, Content-Encoding, X-API-Key or User-Agent.
 	Headers           map[string]string
 	AllowInsecureHTTP bool // allow http:// to hosts other than localhost
 
@@ -109,6 +112,10 @@ type Config struct {
 	BreakerMax      time.Duration // default 5 min
 	ShutdownTimeout time.Duration // default 5 s
 	TargetBodyBytes int           // split above this many body bytes, default 4 MiB
+	// Compression is "gzip" (default; bodies of CompressionMinBytes or more are
+	// sent with Content-Encoding: gzip) or "none" (always plain JSON). gzip needs
+	// an ingestor that decodes it (usage-ingestor wave 8 and later).
+	Compression string
 
 	// OnDrop receives events the SDK gave up on. Panics are recovered and logged.
 	OnDrop func(events []Event, reason DropReason)
@@ -222,6 +229,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.TargetBodyBytes <= 0 {
 		c.TargetBodyBytes = DefaultTargetBodyBytes
+	}
+	if c.Compression == "" {
+		c.Compression = "gzip"
 	}
 	if c.Logf == nil {
 		c.Logf = log.Printf

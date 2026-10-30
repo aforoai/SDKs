@@ -8,6 +8,7 @@ import { AforoClient } from '../src/client';
 import { expressMiddleware } from '../src/middleware/express';
 import { koaMiddleware } from '../src/middleware/koa';
 import { fastifyPlugin } from '../src/middleware/fastify';
+import { bodyJson } from './helpers/request-body';
 
 const KEY = 'sk_live_wave5_secret';
 const mockFetch = jest.fn();
@@ -18,7 +19,7 @@ function ok() {
 }
 
 function sentEvents(): any[] {
-  return mockFetch.mock.calls.flatMap((c) => JSON.parse(c[1].body).events);
+  return mockFetch.mock.calls.flatMap((c) => bodyJson(c[1]).events);
 }
 
 function fakeReqRes(url: string, headers: Record<string, string> = {}, extra: Record<string, unknown> = {}) {
@@ -50,8 +51,9 @@ describe('G266/G269: bounded queue, one flusher, 500-event batches', () => {
     expect(mockFetch).not.toHaveBeenCalled();
     await client.flush();
     expect(mockFetch).toHaveBeenCalledTimes(1);
-    expect(JSON.parse(mockFetch.mock.calls[0][1].body).events).toHaveLength(499);
-    expect(mockFetch.mock.calls[0][1].headers['Content-Encoding']).toBeUndefined();
+    expect(bodyJson(mockFetch.mock.calls[0][1]).events).toHaveLength(499);
+    // A 499-event body is far over 1 KiB, so it is gzip-encoded (wave 8, G269).
+    expect(mockFetch.mock.calls[0][1].headers['Content-Encoding']).toBe('gzip');
     await client.shutdown();
   });
 

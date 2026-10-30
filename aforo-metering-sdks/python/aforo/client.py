@@ -114,6 +114,7 @@ class AforoClient:
             retry_base=opts.retry_base_s,
             shutdown_timeout=opts.shutdown_timeout,
             allow_insecure_http=opts.allow_insecure_http,
+            compression=opts.compression,
             on_drop=opts.on_drop,
             on_error=opts.on_error,
             on_accepted=opts.on_accepted,

@@ -8,6 +8,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { QuotaGuard, parseQuotaResponse } from '../src/interceptor/QuotaGuard.js';
 import { unwrapEnvelope } from '../src/telemetry/IngestorClient.js';
+import { bodyJson } from '../test-support/request-body';
 
 // Response shapes come from the shared contract (derived from the real
 // controller + ApiResponseAdvice), not from this proxy's own types.
@@ -107,7 +108,7 @@ describe('QuotaGuard', () => {
       assert.equal(calls[0].init.method, quotaSpec.method);
       assert.equal(calls[0].init.headers['X-API-Key'], 'k1');
       assert.equal(calls[0].init.headers['X-Tenant-Id'], 't1');
-      const body = JSON.parse(calls[0].init.body);
+      const body = bodyJson(calls[0].init);
       for (const f of quotaSpec.requestRequiredFields) assert.ok(body[f], `required request field '${f}'`);
       const known = [...quotaSpec.requestRequiredFields, ...quotaSpec.requestOptionalFields];
       for (const k of Object.keys(body)) assert.ok(known.includes(k), `request field '${k}' is not on the DTO`);

@@ -37,7 +37,7 @@ import java.util.logging.Logger;
 public class AforoClient implements AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(AforoClient.class.getName());
-    static final String SDK_VERSION = "2.0.0";
+    static final String SDK_VERSION = "2.1.0";
 
     private final TransportCore<ResolvedEvent> core;
     private final String productType;
@@ -59,6 +59,7 @@ public class AforoClient implements AutoCloseable {
                 .baseUrl(options.getBaseUrl())
                 .apiKey(options.getApiKey())
                 .allowInsecureHttp(options.isAllowInsecureHttp())
+                .compression(options.getCompression())
                 .userAgent("aforo-java/" + SDK_VERSION)
                 .flushCount(options.getFlushCount())
                 .flushIntervalMs(options.getFlushIntervalMs())

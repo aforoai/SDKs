@@ -7,6 +7,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { AforoMcpBilling, EXECUTION_STATUSES, defaultToolStatus } from '../src/index';
+import { bodyJson } from './helpers/request-body';
 
 const mockFetch = jest.fn();
 global.fetch = mockFetch as any;
@@ -38,7 +39,7 @@ const req = (name = 'search') => ({ params: { name, _meta: { agent_id: 'agt_1' }
 async function statusesSent(billing: AforoMcpBilling): Promise<string[]> {
   mockFetch.mockResolvedValue({ ok: true, status: 200, text: async () => '' });
   await billing.flush();
-  const body = JSON.parse(mockFetch.mock.calls[mockFetch.mock.calls.length - 1][1].body);
+  const body = bodyJson(mockFetch.mock.calls[mockFetch.mock.calls.length - 1][1]);
   return body.events.map((e: any) => e.executionStatus);
 }
 

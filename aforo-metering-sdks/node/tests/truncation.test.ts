@@ -9,6 +9,7 @@ import { koaMiddleware } from '../src/middleware/koa';
 import { fastifyPlugin } from '../src/middleware/fastify';
 import { AforoClient } from '../src/client';
 import { truncateToLimit, truncateRequestLabel, resetTruncationWarnings } from '../src/limits';
+import { bodyJson } from './helpers/request-body';
 
 const mockFetch = jest.fn();
 global.fetch = mockFetch as any;
@@ -19,7 +20,7 @@ process.removeAllListeners('SIGINT');
 const CLIENT = { flushCount: 1, flushInterval: 60_000, maxRetries: 0 };
 const settle = () => new Promise((r) => setTimeout(r, 50));
 const sentEvents = () =>
-  mockFetch.mock.calls.flatMap((c) => JSON.parse(c[1].body).events as any[]);
+  mockFetch.mock.calls.flatMap((c) => bodyJson(c[1]).events as any[]);
 const truncationWarnings = (spy: jest.SpyInstance) =>
   spy.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('truncated to'));
 

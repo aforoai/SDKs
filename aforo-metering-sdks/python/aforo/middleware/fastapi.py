@@ -73,6 +73,7 @@ class AforoMeteringMiddleware:
             flush_interval=opts.flush_interval,
             max_queue_size=opts.max_queue_size,
             allow_insecure_http=opts.allow_insecure_http,
+            compression=opts.compression,
         )
         self._exclude_paths = opts.exclude_paths or _DEFAULT_EXCLUDE
         self._exclude_status_codes = opts.exclude_status_codes

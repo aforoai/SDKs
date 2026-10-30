@@ -7,6 +7,7 @@ import threading
 from typing import Any, Callable, Dict, List, Optional
 
 import httpx
+from .gzip_body import request_bytes
 
 
 class FakeClock:
@@ -39,7 +40,7 @@ class ScriptedServer:
         self._lock = threading.Lock()
 
     def handle(self, request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content.decode("utf-8"))
+        body = json.loads(request_bytes(request).decode("utf-8"))
         with self._lock:
             self.requests.append({"headers": dict(request.headers), "body": body,
                                   "keys": [e.get("idempotencyKey") for e in body.get("events", [])]})

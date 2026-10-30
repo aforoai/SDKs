@@ -12,6 +12,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { AforoMqttBilling } from '../index';
+import { bodyJson } from '../../test-support/request-body';
 
 const MODULE_KEY = 'node-mqtt';
 
@@ -88,7 +89,7 @@ describe('ingest contract guard (shared fixture)', () => {
     const [url, options] = mockFetch.mock.calls[0];
     expect(new URL(String(url)).pathname).toBe(endpoint);
     expect(options.method).toBe('POST');
-    const body = JSON.parse(options.body);
+    const body = bodyJson(options);
     assertBodyMatchesContract(spec, body);
     // The API key travels as X-API-Key only; every event names its product type.
     expect(options.headers['X-API-Key']).toBe('sk_test_abc');
@@ -117,7 +118,7 @@ describe('ingest contract guard (shared fixture)', () => {
     await handlers['publish']({ topic: 'sensors/other', payload: Buffer.from('2'), qos: 0 }, { id: 'client-1' });
     await billing.shutdown();
 
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     assertBodyMatchesContract(spec, body);
     const [withStatus, withoutStatus] = body[spec.batchKey];
     expect(withStatus.executionStatus).toBe('SUCCESS');

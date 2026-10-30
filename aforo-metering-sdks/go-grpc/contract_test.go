@@ -11,7 +11,6 @@ package grpcmetering
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -131,7 +130,7 @@ func TestIngestContract(t *testing.T) {
 	var paths []string
 	var bodies [][]byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
+		b, _ := readRequestBody(r)
 		mu.Lock()
 		paths = append(paths, r.URL.Path)
 		bodies = append(bodies, b)
@@ -195,7 +194,7 @@ func TestIngestContract_ExecutionStatusValues(t *testing.T) {
 	var mu sync.Mutex
 	var bodies [][]byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
+		b, _ := readRequestBody(r)
 		mu.Lock()
 		bodies = append(bodies, b)
 		mu.Unlock()
@@ -295,7 +294,7 @@ type scriptedServer struct {
 }
 
 func (s *scriptedServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	raw, _ := io.ReadAll(r.Body)
+	raw, _ := readRequestBody(r)
 	var body struct {
 		Events []map[string]any `json:"events"`
 	}

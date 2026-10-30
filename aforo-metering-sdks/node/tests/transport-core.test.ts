@@ -13,7 +13,9 @@ import {
   checkBaseUrl,
   fullJitter,
   parseRetryAfter,
+  COMPRESSION_MIN_BYTES,
 } from '../src/transport-core/core';
+import { bodyJson } from './helpers/request-body';
 
 interface Ev {
   idempotencyKey: string;
@@ -64,7 +66,7 @@ function fakeSleep(holdAtOrAbove = 1e7): { sleep: CoreSleep; delays: number[] } 
 
 interface Harness {
   core: TransportCore<Ev>;
-  calls: Array<{ url: string; headers: Record<string, string>; keys: string[]; body: string }>;
+  calls: Array<{ url: string; headers: Record<string, string>; keys: string[]; body: string | Uint8Array }>;
   drops: Array<{ reason: CoreDropReason; keys: string[] }>;
   logs: string[];
   delays: number[];
@@ -85,7 +87,7 @@ function harness(
     inFlight++;
     max = Math.max(max, inFlight);
     try {
-      const events = JSON.parse(init.body).events as Ev[];
+      const events = bodyJson(init).events as Ev[];
       calls.push({ url, headers: init.headers, keys: events.map((e) => e.idempotencyKey), body: init.body });
       return await answer(calls.length, events);
     } finally {
@@ -119,8 +121,9 @@ describe('transport core: queue and single flusher', () => {
     }, { flushCount: 100 });
     for (let i = 0; i < 450; i++) h.core.enqueue(ev(i));
     expect(h.calls.length).toBe(0); // track() itself never starts a request
-    await new Promise((r) => setImmediate(r));
-    expect(h.calls.length).toBe(1); // the flusher woke and sent one batch
+    // The flusher wakes on its own; gzip makes the send a few ticks later than enqueue.
+    for (let i = 0; i < 100 && h.calls.length === 0; i++) await new Promise((r) => setImmediate(r));
+    expect(h.calls.length).toBe(1); // the flusher woke and sent one batch (the gate holds the rest)
     const done = h.core.flush();
     const second = h.core.flush();
     release();
@@ -130,12 +133,43 @@ describe('transport core: queue and single flusher', () => {
     await h.core.shutdown();
   });
 
-  test('default batch is 500 events, clamped to 1000, no Content-Encoding header', async () => {
+  /** Size of the decoded JSON a call carried. */
+  const utf8 = (body: unknown) => Buffer.byteLength(JSON.stringify(bodyJson({ body })), 'utf8');
+
+  test('gzip only at 1 KiB or more; the same bytes on every retry; compression none sends JSON', async () => {
+    const small = harness((_n, events) => accepted(events.length));
+    small.core.enqueue(ev(1));
+    await small.core.flush();
+    expect(typeof small.calls[0].body).toBe('string');
+    expect(small.calls[0].headers['Content-Encoding']).toBeUndefined();
+    await small.core.shutdown();
+
+    const retried = harness((n, events) => (n === 1 ? response(503) : accepted(events.length)));
+    for (let i = 0; i < 50; i++) retried.core.enqueue(ev(i));
+    await retried.core.flush();
+    expect(retried.calls).toHaveLength(2);
+    expect(retried.calls[0].body).toBeInstanceOf(Uint8Array);
+    expect(Buffer.from(retried.calls[1].body as Uint8Array).equals(Buffer.from(retried.calls[0].body as Uint8Array))).toBe(true);
+    expect(utf8(retried.calls[0].body)).toBeGreaterThan((retried.calls[0].body as Uint8Array).length);
+    await retried.core.shutdown();
+
+    const off = harness((_n, events) => accepted(events.length), { compression: 'none' });
+    for (let i = 0; i < 50; i++) off.core.enqueue(ev(i));
+    await off.core.flush();
+    expect(typeof off.calls[0].body).toBe('string');
+    expect(off.calls[0].headers['Content-Encoding']).toBeUndefined();
+    await off.core.shutdown();
+
+    expect(() => new TransportCore<Ev>({ baseUrl: 'https://x.example', apiKey: 'k', compression: 'br' as any, flushOnExit: false }))
+      .toThrow(/compression/);
+  });
+
+  test('default batch is 500 events, clamped to 1000, gzip-encoded (G269, wave 8)', async () => {
     const h = harness((_n, events) => accepted(events.length));
     for (let i = 0; i < 1200; i++) h.core.enqueue(ev(i));
     await h.core.flush();
     expect(h.calls.map((c) => c.keys.length)).toEqual([500, 500, 200]);
-    expect(Object.keys(h.calls[0].headers).map((k) => k.toLowerCase())).not.toContain('content-encoding');
+    expect(h.calls[0].headers['Content-Encoding']).toBe('gzip');
     expect(h.calls[0].headers['X-API-Key']).toBe(API_KEY);
     expect(h.calls[0].url).toBe('https://ingest.example/v1/ingest/batch');
     await h.core.shutdown();
@@ -347,7 +381,7 @@ describe('transport core: shutdown', () => {
       sleep: fakeSleep().sleep,
       logger: { debug: () => {}, warn: () => {}, error: () => {} },
       fetch: async (_u, init) => {
-        sent.push(...JSON.parse(init.body).events.map((e: Ev) => e.idempotencyKey));
+        sent.push(...bodyJson(init).events.map((e: Ev) => e.idempotencyKey));
         return accepted(1);
       },
     });
@@ -408,6 +442,7 @@ describe('transport core: defaults come from contract/ingest-contract.json trans
     expect(CORE_DEFAULTS.retryAfterMaxMs).toBe(policy.retry.retryAfter.maxMs);
     expect(CORE_DEFAULTS.breakerInitialMs).toBe(policy.afterRetriesExhausted.breakerCooldownMs.initial);
     expect(CORE_DEFAULTS.breakerMaxMs).toBe(policy.afterRetriesExhausted.breakerCooldownMs.max);
-    expect(policy.compression.gzip).toBe(false);
+    expect(policy.compression.gzip).toBe(true);
+    expect(policy.compression.minBytes).toBe(COMPRESSION_MIN_BYTES);
   });
 });

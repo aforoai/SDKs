@@ -11,6 +11,7 @@ from aforo.client import AforoClient
 from aforo.types import TrackEvent
 
 from .fakes import ScriptedServer, wait_until
+from .gzip_body import request_bytes
 
 URL = "https://ingest.example.test"
 
@@ -84,7 +85,7 @@ class TestAforoClient:
         def handle(request):
             import json
 
-            if json.loads(request.content)["events"][0]["metricName"] == "system.session.heartbeat":
+            if json.loads(request_bytes(request))["events"][0]["metricName"] == "system.session.heartbeat":
                 raise httpx.ConnectError("boom")
             return httpx.Response(202, json={"data": {"failed": 0}})
 

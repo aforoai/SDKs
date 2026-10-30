@@ -26,7 +26,7 @@ import (
 	"github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql/v2/internal/ingest"
 )
 
-const sdkVersion = "2.0.0"
+const sdkVersion = "2.1.0"
 
 // maxGqlOperationNameLen is the ingestor's limit for gqlOperationName.
 const maxGqlOperationNameLen = 255
@@ -81,6 +81,7 @@ type Config struct {
 	MaxRequestBodyBytes int64
 
 	AllowInsecureHTTP bool          // allow http:// to a host other than localhost/127.0.0.1/::1
+	Compression       string        // "gzip" (default; 1 KiB+ batches gzip-encoded, needs usage-ingestor wave 8+) or "none"
 	FlushCount        int           // events per request, default 500 (max 1000)
 	FlushInterval     time.Duration // default 5s
 	MaxQueueSize      int           // default 10000; when full the oldest event is dropped (DropOverflow)
