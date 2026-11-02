@@ -1,5 +1,5 @@
 /**
- * Real-server integration test for @aforo/graphql-metering.
+ * Real-server integration test for @aforoai/graphql-metering.
  *
  * Where the unit tests use a fake req/res object, this file:
  *   - builds a real GraphQL schema with the `graphql` peer dep
@@ -23,6 +23,14 @@
 import { AforoGraphQlBilling } from '../index';
 import * as http from 'http';
 import { AddressInfo } from 'net';
+import {
+  INTEGRATION_TEST_TIMEOUT_MS,
+  runCleanups,
+  trackFetch,
+  waitFor,
+  type FetchTracker,
+} from '../../test-support/timing';
+import { requestText } from '../../test-support/request-body';
 
 let graphqlPkg: any;
 try {
@@ -46,16 +54,27 @@ interface Fixture {
   ingestorServer: http.Server;
   captured: CapturedRequest[];
   billing: AforoGraphQlBilling;
+  fetches: FetchTracker;
+}
+
+function closeHttpServer(server: http.Server): Promise<void> {
+  return new Promise<void>((resolve) => {
+    server.close(() => resolve());
+    // Keep-alive sockets (the SDK's fetch, or a request a failed test left
+    // open) would otherwise hold close() open.
+    (server as any).closeAllConnections?.();
+  });
 }
 
 async function setup(): Promise<Fixture> {
+  const fetches = trackFetch();
   const captured: CapturedRequest[] = [];
   const ingestorServer = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on('data', (c) => chunks.push(c));
     req.on('end', () => {
       try {
-        const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || 'null');
+        const body = JSON.parse(requestText(req.headers['content-encoding'], Buffer.concat(chunks)) || 'null');
         captured.push({ url: String(req.url), body, headers: { ...req.headers } });
       } catch {
         captured.push({ url: String(req.url), body: null, headers: { ...req.headers } });
@@ -71,7 +90,7 @@ async function setup(): Promise<Fixture> {
     tenantId: 'tenant-int-gql',
     productId: 'prod-int-gql',
     apiKey: 'sk_int_gql',
-    onError: () => {}, // ignore teardown-race flush noise
+    customerResolver: (ctx: any) => ctx?.customerId, trustCustomerHeader: true,
     ingestorUrl: `http://127.0.0.1:${ingestorPort}`,
     schemaVersion: 'v-test',
     flushCount: 1,
@@ -127,13 +146,23 @@ async function setup(): Promise<Fixture> {
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   const serverPort = (server.address() as AddressInfo).port;
 
-  return { serverPort, server, ingestorServer, captured, billing };
+  return { serverPort, server, ingestorServer, captured, billing, fetches };
 }
 
+/**
+ * Quiesce, then close — in dependency order, and independent of how the test
+ * ended: stop the GraphQL server (no new events), flush, wait for every
+ * in-flight flush to land, and only then close the ingestor it flushes to.
+ */
 async function teardown(f: Fixture): Promise<void> {
-  await f.billing.shutdown();
-  await new Promise<void>((r) => f.server.close(() => r()));
-  await new Promise<void>((r) => f.ingestorServer.close(() => r()));
+  await runCleanups([
+    ['graphql server.close', () => closeHttpServer(f.server)],
+    ['billing.shutdown', () => f.billing.shutdown()],
+    ['in-flight flushes', () =>
+      waitFor(() => f.fetches.pending() === 0, () => `SDK fetches to settle (pending=${f.fetches.pending()})`)],
+    ['ingestor.close', () => closeHttpServer(f.ingestorServer)],
+    ['restore fetch', () => f.fetches.restore()],
+  ]);
 }
 
 function flatEvents(captured: CapturedRequest[]): any[] {
@@ -165,18 +194,19 @@ async function postGraphql(port: number, body: any, customerId?: string): Promis
   });
 }
 
-async function waitForEvents(
+/** Wait until the captured events satisfy `predicate`; returns them. */
+function waitForEvents(
   captured: CapturedRequest[],
   predicate: (events: any[]) => boolean,
-  timeoutMs = 2000,
+  what: string,
 ): Promise<any[]> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const events = flatEvents(captured);
-    if (predicate(events)) return events;
-    await new Promise((r) => setTimeout(r, 25));
-  }
-  throw new Error(`waitForEvents timed out. captured=${JSON.stringify(captured, null, 2)}`);
+  return waitFor(
+    () => {
+      const events = flatEvents(captured);
+      return predicate(events) ? events : undefined;
+    },
+    () => `${what}. captured=${JSON.stringify(captured, null, 2)}`,
+  );
 }
 
 describe('Real-server integration (graphql + http middleware)', () => {
@@ -193,7 +223,7 @@ describe('Real-server integration (graphql + http middleware)', () => {
 
   afterEach(async () => {
     await teardown(fix);
-  });
+  }, INTEGRATION_TEST_TIMEOUT_MS);
 
   itIfPeer(
     'QUERY operation against real schema → metering event with correct shape',
@@ -210,7 +240,7 @@ describe('Real-server integration (graphql + http middleware)', () => {
       expect(status).toBe(200);
       expect(json.data.user).toEqual({ id: 'u1', name: 'user-u1' });
 
-      const events = await waitForEvents(fix.captured, (evs) => evs.length >= 1);
+      const events = await waitForEvents(fix.captured, (evs) => evs.length >= 1, 'the metering event');
       const ev = events[0];
       expect(ev.productType).toBe('GRAPHQL_API');
       expect(ev.gqlOperationType).toBe('QUERY');
@@ -221,7 +251,7 @@ describe('Real-server integration (graphql + http middleware)', () => {
       expect(ev.customerId).toBe('cust_query_001');
       expect(ev.metadata?.schemaVersion).toBe('v-test');
     },
-    10_000,
+    INTEGRATION_TEST_TIMEOUT_MS,
   );
 
   itIfPeer(
@@ -238,13 +268,13 @@ describe('Real-server integration (graphql + http middleware)', () => {
       );
       expect(status).toBe(200);
 
-      const events = await waitForEvents(fix.captured, (evs) => evs.length >= 1);
+      const events = await waitForEvents(fix.captured, (evs) => evs.length >= 1, 'the metering event');
       const ev = events[0];
       expect(ev.gqlOperationType).toBe('MUTATION');
       expect(ev.gqlOperationName).toBe('Rename');
       expect(ev.customerId).toBe('cust_mut_001');
     },
-    10_000,
+    INTEGRATION_TEST_TIMEOUT_MS,
   );
 
   itIfPeer(
@@ -255,13 +285,21 @@ describe('Real-server integration (graphql + http middleware)', () => {
       });
       expect(status).toBe(200);
 
-      // Give it a beat — any spurious event would have flushed by now
-      await new Promise((r) => setTimeout(r, 200));
-      await fix.billing.shutdown();
+      // Proving "nothing was emitted" by sleeping is a guess. Instead send a
+      // sentinel request AFTER it that must be metered: once the sentinel's
+      // event has reached the ingestor, anything the anonymous request had
+      // emitted would be there too.
+      const sentinel = await postGraphql(fix.serverPort, { query: '{ ping }' }, 'cust_sentinel');
+      expect(sentinel.status).toBe(200);
+      const events = await waitForEvents(
+        fix.captured,
+        (evs) => evs.some((e: any) => e.customerId === 'cust_sentinel'),
+        'the sentinel metering event',
+      );
 
-      expect(flatEvents(fix.captured)).toHaveLength(0);
+      expect(events.map((e: any) => e.customerId)).toEqual(['cust_sentinel']);
     },
-    10_000,
+    INTEGRATION_TEST_TIMEOUT_MS,
   );
 
   itIfPeer(
@@ -276,11 +314,11 @@ describe('Real-server integration (graphql + http middleware)', () => {
       );
       expect(status).toBe(400);
 
-      const events = await waitForEvents(fix.captured, (evs) => evs.length >= 1);
+      const events = await waitForEvents(fix.captured, (evs) => evs.length >= 1, 'the metering event');
       const ev = events[0];
       expect(ev.gqlHasErrors).toBe(true);
       expect(ev.customerId).toBe('cust_err_001');
     },
-    10_000,
+    INTEGRATION_TEST_TIMEOUT_MS,
   );
 });

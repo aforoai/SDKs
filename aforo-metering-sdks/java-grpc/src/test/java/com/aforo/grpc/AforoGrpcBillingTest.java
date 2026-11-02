@@ -38,7 +38,7 @@ class AforoGrpcBillingTest {
     private final AtomicInteger responseStatus = new AtomicInteger(204);
     private final ObjectMapper mapper = new ObjectMapper();
 
-    record CapturedRequest(String method, String path, String authorization,
+    record CapturedRequest(String method, String path, String authorization, String apiKey,
                            String tenantId, JsonNode body) {}
 
     @BeforeEach
@@ -47,12 +47,13 @@ class AforoGrpcBillingTest {
         port = server.getAddress().getPort();
         server.createContext("/", exchange -> {
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
-            exchange.getRequestBody().transferTo(buf);
+            buf.writeBytes(com.aforo.testsupport.RequestBodies.read(exchange));
             JsonNode body = buf.size() == 0 ? null : mapper.readTree(buf.toByteArray());
             requests.add(new CapturedRequest(
                     exchange.getRequestMethod(),
                     exchange.getRequestURI().getPath(),
                     exchange.getRequestHeaders().getFirst("Authorization"),
+                    exchange.getRequestHeaders().getFirst("X-API-Key"),
                     exchange.getRequestHeaders().getFirst("X-Tenant-Id"),
                     body
             ));
@@ -68,7 +69,7 @@ class AforoGrpcBillingTest {
     }
 
     private AforoGrpcBilling.Builder baseBuilder() {
-        return AforoGrpcBilling.newBuilder()
+        return AforoGrpcBilling.newBuilder().trustCustomerHeader(true)
                 .tenantId("tenant-001")
                 .productId("prod-001")
                 .apiKey("sk_test_abc")
@@ -92,15 +93,15 @@ class AforoGrpcBillingTest {
     @DisplayName("Missing required fields throw IllegalArgumentException")
     void missingFieldsRejected() {
         // Each required field missing throws
-        assertThatIllegalArgumentExceptionThrown(() -> AforoGrpcBilling.newBuilder()
+        assertThatIllegalArgumentExceptionThrown(() -> AforoGrpcBilling.newBuilder().trustCustomerHeader(true)
                 .productId("p").apiKey("k").ingestorUrl("u").serviceName("s").build());
-        assertThatIllegalArgumentExceptionThrown(() -> AforoGrpcBilling.newBuilder()
+        assertThatIllegalArgumentExceptionThrown(() -> AforoGrpcBilling.newBuilder().trustCustomerHeader(true)
                 .tenantId("t").apiKey("k").ingestorUrl("u").serviceName("s").build());
-        assertThatIllegalArgumentExceptionThrown(() -> AforoGrpcBilling.newBuilder()
+        assertThatIllegalArgumentExceptionThrown(() -> AforoGrpcBilling.newBuilder().trustCustomerHeader(true)
                 .tenantId("t").productId("p").ingestorUrl("u").serviceName("s").build());
-        assertThatIllegalArgumentExceptionThrown(() -> AforoGrpcBilling.newBuilder()
+        assertThatIllegalArgumentExceptionThrown(() -> AforoGrpcBilling.newBuilder().trustCustomerHeader(true)
                 .tenantId("t").productId("p").apiKey("k").serviceName("s").build());
-        assertThatIllegalArgumentExceptionThrown(() -> AforoGrpcBilling.newBuilder()
+        assertThatIllegalArgumentExceptionThrown(() -> AforoGrpcBilling.newBuilder().trustCustomerHeader(true)
                 .tenantId("t").productId("p").apiKey("k").ingestorUrl("u").build());
     }
 
@@ -125,9 +126,11 @@ class AforoGrpcBillingTest {
 
         CapturedRequest req = requests.get(0);
         assertThat(req.method()).isEqualTo("POST");
-        // trailing slash on ingestorUrl must be stripped before appending /v1/ingest/events
-        assertThat(req.path()).isEqualTo("/v1/ingest/events");
-        assertThat(req.authorization()).isEqualTo("Bearer sk_test_abc");
+        // trailing slash on ingestorUrl must be stripped before appending /v1/ingest/batch
+        assertThat(req.path()).isEqualTo("/v1/ingest/batch");
+        assertThat(req.apiKey()).isEqualTo("sk_test_abc");
+        // Bearer is parsed as a JWT by the ingestor and rejected 401, even alongside X-API-Key
+        assertThat(req.authorization()).isNull();
         assertThat(req.tenantId()).isEqualTo("tenant-001");
 
         JsonNode events = req.body().get("events");
@@ -247,6 +250,72 @@ class AforoGrpcBillingTest {
             waitFor(() -> requests.size() >= 3, 12_000);
         }
         assertThat(requests).hasSizeGreaterThanOrEqualTo(3);
+    }
+
+    // ── executionStatus ────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("outcomeFromGrpcStatus maps every Status.Code per the gateway table")
+    void outcomeMappingTable() {
+        java.util.Map<io.grpc.Status.Code, String> expected = new java.util.EnumMap<>(io.grpc.Status.Code.class);
+        expected.put(io.grpc.Status.Code.OK, "SUCCESS");
+        expected.put(io.grpc.Status.Code.CANCELLED, "CANCELLED");
+        expected.put(io.grpc.Status.Code.INVALID_ARGUMENT, "VALIDATION_FAILED");
+        expected.put(io.grpc.Status.Code.FAILED_PRECONDITION, "VALIDATION_FAILED");
+        expected.put(io.grpc.Status.Code.OUT_OF_RANGE, "VALIDATION_FAILED");
+        expected.put(io.grpc.Status.Code.DEADLINE_EXCEEDED, "TIMEOUT");
+        expected.put(io.grpc.Status.Code.PERMISSION_DENIED, "BLOCKED");
+        expected.put(io.grpc.Status.Code.RESOURCE_EXHAUSTED, "BLOCKED");
+        expected.put(io.grpc.Status.Code.UNAUTHENTICATED, "BLOCKED");
+        for (io.grpc.Status.Code code : io.grpc.Status.Code.values()) {
+            assertThat(AforoGrpcBilling.outcomeFromGrpcStatus(code))
+                    .as(code.name()).isEqualTo(expected.getOrDefault(code, "ERROR"));
+        }
+        assertThat(AforoGrpcBilling.outcomeFromGrpcStatus((io.grpc.Status.Code) null)).isNull();
+        assertThat(AforoGrpcBilling.outcomeFromGrpcStatus(" deadline_exceeded ")).isEqualTo("TIMEOUT");
+        assertThat(AforoGrpcBilling.outcomeFromGrpcStatus("NOT_A_CODE")).isNull();
+        assertThat(AforoGrpcBilling.outcomeFromGrpcStatus("  ")).isNull();
+    }
+
+    @Test
+    @DisplayName("record() sends executionStatus: derived, explicit (wins, normalized), blank→derived, unknown label→omitted")
+    void recordSendsExecutionStatus() throws Exception {
+        try (AforoGrpcBilling b = baseBuilder().flushCount(5).build()) {
+            b.record("M", "UNARY", "cust_001", "DEADLINE_EXCEEDED", 1L);          // derived
+            b.record("M", "UNARY", "cust_001", "OK", 1L, "  partial ");           // explicit wins
+            b.record("M", "UNARY", "cust_001", "UNAVAILABLE", 1L, "   ");         // blank → derived
+            b.record("M", "UNARY", "cust_001", "custom-label", 1L);               // no derivation
+            b.record("M", "UNARY", "cust_001", "custom-label", 1L, null);         // nothing set
+            waitFor(() -> requests.size() == 1, 2000);
+        }
+        JsonNode events = requests.get(0).body().get("events");
+        assertThat(events.size()).isEqualTo(5);
+        assertThat(events.get(0).get("executionStatus").asText()).isEqualTo("TIMEOUT");
+        assertThat(events.get(1).get("executionStatus").asText()).isEqualTo("PARTIAL");
+        assertThat(events.get(1).get("grpcStatusCode").asText()).isEqualTo("OK");
+        assertThat(events.get(2).get("executionStatus").asText()).isEqualTo("ERROR");
+        assertThat(events.get(3).has("executionStatus")).isFalse();
+        assertThat(events.get(4).has("executionStatus")).isFalse();
+    }
+
+    @Test
+    @DisplayName("record(): unknown explicit executionStatus is dropped (derived status used); rest of the event is sent")
+    void recordIgnoresUnknownExplicitExecutionStatus() throws Exception {
+        try (AforoGrpcBilling b = baseBuilder().flushCount(3).build()) {
+            b.record("M", "UNARY", "cust_001", "DEADLINE_EXCEEDED", 1L, "not_a_status");
+            b.record("M", "UNARY", "cust_001", "custom-label", 1L, "SUCCESS_BUT_WAY_TOO_LONG_FOR_IT");
+            b.record("M", "UNARY", "cust_001", "OK", 1L, " hitl_required ");
+            waitFor(() -> requests.size() == 1, 2000);
+        }
+        JsonNode events = requests.get(0).body().get("events");
+        assertThat(events.size()).isEqualTo(3);
+        assertThat(events.get(0).get("executionStatus").asText()).isEqualTo("TIMEOUT");
+        assertThat(events.get(0).get("grpcMethod").asText()).isEqualTo("M");
+        assertThat(events.get(1).has("executionStatus")).isFalse();
+        assertThat(events.get(1).get("customerId").asText()).isEqualTo("cust_001");
+        assertThat(events.get(2).get("executionStatus").asText()).isEqualTo("HITL_REQUIRED");
+        assertThat(AforoGrpcBilling.canonicalExecutionStatus("bogus")).isNull();
+        assertThat(AforoGrpcBilling.canonicalExecutionStatus(" validation_failed ")).isEqualTo("VALIDATION_FAILED");
     }
 
     // ── Helpers ────────────────────────────────────────────────────────

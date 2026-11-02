@@ -4,7 +4,7 @@
  * detects tool calls and their responses, delegates to ToolCallTracker.
  */
 
-import type { JsonRpcMessage, JsonRpcRequest, JsonRpcResponse } from '../types.js';
+import type { JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse } from '../types.js';
 import { logger } from '../util/logger.js';
 
 /** Methods we meter (bill for tool invocations) */
@@ -30,11 +30,23 @@ export interface ParsedToolCall {
   requestId: string | number;
   toolName: string;
   agentId: string;
+  /**
+   * `_meta.customer_id` as the client sent it. Untrusted: used for billing
+   * only with `trustClientCustomerId` (see identity/customer.ts).
+   */
+  customerId?: string;
+  /** The call's `params._meta`, as sent. */
+  meta?: Record<string, unknown>;
 }
 
 export interface ParsedToolResponse {
   requestId: string | number;
+  /** A JSON-RPC error response (the call failed at the protocol level). */
   hasError: boolean;
+  /** The JSON-RPC `result` — a tool reports its own failure with `isError: true` here. */
+  result?: unknown;
+  /** The JSON-RPC `error` object, when present. */
+  error?: JsonRpcError;
   responseBytes: number;
 }
 
@@ -62,6 +74,30 @@ export function parseMessage(raw: string): JsonRpcMessage | null {
   }
 }
 
+function isJsonRpcObject(value: unknown): value is JsonRpcMessage {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+    && (value as { jsonrpc?: unknown }).jsonrpc === '2.0';
+}
+
+/**
+ * Parse a raw message that may be a single JSON-RPC message or a JSON-RPC
+ * batch (an array of them). Returns null for anything that is not JSON-RPC.
+ * In a batch, elements that are not JSON-RPC objects are skipped.
+ */
+export function parseJsonRpc(raw: string): { batch: boolean; messages: JsonRpcMessage[] } | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (Array.isArray(parsed)) {
+    const messages = parsed.filter(isJsonRpcObject);
+    return messages.length ? { batch: true, messages } : null;
+  }
+  return isJsonRpcObject(parsed) ? { batch: false, messages: [parsed] } : null;
+}
+
 /**
  * Extract tool call info from a tools/call JSON-RPC request.
  */
@@ -73,8 +109,14 @@ export function extractToolCall(msg: JsonRpcRequest): ParsedToolCall | null {
   const toolName = (params?.name as string) ?? 'unknown';
   const meta = params?._meta as Record<string, unknown> | undefined;
   const agentId = (meta?.agent_id as string) ?? 'unknown';
+  const customerId = typeof meta?.customer_id === 'string' && meta.customer_id.trim()
+    ? meta.customer_id.trim() : undefined;
 
-  return { requestId: msg.id, toolName, agentId };
+  return {
+    requestId: msg.id, toolName, agentId,
+    ...(customerId ? { customerId } : {}),
+    ...(meta && typeof meta === 'object' ? { meta } : {}),
+  };
 }
 
 /**
@@ -86,6 +128,8 @@ export function extractToolResponse(msg: JsonRpcResponse, rawBytes: number): Par
   return {
     requestId: msg.id,
     hasError: msg.error != null,
+    result: msg.result,
+    error: msg.error ?? undefined,
     responseBytes: rawBytes,
   };
 }

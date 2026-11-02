@@ -2,12 +2,34 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Aforo Monetized Product Protection — IAM deny policy that prevents
   deletion of API Gateway resources tagged with aforo-monetized=true.
-  Deploy alongside the main aforo-apigateway-role.yaml stack.
+  The policy protects nothing until it is attached: name the roles, users
+  or groups in AttachToRoles / AttachToUsers / AttachToGroups, or attach it
+  (or an equivalent SCP) yourself.
 
 Parameters:
   AforoAccountId:
     Type: String
-    Description: Aforo's AWS account ID
+    Default: ''
+    AllowedPattern: '^(\d{12})?$'
+    ConstraintDescription: Empty or a 12-digit AWS account ID.
+    Description: Not used. Kept so stacks created with it still update.
+  AttachToRoles:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: IAM role names to attach the policy to (comma-separated). Empty attaches to no role.
+  AttachToUsers:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: IAM user names to attach the policy to (comma-separated). Empty attaches to no user.
+  AttachToGroups:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: IAM group names to attach the policy to (comma-separated). Empty attaches to no group.
+
+Conditions:
+  HasRoles: !Not [!Equals [!Join ['', !Ref AttachToRoles], '']]
+  HasUsers: !Not [!Equals [!Join ['', !Ref AttachToUsers], '']]
+  HasGroups: !Not [!Equals [!Join ['', !Ref AttachToGroups], '']]
 
 Resources:
   AforoDenyDeleteMonetizedPolicy:
@@ -15,6 +37,9 @@ Resources:
     Properties:
       ManagedPolicyName: aforo-deny-delete-monetized-apis
       Description: Prevents deletion of API Gateway resources tagged as monetized by Aforo
+      Roles: !If [HasRoles, !Ref AttachToRoles, !Ref AWS::NoValue]
+      Users: !If [HasUsers, !Ref AttachToUsers, !Ref AWS::NoValue]
+      Groups: !If [HasGroups, !Ref AttachToGroups, !Ref AWS::NoValue]
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -22,15 +47,10 @@ Resources:
             Effect: Deny
             Action:
               - 'apigateway:DELETE'
-            Resource: !Sub 'arn:aws:apigateway:${AWS::Region}::/*'
+            Resource: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}::/*'
             Condition:
               StringEquals:
                 'aws:ResourceTag/aforo-monetized': 'true'
-      Tags:
-        - Key: aforo-managed
-          Value: 'true'
-        - Key: purpose
-          Value: monetized-product-protection
 
 Outputs:
   PolicyArn:

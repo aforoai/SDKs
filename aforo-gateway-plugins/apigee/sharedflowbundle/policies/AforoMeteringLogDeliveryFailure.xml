@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- delivery_mode sync: logs the events lost for good (print, visible in a
+     Debug session) and sets aforo.meteringDroppedEvents. -->
+<Javascript name="AforoMeteringLogDeliveryFailure" timeLimit="500" continueOnError="true">
+    <DisplayName>Aforo Metering - Log Delivery Failure</DisplayName>
+    <Properties>
+        <Property name="phase">final</Property>
+    </Properties>
+    <IncludeURL>jsc://aforo-billing.js</IncludeURL>
+    <ResourceURL>jsc://aforo-metering-delivery.js</ResourceURL>
+</Javascript>

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- delivery_mode sync: the one retry, of the events that failed transiently
+     (aforo.retryPayload). Their idempotencyKeys are unchanged, so an event
+     that did land the first time is deduplicated by the ingestor, never
+     billed twice. Same literal timeouts as the first attempt. -->
+<ServiceCallout name="AforoMeteringSendEventRetry1" continueOnError="true">
+    <DisplayName>Aforo Metering - Retry Transient Failures</DisplayName>
+    <Request variable="aforo.calloutRequestRetry1" clearPayload="true">
+        <IgnoreUnresolvedVariables>true</IgnoreUnresolvedVariables>
+        <Set>
+            <Headers>
+                <Header name="Content-Type">application/json</Header>
+                <Header name="X-API-Key">{private.aforo.apiKey}</Header>
+            </Headers>
+            <Verb>POST</Verb>
+            <Payload contentType="application/json">{aforo.retryPayload}</Payload>
+        </Set>
+    </Request>
+    <Response>aforo.calloutResponseRetry1</Response>
+    <Timeout>3000</Timeout>
+    <HTTPTargetConnection>
+        <Properties>
+            <Property name="connect.timeout.millis">1000</Property>
+            <Property name="io.timeout.millis">2000</Property>
+            <Property name="success.codes">1xx,2xx,3xx,4xx</Property>
+        </Properties>
+        <URL>{private.aforo.endpoint}</URL>
+    </HTTPTargetConnection>
+</ServiceCallout>

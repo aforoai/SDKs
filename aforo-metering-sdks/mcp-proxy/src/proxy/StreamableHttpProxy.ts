@@ -1,17 +1,26 @@
 /**
  * @file Streamable HTTP transport proxy.
- * HTTP server accepting POST to /mcp, forwarding to upstream /mcp.
- * Uses Mcp-Session-Id header for session scoping.
+ * HTTP server accepting POST/GET/DELETE, forwarding to the upstream MCP endpoint.
+ * Uses the Mcp-Session-Id header for session scoping; a request without one
+ * gets its own short-lived session.
  *
  * Client ──HTTP──► Proxy :3100/mcp ──HTTP──► Server :8080/mcp
  */
 
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
+import type { Principal } from '../types.js';
+import { readBody } from '../auth/ListenerGuard.js';
+import { SseParser, sseMessage } from '../util/sse.js';
 import { logger } from '../util/logger.js';
+import { upstreamDeadline, readCappedText, upstreamFailure, DEFAULT_UPSTREAM_TIMEOUT_MS } from '../util/upstream.js';
 import { BaseProxy } from './BaseProxy.js';
+
+/** Request headers passed to the upstream (never Authorization: the proxy's token is not the server's). */
+const FORWARDED_HEADERS = ['mcp-protocol-version', 'last-event-id'];
 
 export class StreamableHttpProxy extends BaseProxy {
   private server: Server | null = null;
+  private readonly streams = new Set<AbortController>();
 
   async start(): Promise<void> {
     const { upstream, listen } = this.config;
@@ -25,216 +34,245 @@ export class StreamableHttpProxy extends BaseProxy {
     });
 
     return new Promise((resolve, reject) => {
-      this.server!.listen(port, host, () => {
-        logger.info('Streamable HTTP proxy listening', { host, port, upstream });
-        resolve();
-      });
-
-      this.server!.on('error', (err) => {
+      this.server!.once('error', (err) => {
         logger.error('HTTP server error', { error: err.message });
         reject(err);
+      });
+      this.server!.listen(port, host, () => {
+        logger.info('Streamable HTTP proxy listening', { host, port: this.port, upstream });
+        this.markServing();
+        resolve();
       });
     });
   }
 
+  /** The port actually bound (useful with port 0). */
+  get port(): number | undefined {
+    const address = this.server?.address();
+    return address && typeof address === 'object' ? address.port : undefined;
+  }
+
   private handleRequest(req: IncomingMessage, res: ServerResponse): void {
+    const decision = this.guard!.admit(req, res);
+    if (!decision.ok) return;
     if (req.method === 'POST') {
-      this.handlePost(req, res);
+      void this.handlePost(req, res, decision.principal);
     } else if (req.method === 'GET') {
-      // SSE upgrade for server-initiated messages
+      // SSE stream for server-initiated messages
       this.handleGetSse(req, res);
     } else if (req.method === 'DELETE') {
       // Session termination
       this.handleDelete(req, res);
     } else {
-      res.writeHead(405, { 'Content-Type': 'text/plain' });
+      res.writeHead(405, { 'Content-Type': 'text/plain', ...this.guard!.corsHeaders(req) });
       res.end('Method Not Allowed');
     }
   }
 
-  private handlePost(req: IncomingMessage, res: ServerResponse): void {
-    const upstream = this.config.upstream!;
-    const mcpSessionId = req.headers['mcp-session-id'] as string | undefined;
+  private upstreamHeaders(req: IncomingMessage, mcpSessionId: string | undefined): Record<string, string> {
+    const headers: Record<string, string> = {};
+    for (const name of FORWARDED_HEADERS) {
+      const value = req.headers[name];
+      if (typeof value === 'string') headers[name] = value;
+    }
+    if (mcpSessionId) headers['Mcp-Session-Id'] = mcpSessionId;
+    return headers;
+  }
+
+  private async handlePost(req: IncomingMessage, res: ServerResponse, principal?: Principal): Promise<void> {
+    const cors = this.guard!.corsHeaders(req);
+    const body = await readBody(req, res, this.guard!.maxBodyBytes, cors);
+    if (body === null) return;
+
+    const mcpSessionId = headerValue(req, 'mcp-session-id');
+    // No Mcp-Session-Id (e.g. initialize): this request is its own session, ended when it is answered.
     const sessionId = this.sessionManager.getOrCreate(mcpSessionId);
+    const ephemeral = !mcpSessionId;
+    const finish = () => { if (ephemeral) this.sessionManager.endSession(sessionId); };
 
-    let body = '';
-    req.on('data', (chunk) => { body += chunk.toString(); });
-    req.on('end', async () => {
-      try {
-        // Intercept client message
-        const result = await this.handleClientMessage(body, sessionId);
+    let deadline: ReturnType<typeof upstreamDeadline> | undefined;
+    try {
+      const result = await this.handleClientMessage(body, sessionId, principal);
+      const echo = mcpSessionId ? { 'Mcp-Session-Id': mcpSessionId } : {};
 
-        if (!result.forward && result.response) {
-          // Quota denied
-          res.writeHead(200, {
-            'Content-Type': 'application/json',
-            ...(mcpSessionId ? { 'Mcp-Session-Id': mcpSessionId } : {}),
-          });
-          res.end(result.response);
-          return;
-        }
+      if (!result.forward) {
+        // Every call in the message was refused by the quota check.
+        res.writeHead(200, { 'Content-Type': 'application/json', ...echo, ...cors });
+        res.end(result.response);
+        finish();
+        return;
+      }
 
-        // Forward to upstream
-        const headers: Record<string, string> = {
+      deadline = upstreamDeadline(this.config.aforo.responseTimeoutMs ?? DEFAULT_UPSTREAM_TIMEOUT_MS);
+      const upstreamRes = await fetch(this.config.upstream!, {
+        method: 'POST',
+        headers: {
+          ...this.upstreamHeaders(req, mcpSessionId),
           'Content-Type': req.headers['content-type'] ?? 'application/json',
           'Accept': req.headers['accept'] ?? 'application/json, text/event-stream',
-        };
-        if (mcpSessionId) {
-          headers['Mcp-Session-Id'] = mcpSessionId;
-        }
+        },
+        body: result.raw,
+        signal: deadline.signal,
+      });
 
-        const upstreamRes = await fetch(upstream, {
-          method: 'POST',
-          headers,
-          body,
+      const contentType = upstreamRes.headers.get('content-type') ?? '';
+      const responseMcpSessionId = upstreamRes.headers.get('mcp-session-id');
+      const sessionHeader = responseMcpSessionId ? { 'Mcp-Session-Id': responseMcpSessionId } : {};
+
+      if (contentType.includes('text/event-stream') && upstreamRes.body) {
+        res.writeHead(upstreamRes.status, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          ...sessionHeader,
+          ...cors,
         });
-
-        const contentType = upstreamRes.headers.get('content-type') ?? '';
-        const responseMcpSessionId = upstreamRes.headers.get('mcp-session-id');
-
-        if (contentType.includes('text/event-stream') && upstreamRes.body) {
-          // Streaming response — forward SSE chunks
-          const responseHeaders: Record<string, string> = {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-          };
-          if (responseMcpSessionId) {
-            responseHeaders['Mcp-Session-Id'] = responseMcpSessionId;
-          }
-          res.writeHead(upstreamRes.status, responseHeaders);
-
-          const reader = upstreamRes.body.getReader();
-          const decoder = new TextDecoder();
-
-          const pipe = async (): Promise<void> => {
-            const { done, value } = await reader.read();
-            if (done) { res.end(); return; }
-
-            const chunk = decoder.decode(value, { stream: true });
-            res.write(chunk);
-
-            // Extract JSON-RPC data lines for telemetry
-            const lines = chunk.split('\n');
-            for (const line of lines) {
-              if (line.startsWith('data: ')) {
-                this.handleServerMessage(line.substring(6), sessionId);
-              }
-            }
-
-            await pipe();
-          };
-
-          pipe().catch(err => {
-            logger.error('Stream pipe error', { error: (err as Error).message });
-            if (!res.writableEnded) res.end();
-          });
-        } else {
-          // Regular JSON response
-          const responseBody = await upstreamRes.text();
-          this.handleServerMessage(responseBody, sessionId);
-
-          const responseHeaders: Record<string, string> = {
-            'Content-Type': contentType || 'application/json',
-          };
-          if (responseMcpSessionId) {
-            responseHeaders['Mcp-Session-Id'] = responseMcpSessionId;
-          }
-          res.writeHead(upstreamRes.status, responseHeaders);
-          res.end(responseBody);
-        }
-
-      } catch (err) {
-        logger.error('POST proxy error', { error: (err as Error).message });
-        res.writeHead(502, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Bad Gateway' }));
+        if (result.response) res.write(sseMessage(result.response));
+        // A streamed answer lives as long as the server keeps it open; the deadline covered the headers.
+        deadline.done();
+        await this.pipeSse(upstreamRes.body, res, sessionId);
+        finish();
+        return;
       }
-    });
+
+      // Regular JSON response (or an empty 202 for notifications).
+      const responseBody = await readCappedText(upstreamRes);
+      deadline.done();
+      this.handleServerMessage(responseBody, sessionId);
+      const merged = result.response ? mergeResponses(responseBody, result.response) : undefined;
+      res.writeHead(merged !== undefined ? 200 : upstreamRes.status, {
+        'Content-Type': merged !== undefined ? 'application/json' : (contentType || 'application/json'),
+        ...sessionHeader,
+        ...cors,
+      });
+      res.end(merged ?? responseBody);
+      finish();
+    } catch (err) {
+      deadline?.done();
+      const failure = upstreamFailure(err, deadline?.signal);
+      logger.error('POST proxy error', { error: (err as Error).message, status: failure.status });
+      if (!res.headersSent) res.writeHead(failure.status, { 'Content-Type': 'application/json', ...cors });
+      res.end(JSON.stringify({ error: failure.error }));
+      finish();
+    }
+  }
+
+  /** Copy an upstream SSE body to the client unchanged, metering each event's data. */
+  private async pipeSse(body: ReadableStream<Uint8Array>, res: ServerResponse, sessionId: string, abort?: AbortController): Promise<void> {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    const parser = new SseParser();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        res.write(chunk);
+        for (const event of parser.push(chunk)) {
+          if (event.data !== undefined) this.handleServerMessage(event.data, sessionId);
+        }
+      }
+    } catch (err) {
+      if (!abort?.signal.aborted) logger.error('Stream pipe error', { error: (err as Error).message });
+    } finally {
+      if (!res.writableEnded) res.end();
+    }
   }
 
   private handleGetSse(req: IncomingMessage, res: ServerResponse): void {
-    const upstream = this.config.upstream!;
-    const mcpSessionId = req.headers['mcp-session-id'] as string | undefined;
+    const cors = this.guard!.corsHeaders(req);
+    const mcpSessionId = headerValue(req, 'mcp-session-id');
     const sessionId = this.sessionManager.getOrCreate(mcpSessionId);
-
-    // Set up SSE response to client
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-      ...(mcpSessionId ? { 'Mcp-Session-Id': mcpSessionId } : {}),
-    });
-
-    // Connect to upstream GET for server-initiated SSE
-    const headers: Record<string, string> = {
-      'Accept': 'text/event-stream',
-    };
-    if (mcpSessionId) {
-      headers['Mcp-Session-Id'] = mcpSessionId;
-    }
-
-    fetch(upstream, { method: 'GET', headers }).then(async (upstreamRes) => {
-      if (!upstreamRes.body) { res.end(); return; }
-
-      const reader = upstreamRes.body.getReader();
-      const decoder = new TextDecoder();
-
-      const pipe = async (): Promise<void> => {
-        const { done, value } = await reader.read();
-        if (done) { res.end(); return; }
-
-        const chunk = decoder.decode(value, { stream: true });
-        res.write(chunk);
-
-        // Track for telemetry
-        const lines = chunk.split('\n');
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            this.handleServerMessage(line.substring(6), sessionId);
-          }
-        }
-
-        await pipe();
-      };
-
-      pipe().catch(() => { if (!res.writableEnded) res.end(); });
-
-    }).catch(err => {
-      logger.error('Upstream GET SSE failed', { error: (err as Error).message });
-      if (!res.writableEnded) res.end();
-    });
-
+    const abort = new AbortController();
+    this.streams.add(abort);
     res.on('close', () => {
-      this.sessionManager.endSession(sessionId);
+      abort.abort();
+      this.streams.delete(abort);
+      if (!mcpSessionId) this.sessionManager.endSession(sessionId);
     });
+
+    void (async () => {
+      try {
+        const upstreamRes = await fetch(this.config.upstream!, {
+          method: 'GET',
+          headers: { ...this.upstreamHeaders(req, mcpSessionId), 'Accept': 'text/event-stream' },
+          signal: abort.signal,
+        });
+        if (!upstreamRes.ok || !upstreamRes.body) {
+          res.writeHead(upstreamRes.status, { 'Content-Type': upstreamRes.headers.get('content-type') ?? 'text/plain', ...cors });
+          res.end(await upstreamRes.text());
+          return;
+        }
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          ...(mcpSessionId ? { 'Mcp-Session-Id': mcpSessionId } : {}),
+          ...cors,
+        });
+        await this.pipeSse(upstreamRes.body, res, sessionId, abort);
+      } catch (err) {
+        if (!abort.signal.aborted) logger.error('Upstream GET SSE failed', { error: (err as Error).message });
+        if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'application/json', ...cors });
+        if (!res.writableEnded) res.end();
+      }
+    })();
   }
 
   private handleDelete(req: IncomingMessage, res: ServerResponse): void {
-    const upstream = this.config.upstream!;
-    const mcpSessionId = req.headers['mcp-session-id'] as string | undefined;
+    const cors = this.guard!.corsHeaders(req);
+    const mcpSessionId = headerValue(req, 'mcp-session-id');
+    if (mcpSessionId) this.sessionManager.endSession(this.sessionManager.getOrCreate(mcpSessionId));
 
-    // Forward DELETE to upstream
-    const headers: Record<string, string> = {};
-    if (mcpSessionId) {
-      headers['Mcp-Session-Id'] = mcpSessionId;
-      this.sessionManager.endSession(mcpSessionId);
-    }
-
-    fetch(upstream, { method: 'DELETE', headers }).then(async (upstreamRes) => {
-      res.writeHead(upstreamRes.status);
-      res.end(await upstreamRes.text());
-    }).catch(err => {
-      logger.error('DELETE proxy error', { error: (err as Error).message });
-      res.writeHead(502);
-      res.end();
-    });
+    const deadline = upstreamDeadline(this.config.aforo.responseTimeoutMs ?? DEFAULT_UPSTREAM_TIMEOUT_MS);
+    fetch(this.config.upstream!, { method: 'DELETE', headers: this.upstreamHeaders(req, mcpSessionId), signal: deadline.signal })
+      .then(async (upstreamRes) => {
+        const text = await readCappedText(upstreamRes);
+        deadline.done();
+        res.writeHead(upstreamRes.status, cors);
+        res.end(text);
+      })
+      .catch((err) => {
+        deadline.done();
+        const failure = upstreamFailure(err, deadline.signal);
+        logger.error('DELETE proxy error', { error: (err as Error).message, status: failure.status });
+        if (!res.headersSent) res.writeHead(failure.status, cors);
+        res.end();
+      });
   }
 
   protected async cleanup(): Promise<void> {
+    for (const abort of this.streams) abort.abort();
     if (this.server) {
-      return new Promise(resolve => {
-        this.server!.close(() => resolve());
+      const server = this.server;
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+        server.closeAllConnections?.();
       });
     }
+  }
+}
+
+function headerValue(req: IncomingMessage, name: string): string | undefined {
+  const value = req.headers[name];
+  return typeof value === 'string' && value ? value : undefined;
+}
+
+/**
+ * The upstream's answer plus the proxy's refusals, as one JSON-RPC batch
+ * response. Returns undefined when the upstream body is not JSON-RPC (it is
+ * then sent as is and the refusals are lost to the client, which is logged).
+ */
+function mergeResponses(upstreamBody: string, refusals: string): string | undefined {
+  const refused = JSON.parse(refusals) as unknown;
+  const refusedList = Array.isArray(refused) ? refused : [refused];
+  if (!upstreamBody.trim()) return JSON.stringify(refusedList);
+  try {
+    const parsed = JSON.parse(upstreamBody) as unknown;
+    const list = Array.isArray(parsed) ? parsed : [parsed];
+    return JSON.stringify([...list, ...refusedList]);
+  } catch {
+    logger.warn('Upstream answer is not JSON; refused calls could not be added to it', { refused: refusedList.length });
+    return undefined;
   }
 }

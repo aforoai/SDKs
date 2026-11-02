@@ -1,0 +1,15 @@
+{
+  "name": "aforo-apim-eventhub-forwarder",
+  "version": "2.3.2",
+  "description": "Reads Aforo usage events that Azure API Management wrote to Event Hubs and delivers them to the Aforo ingestor with batching, retries and checkpoint-after-accept.",
+  "main": "src/functions/aforoMeteringForwarder.js",
+  "private": true,
+  "license": "Apache-2.0",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test --test-timeout=60000 tests/*.test.js"
+  },
+  "dependencies": {
+    "@azure/functions": "4.16.5"
+  }
+}

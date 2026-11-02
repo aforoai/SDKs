@@ -1,49 +1,145 @@
 {
-  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-  "contentVersion": "1.0.0.0",
+  "$schema": "https://schema.management.azure.com/schemas/2018-05-01/subscriptionDeploymentTemplate.json#",
+  "contentVersion": "2.0.0.0",
   "metadata": {
-    "description": "Azure Policy that prevents deletion of APIM resources tagged with aforo-monetized=true"
+    "description": "Azure Policy (denyAction) that blocks DELETE of the API Management APIs and products Aforo bills on, plus its assignment. Deploy at subscription scope."
+  },
+  "parameters": {
+    "protectedResources": {
+      "type": "array",
+      "defaultValue": [],
+      "metadata": {
+        "description": "APIM APIs and products to protect, as '<apim-service-name>/<api-or-product-id>' (the resource's fullName). Example: [\"contoso-apim/orders-api\", \"contoso-apim/gold\"]."
+      }
+    },
+    "protectMonetizedServices": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Also block DELETE of any API Management service tagged aforo-monetized=true."
+      }
+    },
+    "enforcementMode": {
+      "type": "string",
+      "defaultValue": "Default",
+      "allowedValues": [
+        "Default",
+        "DoNotEnforce"
+      ]
+    }
+  },
+  "variables": {
+    "definitionName": "aforo-deny-delete-monetized"
   },
   "resources": [
     {
       "type": "Microsoft.Authorization/policyDefinitions",
-      "apiVersion": "2021-06-01",
-      "name": "aforo-deny-delete-monetized",
+      "apiVersion": "2023-04-01",
+      "name": "[variables('definitionName')]",
       "properties": {
-        "displayName": "Aforo: Deny deletion of monetized API Management resources",
-        "description": "Prevents deletion of APIM APIs and products tagged as monetized by Aforo. Remove the tag in Aforo before deleting.",
+        "displayName": "Aforo: deny deletion of monetized API Management resources",
+        "description": "Blocks DELETE of the APIM APIs and products listed in protectedResources, and of APIM services tagged aforo-monetized=true. Remove the entry (or the tag) to allow the delete.",
         "policyType": "Custom",
         "mode": "All",
-        "parameters": {},
+        "metadata": {
+          "category": "API Management",
+          "version": "2.0.0"
+        },
+        "parameters": {
+          "protectedResources": {
+            "type": "Array",
+            "defaultValue": [],
+            "metadata": {
+              "displayName": "Protected APIs and products",
+              "description": "'<apim-service-name>/<api-or-product-id>' values."
+            }
+          },
+          "protectMonetizedServices": {
+            "type": "Boolean",
+            "defaultValue": true,
+            "metadata": {
+              "displayName": "Protect APIM services tagged aforo-monetized=true"
+            }
+          }
+        },
         "policyRule": {
           "if": {
-            "allOf": [
+            "anyOf": [
               {
-                "field": "type",
-                "in": [
-                  "Microsoft.ApiManagement/service/apis",
-                  "Microsoft.ApiManagement/service/products"
+                "allOf": [
+                  {
+                    "field": "type",
+                    "in": [
+                      "Microsoft.ApiManagement/service/apis",
+                      "Microsoft.ApiManagement/service/products"
+                    ]
+                  },
+                  {
+                    "field": "fullName",
+                    "in": "[[parameters('protectedResources')]"
+                  }
                 ]
               },
               {
-                "field": "tags['aforo-monetized']",
-                "equals": "true"
-              },
-              {
-                "anyOf": [
+                "allOf": [
                   {
-                    "field": "actionType",
-                    "equals": "delete"
+                    "value": "[[parameters('protectMonetizedServices')]",
+                    "equals": true
+                  },
+                  {
+                    "field": "type",
+                    "equals": "Microsoft.ApiManagement/service"
+                  },
+                  {
+                    "field": "tags['aforo-monetized']",
+                    "equals": "true"
                   }
                 ]
               }
             ]
           },
           "then": {
-            "effect": "deny"
+            "effect": "denyAction",
+            "details": {
+              "actionNames": [
+                "delete"
+              ]
+            }
           }
         }
       }
+    },
+    {
+      "type": "Microsoft.Authorization/policyAssignments",
+      "apiVersion": "2023-04-01",
+      "name": "[variables('definitionName')]",
+      "dependsOn": [
+        "[subscriptionResourceId('Microsoft.Authorization/policyDefinitions', variables('definitionName'))]"
+      ],
+      "properties": {
+        "displayName": "Aforo: deny deletion of monetized API Management resources",
+        "policyDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/policyDefinitions', variables('definitionName'))]",
+        "enforcementMode": "[parameters('enforcementMode')]",
+        "parameters": {
+          "protectedResources": {
+            "value": "[parameters('protectedResources')]"
+          },
+          "protectMonetizedServices": {
+            "value": "[parameters('protectMonetizedServices')]"
+          }
+        },
+        "nonComplianceMessages": [
+          {
+            "message": "This API Management resource is billed by Aforo. Remove it from the Aforo protection list (or the aforo-monetized tag) before deleting it."
+          }
+        ]
+      }
     }
-  ]
+  ],
+  "outputs": {
+    "policyAssignmentId": {
+      "type": "string",
+      "value": "[subscriptionResourceId('Microsoft.Authorization/policyAssignments', variables('definitionName'))]"
+    }
+  }
 }

@@ -1,0 +1,42 @@
+{
+  "name": "@aforoai/mcp-test-server",
+  "version": "0.1.0",
+  "description": "Runnable toy MCP server (HTTP + stdio + SSE) for testing Aforo MCP metering — gateway plugins, SDK integrations, and mcp-proxy sidecar",
+  "license": "Apache-2.0",
+  "bin": {
+    "aforo-mcp-test-server": "./dist/bin/aforo-mcp-test-server.js"
+  },
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/src/index.js",
+      "require": "./dist/src/index.js",
+      "types": "./dist/src/index.d.ts"
+    }
+  },
+  "files": [
+    "dist/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/bin/aforo-mcp-test-server.js",
+    "start:http": "node dist/bin/aforo-mcp-test-server.js --transport http --port 8080",
+    "start:sse": "node dist/bin/aforo-mcp-test-server.js --transport sse --port 8081",
+    "start:stdio": "node dist/bin/aforo-mcp-test-server.js --transport stdio",
+    "test": "node --test dist/test/*.test.js",
+    "clean": "rm -rf dist/"
+  },
+  "dependencies": {
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

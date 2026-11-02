@@ -1,32 +1,30 @@
-import { AforoClient } from '../client';
-import { MiddlewareOptions } from '../types';
-import { normalizePath } from '../path-normalizer';
+import { MiddlewareOptions } from '../types.js';
+import { isPreflight, resolveMetricName, httpMethodOf, middlewareClient, customerLookup, endpointPathFor } from './common.js';
 
 const DEFAULT_EXCLUDE_PATHS = ['/health', '/ready', '/metrics', '/favicon.ico'];
 
 /**
- * Express middleware that automatically captures API usage events.
+ * Express middleware that records one usage event per request.
  *
- * Hooks into `res.on('finish')` — runs AFTER the response is sent to the client.
- * Zero latency impact on the API call itself.
+ * Hooks into `res.on('finish')` — runs AFTER the response is sent, so it adds
+ * no latency to the request. Metering never throws into the request.
  *
  * ```typescript
- * import { expressMiddleware } from '@aforo/metering/middleware/express';
- * app.use(expressMiddleware({ apiKey: process.env.AFORO_API_KEY }));
+ * import { AforoClient } from '@aforoai/metering';
+ * import { expressMiddleware } from '@aforoai/metering/middleware/express';
+ * const aforo = new AforoClient({ apiKey: process.env.AFORO_API_KEY!, productType: 'API' });
+ * app.use(expressMiddleware({ client: aforo, customerResolver: (req) => req.user?.aforoCustomerId }));
+ * process.once('SIGTERM', async () => { await aforo.shutdown(); process.exit(0); });
  * ```
  */
 export function expressMiddleware(options: MiddlewareOptions) {
-  const client = new AforoClient({
-    apiKey: options.apiKey,
-    baseUrl: options.baseUrl,
-    ...options.clientOptions,
-  });
+  const lookupCustomer = customerLookup(options, (req) => req.headers?.['x-customer-id']);
+  const client = middlewareClient(options);
 
   const excludePaths = options.excludePaths ?? DEFAULT_EXCLUDE_PATHS;
   const excludeStatusCodes = options.excludeStatusCodes ?? [];
 
-  return function aforoMeteringMiddleware(req: any, res: any, next: any) {
-    // Capture timing
+  const handler = function aforoMeteringMiddleware(req: any, res: any, next: any) {
     const startTime = Date.now();
 
     res.on('finish', () => {
@@ -35,80 +33,35 @@ export function expressMiddleware(options: MiddlewareOptions) {
         const method: string = req.method || 'UNKNOWN';
         const statusCode: number = res.statusCode || 0;
 
-        // Check exclusions
+        if (isPreflight(method)) return;
         if (excludePaths.some((p: string) => path.startsWith(p))) return;
         if (excludeStatusCodes.includes(statusCode)) return;
 
-        // Resolve metric name
-        const routeTemplate: string | undefined = req.route?.path;
-        const normalizedPath = normalizePath(path.split('?')[0], routeTemplate);
-        let metricName: string;
-        if (typeof options.metricName === 'function') {
-          metricName = options.metricName(req, res);
-        } else if (options.metricName) {
-          metricName = options.metricName;
-        } else {
-          metricName = `${method} ${normalizedPath}`;
-        }
+        const quantity = typeof options.quantity === 'function' ? options.quantity(req, res) : options.quantity ?? 1;
+        if (!(quantity > 0)) return; // The ingestor rejects quantity <= 0
 
-        // Resolve quantity
-        let quantity: number;
-        if (typeof options.quantity === 'function') {
-          quantity = options.quantity(req, res);
-        } else {
-          quantity = options.quantity ?? 1;
-        }
-
-        // Resolve customer ID
-        let customerId: string | null;
-        if (typeof options.customerId === 'function') {
-          customerId = options.customerId(req);
-        } else if (options.customerId) {
-          customerId = options.customerId;
-        } else {
-          customerId = extractCustomerId(req);
-        }
-
-        if (!customerId) return; // Can't meter without a customer
-
-        // Build metadata
-        let metadata: Record<string, string | number | boolean> | undefined;
-        if (options.metadata) {
-          metadata = options.metadata(req, res);
-        }
-
+        const route = typeof req.route?.path === 'string' ? `${req.baseUrl ?? ''}${req.route.path}` : undefined;
+        // No customer → track() drops it as 'invalid' and counts it; the request is unaffected.
         client.track({
-          customerId,
-          metricName,
+          customerId: lookupCustomer(req) ?? '',
+          metricName: resolveMetricName(options, req, res),
           quantity,
-          metadata,
-        }).catch(() => {}); // Fire-and-forget
-
-      } catch {
-        // Never let metering errors affect the API
+          metadata: options.metadata ? options.metadata(req, res) : undefined,
+          productType: options.productType,
+          endpointPath: endpointPathFor(options, path, req, route),
+          httpMethod: httpMethodOf(method),
+          statusCode,
+          responseTimeMs: Date.now() - startTime,
+        }).catch((err) => console.debug(`[aforo] metering skipped: ${err?.message ?? err}`));
+      } catch (err) {
+        // Never let metering errors affect the API.
+        console.debug(`[aforo] metering skipped: ${(err as Error)?.message ?? err}`);
       }
     });
 
     next();
   };
-}
-
-/** Extract customer ID using the standard fallback chain. */
-function extractCustomerId(req: any): string | null {
-  // 1. JWT/session user ID
-  if (req.user?.id) return String(req.user.id);
-  if (req.user?.sub) return String(req.user.sub);
-
-  // 2. Explicit customer header
-  const customerHeader = req.headers?.['x-customer-id'];
-  if (customerHeader) return String(customerHeader);
-
-  // 3. API key header
-  const apiKeyHeader = req.headers?.['x-api-key'];
-  if (apiKeyHeader) return String(apiKeyHeader);
-
-  // 4. Authorization bearer token (use as identifier, not as customer ID)
-  return null;
+  return Object.assign(handler, { client });
 }
 
 // Also export as `middleware` for convenience

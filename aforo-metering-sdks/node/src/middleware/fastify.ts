@@ -1,25 +1,26 @@
-import { AforoClient } from '../client';
-import { MiddlewareOptions } from '../types';
-import { normalizePath } from '../path-normalizer';
+import { MiddlewareOptions } from '../types.js';
+import { isPreflight, resolveMetricName, httpMethodOf, middlewareClient, customerLookup, endpointPathFor } from './common.js';
 
 const DEFAULT_EXCLUDE_PATHS = ['/health', '/ready', '/metrics', '/favicon.ico'];
 
 /**
- * Fastify plugin that automatically captures API usage events.
- *
- * Uses the `onResponse` hook — runs AFTER the response is sent.
+ * Fastify plugin that records one usage event per request in the
+ * `onResponse` hook (after the response is sent).
  *
  * ```typescript
- * import { fastifyPlugin } from '@aforo/metering/middleware/fastify';
- * fastify.register(fastifyPlugin, { apiKey: process.env.AFORO_API_KEY });
+ * import { AforoClient } from '@aforoai/metering';
+ * import { fastifyPlugin } from '@aforoai/metering/middleware/fastify';
+ * const aforo = new AforoClient({ apiKey: process.env.AFORO_API_KEY!, productType: 'API' });
+ * fastify.register(fastifyPlugin, { client: aforo, customerResolver: (request) => request.user?.aforoCustomerId });
  * ```
+ *
+ * When the plugin creates its own client (apiKey instead of client), it shuts
+ * that client down in Fastify's onClose hook. A client you pass in is yours to shut down.
  */
 export async function fastifyPlugin(fastify: any, options: MiddlewareOptions) {
-  const client = new AforoClient({
-    apiKey: options.apiKey,
-    baseUrl: options.baseUrl,
-    ...options.clientOptions,
-  });
+  const lookupCustomer = customerLookup(options, (request) => request.headers?.['x-customer-id']);
+  const owned = !options.client;
+  const client = middlewareClient(options);
 
   const excludePaths = options.excludePaths ?? DEFAULT_EXCLUDE_PATHS;
   const excludeStatusCodes = options.excludeStatusCodes ?? [];
@@ -30,59 +31,41 @@ export async function fastifyPlugin(fastify: any, options: MiddlewareOptions) {
       const method: string = request.method || 'UNKNOWN';
       const statusCode: number = reply.statusCode || 0;
 
+      if (isPreflight(method)) return done();
       if (excludePaths.some((p: string) => path.startsWith(p))) return done();
       if (excludeStatusCodes.includes(statusCode)) return done();
 
-      const routeTemplate: string | undefined = request.routeOptions?.url
-        ?? request.routerPath;
-      const normalizedPath = normalizePath(path.split('?')[0], routeTemplate);
+      const quantity = typeof options.quantity === 'function' ? options.quantity(request, reply) : options.quantity ?? 1;
+      if (!(quantity > 0)) return done(); // The ingestor rejects quantity <= 0
 
-      let metricName: string;
-      if (typeof options.metricName === 'function') {
-        metricName = options.metricName(request, reply);
-      } else if (options.metricName) {
-        metricName = options.metricName;
-      } else {
-        metricName = `${method} ${normalizedPath}`;
-      }
+      const elapsed = typeof reply.elapsedTime === 'number'
+        ? reply.elapsedTime
+        : typeof reply.getResponseTime === 'function' ? reply.getResponseTime() : undefined;
 
-      let quantity: number;
-      if (typeof options.quantity === 'function') {
-        quantity = options.quantity(request, reply);
-      } else {
-        quantity = options.quantity ?? 1;
-      }
-
-      let customerId: string | null;
-      if (typeof options.customerId === 'function') {
-        customerId = options.customerId(request);
-      } else if (options.customerId) {
-        customerId = options.customerId;
-      } else {
-        customerId = (request as any).user?.id
-          ?? request.headers?.['x-customer-id']
-          ?? request.headers?.['x-api-key']
-          ?? null;
-      }
-
-      if (!customerId) return done();
-
-      let metadata: Record<string, string | number | boolean> | undefined;
-      if (options.metadata) {
-        metadata = options.metadata(request, reply);
-      }
-
-      client.track({ customerId, metricName, quantity, metadata }).catch(() => {});
-    } catch {
-      // Never let metering affect the API
+      client.track({
+        customerId: lookupCustomer(request) ?? '',
+        metricName: resolveMetricName(options, request, reply),
+        quantity,
+        metadata: options.metadata ? options.metadata(request, reply) : undefined,
+        productType: options.productType,
+        endpointPath: endpointPathFor(options, path, request, request.routeOptions?.url ?? request.routerPath),
+        httpMethod: httpMethodOf(method),
+        statusCode,
+        ...(typeof elapsed === 'number' ? { responseTimeMs: Math.round(elapsed) } : {}),
+      }).catch((err) => console.debug(`[aforo] metering skipped: ${err?.message ?? err}`));
+    } catch (err) {
+      // Never let metering affect the API.
+      console.debug(`[aforo] metering skipped: ${(err as Error)?.message ?? err}`);
     }
 
     done();
   });
 
-  fastify.addHook('onClose', async () => {
-    await client.shutdown();
-  });
+  if (owned) {
+    fastify.addHook('onClose', async () => {
+      await client.shutdown();
+    });
+  }
 }
 
 // Mark as fastify plugin

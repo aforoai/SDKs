@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Whether org-service is asked: nothing cached, or the breaker still below
+     jti_breaker_failures. See aforo-jwt-revocation.js. -->
+<Javascript name="AforoJwtRevocationCallDecision" timeLimit="200" continueOnError="true">
+    <DisplayName>Aforo Access - JWT Revocation Call Decision</DisplayName>
+    <Properties>
+        <Property name="phase">call</Property>
+    </Properties>
+    <IncludeURL>jsc://aforo-billing.js</IncludeURL>
+    <ResourceURL>jsc://aforo-jwt-revocation.js</ResourceURL>
+</Javascript>

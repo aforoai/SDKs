@@ -1,0 +1,168 @@
+<!--
+  Aforo Request Context — Azure APIM Policy Fragment (fragment id: aforo-context)
+
+  OPTIONAL. Include it in the inbound section when you want the settings of
+  aforo-metering to come from Named Values, the customer to come from a
+  verified Aforo JWT or a subscription-to-customer map, or MCP request
+  bodies to be captured for detection:
+
+    <inbound>
+        <base />
+        <include-fragment fragment-id="aforo-jwt-validation" />   (optional, first)
+        <include-fragment fragment-id="aforo-context" />
+        ...
+    </inbound>
+
+  Installs made from release 2.1.0 already include it and already have the
+  Named Values below; nothing changes for them. An install that does not
+  include it keeps working: aforo-metering then bills the APIM subscription
+  id and reads its settings from context variables only.
+
+  It sets these context variables. In every case a variable of the same
+  name that is already set (non-blank) before this fragment wins, so a
+  per-API set-variable overrides the Named Value:
+
+    aforo-customer-id     — the Aforo customer this request is billed to, or ""
+                            (the request is then NOT metered). Order:
+                              1. aforo-customer-id set before this fragment
+                              2. customer_id claim of the verified Aforo JWT
+                                 (aforo-jwt-payload, which only
+                                 aforo-jwt-validation sets, after validate-jwt
+                                 has checked signature, issuer and expiry)
+                              3. the subscription map, looked up by
+                                 context.Subscription.Id
+                            Never the subscription KEY (a secret), never a
+                            request header, never a placeholder.
+    aforo-product-type    — productType for every event (trimmed, upper-cased;
+                            blank or "none" = API).
+    aforo-metric-mappings — endpoint-to-metric rules for aforo-metering.
+    aforo-default-metric  — metric for requests no rule matches.
+    aforo-mcp-body        — the request body, captured only when the Named
+                            Value aforo-mcp-enabled is "true" and the method
+                            is POST.
+
+  Named Values this fragment references. All five must EXIST (APIM rejects a
+  policy that references an undefined Named Value); use the value "none" to
+  leave one empty:
+    aforo-subscription-customer-map — "subscriptionId=customerId" pairs
+        separated by ";", for example "acme-prod=cust_123;globex=cust_456".
+        A Named Value holds at most 4096 characters.
+    aforo-product-type     — for example "API"
+    aforo-metric-mappings  — "KIND|value|metricName;..." (see outbound-policy.xml)
+    aforo-default-metric   — for example "api_calls"
+    aforo-mcp-enabled      — "true" to capture the body for MCP detection
+
+  Values must not contain double quotes or backslashes: they are substituted
+  into C# string literals.
+
+  Subscription map cache (2.3.0). When the customer comes from the map, the
+  result (or "not in the map") is kept in the APIM cache under
+  "aforo:cust:<tenant>:<version>:<map hash>:<subscription id>" for
+  aforo-customer-map-cache-seconds (default 300; "0" = parse every time).
+  <tenant> is the context variable aforo-tenant-id, else the tenant that
+  aforo-jwt-validation checked (aforo-jwt-tenant), else "-"; the Named
+  Value is not referenced, so installs without it keep saving. <map hash>
+  is the first 22 base64 characters of the SHA-256 of the map, so any edit
+  of the map changes the key, and two APIM instances sharing an external
+  cache never read each other's entries unless their maps are identical.
+  aforo-customer-map-version (default "1") still forces a new key.
+  Consumption tier: without an external Redis cache every request parses.
+
+  The map is one Named Value (at most 4096 characters, about 100
+  subscriptions). For more, set aforo-customer-id per product or per API
+  with set-variable (a product policy covers every subscription to that
+  product), or issue Aforo JWTs carrying customer_id.
+
+  The expressions stay inside the subset azure-apim/tests/policy.test.cjs
+  can run (var, foreach, if; no lambdas, no null-conditional operators).
+-->
+<fragment>
+    <set-variable name="aforo-customer-source" value="@{
+        var existing = context.Variables.ContainsKey("aforo-customer-id")
+            ? Convert.ToString(context.Variables["aforo-customer-id"]) : "";
+        if (existing != null && existing.Trim().Length > 0) { return "preset"; }
+        var payload = context.Variables.GetValueOrDefault<object>("aforo-jwt-payload", null) as JObject;
+        if (payload != null) {
+            var fromJwt = Convert.ToString(payload["customer_id"]);
+            if (fromJwt != null && fromJwt.Trim().Length > 0) { return "jwt"; }
+        }
+        if (context.Subscription == null || string.IsNullOrEmpty(context.Subscription.Id)) { return "none"; }
+        return "map";
+    }" />
+    <set-variable name="aforo-customer-map-key" value="@{
+        if (Convert.ToString(context.Variables["aforo-customer-source"]) != "map") { return ""; }
+        var ttl = context.Variables.ContainsKey("aforo-customer-map-cache-seconds")
+            ? Convert.ToString(context.Variables["aforo-customer-map-cache-seconds"]) : "";
+        if (ttl != null && ttl.Trim() == "0") { return ""; }
+        var version = context.Variables.ContainsKey("aforo-customer-map-version")
+            ? Convert.ToString(context.Variables["aforo-customer-map-version"]) : "";
+        if (version == null || version.Trim().Length == 0 || version.Trim().Length > 32) { version = "1"; }
+        var map = context.Variables.ContainsKey("aforo-subscription-customer-map")
+            ? Convert.ToString(context.Variables["aforo-subscription-customer-map"]) : "";
+        if (map == null || map.Trim().Length == 0) { map = "{{aforo-subscription-customer-map}}"; }
+        var tenant = context.Variables.ContainsKey("aforo-tenant-id") ? Convert.ToString(context.Variables["aforo-tenant-id"]) : "";
+        if (tenant == null || tenant.Trim().Length == 0) { tenant = context.Variables.ContainsKey("aforo-jwt-tenant") ? Convert.ToString(context.Variables["aforo-jwt-tenant"]) : ""; }
+        if (tenant == null || tenant.Trim().Length == 0 || tenant.Trim().Length > 64) { tenant = "-"; }
+        var h = System.Security.Cryptography.SHA256.Create().ComputeHash(System.Text.Encoding.UTF8.GetBytes(map));
+        return "aforo:cust:" + tenant.Trim() + ":" + version.Trim() + ":" + Convert.ToBase64String(h).Substring(0, 22) + ":" + context.Subscription.Id;
+    }" />
+    <choose>
+        <when condition="@(Convert.ToString(context.Variables["aforo-customer-map-key"]).Length > 0)">
+            <cache-lookup-value key="@(Convert.ToString(context.Variables["aforo-customer-map-key"]))" variable-name="aforo-customer-map-cached" />
+        </when>
+    </choose>
+    <set-variable name="aforo-customer-id" value="@{
+        var existing = context.Variables.ContainsKey("aforo-customer-id")
+            ? Convert.ToString(context.Variables["aforo-customer-id"]) : "";
+        if (existing != null && existing.Trim().Length > 0) { return existing.Trim(); }
+        var payload = context.Variables.GetValueOrDefault<object>("aforo-jwt-payload", null) as JObject;
+        if (payload != null) {
+            var fromJwt = Convert.ToString(payload["customer_id"]);
+            if (fromJwt != null && fromJwt.Trim().Length > 0) { return fromJwt.Trim(); }
+        }
+        if (context.Subscription == null || string.IsNullOrEmpty(context.Subscription.Id)) { return ""; }
+        if (context.Variables.ContainsKey("aforo-customer-map-cached")) {
+            var hit = Convert.ToString(context.Variables["aforo-customer-map-cached"]);
+            return hit == null || hit == "~" ? "" : hit;
+        }
+        var subId = context.Subscription.Id;
+        var map = context.Variables.ContainsKey("aforo-subscription-customer-map")
+            ? Convert.ToString(context.Variables["aforo-subscription-customer-map"]) : "";
+        if (map == null || map.Trim().Length == 0) { map = "{{aforo-subscription-customer-map}}"; }
+        foreach (var entry in map.Split(';', '\n')) {
+            var idx = entry.IndexOf("=");
+            if (idx <= 0) { continue; }
+            if (entry.Substring(0, idx).Trim() == subId) { return entry.Substring(idx + 1).Trim(); }
+        }
+        return "";
+    }" />
+    <choose>
+        <when condition="@(Convert.ToString(context.Variables["aforo-customer-map-key"]).Length > 0 && !context.Variables.ContainsKey("aforo-customer-map-cached"))">
+            <cache-store-value key="@(Convert.ToString(context.Variables["aforo-customer-map-key"]))" value="@{ var c = Convert.ToString(context.Variables["aforo-customer-id"]); return c.Length == 0 ? "~" : c; }" duration="@{ var t = context.Variables.GetValueOrDefault<string>("aforo-customer-map-cache-seconds", "300").Trim(); return System.Text.RegularExpressions.Regex.IsMatch(t, "^[1-9][0-9]{0,5}$") ? Convert.ToInt32(t) : 300; }" />
+        </when>
+    </choose>
+    <set-variable name="aforo-product-type" value="@{
+        var v = context.Variables.ContainsKey("aforo-product-type")
+            ? Convert.ToString(context.Variables["aforo-product-type"]) : "";
+        if (v == null || v.Trim().Length == 0) { v = "{{aforo-product-type}}"; }
+        v = v.Trim().ToUpperInvariant();
+        return (v.Length == 0 || v == "NONE") ? "API" : v;
+    }" />
+    <set-variable name="aforo-metric-mappings" value="@{
+        var v = context.Variables.ContainsKey("aforo-metric-mappings")
+            ? Convert.ToString(context.Variables["aforo-metric-mappings"]) : "";
+        if (v == null || v.Trim().Length == 0) { v = "{{aforo-metric-mappings}}"; }
+        return v;
+    }" />
+    <set-variable name="aforo-default-metric" value="@{
+        var v = context.Variables.ContainsKey("aforo-default-metric")
+            ? Convert.ToString(context.Variables["aforo-default-metric"]) : "";
+        if (v == null || v.Trim().Length == 0) { v = "{{aforo-default-metric}}"; }
+        return v;
+    }" />
+    <choose>
+        <when condition="@("{{aforo-mcp-enabled}}" == "true" && context.Request.Method == "POST" && context.Request.Body != null)">
+            <set-variable name="aforo-mcp-body" value="@(context.Request.Body.As<string>(preserveContent: true))" />
+        </when>
+    </choose>
+</fragment>

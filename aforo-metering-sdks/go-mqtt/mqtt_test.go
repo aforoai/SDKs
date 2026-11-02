@@ -7,11 +7,13 @@
 package mqttmetering
 
 import (
+	"context"
 	"encoding/json"
-	"io"
+	"github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt/v2/internal/ingest"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,17 +22,26 @@ import (
 type rec struct {
 	mu       sync.Mutex
 	requests []map[string]any
+	paths    []string
+	headers  []http.Header
+	status   int // 0 → 204
 }
 
 func (r *rec) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	raw, _ := io.ReadAll(req.Body)
+	raw, _ := readRequestBody(req)
 	req.Body.Close()
 	var body map[string]any
 	_ = json.Unmarshal(raw, &body)
 	r.mu.Lock()
 	r.requests = append(r.requests, body)
+	r.paths = append(r.paths, req.URL.Path)
+	r.headers = append(r.headers, req.Header.Clone())
+	status := r.status
 	r.mu.Unlock()
-	w.WriteHeader(204)
+	if status == 0 {
+		status = 204
+	}
+	w.WriteHeader(status)
 }
 
 func (r *rec) events() []map[string]any {
@@ -54,6 +65,7 @@ func newBilling(t *testing.T, srv *httptest.Server, opts ...func(*Config)) *Bill
 		ProductID:     "prod-mqtt-001",
 		APIKey:        "sk_mqtt_abc",
 		IngestorURL:   srv.URL,
+		hooks:         fastHooks(),
 		FlushCount:    1,
 		FlushInterval: 60 * time.Second,
 	}
@@ -89,7 +101,7 @@ func TestPublishEventShape(t *testing.T) {
 
 	b.RecordPublish("cust_001", "device-001", "sensors/room-a/temperature", 1, false, 4)
 	waitFor(t, func() bool { return len(r.events()) == 1 }, 2*time.Second)
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	ev := r.events()[0]
 	want := map[string]any{
@@ -118,7 +130,7 @@ func TestDeliverSkippedByDefault(t *testing.T) {
 	defer srv.Close()
 	b := newBilling(t, srv, func(c *Config) { c.FlushCount = 100 })
 	b.RecordDeliver("cust_001", "device-001", "t", 0, false, 10)
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	for _, e := range r.events() {
 		if e["mqttEventType"] == "DELIVER" {
@@ -135,7 +147,7 @@ func TestDeliverEmittedWhenEnabled(t *testing.T) {
 
 	b.RecordDeliver("cust_001", "device-001", "sensors/a", 1, false, 7)
 	waitFor(t, func() bool { return len(r.events()) == 1 }, 2*time.Second)
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	ev := r.events()[0]
 	if ev["mqttEventType"] != "DELIVER" {
@@ -150,9 +162,9 @@ func TestDeliverEmittedWhenEnabled(t *testing.T) {
 
 func TestMetricNameFormula(t *testing.T) {
 	cases := []struct {
-		emit     func(*Billing)
-		want     string
-		metric   string
+		emit   func(*Billing)
+		want   string
+		metric string
 	}{
 		{func(b *Billing) { b.RecordPublish("c", "x", "t", 0, false, 0) }, "PUBLISH", "mqtt_broker.publish"},
 		{func(b *Billing) { b.RecordSubscribe("c", "x", "t", 0) }, "SUBSCRIBE", "mqtt_broker.subscribe"},
@@ -167,7 +179,7 @@ func TestMetricNameFormula(t *testing.T) {
 		b := newBilling(t, srv)
 		c.emit(b)
 		waitFor(t, func() bool { return len(r.events()) == 1 }, 2*time.Second)
-		_ = b.Shutdown()
+		_ = b.Shutdown(bg)
 
 		ev := r.events()[0]
 		if ev["mqttEventType"] != c.want {
@@ -192,7 +204,7 @@ func TestQosRetainedCarried(t *testing.T) {
 	b.RecordPublish("c", "x", "t", 1, true, 1)
 	b.RecordPublish("c", "x", "t", 2, false, 1)
 	waitFor(t, func() bool { return len(r.events()) == 3 }, 2*time.Second)
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	events := r.events()
 	for i, expectQos := range []float64{0, 1, 2} {
@@ -213,7 +225,7 @@ func TestEmptyCustomerIDRejected(t *testing.T) {
 	defer srv.Close()
 	b := newBilling(t, srv)
 	b.RecordPublish("", "x", "t", 0, false, 1)
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 	if n := len(r.events()); n != 0 {
 		t.Errorf("got %d events, want 0", n)
 	}
@@ -229,11 +241,126 @@ func TestIdempotencyKeyFormat(t *testing.T) {
 
 	b.RecordPublish("cust_001", "c1", "a/b", 0, false, 1)
 	waitFor(t, func() bool { return len(r.events()) == 1 }, 2*time.Second)
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	key := r.events()[0]["idempotencyKey"].(string)
 	re := regexp.MustCompile(`^mqtt:tenant-001:c1:PUBLISH:a/b:\d+:[a-z0-9]{8}$`)
 	if !re.MatchString(key) {
 		t.Errorf("idempotencyKey=%q does not match format", key)
+	}
+}
+
+// ── Wire contract: POST /v1/ingest/batch ─────────────────────────────
+
+func TestBatchWireContract(t *testing.T) {
+	r := &rec{}
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+	b := newBilling(t, srv, func(c *Config) { c.FlushCount = 100 })
+	b.RecordPublish("cust_001", "c1", "a/b", 1, true, 64)
+	b.RecordConnect("cust_001", "c1")
+	b.RecordSubscribe("cust_001", "c1", "a/#", 7)      // invalid QoS
+	b.RecordPublish("cust_001", "c1", "", 0, false, 1) // no topic → dropped
+	_ = b.Shutdown(bg)
+
+	r.mu.Lock()
+	path, hdr, body := r.paths[0], r.headers[0], r.requests[0]
+	r.mu.Unlock()
+	if path != "/v1/ingest/batch" {
+		t.Errorf("path = %s, want /v1/ingest/batch", path)
+	}
+	if hdr.Get("X-API-Key") != "sk_mqtt_abc" {
+		t.Errorf("X-API-Key = %q", hdr.Get("X-API-Key"))
+	}
+	if _, ok := body["apiKey"]; ok {
+		t.Error("apiKey must not be in the body")
+	}
+	evs := r.events()
+	if len(evs) != 3 {
+		t.Fatalf("events = %d, want 3", len(evs))
+	}
+	for _, ev := range evs {
+		if _, ok := ev["apiKey"]; ok {
+			t.Error("apiKey must not be in an event")
+		}
+		for _, k := range []string{"customerId", "metricName", "quantity", "occurredAt", "idempotencyKey", "productType", "mqttTopic", "mqttEventType", "mqttClientId", "dataBytes"} {
+			if _, ok := ev[k]; !ok {
+				t.Errorf("event missing %q: %v", k, ev)
+			}
+		}
+		if topic, _ := ev["mqttTopic"].(string); topic == "" {
+			t.Errorf("mqttTopic must be non-empty: %v", ev)
+		}
+	}
+	if evs[1]["mqttTopic"] != "$SYS/clients/c1/connected" {
+		t.Errorf("CONNECT topic = %v", evs[1]["mqttTopic"])
+	}
+	if _, ok := evs[2]["mqttQos"]; ok {
+		t.Errorf("invalid QoS should be omitted, got %v", evs[2]["mqttQos"])
+	}
+}
+
+func TestLargeBufferSplitsIntoBatchesOf1000(t *testing.T) {
+	r := &rec{}
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+	b := newBilling(t, srv, func(c *Config) { c.FlushCount = 100000 })
+	for i := 0; i < 2500; i++ {
+		b.RecordPublish("cust_001", "c1", "a/b", 0, false, 1)
+	}
+	_ = b.Shutdown(bg)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// At least 3 requests: the flusher sends whatever is queued when it wakes
+	// at the 1000-event threshold, so the split can be finer than 1000/1000/500.
+	if len(r.requests) < 3 {
+		t.Fatalf("requests = %d, want at least 3", len(r.requests))
+	}
+	total := 0
+	for _, body := range r.requests {
+		n := len(body["events"].([]any))
+		if n == 0 || n > 1000 {
+			t.Errorf("batch size = %d, want 1..1000", n)
+		}
+		total += n
+	}
+	if total != 2500 {
+		t.Errorf("total = %d, want 2500", total)
+	}
+}
+
+func TestRetriesReuseIdempotencyKey(t *testing.T) {
+	r := &rec{status: 503}
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+	b := newBilling(t, srv, func(c *Config) { c.FlushCount = 100 })
+	b.RecordPublish("cust_001", "c1", "a/b", 0, false, 1)
+	// Shutdown retries until its deadline, then reports the leftover; a short
+	// deadline keeps the test fast.
+	ctx, cancel := context.WithTimeout(bg, 200*time.Millisecond)
+	defer cancel()
+	_ = b.Shutdown(ctx)
+
+	evs := r.events()
+	if len(evs) < ingest.DefaultMaxRetries+1 {
+		t.Fatalf("attempts = %d, want at least %d", len(evs), ingest.DefaultMaxRetries+1)
+	}
+	for _, ev := range evs[1:] {
+		if ev["idempotencyKey"] != evs[0]["idempotencyKey"] {
+			t.Errorf("idempotencyKey changed across retries: %v vs %v", ev["idempotencyKey"], evs[0]["idempotencyKey"])
+		}
+	}
+}
+
+func TestLongTopicKeepsKeyWithinLimit(t *testing.T) {
+	r := &rec{}
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+	b := newBilling(t, srv)
+	b.RecordPublish("cust_001", "c1", strings.Repeat("t/", 240), 0, false, 1)
+	waitFor(t, func() bool { return len(r.events()) == 1 }, 2*time.Second)
+	if key := r.events()[0]["idempotencyKey"].(string); len(key) > 255 {
+		t.Errorf("idempotencyKey length = %d, want <= 255", len(key))
 	}
 }

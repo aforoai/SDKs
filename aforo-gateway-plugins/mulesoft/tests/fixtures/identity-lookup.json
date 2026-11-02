@@ -1,0 +1,213 @@
+{
+  "script": "identity-lookup",
+  "base": {
+    "vars": {
+      "aforoCfg": {
+        "endpoint": "https://api.aforo.ai/v1/ingest/batch",
+        "apiKey": "ak_test_policy",
+        "tenantId": "42",
+        "productId": "prod-7",
+        "introspectUrl": "https://api.aforo.ai/api/v1/customer-keys/introspect",
+        "introspectTimeoutMs": 1500,
+        "keyHeader": "x-api-key",
+        "identityTtlS": 60,
+        "identityNegativeTtlS": 10,
+        "identityStaleTtlS": 900,
+        "identityFailOpen": false,
+        "productType": "API",
+        "defaultMetric": "",
+        "metricRules": [],
+        "quantityHeader": "X-Aforo-Quantity",
+        "agentId": "",
+        "traceIdHeader": "X-Aforo-Trace-Id",
+        "statusOutcomes": {},
+        "excludePaths": [
+          "/health",
+          "/ready",
+          "/metrics"
+        ],
+        "excludeStatusCodes": [
+          401,
+          403,
+          429
+        ],
+        "quotaEnabled": false,
+        "quotaUrl": "https://api.aforo.ai/api/v1/quota/check",
+        "quotaTimeoutMs": 1500,
+        "quotaFailOpen": true,
+        "quotaCacheTtlMs": 1000,
+        "problems": [],
+        "warnings": []
+      },
+      "aforoReq": {
+        "requestId": "req-1",
+        "startMs": 1792653973000,
+        "method": "GET",
+        "path": "/v1/orders",
+        "key": "sk_live_abc",
+        "keyHash": "h",
+        "keyProblem": null,
+        "excluded": false,
+        "cors": false,
+        "plan": {
+          "productType": "API",
+          "tools": false,
+          "plain": true,
+          "calls": [],
+          "otherMessages": 0,
+          "metric": "api_calls",
+          "toolMetric": null,
+          "quotaMetric": "api_calls"
+        }
+      },
+      "aforoIdentityCached": ""
+    }
+  },
+  "cases": [
+    {
+      "name": "nothing cached: ask Aforo",
+      "expect": {
+        "entry": null,
+        "fresh": false,
+        "staleUsable": false,
+        "introspect": true
+      }
+    },
+    {
+      "name": "an active answer 30 s old is fresh (identity-cache-ttl-s 60)",
+      "expect": {
+        "fresh": true,
+        "introspect": false,
+        "entry.customerId": "cust-1"
+      },
+      "vars": {
+        "aforoIdentityCached": "{\"v\": 1, \"active\": true, \"customerId\": \"cust-1\", \"productIds\": [\"prod-7\"], \"keyId\": \"key-1\", \"subscriptionId\": \"sub-1\", \"productType\": \"API\", \"expiresAtMs\": null, \"storedAtMs\": 1792653943000}"
+      }
+    },
+    {
+      "name": "an active answer 61 s old is stale: ask again, but usable if Aforo is down",
+      "expect": {
+        "fresh": false,
+        "staleUsable": true,
+        "introspect": true
+      },
+      "vars": {
+        "aforoIdentityCached": "{\"v\": 1, \"active\": true, \"customerId\": \"cust-1\", \"productIds\": [\"prod-7\"], \"keyId\": \"key-1\", \"subscriptionId\": \"sub-1\", \"productType\": \"API\", \"expiresAtMs\": null, \"storedAtMs\": 1792653912000}"
+      }
+    },
+    {
+      "name": "never trusted past expiresAt, not even stale",
+      "expect": {
+        "fresh": false,
+        "staleUsable": false,
+        "introspect": true
+      },
+      "vars": {
+        "aforoIdentityCached": "{\"v\": 1, \"active\": true, \"customerId\": \"cust-1\", \"productIds\": [\"prod-7\"], \"keyId\": \"key-1\", \"subscriptionId\": \"sub-1\", \"productType\": \"API\", \"expiresAtMs\": 1792653972999, \"storedAtMs\": 1792653943000}"
+      }
+    },
+    {
+      "name": "a stale answer older than identity-stale-ttl-s is not usable",
+      "expect": {
+        "fresh": false,
+        "staleUsable": false,
+        "introspect": true
+      },
+      "vars": {
+        "aforoIdentityCached": "{\"v\": 1, \"active\": true, \"customerId\": \"cust-1\", \"productIds\": [\"prod-7\"], \"keyId\": \"key-1\", \"subscriptionId\": \"sub-1\", \"productType\": \"API\", \"expiresAtMs\": null, \"storedAtMs\": 1792653072000}"
+      }
+    },
+    {
+      "name": "an inactive answer 5 s old is fresh (identity-negative-ttl-s 10)",
+      "expect": {
+        "fresh": true,
+        "staleUsable": false,
+        "introspect": false
+      },
+      "vars": {
+        "aforoIdentityCached": "{\"v\": 1, \"active\": false, \"storedAtMs\": 1792653968000}"
+      }
+    },
+    {
+      "name": "an inactive answer 11 s old: ask again",
+      "expect": {
+        "fresh": false,
+        "staleUsable": false,
+        "introspect": true
+      },
+      "vars": {
+        "aforoIdentityCached": "{\"v\": 1, \"active\": false, \"storedAtMs\": 1792653962000}"
+      }
+    },
+    {
+      "name": "identity-cache-ttl-s 0 asks every time",
+      "expect": {
+        "fresh": false,
+        "staleUsable": true,
+        "introspect": true
+      },
+      "vars": {
+        "aforoIdentityCached": "{\"v\": 1, \"active\": true, \"customerId\": \"cust-1\", \"productIds\": [\"prod-7\"], \"keyId\": \"key-1\", \"subscriptionId\": \"sub-1\", \"productType\": \"API\", \"expiresAtMs\": null, \"storedAtMs\": 1792653972999}",
+        "aforoCfg": {
+          "identityTtlS": 0
+        }
+      }
+    },
+    {
+      "name": "an entry from the future (clock change) is not fresh",
+      "expect": {
+        "fresh": false,
+        "introspect": true
+      },
+      "vars": {
+        "aforoIdentityCached": "{\"v\": 1, \"active\": true, \"customerId\": \"cust-1\", \"productIds\": [\"prod-7\"], \"keyId\": \"key-1\", \"subscriptionId\": \"sub-1\", \"productType\": \"API\", \"expiresAtMs\": null, \"storedAtMs\": 1792653978000}"
+      }
+    },
+    {
+      "name": "an unreadable cache entry is ignored",
+      "expect": {
+        "entry": null,
+        "introspect": true
+      },
+      "vars": {
+        "aforoIdentityCached": "{\"v\":1,\"active\":"
+      }
+    },
+    {
+      "name": "an entry of another version is ignored",
+      "expect": {
+        "entry": null,
+        "introspect": true
+      },
+      "vars": {
+        "aforoIdentityCached": "{\"v\": 2, \"active\": true, \"storedAtMs\": 1792653973000}"
+      }
+    },
+    {
+      "name": "no key: nothing to ask",
+      "expect": {
+        "introspect": false
+      },
+      "vars": {
+        "aforoReq": {
+          "key": null,
+          "keyHash": null,
+          "keyProblem": "missing"
+        }
+      }
+    },
+    {
+      "name": "a policy configuration problem: nothing to ask",
+      "expect": {
+        "introspect": false
+      },
+      "vars": {
+        "aforoCfg": {
+          "problems": [
+            "aforo-product-id is not set"
+          ]
+        }
+      }
+    }
+  ]
+}

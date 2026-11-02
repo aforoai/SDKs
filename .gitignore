@@ -39,6 +39,8 @@ out/
 
 # ---- Go ----
 bin/
+# The TypeScript CLI entry points live in <module>/bin/ and are source, not build output.
+!aforo-metering-sdks/*/bin/
 vendor/
 
 # ---- Erlang / rebar3 (EMQX plugin) ----

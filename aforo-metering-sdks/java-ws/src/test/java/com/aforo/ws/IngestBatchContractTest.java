@@ -1,0 +1,276 @@
+package com.aforo.ws;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sun.net.httpserver.HttpServer;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+/**
+ * Wire contract with the usage ingestor: POST /v1/ingest/batch, {"events":[...]} of at most
+ * 1000 IngestUsageEventRequest objects, API key only in the X-API-Key header.
+ */
+@DisplayName("AforoWsBilling ingest batch contract")
+class IngestBatchContractTest {
+
+    private record Captured(String path, String apiKey, String rawBody, JsonNode body) {}
+
+    private static final String API_KEY = "sk_contract_key";
+    private final ObjectMapper mapper = new ObjectMapper();
+    private final List<Captured> captured = new CopyOnWriteArrayList<>();
+    private final AtomicInteger failuresBeforeSuccess = new AtomicInteger();
+    private final AtomicInteger failureStatus = new AtomicInteger(500);
+    /** When set, the body of a 202 response (to simulate a partial result). */
+    private final java.util.concurrent.atomic.AtomicReference<String> acceptedBody = new java.util.concurrent.atomic.AtomicReference<>();
+    private HttpServer server;
+    private int port;
+
+    @BeforeEach
+    void startServer() throws IOException {
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        port = server.getAddress().getPort();
+        server.createContext("/", exchange -> {
+            String raw = new String(com.aforo.testsupport.RequestBodies.read(exchange), java.nio.charset.StandardCharsets.UTF_8);
+            captured.add(new Captured(exchange.getRequestURI().getPath(),
+                    exchange.getRequestHeaders().getFirst("X-API-Key"), raw, mapper.readTree(raw)));
+            int status = failuresBeforeSuccess.getAndDecrement() > 0 ? failureStatus.get() : 202;
+            if (status == 429) exchange.getResponseHeaders().add("Retry-After", "0");
+            if (status == 400) {
+                byte[] err = "{\"accepted\":0,\"failed\":1,\"errors\":[{\"index\":0,\"message\":\"bad event\"}]}"
+                        .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(status, err.length);
+                exchange.getResponseBody().write(err);
+                exchange.close();
+                return;
+            }
+            String accepted = acceptedBody.get();
+            if (status == 202 && accepted != null) {
+                byte[] ok = accepted.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(status, ok.length);
+                exchange.getResponseBody().write(ok);
+                exchange.close();
+                return;
+            }
+            exchange.sendResponseHeaders(status, -1);
+            exchange.close();
+        });
+        server.start();
+    }
+
+    @AfterEach
+    void stopServer() { server.stop(0); }
+
+    private AforoWsBilling.Builder builder() {
+        return AforoWsBilling.newBuilder().tenantId("tenant-001").productId("prod-ws")
+                .apiKey(API_KEY).ingestorUrl("http://127.0.0.1:" + port).flushIntervalMs(60_000);
+    }
+
+    @Test
+    @DisplayName("POSTs {events:[...]} to /v1/ingest/batch with X-API-Key and DTO field names")
+    void batchShape() throws Exception {
+        try (AforoWsBilling b = builder().flushCount(1).build()) {
+            b.openConnection("cust_001", null);
+            waitFor(() -> !captured.isEmpty(), 3000);
+        }
+        Captured req = captured.get(0);
+        assertThat(req.path()).isEqualTo("/v1/ingest/batch");
+        assertThat(req.apiKey()).isEqualTo(API_KEY);
+        assertThat(req.rawBody()).doesNotContain(API_KEY);
+        assertThat(req.body().findValue("apiKey")).isNull();
+        assertThat(iterable(req.body().fieldNames())).containsExactly("events");
+        assertThat(req.body().get("events").size()).isBetween(1, 1000);
+
+        JsonNode ev = req.body().get("events").get(0);
+        assertThat(ALLOWED_FIELDS).containsAll(iterable(ev.fieldNames()));
+        assertThat(ev.get("customerId").asText()).isEqualTo("cust_001");
+        assertThat(ev.get("metricName").asText()).isNotBlank();
+        assertThat(ev.get("quantity").asDouble()).isGreaterThan(0);
+        Instant.parse(ev.get("occurredAt").asText());
+        assertThat(ev.get("idempotencyKey").asText()).isNotBlank().hasSizeLessThanOrEqualTo(255);
+        assertThat(ev.get("productType").asText()).isEqualTo("WEBSOCKET_API");
+        assertThat(ev.get("wsConnectionId").asText()).isNotBlank().hasSizeLessThanOrEqualTo(64);
+        assertThat(ev.get("wsDirection").asText()).isIn("CLIENT_TO_SERVER", "SERVER_TO_CLIENT");
+        assertThat(ev.get("wsFrameType").asText()).isIn("OPEN", "TEXT", "BINARY", "PING", "PONG", "CLOSE");
+        assertThat(ev.has("executionDurationMs")).isTrue();
+        assertThat(ev.has("durationMs")).isFalse();
+    }
+
+    @Test
+    @DisplayName("per-frame events carry typed ws fields; unknown enum values go to metadata")
+    void perFrameFields() throws Exception {
+        try (AforoWsBilling b = builder().perFrameEvents(true).flushCount(3).build()) {
+            String conn = b.openConnection("cust_001", null);
+            b.recordFrame(conn, "client_to_server", "binary", 7);
+            b.recordFrame(conn, "INBOUND", "TEXT", 3);
+            waitFor(() -> !captured.isEmpty(), 3000);
+        }
+        JsonNode frames = captured.get(0).body().get("events");
+        JsonNode first = frames.get(1);
+        assertThat(first.get("wsDirection").asText()).isEqualTo("CLIENT_TO_SERVER");
+        assertThat(first.get("wsFrameType").asText()).isEqualTo("BINARY");
+        assertThat(first.get("dataBytes").asLong()).isEqualTo(7L);
+        assertThat(first.get("messageCount").asInt()).isEqualTo(1);
+        JsonNode second = frames.get(2);
+        assertThat(second.has("wsDirection")).isFalse();
+        assertThat(second.get("metadata").get("wsDirection").asText()).isEqualTo("INBOUND");
+    }
+
+    @Test
+    @DisplayName("a flush of 2500 events is sliced into requests of at most 1000")
+    void slicesLargeFlushes() throws Exception {
+        try (AforoWsBilling b = builder().flushCount(10_000).build()) {
+            for (int i = 0; i < 2500; i++) {
+                b.openConnection("cust_001", null);
+            }
+        }
+        // 2500 OPEN events, plus the CONNECTION_CLOSED close() emits for each connection left open.
+        waitFor(() -> captured.stream().mapToInt(c -> c.body().get("events").size()).sum() == 5000, 5000);
+        // flushCount is clamped to 1000, so the sender wakes while events are still arriving:
+        // at least 3 requests, none over the ingestor's 1000-event limit.
+        assertThat(captured.size()).isGreaterThanOrEqualTo(3);
+        for (Captured c : captured) {
+            assertThat(c.path()).isEqualTo("/v1/ingest/batch");
+            assertThat(c.body().get("events").size()).isBetween(1, 1000);
+        }
+        Set<String> keys = new java.util.HashSet<>();
+        captured.forEach(c -> c.body().get("events").forEach(e -> keys.add(e.get("idempotencyKey").asText())));
+        assertThat(keys).hasSize(5000);
+    }
+
+    @Test
+    @DisplayName("a retried request resends the same idempotency keys")
+    void retryKeepsIdempotencyKey() throws Exception {
+        failuresBeforeSuccess.set(1);
+        try (AforoWsBilling b = builder().flushCount(1).build()) {
+            b.openConnection("cust_001", null);
+            waitFor(() -> captured.size() == 2, 5000);
+        }
+        assertThat(captured.get(1).body().get("events").get(0).get("idempotencyKey").asText())
+                .isEqualTo(captured.get(0).body().get("events").get(0).get("idempotencyKey").asText());
+    }
+
+    @Test
+    @DisplayName("customerId longer than 64 chars is not sent")
+    void overlongCustomerDropped() throws Exception {
+        List<Map<String, Object>> droppedEvents = new CopyOnWriteArrayList<>();
+        List<AforoWsBilling.DropReason> reasons = new CopyOnWriteArrayList<>();
+        try (AforoWsBilling b = builder().flushCount(1)
+                .onDrop((events, reason) -> { droppedEvents.addAll(events); reasons.add(reason); }).build()) {
+            b.openConnection("c".repeat(65), null);
+            // Not thrown, not buffered: counted and handed to onDrop as INVALID, key intact.
+            assertThat(b.droppedCount()).isEqualTo(1);
+            Thread.sleep(100);
+        }
+        assertThat(captured).isEmpty();
+        assertThat(reasons).containsExactly(AforoWsBilling.DropReason.INVALID);
+        assertThat(droppedEvents).hasSize(1);
+        assertThat(String.valueOf(droppedEvents.get(0).get("idempotencyKey"))).isNotBlank();
+    }
+
+    @Test
+    @DisplayName("a 202 that rejects one event by index drops only that event, as REJECTED")
+    void partialFailureDropsOnlyRejectedEvent() throws Exception {
+        acceptedBody.set("{\"success\":true,\"data\":{\"accepted\":1,\"duplicates\":0,\"failed\":1,\"errors\":[{\"index\":1,\"message\":\"Unknown metric\"}]}}");
+        List<Map<String, Object>> droppedEvents = new CopyOnWriteArrayList<>();
+        List<AforoWsBilling.DropReason> reasons = new CopyOnWriteArrayList<>();
+        AforoWsBilling b = builder().flushCount(1000)
+                .onDrop((events, reason) -> { droppedEvents.addAll(events); reasons.add(reason); }).build();
+        try {
+            String id = b.openConnection("cust_001", null);
+            b.closeConnection(id, 1000);
+        } finally {
+            b.close();
+        }
+        assertThat(captured).hasSize(1);
+        assertThat(captured.get(0).body().get("events").size()).isEqualTo(2);
+        assertThat(b.droppedCount()).isEqualTo(1);
+        assertThat(reasons).containsExactly(AforoWsBilling.DropReason.REJECTED);
+        assertThat(droppedEvents).hasSize(1);
+        assertThat(droppedEvents.get(0).get("metricName")).isEqualTo("websocket_api.connection_closed");
+    }
+
+    @Test
+    @DisplayName("productType defaults to WEBSOCKET_API; client option is trimmed and uppercased")
+    void clientProductType() throws Exception {
+        try (AforoWsBilling b = builder().build()) {
+            assertThat(b.getProductType()).isEqualTo("WEBSOCKET_API");
+        }
+        try (AforoWsBilling b = builder().productType(" api ").flushCount(1).build()) {
+            assertThat(b.getProductType()).isEqualTo("API");
+            b.openConnection("cust_001", null);
+            waitFor(() -> !captured.isEmpty(), 3000);
+        }
+        assertThat(captured.get(0).body().get("events").get(0).get("productType").asText()).isEqualTo("API");
+    }
+
+    @Test
+    @DisplayName("a 400 is not retried")
+    void badRequestNotRetried() throws Exception {
+        failuresBeforeSuccess.set(5);
+        failureStatus.set(400);
+        try (AforoWsBilling b = builder().flushCount(1).build()) {
+            b.openConnection("cust_001", null);
+            waitFor(() -> !captured.isEmpty(), 3000);
+            Thread.sleep(1_500); // longer than the first backoff
+            assertThat(captured).hasSize(1);
+        }
+        // close() then sends the CONNECTION_CLOSED of the open connection (also refused): two requests,
+        // and no body is ever sent twice.
+        assertThat(captured).hasSize(2);
+        assertThat(captured.get(0).rawBody()).isNotEqualTo(captured.get(1).rawBody());
+    }
+
+    @Test
+    @DisplayName("a 429 is retried after Retry-After, with the same idempotency key")
+    void tooManyRequestsHonoursRetryAfter() throws Exception {
+        failuresBeforeSuccess.set(1);
+        failureStatus.set(429);
+        long start = System.currentTimeMillis();
+        try (AforoWsBilling b = builder().flushCount(1).build()) {
+            b.openConnection("cust_001", null);
+            waitFor(() -> captured.size() == 2, 3000);
+        }
+        // Retry-After: 0 replaces the 1s exponential backoff.
+        assertThat(System.currentTimeMillis() - start).isLessThan(900);
+        assertThat(captured.get(1).body().get("events").get(0).get("idempotencyKey").asText())
+                .isEqualTo(captured.get(0).body().get("events").get(0).get("idempotencyKey").asText());
+    }
+
+    /** Every top-level JSON name IngestUsageEventRequest binds; anything else is dropped server-side. */
+    private static final Set<String> ALLOWED_FIELDS = Set.of(
+            "customerId", "metricName", "quantity", "occurredAt", "idempotencyKey", "traceId", "spanId",
+            "sessionId", "metadata", "productType", "executionDurationMs", "executionStatus", "dataBytes",
+            "messageCount", "grpcService", "grpcMethod", "grpcStatusCode", "grpcCallType", "gqlOperationType",
+            "gqlOperationName", "gqlComplexity", "gqlFieldCount", "gqlHasErrors", "wsConnectionId",
+            "wsDirection", "wsFrameType", "wsCloseReason", "mqttTopic", "mqttQos", "mqttRetained",
+            "mqttEventType", "mqttClientId");
+
+    private static <T> List<T> iterable(java.util.Iterator<T> it) {
+        List<T> out = new ArrayList<>();
+        it.forEachRemaining(out::add);
+        return out;
+    }
+
+    private static void waitFor(java.util.function.BooleanSupplier cond, long timeoutMs) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            if (cond.getAsBoolean()) return;
+            Thread.sleep(10);
+        }
+        throw new AssertionError("condition not satisfied within " + timeoutMs + "ms");
+    }
+}

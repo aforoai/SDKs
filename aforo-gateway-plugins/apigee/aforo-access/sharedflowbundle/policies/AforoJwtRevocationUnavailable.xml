@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Only with KVM jti_check_fallback = "DENY": the revocation check gave no
+     answer, so the call is refused with 503 and Retry-After: 5. Not metered. -->
+<RaiseFault name="AforoJwtRevocationUnavailable" continueOnError="false" enabled="true">
+    <DisplayName>Aforo Access - JWT Revocation Check Unavailable (503)</DisplayName>
+    <FaultResponse>
+        <Set>
+            <Headers>
+                <Header name="Retry-After">5</Header>
+            </Headers>
+            <Payload contentType="application/json">{aforo.access.revocationUnavailableBody}</Payload>
+            <StatusCode>503</StatusCode>
+            <ReasonPhrase>Service Unavailable</ReasonPhrase>
+        </Set>
+    </FaultResponse>
+    <IgnoreUnresolvedVariables>true</IgnoreUnresolvedVariables>
+</RaiseFault>

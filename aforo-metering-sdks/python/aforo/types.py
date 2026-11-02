@@ -2,40 +2,111 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional
+
+# Same logger as AforoClient -- normalize_execution_status runs inside track().
+logger = logging.getLogger("aforo.client")
+
+DropReason = Literal["overflow", "retry_exhausted", "rejected", "invalid", "shutdown", "closed"]
+"""Why an event was permanently dropped by the SDK.
+
+- ``overflow``: the queue was full -- the OLDEST event was evicted. Happens
+  during a long ingest outage, when events keep arriving and none can be sent.
+- ``rejected``: the ingestor refused the batch with a non-retryable 4xx, or
+  refused individual events (non-retryable) in a 2xx partial response.
+- ``invalid``: ``track()`` refused the event before queueing it (blank
+  customer/metric, quantity <= 0, or a field over the ingestor's limit). It was
+  never sent.
+- ``shutdown``: still queued when ``shutdown()`` reached ``shutdown_timeout``.
+- ``closed``: ``track()`` was called after ``shutdown()``.
+- ``retry_exhausted``: kept for compatibility. An outage no longer drops
+  events: the batch goes back to the queue and is retried after a pause.
+"""
+
+DEFAULT_PRODUCT_TYPE = "API"
+"""Default ``productType`` stamped on every event by the base SDK."""
+
+MAX_BATCH_SIZE = 1000
+"""The ingestor accepts at most 1000 events per ``POST /v1/ingest/batch``."""
 
 
 @dataclass
 class AforoOptions:
     """Options for creating an AforoClient instance."""
 
-    api_key: str
-    """Aforo API key for authentication."""
+    api_key: str = field(repr=False)
+    """Aforo API key, sent only as ``X-API-Key``. Never shown in ``repr()`` or logs."""
 
-    base_url: str = "https://ingest.aforo.ai"
-    """Base URL for the Aforo ingestor service."""
+    base_url: str = "https://api.aforo.ai"
+    """Base URL for the Aforo ingestor. Must be ``https://``; plain ``http://`` is
+    allowed for localhost / 127.0.0.1 / ::1, or with ``allow_insecure_http``."""
 
-    flush_count: int = 50
-    """Maximum events to buffer before flushing."""
+    flush_count: int = 500
+    """Events per request; also the queue size that wakes the flusher early
+    (clamped to 1..1000, the ingestor's batch limit)."""
 
     flush_interval: float = 5.0
-    """Flush interval in seconds."""
+    """Seconds between background flushes."""
 
     max_queue_size: int = 10_000
-    """Maximum events in the ring buffer. Oldest dropped on overflow."""
+    """Maximum queued events. On overflow the oldest is dropped (reason ``overflow``)."""
 
     max_retries: int = 3
-    """Maximum retries on 5xx/timeout."""
+    """Retries per batch on network errors, timeouts, 408, 429 and 5xx."""
 
-    retry_base_s: float = 1.0
-    """Base delay in seconds for exponential backoff."""
+    retry_base_s: float = 0.5
+    """Base delay for full-jitter backoff: retry ``n`` waits ``random(0, min(30, base * 2**n))``."""
 
     timeout: float = 10.0
-    """Request timeout in seconds."""
+    """Total deadline per HTTP request, in seconds."""
 
     shutdown_timeout: float = 5.0
-    """Graceful shutdown timeout in seconds."""
+    """``shutdown()`` flushes for at most this many seconds; events still queued
+    then are dropped with reason ``shutdown``."""
+
+    allow_insecure_http: bool = False
+
+    compression: str = "gzip"
+    """``"gzip"`` (default): batches of 1 KiB or more are sent with
+    ``Content-Encoding: gzip`` (wave 8, G269; needs usage-ingestor wave 8 or
+    later). ``"none"``: always plain JSON."""
+    """Allow a plain ``http://`` base_url on a host other than localhost."""
+
+    on_drop: Optional[Callable[[list["ResolvedEvent"], DropReason], None]] = None
+    """OPT-IN hook invoked with events the SDK is about to lose permanently
+    (queue overflow, non-retryable rejection, an event ``track()`` refused as
+    invalid, the shutdown deadline, or ``track()`` after shutdown), so the app
+    can persist / alert / replay them. Dropped events keep their idempotency
+    keys -- re-submitting them via track() after recovery is dedup-safe.
+    Default: None (drops are still counted in dropped_count and WARN-logged).
+    Exceptions raised by the hook are caught and logged."""
+
+    on_error: Optional[Callable[[Exception], None]] = None
+    """OPT-IN hook for delivery problems. It receives an ``aforo.TransportError``
+    whose ``kind`` is ``outage`` / ``auth`` (events still queued and retried),
+    ``rejected``, ``shutdown`` or ``closed`` (events gone), with the ``events``
+    concerned and the HTTP ``status`` when there was one. Branch on ``kind``,
+    not the message. Exceptions raised by the hook are caught and logged."""
+
+    on_accepted: Optional[Callable[[Any, list["ResolvedEvent"]], None]] = None
+    """OPT-IN hook called after every accepted batch with the ingestor's response
+    ``data`` object and the events in the batch (for fields such as
+    ``killedSessionIds``). Exceptions raised by the hook are caught and logged."""
+
+    http_transport: Optional[Any] = field(default=None, repr=False)
+    """Optional ``httpx.BaseTransport`` for the SDK's HTTP client (tests, custom
+    proxies). Default: httpx's own."""
+
+    product_type: str = DEFAULT_PRODUCT_TYPE
+    """Default top-level ``productType`` for every event (``API``, ``AGENTIC_API``,
+    ``AI_AGENT``, ``MCP_SERVER``, ``GRPC_API``, ``GRAPHQL_API``, ``WEBSOCKET_API``,
+    ``MQTT_BROKER``). Required by the production ingestor. Trimmed and upper-cased;
+    unknown values are passed through. Override per event with ``track(product_type=...)``."""
+
+    heartbeat_interval: float = 30.0
+    """Seconds between session heartbeats while a session is active (see ``start_session``)."""
 
 
 @dataclass
@@ -52,13 +123,32 @@ class TrackEvent:
     """Quantity of usage."""
 
     idempotency_key: Optional[str] = None
-    """Override for idempotency key. Auto-generated if omitted."""
+    """Idempotency key -- supply a STABLE value to dedup retries of the same
+    logical event. Omitted = dedup opt-out: the SDK stamps a unique random
+    key per track() call (still stable across the SDK's own flush retries).
+    """
 
     occurred_at: Optional[str] = None
     """When the event occurred (ISO 8601). Defaults to now."""
 
     metadata: Optional[dict[str, Any]] = None
     """Arbitrary key-value metadata attached to the event."""
+
+    execution_status: Optional[str] = None
+    """Optional outcome of the request, used by OUTCOME_BASED pricing (each
+    event bills at the weight set for its status; events without a status bill
+    at full price). Trimmed and upper-cased by the SDK; blank is treated as
+    absent. Accepted values: SUCCESS, PARTIAL, TIMEOUT, ERROR,
+    VALIDATION_FAILED, FAILED, FAILURE, CANCELLED, PENDING, BLOCKED,
+    HITL_REQUIRED (max 20 chars). The server is authoritative -- any other
+    value makes it reject the event."""
+
+    product_type: Optional[str] = None
+    """Per-event ``productType`` override. Defaults to the client's ``product_type``."""
+
+    extra_fields: Optional[dict[str, Any]] = None
+    """Optional top-level ingest fields, using their exact camelCase wire names
+    (e.g. ``{"agentId": "a1", "sessionId": "s1"}`` for ``AI_AGENT``)."""
 
 
 @dataclass
@@ -71,17 +161,30 @@ class ResolvedEvent:
     idempotency_key: str
     occurred_at: str
     metadata: Optional[dict[str, Any]] = None
+    execution_status: Optional[str] = None
+    """Normalized (trimmed, upper-cased) status; omitted from the wire when None."""
+
+    product_type: Optional[str] = None
+    extra_fields: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {
+        d: dict[str, Any] = {}
+        # Optional top-level fields first so the required fields below always win.
+        if self.extra_fields:
+            d.update({k: v for k, v in self.extra_fields.items() if v is not None})
+        d.update({
             "customerId": self.customer_id,
             "metricName": self.metric_name,
             "quantity": self.quantity,
             "idempotencyKey": self.idempotency_key,
             "occurredAt": self.occurred_at,
-        }
+        })
+        if self.product_type:
+            d["productType"] = self.product_type
         if self.metadata:
             d["metadata"] = self.metadata
+        if self.execution_status:
+            d["executionStatus"] = self.execution_status
         return d
 
 
@@ -91,22 +194,72 @@ class FlushResult:
 
     sent: int = 0
     failed: int = 0
+    reason: Optional[DropReason] = None
+    """Why the batch failed, when ``failed`` > 0. None on success."""
+    failed_indices: Optional[list[int]] = None
+    """Batch positions of the events the ingestor rejected individually in a
+    partial response, when it identified them (``errors[].index``). None when
+    the whole batch failed or the response did not say which events failed."""
 
 
 @dataclass
 class MiddlewareOptions:
     """Options for framework middleware."""
 
-    api_key: str
-    base_url: str = "https://ingest.aforo.ai"
+    api_key: str = field(repr=False)
+    base_url: str = "https://api.aforo.ai"
+    product_type: str = DEFAULT_PRODUCT_TYPE
+    """``productType`` stamped on every request event. Default ``"API"``."""
     metric_name: Optional[Callable | str] = None
+    """Fixed metric or callable. Default ``"api_calls"``; must exist in your Aforo catalog."""
     quantity: Optional[Callable | float] = None
+    customer_resolver: Optional[Callable] = None
+    """Required unless ``trust_customer_header`` is True: ``callable(request) -> str | None``
+    returning the customer id from identity your service has verified (session,
+    JWT subject, API-key lookup). ``None`` for a request -> that request is not
+    metered and is counted as an ``invalid`` drop."""
     customer_id: Optional[Callable | str] = None
+    """Deprecated alias of ``customer_resolver`` (a callable or one fixed id)."""
+    trust_customer_header: bool = False
+    """Read the customer from the ``X-Customer-Id`` header. The caller of your API
+    controls that header, so only turn this on behind a gateway that sets it."""
     exclude_paths: list[str] = field(
         default_factory=lambda: ["/health", "/ready", "/metrics", "/favicon.ico"]
     )
     exclude_status_codes: list[int] = field(default_factory=list)
     metadata: Optional[Callable] = None
-    flush_count: int = 50
+    flush_count: int = 500
     flush_interval: float = 5.0
     max_queue_size: int = 10_000
+    allow_insecure_http: bool = False
+    compression: str = "gzip"
+
+
+# Canonical execution statuses accepted by the usage-ingestor (mirrors
+# contract/ingest-contract.json ``executionStatus.values``; maxLength 20).
+EXECUTION_STATUSES = frozenset({
+    "SUCCESS", "PARTIAL", "TIMEOUT", "ERROR", "VALIDATION_FAILED", "FAILED",
+    "FAILURE", "CANCELLED", "PENDING", "BLOCKED", "HITL_REQUIRED",
+})
+
+
+def normalize_execution_status(value: Optional[str]) -> Optional[str]:
+    """Trim + upper-case an execution status; blank or non-string -> None.
+
+    A value outside the canonical set (see ``EXECUTION_STATUSES``) is logged
+    and dropped (None): the ingestor rejects an unknown status with a 400 for
+    that event, so its usage would be lost.
+    """
+    if not isinstance(value, str):
+        return None
+    trimmed = value.strip()
+    if not trimmed:
+        return None
+    normalized = trimmed.upper()
+    if normalized not in EXECUTION_STATUSES:
+        logger.warning(
+            "Ignoring unknown executionStatus %r; expected one of %s",
+            value[:40], ", ".join(sorted(EXECUTION_STATUSES)),
+        )
+        return None
+    return normalized

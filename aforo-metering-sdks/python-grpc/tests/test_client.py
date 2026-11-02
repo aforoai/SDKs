@@ -81,7 +81,7 @@ def billing_config():
         tenant_id="tenant-001",
         product_id="prod-001",
         api_key="sk_test_abc",
-        ingestor_url="https://ingestor.aforo.ai/",  # trailing slash stripped
+        ingestor_url="https://api.aforo.ai/",  # trailing slash stripped
         service_name="acme.v1.UserService",
     )
 
@@ -142,10 +142,11 @@ def test_record_emits_event_with_correct_shape(http_collector, billing_config):
     _wait_until(lambda: len(http_collector.requests) == 1)
 
     req = http_collector.requests[0]
-    assert req["url"] == "https://ingestor.aforo.ai/v1/ingest/events"  # trailing slash stripped
+    assert req["url"] == "https://api.aforo.ai/v1/ingest/batch"  # trailing slash stripped
     assert req["method"] == "POST"
     assert req["headers"]["Content-type"] == "application/json"
-    assert req["headers"]["Authorization"] == "Bearer sk_test_abc"
+    assert req["headers"]["X-api-key"] == "sk_test_abc"
+    assert "Authorization" not in req["headers"]
     assert req["headers"]["X-tenant-id"] == "tenant-001"
 
     events = req["body"]["events"]
@@ -224,7 +225,7 @@ def test_idempotency_keys_are_unique_across_rapid_calls(http_collector, billing_
 # ── Retry behaviour ──────────────────────────────────────────────────────
 
 
-def test_retry_3_times_then_onerror(billing_config, monkeypatch):
+def test_retries_then_reports_the_outage_and_keeps_the_event(billing_config, monkeypatch):
     """Simulate a hard failure on every attempt — expect 3 retries + onError."""
     from aforo_grpc_metering import client as client_mod
 
@@ -252,10 +253,10 @@ def test_retry_3_times_then_onerror(billing_config, monkeypatch):
         b.record("M", "UNARY", "cust_1", "OK", 1, 1)
         _wait_until(lambda: len(errors) >= 1, timeout=2.0)
 
-    assert call_count["n"] == 3
-    assert len(errors) == 1
-    assert "network down" in str(errors[0])
-    b.shutdown()
+    assert call_count["n"] >= 4  # 1 + 3 retries, then the outage pause
+    assert "network down" in str(errors[0]) and "unreachable" in str(errors[0])
+    assert b.dropped_count == 0  # an outage keeps the event queued
+    b.shutdown(timeout=0)
 
 
 # ── Helper ───────────────────────────────────────────────────────────────

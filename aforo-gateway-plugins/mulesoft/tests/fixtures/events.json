@@ -1,0 +1,1050 @@
+{
+  "script": "events",
+  "base": {
+    "vars": {
+      "aforoCfg": {
+        "endpoint": "https://api.aforo.ai/v1/ingest/batch",
+        "apiKey": "ak_test_policy",
+        "tenantId": "42",
+        "productId": "prod-7",
+        "introspectUrl": "https://api.aforo.ai/api/v1/customer-keys/introspect",
+        "introspectTimeoutMs": 1500,
+        "keyHeader": "x-api-key",
+        "identityTtlS": 60,
+        "identityNegativeTtlS": 10,
+        "identityStaleTtlS": 900,
+        "identityFailOpen": false,
+        "productType": "API",
+        "defaultMetric": "",
+        "metricRules": [],
+        "quantityHeader": "X-Aforo-Quantity",
+        "agentId": "",
+        "traceIdHeader": "X-Aforo-Trace-Id",
+        "statusOutcomes": {},
+        "excludePaths": [
+          "/health",
+          "/ready",
+          "/metrics"
+        ],
+        "excludeStatusCodes": [
+          401,
+          403,
+          429
+        ],
+        "quotaEnabled": false,
+        "quotaUrl": "https://api.aforo.ai/api/v1/quota/check",
+        "quotaTimeoutMs": 1500,
+        "quotaFailOpen": true,
+        "quotaCacheTtlMs": 1000,
+        "problems": [],
+        "warnings": []
+      },
+      "aforoReq": {
+        "requestId": "0b5c7a52-1f7e-4d2a-9a3e-9a8f2c1d0e11",
+        "startMs": 1792653973000,
+        "method": "GET",
+        "path": "/v1/orders",
+        "excluded": false,
+        "cors": false,
+        "key": "sk_live_abc",
+        "keyHash": "h",
+        "keyProblem": null,
+        "trace": {
+          "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+          "tracestate": null,
+          "xTraceId": null,
+          "xRequestId": null
+        },
+        "plan": {
+          "productType": "API",
+          "tools": false,
+          "plain": true,
+          "calls": [],
+          "otherMessages": 0,
+          "metric": "api_calls",
+          "toolMetric": null,
+          "quotaMetric": "api_calls"
+        }
+      },
+      "aforoAccess": {
+        "outcome": "allow",
+        "source": "cache",
+        "identity": {
+          "customerId": "cust-1",
+          "keyId": "key-1",
+          "subscriptionId": "sub-1"
+        }
+      },
+      "aforoEndMs": 1792653973125,
+      "aforoFlowFailed": false
+    },
+    "attributes": {
+      "statusCode": 200,
+      "headers": {
+        "content-type": "application/json"
+      }
+    }
+  },
+  "cases": [
+    {
+      "name": "API: one event with the shared fields",
+      "expect": {
+        "events": [
+          {
+            "productType": "API",
+            "customerId": "cust-1",
+            "metricName": "api_calls",
+            "quantity": 1,
+            "idempotencyKey": "0b5c7a52-1f7e-4d2a-9a3e-9a8f2c1d0e11",
+            "occurredAt": "2026-10-22T07:26:13.125Z",
+            "endpointPath": "/v1/orders",
+            "httpMethod": "GET",
+            "statusCode": 200,
+            "responseTimeMs": 125,
+            "executionStatus": "SUCCESS",
+            "trace": {
+              "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+              "tracestate": null,
+              "xTraceId": null,
+              "xRequestId": null
+            },
+            "metadata": {
+              "gateway": "mulesoft",
+              "method": "GET",
+              "path": "/v1/orders",
+              "status": 200,
+              "endpoint_path": "/v1/orders",
+              "http_method": "GET",
+              "status_code": 200,
+              "response_time_ms": 125,
+              "productId": "prod-7",
+              "keyId": "key-1"
+            }
+          }
+        ],
+        "skipReason": null,
+        "dropped": [],
+        "payload.#json": {
+          "events": [
+            {
+              "productType": "API",
+              "customerId": "cust-1",
+              "metricName": "api_calls",
+              "quantity": 1,
+              "idempotencyKey": "0b5c7a52-1f7e-4d2a-9a3e-9a8f2c1d0e11",
+              "occurredAt": "2026-10-22T07:26:13.125Z",
+              "endpointPath": "/v1/orders",
+              "httpMethod": "GET",
+              "statusCode": 200,
+              "responseTimeMs": 125,
+              "executionStatus": "SUCCESS",
+              "trace": {
+                "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+                "tracestate": null,
+                "xTraceId": null,
+                "xRequestId": null
+              },
+              "metadata": {
+                "gateway": "mulesoft",
+                "method": "GET",
+                "path": "/v1/orders",
+                "status": 200,
+                "endpoint_path": "/v1/orders",
+                "http_method": "GET",
+                "status_code": 200,
+                "response_time_ms": 125,
+                "productId": "prod-7",
+                "keyId": "key-1"
+              }
+            }
+          ]
+        }
+      },
+      "absent": [
+        "events.0.tenantId",
+        "events.0.traceId",
+        "events.0.agentId",
+        "events.0.sessionId"
+      ]
+    },
+    {
+      "name": "API: X-Aforo-Quantity sets the quantity (rounded to 6 decimals)",
+      "expect": {
+        "events.0.quantity": 2.123457
+      },
+      "attributes": {
+        "headers": {
+          "x-aforo-quantity": " 2.1234567 "
+        }
+      }
+    },
+    {
+      "name": "API: a configured quantity-header is read instead",
+      "expect": {
+        "events.0.quantity": 40
+      },
+      "vars": {
+        "aforoCfg": {
+          "quantityHeader": "X-Tokens"
+        }
+      },
+      "attributes": {
+        "headers": {
+          "X-Tokens": "40",
+          "X-Aforo-Quantity": "3"
+        }
+      }
+    },
+    {
+      "name": "API: an unusable quantity header ('0') means 1",
+      "expect": {
+        "events.0.quantity": 1
+      },
+      "attributes": {
+        "headers": {
+          "X-Aforo-Quantity": "0"
+        }
+      }
+    },
+    {
+      "name": "API: an unusable quantity header ('-2') means 1",
+      "expect": {
+        "events.0.quantity": 1
+      },
+      "attributes": {
+        "headers": {
+          "X-Aforo-Quantity": "-2"
+        }
+      }
+    },
+    {
+      "name": "API: an unusable quantity header ('abc') means 1",
+      "expect": {
+        "events.0.quantity": 1
+      },
+      "attributes": {
+        "headers": {
+          "X-Aforo-Quantity": "abc"
+        }
+      }
+    },
+    {
+      "name": "API: an unusable quantity header ('') means 1",
+      "expect": {
+        "events.0.quantity": 1
+      },
+      "attributes": {
+        "headers": {
+          "X-Aforo-Quantity": ""
+        }
+      }
+    },
+    {
+      "name": "API: X-Aforo-Metric from the upstream wins over the planned metric",
+      "expect": {
+        "events.0.metricName": "premium_calls"
+      },
+      "attributes": {
+        "headers": {
+          "X-Aforo-Metric": "premium_calls"
+        }
+      }
+    },
+    {
+      "name": "API: an unusable X-Aforo-Metric skips the call rather than billing another metric",
+      "expect": {
+        "events": [],
+        "payload": null,
+        "skipReason": "unusable X-Aforo-Metric response header"
+      },
+      "attributes": {
+        "headers": {
+          "X-Aforo-Metric": "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm"
+        }
+      }
+    },
+    {
+      "name": "executionStatus for 201 is SUCCESS",
+      "expect": {
+        "events.0.executionStatus": "SUCCESS",
+        "events.0.statusCode": 201
+      },
+      "attributes": {
+        "statusCode": 201
+      }
+    },
+    {
+      "name": "executionStatus for 302 is SUCCESS",
+      "expect": {
+        "events.0.executionStatus": "SUCCESS",
+        "events.0.statusCode": 302
+      },
+      "attributes": {
+        "statusCode": 302
+      }
+    },
+    {
+      "name": "executionStatus for 400 is VALIDATION_FAILED",
+      "expect": {
+        "events.0.executionStatus": "VALIDATION_FAILED",
+        "events.0.statusCode": 400
+      },
+      "attributes": {
+        "statusCode": 400
+      }
+    },
+    {
+      "name": "executionStatus for 404 is ERROR",
+      "expect": {
+        "events.0.executionStatus": "ERROR",
+        "events.0.statusCode": 404
+      },
+      "attributes": {
+        "statusCode": 404
+      }
+    },
+    {
+      "name": "executionStatus for 408 is TIMEOUT",
+      "expect": {
+        "events.0.executionStatus": "TIMEOUT",
+        "events.0.statusCode": 408
+      },
+      "attributes": {
+        "statusCode": 408
+      }
+    },
+    {
+      "name": "executionStatus for 422 is VALIDATION_FAILED",
+      "expect": {
+        "events.0.executionStatus": "VALIDATION_FAILED",
+        "events.0.statusCode": 422
+      },
+      "attributes": {
+        "statusCode": 422
+      }
+    },
+    {
+      "name": "executionStatus for 499 is CANCELLED",
+      "expect": {
+        "events.0.executionStatus": "CANCELLED",
+        "events.0.statusCode": 499
+      },
+      "attributes": {
+        "statusCode": 499
+      }
+    },
+    {
+      "name": "executionStatus for 500 is ERROR",
+      "expect": {
+        "events.0.executionStatus": "ERROR",
+        "events.0.statusCode": 500
+      },
+      "attributes": {
+        "statusCode": 500
+      }
+    },
+    {
+      "name": "executionStatus for 504 is TIMEOUT",
+      "expect": {
+        "events.0.executionStatus": "TIMEOUT",
+        "events.0.statusCode": 504
+      },
+      "attributes": {
+        "statusCode": 504
+      }
+    },
+    {
+      "name": "status-outcomes overrides the table",
+      "expect": {
+        "events.0.executionStatus": "VALIDATION_FAILED"
+      },
+      "vars": {
+        "aforoCfg": {
+          "statusOutcomes": {
+            "404": "VALIDATION_FAILED"
+          }
+        }
+      },
+      "attributes": {
+        "statusCode": 404
+      }
+    },
+    {
+      "name": "no status: executionStatus is left out",
+      "expect": {
+        "events.0.statusCode": 0
+      },
+      "attributes": {
+        "statusCode": null
+      },
+      "absent": [
+        "events.0.executionStatus"
+      ]
+    },
+    {
+      "name": "an API error that failed the flow is metered as 500 ERROR",
+      "expect": {
+        "events.0.statusCode": 500,
+        "events.0.executionStatus": "ERROR"
+      },
+      "vars": {
+        "aforoFlowFailed": true
+      },
+      "attributes": {
+        "statusCode": null
+      }
+    },
+    {
+      "name": "status 401 is excluded by default",
+      "expect": {
+        "events": [],
+        "skipReason": "excluded status code"
+      },
+      "attributes": {
+        "statusCode": 401
+      }
+    },
+    {
+      "name": "status 403 is excluded by default",
+      "expect": {
+        "events": [],
+        "skipReason": "excluded status code"
+      },
+      "attributes": {
+        "statusCode": 403
+      }
+    },
+    {
+      "name": "status 429 is excluded by default",
+      "expect": {
+        "events": [],
+        "skipReason": "excluded status code"
+      },
+      "attributes": {
+        "statusCode": 429
+      }
+    },
+    {
+      "name": "exclude-status-codes none meters a 429 as BLOCKED",
+      "expect": {
+        "events.0.executionStatus": "BLOCKED"
+      },
+      "vars": {
+        "aforoCfg": {
+          "excludeStatusCodes": []
+        }
+      },
+      "attributes": {
+        "statusCode": 429
+      }
+    },
+    {
+      "name": "an excluded path is not metered",
+      "expect": {
+        "events": [],
+        "skipReason": "excluded path"
+      },
+      "vars": {
+        "aforoReq": {
+          "excluded": true
+        }
+      }
+    },
+    {
+      "name": "a CORS preflight is not metered",
+      "expect": {
+        "events": [],
+        "skipReason": "CORS preflight"
+      },
+      "vars": {
+        "aforoReq": {
+          "cors": true,
+          "method": "OPTIONS"
+        }
+      }
+    },
+    {
+      "name": "no verified customer (identity-fail-open): not metered",
+      "expect": {
+        "events": [],
+        "skipReason": "no verified customer"
+      },
+      "vars": {
+        "aforoAccess": {
+          "identity": null
+        }
+      }
+    },
+    {
+      "name": "the client path is escaped and cut to 512",
+      "expect": {
+        "events.0.endpointPath": "/a%0Abxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      },
+      "vars": {
+        "aforoReq": {
+          "path": "/a\nbxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        }
+      }
+    },
+    {
+      "name": "AGENTIC_API: without X-Aforo-Trace-Id each call is its own trace (the gateway request id)",
+      "expect": {
+        "events.0.productType": "AGENTIC_API",
+        "events.0.traceId": "0b5c7a52-1f7e-4d2a-9a3e-9a8f2c1d0e11"
+      },
+      "vars": {
+        "aforoReq": {
+          "plan": {
+            "productType": "AGENTIC_API"
+          }
+        }
+      },
+      "absent": [
+        "events.0.agentId"
+      ]
+    },
+    {
+      "name": "AGENTIC_API: the client traceparent never names the trace",
+      "expect": {
+        "events.0.traceId": "0b5c7a52-1f7e-4d2a-9a3e-9a8f2c1d0e11",
+        "events.0.trace.traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+      },
+      "vars": {
+        "aforoReq": {
+          "plan": {
+            "productType": "AGENTIC_API"
+          }
+        }
+      },
+      "attributes": {
+        "headers": {
+          "traceparent": "00-ffffffffffffffffffffffffffffffff-b7ad6b7169203331-01"
+        }
+      }
+    },
+    {
+      "name": "AGENTIC_API: the upstream X-Aforo-Trace-Id names the trace",
+      "expect": {
+        "events.0.traceId": "goal-77"
+      },
+      "vars": {
+        "aforoReq": {
+          "plan": {
+            "productType": "AGENTIC_API"
+          }
+        }
+      },
+      "attributes": {
+        "headers": {
+          "x-aforo-trace-id": "goal-77"
+        }
+      }
+    },
+    {
+      "name": "AGENTIC_API: a configured trace-id-header",
+      "expect": {
+        "events.0.traceId": "g-1"
+      },
+      "vars": {
+        "aforoReq": {
+          "plan": {
+            "productType": "AGENTIC_API"
+          }
+        },
+        "aforoCfg": {
+          "traceIdHeader": "X-Goal"
+        }
+      },
+      "attributes": {
+        "headers": {
+          "X-Goal": "g-1",
+          "X-Aforo-Trace-Id": "ignored"
+        }
+      }
+    },
+    {
+      "name": "AGENTIC_API: an unusable trace header skips the event",
+      "expect": {
+        "events": [],
+        "dropped": [
+          "unusable X-Aforo-Trace-Id response header"
+        ]
+      },
+      "vars": {
+        "aforoReq": {
+          "plan": {
+            "productType": "AGENTIC_API"
+          }
+        }
+      },
+      "attributes": {
+        "headers": {
+          "X-Aforo-Trace-Id": "ttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt"
+        }
+      }
+    },
+    {
+      "name": "an API product never becomes AGENTIC_API because of a trace header",
+      "expect": {
+        "events.0.productType": "API"
+      },
+      "attributes": {
+        "headers": {
+          "X-Aforo-Trace-Id": "goal-1"
+        }
+      },
+      "absent": [
+        "events.0.traceId"
+      ]
+    },
+    {
+      "name": "AI_AGENT: agent and session from the upstream response headers",
+      "expect": {
+        "events.0.productType": "AI_AGENT",
+        "events.0.agentId": "agent-a",
+        "events.0.sessionId": "sess-1",
+        "events.0.traceId": "sess-1"
+      },
+      "vars": {
+        "aforoReq": {
+          "plan": {
+            "productType": "AI_AGENT"
+          }
+        }
+      },
+      "attributes": {
+        "headers": {
+          "X-Aforo-Agent-Id": "agent-a",
+          "x-aforo-session-id": "sess-1"
+        }
+      }
+    },
+    {
+      "name": "AI_AGENT: agent-id config, session = the request id",
+      "expect": {
+        "events.0.agentId": "cfg-agent",
+        "events.0.sessionId": "0b5c7a52-1f7e-4d2a-9a3e-9a8f2c1d0e11",
+        "events.0.traceId": "0b5c7a52-1f7e-4d2a-9a3e-9a8f2c1d0e11"
+      },
+      "vars": {
+        "aforoReq": {
+          "plan": {
+            "productType": "AI_AGENT"
+          }
+        },
+        "aforoCfg": {
+          "agentId": "cfg-agent"
+        }
+      }
+    },
+    {
+      "name": "AI_AGENT: no header, no config: the Aforo product id is the agent",
+      "expect": {
+        "events.0.agentId": "prod-7"
+      },
+      "vars": {
+        "aforoReq": {
+          "plan": {
+            "productType": "AI_AGENT"
+          }
+        }
+      }
+    },
+    {
+      "name": "AI_AGENT: a too-long agent-id config is refused, not truncated",
+      "expect": {
+        "events": [],
+        "dropped": [
+          "agentId is longer than 36 characters"
+        ]
+      },
+      "vars": {
+        "aforoReq": {
+          "plan": {
+            "productType": "AI_AGENT"
+          }
+        },
+        "aforoCfg": {
+          "agentId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    {
+      "name": "AI_AGENT: an unusable agent header skips the event",
+      "expect": {
+        "events": [],
+        "dropped": [
+          "unusable X-Aforo-Agent-Id response header"
+        ]
+      },
+      "vars": {
+        "aforoReq": {
+          "plan": {
+            "productType": "AI_AGENT"
+          }
+        }
+      },
+      "attributes": {
+        "headers": {
+          "X-Aforo-Agent-Id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    {
+      "name": "AI_AGENT: an unusable session header skips the event",
+      "expect": {
+        "events": [],
+        "dropped": [
+          "unusable X-Aforo-Session-Id response header"
+        ]
+      },
+      "vars": {
+        "aforoReq": {
+          "plan": {
+            "productType": "AI_AGENT"
+          }
+        }
+      },
+      "attributes": {
+        "headers": {
+          "X-Aforo-Session-Id": "bad\u0007"
+        }
+      }
+    },
+    {
+      "name": "AI_AGENT: client request headers are never read for the agent",
+      "expect": {
+        "events.0.agentId": "prod-7"
+      },
+      "vars": {
+        "aforoReq": {
+          "plan": {
+            "productType": "AI_AGENT"
+          }
+        }
+      },
+      "attributes": {
+        "headers": {
+          "X-Agent-Id": "spoofed"
+        }
+      }
+    },
+    {
+      "name": "MCP: one event per tools/call; agent = the customer; session = upstream Mcp-Session-Id",
+      "expect": {
+        "events.#length": 2,
+        "events.0": {
+          "productType": "MCP_SERVER",
+          "customerId": "cust-1",
+          "metricName": "mcp_server.tool_invocations",
+          "quantity": 1,
+          "idempotencyKey": "mcp:42:0b5c7a52-1f7e-4d2a-9a3e-9a8f2c1d0e11:1:get_weather",
+          "occurredAt": "2026-10-22T07:26:13.125Z",
+          "toolName": "get_weather",
+          "agentId": "cust-1",
+          "sessionId": "mcp-sess-1",
+          "executionDurationMs": 125,
+          "endpointPath": "/mcp",
+          "httpMethod": "POST",
+          "statusCode": 200,
+          "responseTimeMs": 125,
+          "executionStatus": "SUCCESS",
+          "trace": {
+            "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            "tracestate": null,
+            "xTraceId": null,
+            "xRequestId": null
+          },
+          "metadata": {
+            "gateway": "mulesoft",
+            "method": "POST",
+            "path": "/mcp",
+            "status": 200,
+            "endpoint_path": "/mcp",
+            "http_method": "POST",
+            "status_code": 200,
+            "response_time_ms": 125,
+            "productId": "prod-7",
+            "keyId": "key-1"
+          }
+        },
+        "events.1.idempotencyKey": "mcp:42:0b5c7a52-1f7e-4d2a-9a3e-9a8f2c1d0e11:2:search",
+        "events.1.toolName": "search"
+      },
+      "vars": {
+        "aforoReq": {
+          "plan": {
+            "productType": "MCP_SERVER",
+            "tools": true,
+            "plain": false,
+            "calls": [
+              {
+                "toolName": "get_weather",
+                "id": 1
+              },
+              {
+                "toolName": "search",
+                "id": "b"
+              }
+            ],
+            "otherMessages": 1,
+            "metric": "api_calls",
+            "toolMetric": "mcp_server.tool_invocations",
+            "quotaMetric": "mcp_server.tool_invocations"
+          },
+          "method": "POST",
+          "path": "/mcp"
+        }
+      },
+      "attributes": {
+        "headers": {
+          "Mcp-Session-Id": "mcp-sess-1"
+        }
+      }
+    },
+    {
+      "name": "MCP: X-Aforo-Agent-Id and X-Aforo-Session-Id from the upstream win",
+      "expect": {
+        "events.0.agentId": "agent-z",
+        "events.0.sessionId": "s-9",
+        "events.1.agentId": "agent-z"
+      },
+      "vars": {
+        "aforoReq": {
+          "plan": {
+            "productType": "MCP_SERVER",
+            "tools": true,
+            "plain": false,
+            "calls": [
+              {
+                "toolName": "get_weather",
+                "id": 1
+              },
+              {
+                "toolName": "search",
+                "id": "b"
+              }
+            ],
+            "otherMessages": 1,
+            "metric": "api_calls",
+            "toolMetric": "mcp_server.tool_invocations",
+            "quotaMetric": "mcp_server.tool_invocations"
+          },
+          "method": "POST",
+          "path": "/mcp"
+        }
+      },
+      "attributes": {
+        "headers": {
+          "X-Aforo-Agent-Id": "agent-z",
+          "X-Aforo-Session-Id": "s-9",
+          "Mcp-Session-Id": "other"
+        }
+      }
+    },
+    {
+      "name": "MCP: an over-long Mcp-Session-Id is hashed, not dropped",
+      "expect": {
+        "events.0.sessionId": "mcp-49075375af63a2573de0620276fadd88263023bd2b83d49eea49f952"
+      },
+      "vars": {
+        "aforoReq": {
+          "plan": {
+            "productType": "MCP_SERVER",
+            "tools": true,
+            "plain": false,
+            "calls": [
+              {
+                "toolName": "get_weather",
+                "id": 1
+              },
+              {
+                "toolName": "search",
+                "id": "b"
+              }
+            ],
+            "otherMessages": 1,
+            "metric": "api_calls",
+            "toolMetric": "mcp_server.tool_invocations",
+            "quotaMetric": "mcp_server.tool_invocations"
+          },
+          "method": "POST",
+          "path": "/mcp"
+        }
+      },
+      "attributes": {
+        "headers": {
+          "Mcp-Session-Id": "SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS"
+        }
+      }
+    },
+    {
+      "name": "MCP: no session header: sessionId left out",
+      "expect": {
+        "events.#length": 2
+      },
+      "vars": {
+        "aforoReq": {
+          "plan": {
+            "productType": "MCP_SERVER",
+            "tools": true,
+            "plain": false,
+            "calls": [
+              {
+                "toolName": "get_weather",
+                "id": 1
+              },
+              {
+                "toolName": "search",
+                "id": "b"
+              }
+            ],
+            "otherMessages": 1,
+            "metric": "api_calls",
+            "toolMetric": "mcp_server.tool_invocations",
+            "quotaMetric": "mcp_server.tool_invocations"
+          },
+          "method": "POST",
+          "path": "/mcp"
+        }
+      },
+      "absent": [
+        "events.0.sessionId"
+      ]
+    },
+    {
+      "name": "MCP: an unusable X-Aforo-Agent-Id skips every tool call",
+      "expect": {
+        "events": [],
+        "dropped": [
+          "unusable X-Aforo-Agent-Id response header"
+        ]
+      },
+      "vars": {
+        "aforoReq": {
+          "plan": {
+            "productType": "MCP_SERVER",
+            "tools": true,
+            "plain": false,
+            "calls": [
+              {
+                "toolName": "get_weather",
+                "id": 1
+              },
+              {
+                "toolName": "search",
+                "id": "b"
+              }
+            ],
+            "otherMessages": 1,
+            "metric": "api_calls",
+            "toolMetric": "mcp_server.tool_invocations",
+            "quotaMetric": "mcp_server.tool_invocations"
+          },
+          "method": "POST",
+          "path": "/mcp"
+        }
+      },
+      "attributes": {
+        "headers": {
+          "X-Aforo-Agent-Id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        }
+      }
+    },
+    {
+      "name": "MCP: a request without tools/call bills nothing",
+      "expect": {
+        "events": [],
+        "skipReason": "nothing billable (no tools/call)"
+      },
+      "vars": {
+        "aforoReq": {
+          "plan": {
+            "productType": "MCP_SERVER",
+            "tools": false,
+            "plain": false,
+            "calls": [],
+            "otherMessages": 1,
+            "metric": "api_calls",
+            "toolMetric": "mcp_server.tool_invocations",
+            "quotaMetric": "mcp_server.tool_invocations"
+          }
+        }
+      }
+    },
+    {
+      "name": "MCP: a customer id longer than 36 cannot be the agent (as on Kong)",
+      "expect": {
+        "events": [],
+        "dropped.0": "agentId is longer than 36 characters"
+      },
+      "vars": {
+        "aforoReq": {
+          "plan": {
+            "productType": "MCP_SERVER",
+            "tools": true,
+            "plain": false,
+            "calls": [
+              {
+                "toolName": "get_weather",
+                "id": 1
+              },
+              {
+                "toolName": "search",
+                "id": "b"
+              }
+            ],
+            "otherMessages": 1,
+            "metric": "api_calls",
+            "toolMetric": "mcp_server.tool_invocations",
+            "quotaMetric": "mcp_server.tool_invocations"
+          },
+          "method": "POST",
+          "path": "/mcp"
+        },
+        "aforoAccess": {
+          "identity": {
+            "customerId": "cccccccccccccccccccccccccccccccccccccccc"
+          }
+        }
+      }
+    },
+    {
+      "name": "MCP: X-Aforo-Metric applies to tool calls too",
+      "expect": {
+        "events.0.metricName": "tool_x",
+        "events.1.metricName": "tool_x"
+      },
+      "vars": {
+        "aforoReq": {
+          "plan": {
+            "productType": "MCP_SERVER",
+            "tools": true,
+            "plain": false,
+            "calls": [
+              {
+                "toolName": "get_weather",
+                "id": 1
+              },
+              {
+                "toolName": "search",
+                "id": "b"
+              }
+            ],
+            "otherMessages": 1,
+            "metric": "api_calls",
+            "toolMetric": "mcp_server.tool_invocations",
+            "quotaMetric": "mcp_server.tool_invocations"
+          },
+          "method": "POST",
+          "path": "/mcp"
+        }
+      },
+      "attributes": {
+        "headers": {
+          "X-Aforo-Metric": "tool_x"
+        }
+      }
+    }
+  ]
+}

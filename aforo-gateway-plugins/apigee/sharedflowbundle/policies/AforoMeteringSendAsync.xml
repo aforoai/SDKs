@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- delivery_mode async (the default): sends the events without waiting.
+     A ServiceCallout without a <Response> element is Apigee's documented
+     fire-and-forget: "the API proxy does not wait for a response; API Proxy
+     flow execution continues with any subsequent flow steps", and there is
+     "no way for the proxy flow to detect a failure in the remote call". So an
+     event the ingestor does not store is lost silently. X-API-Key alone: the
+     ingestor takes the tenant from the key. -->
+<ServiceCallout name="AforoMeteringSendAsync" continueOnError="true">
+    <DisplayName>Aforo Metering - Send Events (no wait)</DisplayName>
+    <Request variable="aforo.calloutRequestAsync" clearPayload="true">
+        <IgnoreUnresolvedVariables>true</IgnoreUnresolvedVariables>
+        <Set>
+            <Headers>
+                <Header name="Content-Type">application/json</Header>
+                <Header name="X-API-Key">{private.aforo.apiKey}</Header>
+            </Headers>
+            <Verb>POST</Verb>
+            <Payload contentType="application/json">{aforo.eventPayload}</Payload>
+        </Set>
+    </Request>
+    <HTTPTargetConnection>
+        <Properties>
+            <Property name="connect.timeout.millis">2000</Property>
+            <Property name="io.timeout.millis">5000</Property>
+        </Properties>
+        <URL>{private.aforo.endpoint}</URL>
+    </HTTPTargetConnection>
+</ServiceCallout>

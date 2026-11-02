@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Marks the call refused until AforoAccessComplete, clears aforo.verified.*,
+     and copies the caller's key (header x-api-key, header apikey, or query
+     parameter apikey) into aforo.access.clientKey for AforoVerifyApiKey. -->
+<Javascript name="AforoAccessPrepare" timeLimit="200" continueOnError="true">
+    <DisplayName>Aforo Access - Prepare</DisplayName>
+    <ResourceURL>jsc://aforo-access-prepare.js</ResourceURL>
+</Javascript>

@@ -8,113 +8,201 @@
 package mqttmetering
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math/rand"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt/v2/internal/ingest"
 )
 
-const sdkVersion = "1.0.0"
+const sdkVersion = "2.1.0"
 
+// Ingestor limits for the MQTT fields (IngestUsageEventRequest @Size).
+const (
+	maxMqttTopicLen    = 500
+	maxMqttClientIDLen = 128
+)
+
+// Config configures Billing. Sending defaults follow the shared transport
+// policy (contract/ingest-contract.json → transportPolicy).
+//
+// The customer id is an argument of every Record* call: pass the Aforo
+// customer you resolved from your own authentication. The SDK never derives
+// it from the MQTT username or client id.
 type Config struct {
 	TenantID          string
 	ProductID         string
-	APIKey            string
-	IngestorURL       string
-	EmitDeliverEvents bool          // off by default — DELIVER events are high-volume
-	FlushCount        int           // default 200 — MQTT is highest volume
-	FlushInterval     time.Duration // default 2s
-	HTTPClient        *http.Client
-	OnError           func(error)
+	APIKey            string // sent only as X-API-Key; never logged or printed
+	IngestorURL       string // must be https (http only for localhost or with AllowInsecureHTTP)
+	ProductType       string // default "MQTT_BROKER"; sent as top-level productType on every event
+	EmitDeliverEvents bool   // off by default — DELIVER events are high-volume
+
+	AllowInsecureHTTP bool          // allow http:// to a host other than localhost/127.0.0.1/::1
+	Compression       string        // "gzip" (default; 1 KiB+ batches gzip-encoded, needs usage-ingestor wave 8+) or "none"
+	FlushCount        int           // events per request, default 500 (max 1000)
+	FlushInterval     time.Duration // default 5s
+	MaxQueueSize      int           // default 10000; when full the oldest event is dropped (DropOverflow)
+	MaxRetries        int           // default 3; negative disables retries
+	RetryBase         time.Duration // full-jitter backoff base, default 500ms
+	Timeout           time.Duration // total deadline per request, default 10s
+	ShutdownTimeout   time.Duration // how long Shutdown keeps sending, default 5s
+
+	HTTPClient *http.Client // optional; you keep ownership
+	// OnError is called for sending problems with a *TransportError (use
+	// errors.As and branch on Kind: outage, auth, rejected, shutdown,
+	// closed) and for events refused client-side with a plain error. It runs
+	// on the background sender and may call Flush or Shutdown. Never carries
+	// the API key.
+	OnError func(error)
+	// OnAccepted, when set, receives the body of every 2xx answer (the data
+	// object, envelope removed) and the events of that request. Same
+	// goroutine and panic rules as OnError.
+	OnAccepted func(body json.RawMessage, events []map[string]any)
+	// OnDrop is an OPT-IN hook invoked with events the SDK gives up on (see
+	// DropReason). Events keep their idempotency keys, so re-submitting them
+	// after recovery is dedup-safe. Default: nil (drops are still counted in
+	// DroppedCount() and WARN-logged). Panics in the hook are recovered.
+	OnDrop func(events []map[string]any, reason DropReason)
+
+	hooks ingest.Hooks // tests: clock, sleep and random source
 }
 
 type Billing struct {
-	cfg    Config
-	url    string
-	client *http.Client
-
-	mu     sync.Mutex
-	buffer []map[string]any
-	stop   chan struct{}
-	wg     sync.WaitGroup
+	cfg Config
+	tp  *ingest.Client
+	// truncWarned holds the label names already WARN-logged as truncated.
+	truncWarned sync.Map
 }
 
+// New validates cfg and starts the background sender. Call Shutdown(ctx)
+// when your client stops.
 func New(cfg Config) (*Billing, error) {
 	if cfg.TenantID == "" || cfg.ProductID == "" || cfg.APIKey == "" || cfg.IngestorURL == "" {
 		return nil, errors.New("mqttmetering: TenantID, ProductID, APIKey, IngestorURL are required")
 	}
-	if cfg.FlushCount == 0 {
-		cfg.FlushCount = 200
-	}
-	if cfg.FlushInterval == 0 {
-		cfg.FlushInterval = 2 * time.Second
-	}
-	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = &http.Client{Timeout: 10 * time.Second}
+	cfg.ProductType = normalizeProductType(cfg.ProductType)
+	if cfg.ProductType == "" {
+		cfg.ProductType = DefaultProductType
 	}
 	if cfg.OnError == nil {
 		cfg.OnError = func(err error) {}
 	}
-	b := &Billing{
-		cfg:    cfg,
-		url:    strings.TrimRight(cfg.IngestorURL, "/") + "/v1/ingest/events",
-		client: cfg.HTTPClient,
-		stop:   make(chan struct{}),
+	tp, err := newTransport(cfg)
+	if err != nil {
+		return nil, err
 	}
-	b.wg.Add(1)
-	go b.flushLoop()
-	return b, nil
+	return &Billing{cfg: cfg, tp: tp}, nil
+}
+
+// Shutdown sends what is queued until the earlier of ctx's deadline and
+// Config.ShutdownTimeout. Events still queued then are reported as
+// DropShutdown and Shutdown returns an error wrapping ErrShutdownIncomplete.
+// Safe to call more than once.
+func (b *Billing) Shutdown(ctx context.Context) error {
+	return b.shutdownTransport(ctx)
 }
 
 // Per-event recording methods — wrap these around your MQTT client API.
+// Each accepts optional EventOptions (productType override, explicit
+// ExecutionStatus) and has a *WithOptions form taking a single EventOptions.
+//
+// A blank customerID is not billed: the event is dropped as DropInvalid and
+// counted. An event the ingestor would refuse (blank
+// topic on a topic event, a field over its limit) is not buffered: it is
+// counted in DroppedCount(), WARN-logged and handed to OnDrop with DropInvalid.
+// topic and clientID are the exception: they originate from the MQTT client,
+// so a topic over 500 or a client id over 128 characters is truncated and the
+// event is still sent.
 
-func (b *Billing) RecordPublish(customerID, clientID, topic string, qos int, retained bool, payloadBytes int64) {
-	b.push(b.eventOf(customerID, clientID, "PUBLISH", topic, qos, retained, payloadBytes))
+func (b *Billing) RecordPublish(customerID, clientID, topic string, qos int, retained bool, payloadBytes int64, opts ...EventOptions) {
+	b.push(b.eventOf(customerID, clientID, "PUBLISH", topic, qos, retained, payloadBytes, opts))
 }
 
-func (b *Billing) RecordDeliver(customerID, clientID, topic string, qos int, retained bool, payloadBytes int64) {
+func (b *Billing) RecordPublishWithOptions(customerID, clientID, topic string, qos int, retained bool, payloadBytes int64, opts EventOptions) {
+	b.RecordPublish(customerID, clientID, topic, qos, retained, payloadBytes, opts)
+}
+
+func (b *Billing) RecordDeliver(customerID, clientID, topic string, qos int, retained bool, payloadBytes int64, opts ...EventOptions) {
 	if !b.cfg.EmitDeliverEvents {
 		return
 	}
-	b.push(b.eventOf(customerID, clientID, "DELIVER", topic, qos, retained, payloadBytes))
+	b.push(b.eventOf(customerID, clientID, "DELIVER", topic, qos, retained, payloadBytes, opts))
 }
 
-func (b *Billing) RecordSubscribe(customerID, clientID, topicFilter string, qos int) {
-	b.push(b.eventOf(customerID, clientID, "SUBSCRIBE", topicFilter, qos, false, 0))
+func (b *Billing) RecordDeliverWithOptions(customerID, clientID, topic string, qos int, retained bool, payloadBytes int64, opts EventOptions) {
+	b.RecordDeliver(customerID, clientID, topic, qos, retained, payloadBytes, opts)
 }
 
-func (b *Billing) RecordUnsubscribe(customerID, clientID, topicFilter string) {
-	b.push(b.eventOf(customerID, clientID, "UNSUBSCRIBE", topicFilter, 0, false, 0))
+func (b *Billing) RecordSubscribe(customerID, clientID, topicFilter string, qos int, opts ...EventOptions) {
+	b.push(b.eventOf(customerID, clientID, "SUBSCRIBE", topicFilter, qos, false, 0, opts))
 }
 
-func (b *Billing) RecordConnect(customerID, clientID string) {
-	b.push(b.eventOf(customerID, clientID, "CONNECT", "", 0, false, 0))
+func (b *Billing) RecordSubscribeWithOptions(customerID, clientID, topicFilter string, qos int, opts EventOptions) {
+	b.RecordSubscribe(customerID, clientID, topicFilter, qos, opts)
 }
 
-func (b *Billing) RecordDisconnect(customerID, clientID string) {
-	b.push(b.eventOf(customerID, clientID, "DISCONNECT", "", 0, false, 0))
+func (b *Billing) RecordUnsubscribe(customerID, clientID, topicFilter string, opts ...EventOptions) {
+	b.push(b.eventOf(customerID, clientID, "UNSUBSCRIBE", topicFilter, 0, false, 0, opts))
 }
 
-func (b *Billing) eventOf(customerID, clientID, eventType, topic string, qos int, retained bool, bytesAmt int64) map[string]any {
+func (b *Billing) RecordUnsubscribeWithOptions(customerID, clientID, topicFilter string, opts EventOptions) {
+	b.RecordUnsubscribe(customerID, clientID, topicFilter, opts)
+}
+
+func (b *Billing) RecordConnect(customerID, clientID string, opts ...EventOptions) {
+	b.push(b.eventOf(customerID, clientID, "CONNECT", "", 0, false, 0, opts))
+}
+
+func (b *Billing) RecordConnectWithOptions(customerID, clientID string, opts EventOptions) {
+	b.RecordConnect(customerID, clientID, opts)
+}
+
+func (b *Billing) RecordDisconnect(customerID, clientID string, opts ...EventOptions) {
+	b.push(b.eventOf(customerID, clientID, "DISCONNECT", "", 0, false, 0, opts))
+}
+
+func (b *Billing) RecordDisconnectWithOptions(customerID, clientID string, opts EventOptions) {
+	b.RecordDisconnect(customerID, clientID, opts)
+}
+
+func (b *Billing) eventOf(customerID, clientID, eventType, topic string, qos int, retained bool, bytesAmt int64, opts []EventOptions) map[string]any {
+	customerID = strings.TrimSpace(customerID)
+	invalid := ""
 	if customerID == "" {
-		return nil
+		invalid = "customerId is required"
+	}
+	if invalid == "" && strings.TrimSpace(topic) == "" {
+		switch eventType {
+		case "CONNECT", "DISCONNECT":
+			// mqttTopic is required for MQTT_BROKER events; session events have
+			// no topic, so use the broker-style $SYS client topic.
+			topic = fmt.Sprintf("$SYS/clients/%s/%s", clientID, strings.ToLower(eventType)+"ed")
+		default:
+			invalid = fmt.Sprintf("mqttTopic is required on %s (got %q)", eventType, truncate(topic, 80))
+		}
 	}
 	now := time.Now().UTC()
-	return map[string]any{
+	// The key is built from the full topic and client id, before truncation.
+	key := idempotencyKeyFor(b.cfg.TenantID, clientID, eventType, topic, now.UnixMilli(), randomSuffix())
+	// Topic and client id always originate from the MQTT client's message
+	// (integration code only hands them on), so they are truncated to the
+	// ingestor's limits instead of dropping the event.
+	topic = b.truncateLabel("mqttTopic", topic, maxMqttTopicLen)
+	clientID = b.truncateLabel("mqttClientId", clientID, maxMqttClientIDLen)
+	e := map[string]any{
 		"customerId":     customerID,
 		"metricName":     "mqtt_broker." + strings.ToLower(eventType),
 		"quantity":       1,
 		"occurredAt":     now.Format(time.RFC3339Nano),
-		"idempotencyKey": fmt.Sprintf("mqtt:%s:%s:%s:%s:%d:%s", b.cfg.TenantID, clientID, eventType, topic, now.UnixMilli(), randomSuffix()),
-		"productType":    "MQTT_BROKER",
+		"idempotencyKey": key,
+		"productType":    b.productTypeFor(opts),
 		"mqttTopic":      topic,
-		"mqttQos":        qos,
 		"mqttRetained":   retained,
 		"mqttEventType":  eventType,
 		"mqttClientId":   clientID,
@@ -124,76 +212,41 @@ func (b *Billing) eventOf(customerID, clientID, eventType, topic string, qos int
 			"productId":  b.cfg.ProductID,
 		},
 	}
-}
-
-func (b *Billing) push(event map[string]any) {
-	if event == nil {
-		return
+	// mqttQos must be 0, 1 or 2; omit anything else instead of having the
+	// ingestor reject the event.
+	if qos >= 0 && qos <= 2 {
+		e["mqttQos"] = qos
 	}
-	b.mu.Lock()
-	b.buffer = append(b.buffer, event)
-	overflow := len(b.buffer) >= b.cfg.FlushCount
-	b.mu.Unlock()
-	if overflow {
-		go b.flush()
-	}
-}
-
-func (b *Billing) flushLoop() {
-	defer b.wg.Done()
-	ticker := time.NewTicker(b.cfg.FlushInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			b.flush()
-		case <-b.stop:
-			b.flush()
-			return
-		}
-	}
-}
-
-func (b *Billing) flush() {
-	b.mu.Lock()
-	if len(b.buffer) == 0 {
-		b.mu.Unlock()
-		return
-	}
-	batch := b.buffer
-	b.buffer = nil
-	b.mu.Unlock()
-
-	body, err := json.Marshal(map[string]any{"events": batch})
-	if err != nil {
-		b.cfg.OnError(err)
-		return
-	}
-	for attempt := 1; attempt <= 3; attempt++ {
-		req, _ := http.NewRequest(http.MethodPost, b.url, bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+b.cfg.APIKey)
-		req.Header.Set("X-Tenant-Id", b.cfg.TenantID)
-		resp, err := b.client.Do(req)
-		if err == nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				return
+	withExecutionStatus(e, executionStatusFor(opts))
+	// An event the ingestor would refuse is dropped here (DropInvalid)
+	// instead of failing server-side unseen. customerId and productType are
+	// never truncated.
+	if invalid == "" {
+		for _, c := range []struct {
+			field, value string
+			max          int
+		}{
+			{"customerId", customerID, maxCustomerIDLen},
+			{"productType", e["productType"].(string), maxProductTypeLen},
+		} {
+			if invalid = tooLong(c.field, c.value, c.max); invalid != "" {
+				break
 			}
-		} else if attempt == 3 {
-			b.cfg.OnError(err)
-			return
 		}
-		time.Sleep(time.Duration(1<<(attempt-1)) * time.Second)
 	}
-	b.cfg.OnError(fmt.Errorf("mqttmetering: flush exhausted retries (dropped %d events)", len(batch)))
+	if invalid != "" {
+		b.dropInvalid(e, invalid)
+		return nil
+	}
+	return e
 }
 
-func (b *Billing) Shutdown() error {
-	close(b.stop)
-	b.wg.Wait()
-	return nil
+// idempotencyKeyFor returns
+// "mqtt:<tenant>:<clientId>:<eventType>:<topic>:<millis>:<suffix>". A topic can
+// be 500 characters, so the key can exceed the ingestor's 255; see boundedKey
+// for what happens then (the topic is digested, the key is never cut).
+func idempotencyKeyFor(tenantID, clientID, eventType, topic string, millis int64, suffix string) string {
+	return boundedKey(fmt.Sprintf("mqtt:%s:%s:%s:", tenantID, clientID, eventType), topic, fmt.Sprintf(":%d:%s", millis, suffix))
 }
 
 var alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"

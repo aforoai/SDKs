@@ -1,8 +1,8 @@
 # @aforoai/agent-metering
 
-Instrument an AI agent's runtime lifecycle — start session, record reasoning steps and tool calls, end session — and have Aforo bill and analyze the run. Sits one layer above the generic `@aforo/metering` client: events are POSTed directly with no peer dependency, buffered, batched, and flushed on a size/time threshold.
+Meter an AI agent's runs in Aforo: open a session, record steps, tool calls and tokens, end the session. Events are buffered and sent in batches to the Aforo usage ingestor (`POST https://api.aforo.ai/v1/ingest/batch`, header `X-API-Key`). No runtime dependencies.
 
-**Version:** 1.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -10,79 +10,136 @@ Instrument an AI agent's runtime lifecycle — start session, record reasoning s
 npm i @aforoai/agent-metering
 ```
 
-> **Not yet on the public npm registry.** Until it's published, install from source:
-> ```bash
-> git clone https://github.com/aforoai/aforo-metering-sdks.git
-> cd aforo-metering-sdks/node-agent
-> npm install && npm run build
-> npm pack        # produces aforoai-agent-metering-1.0.0.tgz
-> # then in your agent project: npm i /path/to/aforoai-agent-metering-1.0.0.tgz
-> ```
+If `2.0.0` is not on npm yet, install from source:
 
-Requires Node >= 18 (uses the built-in `fetch`). On Node < 18, pass your own `fetchImpl` in the config.
+```bash
+git clone https://github.com/aforoai/SDKs.git
+cd SDKs/aforo-metering-sdks/node-agent
+npm install && npm run build && npm pack   # aforoai-agent-metering-2.0.0.tgz
+```
+
+Requires Node >= 18 (built-in `fetch`). On older Node, pass `fetchImpl`.
 
 ## Quickstart
-
-The smallest run that lands events in Aforo: open a session, record one step, end it.
 
 ```ts
 import { AforoAgent } from '@aforoai/agent-metering';
 
 const agent = new AforoAgent({
-  tenantId: 'tenant_smartai',
-  productId: 'prod_agent_001',
-  apiKey: process.env.AFORO_API_KEY!,
+  apiKey: process.env.AFORO_API_KEY!, // workspace API key
+  customerId: 'cust_123',             // Aforo customer billed for the usage
+  agentId: 'support-bot',             // <= 36 chars
+  productId: 'prod_abc',              // optional, sent as metadata.productId
+  onError: (err) => console.error(`[aforo] ${err.kind}: ${err.message}`),
 });
 
-const session = await agent.startSession({
-  agentId: 'agt_001',
+const session = agent.startSession({
   framework: 'CLAUDE',
   modelProvider: 'ANTHROPIC',
   modelName: 'claude-sonnet-4-6',
 });
 
-await session.recordStep({
-  stepKind: 'TOOL_CALL',
-  capabilityName: 'web-search',
-  inputTokens: 320,
-  outputTokens: 84,
-  durationMs: 510,
-  executionStatus: 'SUCCESS',
-});
+try {
+  await session.recordStep({ stepKind: 'THOUGHT' });
+  await session.recordToolCall('web_search', { durationMs: 510, executionStatus: 'SUCCESS' });
+  await session.recordTokens('claude-sonnet-4-6', 320, 84);
+  await session.endSession({ taskCompleted: true });   // flushes
+} catch (e) {
+  await session.endSession({ taskCompleted: false, errorMessage: String(e) });
+  throw e;
+}
 
-await session.end({ taskCompleted: true });
+await agent.shutdown(); // before the process exits
 ```
 
-`session.end()` forces a final flush, so the events are delivered before your agent process exits. If your agent runs many sessions in one long-lived process, you don't need to do anything else — the buffer flushes on the size/time threshold between sessions too.
+## What gets sent
 
-> ⚠ A single step with `inputTokens` or `outputTokens` emits **two** events: an `agent_step` (counts toward `step_count`) and a `token_usage` (counts toward `tokens_total`). That's intentional — billing on steps and billing on tokens are separate metrics. Don't double-count them yourself.
+| Call | Metric (default name) | Quantity |
+|---|---|---|
+| `recordStep(opts)` | `Agent Steps` | 1 |
+| `recordStep({ stepKind: 'TOOL_CALL' })` / `recordToolCall(name, opts)` | `Agent Steps` + `Agent Tool Calls` | 1 each |
+| `recordTokens(model, input, output)`, or a step with `inputTokens`/`outputTokens` | `Tokens Consumed` | input + output |
+| `recordUsage('knowledgeQueries' \| 'gpuHours' \| 'executionMinutes' \| 'activeAgents' \| '<catalog name>', qty)` | that metric | `qty` |
+| `endSession({ taskCompleted: true })` | `Tasks Completed` | 1 |
+| `endSession({ executionMinutes })` | `Execution Minutes` | the value |
+| `endSession()` (always, last) | `Agent Sessions`, with `sessionBoundary: "SESSION_END"` | 1 |
+
+Zero quantities are skipped (never sent). Each event looks like this:
+
+```json
+{
+  "customerId": "cust_123", "metricName": "Tokens Consumed", "quantity": 404,
+  "occurredAt": "2026-10-21T10:00:00.000Z", "idempotencyKey": "<sessionId>:3",
+  "productType": "AI_AGENT", "agentId": "support-bot", "sessionId": "<uuid>",
+  "traceId": "<32 hex>", "subscriptionId": "sub_1",
+  "metadata": { "model_provider": "ANTHROPIC", "model_name": "claude-sonnet-4-6",
+                "input_tokens": 320, "output_tokens": 84, "productId": "prod_abc" }
+}
+```
+
+Tool-call and step events also carry `capabilityName`, `executionStatus`, `executionDurationMs` and `stepNumber`.
+
+**Idempotency keys** are deterministic: `<sessionId>:<n>`, where `n` counts the session's events. A retried batch re-sends the same keys, so the ingestor deduplicates it. The generated `sessionId` is a UUID; if you pass your own, it must be unique per run, or a later run's events are treated as duplicates. Each session gets one `traceId` (32 hex chars, generated unless you pass one).
 
 ## Configuration
 
-Pass these to `new AforoAgent({...})`:
+| Option | Default | |
+|---|---|---|
+| `apiKey` | required | Workspace API key, sent as `X-API-Key` (never `Authorization: Bearer`). |
+| `customerId` | — | Customer billed. Required here or per session (`startSession({ customerId })`). |
+| `agentId` | — | Required here or per session. At most 36 chars. |
+| `subscriptionId` | — | Optional; per session too. |
+| `productId` | — | Optional; sent as `metadata.productId`. |
+| `endpoint` | `https://api.aforo.ai/v1/ingest/batch` | A bare host gets `/v1/ingest/batch`; `…/v1/ingest` gets `/batch`. |
+| `metricNames` | see below | Override any catalog metric name. |
+| `flushIntervalMs` | `5000` | Max time an event waits before a timed send. |
+| `maxBatchSize` | `500` | Events per request (max 1000). A full batch wakes the sender. |
+| `maxBufferSize` | `10000` | Max events held in memory, including ones kept during an outage. Past it the oldest is dropped (`overflow`). |
+| `maxRetries` | `4` | Attempts per request on 408 / 429 / 5xx / network errors / timeouts, with full-jitter backoff. `Retry-After` (seconds or HTTP-date) is honoured, capped at 60 s. |
+| `retryBaseDelayMs` | `500` | Backoff base, doubled per attempt (random delay up to that ceiling, at most 30 s). |
+| `requestTimeoutMs` | `10000` | Total deadline per request. |
+| `shutdownTimeoutMs` | `5000` | How long `shutdown()` keeps sending. What is still queued then is dropped as `shutdown`. |
+| `flushOnExit` | `true` | Send what is queued on the process `beforeExit` event, within `shutdownTimeoutMs`. |
+| `allowInsecureHttp` | `false` | Allow a plain `http://` endpoint on a host other than localhost / 127.0.0.1 / ::1. Otherwise the endpoint must be `https://`. |
+| `onError` | — | `(err: AforoAgentError) => void`. Called for every delivery problem. |
+| `logger` | `console` | Used for warnings when `onError` is unset. `null` silences. |
+| `fetchImpl` | global `fetch` | Custom transport (tests, Node < 18). |
 
-| Option | Type | Default | What it does |
-|---|---|---|---|
-| `tenantId` | `string` | — (required) | Aforo tenant scope. Stamped on every event and sent as `X-Tenant-Id`. Never read from a client header. |
-| `productId` | `string` | — (required) | The AI_AGENT product these events bill against. |
-| `apiKey` | `string` | — (required) | Sent as `Authorization: Bearer <apiKey>`. Use `process.env.AFORO_API_KEY`. |
-| `ingestorUrl` | `string` | `https://usage-ingestor.aforo.ai/v1/ingest` | Full ingest URL. Override for local dev or air-gapped deployments. |
-| `flushBatchSize` | `number` | `50` | Buffer this many events before forcing a flush. Lower it for low-volume agents to surface metrics sooner; raise it to amortize per-batch HTTP cost. |
-| `flushIntervalMs` | `number` | `5000` | Max time an event sits in the buffer before a timed flush. `session.end()` flushes regardless. |
-| `fetchImpl` | `typeof fetch` | global `fetch` | Pluggable transport. Required on Node < 18 where there's no global `fetch`; also the seam used in tests. |
+`metricNames` defaults (the default AI_AGENT catalog metrics):
 
-### Per-session and per-step options
+```ts
+{ sessions: 'Agent Sessions', steps: 'Agent Steps', toolCalls: 'Agent Tool Calls',
+  tokens: 'Tokens Consumed', executionMinutes: 'Execution Minutes', gpuHours: 'GPU Hours',
+  knowledgeQueries: 'Knowledge Queries', tasksCompleted: 'Tasks Completed', activeAgents: 'Active Agents' }
+```
 
-`startSession({...})` — `agentId` (required), optional `sessionId` (a UUID is generated if omitted), `framework` (`CLAUDE` \| `GPT` \| `LANGCHAIN` \| `CREWAI` \| `AUTOGEN` \| `CUSTOM`), `modelProvider` (`ANTHROPIC` \| `OPENAI` \| `GOOGLE` \| `COHERE` \| `CUSTOM`), `modelName`, and free-form `metadata`.
+### Execution status
 
-`recordStep({...})` — `stepKind` (`TOOL_CALL` \| `THOUGHT` \| `OBSERVATION` \| `FINAL_ANSWER`, required), optional `capabilityName`, `inputTokens`, `outputTokens`, `durationMs`, `executionStatus` (`SUCCESS` \| `ERROR` \| `TIMEOUT` \| `CANCELLED` \| `HITL_REQUIRED`, defaults `SUCCESS`), and `metadata`. `session.recordToolCall(toolName, opts)` is the shortcut for the common `TOOL_CALL` case.
+`executionStatus` accepts `SUCCESS`, `PARTIAL`, `TIMEOUT`, `ERROR`, `VALIDATION_FAILED`, `FAILED`, `FAILURE`, `CANCELLED`, `PENDING`, `BLOCKED`, `HITL_REQUIRED` (exported as `EXECUTION_STATUSES`). The value is trimmed and upper-cased; missing means `SUCCESS`; anything else is left off the event, with a warning.
 
-`end({...})` — `taskCompleted` (required), optional `errorMessage` and `metadata`.
+## Delivery and errors
 
-## Walk me through it
+`record*` calls never throw and never wait for the network: they put the event on a bounded queue, and one background sender posts batches (never two requests at once). `flush()`, `endSession()` and `shutdown()` resolve to `{ accepted, failed, requeued, pending }`.
 
-Step-by-step from install to a verified event in Aforo: [USER_GUIDE.md](USER_GUIDE.md).
+| `err.kind` | When | Events |
+|---|---|---|
+| `retrying` | Every attempt failed with a network error, timeout, 401, 403, 408, 429 or 5xx | **Kept** on the queue with their idempotency keys; the sender pauses (5 s, doubling with jitter up to 5 min) and re-sends them. `err.events` is empty, `err.willRetry === true`. |
+| `rejected` | Another 4xx for the whole batch (400, 422), or per-event errors in a 2xx answer | Dropped; `err.events` lists them. Per-event errors marked `retryable` are re-sent instead. |
+| `invalid` | Missing `customerId` / `agentId`, quantity ≤ 0, field too long | Never sent |
+| `overflow` | Queue above `maxBufferSize` | Oldest dropped |
+| `shutdown` | Still queued when `shutdown()` hit `shutdownTimeoutMs` | Dropped |
+| `closed` | Recorded after `shutdown()` | Dropped |
 
-## What this doesn't cover
+A 401 or 403 is treated as an outage, not a rejection: a wrong or revoked key is logged once per outage, and the usage is sent once a valid key is in place. `agent.droppedCount` and `agent.pendingCount` expose the totals. Events held in memory are lost if the process dies before they are sent. The SDK installs no signal handlers; call `await agent.shutdown()` from yours:
 
-Delivery is **best-effort**. On an HTTP failure `flush()` logs a warning and **drops** the batch — there's no on-disk queue or dead-letter. That's the same posture as the generic and MCP SDKs: direct SDK emit is for first-party customers running their own agents. For billing where a dropped event is unacceptable, meter through a gateway plugin instead. This SDK also does not enforce quotas — it records usage, it doesn't gate the agent on a limit.
+```ts
+process.once('SIGTERM', async () => { await agent.shutdown(); process.exit(0); });
+```
+
+## Upgrading from 2.x
+
+`FlushResult` is `{ accepted, failed, requeued, pending }` (no `duplicates`; duplicates count as accepted). `err.kind` `partial` is gone: per-event rejections are `rejected` with the dropped events in `err.events`; `AforoAgentError` has no `status` or `errors` fields. 401 / 403 are retried as an outage instead of dropped. `maxRetries` now defaults to 4 attempts and `maxBatchSize` to 500. A plain `http://` endpoint needs `allowInsecureHttp: true` unless it is localhost.
+
+## Upgrading from 1.x
+
+1.x options still work but are deprecated: `tenantId` (ignored; the API key identifies the tenant), `ingestorUrl` (use `endpoint`), `flushBatchSize` (use `maxBatchSize`), `onDrop` (use `onError`). `session.end()` is still there (`endSession()` is an alias). `startSession()` now returns the session directly; `await agent.startSession(...)` still works. The emitted metric names changed to the catalog names above. If your product's metrics are named `step_count` / `tokens_total` / etc., set `metricNames`. See the [changelog](CHANGELOG.md).

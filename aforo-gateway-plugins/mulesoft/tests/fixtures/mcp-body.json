@@ -1,0 +1,16 @@
+{
+  "script": "mcp-body",
+  "base": { "vars": {}, "attributes": { "method": "POST", "headers": {} } },
+  "cases": [
+    { "name": "declared length under 1 MiB is read", "attributes": { "headers": { "content-length": "512" } }, "expect": { "read": true } },
+    { "name": "exactly 1 MiB is read", "attributes": { "headers": { "Content-Length": "1048576" } }, "expect": { "read": true } },
+    { "name": "over 1 MiB is not read", "attributes": { "headers": { "content-length": "1048577" } }, "expect": { "read": false, "reason": "the request body is over 1 MiB" } },
+    { "name": "chunked (no Content-Length) is not read", "attributes": { "headers": { "transfer-encoding": "chunked" } }, "expect": { "read": false, "reason": "the request has Transfer-Encoding and no declared length" } },
+    { "name": "Transfer-Encoding wins over a Content-Length", "attributes": { "headers": { "transfer-encoding": "chunked", "content-length": "10" } }, "expect": { "read": false } },
+    { "name": "no length header is not read", "expect": { "read": false, "reason": "the request has no usable Content-Length" } },
+    { "name": "non-numeric Content-Length is not read", "attributes": { "headers": { "content-length": "12abc" } }, "expect": { "read": false, "reason": "the request has no usable Content-Length" } },
+    { "name": "negative Content-Length is not read", "attributes": { "headers": { "content-length": "-1" } }, "expect": { "read": false } },
+    { "name": "Content-Length with spaces is trimmed", "attributes": { "headers": { "content-length": " 20 " } }, "expect": { "read": true } },
+    { "name": "first of repeated Content-Length values", "attributes": { "headers": { "content-length": ["30", "40"] } }, "expect": { "read": true } }
+  ]
+}

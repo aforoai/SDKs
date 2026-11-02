@@ -122,7 +122,7 @@ class AforoGrpcIntegrationTest {
         // Start capture HTTP server on a random port
         captureServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         captureServer.createContext("/", (HttpExchange ex) -> {
-            byte[] body = ex.getRequestBody().readAllBytes();
+            byte[] body = com.aforo.testsupport.RequestBodies.read(ex);
             synchronized (capturedBodies) {
                 try {
                     if (body.length > 0) {
@@ -143,7 +143,7 @@ class AforoGrpcIntegrationTest {
         capturePort = captureServer.getAddress().getPort();
 
         // Build billing
-        billing = AforoGrpcBilling.newBuilder()
+        billing = AforoGrpcBilling.newBuilder().trustCustomerHeader(true)
                 .tenantId("tenant-int-grpc")
                 .productId("prod-int-grpc")
                 .apiKey("sk_int_grpc")
@@ -282,6 +282,7 @@ class AforoGrpcIntegrationTest {
         assertThat(ev).containsEntry("grpcService", "aforo.test.Greeter");
         assertThat(ev).containsEntry("grpcMethod", "SayHello");
         assertThat(ev).containsEntry("grpcStatusCode", "OK");
+        assertThat(ev).containsEntry("executionStatus", "SUCCESS");
         assertThat(ev).containsEntry("grpcCallType", "UNARY");
         assertThat(ev).containsEntry("customerId", "cust_grpc_001");
     }
@@ -297,6 +298,7 @@ class AforoGrpcIntegrationTest {
         Map<String, Object> ev = events.get(0);
         assertThat(ev).containsEntry("grpcMethod", "FailHard");
         assertThat(ev).containsEntry("grpcStatusCode", "INVALID_ARGUMENT");
+        assertThat(ev).containsEntry("executionStatus", "VALIDATION_FAILED");
         assertThat(ev).containsEntry("customerId", "cust_grpc_002");
     }
 
@@ -312,9 +314,10 @@ class AforoGrpcIntegrationTest {
         assertThat(capturedHeaders).isNotEmpty();
         Map<String, List<String>> headers = capturedHeaders.get(0);
         // HttpExchange capitalizes keys; use case-insensitive lookup
-        List<String> auth = headers.getOrDefault("Authorization", List.of());
+        List<String> auth = headers.getOrDefault("X-api-key", headers.getOrDefault("X-API-Key", List.of()));
         List<String> tenant = headers.getOrDefault("X-tenant-id", headers.getOrDefault("X-Tenant-Id", List.of()));
-        assertThat(auth).contains("Bearer sk_int_grpc");
+        assertThat(auth).contains("sk_int_grpc");
+        assertThat(headers.containsKey("Authorization")).isFalse();
         assertThat(tenant).contains("tenant-int-grpc");
     }
 }

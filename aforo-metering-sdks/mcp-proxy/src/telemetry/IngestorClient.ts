@@ -1,11 +1,12 @@
 /**
- * @file HTTP client for sending batched usage events to Aforo ingestor.
- * POST /v1/ingest/batch with Bearer auth + X-Tenant-Id header.
- * 3x retry with exponential backoff (1s, 2s, 4s). 10s timeout.
- * Pattern reused from aforo-metering-sdks/node/src/transport.ts
+ * @file Single-event sender for session heartbeats.
+ * POST /v1/ingest/batch with `{"events":[event]}`, X-API-Key + X-Tenant-Id,
+ * 10 s timeout, sent once. Usage events go through the EventBuffer's
+ * transport core instead (queue, retries, breaker, shutdown deadline).
  */
 
 import type { ProxyUsageEvent, BatchIngestResponse } from '../types.js';
+import { checkBaseUrl } from '../transport-core/core.js';
 import { logger } from '../util/logger.js';
 
 export interface IngestorClientConfig {
@@ -13,95 +14,74 @@ export interface IngestorClientConfig {
   apiKey: string;
   tenantId: string;
   timeout?: number;
-  maxRetries?: number;
+  allowInsecureHttp?: boolean;
 }
 
 export class IngestorClient {
   private readonly baseUrl: string;
-  private readonly apiKey: string;
+  private readonly apiKey!: string;
   private readonly tenantId: string;
   private readonly timeout: number;
-  private readonly maxRetries: number;
 
   constructor(config: IngestorClientConfig) {
-    this.baseUrl = config.baseUrl.replace(/\/+$/, '');
-    this.apiKey = config.apiKey;
+    this.baseUrl = checkBaseUrl(config.baseUrl, config.allowInsecureHttp === true);
+    // Non-enumerable: the key never shows in inspect() or JSON.
+    Object.defineProperty(this, 'apiKey', { value: config.apiKey, enumerable: false });
     this.tenantId = config.tenantId;
     this.timeout = config.timeout ?? 10_000;
-    this.maxRetries = config.maxRetries ?? 3;
   }
 
-  async sendBatch(events: ProxyUsageEvent[]): Promise<BatchIngestResponse | null> {
-    if (events.length === 0) return { accepted: 0, duplicates: 0, failed: 0 };
-
-    const url = `${this.baseUrl}/v1/ingest/batch`;
-    const body = JSON.stringify({ events });
-
-    for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
-      try {
-        const response = await fetch(url, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${this.apiKey}`,
-            'X-Tenant-Id': this.tenantId,
-          },
-          body,
-          signal: AbortSignal.timeout(this.timeout),
-        });
-
-        if (response.ok) {
-          try {
-            return await response.json() as BatchIngestResponse;
-          } catch {
-            // Old ingestor may return empty 202
-            return { accepted: events.length, duplicates: 0, failed: 0 };
-          }
+  /**
+   * POST a single event in its own `{"events":[event]}` request, exactly once.
+   *
+   * Used for session heartbeats: they must never share a batch with usage (a
+   * large batch takes the ingestor's high-throughput path, which does not
+   * intercept heartbeats), and a lost heartbeat is superseded by the next one,
+   * so there is no retry. Never throws; resolves to the parsed response, or
+   * null on any failure.
+   */
+  async sendSingle(event: ProxyUsageEvent): Promise<BatchIngestResponse | null> {
+    try {
+      const response = await fetch(`${this.baseUrl}/v1/ingest/batch`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-Key': this.apiKey,
+          'X-Tenant-Id': this.tenantId,
+        },
+        body: JSON.stringify({ events: [event] }),
+        signal: AbortSignal.timeout(this.timeout),
+        // Never follow a redirect: it would send the API key to another host.
+        redirect: 'manual',
+      });
+      if (!response.ok) {
+        if (response.status === 0 || (response.status >= 300 && response.status < 400)) {
+          logger.warn('Ingestor answered a redirect for a heartbeat; redirects are not followed, check --ingestor-url', {
+            status: response.status,
+          });
+        } else {
+          logger.debug('Single-event send rejected', { status: response.status });
         }
-
-        // 4xx (except 408, 429) — bad input, don't retry
-        if (response.status >= 400 && response.status < 500
-            && response.status !== 408 && response.status !== 429) {
-          logger.error('Ingestor returned non-retryable error', { status: response.status, attempt });
-          return null;
-        }
-
-        // 429 — respect Retry-After
-        if (response.status === 429) {
-          const retryAfter = response.headers.get('Retry-After');
-          const delayMs = retryAfter
-            ? (parseInt(retryAfter, 10) || 1) * 1000
-            : Math.pow(2, attempt - 1) * 1000;
-          if (attempt < this.maxRetries) {
-            await this.sleep(delayMs);
-            continue;
-          }
-        }
-
-        // 5xx or 408 — retry with backoff
-        if (attempt < this.maxRetries) {
-          await this.sleep(Math.pow(2, attempt - 1) * 1000);
-          continue;
-        }
-
-        logger.error('Ingestor exhausted retries', { status: response.status, attempts: this.maxRetries });
-        return null;
-
-      } catch (err) {
-        if (attempt < this.maxRetries) {
-          logger.warn('Ingestor request failed, retrying', { attempt, error: (err as Error).message });
-          await this.sleep(Math.pow(2, attempt - 1) * 1000);
-          continue;
-        }
-        logger.error('Ingestor request failed after all retries', { error: (err as Error).message });
         return null;
       }
+      try {
+        return unwrapEnvelope(await response.json()) as BatchIngestResponse;
+      } catch {
+        return { accepted: 1, duplicates: 0, failed: 0 };
+      }
+    } catch (err) {
+      logger.debug('Single-event send failed', { error: (err as Error).message });
+      return null;
     }
-
-    return null;
   }
 
-  private sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
+}
+
+/**
+ * The ingestor wraps every 2xx JSON body in `{success, data, meta}`. Returns
+ * the inner `data` object when present, else the body unchanged (bare shape).
+ */
+export function unwrapEnvelope(body: any): any {
+  const data = body && typeof body === 'object' && !Array.isArray(body) ? body.data : undefined;
+  return data && typeof data === 'object' && !Array.isArray(data) ? data : body;
 }

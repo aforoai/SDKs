@@ -1,0 +1,17 @@
+{
+  "name": "hello-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Runnable smoke example for @aforoai/agent-metering — invokes 10 capabilities against Aforo's usage-ingestor",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@aforoai/agent-metering": "file:../.."
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

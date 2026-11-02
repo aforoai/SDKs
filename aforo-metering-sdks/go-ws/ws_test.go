@@ -7,7 +7,6 @@ package wsmetering
 
 import (
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -18,15 +17,19 @@ import (
 type rec struct {
 	mu       sync.Mutex
 	requests []map[string]any
+	paths    []string
+	headers  []http.Header
 }
 
 func (r *rec) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	raw, _ := io.ReadAll(req.Body)
+	raw, _ := readRequestBody(req)
 	req.Body.Close()
 	var body map[string]any
 	_ = json.Unmarshal(raw, &body)
 	r.mu.Lock()
 	r.requests = append(r.requests, body)
+	r.paths = append(r.paths, req.URL.Path)
+	r.headers = append(r.headers, req.Header.Clone())
 	r.mu.Unlock()
 	w.WriteHeader(204)
 }
@@ -52,6 +55,7 @@ func newBilling(t *testing.T, srv *httptest.Server, opts ...func(*Config)) *Bill
 		ProductID:     "prod-ws-001",
 		APIKey:        "sk_ws_abc",
 		IngestorURL:   srv.URL,
+		hooks:         fastHooks(),
 		FlushCount:    100,
 		FlushInterval: 60 * time.Second,
 	}
@@ -82,14 +86,17 @@ func TestOpenEmitsConnectionOpened(t *testing.T) {
 	for time.Now().Before(deadline) && len(r.events()) == 0 {
 		time.Sleep(10 * time.Millisecond)
 	}
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	ev := r.events()[0]
 	if ev["productType"] != "WEBSOCKET_API" {
 		t.Errorf("productType = %v", ev["productType"])
 	}
-	if ev["wsFrameType"] != "PING" {
-		t.Errorf("wsFrameType = %v, want PING (lifecycle marker)", ev["wsFrameType"])
+	if ev["wsFrameType"] != "OPEN" {
+		t.Errorf("wsFrameType = %v, want OPEN (its own frame type, not PING)", ev["wsFrameType"])
+	}
+	if ev["metricName"] != "websocket_api.connection_opened" {
+		t.Errorf("metricName = %v, want websocket_api.connection_opened", ev["metricName"])
 	}
 	meta := ev["metadata"].(map[string]any)
 	if meta["event"] != "CONNECTION_OPENED" {
@@ -111,7 +118,7 @@ func TestCloseAggregatesCounters(t *testing.T) {
 	b.RecordFrame(connID, "CLIENT_TO_SERVER", "TEXT", 4)
 	b.RecordFrame(connID, "SERVER_TO_CLIENT", "TEXT", 5)
 	b.Close(connID, 1000)
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	var closes []map[string]any
 	for _, e := range r.events() {
@@ -150,7 +157,7 @@ func TestPerFrameEventsOff(t *testing.T) {
 		b.RecordFrame(connID, "CLIENT_TO_SERVER", "TEXT", 10)
 	}
 	b.Close(connID, 1000)
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	// Only OPEN + CLOSE (2 events), no per-frame MESSAGE events
 	var frames int
@@ -176,7 +183,7 @@ func TestPerFrameEventsOn(t *testing.T) {
 	b.RecordFrame(connID, "CLIENT_TO_SERVER", "TEXT", 10)
 	b.RecordFrame(connID, "SERVER_TO_CLIENT", "BINARY", 20)
 	b.Close(connID, 1000)
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	var frames []map[string]any
 	for _, e := range r.events() {
@@ -216,7 +223,7 @@ func TestCloseCodeMapping(t *testing.T) {
 		b := newBilling(t, srv)
 		connID := b.Open("cust_001", nil)
 		b.Close(connID, c.code)
-		_ = b.Shutdown()
+		_ = b.Shutdown(bg)
 
 		var got string
 		for _, e := range r.events() {
@@ -241,7 +248,7 @@ func TestRecordFrameUnknownConnection(t *testing.T) {
 
 	b.RecordFrame("nonexistent", "CLIENT_TO_SERVER", "TEXT", 10)
 	b.Close("nonexistent", 1000)
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 
 	if n := len(r.events()); n != 0 {
 		t.Errorf("got %d events, want 0", n)
@@ -260,8 +267,99 @@ func TestOpenRejectsEmptyCustomer(t *testing.T) {
 	if connID != "" {
 		t.Errorf("expected empty connID for empty customer, got %q", connID)
 	}
-	_ = b.Shutdown()
+	_ = b.Shutdown(bg)
 	if n := len(r.events()); n != 0 {
 		t.Errorf("got %d events, want 0", n)
+	}
+}
+
+// ── Wire contract: POST /v1/ingest/batch ─────────────────────────────
+
+func TestBatchWireContract(t *testing.T) {
+	r := &rec{}
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+	b := newBilling(t, srv, func(c *Config) { c.PerFrameEvents = true })
+
+	id := b.Open("cust_001", nil)
+	b.RecordFrame(id, "client_to_server", "text", 128)
+	b.RecordFrame(id, "sideways", "blob", 1)
+	b.Close(id, 1000)
+	_ = b.Shutdown(bg)
+
+	r.mu.Lock()
+	path, hdr, body := r.paths[0], r.headers[0], r.requests[0]
+	r.mu.Unlock()
+	if path != "/v1/ingest/batch" {
+		t.Errorf("path = %s, want /v1/ingest/batch", path)
+	}
+	if hdr.Get("X-API-Key") != "sk_ws_abc" {
+		t.Errorf("X-API-Key = %q", hdr.Get("X-API-Key"))
+	}
+	if _, ok := body["apiKey"]; ok {
+		t.Error("apiKey must not be in the body")
+	}
+	evs := r.events()
+	if len(evs) != 4 {
+		t.Fatalf("events = %d, want 4", len(evs))
+	}
+	for _, ev := range evs {
+		if _, ok := ev["apiKey"]; ok {
+			t.Error("apiKey must not be in an event")
+		}
+		if _, ok := ev["durationMs"]; ok {
+			t.Error("durationMs is not a DTO field; use executionDurationMs")
+		}
+		for _, k := range []string{"customerId", "metricName", "quantity", "occurredAt", "idempotencyKey", "productType", "wsConnectionId", "executionDurationMs", "dataBytes", "messageCount"} {
+			if _, ok := ev[k]; !ok {
+				t.Errorf("event missing %q: %v", k, ev)
+			}
+		}
+		if _, err := time.Parse(time.RFC3339Nano, ev["occurredAt"].(string)); err != nil {
+			t.Errorf("occurredAt not RFC3339: %v", err)
+		}
+	}
+	// Lower-case enums are normalised; values outside the enum are omitted.
+	if evs[1]["wsDirection"] != "CLIENT_TO_SERVER" || evs[1]["wsFrameType"] != "TEXT" {
+		t.Errorf("frame enums = %v / %v", evs[1]["wsDirection"], evs[1]["wsFrameType"])
+	}
+	if _, ok := evs[2]["wsDirection"]; ok {
+		t.Errorf("invalid wsDirection should be omitted: %v", evs[2]["wsDirection"])
+	}
+	if _, ok := evs[2]["wsFrameType"]; ok {
+		t.Errorf("invalid wsFrameType should be omitted: %v", evs[2]["wsFrameType"])
+	}
+}
+
+func TestLargeBufferSplitsIntoBatchesOf1000(t *testing.T) {
+	r := &rec{}
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+	b := newBilling(t, srv, func(c *Config) { c.FlushCount = 100000; c.PerFrameEvents = true })
+
+	id := b.Open("cust_001", nil) // 1 event
+	for i := 0; i < 2498; i++ {
+		b.RecordFrame(id, "SERVER_TO_CLIENT", "TEXT", 10)
+	}
+	b.Close(id, 1000) // 1 event → 2500 total
+	_ = b.Shutdown(bg)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// At least 3 requests: the flusher sends whatever is queued when it wakes
+	// at the 1000-event threshold, so the split can be finer than 1000/1000/500.
+	if len(r.requests) < 3 {
+		t.Fatalf("requests = %d, want at least 3", len(r.requests))
+	}
+	total := 0
+	for _, body := range r.requests {
+		n := len(body["events"].([]any))
+		if n == 0 || n > 1000 {
+			t.Errorf("batch size = %d, want 1..1000", n)
+		}
+		total += n
+	}
+	if total != 2500 {
+		t.Errorf("total = %d, want 2500", total)
 	}
 }

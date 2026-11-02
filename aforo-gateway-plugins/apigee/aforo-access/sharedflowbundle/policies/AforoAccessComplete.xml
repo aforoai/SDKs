@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- The last step: nothing refused the call, so aforo-metering may bill it. -->
+<AssignMessage name="AforoAccessComplete" continueOnError="true">
+    <DisplayName>Aforo Access - Complete</DisplayName>
+    <AssignVariable>
+        <Name>aforo.access.refused</Name>
+        <Value>false</Value>
+    </AssignVariable>
+    <IgnoreUnresolvedVariables>true</IgnoreUnresolvedVariables>
+</AssignMessage>

@@ -1,212 +1,419 @@
 /**
- * Tests for {@link AforoAgent} — the AI Agent Metering SDK.
- *
- * Approach: pluggable {@code fetchImpl} captures every outbound POST so we
- * can assert on event payload shape, batching cadence, and session lifecycle
- * markers without standing up a mock HTTP server.
+ * Tests for {@link AforoAgent} with a scripted, mocked fetch — no network.
+ * Wire contract: POST <endpoint>/v1/ingest/batch, body {"events":[IngestUsageEventRequest…]},
+ * header X-API-Key, response 202 {success, data:{accepted, duplicates, failed, errors[]}}.
  */
-import { AforoAgent, AgentSession } from './index';
+import AforoAgent, {
+  AforoAgentConfig,
+  AforoAgentError,
+  AgentSession,
+  DEFAULT_METRIC_NAMES,
+  EXECUTION_STATUSES,
+  resolveEndpoint,
+} from './index';
+import { bodyJson } from '../test-support/request-body';
 
-interface CapturedRequest {
+type Reply = { status: number; body?: unknown; headers?: Record<string, string> } | Error;
+
+interface Call {
   url: string;
-  body: unknown;
   headers: Record<string, string>;
+  body: { events: any[] };
 }
 
-function makeFetch() {
-  const calls: CapturedRequest[] = [];
-  const fetchImpl: typeof fetch = (async (url: any, init: any) => {
-    calls.push({
-      url: typeof url === 'string' ? url : url.toString(),
-      body: init?.body ? JSON.parse(init.body as string) : null,
-      headers: (init?.headers as Record<string, string>) || {},
+/** fetch mock that answers from a script; once the script is used up it answers 202 accepted-all. */
+function mockFetch(script: Reply[] = []) {
+  const calls: Call[] = [];
+  const fetchImpl = jest.fn(async (url: any, init: any) => {
+    const body = bodyJson(init);
+    calls.push({ url: String(url), headers: init.headers, body });
+    const next = script.shift();
+    if (next instanceof Error) throw next;
+    const reply = next ?? {
+      status: 202,
+      body: { success: true, data: { accepted: body.events.length, duplicates: 0, failed: 0, errors: [] } },
+    };
+    return new Response(reply.body === undefined ? '' : JSON.stringify(reply.body), {
+      status: reply.status,
+      headers: reply.headers,
     });
-    return new Response('{}', { status: 200 }) as unknown as Response;
-  }) as unknown as typeof fetch;
-  return { calls, fetchImpl };
+  });
+  return { calls, fetchImpl: fetchImpl as unknown as typeof fetch, mock: fetchImpl };
 }
 
-const baseConfig = (override?: Partial<ConstructorParameters<typeof AforoAgent>[0]>) => ({
-  tenantId: 'tenant_test',
-  productId: 'prod_test',
-  apiKey: 'sk_test_abcdef',
-  flushBatchSize: 100, // suppress auto-batch flush for most tests
-  flushIntervalMs: 9_999_999, // and the timer
-  ...override,
+function client(fetchImpl: typeof fetch, override: Partial<AforoAgentConfig> = {}) {
+  const errors: AforoAgentError[] = [];
+  const agent = new AforoAgent({
+    apiKey: 'sk_test_key',
+    customerId: 'cust_123',
+    agentId: 'support-bot',
+    productId: 'prod_9',
+    fetchImpl,
+    flushIntervalMs: 60_000,
+    retryBaseDelayMs: 1,
+    onError: (e) => errors.push(e),
+    ...override,
+  });
+  return { agent, errors };
+}
+
+const events = (calls: Call[]) => calls.flatMap((c) => c.body.events);
+
+describe('config', () => {
+  test('apiKey is required; tenantId / productId are not', () => {
+    expect(() => new AforoAgent({ apiKey: '' } as any)).toThrow('apiKey is required');
+    expect(() => new AforoAgent({ apiKey: 'k', fetchImpl: mockFetch().fetchImpl })).not.toThrow();
+  });
+
+  test('endpoint resolution: default, bare host, /v1/ingest, legacy /events, full batch URL', () => {
+    expect(resolveEndpoint()).toBe('https://api.aforo.ai/v1/ingest/batch');
+    expect(resolveEndpoint('http://localhost:8084')).toBe('http://localhost:8084/v1/ingest/batch');
+    expect(resolveEndpoint('https://api.aforo.ai/v1/ingest/')).toBe('https://api.aforo.ai/v1/ingest/batch');
+    expect(resolveEndpoint('https://api.aforo.ai/v1/ingest/events')).toBe('https://api.aforo.ai/v1/ingest/batch');
+    expect(resolveEndpoint('https://x.test/api/v1/ingest/batch')).toBe('https://x.test/api/v1/ingest/batch');
+  });
+
+  test('deprecated ingestorUrl still works', () => {
+    const { agent } = client(mockFetch().fetchImpl, { ingestorUrl: 'http://localhost:8084/v1/ingest' });
+    expect(agent.endpoint).toBe('http://localhost:8084/v1/ingest/batch');
+  });
+
+  test('default metric names are the AI_AGENT catalog names', () => {
+    expect(DEFAULT_METRIC_NAMES).toEqual({
+      sessions: 'Agent Sessions',
+      steps: 'Agent Steps',
+      toolCalls: 'Agent Tool Calls',
+      tokens: 'Tokens Consumed',
+      executionMinutes: 'Execution Minutes',
+      gpuHours: 'GPU Hours',
+      knowledgeQueries: 'Knowledge Queries',
+      tasksCompleted: 'Tasks Completed',
+      activeAgents: 'Active Agents',
+    });
+  });
 });
 
-describe('AforoAgent — config validation', () => {
-  test('throws when tenantId missing', () => {
-    expect(() => new AforoAgent({ tenantId: '', productId: 'p', apiKey: 'k' } as any))
-        .toThrow('tenantId is required');
-  });
-  test('throws when productId missing', () => {
-    expect(() => new AforoAgent({ tenantId: 't', productId: '', apiKey: 'k' } as any))
-        .toThrow('productId is required');
-  });
-  test('throws when apiKey missing', () => {
-    expect(() => new AforoAgent({ tenantId: 't', productId: 'p', apiKey: '' } as any))
-        .toThrow('apiKey is required');
-  });
-});
+describe('wire request', () => {
+  test('one POST to /v1/ingest/batch with X-API-Key and no Authorization', async () => {
+    const { calls, fetchImpl } = mockFetch();
+    const { agent, errors } = client(fetchImpl);
+    const s = agent.startSession();
+    await s.recordStep({ stepKind: 'THOUGHT' });
+    await s.end({ taskCompleted: true });
 
-describe('AforoAgent — session lifecycle', () => {
-  test('startSession emits session_start event with framework metadata', async () => {
-    const { calls, fetchImpl } = makeFetch();
-    const agent = new AforoAgent(baseConfig({ fetchImpl }));
-    const session = await agent.startSession({
-      agentId: 'agt_001',
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe('https://api.aforo.ai/v1/ingest/batch');
+    expect(calls[0].headers['X-API-Key']).toBe('sk_test_key');
+    expect(calls[0].headers['Authorization']).toBeUndefined();
+    expect(calls[0].headers['Content-Type']).toBe('application/json');
+    expect(Array.isArray(calls[0].body.events)).toBe(true);
+    expect(errors).toEqual([]);
+  });
+
+  test('event body matches the ingestor contract', async () => {
+    const { calls, fetchImpl } = mockFetch();
+    const { agent } = client(fetchImpl, { subscriptionId: 'sub_1' });
+    const s = agent.startSession({
+      sessionId: 'sess-1',
       framework: 'CLAUDE',
       modelProvider: 'ANTHROPIC',
       modelName: 'claude-sonnet-4-6',
     });
-    await agent.flush();
-    expect(calls).toHaveLength(1);
-    const events = (calls[0].body as any).events;
-    expect(events).toHaveLength(1);
-    expect(events[0].eventType).toBe('agent_session_start');
-    expect(events[0].agentId).toBe('agt_001');
-    expect(events[0].sessionId).toBe(session.sessionId);
-    expect(events[0].properties.framework).toBe('CLAUDE');
-    expect(events[0].properties.modelProvider).toBe('ANTHROPIC');
-    expect(events[0].properties.modelName).toBe('claude-sonnet-4-6');
-  });
+    await s.recordToolCall('web_search', { inputTokens: 320, outputTokens: 84, durationMs: 510.4 });
+    await s.end({ taskCompleted: true });
 
-  test('session.recordStep stamps stepIndex and emits 2 events when tokens present', async () => {
-    const { calls, fetchImpl } = makeFetch();
-    const agent = new AforoAgent(baseConfig({ fetchImpl }));
-    const session = await agent.startSession({ agentId: 'agt_001' });
-    await session.recordStep({
-      stepKind: 'TOOL_CALL',
-      capabilityName: 'web-search',
-      inputTokens: 100,
-      outputTokens: 50,
+    const evs = events(calls);
+    expect(evs.map((e) => e.metricName)).toEqual([
+      'Agent Steps',
+      'Agent Tool Calls',
+      'Tokens Consumed',
+      'Tasks Completed',
+      'Agent Sessions',
+    ]);
+    const tool = evs[1];
+    expect(tool).toMatchObject({
+      customerId: 'cust_123',
+      metricName: 'Agent Tool Calls',
+      quantity: 1,
+      idempotencyKey: 'sess-1:2',
+      productType: 'AI_AGENT',
+      agentId: 'support-bot',
+      sessionId: 'sess-1',
+      subscriptionId: 'sub_1',
+      capabilityName: 'web_search',
       executionStatus: 'SUCCESS',
+      executionDurationMs: 510,
+      stepNumber: 1,
     });
+    expect(tool.traceId).toMatch(/^[0-9a-f]{32}$/);
+    expect(new Date(tool.occurredAt).toISOString()).toBe(tool.occurredAt);
+    expect(tool.metadata).toMatchObject({ framework: 'CLAUDE', productId: 'prod_9' });
+    expect(tool.sessionBoundary).toBeUndefined();
+
+    const tokens = evs[2];
+    expect(tokens.quantity).toBe(404);
+    expect(tokens.metadata).toMatchObject({
+      model_provider: 'ANTHROPIC',
+      model_name: 'claude-sonnet-4-6',
+      input_tokens: 320,
+      output_tokens: 84,
+      productId: 'prod_9',
+    });
+
+    // SESSION_END only on the closing event.
+    expect(evs.filter((e) => e.sessionBoundary)).toHaveLength(1);
+    expect(evs[evs.length - 1].sessionBoundary).toBe('SESSION_END');
+    // one traceId per session
+    expect(new Set(evs.map((e) => e.traceId)).size).toBe(1);
+    // no legacy Apigee fields
+    expect(tool.eventType).toBeUndefined();
+    expect(tool.metricKey).toBeUndefined();
+    expect(tool.value).toBeUndefined();
+  });
+
+  test('idempotency keys are deterministic: <sessionId>:<counter>, unique per event', async () => {
+    const { calls, fetchImpl } = mockFetch();
+    const { agent } = client(fetchImpl);
+    const s = agent.startSession({ sessionId: 'run-42' });
+    await s.recordStep({ stepKind: 'THOUGHT' });
+    await s.recordTokens('gpt-4o', 10, 5, { provider: 'OPENAI' });
+    await s.recordUsage('knowledgeQueries', 2);
+    await s.endSession({});
+    const keys = events(calls).map((e) => e.idempotencyKey);
+    expect(keys).toEqual(['run-42:1', 'run-42:2', 'run-42:3', 'run-42:4']);
+    expect(events(calls)[2].metricName).toBe('Knowledge Queries');
+  });
+
+  test('a generated sessionId is a UUID and two sessions get different traceIds', () => {
+    const { agent } = client(mockFetch().fetchImpl);
+    const a = agent.startSession();
+    const b = agent.startSession();
+    expect(a.sessionId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(a.sessionId).not.toBe(b.sessionId);
+    expect(a.traceId).not.toBe(b.traceId);
+    expect(a).toBeInstanceOf(AgentSession);
+  });
+
+  test('metric names are configurable', async () => {
+    const { calls, fetchImpl } = mockFetch();
+    const { agent } = client(fetchImpl, { metricNames: { steps: 'steps_v2', tokens: 'llm_tokens' } });
+    const s = agent.startSession();
+    await s.recordStep({ inputTokens: 1, outputTokens: 1 });
+    await s.end({});
+    expect(events(calls).map((e) => e.metricName)).toEqual(['steps_v2', 'llm_tokens', 'Agent Sessions']);
+  });
+
+  test('zero quantities are skipped, not sent', async () => {
+    const { calls, fetchImpl } = mockFetch();
+    const { agent, errors } = client(fetchImpl);
+    const s = agent.startSession();
+    await s.recordTokens('m', 0, 0);
+    await s.recordUsage('gpuHours', 0);
+    await s.end({ executionMinutes: 0 });
+    expect(events(calls).map((e) => e.metricName)).toEqual(['Agent Sessions']);
+    expect(errors).toEqual([]);
+  });
+
+  test('maxBatchSize splits into several requests (≤ 1000 each)', async () => {
+    const { calls, fetchImpl } = mockFetch();
+    const { agent } = client(fetchImpl, { maxBatchSize: 5000 });
+    const s = agent.startSession();
+    for (let i = 0; i < 1500; i++) s.recordUsage('gpuHours', 1);
     await agent.flush();
-
-    const events = (calls[0].body as any).events;
-    // session_start + agent_step + token_usage = 3
-    expect(events).toHaveLength(3);
-    const step = events.find((e: any) => e.eventType === 'agent_step');
-    expect(step.properties.stepIndex).toBe(1);
-    expect(step.properties.capabilityName).toBe('web-search');
-    expect(step.properties.executionStatus).toBe('SUCCESS');
-    const tokens = events.find((e: any) => e.eventType === 'token_usage');
-    expect(tokens.value).toBe(150);
-    expect(tokens.properties.inputTokens).toBe(100);
-    expect(tokens.properties.outputTokens).toBe(50);
+    expect(calls.map((c) => c.body.events.length)).toEqual([1000, 500]);
   });
 
-  test('session.recordStep without tokens emits only one event', async () => {
-    const { calls, fetchImpl } = makeFetch();
-    const agent = new AforoAgent(baseConfig({ fetchImpl }));
-    const session = await agent.startSession({ agentId: 'agt_001' });
-    await session.recordStep({ stepKind: 'THOUGHT' });
+  test('executionStatus is normalised; unknown values are left off', async () => {
+    const { calls, fetchImpl } = mockFetch();
+    const { agent } = client(fetchImpl, { logger: null });
+    const s = agent.startSession();
+    await s.recordStep({ executionStatus: ' timeout ' });
+    await s.recordStep({ executionStatus: 'NOPE' });
     await agent.flush();
-    const events = (calls[0].body as any).events;
-    expect(events.filter((e: any) => e.eventType === 'token_usage')).toHaveLength(0);
-  });
-
-  test('session.recordStep increments stepIndex monotonically', async () => {
-    const { calls, fetchImpl } = makeFetch();
-    const agent = new AforoAgent(baseConfig({ fetchImpl }));
-    const session = await agent.startSession({ agentId: 'agt_001' });
-    await session.recordStep({ stepKind: 'THOUGHT' });
-    await session.recordStep({ stepKind: 'TOOL_CALL', capabilityName: 't' });
-    await session.recordStep({ stepKind: 'OBSERVATION' });
-    await agent.flush();
-    const steps = (calls[0].body as any).events.filter((e: any) => e.eventType === 'agent_step');
-    expect(steps.map((s: any) => s.properties.stepIndex)).toEqual([1, 2, 3]);
-  });
-
-  test('session.recordToolCall is a thin wrapper over recordStep', async () => {
-    const { calls, fetchImpl } = makeFetch();
-    const agent = new AforoAgent(baseConfig({ fetchImpl }));
-    const session = await agent.startSession({ agentId: 'agt_001' });
-    await session.recordToolCall('web-search', { inputTokens: 50, outputTokens: 25 });
-    await agent.flush();
-    const step = (calls[0].body as any).events.find((e: any) => e.eventType === 'agent_step');
-    expect(step.properties.stepKind).toBe('TOOL_CALL');
-    expect(step.properties.capabilityName).toBe('web-search');
-  });
-
-  test('session.end records taskCompleted + step count + forces flush', async () => {
-    const { calls, fetchImpl } = makeFetch();
-    const agent = new AforoAgent(baseConfig({ fetchImpl }));
-    const session = await agent.startSession({ agentId: 'agt_001' });
-    await session.recordStep({ stepKind: 'TOOL_CALL', capabilityName: 't' });
-    await session.recordStep({ stepKind: 'TOOL_CALL', capabilityName: 't2' });
-    await session.end({ taskCompleted: true });
-    // session.end must flush — no manual flush
-    expect(calls).toHaveLength(1);
-    const endEvt = (calls[0].body as any).events.find((e: any) => e.eventType === 'agent_session_end');
-    expect(endEvt.properties.taskCompleted).toBe(true);
-    expect(endEvt.properties.stepCount).toBe(2);
-  });
-
-  test('session.end propagates errorMessage on failure', async () => {
-    const { calls, fetchImpl } = makeFetch();
-    const agent = new AforoAgent(baseConfig({ fetchImpl }));
-    const session = await agent.startSession({ agentId: 'agt_001' });
-    await session.end({ taskCompleted: false, errorMessage: 'rate limited' });
-    const endEvt = (calls[0].body as any).events.find((e: any) => e.eventType === 'agent_session_end');
-    expect(endEvt.properties.taskCompleted).toBe(false);
-    expect(endEvt.properties.errorMessage).toBe('rate limited');
+    const evs = events(calls);
+    expect(evs[0].executionStatus).toBe('TIMEOUT');
+    expect(evs[1].executionStatus).toBeUndefined();
+    expect(EXECUTION_STATUSES).toContain('HITL_REQUIRED');
   });
 });
 
-describe('AforoAgent — batching + flush', () => {
-  test('batch flushes when buffer reaches flushBatchSize', async () => {
-    const { calls, fetchImpl } = makeFetch();
-    const agent = new AforoAgent({
-      tenantId: 't', productId: 'p', apiKey: 'k', fetchImpl,
-      flushBatchSize: 3, flushIntervalMs: 9_999_999,
-    });
-    const session = await agent.startSession({ agentId: 'agt_001' }); // 1 event
-    await session.recordStep({ stepKind: 'THOUGHT' }); // 1 event → total 2
-    await session.recordStep({ stepKind: 'THOUGHT' }); // 1 event → total 3 → flush
+describe('delivery', () => {
+  test('retries a 503 and then succeeds with the identical body', async () => {
+    const { calls, fetchImpl } = mockFetch([{ status: 503, body: { message: 'unavailable' } }]);
+    const { agent, errors } = client(fetchImpl);
+    const s = agent.startSession();
+    await s.recordStep({});
+    const result = await agent.flush();
+    expect(calls).toHaveLength(2);
+    expect(calls[1].body).toEqual(calls[0].body);
+    expect(result).toMatchObject({ accepted: 1, failed: 0, pending: 0 });
+    expect(errors).toEqual([]);
+  });
+
+  test('honours Retry-After on 429', async () => {
+    const { calls, fetchImpl } = mockFetch([{ status: 429, headers: { 'Retry-After': '0' } }]);
+    const { agent } = client(fetchImpl);
+    agent.startSession().recordStep({});
+    const result = await agent.flush();
+    expect(calls).toHaveLength(2);
+    expect(result.accepted).toBe(1);
+  });
+
+  test('network errors keep events buffered; the next flush delivers them with the same keys', async () => {
+    const down = new TypeError('fetch failed');
+    const { calls, fetchImpl } = mockFetch([down, down, down]);
+    const { agent, errors } = client(fetchImpl, { maxRetries: 3 });
+    const s = agent.startSession({ sessionId: 's' });
+    await s.recordStep({});
+    await s.recordStep({});
+
+    const first = await agent.flush();
+    expect(calls).toHaveLength(3);
+    expect(first).toMatchObject({ accepted: 0, failed: 0, pending: 2 });
+    expect(agent.pendingCount).toBe(2);
+    expect(agent.droppedCount).toBe(0);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ kind: 'retrying', willRetry: true });
+    expect(errors[0].message).toContain('fetch failed');
+
+    const second = await agent.flush();
+    expect(second).toMatchObject({ accepted: 2, pending: 0 });
+    expect(calls[3].body.events.map((e: any) => e.idempotencyKey)).toEqual(['s:1', 's:2']);
+  });
+
+  test('202 with per-event errors drops only the named events, reported as rejected', async () => {
+    const { fetchImpl } = mockFetch([
+      {
+        status: 202,
+        body: {
+          success: true,
+          data: { accepted: 1, duplicates: 0, failed: 1, errors: [{ index: 1, message: 'agent_id is required for AI_AGENT events' }] },
+        },
+      },
+    ]);
+    const { agent, errors } = client(fetchImpl);
+    const s = agent.startSession({ sessionId: 'p' });
+    await s.recordStep({});
+    await s.recordStep({});
+    const result = await agent.flush();
+    expect(result).toMatchObject({ accepted: 1, failed: 1, pending: 0 });
+    expect(errors).toHaveLength(1);
+    expect(errors[0].kind).toBe('rejected');
+    expect(errors[0].message).toContain('agent_id is required for AI_AGENT events');
+    expect(errors[0].events.map((e) => e.idempotencyKey)).toEqual(['p:2']);
+    expect(agent.droppedCount).toBe(1);
+  });
+
+  test('a per-event retryable error re-sends that event with its key', async () => {
+    const { calls, fetchImpl } = mockFetch([
+      { status: 202, body: { success: true, data: { accepted: 1, duplicates: 0, failed: 1, errors: [{ index: 0, message: 'busy', retryable: true }] } } },
+    ]);
+    const { agent, errors } = client(fetchImpl);
+    const s = agent.startSession({ sessionId: 'rt' });
+    await s.recordStep({});
+    await s.recordStep({});
+    expect(await agent.flush()).toMatchObject({ accepted: 1, requeued: 1 });
+    await agent.flush();
+    expect(calls[1].body.events.map((e: any) => e.idempotencyKey)).toEqual(['rt:1']);
+    expect(errors).toEqual([]);
+    expect(agent.droppedCount).toBe(0);
+  });
+
+  test('duplicates are counted as accepted', async () => {
+    const { fetchImpl } = mockFetch([{ status: 202, body: { success: true, data: { accepted: 0, duplicates: 1, failed: 0, errors: [] } } }]);
+    const { agent, errors } = client(fetchImpl);
+    agent.startSession().recordStep({});
+    expect(await agent.flush()).toMatchObject({ accepted: 1, failed: 0 });
+    expect(errors).toEqual([]);
+  });
+
+  test('401 is an outage, not a drop: the events wait for a valid key', async () => {
+    const { calls, fetchImpl } = mockFetch([{ status: 401, body: { message: 'Invalid API key' } }]);
+    const { agent, errors } = client(fetchImpl, { logger: null });
+    agent.startSession().recordStep({});
+    const first = await agent.flush();
     expect(calls).toHaveLength(1);
-    expect((calls[0].body as any).events).toHaveLength(3);
+    expect(first).toMatchObject({ accepted: 0, failed: 0, pending: 1 });
+    expect(errors[0]).toMatchObject({ kind: 'retrying', willRetry: true });
+    expect(errors[0].message).toContain('HTTP 401');
+    expect(await agent.flush()).toMatchObject({ accepted: 1, pending: 0 });
   });
 
-  test('headers carry tenantId + Bearer apiKey', async () => {
-    const { calls, fetchImpl } = makeFetch();
-    const agent = new AforoAgent(baseConfig({ fetchImpl }));
-    await (await agent.startSession({ agentId: 'a' })).end({ taskCompleted: true });
-    const headers = calls[0].headers;
-    expect(headers['Authorization']).toBe('Bearer sk_test_abcdef');
-    expect(headers['X-Tenant-Id']).toBe('tenant_test');
+  test('a non-retryable 4xx is not retried, drops the batch and reports the server message', async () => {
+    const { calls, fetchImpl } = mockFetch([{ status: 400, body: { message: 'Invalid API key' } }]);
+    const onDrop = jest.fn();
+    const { agent, errors } = client(fetchImpl, { onDrop });
+    agent.startSession().recordStep({});
+    const result = await agent.flush();
+    expect(calls).toHaveLength(1);
+    expect(result).toMatchObject({ accepted: 0, failed: 1, pending: 0 });
+    expect(errors[0]).toMatchObject({ kind: 'rejected', willRetry: false });
+    expect(errors[0].message).toContain('HTTP 400');
+    expect(errors[0].message).toContain('Invalid API key');
+    expect(onDrop).toHaveBeenCalledWith(expect.any(Array), 'rejected');
   });
 
-  test('flush is a no-op when buffer is empty', async () => {
-    const { calls, fetchImpl } = makeFetch();
-    const agent = new AforoAgent(baseConfig({ fetchImpl }));
+  test('the buffer is bounded: oldest events are dropped and reported', async () => {
+    const { calls, fetchImpl } = mockFetch([new Error('down'), new Error('down')]);
+    const { agent, errors } = client(fetchImpl, { maxBatchSize: 3, maxBufferSize: 3, maxRetries: 1 });
+    const s = agent.startSession({ sessionId: 'b' });
+    for (let i = 0; i < 3; i++) s.recordUsage('gpuHours', 1); // full batch → background flush fails
+    await agent.flush(); // fails again; 3 kept
+    expect(agent.pendingCount).toBe(3);
+    s.recordUsage('gpuHours', 1); // 4th → evicts b:1
+    const overflow = errors.find((e) => e.kind === 'overflow');
+    expect(overflow?.events.map((e) => e.idempotencyKey)).toEqual(['b:1']);
+    await agent.shutdown();
+    expect(calls[calls.length - 1].body.events.map((e: any) => e.idempotencyKey)).toEqual(['b:2', 'b:3', 'b:4']);
+    expect(agent.droppedCount).toBe(1);
+  });
+
+  test('missing customerId / agentId is reported as invalid and never sent', async () => {
+    const { calls, fetchImpl } = mockFetch();
+    const { agent, errors } = client(fetchImpl, { customerId: undefined, agentId: undefined });
+    const s = agent.startSession();
+    await s.recordStep({});
     await agent.flush();
     expect(calls).toHaveLength(0);
+    expect(errors[0].kind).toBe('invalid');
+    expect(errors[0].message).toContain('customerId');
+    const t = agent.startSession({ customerId: 'c' });
+    await t.recordStep({});
+    expect(errors[1].message).toContain('agentId is required');
+    expect(agent.droppedCount).toBe(2);
   });
 
-  test('HTTP failure logs warning and drops batch (best-effort)', async () => {
-    const calls: CapturedRequest[] = [];
-    const failingFetch: typeof fetch = (async (url: any) => {
-      calls.push({ url: String(url), body: null, headers: {} });
-      return new Response('{}', { status: 503 }) as unknown as Response;
-    }) as unknown as typeof fetch;
-    const warn = jest.spyOn(console, 'warn').mockImplementation(() => { /* swallow */ });
-    const agent = new AforoAgent(baseConfig({ fetchImpl: failingFetch }));
-    await (await agent.startSession({ agentId: 'a' })).end({ taskCompleted: true });
-    expect(warn).toHaveBeenCalled();
-    expect(warn.mock.calls[0][0]).toContain('503');
-    warn.mockRestore();
+  test('without onError, problems go to the logger', async () => {
+    const warn = jest.fn();
+    const { fetchImpl } = mockFetch([{ status: 400, body: { message: 'bad' } }]);
+    const agent = new AforoAgent({ apiKey: 'k', customerId: 'c', agentId: 'a', fetchImpl, logger: { warn } });
+    agent.startSession().recordStep({});
+    await agent.flush();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('rejected'));
   });
-});
 
-describe('AgentSession — type exports', () => {
-  test('AgentSession class is exported', () => {
-    expect(AgentSession).toBeDefined();
+  test('a full batch triggers a background flush', async () => {
+    const { calls, fetchImpl } = mockFetch();
+    const { agent } = client(fetchImpl, { maxBatchSize: 2 });
+    const s = agent.startSession();
+    await s.recordStep({});
+    expect(calls).toHaveLength(0);
+    await s.recordStep({});
+    await agent.flush();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].body.events).toHaveLength(2);
   });
-  test('default export is AforoAgent', async () => {
-    const Default = (await import('./index')).default;
-    expect(Default).toBe(AforoAgent);
+
+  test('legacy emitEvent maps metricKey/value onto metricName/quantity', async () => {
+    const { calls, fetchImpl } = mockFetch();
+    const { agent } = client(fetchImpl);
+    await agent.emitEvent({ metricKey: 'Agent Steps', value: 3, sessionId: 'legacy', properties: { a: 1 } });
+    await agent.emitEvent({ metricKey: 'Agent Steps', value: 0, sessionId: 'legacy' });
+    await agent.flush();
+    const evs = events(calls);
+    expect(evs).toHaveLength(1);
+    expect(evs[0]).toMatchObject({ metricName: 'Agent Steps', quantity: 3, sessionId: 'legacy', agentId: 'support-bot' });
+    expect(evs[0].idempotencyKey).toMatch(/^legacy:/);
+    expect(evs[0].metadata).toMatchObject({ a: 1 });
   });
 });

@@ -1,0 +1,135 @@
+# Aforo AI_AGENT reference manifest — Research Agent
+# Valid against catalog-service AgentManifestValidator + AgentManifest DTO.
+# Publish to any public Git host; point an AI_AGENT product's sourceRepositoryUrl at the raw URL.
+
+name: Aforo Research Agent
+description: General-purpose research assistant that summarizes URLs, extracts entities, verifies claims, ranks sources, and answers cited questions.
+overview: |
+  The Research Agent is designed to speed up desk research: paste a URL or a
+  question, and it returns a source-verified summary. Built on Claude Sonnet
+  with tool-use, and follows the Anthropic prompt-injection safety guidance
+  for reading untrusted web content.
+
+  Best fit for: analyst workflows, competitive intelligence, journalism
+  fact-checking, academic literature review.
+
+version: 1.2.0
+
+tags:
+  - research
+  - summarization
+  - fact-checking
+  - citation
+
+modelProvider: ANTHROPIC
+defaultModel: claude-sonnet-4-6
+
+capabilities:
+  - name: summarize_url
+    description: Fetch a public URL and return a 3-5 sentence summary of its main claims.
+    costTier: STANDARD
+    rateLimit:
+      requestsPerMinute: 30
+    input_schema:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+          format: uri
+          description: Public HTTPS URL to summarize.
+        length:
+          type: string
+          enum: [short, medium, long]
+          default: medium
+
+  - name: extract_entities
+    description: Extract named entities (people, organizations, locations, dates, monetary amounts) from a text block.
+    costTier: STANDARD
+    rateLimit:
+      requestsPerMinute: 60
+    input_schema:
+      type: object
+      required: [text]
+      properties:
+        text:
+          type: string
+          maxLength: 20000
+        entity_types:
+          type: array
+          items:
+            type: string
+            enum: [PERSON, ORG, LOCATION, DATE, MONEY]
+          description: Optional filter; if omitted, all types are returned.
+
+  - name: verify_claim
+    description: Given a claim and a set of candidate source URLs, return one of supported / refuted / unverifiable plus a citation.
+    costTier: PREMIUM
+    rateLimit:
+      requestsPerMinute: 15
+    input_schema:
+      type: object
+      required: [claim, sources]
+      properties:
+        claim:
+          type: string
+          maxLength: 1000
+        sources:
+          type: array
+          items:
+            type: string
+            format: uri
+          minItems: 1
+          maxItems: 10
+
+  - name: rank_sources
+    description: Rank a list of source URLs by relevance to a query.
+    costTier: STANDARD
+    rateLimit:
+      requestsPerMinute: 30
+    input_schema:
+      type: object
+      required: [query, sources]
+      properties:
+        query:
+          type: string
+        sources:
+          type: array
+          items:
+            type: string
+            format: uri
+          minItems: 2
+
+  - name: answer_question
+    description: Given a question, retrieve relevant sources from the open web and synthesize a cited answer.
+    costTier: PREMIUM
+    rateLimit:
+      requestsPerMinute: 20
+    input_schema:
+      type: object
+      required: [question]
+      properties:
+        question:
+          type: string
+          maxLength: 500
+        max_sources:
+          type: integer
+          minimum: 1
+          maximum: 20
+          default: 5
+
+runtime:
+  max_steps: 25
+  max_tokens: 8000
+  timeout_seconds: 60
+
+session:
+  idle_timeout_minutes: 15
+  max_concurrent_sessions: 10
+  retention_days: 30
+
+governance:
+  hitl_required_for:
+    - verify_claim
+  content_filter: standard
+  audit_all_writes: false

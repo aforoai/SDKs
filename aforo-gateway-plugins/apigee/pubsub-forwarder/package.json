@@ -1,0 +1,16 @@
+{
+  "name": "aforo-apigee-pubsub-forwarder",
+  "version": "3.1.2",
+  "description": "Reads Aforo usage events that the Apigee aforo-metering shared flow published to Pub/Sub and delivers them to the Aforo ingestor in batches, acking only after the ingestor accepted them.",
+  "main": "src/server.js",
+  "private": true,
+  "license": "Apache-2.0",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test --test-timeout=60000 tests/*.test.js"
+  },
+  "dependencies": {
+    "@google-cloud/pubsub": "6.2.0"
+  }
+}

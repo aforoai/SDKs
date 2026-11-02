@@ -8,6 +8,7 @@
 
 import { AforoWsBilling, WS_CLOSE_REASONS } from '../index';
 import { EventEmitter } from 'events';
+import { bodyJson } from '../../test-support/request-body';
 
 // ── HTTP capture ────────────────────────────────────────────────────────
 
@@ -18,7 +19,7 @@ beforeEach(() => {
   capturedRequests = [];
   global.fetch = jest.fn(async (input: any, init: any = {}) => {
     let body: any = init.body;
-    try { body = JSON.parse(init.body); } catch { /* ignore */ }
+    try { body = bodyJson(init); } catch { /* ignore */ }
     capturedRequests.push({ url: String(input), init, body });
     return { ok: true, status: 200, statusText: 'OK' } as unknown as Response;
   }) as any;
@@ -28,13 +29,14 @@ const config = () => ({
   tenantId: 'tenant-001',
   productId: 'prod-ws-001',
   apiKey: 'sk_ws_abc',
-  ingestorUrl: 'https://ingestor.aforo.ai',
+  ingestorUrl: 'https://api.aforo.ai',
 });
 
 // A tiny WebSocket stub that matches the SDK's MinimalWs surface.
 class FakeWs extends EventEmitter {
   readyState = 1;
-  send(_data: any, _cb?: any) { /* stubbed; billing rewrites this at trackConnection time */ }
+  // Like ws: the send callback runs once the frame is written.
+  send(_data: any, ...rest: any[]) { const cb = rest.find((a) => typeof a === 'function'); cb?.(); }
 }
 
 function eventsOfType(type: string) {
@@ -57,7 +59,7 @@ describe('trackConnection — default (OPEN + CLOSE only)', () => {
     expect(opens).toHaveLength(1);
     expect(opens[0].productType).toBe('WEBSOCKET_API');
     expect(opens[0].customerId).toBe('cust_001');
-    expect(opens[0].wsFrameType).toBe('PING');   // lifecycle marker
+    expect(opens[0].wsFrameType).toBe('OPEN');   // lifecycle marker (was PING before 2.0.0)
     expect(opens[0].messageCount).toBe(0);
     await billing.shutdown();
   });
@@ -104,7 +106,8 @@ describe('trackConnection — default (OPEN + CLOSE only)', () => {
     expect(ev.wsCloseReason).toBe('NORMAL_CLOSURE');
     expect(ev.messageCount).toBe(4);             // 2 in + 2 out
     expect(ev.dataBytes).toBe(3 + 4 + 5 + 2);    // 14
-    expect(ev.durationMs).toBeGreaterThanOrEqual(0);
+    expect(ev.executionDurationMs).toBeGreaterThanOrEqual(0);
+    expect(ev.durationMs).toBeUndefined();
     expect(ev.metadata.sentCount).toBe(2);
     expect(ev.metadata.recvCount).toBe(2);
     expect(ev.metadata.sentBytes).toBe(7);
@@ -238,7 +241,7 @@ describe('event shape', () => {
     await new Promise((r) => setTimeout(r, 20));
 
     const key = capturedRequests[0].body.events[0].idempotencyKey;
-    expect(key).toMatch(/^ws:tenant-001:[0-9a-f-]+:PING:\d+:[a-z0-9]{8}$/);
+    expect(key).toMatch(/^ws:tenant-001:[0-9a-f-]+:OPEN:\d+:[a-z0-9]{8}$/);
     await billing.shutdown();
   });
 
@@ -255,5 +258,200 @@ describe('event shape', () => {
     const msgEv = all.find((e: any) => e.wsFrameType === 'TEXT');
     expect(closeEv.metricName).toBe('websocket_api.connection_closed');
     expect(msgEv.metricName).toBe('websocket_api.message');
+  });
+});
+
+function assertBatchContract(reqs: Array<{ url: string; init: RequestInit; body: any }>, apiKey: string, allowed: string[]) {
+  const allowedSet = new Set(allowed);
+  expect(reqs.length).toBeGreaterThan(0);
+  for (const r of reqs) {
+    expect(r.url).toBe('https://api.aforo.ai/v1/ingest/batch');
+    expect((r.init.headers as Record<string, string>)['X-API-Key']).toBe(apiKey);
+    expect(Object.keys(r.body)).toEqual(['events']);
+    expect(r.body.events.length).toBeGreaterThan(0);
+    expect(r.body.events.length).toBeLessThanOrEqual(1000);
+    for (const e of r.body.events) {
+      for (const k of Object.keys(e)) expect(allowedSet.has(k) ? k : `unexpected field ${k}`).toBe(k);
+      expect(JSON.stringify(e)).not.toContain(apiKey);
+      for (const k of ['customerId', 'metricName', 'occurredAt', 'idempotencyKey']) {
+        expect(typeof e[k]).toBe('string');
+        expect(e[k].trim()).not.toBe('');
+      }
+      expect(e.quantity).toBeGreaterThan(0);
+    }
+  }
+}
+
+describe('ingest batch contract', () => {
+  const FIELDS = ['customerId', 'metricName', 'quantity', 'occurredAt', 'idempotencyKey', 'productType', 'metadata', 'wsConnectionId', 'wsDirection', 'wsFrameType',
+    'wsCloseReason', 'messageCount', 'dataBytes', 'executionDurationMs', 'executionStatus'];
+
+  test('events carry only IngestUsageEventRequest fields', async () => {
+    const billing = new AforoWsBilling({ ...config(), flushCount: 100, perFrameEvents: true });
+    const ws = new FakeWs();
+    billing.trackConnection(ws as any, { customerId: 'cust_001' });
+    ws.emit('message', 'hi', false);
+    ws.send(Buffer.from('yo'));
+    ws.emit('close', 1006);
+    await billing.shutdown();
+    assertBatchContract(capturedRequests, 'sk_ws_abc', FIELDS);
+  });
+
+  test('>1000 buffered events are split into requests of <=1000', async () => {
+    const billing = new AforoWsBilling({ ...config(), flushCount: 5000, perFrameEvents: true });
+    const ws = new FakeWs();
+    billing.trackConnection(ws as any, { customerId: 'cust_001' }); // 1 OPEN event
+    for (let i = 0; i < 2499; i++) ws.emit('message', 'm', false);
+    await billing.shutdown();
+    // 1 OPEN + 2499 frames + the CONNECTION_CLOSED shutdown() bills for the still-open socket.
+    expect(capturedRequests.map((r) => r.body.events.length)).toEqual([1000, 1000, 501]);
+    assertBatchContract(capturedRequests, 'sk_ws_abc', FIELDS);
+  });
+
+  test('blank customerId is not metered; it is counted as one invalid drop', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const billing = new AforoWsBilling({ ...config(), flushCount: 1 });
+    billing.trackConnection(new FakeWs() as any, { customerId: ' ' });
+    await billing.shutdown();
+    expect(capturedRequests).toHaveLength(0);
+    expect(billing.droppedCount).toBe(1);
+    warn.mockRestore();
+  });
+
+  test('over-long customerId: every event of the connection is dropped as invalid — not thrown, not sent', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const onError = jest.fn();
+    const drops: Array<{ events: any[]; reason: string }> = [];
+    const billing = new AforoWsBilling({
+      ...config(), flushCount: 100, onError,
+      onDrop: (events, reason) => drops.push({ events, reason }),
+    });
+    const ws = new FakeWs();
+    expect(() => billing.trackConnection(ws as any, { customerId: 'c'.repeat(65) })).not.toThrow();
+    ws.emit('close', 1000);
+    await billing.shutdown();
+    expect(capturedRequests).toHaveLength(0);
+    expect(billing.droppedCount).toBe(2); // CONNECTION_OPENED + CONNECTION_CLOSED
+    expect(drops.map((d) => d.reason)).toEqual(['invalid', 'invalid']);
+    expect(drops[1].events[0].metadata.event).toBe('CONNECTION_CLOSED');
+    expect(drops[1].events[0].idempotencyKey).toBeTruthy();
+    expect(onError).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(1); // invalid drops are logged on the first and every 1000th
+    expect(warn.mock.calls[0][0]).toMatch(/invalid: customerId is 65 chars, limit 64/);
+    warn.mockRestore();
+  });
+});
+
+describe('productType', () => {
+  test('defaults to WEBSOCKET_API; client option is trimmed + uppercased; per-connection value wins', async () => {
+    const def = new AforoWsBilling({ ...config(), flushCount: 100 });
+    def.trackConnection(new FakeWs() as any, { customerId: 'cust_001' });
+    await def.shutdown();
+    expect(capturedRequests[0].body.events[0].productType).toBe('WEBSOCKET_API');
+
+    capturedRequests = [];
+    const b = new AforoWsBilling({ ...config(), flushCount: 100, productType: ' agentic_api ' });
+    b.trackConnection(new FakeWs() as any, { customerId: 'c_default' });
+    b.trackConnection(new FakeWs() as any, { customerId: 'c_custom', productType: ' custom_type ' });
+    b.trackConnection(new FakeWs() as any, { customerId: 'c_blank', productType: '  ' });
+    const wss = new EventEmitter();
+    b.wrapServer(wss as any, { extractCustomerId: () => 'c_server', productType: 'api' });
+    const ws = new FakeWs();
+    wss.emit('connection', ws, {});
+    ws.emit('close', 1000);
+    await b.shutdown();
+    const types = capturedRequests[0].body.events.map((e: any) => `${e.customerId}=${e.productType}`);
+    expect(types).toEqual([
+      'c_default=AGENTIC_API', 'c_custom=CUSTOM_TYPE', 'c_blank=AGENTIC_API', 'c_server=API', 'c_server=API',
+      // shutdown() closes the three connections that were never closed, with the same productType
+      'c_default=AGENTIC_API', 'c_custom=CUSTOM_TYPE', 'c_blank=AGENTIC_API',
+    ]);
+  });
+
+  test('idempotencyKey is capped at 255 chars', async () => {
+    const b = new AforoWsBilling({ ...config(), tenantId: 't'.repeat(400), flushCount: 100 });
+    b.trackConnection(new FakeWs() as any, { customerId: 'cust_001' });
+    await b.shutdown();
+    const key = capturedRequests[0].body.events[0].idempotencyKey;
+    expect(key.length).toBeLessThanOrEqual(255);
+    expect(key).toMatch(/:\d+:[a-z0-9]{8}$/);
+  });
+});
+
+describe('batch response handling', () => {
+  let warn: jest.SpyInstance;
+  beforeEach(() => { warn = jest.spyOn(console, 'warn').mockImplementation(() => {}); });
+  afterEach(() => { warn.mockRestore(); });
+
+  const resp = (status: number, body: any = {}, headers: Record<string, string> = {}) => ({
+    ok: status >= 200 && status < 300, status, statusText: String(status),
+    headers: { get: (k: string) => headers[k.toLowerCase()] ?? null },
+    json: async () => body,
+  } as unknown as Response);
+  const respondWith = (next: () => Response) => {
+    global.fetch = jest.fn(async (input: any, init: any = {}) => {
+      capturedRequests.push({ url: String(input), init, body: bodyJson(init) });
+      return next();
+    }) as any;
+  };
+  /** One tracked connection, opened and closed: 2 events (OPENED at index 0, CLOSED at index 1). */
+  const meterOnce = async (overrides: Record<string, unknown>) => {
+    const b = new AforoWsBilling({ ...config(), flushCount: 100, ...overrides });
+    const ws = new FakeWs();
+    b.trackConnection(ws as any, { customerId: 'cust_001' });
+    ws.emit('close', 1000);
+    await b.shutdown();
+    return b;
+  };
+
+  test('4xx (not 408/429) is not retried, reports errors[].message, and drops the batch as rejected', async () => {
+    const onError = jest.fn();
+    const onDrop = jest.fn();
+    respondWith(() => resp(400, { errors: [{ index: 0, message: 'field is required' }] }));
+    const b = await meterOnce({ onError, onDrop });
+    expect(capturedRequests).toHaveLength(1);
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError.mock.calls[0][0].message).toMatch(/HTTP 400.*field is required.*not retried/);
+    expect(b.droppedCount).toBe(2);
+    expect(onDrop).toHaveBeenCalledTimes(1);
+    expect(onDrop.mock.calls[0][1]).toBe('rejected');
+  });
+
+  test('429 honours Retry-After and 408 is retried; same idempotencyKeys re-sent', async () => {
+    const onError = jest.fn();
+    const seq = [resp(429, {}, { 'retry-after': '0' }), resp(408, {}, { 'retry-after': '0' }), resp(202, { accepted: 2, failed: 0 })];
+    respondWith(() => seq.shift()!);
+    const b = await meterOnce({ onError });
+    expect(capturedRequests).toHaveLength(3);
+    expect(new Set(capturedRequests.map((r: any) => r.body.events[0].idempotencyKey)).size).toBe(1);
+    expect(onError).not.toHaveBeenCalled();
+    expect(b.droppedCount).toBe(0);
+  });
+
+  test('202 with failed > 0 reports errors[].message and drops only the events named by index', async () => {
+    const onError = jest.fn();
+    const onDrop = jest.fn();
+    respondWith(() => resp(202, { success: true, data: { accepted: 1, duplicates: 0, failed: 1, errors: [{ index: 1, message: 'bad event' }] } }));
+    const b = await meterOnce({ onError, onDrop });
+    expect(capturedRequests).toHaveLength(1);
+    expect(onError.mock.calls[0][0].message).toMatch(/rejected 1 event\(s\).*#1: bad event/);
+    expect(b.droppedCount).toBe(1);
+    expect(onDrop).toHaveBeenCalledTimes(1);
+    expect(onDrop.mock.calls[0][1]).toBe('rejected');
+    expect(onDrop.mock.calls[0][0].map((e: any) => e.metadata.event)).toEqual(['CONNECTION_CLOSED']);
+  });
+
+  test('202 with failed > 0 but no usable index counts the drops without naming events', async () => {
+    const onDrop = jest.fn();
+    respondWith(() => resp(202, { accepted: 1, failed: 1 }));
+    const b = await meterOnce({ onError: () => {}, onDrop });
+    expect(b.droppedCount).toBe(1);
+    expect(onDrop).not.toHaveBeenCalled();
+  });
+
+  test('a throwing onError never turns a delivered batch into a retry', async () => {
+    respondWith(() => resp(202, { accepted: 1, failed: 1, errors: [{ index: 0, message: 'bad' }] }));
+    await meterOnce({ onError: () => { throw new Error('hook bug'); } });
+    expect(capturedRequests).toHaveLength(1);
   });
 });

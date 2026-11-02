@@ -4,7 +4,7 @@
 
 Meter your product's usage and send it to Aforo for billing — in code with a language SDK, or with zero code at your API gateway. Everything in this repo is what you install to get usage events flowing into Aforo.
 
-> **Distribution status:** these packages are being prepared for public registries (npm · PyPI · Maven Central · Go modules) and the gateway plugins for tagged GitHub Releases. Until a package is published, install it from source — each package directory has its own README with the steps. The integration model below is stable.
+> **Distribution status:** the Node SDKs are on npm under `@aforoai/*`, the Python SDKs on PyPI as `aforo-*`, and the Go modules are tagged in this repo; the Java SDKs (`ai.aforo`) are not on Maven Central yet, and the gateway plugins ship as tagged GitHub Releases. Do not install `1.0.0` of any SDK — it predates `executionStatus` and the response-envelope fix. Each package README names the minimum version and the from-source steps. The integration model below is stable.
 
 ---
 
@@ -25,12 +25,12 @@ Most teams start with a gateway plugin (no code) or the base SDK for their langu
 
 ## What's here
 
-### `aforo-metering-sdks/` — language SDKs (24 packages)
+### `aforo-metering-sdks/` — language SDKs (25 packages)
 
 | Language | Base | GraphQL | gRPC | WebSocket | MQTT | MCP | Agent | Proxy (CLI) |
 |---|---|---|---|---|---|---|---|---|
 | **Node** | `node` | `node-graphql` | `node-grpc` | `node-ws` | `node-mqtt` | `node-mcp` | `node-agent` | `mcp-proxy` |
-| **Python** | `python` | `python-graphql` | `python-grpc` | `python-ws` | `python-mqtt` | `python-mcp` | — | — |
+| **Python** | `python` | `python-graphql` | `python-grpc` | `python-ws` | `python-mqtt` | `python-mcp` | `python-agent` | — |
 | **Java** | `java` | `java-graphql` | `java-grpc` | `java-ws` | `java-mqtt` | — | — | — |
 | **Go** | `go` | `go-graphql` | `go-grpc` | `go-ws` | `go-mqtt` | — | — | — |
 
@@ -44,7 +44,7 @@ Base SDKs ship framework middleware (Express/Fastify/Koa, FastAPI/Django/Flask, 
 | Apigee | [`aforo-gateway-plugins/apigee`](aforo-gateway-plugins/apigee) | Shared-flow bundle (JS callout) |
 | AWS API Gateway | [`aforo-gateway-plugins/aws-lambda`](aforo-gateway-plugins/aws-lambda) | Lambda + SAM template + JWT authorizer |
 | Azure APIM | [`aforo-gateway-plugins/azure-apim`](aforo-gateway-plugins/azure-apim) | Outbound XML/C# policy |
-| MuleSoft | [`aforo-gateway-plugins/mulesoft`](aforo-gateway-plugins/mulesoft) | DataWeave custom policy |
+| MuleSoft | [`aforo-gateway-plugins/mulesoft`](aforo-gateway-plugins/mulesoft) | Mule 4 custom policy (key introspection, quota, metering) |
 
 Plus IaC templates in [`aforo-gateway-plugins/aws-cloudformation`](aforo-gateway-plugins/aws-cloudformation) and [`aforo-gateway-plugins/azure-arm-templates`](aforo-gateway-plugins/azure-arm-templates), and per-gateway deployment notes in [`aforo-gateway-plugins/docs`](aforo-gateway-plugins/docs). All five gateway plugins detect MCP `tools/call` JSON-RPC and meter the tool name + agent id alongside standard HTTP requests.
 
@@ -62,13 +62,15 @@ Every artifact ships three docs in its own folder: a **README** (install + quick
 
 ## Common model
 
-Everything here funnels usage to one ingestion API. Base SDKs and the gateway/broker plugins batch events and `POST /v1/ingest/batch` (plugins do it from the log/response phase, non-blocking). The protocol SDKs (GraphQL/gRPC/WebSocket/MQTT) post to `/v1/ingest/events`, and the agent SDK posts to `/v1/ingest` — each package's README states the exact path it uses.
+Everything here funnels usage to one ingestion API. SDKs and the gateway/broker plugins batch events and `POST /v1/ingest/batch` with a body of `{"events":[...]}` (1–1000 events; plugins do it from the log/response phase, non-blocking).
 
-- **Endpoint base:** `https://ingest.aforo.ai` (override per environment); the path is `/v1/ingest/batch`, `/v1/ingest/events`, or `/v1/ingest` depending on the SDK — see the package README.
-- **Auth:** `Authorization: Bearer <AFORO_API_KEY>`
-- **Tenant scope:** your tenant id, supplied via SDK config or plugin config — never read from a client-settable request header
+- **Endpoint base:** `https://api.aforo.ai` (override per environment). The full batch URL is `https://api.aforo.ai/v1/ingest/batch`.
+- **Auth:** `X-API-Key: <AFORO_API_KEY>` — the `sk_live_...` / `sk_test_...` key you create in the Aforo UI. Do not send it as `Authorization: Bearer`: the ingestor parses a Bearer value as a JWT and rejects the request 401, even when `X-API-Key` is also present.
+- **Tenant scope:** derived from the API key on the server. Where an SDK or plugin still asks for a tenant id (the protocol SDKs, Kong), the key's tenant always wins.
+- **Event fields (camelCase):** `customerId`, `metricName` (must match a billable metric in your Aforo catalog), `quantity` (> 0), `occurredAt` (ISO-8601), `idempotencyKey`, and `productType` — one of `API`, `AGENTIC_API`, `AI_AGENT`, `MCP_SERVER`, `GRPC_API`, `GRAPHQL_API`, `WEBSOCKET_API`, `MQTT_BROKER`. `productType` is required in production; every SDK sets it from a client-level option (base SDKs default to `API`, protocol SDKs to their own type) that you can override per event.
+- **Idempotency:** every SDK and plugin mints a unique `idempotencyKey` per event (a random UUID, or a per-request id from the gateway) when the event is created, and re-sends that same key on retries — so a retried batch is deduplicated but two genuinely distinct events are never confused. Dedup is opt-in: pass your own `idempotencyKey` and it is sent verbatim, and the ingestor dedupes on it.
 
-Gateway/broker plugins take three values: `aforo_endpoint`, `api_key`, `tenant_id`. Each plugin README shows where to set them.
+Gateway/broker plugins take `aforo_endpoint`, `api_key`, and `product_type` (default `API`); the Kong plugin still also requires `tenant_id`. Each plugin README shows where to set them.
 
 ---
 

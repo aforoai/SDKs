@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- A recent ALLOW or WARN for this tenant + customer + metric, cached by
+     AforoQuotaPopulateCache. Environment shared cache, key
+     aforo-quota__{tenant}|{customer}|{metric}: one answer serves every proxy.
+     A hit skips the quota call. -->
+<LookupCache name="AforoQuotaLookupCache" continueOnError="true">
+    <DisplayName>Aforo Access - Quota Cache Lookup</DisplayName>
+    <CacheKey>
+        <Prefix>aforo-quota</Prefix>
+        <KeyFragment ref="aforo.access.quotaCacheKey"/>
+    </CacheKey>
+    <Scope>Global</Scope>
+    <AssignTo>aforo.access.cachedDecision</AssignTo>
+</LookupCache>

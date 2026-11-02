@@ -15,8 +15,9 @@ Pick the channel that matches what you need — it gets you an answer faster.
 - Check the artifact's `USER_GUIDE.md` **Troubleshooting** table — common symptoms
   (events not appearing, 401s, metric not billing) are answered there.
 - Confirm the version you're on (the manifest or `VERSION` file) and include it.
-- For "events aren't showing up in Aforo," verify the three values first:
-  `aforo_endpoint`, `api_key`, `tenant_id`. Most reports trace back to one of these.
+- For "events aren't showing up in Aforo," verify these first: the endpoint
+  (`https://api.aforo.ai/v1/ingest/batch`), the `api_key`, the `productType`, and that
+  the `metricName` exists as a billable metric in Aforo. Most reports trace back to one of these.
 
 ## What makes a fast-to-answer issue
 

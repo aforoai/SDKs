@@ -1,6 +1,6 @@
 {
-  "name": "@aforo/graphql-metering",
-  "version": "1.0.0",
+  "name": "@aforoai/graphql-metering",
+  "version": "2.1.0",
   "description": "Aforo GraphQL Metering SDK — plugin + middleware that meters every GraphQL operation (query/mutation/subscription) with accurate complexity scoring and ships usage events to Aforo.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -41,5 +41,14 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aforoai/SDKs.git",
+    "directory": "aforo-metering-sdks/node-graphql"
+  },
+  "homepage": "https://github.com/aforoai/SDKs/tree/main/aforo-metering-sdks/node-graphql#readme",
+  "bugs": {
+    "url": "https://github.com/aforoai/SDKs/issues"
   }
 }

@@ -187,6 +187,7 @@ def fixture():
         schema_version="v-test",
         flush_count=1,
         flush_interval_sec=60.0,
+        trust_customer_header=True,  # the test client sends x-customer-id
     )
 
     schema = _build_schema()
@@ -251,6 +252,7 @@ async def test_QUERY_against_real_schema_emits_event(fixture):
     assert ev["gqlHasErrors"] is False
     assert ev["customerId"] == "cust_query_001"
     assert ev["metadata"]["schemaVersion"] == "v-test"
+    assert ev["executionStatus"] == "SUCCESS"
 
 
 @pytest.mark.asyncio
@@ -295,3 +297,7 @@ async def test_schema_errors_are_flagged(fixture):
     ev = events[0]
     assert ev["gqlHasErrors"] is True
     assert ev["customerId"] == "cust_err_001"
+    # This test server answers validation errors with {"data": null, ...};
+    # a present-but-null data key means ERROR, and the parsed body wins over
+    # the 400 status.
+    assert ev["executionStatus"] == "ERROR"

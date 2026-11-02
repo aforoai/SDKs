@@ -8,7 +8,7 @@
  *   1. Decode and parse JWT header + claims
  *   2. Fetch JWKS from AFORO_JWKS_URI (cached per Lambda warm instance)
  *   3. Verify RS256 signature with the matching key (kid lookup)
- *   4. Check exp (expiry), iss (issuer)
+ *   4. Check exp (expiry), iss (issuer), tenant_id == AFORO_TENANT_ID
  *   5. Check jti blocklist in Redis: key `jti:blocked:{jti}` — exists = revoked
  *   6. Check client-level revocation in Redis: key `jti:client:{keyId}` — exists = all tokens revoked
  *   7. Return IAM Allow policy with claims as authorizer context variables
@@ -29,16 +29,37 @@
  * Environment variables:
  *   AFORO_JWKS_URI      — Aforo JWKS endpoint URL (required)
  *                         e.g. https://auth.smartai.com/.well-known/jwks.json
- *   AFORO_JWT_ISSUER    — Expected issuer string (optional — skip check if unset)
- *   REDIS_HOST          — ElastiCache Redis host for jti/client blocklist (optional)
+ *   AFORO_TENANT_ID     — Your Aforo workspace (tenant) id (required). Aforo signs
+ *                         every tenant's tokens with the same key, so a token whose
+ *                         tenant_id claim differs is denied (TENANT_MISMATCH). Unset
+ *                         or blank → every request is denied (TENANT_NOT_CONFIGURED).
+ *                         The tenantId passed downstream is always this value.
+ *   AFORO_JWT_ISSUER    — Required iss claim (default: https://auth.aforo.ai)
+ *   AFORO_JWT_ISSUER_CHECK_DISABLED — "true" skips the issuer check (logged once
+ *                         per container). Any other value keeps it.
+ *   REDIS_HOST          — ElastiCache Redis host for jti/client blocklist (optional;
+ *                         unset = no revocation check, logged once per container)
  *   REDIS_PORT          — Redis port (default: 6379)
+ *   REDIS_TLS           — "true" (default) connects with TLS; "false" only for a
+ *                         local Redis without in-transit encryption (logged)
+ *   REDIS_TLS_SERVERNAME — TLS server name when it differs from REDIS_HOST
+ *   REDIS_AUTH_SECRET_ARN — Secrets Manager secret holding the Redis AUTH token
+ *                         (plain text). REDIS_AUTH_TOKEN is the plain-variable
+ *                         fallback. REDIS_USERNAME adds an ACL user name.
+ *   REDIS_TIMEOUT_MS    — connect + reply deadline (default: 1000)
  *   TOKEN_CACHE_TTL_MS  — JWKS cache TTL in ms (default: 3600000 = 1 hour)
+ *
+ * Revocation fails closed: when Redis is configured and cannot answer (timeout,
+ * TLS failure, -NOAUTH / -WRONGPASS or any other error reply, a reply that is
+ * not a bulk string), the token is denied.
  *
  * API Gateway Authorizer settings:
  *   Type:                 TOKEN
  *   Identity source:      method.request.header.Authorization
  *   Token validation:     ^Bearer\s.+  (optional — authorizer validates itself)
- *   Authorization caching: TTL = token_exp - 60s (recommended: 840s for 15-min tokens)
+ *   Authorization caching: TTL 60 s or less (the Allow policy covers the
+ *                         token's stage; a revoked token stays allowed for at
+ *                         most the TTL)
  *
  * Downstream context variables (accessible via $context.authorizer.* in integrations):
  *   customerId, tenantId, keyId, scopes, environment, offeringIds
@@ -50,6 +71,8 @@ const https = require('https');
 const http  = require('http');
 const crypto = require('crypto');
 const net   = require('net');
+const tls   = require('tls');
+const { createSecretSource } = require('./aws-secret');
 
 // ────────────────────────────────────────────────────────────
 // JWKS cache — survives across warm Lambda invocations
@@ -64,24 +87,30 @@ let jwksCacheExpiry = 0;
 let jwksFetchErrorTime = 0;
 const JWKS_ERROR_BACKOFF_MS = 30000;
 
+// An unknown kid triggers at most one JWKS refetch per 30 s, so a stream of
+// tokens with made-up kids cannot turn every request into a JWKS fetch.
+let lastUnknownKidRefetch = 0;
+const UNKNOWN_KID_REFETCH_MS = 30000;
+
 /**
  * Fetch JWKS from Aforo's JWKS endpoint.
- * Returns cached result when still fresh; performs HTTP fetch on miss.
- * Negative-caches failures for 30 seconds to prevent cascading retries.
+ * Returns the cached set while it is fresh (force skips that). A failure is
+ * remembered for 30 s; during that time only a fresh cache is served.
  *
+ * @param {{ force?: boolean }} [opts]
  * @returns {Promise<{ keys: object[] }>}
  */
-async function fetchJwks() {
+async function fetchJwks({ force = false } = {}) {
     const now = Date.now();
     const ttl = parseInt(process.env.TOKEN_CACHE_TTL_MS || '3600000', 10);
 
-    // Negative cache: if last fetch errored recently, fail fast
-    if (jwksFetchErrorTime > 0 && (now - jwksFetchErrorTime) < JWKS_ERROR_BACKOFF_MS) {
-        throw new Error('JWKS endpoint unavailable (cached failure — retry in 30s)');
+    if (!force && jwksCache && now < jwksCacheExpiry) {
+        return jwksCache;
     }
 
-    if (jwksCache && now < jwksCacheExpiry) {
-        return jwksCache;
+    // Negative cache: if the last fetch errored recently, fail fast
+    if (jwksFetchErrorTime > 0 && (now - jwksFetchErrorTime) < JWKS_ERROR_BACKOFF_MS) {
+        throw new Error('JWKS endpoint unavailable (cached failure — retry in 30s)');
     }
 
     const jwksUri = process.env.AFORO_JWKS_URI;
@@ -89,6 +118,9 @@ async function fetchJwks() {
 
     try {
         const jwks = await httpGet(jwksUri);
+        if (!jwks || !Array.isArray(jwks.keys)) {
+            throw new Error('JWKS response has no "keys" array');
+        }
         jwksCache = jwks;
         jwksCacheExpiry = now + ttl;
         jwksFetchErrorTime = 0; // Clear error state on success
@@ -112,7 +144,11 @@ function httpGet(url) {
         const transport = parsedUrl.protocol === 'https:' ? https : http;
 
         const req = transport.get(url, { timeout: 5000 }, (res) => {
+            // A timeout or reset after the headers destroys the response; without
+            // this listener that 'error' is unhandled and crashes the runtime.
+            res.on('error', reject);
             if (res.statusCode < 200 || res.statusCode >= 300) {
+                res.resume();
                 return reject(new Error(`JWKS fetch failed: HTTP ${res.statusCode} from ${url}`));
             }
             let data = '';
@@ -204,18 +240,43 @@ async function verifyJwt(token) {
         throw new Error(`Token expired at ${new Date((claims.exp || 0) * 1000).toISOString()}`);
     }
 
-    // Issuer check
-    const expectedIssuer = process.env.AFORO_JWT_ISSUER;
-    if (expectedIssuer && claims.iss !== expectedIssuer) {
-        throw new Error(`Invalid issuer: got '${claims.iss}', expected '${expectedIssuer}'`);
+    // Issuer check: required unless explicitly disabled.
+    if (issuerCheckDisabled()) {
+        if (!warnedIssuerDisabled) {
+            warnedIssuerDisabled = true;
+            console.warn('Authorizer: AFORO_JWT_ISSUER_CHECK_DISABLED=true — the iss claim is not checked');
+        }
+    } else {
+        const expectedIssuer = expectedJwtIssuer();
+        if (claims.iss !== expectedIssuer) {
+            throw new Error(`Invalid issuer: got '${claims.iss}', expected '${expectedIssuer}'`);
+        }
     }
 
     return claims;
 }
 
+const DEFAULT_JWT_ISSUER = 'https://auth.aforo.ai';
+let warnedIssuerDisabled = false;
+
+function expectedJwtIssuer() {
+    return (process.env.AFORO_JWT_ISSUER || '').trim() || DEFAULT_JWT_ISSUER;
+}
+
+function issuerCheckDisabled() {
+    return String(process.env.AFORO_JWT_ISSUER_CHECK_DISABLED || '').trim().toLowerCase() === 'true';
+}
+
+/** The workspace this gateway serves (AFORO_TENANT_ID), or '' when unset. */
+function configuredTenantId() {
+    return (process.env.AFORO_TENANT_ID || '').trim();
+}
+
 /**
  * Find the JWKS key matching `kid`.
- * On cache miss: clears cache, re-fetches once, and tries again.
+ * An unknown kid refetches the JWKS (key rotation), at most once per 30 s.
+ * The previous key set stays in place when that refetch fails, so tokens
+ * signed with a known key keep verifying.
  *
  * @param {string} kid
  * @returns {Promise<object>}  — the matching JWK entry
@@ -225,11 +286,19 @@ async function resolveSigningKey(kid) {
     const jwk  = jwks.keys.find(k => k.kid === kid);
     if (jwk) return jwk;
 
-    // kid not in cache — force one refresh (key rotation scenario)
+    const now = Date.now();
+    if (now - lastUnknownKidRefetch < UNKNOWN_KID_REFETCH_MS) {
+        throw new Error(`No JWKS key found for kid '${kid}'`);
+    }
+    lastUnknownKidRefetch = now;
     console.log(`kid '${kid}' not in JWKS cache — refreshing`);
-    jwksCache = null;
-    const freshJwks = await fetchJwks();
-    const freshJwk  = freshJwks.keys.find(k => k.kid === kid);
+    let freshJwks;
+    try {
+        freshJwks = await fetchJwks({ force: true });
+    } catch (err) {
+        throw new Error(`No JWKS key found for kid '${kid}' (refresh failed: ${err.message})`);
+    }
+    const freshJwk = freshJwks.keys.find(k => k.kid === kid);
     if (!freshJwk) {
         throw new Error(`No JWKS key found for kid '${kid}'`);
     }
@@ -237,78 +306,220 @@ async function resolveSigningKey(kid) {
 }
 
 // ────────────────────────────────────────────────────────────
-// Redis blocklist check (raw TCP — no external package needed)
+// Redis blocklist check (RESP over TLS — no external package needed)
 // ────────────────────────────────────────────────────────────
 
-/**
- * Send a raw Redis GET command over a plain TCP socket.
- * Fail-open: returns false on any connection or protocol error.
- *
- * @param {string} key  — Redis key to GET
- * @returns {Promise<boolean>}  — true if key exists (non-nil response)
- */
-function redisGet(key) {
-    const host = process.env.REDIS_HOST;
-    if (!host) return Promise.resolve(false);
+const MAX_REDIS_REPLY_BYTES = 65536;
 
-    const port = parseInt(process.env.REDIS_PORT || '6379', 10);
-    const command = `*2\r\n$3\r\nGET\r\n$${Buffer.byteLength(key)}\r\n${key}\r\n`;
+let redisAuth = null;
+let warnedNoRedis = false;
+let warnedPlaintext = false;
 
-    return new Promise((resolve) => {
-        let settled = false;
-        let accumulated = '';
-
-        const done = (val) => {
-            if (!settled) {
-                settled = true;
-                socket.destroy();
-                resolve(val);
-            }
-        };
-
-        const socket = new net.Socket();
-        socket.setTimeout(500);
-        socket.on('timeout', () => done(false));
-        socket.on('error',   () => done(false));
-
-        socket.connect(port, host, () => {
-            socket.write(command);
+/** AUTH token source: Secrets Manager (REDIS_AUTH_SECRET_ARN) or REDIS_AUTH_TOKEN. */
+function redisAuthSource() {
+    if (!redisAuth) {
+        redisAuth = createSecretSource({
+            label: 'Redis AUTH token',
+            secretIdEnv: 'REDIS_AUTH_SECRET_ARN',
+            plainEnv: 'REDIS_AUTH_TOKEN',
         });
+    }
+    return redisAuth;
+}
 
+/** One RESP command: an array of bulk strings. */
+function encodeCommand(args) {
+    let out = `*${args.length}\r\n`;
+    for (const a of args) {
+        const v = String(a);
+        out += `$${Buffer.byteLength(v)}\r\n${v}\r\n`;
+    }
+    return out;
+}
+
+/**
+ * Parse RESP2 replies from buf. Returns the complete replies found (each
+ * { type: 'simple'|'error'|'integer'|'bulk'|'nil', value }) and the number of
+ * bytes they used. A partial reply at the end is left for the next chunk.
+ * Throws on bytes that are not RESP, and on arrays (no command sent here
+ * returns one).
+ *
+ * @param {Buffer} buf
+ * @returns {{ replies: object[], used: number }}
+ */
+function parseRespReplies(buf) {
+    const replies = [];
+    let offset = 0;
+    while (offset < buf.length) {
+        const eol = buf.indexOf('\r\n', offset);
+        if (eol < 0) break;
+        const type = String.fromCharCode(buf[offset]);
+        const line = buf.toString('utf8', offset + 1, eol);
+        if (type === '+' || type === '-' || type === ':') {
+            const t = type === '+' ? 'simple' : type === '-' ? 'error' : 'integer';
+            if (t === 'integer' && !/^-?\d+$/.test(line)) throw new Error('Redis sent a malformed integer reply');
+            replies.push({ type: t, value: line });
+            offset = eol + 2;
+        } else if (type === '$') {
+            if (!/^-?\d+$/.test(line)) throw new Error('Redis sent a malformed bulk reply');
+            const n = parseInt(line, 10);
+            if (n === -1) {
+                replies.push({ type: 'nil', value: null });
+                offset = eol + 2;
+                continue;
+            }
+            if (n < 0) throw new Error('Redis sent a malformed bulk reply');
+            const end = eol + 2 + n;
+            if (buf.length < end + 2) break; // body not complete yet
+            if (buf[end] !== 0x0d || buf[end + 1] !== 0x0a) throw new Error('Redis sent a malformed bulk reply');
+            replies.push({ type: 'bulk', value: buf.toString('utf8', eol + 2, end) });
+            offset = end + 2;
+        } else {
+            throw new Error(`Redis sent an unexpected reply type '${type}'`);
+        }
+    }
+    return { replies, used: offset };
+}
+
+/**
+ * Send commands on one connection and return one reply per command.
+ * TLS unless REDIS_TLS=false. Rejects on timeout, TLS or socket error, a
+ * connection closed early, or a malformed reply.
+ *
+ * @param {string[][]} commands
+ * @returns {Promise<object[]>}
+ */
+function redisCommands(commands) {
+    const host = process.env.REDIS_HOST;
+    const port = parseInt(process.env.REDIS_PORT || '6379', 10);
+    const timeoutMs = parseInt(process.env.REDIS_TIMEOUT_MS || '1000', 10);
+    const useTls = String(process.env.REDIS_TLS || 'true').toLowerCase() !== 'false';
+    if (!useTls && !warnedPlaintext) {
+        warnedPlaintext = true;
+        console.warn('Authorizer: REDIS_TLS=false — the revocation lookup and AUTH token travel unencrypted');
+    }
+    const payload = commands.map(encodeCommand).join('');
+
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        let buffered = Buffer.alloc(0);
+        const replies = [];
+        let socket;
+
+        const finish = (err, value) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            if (socket) socket.destroy();
+            if (err) reject(err); else resolve(value);
+        };
+        const timer = setTimeout(() => finish(new Error(`Redis did not answer within ${timeoutMs} ms`)), timeoutMs);
+
+        const onReady = () => socket.write(payload);
+        try {
+            if (useTls) {
+                const options = {
+                    host,
+                    port,
+                    rejectUnauthorized: true,
+                };
+                const servername = process.env.REDIS_TLS_SERVERNAME || (net.isIP(host) ? '' : host);
+                if (servername) options.servername = servername;
+                if (process.env.REDIS_TLS_CA_FILE) {
+                    options.ca = require('fs').readFileSync(process.env.REDIS_TLS_CA_FILE);
+                }
+                socket = tls.connect(options, onReady);
+            } else {
+                socket = net.connect({ host, port }, onReady);
+            }
+        } catch (err) {
+            finish(new Error(`Redis connection failed: ${err.message}`));
+            return;
+        }
+
+        socket.on('error', (err) => finish(new Error(`Redis connection failed: ${err.message}`)));
+        socket.on('close', () => finish(new Error('Redis closed the connection before answering')));
         socket.on('data', (chunk) => {
-            // Accumulate chunks — TCP may split a single RESP response across multiple events
-            accumulated += chunk.toString('ascii');
-            // A complete RESP response always ends with \r\n
-            if (!accumulated.includes('\r\n')) return;
-            // Redis RESP: "$-1\r\n" = nil (key not found), "$N\r\n..." = key exists
-            done(accumulated.startsWith('$') && !accumulated.startsWith('$-1'));
+            buffered = Buffer.concat([buffered, chunk]);
+            if (buffered.length > MAX_REDIS_REPLY_BYTES) {
+                finish(new Error('Redis reply too large'));
+                return;
+            }
+            let parsed;
+            try {
+                parsed = parseRespReplies(buffered);
+            } catch (err) {
+                finish(err);
+                return;
+            }
+            replies.push(...parsed.replies);
+            buffered = buffered.subarray(parsed.used);
+            if (replies.length >= commands.length) finish(null, replies.slice(0, commands.length));
         });
     });
 }
 
 /**
- * Check whether a specific jti has been blocklisted.
- * Redis key format: `jti:blocked:{jti}`
+ * Look up the jti blocklist and the client revocation key.
+ * Returns [jtiBlocked, clientRevoked]. Throws when Redis is configured and
+ * the answer is not a clear "exists" / "does not exist" — the caller denies.
+ *
+ * Redis keys: `jti:blocked:{jti}`, `jti:client:{keyId}`.
  *
  * @param {string} jti
- * @returns {Promise<boolean>}
+ * @param {string} keyId
+ * @returns {Promise<[boolean, boolean]>}
  */
-function isJtiBlocked(jti) {
-    if (!jti) return Promise.resolve(false);
-    return redisGet(`jti:blocked:${jti}`);
+async function checkRevocation(jti, keyId) {
+    if (!process.env.REDIS_HOST) {
+        if (!warnedNoRedis) {
+            warnedNoRedis = true;
+            console.warn('Authorizer: REDIS_HOST is not set — revoked tokens are not checked');
+        }
+        return [false, false];
+    }
+    const lookups = [];
+    if (jti) lookups.push(['jti', `jti:blocked:${jti}`]);
+    if (keyId) lookups.push(['client', `jti:client:${keyId}`]);
+    if (lookups.length === 0) return [false, false];
+
+    const commands = [];
+    const auth = redisAuthSource();
+    if (auth.configured) {
+        const token = await auth.get();
+        if (!token) throw new Error('Redis AUTH token is empty');
+        const user = (process.env.REDIS_USERNAME || '').trim();
+        commands.push(user ? ['AUTH', user, token] : ['AUTH', token]);
+    }
+    for (const [, key] of lookups) commands.push(['GET', key]);
+
+    const replies = await redisCommands(commands);
+    let i = 0;
+    if (auth.configured) {
+        const r = replies[i++];
+        if (r.type !== 'simple' || r.value !== 'OK') {
+            throw new Error(`Redis AUTH failed: ${r.type === 'error' ? r.value : 'unexpected reply'}`);
+        }
+    }
+    const result = { jti: false, client: false };
+    for (const [name, key] of lookups) {
+        const r = replies[i++];
+        if (r.type === 'nil') result[name] = false;
+        else if (r.type === 'bulk') result[name] = true;
+        else if (r.type === 'error') throw new Error(`Redis GET ${key.split(':').slice(0, 2).join(':')} failed: ${r.value}`);
+        else throw new Error(`Redis GET returned an unexpected ${r.type} reply`);
+    }
+    return [result.jti, result.client];
 }
 
-/**
- * Check whether all tokens for a given keyId have been revoked
- * (client-level revocation).
- * Redis key format: `jti:client:{keyId}`
- *
- * @param {string} keyId
- * @returns {Promise<boolean>}
- */
-function isClientRevoked(keyId) {
-    if (!keyId) return Promise.resolve(false);
-    return redisGet(`jti:client:${keyId}`);
+/** True if the jti is blocklisted. Throws when Redis cannot answer. */
+async function isJtiBlocked(jti) {
+    return (await checkRevocation(jti, ''))[0];
+}
+
+/** True if every token of keyId is revoked. Throws when Redis cannot answer. */
+async function isClientRevoked(keyId) {
+    return (await checkRevocation('', keyId))[1];
 }
 
 // ────────────────────────────────────────────────────────────
@@ -318,9 +529,10 @@ function isClientRevoked(keyId) {
 /**
  * Build an API Gateway IAM policy document.
  *
- * Using a wildcard resource (`arn:...:*`) means the cached policy
- * is valid for any method/resource on the same API, avoiding
- * repeated Authorizer invocations within the cache TTL.
+ * Allow covers the stage of the called method (`arn:...:apiId/stage/*`), not
+ * the whole API: a cached Allow for one stage is not reused on another.
+ * Deny covers the called method only. Keep the authorizer result TTL at 60 s
+ * or less; a revoked token stays allowed for at most that long.
  *
  * @param {'Allow'|'Deny'} effect
  * @param {string} resource  — the methodArn from the authorizer event
@@ -328,12 +540,6 @@ function isClientRevoked(keyId) {
  * @returns {object}  — IAM policy response
  */
 function buildPolicy(effect, resource, context) {
-    // Wildcard the method/path so the cached policy covers the whole API
-    const arnParts  = (resource || '').split(':');
-    const wildcardArn = arnParts.length >= 6
-        ? arnParts.slice(0, 6).join(':') + ':*'
-        : resource;
-
     return {
         principalId:    (context && context.customerId) || 'aforo-user',
         policyDocument: {
@@ -341,11 +547,22 @@ function buildPolicy(effect, resource, context) {
             Statement: [{
                 Action:   'execute-api:Invoke',
                 Effect:   effect,
-                Resource: wildcardArn,
+                Resource: effect === 'Allow' ? stageArn(resource) : String(resource || ''),
             }],
         },
         context: context || {},
     };
+}
+
+/**
+ * `arn:aws:execute-api:region:account:apiId/stage/METHOD/path` →
+ * `arn:aws:execute-api:region:account:apiId/stage/*`. Anything that does not
+ * have that shape is returned unchanged (an exact, narrower resource).
+ */
+function stageArn(methodArn) {
+    const arn = String(methodArn || '');
+    const m = arn.match(/^(arn:[^:]+:execute-api:[^:]+:\d{12}:[^/]+\/[^/]+)\//);
+    return m ? `${m[1]}/*` : arn;
 }
 
 // ────────────────────────────────────────────────────────────
@@ -365,6 +582,16 @@ exports.handler = async (event) => {
     const rawToken = event.authorizationToken || '';
     const token    = rawToken.replace(/^[Bb]earer\s+/, '').trim();
 
+    // Organization-service signs every tenant's tokens with one key, so a
+    // valid signature alone would let any Aforo workspace's token in. Without
+    // a configured tenant nothing can be checked: deny everything.
+    const tenantId = configuredTenantId();
+    if (!tenantId) {
+        console.error('Authorizer: AFORO_TENANT_ID is not set — denying every request. ' +
+            'Set it to your Aforo workspace id.');
+        return buildPolicy('Deny', methodArn, { error: 'TENANT_NOT_CONFIGURED' });
+    }
+
     if (!token) {
         console.warn('Authorizer: no token in Authorization header — denying');
         return buildPolicy('Deny', methodArn, { error: 'NO_TOKEN' });
@@ -379,12 +606,20 @@ exports.handler = async (event) => {
         return buildPolicy('Deny', methodArn, { error: err.message });
     }
 
-    // Check jti blocklist and client-level revocation in parallel
+    if (claims.tenant_id !== tenantId) {
+        console.warn(`Authorizer: TENANT_MISMATCH — token tenant_id is not '${tenantId}' — denying`);
+        return buildPolicy('Deny', methodArn, { error: 'TENANT_MISMATCH' });
+    }
+
+    // Check jti blocklist and client-level revocation (one Redis round trip)
     const keyId = claims.key_id || '';
-    const [jtiBlocked, clientRevoked] = await Promise.all([
-        isJtiBlocked(claims.jti || ''),
-        isClientRevoked(keyId),
-    ]);
+    let jtiBlocked, clientRevoked;
+    try {
+        [jtiBlocked, clientRevoked] = await checkRevocation(claims.jti || '', keyId);
+    } catch (err) {
+        console.error(`Authorizer: revocation check failed — denying (${err.message})`);
+        return buildPolicy('Deny', methodArn, { error: 'REVOCATION_CHECK_FAILED' });
+    }
 
     if (jtiBlocked) {
         console.warn(`Authorizer: jti '${claims.jti}' is blocklisted — denying`);
@@ -404,7 +639,7 @@ exports.handler = async (event) => {
     // Build authorizer context — all values MUST be strings (API Gateway requirement)
     const context = {
         customerId:   String(claims.customer_id || claims.sub || ''),
-        tenantId:     String(claims.tenant_id   || ''),
+        tenantId:     tenantId,
         keyId:        String(claims.key_id       || ''),
         scopes:       String(scopes),
         environment:  String(claims.environment  || 'live'),
@@ -425,6 +660,21 @@ module.exports._test = {
     verifyJwt,
     isJtiBlocked,
     isClientRevoked,
+    checkRevocation,
+    redisCommands,
+    parseRespReplies,
     buildPolicy,
+    stageArn,
+    resolveSigningKey,
+    reset() {
+        jwksCache = null;
+        jwksCacheExpiry = 0;
+        jwksFetchErrorTime = 0;
+        lastUnknownKidRefetch = 0;
+        redisAuth = null;
+        warnedNoRedis = false;
+        warnedPlaintext = false;
+        warnedIssuerDisabled = false;
+    },
     jwkToPublicKey,
 };

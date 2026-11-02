@@ -11,7 +11,9 @@ Usage:
         tenant_id="tenant_smartai",
         product_id="prod_mcp_001",
         api_key=os.environ["AFORO_API_KEY"],
-        ingestor_url="https://ingestor.aforo.ai",
+        ingestor_url="https://api.aforo.ai",
+        # Bill the customer your server authenticated, never a value the client sends.
+        customer_resolver=lambda call: current_session_customer_id(),
     )
 
     @server.call_tool()
@@ -21,7 +23,22 @@ Usage:
         return [TextContent(type="text", text=result)]
 """
 
-from .client import AforoMcpBilling
+from .client import (
+    EXECUTION_STATUSES,
+    AforoMcpBilling,
+    CustomerResolver,
+    ToolCall,
+    ToolStatusResolver,
+    __version__,
+    default_tool_status,
+)
 
-__all__ = ["AforoMcpBilling"]
-__version__ = "1.0.0"
+__all__ = [
+    "EXECUTION_STATUSES",
+    "AforoMcpBilling",
+    "CustomerResolver",
+    "ToolCall",
+    "ToolStatusResolver",
+    "__version__",
+    "default_tool_status",
+]

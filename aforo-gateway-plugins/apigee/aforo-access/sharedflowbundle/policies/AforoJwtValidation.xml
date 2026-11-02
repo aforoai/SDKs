@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Optional Aforo JWT (KVM jwt_validation_enabled = "true"), checked in
+  addition to the API key. Reads the token from Authorization: Bearer (the
+  VerifyJWT default) and checks the RS256 signature against the JWKS at KVM
+  aforo_jwks_uri, the issuer against KVM aforo_jwt_issuer, and exp / nbf.
+  Any failure is Apigee's 401 (steps.jwt.*). Both KVM keys are required when
+  this is on; with either missing every call is refused (fails closed).
+
+  Fixed in 3.0.0: the policy carried an <OutputClaims> element, which
+  VerifyJWT does not have, so no claim was ever copied, and a <URI> child
+  under <JWKS>, which is not its syntax either. VerifyJWT itself sets
+  jwt.AforoJwtValidation.decoded.claim.<name> for every claim;
+  AforoJwtAssignClaims copies the Aforo ones into aforo.jwt.*.
+-->
+<VerifyJWT name="AforoJwtValidation" continueOnError="false">
+    <DisplayName>Aforo Access - Verify Aforo JWT</DisplayName>
+    <Algorithm>RS256</Algorithm>
+    <PublicKey>
+        <JWKS uriRef="private.aforo.jwksUri"/>
+    </PublicKey>
+    <Issuer ref="private.aforo.jwtIssuer"/>
+    <IgnoreUnresolvedVariables>false</IgnoreUnresolvedVariables>
+</VerifyJWT>

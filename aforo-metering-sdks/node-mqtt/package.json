@@ -1,6 +1,6 @@
 {
-  "name": "@aforo/mqtt-metering",
-  "version": "1.0.0",
+  "name": "@aforoai/mqtt-metering",
+  "version": "2.1.0",
   "description": "Aforo MQTT Metering SDK — aedes broker hooks + mqtt.js client wrapper that meters PUBLISH/DELIVER/SUBSCRIBE/CONNECT/DISCONNECT events to Aforo.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -50,5 +50,14 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aforoai/SDKs.git",
+    "directory": "aforo-metering-sdks/node-mqtt"
+  },
+  "homepage": "https://github.com/aforoai/SDKs/tree/main/aforo-metering-sdks/node-mqtt#readme",
+  "bugs": {
+    "url": "https://github.com/aforoai/SDKs/issues"
   }
 }

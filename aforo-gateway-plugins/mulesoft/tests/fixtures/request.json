@@ -1,0 +1,552 @@
+{
+  "script": "request",
+  "base": {
+    "vars": {
+      "aforoCfg": {
+        "endpoint": "https://api.aforo.ai/v1/ingest/batch",
+        "apiKey": "ak_test_policy",
+        "tenantId": "42",
+        "productId": "prod-7",
+        "introspectUrl": "https://api.aforo.ai/api/v1/customer-keys/introspect",
+        "introspectTimeoutMs": 1500,
+        "keyHeader": "x-api-key",
+        "identityTtlS": 60,
+        "identityNegativeTtlS": 10,
+        "identityStaleTtlS": 900,
+        "identityFailOpen": false,
+        "productType": "API",
+        "defaultMetric": "",
+        "metricRules": [],
+        "quantityHeader": "X-Aforo-Quantity",
+        "agentId": "",
+        "traceIdHeader": "X-Aforo-Trace-Id",
+        "statusOutcomes": {},
+        "excludePaths": [
+          "/health",
+          "/ready",
+          "/metrics"
+        ],
+        "excludeStatusCodes": [
+          401,
+          403,
+          429
+        ],
+        "quotaEnabled": false,
+        "quotaUrl": "https://api.aforo.ai/api/v1/quota/check",
+        "quotaTimeoutMs": 1500,
+        "quotaFailOpen": true,
+        "quotaCacheTtlMs": 1000,
+        "problems": [],
+        "warnings": []
+      },
+      "aforoRequestId": "req-1",
+      "aforoStartMs": 1792653973000,
+      "aforoRequestText": null
+    },
+    "attributes": {
+      "method": "GET",
+      "requestPath": "/v1/orders",
+      "headers": {
+        "host": "api.example.test",
+        "x-api-key": "sk_live_abc123"
+      }
+    }
+  },
+  "cases": [
+    {
+      "name": "the key, its SHA-256 and the plain plan of an API call",
+      "expect": {
+        "requestId": "req-1",
+        "startMs": 1792653973000,
+        "method": "GET",
+        "path": "/v1/orders",
+        "key": "sk_live_abc123",
+        "keyHash": "e9982364fd73c3ea5cfbc3c032589e2b8d332cd405e37d6ed3277972c1743f11",
+        "keyProblem": null,
+        "excluded": false,
+        "cors": false,
+        "plan": {
+          "productType": "API",
+          "tools": false,
+          "plain": true,
+          "calls": [],
+          "otherMessages": 0,
+          "metric": "api_calls",
+          "toolMetric": null,
+          "quotaMetric": "api_calls"
+        }
+      }
+    },
+    {
+      "name": "the key header is matched case-insensitively and trimmed",
+      "expect": {
+        "key": "sk_live_abc123",
+        "keyHash": "e9982364fd73c3ea5cfbc3c032589e2b8d332cd405e37d6ed3277972c1743f11"
+      },
+      "attributes": {
+        "headers": {
+          "X-API-KEY": "  sk_live_abc123 ",
+          "x-api-key": null
+        }
+      }
+    },
+    {
+      "name": "a configured key-header is used instead of x-api-key",
+      "expect": {
+        "key": "other-key",
+        "keyProblem": null
+      },
+      "vars": {
+        "aforoCfg": {
+          "keyHeader": "x-customer-key"
+        }
+      },
+      "attributes": {
+        "headers": {
+          "X-Customer-Key": "other-key"
+        }
+      }
+    },
+    {
+      "name": "no key: keyProblem missing, no hash",
+      "expect": {
+        "key": null,
+        "keyHash": null,
+        "keyProblem": "missing"
+      },
+      "attributes": {
+        "headers": {
+          "host": "h",
+          "x-api-key": "  "
+        }
+      }
+    },
+    {
+      "name": "a key with control characters or over 1024 characters is not sent to Aforo",
+      "expect": {
+        "key": null,
+        "keyHash": null,
+        "keyProblem": "invalid"
+      },
+      "attributes": {
+        "headers": {
+          "x-api-key": "a\u0001b"
+        }
+      }
+    },
+    {
+      "name": "an over-long key is not sent to Aforo",
+      "expect": {
+        "keyProblem": "invalid"
+      },
+      "attributes": {
+        "headers": {
+          "x-api-key": "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk"
+        }
+      }
+    },
+    {
+      "name": "other key shapes are left to Aforo to judge (afr_ client id, 48 hex)",
+      "expect": {
+        "keyProblem": null,
+        "key": "afr_client_123"
+      },
+      "attributes": {
+        "headers": {
+          "x-api-key": "afr_client_123"
+        }
+      }
+    },
+    {
+      "name": "48 lowercase hex characters (agent client secret) are a key like any other",
+      "expect": {
+        "keyProblem": null,
+        "key": "0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
+      "attributes": {
+        "headers": {
+          "x-api-key": "0123456789abcdef0123456789abcdef0123456789abcdef"
+        }
+      }
+    },
+    {
+      "name": "metric-mappings: first match by method and Lua-pattern path wins",
+      "expect": {
+        "plan.metric": "user_reads",
+        "plan.quotaMetric": "user_reads"
+      },
+      "vars": {
+        "aforoCfg": {
+          "metricRules": [
+            {
+              "method": "GET",
+              "metricName": "user_reads",
+              "re": "^\\/v1\\/users\\/[0-9]+$"
+            },
+            {
+              "method": "",
+              "metricName": "searches",
+              "re": "\\/search"
+            }
+          ]
+        }
+      },
+      "attributes": {
+        "method": "get",
+        "requestPath": "/v1/users/42"
+      }
+    },
+    {
+      "name": "metric-mappings: a rule for another method does not match; default-metric applies",
+      "expect": {
+        "plan.metric": "orders"
+      },
+      "vars": {
+        "aforoCfg": {
+          "metricRules": [
+            {
+              "method": "GET",
+              "metricName": "user_reads",
+              "re": "^\\/v1\\/users\\/[0-9]+$"
+            },
+            {
+              "method": "",
+              "metricName": "searches",
+              "re": "\\/search"
+            }
+          ],
+          "defaultMetric": "orders"
+        }
+      },
+      "attributes": {
+        "method": "POST",
+        "requestPath": "/v1/users/42"
+      }
+    },
+    {
+      "name": "metric-mappings: unanchored patterns match anywhere in the path",
+      "expect": {
+        "plan.metric": "searches"
+      },
+      "vars": {
+        "aforoCfg": {
+          "metricRules": [
+            {
+              "method": "GET",
+              "metricName": "user_reads",
+              "re": "^\\/v1\\/users\\/[0-9]+$"
+            },
+            {
+              "method": "",
+              "metricName": "searches",
+              "re": "\\/search"
+            }
+          ]
+        }
+      },
+      "attributes": {
+        "requestPath": "/api/search/v2"
+      }
+    },
+    {
+      "name": "excluded path: /health excludes /health/live, not /healthcare; no quota metric",
+      "expect": {
+        "excluded": true,
+        "plan.quotaMetric": null,
+        "plan.metric": "api_calls"
+      },
+      "attributes": {
+        "requestPath": "/health/live"
+      }
+    },
+    {
+      "name": "/healthcare is not excluded by /health",
+      "expect": {
+        "excluded": false,
+        "plan.quotaMetric": "api_calls"
+      },
+      "attributes": {
+        "requestPath": "/healthcare"
+      }
+    },
+    {
+      "name": "a CORS preflight is flagged and not quota-checked",
+      "expect": {
+        "cors": true,
+        "plan.quotaMetric": null
+      },
+      "attributes": {
+        "method": "OPTIONS",
+        "headers": {
+          "Access-Control-Request-Method": "POST",
+          "x-api-key": "sk_live_abc123"
+        }
+      }
+    },
+    {
+      "name": "an empty request path is /",
+      "expect": {
+        "path": "/"
+      },
+      "attributes": {
+        "requestPath": ""
+      }
+    },
+    {
+      "name": "client trace headers are kept for correlation only",
+      "expect": {
+        "trace": {
+          "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+          "tracestate": null,
+          "xTraceId": "t-1",
+          "xRequestId": null
+        },
+        "plan.productType": "AGENTIC_API",
+        "plan.metric": "api_calls"
+      },
+      "vars": {
+        "aforoCfg": {
+          "productType": "AGENTIC_API"
+        }
+      },
+      "attributes": {
+        "headers": {
+          "x-api-key": "sk_live_abc123",
+          "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+          "X-Trace-Id": "t-1",
+          "x-request-id": "bad\nvalue"
+        }
+      }
+    },
+    {
+      "name": "MCP: one tools/call",
+      "expect": {
+        "plan": {
+          "productType": "MCP_SERVER",
+          "tools": true,
+          "plain": false,
+          "calls": [
+            {
+              "toolName": "get_weather",
+              "id": 1
+            }
+          ],
+          "otherMessages": 0,
+          "metric": "api_calls",
+          "toolMetric": "mcp_server.tool_invocations",
+          "quotaMetric": "mcp_server.tool_invocations"
+        }
+      },
+      "vars": {
+        "aforoCfg": {
+          "productType": "MCP_SERVER"
+        },
+        "aforoRequestText": "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"tools/call\", \"params\": {\"name\": \"get_weather\", \"arguments\": {\"city\": \"x\"}, \"_meta\": {\"agent_id\": \"spoofed\"}}}"
+      },
+      "attributes": {
+        "method": "POST",
+        "requestPath": "/mcp"
+      }
+    },
+    {
+      "name": "MCP: a batch bills each tools/call and skips protocol messages",
+      "expect": {
+        "plan.tools": true,
+        "plan.calls": [
+          {
+            "toolName": "a",
+            "id": "x1"
+          },
+          {
+            "toolName": "b",
+            "id": null
+          },
+          {
+            "toolName": "unknown",
+            "id": 3
+          }
+        ],
+        "plan.otherMessages": 2
+      },
+      "vars": {
+        "aforoCfg": {
+          "productType": "MCP_SERVER"
+        },
+        "aforoRequestText": "[{\"jsonrpc\": \"2.0\", \"id\": \"x1\", \"method\": \"tools/call\", \"params\": {\"name\": \"a\"}}, {\"jsonrpc\": \"2.0\", \"method\": \"notifications/initialized\"}, {\"jsonrpc\": \"2.0\", \"id\": 2, \"method\": \"tools/list\"}, {\"jsonrpc\": \"2.0\", \"method\": \"tools/call\", \"params\": {\"name\": \"b\"}}, {\"jsonrpc\": \"2.0\", \"id\": 3, \"method\": \"tools/call\", \"params\": {\"name\": 7}}, {\"jsonrpc\": \"1.0\", \"id\": 9, \"method\": \"tools/call\", \"params\": {\"name\": \"old\"}}, \"junk\"]"
+      },
+      "attributes": {
+        "method": "POST",
+        "requestPath": "/mcp"
+      }
+    },
+    {
+      "name": "MCP: initialize is never billed and never quota-checked",
+      "expect": {
+        "plan.tools": false,
+        "plan.plain": false,
+        "plan.calls": [],
+        "plan.otherMessages": 1,
+        "plan.quotaMetric": null
+      },
+      "vars": {
+        "aforoCfg": {
+          "productType": "MCP_SERVER"
+        },
+        "aforoRequestText": "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"initialize\", \"params\": {}}"
+      },
+      "attributes": {
+        "method": "POST",
+        "requestPath": "/mcp"
+      }
+    },
+    {
+      "name": "MCP: tools/list is never billed and never quota-checked",
+      "expect": {
+        "plan.tools": false,
+        "plan.plain": false,
+        "plan.calls": [],
+        "plan.otherMessages": 1,
+        "plan.quotaMetric": null
+      },
+      "vars": {
+        "aforoCfg": {
+          "productType": "MCP_SERVER"
+        },
+        "aforoRequestText": "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"tools/list\", \"params\": {}}"
+      },
+      "attributes": {
+        "method": "POST",
+        "requestPath": "/mcp"
+      }
+    },
+    {
+      "name": "MCP: ping is never billed and never quota-checked",
+      "expect": {
+        "plan.tools": false,
+        "plan.plain": false,
+        "plan.calls": [],
+        "plan.otherMessages": 1,
+        "plan.quotaMetric": null
+      },
+      "vars": {
+        "aforoCfg": {
+          "productType": "MCP_SERVER"
+        },
+        "aforoRequestText": "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"ping\", \"params\": {}}"
+      },
+      "attributes": {
+        "method": "POST",
+        "requestPath": "/mcp"
+      }
+    },
+    {
+      "name": "MCP: a body that is not JSON-RPC bills nothing",
+      "expect": {
+        "plan.tools": false,
+        "plan.plain": false,
+        "plan.quotaMetric": null
+      },
+      "vars": {
+        "aforoCfg": {
+          "productType": "MCP_SERVER"
+        },
+        "aforoRequestText": "{\"hello\":"
+      },
+      "attributes": {
+        "method": "POST",
+        "requestPath": "/mcp"
+      }
+    },
+    {
+      "name": "MCP: a GET (SSE stream) bills nothing",
+      "expect": {
+        "plan.tools": false,
+        "plan.plain": false,
+        "plan.quotaMetric": null
+      },
+      "vars": {
+        "aforoCfg": {
+          "productType": "MCP_SERVER"
+        },
+        "aforoRequestText": null
+      },
+      "attributes": {
+        "method": "GET",
+        "requestPath": "/mcp"
+      }
+    },
+    {
+      "name": "MCP: tool names are escaped and cut to 64 characters",
+      "expect": {
+        "plan.calls.0.toolName": "a%0Abxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      },
+      "vars": {
+        "aforoCfg": {
+          "productType": "MCP_SERVER"
+        },
+        "aforoRequestText": "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"tools/call\", \"params\": {\"name\": \"a\\nbxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}}"
+      },
+      "attributes": {
+        "method": "POST",
+        "requestPath": "/mcp"
+      }
+    },
+    {
+      "name": "MCP: the product default metric bills tool calls unless it is api_calls",
+      "expect": {
+        "plan.toolMetric": "weather_tools",
+        "plan.quotaMetric": "weather_tools"
+      },
+      "vars": {
+        "aforoCfg": {
+          "productType": "MCP_SERVER",
+          "defaultMetric": "weather_tools"
+        },
+        "aforoRequestText": "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"tools/call\", \"params\": {\"name\": \"t\"}}"
+      },
+      "attributes": {
+        "method": "POST",
+        "requestPath": "/mcp"
+      }
+    },
+    {
+      "name": "MCP: a mapping wins over the default for tool calls",
+      "expect": {
+        "plan.toolMetric": "mcp_mapped"
+      },
+      "vars": {
+        "aforoCfg": {
+          "productType": "MCP_SERVER",
+          "defaultMetric": "api_calls",
+          "metricRules": [
+            {
+              "method": "POST",
+              "metricName": "mcp_mapped",
+              "re": "^\\/mcp"
+            }
+          ]
+        },
+        "aforoRequestText": "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"tools/call\", \"params\": {\"name\": \"t\"}}"
+      },
+      "attributes": {
+        "method": "POST",
+        "requestPath": "/mcp"
+      }
+    },
+    {
+      "name": "a tools/call body on a non-MCP product is an ordinary call",
+      "expect": {
+        "plan.tools": false,
+        "plan.plain": true,
+        "plan.quotaMetric": "api_calls"
+      },
+      "vars": {
+        "aforoRequestText": "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"tools/call\", \"params\": {\"name\": \"t\"}}"
+      },
+      "attributes": {
+        "method": "POST",
+        "requestPath": "/mcp"
+      }
+    }
+  ]
+}

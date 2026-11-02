@@ -65,7 +65,7 @@ class AforoWsIntegrationTest {
     void setUp() throws IOException, InterruptedException {
         captureServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         captureServer.createContext("/", (HttpExchange ex) -> {
-            byte[] body = ex.getRequestBody().readAllBytes();
+            byte[] body = com.aforo.testsupport.RequestBodies.read(ex);
             synchronized (capturedBodies) {
                 try {
                     if (body.length > 0) {
@@ -237,7 +237,7 @@ class AforoWsIntegrationTest {
                 2000);
 
         Map<String, Object> open = events.stream()
-                .filter(e -> "PING".equals(e.get("wsFrameType")))
+                .filter(e -> "OPEN".equals(e.get("wsFrameType")))
                 .findFirst().orElseThrow();
         Map<String, Object> closed = events.stream()
                 .filter(e -> "CLOSE".equals(e.get("wsFrameType")))
@@ -292,10 +292,11 @@ class AforoWsIntegrationTest {
         }
         assertThat(capturedHeaders).isNotEmpty();
         Map<String, List<String>> headers = capturedHeaders.get(0);
-        List<String> auth = headers.getOrDefault("Authorization", List.of());
+        List<String> auth = headers.getOrDefault("X-api-key", headers.getOrDefault("X-API-Key", List.of()));
         List<String> tenant = headers.getOrDefault("X-tenant-id",
                 headers.getOrDefault("X-Tenant-Id", List.of()));
-        assertThat(auth).contains("Bearer sk_int_ws");
+        assertThat(auth).contains("sk_int_ws");
+        assertThat(headers.containsKey("Authorization")).isFalse();
         assertThat(tenant).contains("tenant-int-ws");
     }
 }

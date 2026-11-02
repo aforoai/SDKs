@@ -1,0 +1,105 @@
+{
+  "script": "quota-lookup",
+  "base": {
+    "vars": {
+      "aforoCfg": {
+        "endpoint": "https://api.aforo.ai/v1/ingest/batch",
+        "apiKey": "ak_test_policy",
+        "tenantId": "42",
+        "productId": "prod-7",
+        "introspectUrl": "https://api.aforo.ai/api/v1/customer-keys/introspect",
+        "introspectTimeoutMs": 1500,
+        "keyHeader": "x-api-key",
+        "identityTtlS": 60,
+        "identityNegativeTtlS": 10,
+        "identityStaleTtlS": 900,
+        "identityFailOpen": false,
+        "productType": "API",
+        "defaultMetric": "",
+        "metricRules": [],
+        "quantityHeader": "X-Aforo-Quantity",
+        "agentId": "",
+        "traceIdHeader": "X-Aforo-Trace-Id",
+        "statusOutcomes": {},
+        "excludePaths": [
+          "/health",
+          "/ready",
+          "/metrics"
+        ],
+        "excludeStatusCodes": [
+          401,
+          403,
+          429
+        ],
+        "quotaEnabled": true,
+        "quotaUrl": "https://api.aforo.ai/api/v1/quota/check",
+        "quotaTimeoutMs": 1500,
+        "quotaFailOpen": true,
+        "quotaCacheTtlMs": 1000,
+        "problems": [],
+        "warnings": []
+      },
+      "aforoReq": {
+        "requestId": "req-1",
+        "startMs": 1792653973000
+      },
+      "aforoQuotaCached": ""
+    }
+  },
+  "cases": [
+    {
+      "name": "nothing cached: call",
+      "expect": {
+        "call": true,
+        "cachedDecision": null
+      }
+    },
+    {
+      "name": "ALLOW 500 ms old answers the check",
+      "expect": {
+        "call": false,
+        "cachedDecision": "ALLOW"
+      },
+      "vars": {
+        "aforoQuotaCached": "{\"decision\": \"ALLOW\", \"storedAtMs\": 1792653972500}"
+      }
+    },
+    {
+      "name": "WARN 999 ms old answers the check",
+      "expect": {
+        "call": false,
+        "cachedDecision": "WARN"
+      },
+      "vars": {
+        "aforoQuotaCached": "{\"decision\": \"WARN\", \"storedAtMs\": 1792653972001}"
+      }
+    },
+    {
+      "name": "ALLOW 1000 ms old: call again",
+      "expect": {
+        "call": true
+      },
+      "vars": {
+        "aforoQuotaCached": "{\"decision\": \"ALLOW\", \"storedAtMs\": 1792653972000}"
+      }
+    },
+    {
+      "name": "a DENY is never taken from the cache",
+      "expect": {
+        "call": true
+      },
+      "vars": {
+        "aforoQuotaCached": "{\"decision\": \"DENY\", \"storedAtMs\": 1792653972990}"
+      }
+    },
+    {
+      "name": "garbage in the cache: call",
+      "expect": {
+        "call": true
+      },
+      "vars": {
+        "aforoQuotaCached": "nope"
+      }
+    }
+  ]
+}

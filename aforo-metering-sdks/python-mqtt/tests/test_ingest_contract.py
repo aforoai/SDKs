@@ -1,0 +1,320 @@
+"""Ingest-contract guard (A+ delivery-guarantee prompt 7).
+
+Validates the OBSERVED wire request (endpoint path + body shape) against the
+shared, checked-in contract fixture at contract/ingest-contract.json — which
+is derived from the REAL usage-ingestor controllers/DTOs, never from this
+SDK's own constants. The 2026-07-05 D1 incident shipped this very SDK posting
+a batch body to a single-event endpoint; its own green suite hid 100% event
+loss because it asserted the SDK's own (wrong) constant.
+
+Also covers the transport rules shared by every variant: the key travels only
+in X-API-Key, a flush is split into requests of at most 1000 events,
+idempotency keys are reused verbatim on retry, and an event with an unusable
+customerId is dropped with reason "invalid" instead of being sent.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import List
+from urllib.parse import urlparse
+
+from unittest import mock
+
+import pytest
+
+from aforo_mqtt_metering import client as mod
+from aforo_mqtt_metering.client import AforoMqttBilling
+from gzip_body import request_bytes
+
+MODULE_KEY = "python-mqtt"
+
+FIXTURE = json.loads(
+    (Path(__file__).resolve().parents[2] / "contract" / "ingest-contract.json").read_text()
+)
+
+
+def _assert_required(obj: dict, field: str) -> None:
+    assert field in obj, f"required field '{field}' missing from wire body"
+    v = obj[field]
+    assert v is not None, f"required field '{field}' is null"
+    if isinstance(v, str):
+        assert v.strip() != "", f"required field '{field}' is blank"
+
+
+def assert_body_matches_contract(spec: dict, body) -> None:
+    """Same assertion shape in every SDK suite (all languages)."""
+    assert body is not None
+    if spec["cardinality"] == "batch-wrapped":
+        # A bare array here is the /v1/ingest/async-batch shape — wrong for this endpoint.
+        assert isinstance(body, dict), "batch body must be an object, not a bare array"
+        events = body.get(spec["batchKey"])
+        assert isinstance(events, list) and events, f"batch body must carry non-empty '{spec['batchKey']}'"
+        assert len(events) <= spec["maxEvents"]
+        for ev in events:
+            for field in spec["eventRequiredFields"]:
+                _assert_required(ev, field)
+    elif spec["cardinality"] == "single":
+        assert isinstance(body, dict)
+        for key in spec.get("forbiddenTopLevelKeys", []):
+            assert key not in body, f"single-event body must not carry '{key}'"
+        for field in spec["requiredFields"]:
+            _assert_required(body, field)
+    else:
+        raise AssertionError(f"unhandled cardinality in fixture: {spec['cardinality']}")
+
+
+class _CapturingClient:
+    """httpx transport that records each POST and answers 202."""
+
+    captured: list = []
+
+    @classmethod
+    def transport(cls):
+        import httpx
+
+        def handle(request):
+            body = json.loads(request_bytes(request))
+            cls.captured.append((str(request.url), body, dict(request.headers)))
+            return httpx.Response(202, json={"data": {"accepted": len(body["events"]), "failed": 0}})
+
+        return httpx.MockTransport(handle)
+
+
+def test_posts_to_contracted_endpoint_with_contracted_body_shape(monkeypatch):
+    sdk_entry = FIXTURE["sdks"].get(MODULE_KEY)
+    assert sdk_entry is not None, "module must be registered in the fixture"
+    endpoint = sdk_entry["endpoint"]
+    spec = FIXTURE["endpoints"][endpoint]
+
+    _CapturingClient.captured = []
+
+    billing = AforoMqttBilling(
+        tenant_id="tenant-001",
+        product_id="prod-mqtt-001",
+        api_key="sk_test_abc",
+        ingestor_url="https://ingest.example.test",
+        http_transport=_CapturingClient.transport(),
+    )
+    billing.push(
+        customer_id="cust_contract",
+        topic="sensors/temp",
+        qos=1,
+        retained=False,
+        event_type="PUBLISH",
+        client_id="client-1",
+        data_bytes=4,
+    )
+    billing.shutdown()
+
+    assert _CapturingClient.captured, "no wire request observed"
+    url, body, _headers = _CapturingClient.captured[0]
+    assert urlparse(str(url)).path == endpoint
+    assert_body_matches_contract(spec, body)
+
+
+def test_execution_status_is_contracted_optional_field_sent_only_when_set(monkeypatch):
+    spec = FIXTURE["endpoints"][FIXTURE["sdks"][MODULE_KEY]["endpoint"]]
+    status_spec = spec["eventOptionalFields"]["executionStatus"]
+
+    _CapturingClient.captured = []
+
+    billing = AforoMqttBilling(
+        tenant_id="tenant-001",
+        product_id="prod-mqtt-001",
+        api_key="sk_test_abc",
+        ingestor_url="https://ingest.example.test",
+        http_transport=_CapturingClient.transport(),
+    )
+    common = dict(customer_id="cust_contract", topic="sensors/temp", qos=1, retained=False,
+                  event_type="PUBLISH", client_id="client-1")
+    billing.push(**common, execution_status="timeout")
+    billing.push(**common)
+    billing.shutdown()
+
+    assert _CapturingClient.captured, "no wire request observed"
+    _url, body, _headers = _CapturingClient.captured[0]
+    assert_body_matches_contract(spec, body)
+    with_status, without_status = body[spec["batchKey"]]
+    assert with_status["executionStatus"] == "TIMEOUT"
+    assert with_status["executionStatus"] in status_spec["values"]
+    assert len(with_status["executionStatus"]) <= status_spec["maxLength"]
+    assert "executionStatus" not in without_status
+
+
+# ── Transport rules (X-API-Key, 1000-event requests, stable keys) ──
+
+ALLOWED_TOP_LEVEL = {
+    "customerId", "metricName", "quantity", "occurredAt", "idempotencyKey",
+    "traceId", "spanId", "sessionId", "metadata", "productType",
+    "executionDurationMs", "executionStatus", "dataBytes", "messageCount",
+    "mqttTopic", "mqttQos", "mqttRetained", "mqttEventType", "mqttClientId",
+}
+ISO_INSTANT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$")
+
+
+class _Http:
+    def __init__(self, statuses=None):
+        self.statuses = list(statuses or [])
+        self.requests: List[dict] = []
+
+    def urlopen(self, req, timeout=None):
+        self.requests.append({
+            "url": req.full_url,
+            "headers": {k.lower(): v for k, v in req.header_items()},
+            "body": json.loads(req.data.decode("utf-8")),
+        })
+        code = self.statuses.pop(0) if self.statuses else 202
+
+        class _R:
+            status = code
+            def __enter__(self_i): return self_i
+            def __exit__(self_i, *_a): return False
+            def read(self_i): return b""
+
+        return _R()
+
+
+def _install(monkeypatch, statuses=None):
+    monkeypatch.setattr(mod, "HAS_HTTPX", False, raising=False)
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+    h = _Http(statuses)
+    patcher = mock.patch("urllib.request.urlopen", side_effect=h.urlopen)
+    patcher.start()
+    return h, patcher
+
+
+def _make():
+    return AforoMqttBilling(
+        tenant_id="tenant-001",
+        product_id="prod-001",
+        api_key="sk_contract",
+        ingestor_url="https://api.aforo.ai/",
+        flush_count=10_000,
+        flush_interval_sec=3600,
+    )
+
+
+def _emit(b, i):
+    _emit_customer(b, f"cust_{i}")
+
+
+def _emit_customer(b, customer_id):
+    b.push(customer_id=customer_id, topic="sensors/a/temp", qos=1, retained=True,
+           event_type="PUBLISH", client_id="device-1", data_bytes=5)
+
+
+def test_posts_batch_to_v1_ingest_batch_with_dto_shape(monkeypatch):
+    h, patcher = _install(monkeypatch)
+    try:
+        b = _make()
+        _emit(b, 0)
+        b.shutdown()
+    finally:
+        patcher.stop()
+
+    assert len(h.requests) == 1
+    req = h.requests[0]
+    assert req["url"] == "https://api.aforo.ai/v1/ingest/batch"
+    assert req["headers"]["x-api-key"] == "sk_contract"
+    assert "authorization" not in req["headers"]
+    assert set(req["body"].keys()) == {"events"}
+    assert "sk_contract" not in json.dumps(req["body"])
+
+    ev = req["body"]["events"][0]
+    assert "apiKey" not in ev
+    assert set(ev.keys()) <= ALLOWED_TOP_LEVEL, set(ev.keys()) - ALLOWED_TOP_LEVEL
+    assert ev["customerId"] == "cust_0"
+    assert ev["quantity"] > 0
+    assert ISO_INSTANT.match(ev["occurredAt"])
+    assert ev["idempotencyKey"] and len(ev["idempotencyKey"]) <= 255
+    assert ev["productType"] == "MQTT_BROKER"
+    assert ev["mqttTopic"] == "sensors/a/temp"
+    assert ev["mqttQos"] == 1
+    assert ev["mqttRetained"] is True
+    assert ev["mqttEventType"] == "PUBLISH"
+    assert ev["mqttClientId"] == "device-1"
+    assert ev["dataBytes"] == 5
+
+
+def test_connect_event_has_non_blank_topic(monkeypatch):
+    h, patcher = _install(monkeypatch)
+    try:
+        b = _make()
+        b.push(customer_id="cust_1", topic="", qos=0, retained=False,
+               event_type="CONNECT", client_id="device-1")
+        b.shutdown()
+    finally:
+        patcher.stop()
+    ev = h.requests[0]["body"]["events"][0]
+    assert ev["mqttEventType"] == "CONNECT"
+    assert ev["mqttTopic"] == "$SYS/clients/device-1/connected"
+
+
+def test_more_than_1000_events_are_split_into_batches_of_at_most_1000(monkeypatch):
+    h, patcher = _install(monkeypatch)
+    try:
+        b = _make()
+        for i in range(2500):
+            _emit(b, i)
+        b.shutdown()
+    finally:
+        patcher.stop()
+
+    sizes = [len(r["body"]["events"]) for r in h.requests]
+    assert sum(sizes) == 2500 and max(sizes) <= 1000
+    assert all(r["url"].endswith("/v1/ingest/batch") for r in h.requests)
+    keys = [e["idempotencyKey"] for r in h.requests for e in r["body"]["events"]]
+    assert len(set(keys)) == 2500
+
+
+def test_idempotency_keys_are_stable_across_retries(monkeypatch):
+    h, patcher = _install(monkeypatch, statuses=[503, 202])
+    try:
+        b = _make()
+        for i in range(3):
+            _emit(b, i)
+        b.shutdown()
+    finally:
+        patcher.stop()
+
+    assert len(h.requests) == 2
+    first = [e["idempotencyKey"] for e in h.requests[0]["body"]["events"]]
+    retry = [e["idempotencyKey"] for e in h.requests[1]["body"]["events"]]
+    assert first == retry and len(set(first)) == 3
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "c" * 65])
+def test_invalid_customer_id_is_dropped_as_invalid_and_not_sent(monkeypatch, bad):
+    h, patcher = _install(monkeypatch)
+    drops = []
+    try:
+        b = _make()
+        b.on_drop = lambda events, reason: drops.append((events, reason))
+        _emit_customer(b, bad)  # must not raise
+        assert b.dropped_count == 1
+        b.shutdown()
+    finally:
+        patcher.stop()
+    assert h.requests == []
+    assert len(drops) == 1
+    events, reason = drops[0]
+    assert reason == "invalid"
+    assert len(events) == 1 and events[0]["idempotencyKey"]
+
+
+def test_transport_defaults_match_the_contract_policy():
+    from aforo_mqtt_metering._transport import policy
+
+    tp = FIXTURE["transportPolicy"]
+    assert tp["batch"]["defaultEvents"] == policy.DEFAULT_FLUSH_COUNT
+    assert tp["batch"]["maxEvents"] == policy.MAX_BATCH_EVENTS
+    assert tp["queue"]["defaultCapacity"] == policy.DEFAULT_QUEUE_CAPACITY
+    assert tp["timeouts"]["requestMs"] / 1000 == policy.REQUEST_TIMEOUT_S
+    assert tp["timeouts"]["shutdownMs"] / 1000 == policy.SHUTDOWN_TIMEOUT_S
+    assert tp["retry"]["maxRetries"] == policy.MAX_RETRIES
+    assert tp["retry"]["retryAfter"]["maxMs"] / 1000 == policy.RETRY_AFTER_MAX_S
+    assert tp["compression"]["gzip"] is policy.GZIP is True
+    assert tp["compression"]["minBytes"] == policy.COMPRESSION_MIN_BYTES

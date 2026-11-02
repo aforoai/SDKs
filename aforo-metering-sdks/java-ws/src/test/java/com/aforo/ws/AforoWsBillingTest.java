@@ -38,7 +38,7 @@ class AforoWsBillingTest {
         port = server.getAddress().getPort();
         server.createContext("/", exchange -> {
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
-            exchange.getRequestBody().transferTo(buf);
+            buf.writeBytes(com.aforo.testsupport.RequestBodies.read(exchange));
             requestBodies.add(buf.size() == 0 ? mapper.nullNode() : mapper.readTree(buf.toByteArray()));
             exchange.sendResponseHeaders(204, -1);
             exchange.close();
@@ -74,10 +74,63 @@ class AforoWsBillingTest {
         return allEvents().stream().filter(p).toList();
     }
 
+    // ── executionStatus (explicit only) ────────────────────────────────
+
+    @Test
+    @DisplayName("executionStatus: explicit values are normalized and sent; never derived from the close code")
+    void executionStatusExplicitOnly() throws Exception {
+        try (AforoWsBilling b = baseBuilder().perFrameEvents(true).build()) {
+            String c1 = b.openConnection("cust_001", null, " pending ");
+            b.recordFrame(c1, "CLIENT_TO_SERVER", "TEXT", 3, "success");
+            b.recordFrame(c1, "CLIENT_TO_SERVER", "TEXT", 3);
+            b.closeConnection(c1, 1011, "  timeout ");
+            String c2 = b.openConnection("cust_001", null);
+            b.recordFrame(c2, "CLIENT_TO_SERVER", "TEXT", 3, "   ");
+            b.closeConnection(c2, 1011);                    // error close code, but nothing derived
+        }
+        waitFor(() -> allEvents().size() == 7, 2000);
+        List<JsonNode> ev = allEvents();
+        java.util.Map<String, List<JsonNode>> byConn = new java.util.HashMap<>();
+        for (JsonNode e : ev) byConn.computeIfAbsent(e.get("wsConnectionId").asText(), k -> new java.util.ArrayList<>()).add(e);
+        assertThat(byConn).hasSize(2);
+        for (List<JsonNode> events : byConn.values()) {
+            boolean first = events.size() == 4;
+            if (first) {
+                assertThat(events.get(0).get("executionStatus").asText()).isEqualTo("PENDING");
+                assertThat(events.get(1).get("executionStatus").asText()).isEqualTo("SUCCESS");
+                assertThat(events.get(2).has("executionStatus")).isFalse();
+                assertThat(events.get(3).get("wsFrameType").asText()).isEqualTo("CLOSE");
+                assertThat(events.get(3).get("executionStatus").asText()).isEqualTo("TIMEOUT");
+            } else {
+                assertThat(events).hasSize(3);
+                events.forEach(e -> assertThat(e.has("executionStatus")).isFalse());
+                assertThat(events.get(2).get("wsCloseReason").asText()).isEqualTo("INTERNAL_ERROR");
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("executionStatus: unknown explicit values are omitted; the rest of each event is sent")
+    void executionStatusUnknownOmitted() throws Exception {
+        try (AforoWsBilling b = baseBuilder().perFrameEvents(true).build()) {
+            String c1 = b.openConnection("cust_001", null, "opened");
+            b.recordFrame(c1, "CLIENT_TO_SERVER", "TEXT", 3, "TIMEOUT_BUT_WAY_TOO_LONG_FOR_IT");
+            b.closeConnection(c1, 1000, " cancelled ");
+        }
+        waitFor(() -> allEvents().size() == 3, 2000);
+        List<JsonNode> ev = allEvents();
+        assertThat(ev).hasSize(3);
+        assertThat(ev.get(0).has("executionStatus")).isFalse();
+        assertThat(ev.get(0).get("customerId").asText()).isEqualTo("cust_001");
+        assertThat(ev.get(1).has("executionStatus")).isFalse();
+        assertThat(ev.get(1).get("dataBytes").asLong()).isEqualTo(3L);
+        assertThat(ev.get(2).get("executionStatus").asText()).isEqualTo("CANCELLED");
+    }
+
     // ── Lifecycle: open → close ────────────────────────────────────────
 
     @Test
-    @DisplayName("openConnection emits CONNECTION_OPENED event immediately (PING marker)")
+    @DisplayName("openConnection emits CONNECTION_OPENED immediately (OPEN frame type, connection_opened metric)")
     void openConnectionEmitsOpen() throws Exception {
         try (AforoWsBilling b = baseBuilder().flushCount(1).build()) {
             String connId = b.openConnection("cust_001", Map.of("region", "us-east-1"));
@@ -86,7 +139,8 @@ class AforoWsBillingTest {
         }
         JsonNode ev = requestBodies.get(0).get("events").get(0);
         assertThat(ev.get("productType").asText()).isEqualTo("WEBSOCKET_API");
-        assertThat(ev.get("wsFrameType").asText()).isEqualTo("PING");
+        assertThat(ev.get("wsFrameType").asText()).isEqualTo("OPEN");
+        assertThat(ev.get("metricName").asText()).isEqualTo("websocket_api.connection_opened");
         assertThat(ev.get("messageCount").asInt()).isEqualTo(0);
         assertThat(ev.get("metadata").get("event").asText()).isEqualTo("CONNECTION_OPENED");
         assertThat(ev.get("metadata").get("region").asText()).isEqualTo("us-east-1");
@@ -111,7 +165,8 @@ class AforoWsBillingTest {
         assertThat(ev.get("wsCloseReason").asText()).isEqualTo("NORMAL_CLOSURE");
         assertThat(ev.get("messageCount").asInt()).isEqualTo(3);
         assertThat(ev.get("dataBytes").asLong()).isEqualTo(12L);
-        assertThat(ev.get("durationMs").asLong()).isGreaterThanOrEqualTo(0L);
+        assertThat(ev.get("executionDurationMs").asLong()).isGreaterThanOrEqualTo(0L);
+        assertThat(ev.has("durationMs")).isFalse();
         assertThat(ev.get("metricName").asText()).isEqualTo("websocket_api.connection_closed");
     }
 
@@ -134,7 +189,7 @@ class AforoWsBillingTest {
             boolean isLifecycle = eventField != null
                     && (eventField.asText().equals("CONNECTION_OPENED")
                         || eventField.asText().equals("CONNECTION_CLOSED"));
-            return !isLifecycle && !type.equals("CLOSE") && !type.equals("PING");
+            return !isLifecycle && !type.equals("CLOSE") && !type.equals("OPEN");
         });
         assertThat(frameMessages).isEmpty();
     }

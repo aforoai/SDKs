@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Is this proxy one Aforo manages? Reads KVM key
+     managed_proxy__{apiproxy.name} (Apigee joins the Parameters with "__")
+     from the organization-scoped KVM aforo-metering-config. Every later step
+     runs only when it is "true": flow hooks run for every proxy in the
+     environment, and an unmanaged proxy must not be touched.
+     Apigee X encrypts every KVM and requires a private.* assignTo.
+     continueOnError="true": an unreadable KVM must not fail calls to proxies
+     Aforo does not manage. The price: while the KVM cannot be read, a managed
+     proxy is served as unmanaged (no key check, no metering). -->
+<KeyValueMapOperations name="AforoAccessReadManaged" mapIdentifier="aforo-metering-config" continueOnError="true">
+    <DisplayName>Aforo Access - Is This Proxy Managed</DisplayName>
+    <ExpiryTimeInSecs>60</ExpiryTimeInSecs>
+    <Scope>organization</Scope>
+    <Get assignTo="private.aforo.managedProxy">
+        <Key>
+            <Parameter>managed_proxy</Parameter>
+            <Parameter ref="apiproxy.name"/>
+        </Key>
+    </Get>
+</KeyValueMapOperations>

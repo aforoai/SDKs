@@ -1,148 +1,141 @@
 # Aforo Metering — Azure APIM Policy — User Guide
 
-**Version:** 2.0.0 · **Updated:** 2026-06-29 · **Audience:** engineers who own an Azure API Management instance and need gateway-level metering for Aforo billing.
+**Version:** 2.3.2 · **Updated:** 2026-10-28 · **Audience:** engineers who own an Azure API Management instance and need gateway-level metering for Aforo billing.
+
+> These fragments have not been executed on a live APIM instance in this repository. Follow this guide on a non-production instance first and use APIM request tracing to confirm each step. `scripts/verify-on-apim.sh` automates that for the metering fragment.
 
 ## What you'll build
 
-An APIM API that fires a non-blocking usage event to Aforo after every response, with customer/tenant identity taken from a verified JWT (or the APIM subscription). By the end you'll have made one request through the gateway and confirmed the event landed in Aforo with the correct customer attribution — including a forged-header check proving a spoofed `X-Customer-Id` is ignored.
+An APIM API that sends one usage event to Aforo after every response, without delaying the response, attributed to an Aforo customer and billed against a metric that exists in your Aforo catalog.
+
+There are two ways to configure it. Pick one.
+
+| | A. Context variables | B. Named Values + `aforo-context` |
+|---|---|---|
+| Settings live in | `set-variable` lines in your policy (or the `aforo-metering-config` fragment Aforo's one-click deploy creates) | APIM Named Values |
+| Customer | the APIM subscription id, or `aforo-customer-id` | verified JWT `customer_id` claim, else a subscription-to-customer map |
+| Fragments | `aforo-metering` | `aforo-context` + `aforo-metering` |
+| Use it when | your subscriptions are named after Aforo customer ids, or you set the customer yourself | callers present Aforo JWTs, or subscription ids differ from Aforo customer ids; this is what release 2.1.0 installed |
 
 ## Prerequisites
 
-- An **Azure API Management** instance and an API you can edit policies on.
-- Permission to create **Named Values** and **Policy Fragments** (portal or `az apim`).
-- Aforo `ingestor_url`, `api_key`, `tenant_id`, and (for JWT identity) your Aforo JWKS URI + issuer.
-- Optional: a pricing-service URL (margin-guard) and usage-ingestor quota URL (pre-flight quota).
+- An Azure API Management instance and an API you can edit policies on.
+- Permission to create Named Values and policy fragments.
+- An Aforo API key with scope `usage:ingest`. The tenant comes from the key.
+- The metrics you bill against registered in the Aforo catalog (at least your default metric, e.g. `api_calls`).
 
 ## Step 1 — Create the Named Values
 
-Set the three core values. Mark the API key Secret.
-
 ```bash
 RG="<resource-group>"; APIM="<apim-instance>"
+nv() { az apim nv create -g "$RG" --service-name "$APIM" --named-value-id "$1" --display-name "$1" --value "$2" ${3:+--secret true}; }
 
-az apim nv create -g "$RG" --service-name "$APIM" \
-  --named-value-id aforo-endpoint --display-name aforo-endpoint \
-  --value "https://ingest.aforo.ai/v1/ingest/batch"
-
-az apim nv create -g "$RG" --service-name "$APIM" \
-  --named-value-id aforo-api-key --display-name aforo-api-key \
-  --secret true --value "sk_live_..."
-
-az apim nv create -g "$RG" --service-name "$APIM" \
-  --named-value-id aforo-tenant-id --display-name aforo-tenant-id \
-  --value "tenant_acme"
+nv aforo-endpoint "https://api.aforo.ai/v1/ingest/batch"
+nv aforo-api-key "sk_live_..." secret
+nv aforo-mcp-enabled "false"
+nv aforo-mcp-product-id "none"
 ```
 
-If you'll use JWT-based identity, add `aforo-jwks-uri` and `aforo-jwt-issuer` too.
-
-## Step 2 — Import the metering fragment
+Path B only — `aforo-context` references these five (the first four plus `aforo-mcp-enabled` above). All must exist; use `none` to leave one empty. Values must not contain `"` or `\`.
 
 ```bash
-az apim policy-fragment create -g "$RG" --service-name "$APIM" \
-  --policy-fragment-id aforo-metering \
-  --value @outbound-policy.xml --format xml
+nv aforo-default-metric "api_calls"
+nv aforo-metric-mappings "PREFIX|/sms/v1/send|sms_sent;EXACT|/otp/v1/verify|otp_verified"   # or none
+nv aforo-subscription-customer-map "acme-prod=cust_123;globex=cust_456"                       # or none
+nv aforo-product-type "API"
 ```
 
-> ⚠ The fragment id MUST be `aforo-metering` — `mcp-policy-fragment.xml` and any inline reference `<include-fragment fragment-id="aforo-metering" />` resolve to that id. Use a different id and the include won't resolve.
+For JWT identity add `aforo-jwks-uri` (an OpenID discovery document URL — see the README), `aforo-jwt-issuer`, `aforo-org-service-url` and `aforo-tenant-id` (your Aforo tenant id; a token for any other tenant gets 401 `TENANT_MISMATCH`).
 
-## Step 3 — Add JWT validation (required for JWT-based identity)
+## Step 2 — Import the fragments
 
-Without this, `customerId` falls back to the APIM subscription ID and `tenantId` to the `aforo-tenant-id` Named Value — workable, but per-customer attribution and margin-guard/quota scoping need the JWT.
+Upload each file **from its `<fragment>` line on**, with format `rawxml`. The expressions contain raw `"` and `<`, which format `xml` rejects.
 
 ```bash
-az apim policy-fragment create -g "$RG" --service-name "$APIM" \
-  --policy-fragment-id aforo-jwt-validation \
-  --value @jwt-validation-policy.xml --format xml
+SUB="$(az account show --query id -o tsv)"
+frag() { # id file
+  awk 'f || /^<fragment>/ { f = 1; print }' "$2" > /tmp/aforo-frag.xml
+  jq -n --rawfile v /tmp/aforo-frag.xml '{properties: {format: "rawxml", value: $v}}' > /tmp/aforo-frag.json
+  az rest --method PUT --body @/tmp/aforo-frag.json --headers Content-Type=application/json \
+    --url "https://management.azure.com/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.ApiManagement/service/$APIM/policyFragments/$1?api-version=2022-08-01"
+}
+
+frag aforo-metering outbound-policy.xml
+frag aforo-context context-policy-fragment.xml          # path B
+frag aforo-jwt-validation jwt-validation-policy.xml     # optional
 ```
 
-The fragment runs `validate-jwt` (RS256 via JWKS), returns 401 on failure, and sets `context.Variables["aforo-jwt-payload"]` for downstream policies to read verified claims.
+In the portal: **APIs → Policy fragments → Create**, paste from `<fragment>` on.
 
-> ⚠ `jwt-validation-policy.xml` ships with a synchronous `send-request` jti-blocklist check against `org-service` (Option A — real-time revocation, ~5–10ms). If org-service isn't reachable from APIM, comment that block out to use Option B (accept the validate-jwt cache TTL window). It is `ignore-error="true"` and fail-open, so a timeout won't 401 a valid token.
+## Step 3 — Wire the fragments into the API policy
 
-## Step 4 — Wire fragments into the API policy
-
-Edit the API's policy. Order matters: JWT validation in `<inbound>` runs before anything that reads identity; metering runs in `<outbound>`.
+Path A:
 
 ```xml
 <policies>
-    <inbound>
-        <base />
-        <include-fragment fragment-id="aforo-jwt-validation" />
-        <!-- optional pre-flight gates (each gated by its *-enabled Named Value): -->
-        <!-- <include-fragment fragment-id="aforo-margin-guard" /> -->
-        <!-- <include-fragment fragment-id="aforo-preflight" /> -->
-    </inbound>
+    <inbound><base /></inbound>
     <backend><base /></backend>
     <outbound>
         <base />
+        <set-variable name="aforo-default-metric" value="api_calls" />
+        <set-variable name="aforo-metric-mappings" value="PREFIX|/sms/v1/send|sms_sent" />
         <include-fragment fragment-id="aforo-metering" />
-        <!-- <include-fragment fragment-id="aforo-compound-metering" /> -->
     </outbound>
     <on-error><base /></on-error>
 </policies>
 ```
 
-> ⚠ Margin-guard reads its identity from `context.Variables["aforo-jwt-payload"]`. If you include `aforo-margin-guard` but NOT `aforo-jwt-validation` before it, it has no JWT payload, `mgCustomerId` falls back to the subscription ID, and if that's also empty the check is skipped (treated as anonymous) — it never reads a request header.
+Path B:
 
-## Step 5 — Enable MCP metering (only if you front an MCP server)
-
-Set the optional Named Values, then the same `aforo-metering` fragment branches on the JSON-RPC body automatically:
-
-```bash
-az apim nv create -g "$RG" --service-name "$APIM" \
-  --named-value-id aforo-mcp-enabled --display-name aforo-mcp-enabled --value "true"
-az apim nv create -g "$RG" --service-name "$APIM" \
-  --named-value-id aforo-mcp-product-id --display-name aforo-mcp-product-id --value "prod_mcp_search"
+```xml
+<policies>
+    <inbound>
+        <base />
+        <include-fragment fragment-id="aforo-jwt-validation" />   <!-- optional; before aforo-context -->
+        <include-fragment fragment-id="aforo-context" />
+    </inbound>
+    <backend><base /></backend>
+    <outbound>
+        <base />
+        <include-fragment fragment-id="aforo-metering" />
+    </outbound>
+    <on-error><base /></on-error>
+</policies>
 ```
 
-A POST whose body contains `tools/call` now emits `metricName: "mcp_server.tool_invocations"` with `toolName`, `agentId`, and `sessionId`.
+A fragment holds statements only, so where it runs is decided by where you include it.
 
-> ⚠ `agentId` comes only from the request body's `params._meta.agent_id` — never from an `X-Agent-Id` header (that fallback was removed in v2.0.0). If your clients don't put the agent in `_meta`, `agentId` is empty.
-
-## Step 6 — Send a request and verify it landed
-
-Make a normal request through the gateway, including W3C trace headers so you can confirm capture:
+## Step 4 — Send a request and check the event
 
 ```bash
-curl -X GET "https://<apim-instance>.azure-api.net/v1/accounts/123" \
-  -H "Ocp-Apim-Subscription-Key: <subscription-key>" \
-  -H "Authorization: Bearer <valid-aforo-jwt>" \
-  -H "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" \
-  -H "tracestate: congo=t61rcWkgMzE"
+curl "https://<apim-instance>.azure-api.net/sms/v1/send" -X POST \
+  -H "Ocp-Apim-Subscription-Key: <subscription-key>"
 ```
 
-In Aforo's usage/ingestion view, filter to your tenant and confirm one event with:
-`metricName = "GET /v1/accounts/123"`, `httpMethod = GET`, `statusCode = 200`, `trace.traceparent = 00-4bf9...`, and `customerId` equal to the JWT's `customer_id` (or the subscription ID if you skipped Step 3).
+In Aforo, confirm one event with the expected `customerId`, `metricName = sms_sent`, `productType = API`, `executionStatus = SUCCESS` and `idempotencyKey` = the APIM request id. In the APIM trace, the outbound `send-one-way-request` carries `X-API-Key` and no `Authorization` or `X-Tenant-Id` header.
 
-Now the security check — a forged identity header MUST be ignored:
+Then the negative cases:
 
-```bash
-curl -X GET "https://<apim-instance>.azure-api.net/v1/accounts/123" \
-  -H "Ocp-Apim-Subscription-Key: <subscription-key>" \
-  -H "Authorization: Bearer <jwt-for-customerA>" \
-  -H "X-Customer-Id: customerB"
-```
-
-> ⚠ Expected: the event attributes usage to **customerA** (the JWT value), not customerB (the header). If you see customerB, JWT validation didn't run before metering — recheck Step 4 ordering.
-
-## Configuration reference
-
-See the README's Configuration table for the full Named Value list. Core (always needed): `aforo-endpoint`, `aforo-api-key`, `aforo-tenant-id`. JWT identity: `aforo-jwks-uri`, `aforo-jwt-issuer`. MCP: `aforo-mcp-enabled`, `aforo-mcp-product-id`. Margin-guard: `aforo-margin-guard-enabled`, `aforo-margin-guard-url`. Quota: `aforo-preflight-enabled`, `aforo-preflight-url`, `aforo-preflight-fallback`. Compound: `aforo-ingestor-url`, `aforo-compound-enabled`, `aforo-compound-extraction-paths`, `aforo-compound-dimension-paths`.
+- `curl -X OPTIONS …` → no event (trace: `Not metered: OPTIONS preflight`).
+- A call that returns 401, 403 or 429, or a call to `/health` → no event (default exclusions).
+- Path B: a subscription that is not in `aforo-subscription-customer-map`, without an Aforo JWT → no event (trace: `Not metered: no Aforo customer`).
+- `-H "X-Customer-Id: someone-else"` → ignored; attribution does not change.
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| No event in Aforo, request succeeded | `send-one-way-request` is fire-and-forget; `aforo-endpoint` unreachable from APIM, or wrong URL/key. | Verify `aforo-endpoint` + `aforo-api-key` Named Values. There's no retry on the gateway — confirm APIM's outbound network reaches the ingestor. |
-| Event lands but `customerId` is the subscription ID, not the JWT customer | `aforo-jwt-validation` isn't running before metering, so there's no `aforo-jwt-payload`. | Include `aforo-jwt-validation` in `<inbound>` before the API resolves identity (Step 4). |
-| Forged `X-Customer-Id` shows up as the customer | Same as above — without the JWT payload, attribution falls back to the subscription, but a header should never win. If a header value appears, you're running a pre-v2.0.0 fragment. | Re-import the current `outbound-policy.xml` / `margin-guard-policy-fragment.xml`. v2.0.0 never reads identity headers. |
-| 401 on every request after adding JWT validation | Wrong `aforo-jwks-uri`/`aforo-jwt-issuer`, or the token isn't RS256/expired. | Confirm the JWKS URL serves your Aforo org's keys and `aforo-jwt-issuer` matches the token's `iss`. |
-| MCP requests metered as standard API | `aforo-mcp-enabled` not `"true"`, or the body doesn't contain `tools/call` / isn't reachable (`preserveContent`). | Set `aforo-mcp-enabled = "true"` and confirm the request is a POST with a JSON-RPC `tools/call` body. |
-| Margin-guard returns 429 on a public endpoint | The endpoint resolved a customer + tenant and the quick-check blocked it. | Public/anonymous endpoints should not carry a JWT or subscription that resolves an identity; if `mgCustomerId`/`mgTenantId` are empty the check is skipped by design. |
-| jti revocation not taking effect | You're on Option B (cache-window) or the org-service blocklist call is failing fail-open. | Keep the synchronous `send-request` block (Option A) and ensure org-service `/internal/v1/auth/token-check` is reachable from APIM. |
+| Policy save fails: named value not found | A referenced Named Value doesn't exist. | `aforo-metering` needs four, `aforo-context` five, `aforo-jwt-validation` five (2.3.0 adds `aforo-api-key` and `aforo-tenant-id`), `aforo-margin-guard` one (`aforo-api-key`). Create the missing one (`none` for empty). |
+| Fragment upload fails with an XML parse error | Uploaded with format `xml`. | Use `rawxml`. |
+| No events at all | No customer resolves. | Path A: the request needs an APIM subscription, or set `aforo-customer-id`. Path B: check the JWT `customer_id` claim or add the subscription id to the map. |
+| The trace shows the send, Aforo shows nothing | The ingestor rejected the event: unknown metric, unknown customer, or a key without `usage:ingest`. `send-one-way-request` discards the response. | Set `aforo-default-metric` to a catalog metric; check the customer exists. |
+| 401 `TENANT_MISMATCH` | The token's `tenant_id` claim is missing or is not `aforo-tenant-id`. | Set `aforo-tenant-id` to your Aforo tenant id; tokens for another tenant are refused on purpose. |
+| 401 on every request after adding JWT validation | `aforo-jwks-uri` is a bare JWKS URL (`openid-config` needs a discovery document), or the issuer does not match. | See the README, "What this does not cover". |
+| MCP requests metered as standard API | `aforo-mcp-enabled` is not `true`, or the request body was not captured in inbound. | Include `aforo-context`, or add the `aforo-mcp-body` line from the README. |
 
 ## What this guide does NOT cover
 
-- **APIM provisioning and networking** (VNet integration, the route from APIM to your ingestor/pricing-service). That's your Azure setup.
-- **Writing the Aforo product / rate plan** that consumes these events — configure that in the Aforo console.
-- **Compound-metering extraction-path design.** The fragment runs whatever JSONPath→metric map you put in `aforo-compound-extraction-paths`; designing that map for your response shape is on you.
+- APIM provisioning and networking (reachability of the ingestor, org-service and pricing-service from APIM).
+- Durable delivery. The default direct send is fire-and-forget; Event Hub delivery (README, "Event Hub delivery", and `eventhub-forwarder/README.md`) is the durable option.
+- Fetching metric mappings from the catalog automatically.
+- The optional preflight, margin-guard and compound fragments: see the README, "Optional fragments", and the CHANGELOG for the lines a 2.1.0 install needs.

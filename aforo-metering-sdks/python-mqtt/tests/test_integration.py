@@ -173,6 +173,13 @@ def fixture():
     }
 
     billing.shutdown()
+    # flush_count=1 starts one flush thread per event, and shutdown() does not
+    # wait for them. Let any still in flight finish while the capture server is
+    # up: otherwise one fails, backs off, and retries into the next test's
+    # patched urlopen.
+    for t in threading.enumerate():
+        if t is not threading.current_thread() and getattr(t, "_target", None) == billing._flush:
+            t.join(timeout=5)
     broker.stop()
     capture_server.shutdown()
     capture_thread.join(timeout=2)
@@ -268,7 +275,9 @@ def test_authorization_and_tenant_headers_reach_ingestor(fixture):
         assert fixture["captured"], "ingestor was never called"
 
         headers = fixture["captured"][0]["headers"]
-        assert headers.get("Authorization") == "Bearer sk_int_mqtt"
+        lower = {k.lower(): v for k, v in headers.items()}
+        assert lower.get("x-api-key") == "sk_int_mqtt"
+        assert "authorization" not in lower
         assert headers.get("X-Tenant-Id") == "tenant-int-mqtt"
     finally:
         client.loop_stop()

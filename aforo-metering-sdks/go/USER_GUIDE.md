@@ -1,179 +1,182 @@
 # metering-go — User Guide
 
-**Version:** 1.0.0 · **Updated:** 2026-06-29 · **Audience:** Go engineers adding usage metering to an HTTP service or any code path that knows when a billable event happened.
+**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Go engineers adding usage metering to an HTTP service or any code path that knows when a billable event happened.
 
 ## What you'll build
 
-A Go service that ships one usage event per HTTP request (or per manual `Track` call) to Aforo's ingestor, batched and retried in the background. By the end you'll have sent a real event and confirmed it landed in Aforo.
+A Go service that sends one usage event per HTTP request (or per `Track` call) to Aforo's ingestor, batched and retried in the background, and that sends what is left when it shuts down. By the end you'll have sent a real event and confirmed it landed in Aforo.
 
 ## Prerequisites
 
-- Go 1.21+ (the module declares `go 1.21`).
-- An Aforo API key (`AFORO_API_KEY`) whose scope already carries your `tenant_id`. The SDK does **not** take a tenant id — it rides on the key.
-- A customer identifier per request. For the middleware path that's an inbound `X-Customer-Id` header your gateway/auth layer has already set; for the direct path it's whatever id you pass to `Track`.
-- The ingestor base URL — `https://ingest.aforo.ai` in production.
+- Go 1.21 or later.
+- An Aforo API key (`AFORO_API_KEY`). The tenant comes from the key; the SDK takes no tenant id.
+- A way to know the Aforo customer for a request from your own authentication (session, JWT subject, API-key lookup).
+- The ingestor base URL — `https://api.aforo.ai` in production.
 
-## Step 1 — Add the module from source
-
-`go get github.com/aforoai/SDKs/aforo-metering-sdks/go` does not resolve yet (the module proxy isn't live). Clone the distribution repo and point at it with a `replace`:
+## Step 1 — Add the module
 
 ```bash
-git clone https://github.com/aforoai/SDKs.git
+go get github.com/aforoai/SDKs/aforo-metering-sdks/go/v2
 ```
 
-In your service's `go.mod`:
+Until the `aforo-metering-sdks/go/v2.0.0` tag exists, clone github.com/aforoai/SDKs and point at it from your `go.mod`:
 
 ```go
-require github.com/aforoai/SDKs/aforo-metering-sdks/go v1.0.0
+require github.com/aforoai/SDKs/aforo-metering-sdks/go/v2 v2.0.0
 
-replace github.com/aforoai/SDKs/aforo-metering-sdks/go => ../SDKs/aforo-metering-sdks/go
+replace github.com/aforoai/SDKs/aforo-metering-sdks/go/v2 => ../SDKs/aforo-metering-sdks/go
 ```
 
-```bash
-go mod tidy
-```
+> ⚠ The `replace` target is a filesystem path relative to your `go.mod`. The package uses the standard library only.
 
-> ⚠ The `replace` target is a filesystem path relative to YOUR `go.mod`. Adjust `../SDKs/...` to wherever you cloned. There are no third-party deps to fetch — the package is standard-library only.
-
-## Step 2 — Create a client and wire shutdown
+## Step 2 — Create one client and close it on shutdown
 
 ```go
 import (
+	"context"
+	"log"
 	"os"
+	"time"
 
-	metering "github.com/aforoai/SDKs/aforo-metering-sdks/go"
+	metering "github.com/aforoai/SDKs/aforo-metering-sdks/go/v2"
 )
 
-client := metering.NewClient(metering.Options{
+client, err := metering.NewClient(metering.Options{
 	APIKey:  os.Getenv("AFORO_API_KEY"),
-	BaseURL: "https://ingest.aforo.ai",
+	BaseURL: "https://api.aforo.ai",
 })
-defer client.Close()
+if err != nil {
+	log.Fatal(err) // blank key, or a BaseURL that is not https
+}
+
+// In your shutdown path (after the HTTP server stopped accepting requests):
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+if err := client.Close(ctx); err != nil {
+	log.Printf("aforo: %v", err)
+}
 ```
 
-> ⚠ `Close()` is the only thing that flushes the buffer on the way out. If you skip it (or your process is `kill -9`'d), in-flight events never leave the buffer. Wire `Close()` into your real shutdown path (signal handler / `defer` in `main`), not just a test.
+> ⚠ `Close` sends what is queued. It is bounded: it stops at the earlier of `ctx`'s deadline and `Options.ShutdownTimeout` (5 s), reports events still queued to `OnDrop` with reason `shutdown`, and returns an error wrapping `metering.ErrShutdownIncomplete`. The library installs no signal handler — call `Close` from yours.
 
 ## Step 3 — Meter one event per request with the middleware
 
-If you want every HTTP request metered without editing handlers, wrap your router:
-
 ```go
-import "net/http"
+mw, err := metering.NewMiddleware(client, metering.MiddlewareOptions{
+	MetricName: "api_calls", // must exist in your Aforo catalog
+	CustomerResolver: func(r *http.Request) string {
+		return customerFromSession(r) // your authenticated Aforo customer id
+	},
+})
+if err != nil {
+	log.Fatal(err)
+}
 
 mux := http.NewServeMux()
 mux.HandleFunc("/v1/widgets", widgetsHandler)
-
-wrapped := metering.HTTPMiddleware(mux, metering.MiddlewareOptions{
-	APIKey:  os.Getenv("AFORO_API_KEY"),
-	BaseURL: "https://ingest.aforo.ai",
-})
-http.ListenAndServe(":8080", wrapped)
+http.ListenAndServe(":8080", mw(mux))
 ```
 
-What the middleware does, after the response is written:
+Chi: `r.Use(mw)` (or build it with `metering.ChiMiddleware(client, opts)`). Every route shares the client you passed in.
 
-- Resolves the customer id from `X-Customer-Id`, then `X-Api-Key`, then your `CustomerIDHeader` if set (a non-empty `CustomerIDHeader` value wins).
-- Skips the request if the path matches an `ExcludePaths` prefix (defaults: `/health`, `/ready`, `/metrics`, `/favicon.ico`) or the status matches `ExcludeStatusCode`.
-- Skips the request if no customer id resolved.
-- Records `MetricName` as `"<METHOD> <normalized-path>"`, where numeric / UUID / 24-hex Mongo-id segments collapse to `:id` (e.g. `GET /v1/widgets/8f3c… ` → `GET /v1/widgets/:id`). A `vN` version segment is left intact.
+What the middleware does after the response is written:
 
-> ⚠ The customer id is read straight from a request header. Only trust that header behind your own auth/gateway. `HTTPMiddleware` creates and owns its own client internally — you don't pass it one; tune it via `ClientOptions`.
+- Skips `OPTIONS` requests, paths under `ExcludePaths` (defaults: `/health`, `/ready`, `/metrics`, `/favicon.ico`) and statuses in `ExcludeStatusCode`.
+- Asks `CustomerResolver` for the customer. An empty answer is not billed: the event is dropped as `invalid` and counted in `DroppedCount()`. The request is never blocked.
+- Records `MetricNameFunc(r)` if set and non-empty, otherwise `MetricName` (default `api_calls`), with `productType`, `endpointPath` (normalized, no query string), `httpMethod`, `statusCode` and `responseTimeMs`.
 
-Chi users use the adapter instead:
+> ⚠ `NewMiddleware` refuses to build without `CustomerResolver` unless you set `TrustCustomerHeader: true`. That option bills the customer named in the `X-Customer-Id` header (or `CustomerIDHeader`). Callers of your API control that header, so use it only when a trusted proxy sets it and removes any value the client sent.
 
-```go
-r.Use(metering.ChiMiddleware(metering.MiddlewareOptions{APIKey: os.Getenv("AFORO_API_KEY")}))
-```
+> ⚠ The metric must exist in your tenant's Aforo catalog. The ingestor rejects an unknown metric for the whole batch.
+
+The middleware's response writer passes `Flush` and `Hijack` through and implements `Unwrap`, so server-sent events and WebSocket upgrades behind it keep working.
 
 ## Step 4 — Or meter explicitly with Track
 
-When metering isn't one-per-request — a background job, a batch operation, a non-HTTP trigger — call `Track` directly:
-
 ```go
-client.Track(metering.TrackEvent{
+if err := client.Track(metering.TrackEvent{
 	CustomerID: "cust_acme_001",
 	MetricName: "report_generated",
 	Quantity:   1,
-	Metadata: map[string]any{
-		"format": "pdf",
-	},
-})
+	Metadata:   map[string]any{"format": "pdf"},
+}); err != nil {
+	log.Printf("aforo: %v", err) // ErrInvalidEvent or ErrClientClosed
+}
 ```
 
-Field defaults applied inside `Track`:
+Inside `Track`: a `Quantity` of `0` becomes `1`; an empty `OccurredAt` becomes now (UTC), a set one must be RFC 3339; `IdempotencyKey` defaults to a new random UUID. `Track` returns an error wrapping `metering.ErrInvalidEvent` (and queues nothing) for a blank `CustomerID`/`MetricName`, a negative/NaN/Inf `Quantity`, an unparseable `OccurredAt` or a field over the ingestor's limit.
 
-- `Quantity` of `0` becomes `1`.
-- `OccurredAt` is set to now (`RFC3339Nano`, UTC) if empty.
-- `IdempotencyKey` is auto-derived (SHA-256 of `customerID:metricName:quantity:occurredAt`, first 32 hex chars) if empty.
+> **Idempotency keys.** The key is minted once, when `Track` queues the event, and every resend carries it, so a retried or requeued batch is deduplicated by the ingestor. To deduplicate a logical event you replay yourself, set `IdempotencyKey`.
 
-> ⚠ The auto idempotency key is deterministic over those four fields. Two `Track` calls with the same customer, metric, quantity, AND timestamp string produce the same key and dedupe downstream. If you want each call counted separately, set a distinct `OccurredAt` or pass your own `IdempotencyKey`.
-
-## Step 5 — Force a flush and verify it landed
-
-The buffer flushes on its own (every `FlushInterval`, or immediately when it hits `FlushCount`), but to see an event now, flush explicitly and read the result:
+## Step 5 — Flush and verify it landed
 
 ```go
-res := client.Flush()
-log.Printf("aforo flush: sent=%d failed=%d", res.Sent, res.Failed)
+res, err := client.Flush(ctx)
+log.Printf("aforo flush: sent=%d rejected=%d pending=%d err=%v", res.Sent, res.Rejected, res.Pending, err)
 ```
 
-A clean run prints `failed=0`. Then confirm server-side:
+A clean run prints `rejected=0 pending=0 err=<nil>`. Then open the customer in the Aforo console and look at recent usage for the metric.
 
-- In the Aforo console, open the customer (`cust_acme_001`) and look at recent usage events for the metric you sent.
-- Or query the ingestion API for that tenant + metric over the last few minutes.
-
-The wire call the SDK makes:
+The wire call:
 
 ```
-POST https://ingest.aforo.ai/v1/ingest/batch
-Authorization: Bearer <AFORO_API_KEY>
+POST https://api.aforo.ai/v1/ingest/batch
+X-API-Key: <AFORO_API_KEY>
 Content-Type: application/json
+User-Agent: aforo-go/2.0.0
 
-{"events":[{"customerId":"cust_acme_001","metricName":"report_generated","quantity":1,"idempotencyKey":"…","occurredAt":"2026-06-29T…Z","metadata":{"format":"pdf"}}]}
+{"events":[{"customerId":"cust_acme_001","metricName":"report_generated","quantity":1,"idempotencyKey":"…","occurredAt":"2026-10-26T…Z","productType":"API","metadata":{"format":"pdf"}}]}
 ```
 
-> ⚠ `FlushResult.Failed > 0` means a batch exhausted retries. A `4xx` other than `408`/`429` (bad key, malformed payload, unknown metric) is dropped immediately without retry — check the key, the metric name, and that the tenant on the key owns that metric.
+> ⚠ `err == metering.ErrIngestUnavailable` means the ingestor could not be reached (or refused the key) after the retries. Nothing is lost: the events stay queued and go out when it recovers. `Rejected > 0` means the ingestor refused events (bad payload, unknown metric); they were reported to `OnDrop` with reason `rejected`.
 
 ## Configuration reference
 
-`Options`:
-
 | Option | Type | Default | What it does |
 |---|---|---|---|
-| `APIKey` | `string` | — (required) | `Authorization: Bearer <APIKey>`. |
-| `BaseURL` | `string` | `https://ingest.aforo.ai` | Ingestor base; `/v1/ingest/batch` is appended. |
-| `FlushCount` | `int` | `50` | Flush threshold + per-batch drain size. |
-| `FlushInterval` | `time.Duration` | `5s` | Background flush cadence. |
-| `MaxQueueSize` | `int` | `10000` | Ring-buffer capacity; oldest event dropped when full. |
-| `MaxRetries` | `int` | `3` | Retry attempts per batch. |
-| `RetryBase` | `time.Duration` | `1s` | Backoff base (`RetryBase × 2^attempt`). |
-| `Timeout` | `time.Duration` | `10s` | Per-request HTTP timeout. |
-| `ShutdownTimeout` | `time.Duration` | `5s` | Reserved for shutdown coordination. |
+| `APIKey` | `string` | — (required) | Sent only as `X-API-Key`; never logged or printed. |
+| `BaseURL` | `string` | `https://api.aforo.ai` | Must be https (http only for localhost or with `AllowInsecureHTTP`). |
+| `ProductType` | `string` | `API` | Top-level `productType`. |
+| `FlushCount` | `int` | `500` | Events per request (max 1000). |
+| `FlushInterval` | `time.Duration` | `5s` | Background send interval. |
+| `MaxQueueSize` | `int` | `10000` | Queue capacity; when full the oldest event is dropped. |
+| `MaxRetries` | `int` | `3` | Retries per batch; negative disables. |
+| `RetryBase` | `time.Duration` | `500ms` | Full-jitter backoff base (cap 30 s; `Retry-After` honoured up to 60 s). |
+| `Timeout` | `time.Duration` | `10s` | Total deadline per request. |
+| `ShutdownTimeout` | `time.Duration` | `5s` | How long `Close` keeps sending. |
+| `HTTPClient` | `*http.Client` | one pooled client | Your own client; you keep ownership. |
+| `OnDrop` | `func([]TrackEvent, DropReason)` | `nil` | Events the SDK gives up on. |
 
-`MiddlewareOptions`:
+## Dropped events
 
-| Option | Type | Default | What it does |
-|---|---|---|---|
-| `APIKey` | `string` | — (required) | API key for the internal client. |
-| `BaseURL` | `string` | `https://ingest.aforo.ai` | Ingestor base for the internal client. |
-| `ExcludePaths` | `[]string` | `["/health","/ready","/metrics","/favicon.ico"]` | Path prefixes to skip; your value replaces the defaults. |
-| `ExcludeStatusCode` | `[]int` | none | Status codes to skip. |
-| `CustomerIDHeader` | `string` | `X-Customer-Id` then `X-Api-Key` | Extra header for the customer id; non-empty value wins. |
-| `ClientOptions` | `*Options` | nil | Full client tuning; `APIKey`/`BaseURL` above override it. |
+| `DropReason` | When |
+|---|---|
+| `overflow` | The queue was full (for example during a long outage); the oldest event was evicted. |
+| `rejected` | The ingestor refused the event. |
+| `invalid` | `Track` refused the event, or the middleware resolved no customer. |
+| `shutdown` | Still queued at `Close`'s deadline. |
+| `closed` | `Track` after `Close`. |
+
+Every dropped event keeps its idempotency key; passing it to `Track` again after recovery cannot bill twice. Panics in `OnDrop` are recovered and logged.
+
+## Execution status (outcome-based pricing)
+
+`TrackEvent.ExecutionStatus` is optional. Accepted values: `SUCCESS`, `PARTIAL`, `TIMEOUT`, `ERROR`, `VALIDATION_FAILED`, `FAILED`, `FAILURE`, `CANCELLED`, `PENDING`, `BLOCKED`, `HITL_REQUIRED`. Any other value is WARN-logged and left off; the event is still sent. The middleware does not set a status.
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `Track` returns `ErrClientClosed` | `Close()` already ran on this client | Don't reuse a closed client; create a new one, or move `Close()` to actual shutdown. |
-| Events never arrive, no error | Process exited before a flush and `Close()` wasn't called | Add `defer client.Close()` / call it in your signal handler. The buffer is in-memory only. |
-| `Flush()` returns `Failed > 0` repeatedly | Bad API key, wrong `BaseURL`, or `4xx` from the ingestor | Verify `AFORO_API_KEY`, confirm `BaseURL`, and check the metric exists for the key's tenant. Non-`408`/`429` `4xx` is not retried. |
-| Middleware records nothing for some requests | No resolvable customer id, excluded path prefix, or excluded status | Confirm `X-Customer-Id` (or your `CustomerIDHeader`) is set upstream and the path/status isn't in the exclude lists. |
-| Two identical calls show as one event | Auto idempotency key collided (same customer/metric/quantity/`OccurredAt`) | Vary `OccurredAt` or pass a distinct `IdempotencyKey`. |
-| Older events seem missing under load | Buffer hit `MaxQueueSize` and dropped oldest entries | Raise `MaxQueueSize`, lower `FlushInterval`, or lower `FlushCount` so flushes drain sooner. |
+| `NewClient` returns an error about https | `BaseURL` is `http://` on a remote host | Use `https://`; for a local test server use `localhost`/`127.0.0.1`. |
+| `NewMiddleware` returns `ErrNoCustomerResolver` | Neither `CustomerResolver` nor `TrustCustomerHeader` set | Add a resolver that returns your authenticated customer id. |
+| `DroppedCount()` grows with reason `invalid` from the middleware | Your resolver returned `""` for some requests | Check those requests are authenticated; unauthenticated calls are not billed. |
+| ERROR log "the API key is wrong or revoked" | `401`/`403` from the ingestor | Fix `AFORO_API_KEY`. The queued events are kept and sent once the key works. |
+| `Flush` returns `ErrIngestUnavailable` | Ingestor unreachable | Nothing to do in code; events are kept. Check network/egress to `BaseURL`. |
+| `Close` returns `ErrShutdownIncomplete` | The ingestor was slow or down during shutdown | Raise `ShutdownTimeout`, or persist the events your `OnDrop` receives with reason `shutdown`. |
+| Two identical calls show as one event | Same explicit `IdempotencyKey` | Leave it empty or pass distinct keys. |
 
 ## What this guide does NOT cover
 
-- **Defining metrics / rate plans in Aforo.** This guide gets events to the ingestor; modeling what those events bill is done in the Aforo console.
-- **Customer-id extraction from JWTs/sessions.** You decode your auth and feed the id to the middleware header or to `Track` — the SDK only reads what you give it.
-- **Non-HTTP protocol metering.** GraphQL / gRPC / WebSocket / MQTT have dedicated sibling SDKs (`go-graphql`, `go-grpc`, `go-ws`, `go-mqtt`).
+- **Defining metrics / rate plans.** Done in the Aforo console.
+- **Customer identity.** You decode your auth; the SDK only calls your resolver.
+- **Non-HTTP protocols.** Use `go-graphql`, `go-grpc`, `go-ws` or `go-mqtt`.

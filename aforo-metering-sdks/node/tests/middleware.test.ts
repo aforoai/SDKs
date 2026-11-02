@@ -1,5 +1,6 @@
 import { expressMiddleware } from '../src/middleware/express';
 import { EventEmitter } from 'events';
+import { bodyJson } from './helpers/request-body';
 
 // Mock fetch globally
 const mockFetch = jest.fn();
@@ -41,6 +42,8 @@ describe('expressMiddleware', () => {
   it('should capture events after response finishes', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
       baseUrl: 'https://ingest.test.aforo.ai',
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
     });
@@ -62,14 +65,18 @@ describe('expressMiddleware', () => {
     await new Promise((r) => setTimeout(r, 100));
 
     expect(mockFetch).toHaveBeenCalled();
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     expect(body.events[0].customerId).toBe('cust_123');
-    expect(body.events[0].metricName).toMatch(/^GET \/api\/v1\/data$/);
+    // Default metric is a catalog metric, not a route-shaped name the ingestor rejects
+    expect(body.events[0].metricName).toBe('api_calls');
   });
 
-  it('should use route template for path normalization', async () => {
+  it('should use a fixed metricName when configured', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
+      metricName: 'sms_sent',
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
     });
 
@@ -86,13 +93,38 @@ describe('expressMiddleware', () => {
 
     await new Promise((r) => setTimeout(r, 100));
 
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
-    expect(body.events[0].metricName).toBe('GET /users/:id');
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
+    expect(body.events[0].metricName).toBe('sms_sent');
+  });
+
+  it('should not meter CORS preflight (OPTIONS) requests', async () => {
+    const mw = expressMiddleware({
+      apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
+      clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
+    });
+
+    const { req, res } = createMockReqRes({
+      method: 'OPTIONS',
+      url: '/api/data',
+      headers: { 'x-customer-id': 'cust_1', 'access-control-request-method': 'POST' },
+    });
+
+    const next = jest.fn();
+    mw(req, res, next);
+    expect(next).toHaveBeenCalled();
+    res.emit('finish');
+
+    await new Promise((r) => setTimeout(r, 50));
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it('should exclude health check paths', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
     });
 
@@ -112,6 +144,8 @@ describe('expressMiddleware', () => {
   it('should extract customer ID from x-customer-id header', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
     });
 
@@ -126,13 +160,15 @@ describe('expressMiddleware', () => {
 
     await new Promise((r) => setTimeout(r, 100));
 
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     expect(body.events[0].customerId).toBe('header-cust-456');
   });
 
-  it('should extract customer ID from x-api-key header as fallback', async () => {
+  it('should never use the caller\'s x-api-key header as the customer ID', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
     });
 
@@ -145,15 +181,16 @@ describe('expressMiddleware', () => {
     mw(req, res, next);
     res.emit('finish');
 
-    await new Promise((r) => setTimeout(r, 100));
-
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
-    expect(body.events[0].customerId).toBe('apikey-789');
+    await new Promise((r) => setTimeout(r, 50));
+    // No customer resolvable -> not metered (and the secret never leaves the process)
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it('should skip when no customer ID can be resolved', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
     });
 
@@ -173,6 +210,8 @@ describe('expressMiddleware', () => {
   it('should support custom metric name function', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
       metricName: (req: any) => `custom.${req.method.toLowerCase()}`,
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
     });
@@ -189,13 +228,15 @@ describe('expressMiddleware', () => {
 
     await new Promise((r) => setTimeout(r, 100));
 
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     expect(body.events[0].metricName).toBe('custom.post');
   });
 
   it('should support custom quantity function', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
       quantity: (_req: any, _res: any) => 42,
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
     });
@@ -211,13 +252,15 @@ describe('expressMiddleware', () => {
 
     await new Promise((r) => setTimeout(r, 100));
 
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const body = bodyJson(mockFetch.mock.calls[0][1]);
     expect(body.events[0].quantity).toBe(42);
   });
 
   it('should exclude specified status codes', async () => {
     const mw = expressMiddleware({
       apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
       excludeStatusCodes: [401, 403],
       clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
     });
@@ -232,6 +275,56 @@ describe('expressMiddleware', () => {
     mw(req, res, next);
     res.emit('finish');
 
+    await new Promise((r) => setTimeout(r, 50));
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('sends productType and top-level HTTP fields', async () => {
+    const mw = expressMiddleware({
+      apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
+      productType: 'agentic_api',
+      clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
+    });
+    const { req, res } = createMockReqRes({ method: 'POST', url: '/api/items?page=2', statusCode: 201, user: { id: 'cust_1' } });
+    mw(req, res, jest.fn());
+    res.emit('finish');
+    await new Promise((r) => setTimeout(r, 100));
+
+    const ev = bodyJson(mockFetch.mock.calls[0][1]).events[0];
+    expect(ev).toMatchObject({ productType: 'AGENTIC_API', endpointPath: '/api/items', httpMethod: 'POST', statusCode: 201 });
+    expect(typeof ev.responseTimeMs).toBe('number');
+  });
+
+  it('defaults productType to API and caps endpointPath at 512 chars', async () => {
+    const mw = expressMiddleware({
+      apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
+      clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
+    });
+    const { req, res } = createMockReqRes({ url: '/' + 'a'.repeat(600), user: { id: 'cust_1' } });
+    mw(req, res, jest.fn());
+    res.emit('finish');
+    await new Promise((r) => setTimeout(r, 100));
+
+    const ev = bodyJson(mockFetch.mock.calls[0][1]).events[0];
+    expect(ev.productType).toBe('API');
+    expect(ev.endpointPath).toHaveLength(512);
+  });
+
+  it('skips requests whose quantity is <= 0', async () => {
+    const mw = expressMiddleware({
+      apiKey: 'test-key',
+      customerResolver: (req: any) => req.user?.id,
+      trustCustomerHeader: true,
+      quantity: 0,
+      clientOptions: { flushCount: 1, flushInterval: 60_000, maxRetries: 0 },
+    });
+    const { req, res } = createMockReqRes({ user: { id: 'cust_1' } });
+    mw(req, res, jest.fn());
+    res.emit('finish');
     await new Promise((r) => setTimeout(r, 50));
     expect(mockFetch).not.toHaveBeenCalled();
   });

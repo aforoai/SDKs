@@ -65,7 +65,7 @@ class AforoGraphQlIntegrationTest {
         // Capture HTTP server
         captureServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         captureServer.createContext("/", (HttpExchange ex) -> {
-            byte[] body = ex.getRequestBody().readAllBytes();
+            byte[] body = com.aforo.testsupport.RequestBodies.read(ex);
             synchronized (capturedBodies) {
                 try {
                     if (body.length > 0) {
@@ -85,7 +85,7 @@ class AforoGraphQlIntegrationTest {
         captureServer.start();
         capturePort = captureServer.getAddress().getPort();
 
-        billing = AforoGraphQlBilling.newBuilder()
+        billing = AforoGraphQlBilling.newBuilder().trustCustomerHeader(true)
                 .tenantId("tenant-int-gql")
                 .productId("prod-int-gql")
                 .apiKey("sk_int_gql")
@@ -187,6 +187,7 @@ class AforoGraphQlIntegrationTest {
         assertThat(ev).containsEntry("customerId", "cust_query_001");
         assertThat(((Number) ev.get("gqlComplexity")).intValue()).isGreaterThan(0);
         assertThat(ev).containsEntry("gqlHasErrors", Boolean.FALSE);
+        assertThat(ev).containsEntry("executionStatus", "SUCCESS");
     }
 
     @Test
@@ -229,6 +230,9 @@ class AforoGraphQlIntegrationTest {
         assertThat(events).isNotEmpty();
         Map<String, Object> ev = events.get(0);
         assertThat(ev).containsEntry("gqlHasErrors", Boolean.TRUE);
+        // Validation failure → data key absent → VALIDATION_FAILED
+        assertThat(result.isDataPresent()).isFalse();
+        assertThat(ev).containsEntry("executionStatus", "VALIDATION_FAILED");
         assertThat(ev).containsEntry("customerId", "cust_err_001");
     }
 }
