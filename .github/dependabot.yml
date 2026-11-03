@@ -1,3 +1,5 @@
+# Mirror of aforo-metering-sdks (synced one way). Version PRs are opened in the source repo,
+# so none here (limit 0); GitHub security alerts still run. SOC 2 PR cleanup, 2026-11-03.
 version: 2
 updates:
   # Node SDKs + the npm-based AWS Lambda plugin
@@ -8,7 +10,7 @@ updates:
       - "/aforo-gateway-plugins/aws-lambda"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     commit-message:
       prefix: "deps"
 
@@ -18,7 +20,7 @@ updates:
       - "/aforo-metering-sdks/python*"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     commit-message:
       prefix: "deps"
 
@@ -28,7 +30,7 @@ updates:
       - "/aforo-metering-sdks/java*"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     commit-message:
       prefix: "deps"
 
@@ -38,12 +40,13 @@ updates:
       - "/aforo-metering-sdks/go*"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     commit-message:
       prefix: "deps"
 
   # GitHub Actions used by CI / release workflows
   - package-ecosystem: github-actions
+    open-pull-requests-limit: 0
     directory: "/"
     schedule:
       interval: weekly
