@@ -46,6 +46,7 @@ updates:
 
   # GitHub Actions used by CI / release workflows
   - package-ecosystem: github-actions
+    open-pull-requests-limit: 0
     directory: "/"
     schedule:
       interval: weekly
