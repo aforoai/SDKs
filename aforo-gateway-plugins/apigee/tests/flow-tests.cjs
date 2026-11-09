@@ -645,6 +645,56 @@ test('pubsub: a failed publish never fails the call', () => {
     assert.strictEqual(r.ingestCalls.length, 0);
 });
 
+test('pubsub: a projects/x/topics/y KVM value is split for the policy and published to the same topic (F11)', () => {
+    const r = call(newEnv({ kvm: { delivery_mode: 'pubsub', pubsub_topic: TOPIC } }), { headers: KEY });
+    assert.strictEqual(r.msg.get('private.aforo.pubsubProject'), 'my-gcp-project');
+    assert.strictEqual(r.msg.get('private.aforo.pubsubTopicId'), 'aforo-metering');
+    assert.strictEqual(r.publishes[0].topic, TOPIC);
+});
+
+test('pubsub: a pubsub_topic of another form falls back to async HTTP, nothing published (F11)', () => {
+    for (const pubsub_topic of ['aforo-metering', 'projects/p/topics/t/extra', 'projects//topics/t']) {
+        const r = call(newEnv({ kvm: { delivery_mode: 'pubsub', pubsub_topic } }), { headers: KEY });
+        assert.strictEqual(r.publishes.length, 0, pubsub_topic);
+        assert.strictEqual(r.ingestCalls.length, 1, pubsub_topic);
+    }
+});
+
+test('pubsub: delivers with an http:// aforo_endpoint, which only the HTTP modes use', () => {
+    const r = call(newEnv({ kvm: { delivery_mode: 'pubsub', pubsub_topic: TOPIC, aforo_endpoint: 'http://ingest.internal/v1/ingest/batch', quota_check_url: QUOTA_URL } }), { headers: KEY });
+    assert.strictEqual(r.publishes.length, 1);
+});
+
+test('http:// aforo_endpoint: not sent and not upgraded to https, skipReason says why (F13)', () => {
+    for (const delivery_mode of ['async', 'sync']) {
+        const env = newEnv({ kvm: { delivery_mode, aforo_endpoint: 'http://api.aforo.ai/v1/ingest/batch', quota_check_url: QUOTA_URL } });
+        const r = call(env, { headers: KEY });
+        assert.strictEqual(r.upstreamCalled, true, 'the API call still goes through');
+        assert.strictEqual(r.ingestCalls.length, 0, delivery_mode);
+        assert.ok(/not an https URL/.test(r.msg.get('aforo.skipReason')), r.msg.get('aforo.skipReason'));
+    }
+});
+
+test('aforo_endpoint with a port and path keeps both; the scheme is matched in any case (F13)', () => {
+    const env = newEnv({ kvm: { aforo_endpoint: 'HTTPS://ingest.example:8443/v1/ingest/batch', quota_check_url: QUOTA_URL } });
+    call(env, { headers: KEY });
+    assert.ok(env.log.some((r) => r.url === 'https://ingest.example:8443/v1/ingest/batch'), JSON.stringify(env.log.map((r) => r.url)));
+});
+
+test('http:// quota_check_url: no quota call, quota not enforced, the call goes on (F13)', () => {
+    const env = newEnv({ kvm: { quota_check_url: 'http://api.aforo.ai/api/v1/quota/check' } });
+    env.quota = () => ({ status: 200, body: '{"decision":"DENY"}' });
+    const r = call(env, { headers: KEY });
+    assert.strictEqual(r.upstreamCalled, true);
+    assert.strictEqual(env.log.filter((x) => /quota/.test(x.url)).length, 0);
+});
+
+test('derived quota URL: origin of aforo_endpoint, with its port (F13)', () => {
+    const env = newEnv({ kvm: { aforo_endpoint: 'https://ingest.example:8443/v1/ingest/batch' } });
+    call(env, { headers: KEY });
+    assert.ok(env.log.some((r) => r.url === 'https://ingest.example:8443/api/v1/quota/check'), JSON.stringify(env.log.map((r) => r.url)));
+});
+
 test('pubsub without pubsub_topic: falls back to async HTTP delivery, nothing published', () => {
     const r = call(newEnv({ kvm: { delivery_mode: 'pubsub' } }), { headers: KEY });
     assert.strictEqual(r.publishes.length, 0);
@@ -802,6 +852,16 @@ test('aforo_org_service_url missing: no call; ALLOW lets through and logs, DENY 
     assert.strictEqual(r.revocationCalls.length, 0);
     assert.ok(r.msg.prints.some((p) => /aforo_org_service_url is not set/.test(p)));
     const deny = jwtEnv({ kvm: { aforo_org_service_url: '', jti_check_fallback: 'DENY' } });
+    assert.strictEqual(call(deny, { headers: BEARER() }).accessFault.status, 503);
+});
+
+test('http:// aforo_org_service_url: never called, not upgraded; counts as no answer (F13)', () => {
+    const allow = jwtEnv({ kvm: { aforo_org_service_url: 'http://org.aforo.ai' } });
+    const r = call(allow, { headers: BEARER() });
+    assert.strictEqual(r.accessFault, null);
+    assert.strictEqual(allow.log.filter((x) => /token-status/.test(x.url)).length, 0);
+    assert.ok(r.msg.prints.some((p) => /not https/.test(p)));
+    const deny = jwtEnv({ kvm: { aforo_org_service_url: 'http://org.aforo.ai', jti_check_fallback: 'DENY' } });
     assert.strictEqual(call(deny, { headers: BEARER() }).accessFault.status, 503);
 });
 

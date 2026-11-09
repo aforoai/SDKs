@@ -169,6 +169,26 @@ test('request-side checks live only in aforo-access: no VerifyJWT, VerifyAPIKey 
     assert.strictEqual(jwt && jwt.name, 'VerifyJWT');
 });
 
+test('every ServiceCallout URL has a literal https://, the Topic the projects/.../topics/... form: Apigee refuses a bare variable (F11, F13)', () => {
+    const want = {
+        AforoJwtRevocationCheck: 'https://{aforo.access.revocationHostPath}',
+        AforoQuotaCheck: 'https://{aforo.access.quotaHostPath}',
+        AforoMeteringSendAsync: 'https://{private.aforo.endpointHostPath}',
+        AforoMeteringSendEvent: 'https://{private.aforo.endpointHostPath}',
+        AforoMeteringSendEventRetry1: 'https://{private.aforo.endpointHostPath}'
+    };
+    const seen = {};
+    for (const dir of Object.values(BUNDLES)) {
+        for (const [file, p] of Object.entries(sim.loadBundle(dir).policies)) {
+            if (p.name === 'ServiceCallout') seen[file] = sim.text(sim.descendants(p, 'URL')[0]);
+            if (p.name === 'PublishMessage') {
+                assert.ok(/^projects\/[^/]+\/topics\/[^/]+$/.test(sim.text(sim.descendants(p, 'Topic')[0])), file);
+            }
+        }
+    }
+    assert.deepStrictEqual(seen, want);
+});
+
 test('default delivery never waits: only the sync steps are ServiceCallouts with a <Response> (G355)', () => {
     const metering = sim.loadBundle(BUNDLES['aforo-metering']);
     for (const step of metering.steps) {
@@ -183,7 +203,7 @@ test('pubsub delivery: PublishMessage to KVM pubsub_topic, continueOnError, only
     const p = metering.policies.AforoMeteringPublish;
     assert.strictEqual(p.name, 'PublishMessage');
     assert.strictEqual(p.attrs.continueOnError, 'true');
-    assert.strictEqual(sim.text(sim.kid(sim.kid(p, 'CloudPubSub'), 'Topic')), '{private.aforo.pubsubTopic}');
+    assert.strictEqual(sim.text(sim.kid(sim.kid(p, 'CloudPubSub'), 'Topic')), 'projects/{private.aforo.pubsubProject}/topics/{private.aforo.pubsubTopicId}');
     assert.strictEqual(sim.text(sim.kid(p, 'Source')), '{aforo.eventPayload}');
     const step = metering.steps.find((s) => s.name === 'AforoMeteringPublish');
     assert.ok(/private\.aforo\.deliveryMode = "pubsub"/.test(step.condition), step.condition);
@@ -206,7 +226,7 @@ test('JWT revocation: org-service token-status, wired after the tenant check and
     assert.strictEqual(sim.text(sim.descendants(c, 'Verb')[0]), 'GET');
     const headers = sim.descendants(c, 'Header').map((h) => h.attrs.name + '=' + sim.text(h));
     assert.deepStrictEqual(headers, ['X-API-Key={private.aforo.apiKey}'], 'X-API-Key only, no tenant header');
-    assert.strictEqual(sim.text(sim.descendants(c, 'URL')[0]), '{aforo.access.revocationUrl}');
+    assert.strictEqual(sim.text(sim.descendants(c, 'URL')[0]), 'https://{aforo.access.revocationHostPath}');
     const js = access.resources['jsc://aforo-jwt-revocation.js'];
     assert.ok(js.indexOf("'/api/v1/public/gateway/token-status'") !== -1, 'token-status path');
     for (const p of ['AforoJwtRevocationPrepare', 'AforoJwtRevocationCallDecision', 'AforoJwtRevocationDecide']) {

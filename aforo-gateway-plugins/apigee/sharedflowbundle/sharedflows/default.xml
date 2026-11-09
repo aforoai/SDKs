@@ -19,7 +19,8 @@
                      the messages to the ingestor and acks after it accepted
                      them, so an ingestor outage loses nothing. The client
                      waits for the publish, not for the ingestor. Without
-                     pubsub_topic the flow uses async instead.
+                     a pubsub_topic of the form projects/{p}/topics/{t} the
+                     flow uses async instead.
     sync             AforoMeteringSendEvent waits for the 202 (1 s to
                      connect, 2 s for the answer), re-sends once what failed
                      transiently (whole batch on no answer / 5xx / 408; just
@@ -41,11 +42,11 @@
     </Step>
     <Step>
         <Name>AforoMeteringSendAsync</Name>
-        <Condition>(aforo.meteringSend = "true") and (private.aforo.deliveryMode != "sync") and ((private.aforo.deliveryMode != "pubsub") or (private.aforo.pubsubTopic = null))</Condition>
+        <Condition>(aforo.meteringSend = "true") and (private.aforo.deliveryMode != "sync") and ((private.aforo.deliveryMode != "pubsub") or (private.aforo.pubsubTopicId = null))</Condition>
     </Step>
     <Step>
         <Name>AforoMeteringPublish</Name>
-        <Condition>(aforo.meteringSend = "true") and (private.aforo.deliveryMode = "pubsub") and (private.aforo.pubsubTopic != null)</Condition>
+        <Condition>(aforo.meteringSend = "true") and (private.aforo.deliveryMode = "pubsub") and (private.aforo.pubsubTopicId != null)</Condition>
     </Step>
     <Step>
         <Name>AforoMeteringSendEvent</Name>

@@ -53,6 +53,15 @@ function aforoCfg(name) {
     return aforoTrim(aforoStr('private.aforo.' + name));
 }
 
+// What a ServiceCallout's <URL> takes after its literal https://: the host,
+// path and query of an https URL. Apigee fails the deploy on a URL that is
+// only a variable (MalformedTargetUrl), so the scheme cannot come from the
+// KVM. '' for anything else: an http:// URL is refused, never upgraded.
+function aforoHostPath(url) {
+    var m = /^https:\/\/([^\/?#\s].*)$/i.exec(aforoTrim(url));
+    return m ? m[1] : '';
+}
+
 function aforoFlag(name, dflt) {
     var v = aforoCfg(name).toLowerCase();
     if (v === 'true') return true;

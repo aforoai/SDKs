@@ -4,6 +4,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [Unreleased]
 
+## [3.1.3] — 2026-10-30
+
+Fix from the wave 6 live test (F8). Configuration properties unchanged. Not yet verified on a live Anypoint org.
+
+### Fixed
+- **An MCP_SERVER POST whose body is not read is billed (F8).** Only a detected `tools/call` billed on MCP_SERVER, so a `tools/call` sent chunked or over 1 MiB billed nothing, although the WARN and the README said "metered as a normal request": a client could avoid billing with `Transfer-Encoding: chunked` (live: 22 such calls, 0 events). Such a POST now bills as one `tools/call` with `toolName: unknown`, under the tool-call metric (`metric-mappings`, then `default-metric`, then `mcp_server.tool_invocations`), and the pre-flight quota check covers it. It is one event, never a second one next to a parsed `tools/call`. A failed body read or a detection error is billed the same way. The log lines and docs say so.
+
+### Known limits
+- Fail-safe on purpose: with an unread body the policy cannot tell what the call is, so a chunked `initialize` or `tools/list` also bills one and can get a 429, and a chunked batch bills as one.
+- Tests: `policy.test.cjs` 226/226 (two new structure checks), DataWeave 195/195 (four plan cases and one event case).
+
 ## [3.1.2] — 2026-10-28
 
 Fixes from the second wave 6 review. Configuration properties unchanged. Not yet verified on a live Anypoint org.

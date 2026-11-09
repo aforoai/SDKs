@@ -229,4 +229,14 @@ test('request path: base path + suffix, "/" base path, empty -> "/"', () => {
     assert.strictEqual(lib({}).aforoRequestPath(), '/');
 });
 
+test('aforoHostPath: https URL without its scheme; anything else is empty, never upgraded (F13)', () => {
+    const L = lib();
+    assert.strictEqual(L.aforoHostPath('https://api.aforo.ai/v1/ingest/batch'), 'api.aforo.ai/v1/ingest/batch');
+    assert.strictEqual(L.aforoHostPath(' HTTPS://h:8443/p?a=1 '), 'h:8443/p?a=1');
+    assert.strictEqual(L.aforoHostPath('https://h'), 'h');
+    for (const bad of ['http://api.aforo.ai/x', 'api.aforo.ai/x', 'https://', 'https:///x', 'ftp://h/x', '', null, undefined]) {
+        assert.strictEqual(L.aforoHostPath(bad), '', String(bad));
+    }
+});
+
 report('apigee unit tests');

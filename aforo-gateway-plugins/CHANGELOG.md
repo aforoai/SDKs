@@ -4,6 +4,12 @@ This monorepo ships five gateway metering plugins (Kong, Apigee, AWS Lambda, Azu
 
 ## Unreleased
 
+### Wave 6 live test fixes (Apigee 3.1.3, MuleSoft 3.1.3)
+
+- Apigee: both shared flows import and deploy on a real org. `AforoMeteringPublish` reads `projects/{...}/topics/{...}`, from KVM `pubsub_topic` split by the flow, and the five ServiceCallouts read `https://{...HostPath}`. An `http://` URL is refused, never upgraded. `aforo-metering` needs a deployment service account in every delivery mode; the docs say so now.
+- MuleSoft: an MCP_SERVER POST whose body is not read (chunked, over 1 MiB) bills as one `tools/call` with `toolName: unknown` instead of nothing.
+- Not yet re-run on a live gateway. Details in each plugin's CHANGELOG.
+
 ### AWS CloudFormation 3.2.0: opt-in Gateway Orchestration for role-only connections
 
 - `aws-cloudformation/aforo-apigateway-role.yaml` has a new parameter `AllowGatewayOrchestration` (default `false`, which grants exactly what 3.1.0 granted). With `true`, a connection that has only the role (no access keys) can use Gateway Orchestration (usage plans and API keys), pull CloudWatch metrics and push ingestion through a Firehose stream `aforo-gateway-*`; `FirehoseBackupBucketArn` makes the stack create the Firehose and CloudWatch Logs service roles too. Not run in a live AWS account. Details: `aws-cloudformation/CHANGELOG.md` 3.2.0.

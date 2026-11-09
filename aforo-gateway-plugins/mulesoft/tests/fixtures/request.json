@@ -458,6 +458,93 @@
       }
     },
     {
+      "name": "MCP: a POST whose body was not read bills one tools/call, toolName unknown (F8)",
+      "expect": {
+        "plan": {
+          "productType": "MCP_SERVER",
+          "tools": true,
+          "plain": false,
+          "calls": [
+            {
+              "toolName": "unknown",
+              "id": null
+            }
+          ],
+          "otherMessages": 0,
+          "metric": "api_calls",
+          "toolMetric": "mcp_server.tool_invocations",
+          "quotaMetric": "mcp_server.tool_invocations"
+        }
+      },
+      "vars": {
+        "aforoCfg": {
+          "productType": "MCP_SERVER"
+        },
+        "aforoRequestText": null
+      },
+      "attributes": {
+        "method": "POST",
+        "requestPath": "/mcp"
+      }
+    },
+    {
+      "name": "MCP: an unread body uses the product default metric, for billing and quota (F8)",
+      "expect": {
+        "plan.tools": true,
+        "plan.plain": false,
+        "plan.toolMetric": "tool_calls",
+        "plan.quotaMetric": "tool_calls"
+      },
+      "vars": {
+        "aforoCfg": {
+          "productType": "MCP_SERVER",
+          "defaultMetric": "tool_calls"
+        },
+        "aforoRequestText": null
+      },
+      "attributes": {
+        "method": "POST",
+        "requestPath": "/mcp"
+      }
+    },
+    {
+      "name": "MCP: an unread body on an excluded path is not quota-checked (F8)",
+      "expect": {
+        "excluded": true,
+        "plan.tools": true,
+        "plan.quotaMetric": null
+      },
+      "vars": {
+        "aforoCfg": {
+          "productType": "MCP_SERVER"
+        },
+        "aforoRequestText": null
+      },
+      "attributes": {
+        "method": "POST",
+        "requestPath": "/health"
+      }
+    },
+    {
+      "name": "MCP: an empty body that was read bills nothing",
+      "expect": {
+        "plan.tools": false,
+        "plan.plain": false,
+        "plan.calls": [],
+        "plan.quotaMetric": null
+      },
+      "vars": {
+        "aforoCfg": {
+          "productType": "MCP_SERVER"
+        },
+        "aforoRequestText": ""
+      },
+      "attributes": {
+        "method": "POST",
+        "requestPath": "/mcp"
+      }
+    },
+    {
       "name": "MCP: a GET (SSE stream) bills nothing",
       "expect": {
         "plan.tools": false,

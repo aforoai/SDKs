@@ -803,6 +803,39 @@
       }
     },
     {
+      "name": "MCP: an unread body is one event, toolName unknown, no ordinary event as well (F8)",
+      "expect": {
+        "events.#length": 1,
+        "events.0.toolName": "unknown",
+        "events.0.metricName": "mcp_server.tool_invocations",
+        "events.0.quantity": 1
+      },
+      "vars": {
+        "aforoReq": {
+          "plan": {
+            "productType": "MCP_SERVER",
+            "tools": true,
+            "plain": false,
+            "calls": [
+              {
+                "toolName": "unknown",
+                "id": null
+              }
+            ],
+            "otherMessages": 0,
+            "metric": "api_calls",
+            "toolMetric": "mcp_server.tool_invocations",
+            "quotaMetric": "mcp_server.tool_invocations"
+          },
+          "method": "POST",
+          "path": "/mcp"
+        }
+      },
+      "attributes": {
+        "headers": {}
+      }
+    },
+    {
       "name": "MCP: X-Aforo-Agent-Id and X-Aforo-Session-Id from the upstream win",
       "expect": {
         "events.0.agentId": "agent-z",

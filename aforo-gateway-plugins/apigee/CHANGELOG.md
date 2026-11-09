@@ -6,6 +6,21 @@ This bundle ships on the Aforo gateway-plugins line; the whole repo is versioned
 
 ## [Unreleased]
 
+## [3.1.3] — 2026-10-30
+
+Fixes from the wave 6 live test on an Apigee X eval org, where neither shared flow deployed (F11, F12, F13). Import and deploy both bundles, and deploy `aforo-metering` with a service account. No KVM key changes. Each change below matches a form the eval org accepted at import or deploy; the flows have not yet carried a live call.
+
+### Fixed
+- **`aforo-metering` is accepted at import (F11).** `AforoMeteringPublish` had `<Topic>{private.aforo.pubsubTopic}</Topic>`, which Apigee refuses: a Topic must read `projects/.../topics/...`. It is now `projects/{private.aforo.pubsubProject}/topics/{private.aforo.pubsubTopicId}`. `aforo-metering.js` splits the KVM value, which stays `projects/{project}/topics/{topic}`. A value in any other form now falls back to `async` with a log line, as a missing one does (it used to reach the policy).
+- **Both shared flows deploy (F13).** The five ServiceCallouts had a `<URL>` that was only a variable, which fails at deploy with `MalformedTargetUrl`. They now read `https://{...HostPath}`, and the scripts set `private.aforo.endpointHostPath`, `aforo.access.quotaHostPath` and `aforo.access.revocationHostPath`, which replace `aforo.access.quotaUrl` and `aforo.access.revocationUrl`.
+
+### Changed
+- **`http://` URLs are refused, never upgraded** (a result of the F13 fix: the scheme is now literal). `aforo_endpoint`: nothing is sent in `async` and `sync` mode and `aforo.skipReason` says why. `quota_check_url`: the quota is not enforced and the flow logs why. `aforo_org_service_url`: the check counts as no answer. See "https only" in the README.
+
+### Docs
+- **`aforo-metering` needs a deployment service account in every delivery mode (F12).** Apigee requires one for any bundle with PublishMessage (`MISSING_SERVICE_ACCOUNT`), so Step 1 of the user guide now deploys with one. The policy stays in the bundle: moving it to a third shared flow would change the install for everyone.
+- Tests: static checks 32, unit tests 21, flow tests 82; each change has a test.
+
 ## [3.1.2] — 2026-10-28
 
 Fixes from the second wave 6 review. Redeploy `aforo-access`; no KVM change. Not yet verified on a live Apigee org.

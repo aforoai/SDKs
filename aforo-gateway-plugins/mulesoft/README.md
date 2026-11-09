@@ -2,7 +2,7 @@
 
 One custom policy, **`aforo-metering`**, that Aforo applies to an API instance in Anypoint API Manager. On every call it checks the end customer's **Aforo API key**, refuses a customer whose hard limit is used up (**429**), lets the call through, and sends the call's usage to Aforo after the response. Your API needs no Aforo code.
 
-**Version:** 3.1.2 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 3.1.3 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 Target: **Mule 4 runtimes as API gateways** (CloudHub, CloudHub 2.0, Runtime Fabric, hybrid), Mule 4.4 or later, Java 8, 11 or 17. Flex Gateway is not covered (it needs a separate PDK policy).
 
@@ -14,7 +14,7 @@ Aforo's organization service does this when you connect your Anypoint org and de
 
 | What | Where | Notes |
 |---|---|---|
-| Policy asset `aforo-metering` **3.1.2** | your org's Exchange, groupId = your **Anypoint organization id** | the jar `aforo-metering-3.1.2-mule-policy.jar` plus its definition [`aforo-metering.yaml`](aforo-metering/aforo-metering.yaml) (classifier `policy-definition`) |
+| Policy asset `aforo-metering` **3.1.3** | your org's Exchange, groupId = your **Anypoint organization id** | the jar `aforo-metering-3.1.3-mule-policy.jar` plus its definition [`aforo-metering.yaml`](aforo-metering/aforo-metering.yaml) (classifier `policy-definition`) |
 | The policy, applied to each API instance | API Manager, per API instance (and environment) | with the [configuration properties](USER_GUIDE.md#configuration-properties) for the Aforo product it sells: `aforo-product-id`, `product-type`, metrics, quota |
 | The product ↔ API instance mapping | Aforo, `gateway_product_meterings` | provider `mulesoft`, `gateway_resource_id` = the API instance id |
 
@@ -69,7 +69,7 @@ Trusted sources only: the introspected key, the policy configuration, the gatewa
 | `API` (default) | 1 | none |
 | `AGENTIC_API` | 1 | `traceId` = upstream `X-Aforo-Trace-Id` (name: `trace-id-header`), else the gateway request id (one call, one goal). The client's `traceparent` only travels in `event.trace`: it never names the trace and never changes the type. |
 | `AI_AGENT` | 1 | `agentId` = upstream `X-Aforo-Agent-Id`, else `agent-id`, else the Aforo product id. `sessionId` = upstream `X-Aforo-Session-Id`, else the gateway request id. `traceId` = `sessionId`. Request headers such as `X-Agent-Id` are never read. |
-| `MCP_SERVER` | 1 per JSON-RPC `tools/call`, batches included; **0** for `initialize`, `tools/list`, `ping` and notifications, which are also never quota-refused | `toolName` from the body (`unknown` when missing); `agentId` = upstream `X-Aforo-Agent-Id`, else the customer (never `params._meta.agent_id`); `sessionId` = upstream `X-Aforo-Session-Id`, else the upstream's `Mcp-Session-Id` **response** header (hashed when longer than 64 characters). |
+| `MCP_SERVER` | 1 per JSON-RPC `tools/call`, batches included; **0** for `initialize`, `tools/list`, `ping` and notifications, which are also never quota-refused (when the body could be read: see [Known differences](#known-differences-from-kong-and-apigee)) | `toolName` from the body (`unknown` when missing); `agentId` = upstream `X-Aforo-Agent-Id`, else the customer (never `params._meta.agent_id`); `sessionId` = upstream `X-Aforo-Session-Id`, else the upstream's `Mcp-Session-Id` **response** header (hashed when longer than 64 characters). |
 
 Every event carries `customerId`, `metricName`, `quantity`, `idempotencyKey` (a UUID the policy mints per call; for MCP `mcp:{tenant}:{id}:{n}:{tool}`; never a client header), `occurredAt`, `productType`, `executionStatus`, `endpointPath`, `httpMethod`, `statusCode`, `responseTimeMs`, `trace` (the client's trace headers, for correlation only) and `metadata` (`gateway: mulesoft`, `productId`, `keyId`, …).
 
@@ -107,7 +107,7 @@ Every event carries `customerId`, `metricName`, `quantity`, `idempotencyKey` (a 
 ```bash
 cd aforo-gateway-plugins/mulesoft/aforo-metering
 docker run --rm -v "$PWD":/src -v "$HOME/.m2":/root/.m2 -w /src eclipse-temurin:17 ./mvnw -B -ntp clean package
-# -> target/aforo-metering-3.1.2-mule-policy.jar
+# -> target/aforo-metering-3.1.3-mule-policy.jar
 ```
 
 Everything resolves from MuleSoft's public repository (`repository.mulesoft.org/releases`) and Maven Central: no Anypoint or Nexus EE credentials. The policy bundles the HTTP connector 1.10.3, the ObjectStore connector 1.2.2, the Java module 1.2.16 and the secure configuration property module 1.2.7. `./mvnw deploy -Danypoint.org.id=<org id>` publishes the jar and the definition to your Exchange (credentials in `~/.m2/settings.xml`, server id `exchange-server`).
@@ -148,7 +148,7 @@ There is no Mule 4 runtime that runs a custom policy offline: policies need the 
 ## Known differences from Kong and Apigee
 
 - A quota WARN is not marked with `X-RateLimit-Warning` on the response (the response attributes are not rebuilt).
-- The MCP request body is read for `tools/call` detection only when the request declares its length (`Content-Length`, no `Transfer-Encoding`) and it is at most 1 MiB. A chunked request, or one over 1 MiB, is metered as one normal request (no `toolName`) and a WARN `MCP request body not read (...)` is logged, at most once a minute per reason (DEBUG in between). An error in the detection itself is logged at WARN and the call is metered as a normal request; it never refuses the call. Mule gives DataWeave no way to read only the first 1 MiB of a repeatable stream without buffering all of it, so an undeclared length is not read at all.
+- The MCP request body is read for `tools/call` detection only when the request declares its length (`Content-Length`, no `Transfer-Encoding`) and it is at most 1 MiB. A POST that is chunked, or over 1 MiB, may be a `tools/call`, so it is billed as **one** `tools/call` with `toolName: unknown` and the tool-call metric, quota check included, and a WARN `MCP request body not read (...)` is logged, at most once a minute per reason (DEBUG in between). This is fail-safe: without it a client avoids billing by sending `Transfer-Encoding: chunked`. The cost is that a chunked `initialize` or `tools/list` bills as a tool call too and can get a 429, and a chunked batch bills as one. Clients that send `Content-Length` are unaffected. An error in the detection itself is logged at WARN and billed the same way; it never refuses the call. Mule gives DataWeave no way to read only the first 1 MiB of a repeatable stream without buffering all of it, so an undeclared length is not read at all.
 - A JSON-RPC error inside a 2xx MCP answer is not detected: the response body is streamed to the client and not read. MCP events are classified by HTTP status only.
 - Quantity comes from `X-Aforo-Quantity` or is 1; there is no `response_size` option.
 - No CORS bypass: apply MuleSoft's CORS policy before this one if browsers call the API.

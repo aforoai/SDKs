@@ -27,7 +27,7 @@
  * and for the quota steps:
  *   aforo.access.checkQuota      "true" when the pre-flight check runs
  *   aforo.access.preflightMetric the metric it asks about
- *   aforo.access.quotaCacheKey / quotaCacheTtlSec / quotaUrl / quotaBody
+ *   aforo.access.quotaCacheKey / quotaCacheTtlSec / quotaHostPath / quotaBody
  */
 
 var VERIFY_POLICY = 'AforoVerifyApiKey';
@@ -37,11 +37,12 @@ function verified(name) {
     return aforoTrim(aforoStr('verifyapikey.' + VERIFY_POLICY + '.' + name));
 }
 
-function quotaUrl() {
+// Host and path for AforoQuotaCheck's https:// URL; '' when the URL is not https.
+function quotaHostPath() {
     var configured = aforoCfg('quotaCheckUrl');
-    if (configured) return configured;
-    var m = /^(https?:\/\/[^\/]+)/i.exec(aforoCfg('endpoint'));
-    return m ? m[1] + QUOTA_CHECK_PATH : '';
+    if (configured) return aforoHostPath(configured);
+    var host = aforoHostPath(aforoCfg('endpoint')).split(/[\/?#]/)[0];
+    return host ? host + QUOTA_CHECK_PATH : '';
 }
 
 // quota_cache_ttl_ms (default 1000) in whole seconds, the cache's unit:
@@ -104,22 +105,22 @@ if (skip) {
         } else if (billable.plain) {
             metric = aforoResolveMetric(method, path, '', product, '');
         }
-        var url = quotaUrl();
-        if (metric && url) {
+        var hostPath = quotaHostPath();
+        if (metric && hostPath) {
             var tenantId = aforoCfg('tenantId');
             var ttl = cacheTtlSeconds();
             context.setVariable('aforo.access.checkQuota', 'true');
             context.setVariable('aforo.access.preflightMetric', metric);
-            context.setVariable('aforo.access.quotaUrl', url);
+            context.setVariable('aforo.access.quotaHostPath', hostPath);
             context.setVariable('aforo.access.quotaBody',
                 JSON.stringify({ customerId: customerId, metricName: metric }));
             // Tenant in the key: customer ids are unique only within a tenant.
             context.setVariable('aforo.access.quotaCacheKey', tenantId + '|' + customerId + '|' + metric);
             context.setVariable('aforo.access.quotaCacheTtlSec', String(ttl));
             context.setVariable('aforo.access.quotaCacheEnabled', ttl > 0 ? 'true' : 'false');
-        } else if (metric && !url) {
-            print('[aforo-access] enforce_quota is set but there is no quota_check_url and ' +
-                'aforo_endpoint has no http(s) origin: quota NOT enforced');
+        } else if (metric && !hostPath) {
+            print('[aforo-access] enforce_quota is set but neither quota_check_url nor ' +
+                'aforo_endpoint is an https URL (http is not supported): quota NOT enforced');
         }
     }
 }

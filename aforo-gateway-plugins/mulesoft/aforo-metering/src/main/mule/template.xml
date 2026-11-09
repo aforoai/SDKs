@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Aforo Usage Metering 3.1.2 - Mule 4 custom policy template.
+  Aforo Usage Metering 3.1.3 - Mule 4 custom policy template.
 
   One API call:
     1. Configuration. Every policy property arrives as the attribute value
@@ -326,15 +326,16 @@ var problems =
                      most 1 MiB. A chunked request has no declared length, and
                      Mule offers no way to read just the first 1 MiB of a
                      repeatable stream from DataWeave without buffering all of
-                     it, so such a body is not read: the call is metered as a
-                     normal request and a WARN says why. The output type is
+                     it, so such a body is not read: the call is billed as one
+                     tools/call with toolName "unknown" (see the request script)
+                     and a WARN says why. The output type is
                      explicit: the request payload is application/json and the
                      value a Java String (without it no tools/call was ever seen
-                     on a live runtime). A failure is logged, since the call then
-                     goes unmetered as MCP. -->
+                     on a live runtime). A failure is logged, and the call is
+                     billed the same way. -->
                 <!-- MCP detection fails open: any error in it (the mcp-body
                      script, the body read, the warning throttle) is logged at
-                     WARN and the call is metered as a normal request. Without
+                     WARN and the call is billed as one tools/call. Without
                      this try an error here reached the access-check handler
                      below and answered 503. -->
                 <try>
@@ -372,7 +373,7 @@ else {read: true, reason: null}]]></ee:set-variable>
                                         <set-variable variableName="aforoRequestText" value="#[output application/java --- (payload.^raw default '') as String {encoding: 'UTF-8'}]"/>
                                         <error-handler>
                                             <on-error-continue type="ANY" logException="false">
-                                                <logger level="WARN" message="#['[aforo-metering] could not read the MCP request body, so its tools/call is not metered: ' ++ (error.description default 'unknown error')]"/>
+                                                <logger level="WARN" message="#['[aforo-metering] could not read the MCP request body, so the call is billed as one tools/call (toolName unknown): ' ++ (error.description default 'unknown error')]"/>
                                                 <set-variable variableName="aforoRequestText" value="#[null]"/>
                                             </on-error-continue>
                                         </error-handler>
@@ -389,13 +390,13 @@ else {read: true, reason: null}]]></ee:set-variable>
                                     </os:retrieve>
                                     <choice>
                                         <when expression="#[(vars.aforoStartMs - (vars.aforoWarnedAt default 0)) >= 60000]">
-                                            <logger level="WARN" message="#['[aforo-metering] MCP request body not read (' ++ (vars.aforoMcpBody.reason default 'unknown') ++ '); the call is metered as a normal request. Repeats are logged at DEBUG for 60s.']"/>
+                                            <logger level="WARN" message="#['[aforo-metering] MCP request body not read (' ++ (vars.aforoMcpBody.reason default 'unknown') ++ '); the call is billed as one tools/call (toolName unknown). Repeats are logged at DEBUG for 60s.']"/>
                                             <os:store key="#[vars.aforoMcpWarnKey]" objectStore="{{{policyId}}}-aforo-state">
                                                 <os:value>#[vars.aforoStartMs]</os:value>
                                             </os:store>
                                         </when>
                                         <otherwise>
-                                            <logger level="DEBUG" message="#['[aforo-metering] MCP request body not read (' ++ (vars.aforoMcpBody.reason default 'unknown') ++ '); the call is metered as a normal request']"/>
+                                            <logger level="DEBUG" message="#['[aforo-metering] MCP request body not read (' ++ (vars.aforoMcpBody.reason default 'unknown') ++ '); the call is billed as one tools/call (toolName unknown)']"/>
                                         </otherwise>
                                     </choice>
                                 </otherwise>
@@ -404,7 +405,7 @@ else {read: true, reason: null}]]></ee:set-variable>
                     </choice>
                     <error-handler>
                         <on-error-continue type="ANY" logException="false">
-                            <logger level="WARN" message="#['[aforo-metering] MCP tools/call detection failed, the call is metered as a normal request: ' ++ (error.description default 'unknown error')]"/>
+                            <logger level="WARN" message="#['[aforo-metering] MCP tools/call detection failed, the call is billed as one tools/call (toolName unknown): ' ++ (error.description default 'unknown error')]"/>
                             <set-variable variableName="aforoRequestText" value="#[null]"/>
                         </on-error-continue>
                     </error-handler>
@@ -484,8 +485,16 @@ var toolMetric = mappedMetric(method, path) default
   (if ((cfg.defaultMetric != "") and (cfg.defaultMetric != "api_calls")) cfg.defaultMetric else "mcp_server.tool_invocations")
 
 var isMcp = cfg.productType == "MCP_SERVER"
-var jsonrpc = if (isMcp and (method == "POST")) parseJsonRpc(vars.aforoRequestText) else null
-var tools = isMcp and (jsonrpc != null) and (sizeOf(jsonrpc.calls) > 0)
+var isMcpPost = isMcp and (method == "POST")
+var jsonrpc = if (isMcpPost) parseJsonRpc(vars.aforoRequestText) else null
+// A POST whose body was not read (chunked, over 1 MiB, or the read failed)
+// could be a tools/call, so it bills as one, fail-safe: otherwise a client
+// avoids billing and quota by sending Transfer-Encoding: chunked. An empty
+// body was read (""), so it is not this case.
+var unread = isMcpPost and (not (vars.aforoRequestText is String))
+var calls = if (unread) [{toolName: "unknown", id: null}]
+  else if (jsonrpc != null) jsonrpc.calls else []
+var tools = sizeOf(calls) > 0
 // MCP_SERVER bills tool calls only: initialize, tools/list, ping and
 // notifications are protocol traffic, never billed and never refused.
 var plain = not isMcp
@@ -519,7 +528,7 @@ var keyProblem = if (key == "") "missing"
     productType: cfg.productType,
     tools: tools,
     plain: plain,
-    calls: if (tools) jsonrpc.calls else [],
+    calls: calls,
     otherMessages: if (jsonrpc != null) jsonrpc.other else 0,
     metric: plainMetric,
     toolMetric: if (tools) toolMetric else null,

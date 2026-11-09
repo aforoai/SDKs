@@ -3,7 +3,9 @@
      ?jti=&keyId=&clientId= with X-API-Key (the tenant comes from the key).
      Answers {"revoked": true|false, "reason"}. Waits at most 2000 ms (the
      Azure fragment's timeout; Apigee takes only a literal here).
-     continueOnError="true": no answer is read by AforoJwtRevocationDecide. -->
+     continueOnError="true": no answer is read by AforoJwtRevocationDecide.
+     The URL's scheme is literal: Apigee refuses a URL that is only a variable
+     at deploy (MalformedTargetUrl). The variable holds host, path and query. -->
 <ServiceCallout name="AforoJwtRevocationCheck" continueOnError="true">
     <DisplayName>Aforo Access - JWT Revocation Check</DisplayName>
     <Request variable="aforo.access.revocationRequest" clearPayload="true">
@@ -22,6 +24,6 @@
             <Property name="connect.timeout.millis">2000</Property>
             <Property name="io.timeout.millis">2000</Property>
         </Properties>
-        <URL>{aforo.access.revocationUrl}</URL>
+        <URL>https://{aforo.access.revocationHostPath}</URL>
     </HTTPTargetConnection>
 </ServiceCallout>

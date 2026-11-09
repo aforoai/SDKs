@@ -1,6 +1,6 @@
 # Aforo Apigee Pub/Sub forwarder
 
-**Version:** 3.1.2 · Apache-2.0 · ships with the Apigee shared flows 3.1.2
+**Version:** 3.1.3 · Apache-2.0 · ships with the Apigee shared flows 3.1.3
 
 Use this when an ingest outage or a `429` must not cost you usage. In the default `async` mode, `aforo-metering` posts each call's events with a ServiceCallout that nobody waits for: an event the ingestor does not store is lost and nothing logs it. With `delivery_mode = pubsub` the flow publishes each call's events to a Pub/Sub topic instead, and this service reads a pull subscription, sends the events to the Aforo ingestor in batches, and acks a message only after the ingestor accepted (or permanently rejected) its events. While the ingestor is down, messages wait in the subscription (7 days by default) and are redelivered.
 
@@ -78,14 +78,14 @@ Run these in the Google Cloud project of your Apigee X org.
      --set-secrets AFORO_API_KEY=aforo-api-key:latest
    ```
 
-5. Redeploy `aforo-metering` with the publisher service account (PublishMessage authenticates as the deployment's service account). Your user needs `iam.serviceAccounts.actAs` on it:
+5. Redeploy `aforo-metering` with the publisher service account, if it runs with another one (every deployment of it needs a service account; PublishMessage authenticates as that account). Your user needs `iam.serviceAccounts.actAs` on it:
 
    ```bash
    curl -X POST -H "Authorization: Bearer $TOKEN" \
      "https://apigee.googleapis.com/v1/organizations/$ORG/environments/$ENV/sharedflows/aforo-metering/revisions/$REV/deployments?override=true&serviceAccount=aforo-apigee-publisher@$PROJECT.iam.gserviceaccount.com"
    ```
 
-6. KVM: `pubsub_topic = projects/$PROJECT/topics/aforo-metering`, then `delivery_mode = pubsub`. Set the topic first: `pubsub` without a topic falls back to `async`.
+6. KVM: `pubsub_topic = projects/$PROJECT/topics/aforo-metering`, then `delivery_mode = pubsub`. Use that full form and set the topic first: `pubsub` without a topic, or with one in any other form, falls back to `async`.
 
 7. Check: call an API, then look for `aforo-forwarder: messages=1 accepted=1` in the service's logs.
 
@@ -95,7 +95,7 @@ Run these in the Google Cloud project of your Apigee X org.
 |---|---|---|
 | Messages pile up in the subscription | The service is not running, or runs with CPU throttling | `--no-cpu-throttling --min-instances 1`; check the service's logs |
 | Logs show `refused with HTTP 401` and messages keep coming back | `AFORO_API_KEY` is wrong or lacks `usage:ingest` | Fix the secret and redeploy; the waiting messages are then delivered |
-| Nothing in the topic | `delivery_mode` is not `pubsub`, `pubsub_topic` is missing, or the shared flow was deployed without the publisher service account | Debug the call: the `AforoMeteringPublish` step must run and not fail |
+| Nothing in the topic | `delivery_mode` is not `pubsub`, `pubsub_topic` is missing or not `projects/{project}/topics/{topic}`, or the shared flow was deployed without the publisher service account | Debug the call: the `AforoMeteringPublish` step must run and not fail |
 | `dropped N event(s): rejected by the ingestor` | Unknown metric or customer | Fix the catalog or the KVM mappings; those events are not retried |
 
 ## Tests

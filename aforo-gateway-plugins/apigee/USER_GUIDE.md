@@ -1,6 +1,6 @@
 # Aforo for Apigee X: user guide
 
-**Version:** 3.1.2 · **Updated:** 2026-10-28 · **Audience:** engineers running Apigee X or hybrid who want their API metered and quota-enforced by Aforo without changing their API.
+**Version:** 3.1.3 · **Updated:** 2026-10-30 · **Audience:** engineers running Apigee X or hybrid who want their API metered and quota-enforced by Aforo without changing their API.
 
 Aforo's organization service normally does every step below when you connect your Apigee org in Aforo and deploy a product to it. This guide does it by hand: for a test org, for troubleshooting, or to see exactly what Aforo changes. The [README](README.md) is the reference for every setting.
 
@@ -13,6 +13,7 @@ Aforo's organization service normally does every step below when you connect you
 ## Prerequisites
 
 - An Apigee X org and environment, with `gcloud` and [`apigeecli`](https://github.com/apigee/apigeecli) logged in as an org admin (attaching flow hooks needs one).
+- A Google service account for the `aforo-metering` deployment (Step 1 creates one).
 - An API proxy in that environment, for example `payments-proxy`, and an API product that includes it, for example `payments-product`.
 - From Aforo:
   - your tenant id
@@ -33,7 +34,15 @@ cd SDKs/aforo-gateway-plugins/apigee
 apigeecli sharedflows create bundle --name aforo-access   --folder aforo-access/sharedflowbundle --org "$ORG" --token "$TOKEN"
 apigeecli sharedflows create bundle --name aforo-metering --folder sharedflowbundle              --org "$ORG" --token "$TOKEN"
 apigeecli sharedflows deploy --name aforo-access   --rev 1 --env "$ENV" --org "$ORG" --token "$TOKEN"
-apigeecli sharedflows deploy --name aforo-metering --rev 1 --env "$ENV" --org "$ORG" --token "$TOKEN"
+```
+
+`aforo-metering` must be deployed with a Google service account, in every delivery mode: the bundle contains a PublishMessage policy, and Apigee refuses to deploy it without one (`MISSING_SERVICE_ACCOUNT`). The account needs no role unless you use `pubsub`, and your user needs `iam.serviceAccounts.actAs` on it.
+
+```bash
+export PROJECT=my-gcp-project
+gcloud iam service-accounts create aforo-apigee-publisher --project "$PROJECT"
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  "https://apigee.googleapis.com/v1/organizations/$ORG/environments/$ENV/sharedflows/aforo-metering/revisions/1/deployments?override=true&serviceAccount=aforo-apigee-publisher@$PROJECT.iam.gserviceaccount.com"
 ```
 
 The metering bundle stays at `sharedflowbundle/`, its 2.x path. The access bundle is in `aforo-access/sharedflowbundle/`. Each folder is a bundle root: its manifest XML, `policies/`, `resources/` and `sharedflows/`.
@@ -144,13 +153,20 @@ Apigee sends a target's 4xx/5xx to the error flow, which skips the PostProxyFlow
 
 - **`async`** (the default): the client never waits for Aforo. An event the ingestor does not store is lost without a trace. Use it in production.
 - **`sync`**: the client waits for the ingestor's answer, which takes at most about 4 s. A transient failure is re-sent once and every loss is logged. Use it while testing, or where every event matters more than latency.
-- **`pubsub`** (Apigee X / hybrid): each call's events go to a Pub/Sub topic (`pubsub_topic`), and the [Pub/Sub forwarder](pubsub-forwarder/README.md) delivers them in batches and acks only after the ingestor accepted them. The client waits for the publish, not for Aforo; an ingest outage loses nothing. Set it up with the forwarder README, then set `pubsub_topic` before `delivery_mode = pubsub`.
+- **`pubsub`** (Apigee X / hybrid): each call's events go to a Pub/Sub topic (`pubsub_topic`, in the form `projects/{project}/topics/{topic}`), and the [Pub/Sub forwarder](pubsub-forwarder/README.md) delivers them in batches and acks only after the ingestor accepted them. The client waits for the publish, not for Aforo; an ingest outage loses nothing. Set it up with the forwarder README, then set `pubsub_topic` before `delivery_mode = pubsub`.
 
 See the README for why Apigee forces this choice.
 
 ## Token revocation
 
-With `jwt_validation_enabled`, a revoked Aforo JWT gets 401 within `jti_cache_seconds` (default 30 s) of its revocation. Set `aforo_org_service_url` (for example `https://org.aforo.ai`) in the KVM; without it the check never gets an answer. By default a check that gets no answer lets the call through; set `jti_check_fallback` to `DENY` to answer 503 instead. `jti_check_enabled = false` switches the check off. The README, "Token revocation", has the details. Revoking the end customer's key (the app credential) takes effect on the next call.
+With `jwt_validation_enabled`, a revoked Aforo JWT gets 401 within `jti_cache_seconds` (default 30 s) of its revocation. Set `aforo_org_service_url` (https, for example `https://org.aforo.ai`) in the KVM; without it the check never gets an answer. By default a check that gets no answer lets the call through; set `jti_check_fallback` to `DENY` to answer 503 instead. `jti_check_enabled = false` switches the check off. The README, "Token revocation", has the details. Revoking the end customer's key (the app credential) takes effect on the next call.
+
+## Upgrading from 3.1.2
+
+3.1.2 cannot be imported or deployed on a real org, so there is nothing to carry over from a running 3.1.2. Import and deploy both bundles from this version, and deploy `aforo-metering` with a service account (Step 1).
+
+- No KVM key changes. `pubsub_topic` stays `projects/{project}/topics/{topic}`.
+- `aforo_endpoint`, `quota_check_url` and `aforo_org_service_url` must be `https://`. See "https only" in the README for what happens otherwise.
 
 ## Upgrading from 3.1.0
 
@@ -177,6 +193,9 @@ Nothing to change: 3.1.0 adds the opt-in `pubsub` delivery mode and the `pubsub_
 |---|---|
 | Every call 401 | Is the key the app's **consumerKey**, approved, with an API product that includes this proxy? With JWT on, is there a valid `Authorization: Bearer`? |
 | Calls pass but nothing in Aforo | Debug: `aforo.skipReason`. Look for `no verified customer` (attribute missing), `API product … has no Aforo settings`, or `KVM aforo_endpoint or api_key is not set`. In `async` mode, also try `sync` to see the ingestor's answer. |
+| `aforo.skipReason` says `not an https URL` | `aforo_endpoint` is `http://`. Only https works; nothing is sent until it is changed. |
+| `MISSING_SERVICE_ACCOUNT` when deploying `aforo-metering` | Deploy with `serviceAccount=` as in Step 1. It is needed in every delivery mode. |
+| `MalformedTargetUrl`, or the import refuses the `Topic` | A bundle older than 3.1.3. Import this version. |
 | Wrong metric | `metric_mappings__{p}` patterns are Lua patterns matched against base path + suffix (`/payments/v1/charge`, not `/v1/charge`). Escape `-` and `.` as `%-` and `%.`. |
 | Never 429 | `enforce_quota__{p}` = `true`? `aforo.access.quotaDecision` UNAVAILABLE means no answer within 1500 ms, or a 401 for `api_key` / `tenant_id`. |
 | KVM change ignored | Values are cached 60 s. |
