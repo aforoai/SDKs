@@ -1,6 +1,6 @@
 # Aforo for MuleSoft — User Guide
 
-**Version:** 3.1.2 · **Updated:** 2026-10-28 · **Audience:** engineers who own an API in Anypoint API Manager and sell it through Aforo.
+**Version:** 3.1.3 · **Updated:** 2026-10-30 · **Audience:** engineers who own an API in Anypoint API Manager and sell it through Aforo.
 
 Normally you do none of this by hand: when you connect your Anypoint org in Aforo and deploy an Aforo product to an API instance, Aforo publishes the policy to your Exchange and applies it with the right configuration. This guide explains what that does, how to do it manually, and how to check it.
 
@@ -34,7 +34,7 @@ The policy reads only these. Aforo's deploy sets them per API instance; in API M
 | `identity-stale-ttl-s` | `900` (max 86400) | When introspection fails, an active answer up to this old is still used. |
 | `identity-fail-open` | `false` | When introspection fails and no answer may be used: `false` answers 503; `true` lets the call through **unchecked and unmetered**. |
 | `product-type` | `API` | `API`, `AGENTIC_API`, `AI_AGENT` or `MCP_SERVER`. |
-| `default-metric` | `api_calls` | Metric of calls no mapping matches (an MCP tool call: `mcp_server.tool_invocations` unless this is set). |
+| `default-metric` | `api_calls` | Metric of calls no mapping matches (an MCP tool call: `mcp_server.tool_invocations` unless this is set). On MCP, set it to the product's metric: Aforo refuses `mcp_server.tool_invocations` unless the tenant registered it. |
 | `metric-mappings` | none | JSON array `[{"pathPattern": "^/v1/search", "method": "GET", "metricName": "searches"}]`, first match wins. `pathPattern` is a **Lua pattern**, as on Kong (`%d`, `%w`, `[...]`, `.-`, `^`, `$`; unanchored unless it starts with `^`); `%b`, `%f` and back-references are not supported and skip the rule. `method` is optional. |
 | `quantity-header` | `X-Aforo-Quantity` | Upstream response header with the event quantity. |
 | `agent-id` | the Aforo product id | AI_AGENT: the agent when the upstream sends no `X-Aforo-Agent-Id`. At most 36 characters. |
@@ -51,8 +51,8 @@ Values are rendered into the policy as text. A value must not contain `${` (Mule
 
 ## 4. Install by hand
 
-1. **Build** the jar ([README → Build](README.md#build)), or take `aforo-metering-3.1.2-mule-policy.jar` from the release.
-2. **Publish** it to your Exchange as a policy: groupId = your Anypoint organization id, assetId `aforo-metering`, version `3.1.2`, with `aforo-metering.yaml` as the `policy-definition`. Either `./mvnw deploy -Danypoint.org.id=<org id>` from `aforo-metering/`, or Exchange → Publish new asset → Policy, uploading both files.
+1. **Build** the jar ([README → Build](README.md#build)), or take `aforo-metering-3.1.3-mule-policy.jar` from the release.
+2. **Publish** it to your Exchange as a policy: groupId = your Anypoint organization id, assetId `aforo-metering`, version `3.1.3`, with `aforo-metering.yaml` as the `policy-definition`. Either `./mvnw deploy -Danypoint.org.id=<org id>` from `aforo-metering/`, or Exchange → Publish new asset → Policy, uploading both files.
 3. **Apply** it in API Manager → your API instance → Policies → Add policy → *Aforo Usage Metering*, filling in the properties above. Put it **first** in the policy order (it is the API's authentication). If browsers call the API, apply MuleSoft's CORS policy before it.
 4. **Map** the product in Aforo (Aforo's deploy records the API instance id against the product).
 
@@ -92,6 +92,8 @@ Publish 3.1.0 as a new version of the asset and update the policy on each API in
 - Delivery waits a random 0–1 s, then 0–2 s, between attempts instead of a fixed 2 s, and waits for the ingestor's `Retry-After` when it is longer (at most 60 s).
 - Events the ingestor marks `"retryable": true` are re-sent; `"retryable": false` events are dropped even if their message says "could not be stored".
 - The log line for lost usage is now `USAGE NOT DELIVERED (<reason>)`.
+
+**From 3.1.2:** publish and apply 3.1.3; properties are unchanged. On `MCP_SERVER`, a POST whose body the policy does not read (chunked, or over 1 MiB) used to bill nothing. It now bills one `tools/call` with `toolName: unknown`, and the quota check covers it.
 
 ## 8. Troubleshooting
 

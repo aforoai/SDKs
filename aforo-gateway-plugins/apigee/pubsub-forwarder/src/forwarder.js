@@ -229,7 +229,7 @@ class Forwarder {
             const res = await this.fetch(url, {
                 method: 'POST',
                 redirect: 'manual',
-                headers: { 'Content-Type': 'application/json', 'X-API-Key': this.cfg.apiKey, 'User-Agent': 'aforo-apigee-pubsub-forwarder/3.1.2' },
+                headers: { 'Content-Type': 'application/json', 'X-API-Key': this.cfg.apiKey, 'User-Agent': 'aforo-apigee-pubsub-forwarder/3.1.3' },
                 body: body,
                 signal: signal,
             });

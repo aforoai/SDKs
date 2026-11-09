@@ -26,6 +26,6 @@
             <Property name="io.timeout.millis">2000</Property>
             <Property name="success.codes">1xx,2xx,3xx,4xx</Property>
         </Properties>
-        <URL>{private.aforo.endpoint}</URL>
+        <URL>https://{private.aforo.endpointHostPath}</URL>
     </HTTPTargetConnection>
 </ServiceCallout>

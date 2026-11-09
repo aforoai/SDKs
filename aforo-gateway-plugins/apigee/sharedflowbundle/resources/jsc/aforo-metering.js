@@ -37,6 +37,10 @@
  * responseTimeMs, trace (client headers, informational) and metadata.
  *
  * Output:
+ *   private.aforo.endpointHostPath   aforo_endpoint without its https://
+ *   private.aforo.pubsubProject / pubsubTopicId   pubsub_topic split up
+ *       (Apigee refuses a <URL> or <Topic> that is only a variable, so the
+ *       policies hold the literal part and these fill it in)
  *   aforo.eventPayload   {"events":[...]} when there is something to send
  *   aforo.meteringSend   "true" then
  *   aforo.meteringSendStartMs, aforo.eventCount
@@ -177,6 +181,20 @@ function traceContext() {
     };
 }
 
+// ── Where the events go ──
+// pubsub_topic must be projects/{project}/topics/{topic}; anything else leaves
+// pubsubTopicId unset and the flow uses async, as without the key.
+var pubsubTopic = /^projects\/([^\/\s{}]+)\/topics\/([^\/\s{}]+)$/.exec(aforoCfg('pubsubTopic'));
+var viaPubsub = !!pubsubTopic && aforoCfg('deliveryMode') === 'pubsub';
+if (pubsubTopic) {
+    context.setVariable('private.aforo.pubsubProject', pubsubTopic[1]);
+    context.setVariable('private.aforo.pubsubTopicId', pubsubTopic[2]);
+} else if (aforoCfg('deliveryMode') === 'pubsub' && aforoCfg('pubsubTopic')) {
+    print('[aforo-metering] pubsub_topic is not projects/{project}/topics/{topic}: delivering by async HTTP instead');
+}
+var endpointHostPath = aforoHostPath(aforoCfg('endpoint'));
+if (endpointHostPath) context.setVariable('private.aforo.endpointHostPath', endpointHostPath);
+
 // ── Should this call be billed at all? ──
 var skipReason = '';
 var status = clientStatus();
@@ -194,6 +212,8 @@ if (refused !== 'false') {
     skipReason = 'no messageid';
 } else if (!aforoCfg('endpoint') || !aforoCfg('apiKey')) {
     skipReason = 'KVM aforo_endpoint or api_key is not set';
+} else if (!endpointHostPath && !viaPubsub) {
+    skipReason = 'KVM aforo_endpoint is not an https URL (http is not supported)';
 }
 
 var events = [];

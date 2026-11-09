@@ -5,7 +5,10 @@
      flow execution continues with any subsequent flow steps", and there is
      "no way for the proxy flow to detect a failure in the remote call". So an
      event the ingestor does not store is lost silently. X-API-Key alone: the
-     ingestor takes the tenant from the key. -->
+     ingestor takes the tenant from the key. A URL that is only a variable
+     fails at deploy (MalformedTargetUrl), so the scheme is literal and
+     aforo-metering.js sets the host and path; an http:// aforo_endpoint is
+     refused there, never upgraded. -->
 <ServiceCallout name="AforoMeteringSendAsync" continueOnError="true">
     <DisplayName>Aforo Metering - Send Events (no wait)</DisplayName>
     <Request variable="aforo.calloutRequestAsync" clearPayload="true">
@@ -24,6 +27,6 @@
             <Property name="connect.timeout.millis">2000</Property>
             <Property name="io.timeout.millis">5000</Property>
         </Properties>
-        <URL>{private.aforo.endpoint}</URL>
+        <URL>https://{private.aforo.endpointHostPath}</URL>
     </HTTPTargetConnection>
 </ServiceCallout>

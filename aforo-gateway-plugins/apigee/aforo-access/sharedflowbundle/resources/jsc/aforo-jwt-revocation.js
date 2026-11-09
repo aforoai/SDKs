@@ -11,8 +11,8 @@
  *
  *   prepare  decides whether the check runs (the token has a jti or key_id,
  *            jti_check_enabled is not "false", the token is for this
- *            tenant) and sets the cache key tenant|jti|keyId, the URL and
- *            the limits. AforoJwtRevocationLookupCache then reads the entry.
+ *            tenant) and sets the cache key tenant|jti|keyId, the URL (host, path
+ *            and query; AforoJwtRevocationCheck adds https://) and the limits. AforoJwtRevocationLookupCache then reads the entry.
  *   call     whether to call org-service: nothing cached, or fewer than
  *            jti_breaker_failures failures in a row. "OK", "REVOKED" and
  *            "OPEN" (breaker) answer without a call.
@@ -65,14 +65,15 @@ function prepare() {
         limit('jtiBreakerFailures', 3, false),
         limit('jtiBreakerSeconds', 30, false)
     ].join(','));
-    if (!/^https?:\/\/[^\/]/i.test(base)) {
+    var hostPath = aforoHostPath(base);
+    if (!hostPath) {
         // Counts as no answer: the fallback applies, as for an outage.
-        print('[aforo-access] jwt revocation check: aforo_org_service_url is not set or not http(s); ' +
+        print('[aforo-access] jwt revocation check: aforo_org_service_url is not set or not https; ' +
             'treated as no answer (jti_check_fallback applies)');
-        context.setVariable('aforo.access.revocationUrl', '');
+        context.setVariable('aforo.access.revocationHostPath', '');
         return;
     }
-    context.setVariable('aforo.access.revocationUrl', base + TOKEN_STATUS_PATH +
+    context.setVariable('aforo.access.revocationHostPath', hostPath + TOKEN_STATUS_PATH +
         '?jti=' + encodeURIComponent(jti) +
         '&keyId=' + encodeURIComponent(keyId) +
         '&clientId=' + encodeURIComponent(clientId));
@@ -80,7 +81,7 @@ function prepare() {
 
 function call() {
     var go = 'false';
-    if (rv('aforo.access.revocationCheck') === 'true' && rv('aforo.access.revocationUrl')) {
+    if (rv('aforo.access.revocationCheck') === 'true' && rv('aforo.access.revocationHostPath')) {
         var c = rv('aforo.access.revocationCached');
         var lim = rv('aforo.access.revocationLimits').split(',');
         if (!c) go = 'true';
@@ -125,7 +126,7 @@ function decide() {
     var store = '';
     var ttl = 0;
     var result;  // ok | revoked | none (no answer)
-    if (!rv('aforo.access.revocationUrl')) {
+    if (!rv('aforo.access.revocationHostPath')) {
         result = 'none';  // misconfigured: nothing stored, the fallback applies
     } else if (called) {
         var a = answer();

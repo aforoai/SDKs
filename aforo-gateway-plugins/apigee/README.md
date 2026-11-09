@@ -6,7 +6,7 @@ Two Apigee shared flows that meter every call to your API in Aforo, enforce your
 - **`aforo-metering`** on the environment's **PostProxyFlowHook**: builds the call's usage events and sends them to Aforo.
 - **`pubsub-forwarder/`** (optional, for `delivery_mode = pubsub`): a Cloud Run service that reads the events from Pub/Sub and delivers them in batches, so an ingest outage loses nothing.
 
-**Version:** 3.1.2 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 3.1.3 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 Target: **Apigee X and hybrid** (`apigee.googleapis.com/v1/organizations/{org}`). The bundles use only policies Apigee Edge also has, but they are built and documented for X. Apigee bundles have no version field, so the version lives in [`VERSION`](VERSION).
 
@@ -79,22 +79,22 @@ Organization scope. Apigee X encrypts it, and the flows read every value into `p
 
 | Key | Default | What it does |
 |---|---|---|
-| `aforo_endpoint` | required | ingest URL, `https://api.aforo.ai/v1/ingest/batch` |
+| `aforo_endpoint` | required | ingest URL, `https://api.aforo.ai/v1/ingest/batch`. **https only** (see [below](#https-only)). |
 | `api_key` | required | your Aforo API key, scope `usage:ingest`; sent as `X-API-Key` |
 | `tenant_id` | required for quota | sent as `X-Tenant-Id` on the quota check; also the JWT tenant binding |
-| `quota_check_url` | origin of `aforo_endpoint` + `/api/v1/quota/check` | the pre-flight endpoint |
+| `quota_check_url` | origin of `aforo_endpoint` + `/api/v1/quota/check` | the pre-flight endpoint. https only. |
 | `quota_timeout_ms` | `1500` | informational: Apigee takes only literal ServiceCallout timeouts, so the check always waits at most 1500 ms. Change the bundle to change it. |
 | `quota_fail_open` | `true` | `false`: no answer means 503 instead of letting the call through |
 | `quota_cache_ttl_ms` | `1000` | how long ALLOW/WARN is cached, rounded up to whole seconds; `0` turns the cache off |
 | `delivery_mode` | `async` | `async`, `sync` or `pubsub`, see [Delivery](#delivery-latency-and-loss) |
-| `pubsub_topic` | none | `pubsub` only: `projects/{project}/topics/{topic}`. Without it `pubsub` falls back to `async`. |
+| `pubsub_topic` | none | `pubsub` only: `projects/{project}/topics/{topic}`. Without it, or in any other form, `pubsub` falls back to `async`. |
 | `max_retries` | `1` | `sync` only: `0` turns the one retry off |
 | `exclude_paths` | `/health,/ready,/metrics` | path prefixes never metered or checked (a prefix matches itself and the paths below it, against the full path and the proxy path suffix); `none` excludes nothing |
 | `exclude_status_codes` | `401,403,429` | statuses never metered; `none` excludes nothing |
 | `include_metadata` | `true` | `false` keeps only `metadata.endpoint_path` |
 | `quantity_source` | `1` | `1`, a fixed number, or `response_size` |
 | `jwt_validation_enabled` | off | `true`: also require an Aforo JWT (`Authorization: Bearer`), checked against `aforo_jwks_uri` and `aforo_jwt_issuer` (both required), issued for `tenant_id`. Claims go upstream as `X-Customer-Id`, `X-Tenant-Id`, `X-Key-Id`, `X-Scopes`, `X-Environment`, and `key_id` goes into `metadata.keyId`. The billed customer stays the app attribute. See [Token revocation](#token-revocation). |
-| `aforo_org_service_url` | none | org-service base URL reachable from Apigee (for example `https://org.aforo.ai`), for the JWT revocation check. Required when `jwt_validation_enabled` is on and `jti_check_enabled` is not `false`; without it every check counts as no answer. |
+| `aforo_org_service_url` | none | org-service https base URL reachable from Apigee (for example `https://org.aforo.ai`), for the JWT revocation check. Required when `jwt_validation_enabled` is on and `jti_check_enabled` is not `false`; without it, or with an `http://` URL, every check counts as no answer. |
 | `jti_check_enabled` | `true` | with `jwt_validation_enabled`: check that the JWT is not revoked. `false` switches the check off. |
 | `jti_check_fallback` | `ALLOW` | what no answer from the revocation check means: `ALLOW` lets the call through, `DENY` answers 503 with `Retry-After: 5` |
 | `jti_cache_seconds` | `30` | how long "not revoked" is cached; `0` asks every time. "Revoked" is kept until the token's `exp` (at most 24 h). |
@@ -119,6 +119,16 @@ Organization scope. Apigee X encrypts it, and the flows read every value into `p
 
 An API product with none of `product_type__`, `default_metric__` and `metric_mappings__` is not Aforo's: its calls go through unmetered.
 
+### https only
+
+Apigee fails a deployment whose ServiceCallout `<URL>` is only a variable (`MalformedTargetUrl`), so `https://` is written in the policies and the flows fill in host and path. An `http://` URL is refused, never upgraded to https:
+
+| KVM key with an `http://` value | What happens |
+|---|---|
+| `aforo_endpoint` | Nothing is sent in `async` and `sync` mode: `aforo.skipReason` = `KVM aforo_endpoint is not an https URL`, and the call is not metered. `pubsub` does not use it. |
+| `quota_check_url` (or `aforo_endpoint` when that is not set) | The quota is **not enforced**, whatever `quota_fail_open` says, and the flow logs why. |
+| `aforo_org_service_url` | Every revocation check counts as no answer: `jti_check_fallback` applies. |
+
 ## Delivery: latency and loss
 
 The PostProxyFlowHook runs **before** the response goes to the client, so how the events are sent decides what the client waits for. We considered three options:
@@ -135,7 +145,9 @@ The flows offer the last two:
 | `sync` | yes: the ingestor's response time, at most about 4 s (1 s connect + 2 s answer, plus one retry only when the first failure was quick) | Only what still fails after one retry. The 202's per-event `errors` are read: "The event could not be stored…" is re-sent once (just those events, same `idempotencyKey`, so a copy that did land is deduplicated), other errors are dropped. No answer, a 5xx or a 408 re-sends the batch. 429 and other 4xx are not re-sent. Every loss is `print`ed (visible in Debug). |
 | `pubsub` (Apigee X / hybrid) | for one Pub/Sub publish (inside Google Cloud), not for the ingestor | Only a failed publish (Pub/Sub unreachable or the permission missing): that call's events are lost, as in `async`. An ingest outage, 429 or 5xx loses nothing: the [Pub/Sub forwarder](pubsub-forwarder/README.md) acks a message only after the ingestor accepted it, batches up to 500 events per request, and Pub/Sub redelivers what it nacked (7 days by default). |
 
-`async` and `sync` send one HTTP request per API call. `pubsub` is the batched path: one Pub/Sub message per call, and the forwarder sends those to the ingestor 500 events at a time. It needs a topic, a subscription, a Cloud Run service and a deployment service account (see the forwarder README); that is why it is opt-in.
+`async` and `sync` send one HTTP request per API call. `pubsub` is the batched path: one Pub/Sub message per call, and the forwarder sends those to the ingestor 500 events at a time. It needs a topic, a subscription and a Cloud Run service (see the forwarder README); that is why it is opt-in.
+
+**`aforo-metering` always needs a deployment service account, in every delivery mode.** The bundle contains the PublishMessage policy, and Apigee refuses to deploy such a bundle without a Google service account (`MISSING_SERVICE_ACCOUNT`), even if `pubsub` is never used. Only `pubsub` needs `roles/pubsub.publisher` on that account. `aforo-access` needs none. See [Step 1 of the user guide](USER_GUIDE.md#step-1-import-and-deploy-both-shared-flows).
 
 Kong avoids this choice by buffering in shared memory and flushing in the background. Apigee has no such place: anything after the response leaves (PostClientFlow) must be in the proxy itself, cannot be attached by a flow hook, and cannot run JavaScript.
 
@@ -186,7 +198,8 @@ CI runs them in the `apigee` job.
 
 - That VerifyAPIKey exposes the custom attributes as `verifyapikey.AforoVerifyApiKey.app.aforo_customer_id` / `.developer.aforo_customer_id` (as documented), and which product it picks when a key has several products for the same proxy.
 - That a ServiceCallout without `<Response>` adds no measurable latency, and how often its requests are lost.
-- That PublishMessage accepts the topic from a flow variable (`{private.aforo.pubsubTopic}`) as its reference says, how long the publish takes, and that a failed publish with `continueOnError` leaves the response untouched.
+- That PublishMessage resolves `projects/{private.aforo.pubsubProject}/topics/{private.aforo.pubsubTopicId}` at runtime (an eval org accepts it at import; no message has been published yet), how long the publish takes, and that a failed publish with `continueOnError` leaves the response untouched.
+- That a ServiceCallout `<URL>` of `https://{variable}` reaches the right host at runtime (an eval org deploys it; no call has been made), also when the variable carries a query string, as the revocation check's does.
 - That the PostProxyFlowHook really is skipped on a target 4xx/5xx (the docs do not say), that a DefaultFaultRule FlowCallout sees the target's status in `response.status.code`, and that a RaiseFault from the PreProxyFlowHook reaches the client unchanged, or is reshaped by the proxy's own FaultRules.
 - That Apigee joins composite KVM keys exactly as `managed_proxy__{proxy}`, and how a KVM `Get` behaves when its key is missing.
 - Rhino quirks the Node model cannot show, the `crypto` object, and JavaScript `timeLimit` under load.
