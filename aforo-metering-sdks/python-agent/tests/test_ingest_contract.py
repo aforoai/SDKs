@@ -148,7 +148,7 @@ async def test_capability_name_lands_in_metadata_snake_case() -> None:
     client.record_capability(
         capability_name="translate_document",
         agent_id="agt_007",
-        customer_id="cust_x",
+        customer_id="cust_x", session_id="sess_1",
     )
     await client.flush()
 
@@ -174,7 +174,7 @@ async def test_batch_wrapper_never_a_bare_array() -> None:
     captured, post_fn = _capturing_transport()
     client = _client(post_fn=post_fn)
 
-    client.record_capability(capability_name="x", agent_id="a")
+    client.record_capability(capability_name="x", agent_id="a", session_id="sess_1")
     await client.flush()
 
     parsed = json.loads(captured[0][2])
@@ -202,11 +202,11 @@ def test_execution_statuses_match_contract() -> None:
 async def test_execution_status_normalized_and_omitted_when_blank() -> None:
     captured, post_fn = _capturing_transport()
     client = _client(post_fn=post_fn)
-    client.record_capability("c", "agt", execution_status=" partial ")
-    client.record_capability("c", "agt", execution_status="BLOCKED")
-    client.record_capability("c", "agt", execution_status="   ")
-    client.record_capability("c", "agt", execution_status=None)
-    client.record_capability("c", "agt")  # default stays SUCCESS
+    client.record_capability("c", "agt", execution_status=" partial ", session_id="sess_1")
+    client.record_capability("c", "agt", execution_status="BLOCKED", session_id="sess_1")
+    client.record_capability("c", "agt", execution_status="   ", session_id="sess_1")
+    client.record_capability("c", "agt", execution_status=None, session_id="sess_1")
+    client.record_capability("c", "agt", session_id="sess_1")  # default stays SUCCESS
     await client.flush()
 
     events = [ev for _, _, body in captured for ev in json.loads(body)["events"]]
@@ -223,13 +223,13 @@ async def test_execution_status_normalized_and_omitted_when_blank() -> None:
 
 @pytest.mark.asyncio
 async def test_unknown_execution_status_is_left_off_not_sent(caplog) -> None:
-    # An unknown executionStatus makes the ingestor reject the WHOLE batch,
-    # so the other events in it would be lost too.
+    # The ingestor rejects an event with an unknown executionStatus, and that
+    # refusal only shows up on a background flush, so the SDK leaves it off.
     captured, post_fn = _capturing_transport()
     client = _client(post_fn=post_fn)
-    client.record_capability("c", "agt", execution_status="PENDNG")
-    client.record_capability("c", "agt", execution_status="VALIDATION_FAILED_EXTRA")
-    client.record_capability("c", "agt", execution_status="SUCCESS")
+    client.record_capability("c", "agt", execution_status="PENDNG", session_id="sess_1")
+    client.record_capability("c", "agt", execution_status="VALIDATION_FAILED_EXTRA", session_id="sess_1")
+    client.record_capability("c", "agt", execution_status="SUCCESS", session_id="sess_1")
     await client.flush()
 
     events = [ev for _, _, body in captured for ev in json.loads(body)["events"]]

@@ -208,7 +208,8 @@ export interface MiddlewareOptions {
    * session, a verified JWT subject, an API-key lookup). Required unless
    * `trustCustomerHeader` is true. Return null/undefined/'' when the request
    * has no billable customer: the event is dropped as 'invalid' and counted;
-   * the request itself is never blocked.
+   * the request itself is never blocked. A resolver that throws is treated the
+   * same way (so is a throwing metricName, quantity or metadata function).
    */
   customerResolver?: (req: any) => string | null | undefined;
 
@@ -234,7 +235,11 @@ export interface MiddlewareOptions {
    */
   normalizePath?: boolean | ((path: string, req: any) => string);
 
-  /** Paths to exclude from metering. Default: ["/health", "/ready", "/metrics", "/favicon.ico"] */
+  /**
+   * Paths never metered: a request path (query string ignored) equal to an
+   * entry or below it (`/health` covers `/health` and `/health/live`, not
+   * `/healthcare`). Default: ["/health", "/ready", "/metrics", "/favicon.ico"]
+   */
   excludePaths?: string[];
 
   /** Status codes to exclude. Default: none */

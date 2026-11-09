@@ -26,7 +26,7 @@ import (
 	"github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql/v2/internal/ingest"
 )
 
-const sdkVersion = "2.1.0"
+const sdkVersion = "2.1.1"
 
 // maxGqlOperationNameLen is the ingestor's limit for gqlOperationName.
 const maxGqlOperationNameLen = 255
@@ -229,7 +229,15 @@ func (b *Billing) middleware(next http.Handler) http.Handler {
 		recw := &responseRecorder{ResponseWriter: w, status: 200}
 		next.ServeHTTP(recw, r)
 
-		customerID := strings.TrimSpace(b.customer(r))
+		customerID, resolverErr := b.resolveCustomer(r)
+		if resolverErr != "" {
+			// A resolver that panics: not billed, counted as invalid; the
+			// request was already served.
+			for i := 0; i < len(ops) || i == 0; i++ {
+				b.dropInvalid(map[string]any{"productType": b.cfg.ProductType}, resolverErr)
+			}
+			return
+		}
 		if tooLarge {
 			b.dropInvalid(map[string]any{"customerId": customerID, "productType": b.cfg.ProductType},
 				fmt.Sprintf("request body larger than MaxRequestBodyBytes (%d); operation not read, request not metered", b.cfg.MaxRequestBodyBytes))
@@ -252,6 +260,17 @@ func (b *Billing) middleware(next http.Handler) http.Handler {
 			b.recordOp(customerID, op, elapsed, recw.status >= 400, executionStatus, b.cfg.ProductType)
 		}
 	})
+}
+
+// resolveCustomer runs the resolver, turning a panic into the reason to drop
+// the event as DropInvalid.
+func (b *Billing) resolveCustomer(r *http.Request) (id, failure string) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			id, failure = "", fmt.Sprintf("CustomerResolver panicked: %v", rec)
+		}
+	}()
+	return strings.TrimSpace(b.customer(r)), ""
 }
 
 // readOperations finds the GraphQL operations in r without holding more than
@@ -471,22 +490,134 @@ func (r *responseRecorder) Write(p []byte) (int, error) {
 // text was a CPU cost the caller controlled.
 var fieldTokenRegex = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*\s*[(:{]?`)
 
-var firstKeywordRegex = regexp.MustCompile(`^\s*(query|mutation|subscription)\b\s*([A-Za-z_][A-Za-z0-9_]*)?`)
-
+// detectOperation returns the type and name of the operation the request
+// runs: the one named operationName when the document holds it, else the
+// first operation. Comments, fragment definitions, strings and nested braces
+// are skipped, so "# note\nmutation M {…}" and "fragment F on T {…} mutation
+// M {…}" are mutations.
 func detectOperation(query, operationName string) (string, string) {
-	matches := firstKeywordRegex.FindStringSubmatch(query)
-	opType := "QUERY"
-	opName := operationName
-	if len(matches) >= 2 {
-		opType = strings.ToUpper(matches[1])
+	ops := operationsOf(query)
+	opType, opName := "QUERY", operationName
+	chosen := -1
+	if operationName != "" {
+		for i, op := range ops {
+			if op.name == operationName {
+				chosen = i
+				break
+			}
+		}
 	}
-	if opName == "" && len(matches) >= 3 && matches[2] != "" {
-		opName = matches[2]
+	if chosen < 0 && len(ops) > 0 {
+		chosen = 0
+	}
+	if chosen >= 0 {
+		opType = ops[chosen].typ
+		if opName == "" {
+			opName = ops[chosen].name
+		}
 	}
 	if opName == "" {
 		opName = "anonymous"
 	}
 	return opType, opName
+}
+
+type opDef struct{ typ, name string }
+
+// operationsOf lists the operation definitions of a GraphQL document, in
+// order. It is a single pass over the text: top-level keywords are read only
+// outside selection sets, parentheses, strings and comments.
+func operationsOf(doc string) []opDef {
+	var ops []opDef
+	braces, parens := 0, 0
+	pending := ""     // "op" after query/mutation/subscription, "fragment" after fragment
+	wantName := false // the next top-level name is the operation's name
+	afterAt := false  // the next name is a directive name
+	for i := 0; i < len(doc); {
+		c := doc[i]
+		switch {
+		case c == '#':
+			for i < len(doc) && doc[i] != '\n' && doc[i] != '\r' {
+				i++
+			}
+			continue
+		case c == '"':
+			i = skipString(doc, i)
+			continue
+		case c == '{':
+			if braces == 0 && parens == 0 {
+				if pending == "" { // shorthand query: { field }
+					ops = append(ops, opDef{typ: "QUERY"})
+				}
+				pending, wantName = "", false
+			}
+			braces++
+		case c == '}':
+			if braces > 0 {
+				braces--
+			}
+		case c == '(':
+			parens++
+			wantName = false
+		case c == ')':
+			if parens > 0 {
+				parens--
+			}
+		case c == '@':
+			afterAt, wantName = true, false
+		case c == '_' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z':
+			j := i + 1
+			for j < len(doc) && (doc[j] == '_' || doc[j] >= 'A' && doc[j] <= 'Z' || doc[j] >= 'a' && doc[j] <= 'z' || doc[j] >= '0' && doc[j] <= '9') {
+				j++
+			}
+			word := doc[i:j]
+			i = j
+			if braces != 0 || parens != 0 {
+				continue
+			}
+			switch {
+			case afterAt:
+				afterAt = false
+			case wantName:
+				ops[len(ops)-1].name = word
+				wantName = false
+			case pending == "" && (word == "query" || word == "mutation" || word == "subscription"):
+				ops = append(ops, opDef{typ: strings.ToUpper(word)})
+				pending, wantName = "op", true
+			case pending == "" && word == "fragment":
+				pending = "fragment"
+			}
+			continue
+		}
+		i++
+	}
+	return ops
+}
+
+// skipString returns the index just past the string literal starting at i
+// (a "…" string with escapes, or a """…""" block string).
+func skipString(doc string, i int) int {
+	if strings.HasPrefix(doc[i:], `"""`) {
+		for j := i + 3; j < len(doc); j++ {
+			if doc[j] == '\\' && strings.HasPrefix(doc[j+1:], `"""`) {
+				j += 3
+				continue
+			}
+			if strings.HasPrefix(doc[j:], `"""`) {
+				return j + 3
+			}
+		}
+		return len(doc)
+	}
+	for j := i + 1; j < len(doc); j++ {
+		switch doc[j] {
+		case '\\':
+			j++
+		case '"', '\n', '\r':
+			return j + 1
+		}
+	}
+	return len(doc)
 }
 
 // scoreComplexity = field_count + 5 * max_depth using a brace-balance approximation.

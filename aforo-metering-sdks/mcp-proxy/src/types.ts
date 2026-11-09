@@ -11,6 +11,7 @@ export interface AforoConfig {
   productId: string;
   apiKey: string;
   ingestorUrl: string;
+  /** Operator override: every call is billed to this agent id, whatever `_meta.agent_id` the client sends. */
   agentId?: string;
   /**
    * One customer billed for every tool call (a single-tenant sidecar). Also
@@ -38,6 +39,13 @@ export interface AforoConfig {
    * 127.0.0.1 / ::1. The API key would cross the network unencrypted.
    */
   allowInsecureHttp?: boolean;
+  /**
+   * Usage-batch compression, as in the other Node SDKs: 'gzip' (default) sends
+   * batches of 1 KiB or more with Content-Encoding: gzip (usage-ingestor wave 8
+   * or later); 'none' always sends plain JSON. CLI `--compression`, env
+   * `AFORO_COMPRESSION`.
+   */
+  compression?: 'gzip' | 'none';
   /**
    * Top-level `productType` on every event (required by the ingestor).
    * Default `MCP_SERVER`; trimmed and uppercased, unknown values pass through.
@@ -98,9 +106,11 @@ export interface AforoConfig {
  * Why usage events were permanently dropped.
  * - 'rejected': the ingestor refused the batch with a non-retryable 4xx, or
  *   refused these events individually inside a batch it otherwise accepted.
- * - 'invalid': the tool call failed a client-side check (no customer, agentId
- *   over 36 chars, customerId over 64, sessionId over 64) and its event was
- *   never queued or sent. An over-long toolName is truncated to 64, not dropped.
+ * - 'invalid': the tool call failed a client-side check (no customer, a
+ *   configured agentId over 36 chars, customerId over 64, sessionId over 64)
+ *   and its event was never queued or sent. Client values are never a reason
+ *   to drop: an over-long toolName is truncated to 64, an unusable
+ *   `_meta.agent_id` is billed as "unknown".
  * - 'overflow': the queue was full (maxQueueSize) and the oldest event made room.
  * - 'shutdown': still queued when the shutdown deadline passed.
  * - 'closed': produced after shutdown.

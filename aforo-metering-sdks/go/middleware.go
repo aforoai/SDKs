@@ -3,6 +3,7 @@ package metering
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"regexp"
@@ -23,9 +24,10 @@ var (
 // MetricName nor MetricNameFunc is set.
 //
 // It must exist in the tenant's Aforo metric catalog: the ingestor rejects an
-// unknown metric, and because it validates a batch as a whole, one such event
-// fails the entire batch with 400. The previous default, "METHOD /path", is a
-// name no catalog contains, so every event failed out of the box.
+// unknown metric. It checks each event on its own, so only that event is lost,
+// and the refusal arrives on a background flush where no caller sees it. The
+// previous default, "METHOD /path", is a name no catalog contains, so every
+// event failed out of the box.
 const DefaultMetricName = "api_calls"
 
 // DefaultCustomerIDHeader is the request header read for the customer id when
@@ -100,6 +102,7 @@ func NewMiddleware(client *AforoClient, opts MiddlewareOptions) (func(http.Handl
 	if len(excludePaths) == 0 {
 		excludePaths = defaultExcludePaths
 	}
+	excludePaths = normalizeExcludePaths(excludePaths)
 	metricName := opts.MetricName
 	if metricName == "" {
 		metricName = DefaultMetricName
@@ -123,10 +126,8 @@ func NewMiddleware(client *AforoClient, opts MiddlewareOptions) (func(http.Handl
 				return
 			}
 			path := r.URL.Path // never carries the query string
-			for _, ep := range excludePaths {
-				if strings.HasPrefix(path, ep) {
-					return
-				}
+			if isExcludedPath(path, excludePaths) {
+				return
 			}
 			for _, sc := range opts.ExcludeStatusCode {
 				if sw.statusCode == sc {
@@ -134,24 +135,36 @@ func NewMiddleware(client *AforoClient, opts MiddlewareOptions) (func(http.Handl
 				}
 			}
 
-			metric := metricName
-			if opts.MetricNameFunc != nil {
-				if m := opts.MetricNameFunc(r); m != "" {
-					metric = m
-				}
-			}
-			// A blank customer id makes Track drop the event as DropInvalid
-			// (counted and handed to OnDrop); the request is already served.
-			_ = client.Track(TrackEvent{
-				CustomerID:     strings.TrimSpace(resolve(r)),
-				MetricName:     metric,
+			event := TrackEvent{
+				MetricName:     metricName,
 				Quantity:       1,
 				ProductType:    productType,
 				EndpointPath:   labels.truncate("endpointPath", normalizePath(path), maxEndpointPathLen),
 				HTTPMethod:     labels.truncate("httpMethod", r.Method, maxHTTPMethodLen),
 				StatusCode:     sw.statusCode,
 				ResponseTimeMs: elapsed.Milliseconds(),
-			})
+			}
+			// A resolver that panics drops the event as DropInvalid (counted
+			// and handed to OnDrop); the panic never reaches the server.
+			if opts.MetricNameFunc != nil {
+				m, err := callResolver("MetricNameFunc", func() string { return opts.MetricNameFunc(r) })
+				if err != nil {
+					client.reportInvalid(event, err)
+					return
+				}
+				if m != "" {
+					event.MetricName = m
+				}
+			}
+			customer, err := callResolver("CustomerResolver", func() string { return resolve(r) })
+			if err != nil {
+				client.reportInvalid(event, err)
+				return
+			}
+			// A blank customer id makes Track drop the event as DropInvalid
+			// (counted and handed to OnDrop); the request is already served.
+			event.CustomerID = strings.TrimSpace(customer)
+			_ = client.Track(event)
 		})
 	}, nil
 }
@@ -182,6 +195,41 @@ func ChiMiddleware(client *AforoClient, opts MiddlewareOptions) (func(http.Handl
 //	router.Use(gin.WrapH(mw(next)))
 //
 // or call client.Track(...) directly from a gin.HandlerFunc.
+
+// callResolver runs a caller-supplied resolver and turns a panic into an
+// error naming it.
+func callResolver(name string, fn func() string) (out string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%w: %s panicked: %v", ErrInvalidEvent, name, r)
+		}
+	}()
+	return fn(), nil
+}
+
+// normalizeExcludePaths drops a trailing slash ("/health/" is "/health").
+func normalizeExcludePaths(paths []string) []string {
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if t := strings.TrimRight(p, "/"); t != "" {
+			out = append(out, t)
+		} else if p != "" {
+			out = append(out, "/")
+		}
+	}
+	return out
+}
+
+// isExcludedPath matches an excluded path exactly or as a parent: "/health"
+// excludes "/health" and "/health/live", never "/healthcare".
+func isExcludedPath(path string, excluded []string) bool {
+	for _, ep := range excluded {
+		if path == ep || (ep != "/" && strings.HasPrefix(path, ep+"/")) {
+			return true
+		}
+	}
+	return false
+}
 
 // NormalizePath replaces dynamic path segments (numeric ids, UUIDs, Mongo ids)
 // with ":id". Useful inside a MetricNameFunc or for metadata; the middleware no
@@ -216,7 +264,9 @@ type statusWriter struct {
 }
 
 func (w *statusWriter) WriteHeader(code int) {
-	if !w.written {
+	// 1xx informational answers (100 Continue, 103 Early Hints) come before
+	// the real status; 101 Switching Protocols is final.
+	if !w.written && (code >= 200 || code == http.StatusSwitchingProtocols) {
 		w.statusCode = code
 		w.written = true
 	}

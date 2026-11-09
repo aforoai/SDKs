@@ -79,6 +79,16 @@ export class EventBuffer {
         error: (m) => logger.error(m),
       },
       onDrop: onDrop ? (events, reason) => onDrop(events, reason) : undefined,
+      // With --debug, each accepted batch is logged: the USER_GUIDE's way to confirm metering.
+      onAccepted: (body, events) => {
+        const result = (body && typeof body === 'object' ? body : {}) as { accepted?: unknown; duplicates?: unknown; failed?: unknown };
+        logger.debug('Flushed events', {
+          events: events.length,
+          accepted: result.accepted,
+          duplicates: result.duplicates,
+          failed: result.failed,
+        });
+      },
     });
   }
 

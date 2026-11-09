@@ -2,6 +2,22 @@
 
 All notable changes to this package are documented here. Format follows [Keep a Changelog](https://keepachangelog.com); versioning follows [SemVer](https://semver.org).
 
+## [2.1.1] - 2026-11-09
+
+### Fixed (transport core, review of 2026-11-09)
+- **One unreadable event no longer loses its whole batch.** usage-ingestor binds a batch as typed fields, so an `occurredAt` without seconds or a zone (`2026-03-01T14:30:00`, `…T14:30Z`, `…+0530`) or a `metadata` that is not a plain object made it answer 400 for the entire request, and every event in it was dropped as `rejected`. Such an event is now dropped alone, as `invalid`, when it is recorded.
+- **Integer fields outside the ingestor's range are left off the event** (`statusCode` beyond a Java short, `responseTimeMs` / `executionDurationMs` / `messageCount` / `gqlComplexity` beyond an int, `dataBytes` beyond a long, or not a finite number). The event is still sent; one WARN per field. Before, one such value failed the whole batch with 400.
+- **429 with `X-RateLimit-Limit` below the batch size splits the batch.** A key with a hard limit under the batch size (default 500 events) can never send that request, so it was retried at the head of the queue forever while everything behind it overflowed. The batch now goes back to the head in order and is sent in parts of at most that many events (contract/TRANSPORT-SPEC.md, "Rate-limit split").
+- **`shutdown()` keeps the process alive until it settles** (at most `shutdownTimeoutMs`). With `flushOnExit: false`, a job awaiting `shutdown()` during an outage exited mid-retry and the queued usage was neither sent nor reported as `shutdown`.
+- **The API key is trimmed**, and construction throws when it still contains whitespace, control or non-ASCII characters (fetch would refuse every request with an error quoting the key). The message never contains the key.
+
+### Fixed (@aforoai/metering)
+- `track()` drops as `invalid` an `occurredAt` string without seconds and a zone (`Z` or `±HH:MM`), and a `metadata` that is not a plain object; the WARN names the field.
+- Middleware `excludePaths` match a path equal to an entry or below it: `/health` no longer skips `/healthcare/...`, nor `/metrics` skip `/metrics-api/...`. Defaults unchanged and exported as `DEFAULT_EXCLUDE_PATHS`; USER_GUIDE listed only two of the four.
+- A `customerResolver`, `metricName`, `quantity` or `metadata` function that throws drops that request's event as `invalid` (counted, passed to `onDrop`) instead of losing it with a debug line.
+- Koa: a request answered through `ctx.throw(…)` or a crash further down is metered, with the status Koa sends (it was skipped).
+- README and USER_GUIDE show version 2.1.0, as `package.json` does.
+
 ## [2.0.0] - 2026-10-26
 
 Breaking. Migration: give every middleware a `customerResolver` (or `trustCustomerHeader: true` behind a proxy you control), call `await client.shutdown()` from your own SIGTERM handler, and use an `https://` `baseUrl` (or `allowInsecureHttp: true`).

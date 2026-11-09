@@ -129,8 +129,14 @@ export async function startMockIngestor(opts = {}) {
     return { over, total, buf: over ? null : Buffer.concat(chunks) };
   }
 
-  function nextFault(kind) {
-    const i = st.faults.findIndex((f) => (f.match ?? 'ingest') === kind);
+  /**
+   * First queued fault for this request. A fault with `rateLimit: N` (opt-in,
+   * like usage-ingestor's HARD per-key limit) only matches an ingest request
+   * carrying more than N events; smaller requests skip it and are not consumed.
+   */
+  function nextFault(kind, eventCount = 0) {
+    const i = st.faults.findIndex((f) => (f.match ?? 'ingest') === kind
+      && !(typeof f.rateLimit === 'number' && eventCount <= f.rateLimit));
     if (i < 0) return null;
     const f = st.faults[i];
     if (f.times !== -1) {
@@ -251,7 +257,7 @@ export async function startMockIngestor(opts = {}) {
           // Malformed JSON is answered 400 below; nothing to record.
         }
       }
-      const fault = nextFault('ingest');
+      const fault = nextFault('ingest', record.eventCount);
       if (await applyTimingFault(fault, req, res)) {
         record.status = fault.reset ? -1 : -2;
         // A hung request stays in flight until the client gives up.
@@ -285,9 +291,17 @@ export async function startMockIngestor(opts = {}) {
         }
         return;
       }
-      if (fault?.status) {
+      if (fault?.status || typeof fault?.rateLimit === 'number') {
         const headers = {};
         if (fault.retryAfter !== undefined) headers['Retry-After'] = String(fault.retryAfter);
+        if (typeof fault.rateLimit === 'number') {
+          // As IngestRateLimiter: the key's events-per-minute limit, on the refusal.
+          headers['X-RateLimit-Limit'] = String(fault.rateLimit);
+          headers['X-RateLimit-Remaining'] = String(fault.rateLimit);
+          const status = fault.status ?? 429;
+          return reply(status, fault.body ?? problem(status, 'Too Many Requests',
+            `Rate limit exceeded: this API key may report ${fault.rateLimit} events per minute; this request has ${record.eventCount}`), headers);
+        }
         if (fault.location !== undefined) headers.Location = String(fault.location);
         return reply(fault.status, fault.body ?? problem(fault.status, 'Injected fault', `status ${fault.status}`), headers);
       }
@@ -340,11 +354,14 @@ export async function startMockIngestor(opts = {}) {
         st.events.push(event);
         accepted += 1;
       });
+      // While a rateLimit fault is queued the key "has a limit": like IngestRateLimiter,
+      // every answer carries X-RateLimit-Limit, the accepted ones too.
+      const limited = st.faults.find((f) => typeof f.rateLimit === 'number' && (f.match ?? 'ingest') === 'ingest');
       return reply(202, {
         success: true,
         data: { accepted, duplicates, failed: errors.length, errors, killedSessionIds: fault?.killedSessionIds ?? [] },
         meta: {},
-      });
+      }, limited ? { 'X-RateLimit-Limit': String(limited.rateLimit) } : {});
     } finally {
       if (hung && !req.socket.destroyed) {
         req.socket.once('close', () => {

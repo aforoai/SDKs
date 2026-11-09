@@ -466,10 +466,11 @@ describe('ToolCallTracker attribution, productType and limits', () => {
     assert.notEqual(buffer.events[0].idempotencyKey, buffer.events[1].idempotencyKey);
   });
 
-  it('drops calls whose agentId/customerId/sessionId exceed the ingestor limits as "invalid"', () => {
+  it('drops calls whose customerId/sessionId exceed the ingestor limits as "invalid"', () => {
     const tracker = make();
     assert.equal(tracker.trackRequest({ requestId: 1, toolName: 'x'.repeat(65), agentId: 'a', customerId: 'c'.repeat(65) }, 's'), false);
-    assert.equal(tracker.trackRequest({ requestId: 2, toolName: 't', agentId: 'a'.repeat(37) }, 's'), false);
+    // (A client's over-long agent_id is no longer a drop: it is billed as "unknown" -- review-fixes.test.ts.)
+    assert.equal(tracker.trackRequest({ requestId: 2, toolName: 't', agentId: 'a', customerId: 'd'.repeat(70) }, 's'), false);
     assert.equal(tracker.trackRequest({ requestId: 3, toolName: 't', agentId: 'a', customerId: 'c'.repeat(65) }, 's'), false);
     assert.equal(tracker.trackRequest({ requestId: 4, toolName: 't', agentId: 'a' }, 's'.repeat(65)), false);
     // An invalid call never starts the session: its customer could not be sent either.

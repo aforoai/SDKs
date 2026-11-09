@@ -17,8 +17,8 @@ public class AforoMeteringProperties {
 
     /**
      * Metric recorded for each request by the servlet filter. Must exist in the
-     * tenant's Aforo catalog -- the ingestor rejects unknown metrics and fails the
-     * whole batch. For a per-request metric, declare a
+     * tenant's Aforo catalog -- the ingestor rejects each event that names an
+     * unknown metric. For a per-request metric, declare a
      * {@link AforoServletFilter.MetricNameResolver} bean.
      */
     private String metricName = AforoServletFilter.DEFAULT_METRIC_NAME;

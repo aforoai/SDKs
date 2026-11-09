@@ -19,6 +19,8 @@ export interface MockFault {
   hang?: boolean;
   reset?: boolean;
   perEvent?: Array<{ index: number; message?: string; retryable?: boolean }>;
+  /** Opt-in: 429 + X-RateLimit-Limit for requests with more than this many events (HARD per-key limit). */
+  rateLimit?: number;
 }
 
 export interface MockRequest {

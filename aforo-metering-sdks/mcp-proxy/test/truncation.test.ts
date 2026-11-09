@@ -129,10 +129,9 @@ describe('request-derived toolName', () => {
     assert.equal(buffer.drops[0].events[0].customerId, 'c'.repeat(65));
   });
 
-  it('still drops a call whose agentId is over 36 chars as invalid', () => {
-    assert.equal(roundTrip(1, 'search', { agent_id: 'a'.repeat(37) }), false);
-    assert.equal(buffer.events.length, 0);
-    assert.equal(buffer.drops[0].reason, 'invalid');
-    assert.equal(buffer.drops[0].events[0].agentId, 'a'.repeat(37));
+  it('meters a call whose client agent_id is over 36 chars as agent "unknown" instead of dropping it', () => {
+    assert.equal(roundTrip(1, 'search', { agent_id: 'a'.repeat(37) }), true);
+    assert.equal(buffer.drops.length, 0);
+    assert.equal(buffer.events[0].agentId, 'unknown');
   });
 });

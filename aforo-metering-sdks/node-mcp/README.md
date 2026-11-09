@@ -82,7 +82,7 @@ Pass these to `new AforoMcpBilling({...})`:
 | `customerResolver` | `(request, extra) => string \| undefined \| Promise<…>` | unset | Decides the customer per call from authenticated identity (see [Who is billed](#who-is-billed)). |
 | `customerId` | `string` | unset | One customer billed for every call. Also the heartbeat customer. |
 | `trustCustomerHeader` | `boolean` | `false` | Bill `params._meta.customer_id` as the client sends it. |
-| `agentId` | `string` | `"unknown"` | Agent id used when a call has no `_meta.agent_id`. |
+| `agentId` | `string` | `"unknown"` | Agent id used when a call has no usable `_meta.agent_id` (missing, blank, not a string, or over 36 characters). |
 | `entitlementMode` | `'SERVER_LEVEL' \| 'TOOL_LEVEL'` | unset | Reserved for entitlement scoping. Accepted but not enforced client-side at this version. |
 | `sessionConfig.idleTimeoutSec` | `number` | unset | Reserved for session idle/duration policy. Accepted; not enforced client-side at this version. |
 | `sessionConfig.maxDurationSec` | `number` | unset | Reserved; same as above. |
@@ -96,7 +96,7 @@ Pass these to `new AforoMcpBilling({...})`:
 | `allowInsecureHttp` | `boolean` | `false` | Allow plain `http://` on a host other than localhost / 127.0.0.1 / ::1. Otherwise `ingestorUrl` must be `https://`. |
 | `heartbeatIntervalMs` | `number` | `30000` | Interval between session heartbeats. |
 | `heartbeatEnabled` | `boolean` | `true` | Send session heartbeats while a session is active. |
-| `onError` | `(err: Error) => void` | logs to `console.error` | Called when the ingestor becomes unreachable (events kept), on rejected events, on a shutdown that left events behind, on a bad `statusResolver` or `customerResolver`, and on failed heartbeats. Delivery reports are a `CoreTransportError`: branch on `err.kind` (`outage`, `auth`, `rejected`, `shutdown`, `closed`) and read `err.events`, not the message. |
+| `onError` | `(err: Error) => void` | logs to `console.error` | Called when the ingestor becomes unreachable (events kept), on rejected events, on a shutdown that left events behind, on a bad `statusResolver` or `customerResolver`, and on failed heartbeats. Delivery reports are a `CoreTransportError`: branch on `err.kind` (`outage`, `auth`, `rejected`, `shutdown`, `closed`) and read `err.events`, not the message; the other reports are plain `Error`s, so check `err instanceof CoreTransportError` first. A throwing `onError` is logged and ignored: it never reaches the tool call. |
 | `onDrop` | `(events, reason) => void` | unset | Called with usage events the SDK is about to lose. `reason` is `rejected`, `invalid`, `overflow`, `shutdown` or `closed`. See [Execution status and dropped events](#execution-status-and-dropped-events). |
 | `onSessionKilled` | `(sessionId, reason) => void` | unset | Fired when a heartbeat or usage-batch response lists the active session in `killedSessionIds`. |
 
@@ -124,12 +124,12 @@ Every usage event the SDK loses is counted in `billing.droppedCount`, WARN-logge
 | `reason` | When |
 |---|---|
 | `rejected` | The ingestor refused the batch with a non-retryable 4xx (400, 422, ...), or refused these events individually inside a batch it otherwise accepted. Per-event errors marked `retryable` are re-sent instead. |
-| `invalid` | The event failed a client-side check and was never queued or sent: no customer (the resolver returned nothing, or no source applied), blank `toolName`, `agentId` over 36, `customerId` over 64, `sessionId` over 64, `productType` over 20. A tool name over 64 characters is not a drop: it is cut to 64 and the event is sent (one warning per label). |
+| `invalid` | The event failed a client-side check and was never queued or sent: no customer (the resolver returned nothing, or no source applied), blank `toolName`, `productType` over 20, or — for `recordToolInvocation` — an `agentId` over 36, `customerId` over 64 or `sessionId` over 64. The tool name, agent id and session id the client sends never drop a wrapped call: a tool name over 64 characters is cut to 64, a `_meta.agent_id` that is blank, not a string or over 36 characters is replaced by the `agentId` config (else `"unknown"`), and a `_meta.session_id` over 64 characters is left off the event (one warning each). |
 | `overflow` | The queue was full (`maxQueueSize`) during an outage; the oldest event made room. |
 | `shutdown` | Still queued when `shutdown()` reached `shutdownTimeoutMs`. |
 | `closed` | Recorded after `shutdown()`. |
 
-An ingest outage is not a drop: on network errors, timeouts, 401, 403, 408, 429 and 5xx the batch is retried, then put back at the front of the queue with the same idempotency keys while the sender pauses (5 s, doubling with jitter up to 5 min). A wrong or revoked key (401/403) is logged once per outage, and the usage is sent once a valid key is in place. `recordToolInvocation` and the wrapper never throw. When a 2xx response reports failures without saying which events, the count is added to `droppedCount` and `onDrop` is not called. A failed heartbeat is not a drop. Only one ingest request is in flight at a time.
+An ingest outage is not a drop: on network errors, timeouts, 401, 403, 408, 429 and 5xx the batch is retried, then put back at the front of the queue with the same idempotency keys while the sender pauses (5 s, doubling with jitter up to 5 min). A wrong or revoked key (401/403) is logged once per outage, and the usage is sent once a valid key is in place. `recordToolInvocation` and the wrapper never throw, even when `onError` does. An `executionDurationMs` that does not fit the ingestor's int field is left off the event (one warning). When a 2xx response reports failures without saying which events, the count is added to `droppedCount` and `onDrop` is not called. A failed heartbeat is not a drop. Only one ingest request is in flight at a time.
 
 ## Walk me through it
 

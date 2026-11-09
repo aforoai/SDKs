@@ -8,6 +8,7 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
+import { StringDecoder } from 'node:string_decoder';
 import { parseStreamBuffer } from '../interceptor/MessageInterceptor.js';
 import { buildChildEnv } from '../util/childEnv.js';
 import { logger } from '../util/logger.js';
@@ -17,6 +18,13 @@ export class StdioProxy extends BaseProxy {
   private child: ChildProcess | null = null;
   private clientBuffer = '';
   private serverBuffer = '';
+  /**
+   * One UTF-8 decoder per direction: a pipe chunk can end in the middle of a
+   * multi-byte character, and decoding each chunk on its own would turn both
+   * halves into U+FFFD and corrupt the message.
+   */
+  private readonly clientDecoder = new StringDecoder('utf8');
+  private readonly serverDecoder = new StringDecoder('utf8');
   private sessionId: string = '';
   /** Client messages are handled one after another so a quota check never reorders them. */
   private clientChain: Promise<void> = Promise.resolve();
@@ -81,7 +89,7 @@ export class StdioProxy extends BaseProxy {
   }
 
   private handleClientChunk(chunk: Buffer): void {
-    this.clientBuffer += chunk.toString('utf-8');
+    this.clientBuffer += this.clientDecoder.write(chunk);
     const { messages, remaining } = parseStreamBuffer(this.clientBuffer);
     this.clientBuffer = remaining;
 
@@ -102,7 +110,7 @@ export class StdioProxy extends BaseProxy {
   }
 
   private handleServerChunk(chunk: Buffer): void {
-    this.serverBuffer += chunk.toString('utf-8');
+    this.serverBuffer += this.serverDecoder.write(chunk);
     const { messages, remaining } = parseStreamBuffer(this.serverBuffer);
     this.serverBuffer = remaining;
 

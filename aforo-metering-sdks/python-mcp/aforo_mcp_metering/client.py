@@ -10,11 +10,15 @@ import hashlib
 import inspect
 import json
 import logging
+import math
+import numbers
+import sys
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ._transport import (
@@ -27,7 +31,7 @@ from ._transport import (
 from ._transport import policy as _policy
 from ._transport import too_long as _too_long_utf16
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 
 logger = logging.getLogger("aforo_mcp_metering")
 
@@ -173,8 +177,103 @@ def _fit_idempotency_key(parts: List[Any], request_derived: Tuple[int, ...]) -> 
 
 
 def _utc_now_iso() -> str:
-    """ISO-8601 instant, e.g. ``2026-09-22T10:00:00.000Z``."""
+    """ISO-8601 instant with seconds and ``Z``, e.g. ``2026-09-22T10:00:00.000Z``.
+    The SDK always stamps ``occurredAt`` itself; callers cannot pass one."""
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+# The ingestor holds executionDurationMs in a Java ``Integer``. A value outside
+# that range (or not a number) fails JSON binding for the whole request, so it
+# is left off the event, which is still sent.
+_JAVA_INT_MIN = -(2 ** 31)
+_JAVA_INT_MAX = 2 ** 31 - 1
+
+
+def _java_int(value: Any) -> Optional[int]:
+    """``value`` as an int a Java ``int`` can hold, else None."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, numbers.Integral):
+            number = int(value)
+        elif isinstance(value, (numbers.Real, Decimal)):  # Decimal is not a numbers.Real
+            as_float = float(value)
+            if not math.isfinite(as_float):
+                return None
+            number = int(as_float)
+        elif isinstance(value, str):
+            text = value.strip()
+            try:
+                number = int(text)
+            except ValueError:
+                as_float = float(text)
+                if not math.isfinite(as_float):
+                    return None
+                number = int(as_float)
+        else:
+            return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if _JAVA_INT_MIN <= number <= _JAVA_INT_MAX else None
+
+
+# ── MCP request context (mcp 1.x) ────────────────────────────────
+# ``mcp``'s low-level Server calls a tool handler as ``handler(name, arguments)``
+# and keeps the rest of the request -- ``params._meta`` and the session, whose
+# ``clientInfo`` names the client -- in the context variable
+# ``mcp.server.lowlevel.server.request_ctx``. It is read only when the host has
+# already imported that module, so this SDK never imports ``mcp`` itself and
+# works without it.
+
+
+def _mcp_request_context() -> Any:
+    """The current MCP request context, or None (no ``mcp``, no request, or
+    an ``mcp`` version whose context looks different)."""
+    module = sys.modules.get("mcp.server.lowlevel.server")
+    ctx_var = getattr(module, "request_ctx", None) if module is not None else None
+    if ctx_var is None:
+        return None
+    try:
+        return ctx_var.get()
+    except Exception:  # LookupError outside a request
+        return None
+
+
+def _request_meta(ctx: Any) -> Dict[str, Any]:
+    """``params._meta`` of the request ``ctx`` belongs to, as a dict ({} if none)."""
+    meta = getattr(ctx, "meta", None) if ctx is not None else None
+    if meta is None:
+        return {}
+    try:
+        if isinstance(meta, dict):
+            return meta
+        dump = getattr(meta, "model_dump", None)
+        if callable(dump):
+            data = dump()
+            return data if isinstance(data, dict) else {}
+        return dict(vars(meta))
+    except Exception:
+        return {}
+
+
+def _client_name(ctx: Any) -> Optional[str]:
+    """``clientInfo.name`` the MCP client sent in ``initialize``, if any."""
+    try:
+        info = getattr(getattr(getattr(ctx, "session", None), "client_params", None), "clientInfo", None)
+        return clean_customer_id(getattr(info, "name", None))
+    except Exception:
+        return None
+
+
+def _process_memory_mb() -> Optional[int]:
+    """Peak resident memory in MB: ``ru_maxrss`` is bytes on macOS, KiB on Linux."""
+    try:
+        import resource
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except Exception:
+        return None
+    divisor = 1024 * 1024 if sys.platform == "darwin" else 1024
+    return round(peak / divisor)
 
 
 def _normalize_product_type(product_type: Optional[str], default: str) -> str:
@@ -237,14 +336,20 @@ class ToolCall:
     name: str
     arguments: Optional[Dict[str, Any]]
     kwargs: Dict[str, Any]
+    #: ``mcp``'s request context for this call (``mcp.server.lowlevel.server.request_ctx``),
+    #: or None outside an ``mcp`` request. ``request_context.session.client_params``
+    #: holds the client's ``initialize`` parameters.
+    request_context: Any = None
 
     @property
     def meta(self) -> Dict[str, Any]:
-        """The request's ``_meta`` object (from ``arguments`` or kwargs), if any."""
-        for source in (self.kwargs.get("_meta"), (self.arguments or {}).get("_meta")):
-            if isinstance(source, dict):
-                return source
-        return {}
+        """The request's ``_meta`` object: a ``_meta`` kwarg your server passes,
+        else ``params._meta`` from the MCP request context. Never read from
+        ``arguments``: those are tool input, which the caller writes freely."""
+        source = self.kwargs.get("_meta")
+        if isinstance(source, dict):
+            return source
+        return _request_meta(self.request_context)
 
 
 #: ``customer_resolver(call) -> Optional[str]``: the customer to bill for one
@@ -254,7 +359,8 @@ CustomerResolver = Callable[[ToolCall], Optional[str]]
 
 
 def _caller_supplied_customer(call: ToolCall) -> Optional[str]:
-    """``customer_id`` kwarg or ``_meta.customer_id``: values the MCP client sends."""
+    """``customer_id`` kwarg or ``_meta.customer_id`` (the request's ``params._meta``):
+    values the MCP client sends."""
     return clean_customer_id(call.kwargs.get("customer_id") or call.meta.get("customer_id"))
 
 
@@ -311,7 +417,9 @@ class AforoMcpBilling:
         sends -- only safe when your transport authenticates the client and
         sets it. ``wrap_tool_handler`` needs one of the two.
         ``agent_resolver(call)`` supplies ``agentId`` when a call carries no
-        ``agent_id`` kwarg (for example from the MCP session's ``clientInfo``).
+        ``agent_id`` kwarg. Without either, the wrapper uses the
+        ``clientInfo.name`` the MCP client sent in ``initialize`` (read from
+        ``mcp``'s request context; cut to 36 characters).
         ``ingestor_url`` must be ``https://`` (plain ``http://`` only for
         localhost, or with ``allow_insecure_http=True``). ``on_drop(events,
         reason)`` gets events lost for good: ``overflow``, ``rejected``,
@@ -334,6 +442,10 @@ class AforoMcpBilling:
         self.trust_customer_header = trust_customer_header
         self.agent_resolver = agent_resolver
         self._truncation_warned: set = set()
+        self._range_warned: set = set()
+        self._no_agent_logged = False
+        options = dict(transport_options or {})
+        self._user_on_accepted: Optional[Callable[[Any, List[Any]], None]] = options.pop("on_accepted", None)
         self._core = TransportCore(
             api_key=api_key,
             base_url=ingestor_url,
@@ -349,9 +461,10 @@ class AforoMcpBilling:
             compression=compression,
             on_drop=on_drop,
             on_error=self._safe_on_error,
+            on_accepted=self._on_batch_accepted,
             extra_headers={"X-Tenant-Id": tenant_id},
             http_transport=http_transport,
-            **(transport_options or {}),
+            **options,
         )
         self.ingestor_url = self._core.url[: -len(_policy.INGEST_PATH)]
         self.flush_count = self._core.flush_count
@@ -361,6 +474,9 @@ class AforoMcpBilling:
         self._heartbeat_enabled = heartbeat_enabled
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._active_session_id: Optional[str] = None
+        # Loop the session was started on: a kill read from a usage-batch
+        # response (sender thread) is handed to it.
+        self._session_loop: Optional[asyncio.AbstractEventLoop] = None
         self._session_customer_id = "system"
         self._session_product_type = self.product_type
         self._session_started_at = 0.0
@@ -427,12 +543,30 @@ class AforoMcpBilling:
         cid = str(customer_id).strip() if customer_id is not None else ""
         self._session_customer_id = cid if cid and utf16_length(cid) <= MAX_CUSTOMER_ID_LEN else "system"
         self._session_started_at = time.monotonic()
+        try:
+            self._session_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._session_loop = None
         if self._heartbeat_enabled and session_id:
             self._heartbeat_task = asyncio.ensure_future(self._heartbeat_loop(session_id))
 
     def _stop_session(self) -> None:
-        if self._heartbeat_task and not self._heartbeat_task.done():
-            self._heartbeat_task.cancel()
+        task = self._heartbeat_task
+        if task is not None and not task.done():
+            # A task may only be cancelled from its own loop's thread
+            # (``shutdown_sync()`` can run on another one).
+            loop = task.get_loop()
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is loop:
+                task.cancel()
+            elif not loop.is_closed():
+                try:
+                    loop.call_soon_threadsafe(task.cancel)
+                except RuntimeError:  # closed in between
+                    pass
         self._heartbeat_task = None
         self._active_session_id = None
 
@@ -453,14 +587,13 @@ class AforoMcpBilling:
             "heartbeatType": heartbeat_type,
             "uptimeMs": int((time.monotonic() - self._session_started_at) * 1000),
             "productId": self.product_id,
-            "sdk": "python",
+            "sdkLanguage": "python",  # the key the ingestor's heartbeat log reads
+            "sdk": "python",  # kept for existing readers
             "sdkVersion": __version__,
         }
-        try:
-            import resource
-            metadata["processMemoryMb"] = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
-        except Exception:
-            logger.debug("[aforo-mcp] process memory not available for the heartbeat", exc_info=True)
+        memory_mb = _process_memory_mb()
+        if memory_mb is not None:
+            metadata["processMemoryMb"] = memory_mb
         return {
             "customerId": self._session_customer_id,
             "metricName": HEARTBEAT_METRIC,
@@ -489,11 +622,34 @@ class AforoMcpBilling:
         except Exception:
             logger.debug("[aforo-mcp] heartbeat failed", exc_info=True)
 
+    def _on_batch_accepted(self, body: Any, items: List[Any]) -> None:
+        """Every accepted usage batch (sender thread): act on ``killedSessionIds``
+        on the loop the session runs on, then call a user ``on_accepted``."""
+        try:
+            killed = body.get("killedSessionIds") if isinstance(body, dict) else None
+            active = self._active_session_id
+            if isinstance(killed, list) and active and active in killed:
+                data = {"killedSessionIds": list(killed)}
+                loop = self._session_loop
+                if loop is not None and not loop.is_closed():
+                    try:
+                        loop.call_soon_threadsafe(self._check_killed, data)
+                    except RuntimeError:  # the loop closed in between
+                        self._check_killed(data)
+                else:
+                    self._check_killed(data)
+        except Exception:
+            logger.debug("[aforo-mcp] reading killedSessionIds from a batch response failed", exc_info=True)
+        if self._user_on_accepted is not None:
+            self._user_on_accepted(body, items)  # the core catches what it raises
+
     def _check_killed(self, data: Dict[str, Any]) -> None:
         """Stop the active session if the ingestor lists it in ``killedSessionIds``."""
         if not self._active_session_id:
             return
         killed_ids = data.get("killedSessionIds") or []
+        if not isinstance(killed_ids, list):
+            return
         if self._active_session_id in killed_ids:
             killed_id = self._active_session_id
             self._stop_session()
@@ -515,17 +671,25 @@ class AforoMcpBilling:
     ) -> Callable:
         """
         Decorator that wraps an MCP tool handler with automatic metering.
-        Starts the session (and its heartbeats) on the first tool call that
-        carries a ``session_id``. Optional kwargs read by the wrapper (and passed
-        through to the handler): ``agent_id``, ``session_id``, ``product_type``.
-        Without an ``agent_id`` kwarg the client's ``agent_resolver`` is asked;
-        a call with no agent is dropped as ``"invalid"`` (never ``"unknown"``).
+        Stack it under ``mcp``'s ``@server.call_tool()``, which calls the
+        handler as ``handler(name, arguments)``. Starts the session (and its
+        heartbeats) on the first tool call that carries a ``session_id``.
+        Optional kwargs a custom host may pass (read by the wrapper and passed
+        through to the handler): ``agent_id``, ``session_id``, ``product_type``,
+        ``_meta``.
+
+        The agent: the ``agent_id`` kwarg, else the client's ``agent_resolver``,
+        else the ``clientInfo.name`` the MCP client sent in ``initialize`` (from
+        ``mcp``'s request context, cut to 36 characters). A call with no agent
+        is dropped as ``"invalid"`` (never ``"unknown"``); the first such drop
+        is logged at ERROR.
 
         The customer comes from ``customer_resolver`` (here or on the client),
         called with a :class:`ToolCall`. ``trust_customer_header=True`` bills the
-        ``customer_id`` kwarg / ``_meta.customer_id`` the MCP client sends
-        instead. With neither, decorating raises ValueError. A call with no
-        customer still runs; its event is dropped as ``"invalid"`` and counted.
+        ``customer_id`` kwarg / the request's ``params._meta.customer_id`` the
+        MCP client sends instead (never a ``_meta`` inside the tool arguments).
+        With neither, decorating raises ValueError. A call with no customer
+        still runs; its event is dropped as ``"invalid"`` and counted.
 
         The call's executionStatus comes from :func:`default_tool_status`
         (a returned ``isError`` result is ERROR, not SUCCESS), unless
@@ -536,9 +700,11 @@ class AforoMcpBilling:
         (see :meth:`record_tool_invocation`). ``agent_id`` / ``session_id`` are
         never altered: an over-long one drops the event as ``"invalid"``.
 
-        Usage:
+        Usage (``mcp`` 1.x low-level server):
+            server = Server("my-tools")
             billing = AforoMcpBilling(..., customer_resolver=lambda call: session_user.customer_id)
 
+            @server.call_tool()
             @billing.wrap_tool_handler
             async def handle_tool(name: str, arguments: dict):
                 ...
@@ -552,9 +718,7 @@ class AforoMcpBilling:
                                      customer_resolver=customer_resolver,
                                      trust_customer_header=trust_customer_header)
 
-        def customer_for(name: str, arguments: Any, kwargs: Dict[str, Any]) -> Optional[str]:
-            call = ToolCall(name=name, arguments=arguments if isinstance(arguments, dict) else None,
-                            kwargs=kwargs)
+        def customer_for(call: ToolCall) -> Optional[str]:
             try:
                 if resolver is not None:
                     return clean_customer_id(resolver(call))
@@ -563,23 +727,33 @@ class AforoMcpBilling:
                 logger.warning("[aforo-mcp] customer_resolver raised; the call is not metered", exc_info=True)
                 return None
 
-        def agent_for(name: str, arguments: Any, kwargs: Dict[str, Any]) -> Optional[str]:
-            explicit = clean_customer_id(kwargs.get("agent_id"))
-            if explicit or self.agent_resolver is None:
+        def agent_for(call: ToolCall) -> Optional[str]:
+            explicit = clean_customer_id(call.kwargs.get("agent_id"))
+            if explicit:
                 return explicit
-            try:
-                return clean_customer_id(self.agent_resolver(ToolCall(
-                    name=name, arguments=arguments if isinstance(arguments, dict) else None, kwargs=kwargs)))
-            except Exception:
-                logger.warning("[aforo-mcp] agent_resolver raised", exc_info=True)
-                return None
+            if self.agent_resolver is not None:
+                try:
+                    resolved = clean_customer_id(self.agent_resolver(call))
+                except Exception:
+                    logger.warning("[aforo-mcp] agent_resolver raised", exc_info=True)
+                    resolved = None
+                if resolved:
+                    return resolved
+            # The MCP client's own name (clientInfo.name). It comes with the
+            # request, so an over-long one is cut to the limit, never dropped.
+            name = _client_name(call.request_context)
+            if name:
+                return _truncate_label("agentId", name, MAX_AGENT_ID_LEN, self._truncation_warned)
+            return None
 
         @functools.wraps(handler)
         async def wrapper(name: str, arguments: dict = None, **kwargs):
-            agent_id = agent_for(name, arguments, kwargs)
+            call = ToolCall(name=name, arguments=arguments if isinstance(arguments, dict) else None,
+                            kwargs=kwargs, request_context=_mcp_request_context())
+            agent_id = agent_for(call)
             session_id = kwargs.get("session_id")
             product_type = kwargs.get("product_type")
-            customer_id = customer_for(name, arguments, kwargs)
+            customer_id = customer_for(call)
             start_time = time.monotonic()
             result: Any = None
             error: Optional[BaseException] = None
@@ -671,9 +845,16 @@ class AforoMcpBilling:
         longer than 64 characters is cut to 64 and the event is still sent (a
         WARNING is logged once per client); the idempotency key is built from
         the full name.
+
+        ``session_id`` defaults to the active session (``start_session``, or
+        the first wrapped call that carried one). ``execution_duration_ms``
+        that is not a whole number a Java ``int`` can hold is left off the
+        event (WARNING once per client); the event is still sent.
         """
         agent_id = clean_customer_id(agent_id) or ""
         customer = clean_customer_id(customer_id) or ""
+        if session_id is None or (isinstance(session_id, str) and not session_id.strip()):
+            session_id = self._active_session_id
         key_tool_name = str(tool_name).strip() if tool_name is not None else ""
         tool_name = _truncate_label("toolName", key_tool_name, MAX_TOOL_NAME_LEN, self._truncation_warned)
         resolved_product_type = _normalize_product_type(product_type, self.product_type)
@@ -695,22 +876,42 @@ class AforoMcpBilling:
             "toolName": tool_name,
             "agentId": agent_id,
             "sessionId": session_id,
-            "executionDurationMs": execution_duration_ms,
             "metadata": {
                 "productId": self.product_id,
                 "sdk": "python",
                 "sdkVersion": __version__,
             },
         }
+        duration = _java_int(execution_duration_ms)
+        if duration is not None:
+            event["executionDurationMs"] = duration
+        elif execution_duration_ms is not None:
+            self._warn_once("executionDurationMs",
+                            "[aforo-mcp] executionDurationMs %r is not a whole number the ingestor can hold "
+                            "(Java int); the field is left off and the event is still sent. Logged once.",
+                            execution_duration_ms)
         status = _normalize_status(execution_status)
         if status is not None:
             event["executionStatus"] = status
 
         problem = _invalid_reason(event)
         if problem:
+            if not agent_id and not self._no_agent_logged:
+                self._no_agent_logged = True
+                logger.error(
+                    "[aforo-mcp] Tool call %r has no agent, so its usage is not sent (dropped as invalid). "
+                    "Pass an agent_id kwarg, set agent_resolver=..., or call the wrapped handler inside an "
+                    "mcp request whose client sent clientInfo.name. Logged once.", str(tool_name)[:64])
             self._core.report_drop([event], "invalid", detail=problem)
             return
         self._core.enqueue(event)
+
+    def _warn_once(self, field_name: str, message: str, *args: Any) -> None:
+        with _truncation_lock:
+            first = field_name not in self._range_warned
+            self._range_warned.add(field_name)
+        if first:
+            logger.warning(message, *args)
 
     async def flush(self, timeout: Optional[float] = None) -> int:
         """Send everything queued now and wait for it (in a worker thread, so

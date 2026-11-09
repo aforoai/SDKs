@@ -213,7 +213,7 @@ function checkDebounce(value: unknown, fallback: number, where: string): number 
 
 type ExecutionStatusOption = string | ((event: MqttUsageEvent) => string | undefined);
 
-const SDK_VERSION = '2.1.0';
+const SDK_VERSION = '2.1.1';
 /** Default top-level `productType` for this SDK. */
 export const DEFAULT_PRODUCT_TYPE = 'MQTT_BROKER';
 /**
@@ -679,8 +679,8 @@ export class AforoMqttBilling {
     if (checked.problem) this.reportError(new Error(`[aforo-mqtt] ${checked.problem}`));
     if (checked.status) event.executionStatus = checked.status;
 
-    // An event the ingestor would reject is not sent (one bad event fails its
-    // whole batch): it is dropped here with reason 'invalid', never thrown
+    // An event the ingestor would reject is not sent (the refusal would only
+    // show up on a background flush): it is dropped here with reason 'invalid', never thrown
     // into the broker / client handlers. mqttTopic is required on every
     // MQTT_BROKER event.
     const invalid =

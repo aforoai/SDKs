@@ -27,22 +27,28 @@ import java.util.logging.Logger;
  */
 public interface HttpSender extends AutoCloseable {
 
-    /** Status, body, {@code Retry-After} and {@code Location} headers of one response. */
+    /** Status, body, {@code Retry-After}, {@code Location} and {@code X-RateLimit-Limit} headers of one response. */
     final class Response {
         private final int status;
         private final String body;
         private final String retryAfter;
         private final String location;
+        private final String rateLimitLimit;
 
         public Response(int status, String body, String retryAfter) {
-            this(status, body, retryAfter, null);
+            this(status, body, retryAfter, null, null);
         }
 
         public Response(int status, String body, String retryAfter, String location) {
+            this(status, body, retryAfter, location, null);
+        }
+
+        public Response(int status, String body, String retryAfter, String location, String rateLimitLimit) {
             this.status = status;
             this.body = body;
             this.retryAfter = retryAfter;
             this.location = location;
+            this.rateLimitLimit = rateLimitLimit;
         }
 
         public int status() { return status; }
@@ -50,6 +56,8 @@ public interface HttpSender extends AutoCloseable {
         public String retryAfter() { return retryAfter; }
         /** {@code Location} of a 3xx answer; redirects are never followed. */
         public String location() { return location; }
+        /** {@code X-RateLimit-Limit}: events per minute the API key may report, when the ingestor sent it. */
+        public String rateLimitLimit() { return rateLimitLimit; }
     }
 
     /**
@@ -123,7 +131,14 @@ public interface HttpSender extends AutoCloseable {
             HttpRequest.Builder b = HttpRequest.newBuilder(uri)
                     .timeout(Duration.ofMillis(deadline))
                     .POST(HttpRequest.BodyPublishers.ofByteArray(body));
-            headers.forEach(b::header);
+            for (Map.Entry<String, String> h : headers.entrySet()) {
+                try {
+                    b.header(h.getKey(), h.getValue());
+                } catch (IllegalArgumentException e) {
+                    // The JDK's message quotes the header value, which may be the API key: never pass it on.
+                    throw new IllegalArgumentException("the HTTP client refused the " + h.getKey() + " header");
+                }
+            }
             CompletableFuture<HttpResponse<String>> exchange =
                     client.sendAsync(b.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             HttpResponse<String> r;
@@ -142,7 +157,8 @@ public interface HttpSender extends AutoCloseable {
                         cause == null ? e : cause);
             }
             return new Response(r.statusCode(), r.body(), r.headers().firstValue("Retry-After").orElse(null),
-                    r.headers().firstValue("Location").orElse(null));
+                    r.headers().firstValue("Location").orElse(null),
+                    r.headers().firstValue("X-RateLimit-Limit").orElse(null));
         }
 
         /**

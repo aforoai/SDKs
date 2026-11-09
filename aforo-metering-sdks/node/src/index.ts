@@ -5,7 +5,7 @@ export { expressMiddleware, middleware } from './middleware/express.js';
 export { fastifyPlugin } from './middleware/fastify.js';
 export { koaMiddleware } from './middleware/koa.js';
 export { normalizePath } from './path-normalizer.js';
-export { DEFAULT_METRIC_NAME } from './middleware/common.js';
+export { DEFAULT_METRIC_NAME, DEFAULT_EXCLUDE_PATHS } from './middleware/common.js';
 export {
   MAX_LENGTHS,
   MAX_QUANTITY_DECIMAL_PLACES,

@@ -2,7 +2,7 @@
 
 Meter every gRPC call with a server interceptor — one Aforo event per RPC, with the gRPC status mapped to a readable label, call type, and duration. Streaming RPCs are metered with one explicit `record()` call.
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 

@@ -1,6 +1,6 @@
 # metering-go — User Guide
 
-**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Go engineers adding usage metering to an HTTP service or any code path that knows when a billable event happened.
+**Version:** 2.1.1 · **Updated:** 2026-10-26 · **Audience:** Go engineers adding usage metering to an HTTP service or any code path that knows when a billable event happened.
 
 ## What you'll build
 
@@ -19,10 +19,10 @@ A Go service that sends one usage event per HTTP request (or per `Track` call) t
 go get github.com/aforoai/SDKs/aforo-metering-sdks/go/v2
 ```
 
-Until the `aforo-metering-sdks/go/v2.0.0` tag exists, clone github.com/aforoai/SDKs and point at it from your `go.mod`:
+Until the `aforo-metering-sdks/go/v2.1.1` tag exists, clone github.com/aforoai/SDKs and point at it from your `go.mod`:
 
 ```go
-require github.com/aforoai/SDKs/aforo-metering-sdks/go/v2 v2.0.0
+require github.com/aforoai/SDKs/aforo-metering-sdks/go/v2 v2.1.1
 
 replace github.com/aforoai/SDKs/aforo-metering-sdks/go/v2 => ../SDKs/aforo-metering-sdks/go
 ```
@@ -81,13 +81,13 @@ Chi: `r.Use(mw)` (or build it with `metering.ChiMiddleware(client, opts)`). Ever
 
 What the middleware does after the response is written:
 
-- Skips `OPTIONS` requests, paths under `ExcludePaths` (defaults: `/health`, `/ready`, `/metrics`, `/favicon.ico`) and statuses in `ExcludeStatusCode`.
-- Asks `CustomerResolver` for the customer. An empty answer is not billed: the event is dropped as `invalid` and counted in `DroppedCount()`. The request is never blocked.
+- Skips `OPTIONS` requests, paths under `ExcludePaths` (defaults: `/health`, `/ready`, `/metrics`, `/favicon.ico`; each covers itself and everything under it, so `/health` skips `/health/live` but not `/healthcare`) and statuses in `ExcludeStatusCode`.
+- Asks `CustomerResolver` for the customer. An empty answer, or a resolver that panics, is not billed: the event is dropped as `invalid` and counted in `DroppedCount()`. The request is never blocked.
 - Records `MetricNameFunc(r)` if set and non-empty, otherwise `MetricName` (default `api_calls`), with `productType`, `endpointPath` (normalized, no query string), `httpMethod`, `statusCode` and `responseTimeMs`.
 
 > ⚠ `NewMiddleware` refuses to build without `CustomerResolver` unless you set `TrustCustomerHeader: true`. That option bills the customer named in the `X-Customer-Id` header (or `CustomerIDHeader`). Callers of your API control that header, so use it only when a trusted proxy sets it and removes any value the client sent.
 
-> ⚠ The metric must exist in your tenant's Aforo catalog. The ingestor rejects an unknown metric for the whole batch.
+> ⚠ The metric must exist in your tenant's Aforo catalog. The ingestor rejects every event that names an unknown metric; the other events in the batch are still stored.
 
 The middleware's response writer passes `Flush` and `Hijack` through and implements `Unwrap`, so server-sent events and WebSocket upgrades behind it keep working.
 
@@ -104,7 +104,9 @@ if err := client.Track(metering.TrackEvent{
 }
 ```
 
-Inside `Track`: a `Quantity` of `0` becomes `1`; an empty `OccurredAt` becomes now (UTC), a set one must be RFC 3339; `IdempotencyKey` defaults to a new random UUID. `Track` returns an error wrapping `metering.ErrInvalidEvent` (and queues nothing) for a blank `CustomerID`/`MetricName`, a negative/NaN/Inf `Quantity`, an unparseable `OccurredAt` or a field over the ingestor's limit.
+Inside `Track`: a `Quantity` of `0` becomes `1`; an empty `OccurredAt` becomes now (UTC), a set one must be RFC 3339 with seconds and a zone (`Z` or `±HH:MM`); `IdempotencyKey` defaults to a new random UUID. `Track` returns an error wrapping `metering.ErrInvalidEvent` (and queues nothing) for a blank `CustomerID`/`MetricName`, a negative/NaN/Inf `Quantity`, an unparseable `OccurredAt` or a field over the ingestor's limit.
+
+> ⚠ **`Quantity: 0` is billed as one unit.** Go cannot tell a `Quantity` you left out from one you set to `0`, so both become `1`. When the amount is zero, do not call `Track`.
 
 > **Idempotency keys.** The key is minted once, when `Track` queues the event, and every resend carries it, so a retried or requeued batch is deduplicated by the ingestor. To deduplicate a logical event you replay yourself, set `IdempotencyKey`.
 
@@ -123,7 +125,7 @@ The wire call:
 POST https://api.aforo.ai/v1/ingest/batch
 X-API-Key: <AFORO_API_KEY>
 Content-Type: application/json
-User-Agent: aforo-go/2.0.0
+User-Agent: aforo-go/2.1.1
 
 {"events":[{"customerId":"cust_acme_001","metricName":"report_generated","quantity":1,"idempotencyKey":"…","occurredAt":"2026-10-26T…Z","productType":"API","metadata":{"format":"pdf"}}]}
 ```

@@ -1,10 +1,10 @@
 import { AforoOptions, TrackEvent, ResolvedEvent, FlushResult, DropReason } from './types.js';
-import { TransportCore, checkBaseUrl, CoreDropReason } from './transport-core/core.js';
+import { TransportCore, checkApiKey, checkBaseUrl, CoreDropReason } from './transport-core/core.js';
 import { generateRandomKey } from './idempotency.js';
 import { describeLimitViolation } from './limits.js';
 
 /** Package version, sent in User-Agent. Keep in step with package.json. */
-export const SDK_VERSION = '2.1.0';
+export const SDK_VERSION = '2.1.1';
 const DEFAULT_BASE_URL = 'https://api.aforo.ai';
 const DEFAULT_PRODUCT_TYPE = 'API';
 const DEFAULT_SESSION_PRODUCT_TYPE = 'AI_AGENT';
@@ -68,7 +68,8 @@ export class AforoClient {
   private sessionProductType: string = DEFAULT_SESSION_PRODUCT_TYPE;
 
   constructor(options: AforoOptions) {
-    if (!options || !options.apiKey) throw new Error('apiKey is required');
+    // Trimmed; throws (never echoing the key) on whitespace, control or non-ASCII characters.
+    const apiKey = checkApiKey(options?.apiKey);
     const baseUrl = checkBaseUrl(options.baseUrl ?? DEFAULT_BASE_URL, options.allowInsecureHttp === true);
     const timeout = options.timeout ?? DEFAULT_TIMEOUT;
 
@@ -76,7 +77,7 @@ export class AforoClient {
     const onDrop = options.onDrop;
     this.core = new TransportCore<ResolvedEvent>({
       baseUrl,
-      apiKey: options.apiKey,
+      apiKey,
       allowInsecureHttp: options.allowInsecureHttp,
       compression: options.compression,
       userAgent: `aforo-node/${SDK_VERSION}`,
@@ -93,7 +94,7 @@ export class AforoClient {
     });
     // Non-enumerable, so inspect()/JSON never walk into the closure's owner.
     Object.defineProperty(this, 'sendHeartbeat', {
-      value: makeHeartbeatSender(baseUrl, options.apiKey, timeout),
+      value: makeHeartbeatSender(baseUrl, apiKey, timeout),
       enumerable: false,
     });
   }
@@ -188,8 +189,9 @@ export class AforoClient {
    * Never throws. An event the ingestor would reject — a blank or over-long
    * `customerId` / `metricName` / `idempotencyKey`, a `quantity` that is not
    * positive or carries more than 14 integer digits / 6 decimal places, an
-   * `occurredAt` that is not an ISO-8601 instant, or any other capped field
-   * that is too long — is NOT queued and NOT sent. It is counted in
+   * `occurredAt` that is not an ISO-8601 instant with seconds and a zone (`Z`
+   * or `±HH:MM`), a `metadata` that is not a plain object, or any other capped
+   * field that is too long — is NOT queued and NOT sent. It is counted in
    * `droppedCount`, WARN-logged with the field and the limit, and passed to
    * the opt-in `onDrop` hook with reason `'invalid'`. After `shutdown()` the
    * event is counted and reported with reason `'closed'`.
@@ -333,6 +335,7 @@ function describeInvalidEvent(event: TrackEvent, resolved: ResolvedEvent): strin
     productType: resolved.productType,
     endpointPath: resolved.endpointPath,
     httpMethod: resolved.httpMethod,
+    metadata: resolved.metadata,
   });
 }
 

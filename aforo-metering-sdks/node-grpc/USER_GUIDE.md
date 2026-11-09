@@ -1,6 +1,6 @@
 # @aforoai/grpc-metering — User Guide
 
-**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Node.js engineers running a `@grpc/grpc-js` server who need per-RPC usage metered into Aforo.
+**Version:** 2.1.1 · **Updated:** 2026-10-26 · **Audience:** Node.js engineers running a `@grpc/grpc-js` server who need per-RPC usage metered into Aforo.
 
 ## What you'll build
 
@@ -71,7 +71,7 @@ server.addService(UserServiceService, {
 What gets counted:
 - **Unary** — `messageCount: 1`.
 - **Server-stream** — counts each `call.write(...)`; one event on close.
-- **Client-stream** — counts each inbound `data`; one event on completion.
+- **Client-stream** — counts each inbound message as grpc-js delivers it, without reading the stream (your handler can await before it starts reading and still gets every message); one event on completion.
 - **Bidi-stream** — counts both inbound and outbound; one event on close.
 
 On a thrown error, the wrapper records the event with the gRPC status label (from `err.code`, defaulting to `UNKNOWN`) and propagates the error to the caller.

@@ -2,7 +2,7 @@
 
 Meter WebSocket connections, frames, and bytes from any Java WebSocket stack. Call three methods from your open/message/close handlers — Jakarta WebSocket, Spring WebSocket, Netty, Undertow — and Aforo handles aggregation, batching, and retry.
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -12,7 +12,7 @@ Intended (once published to Maven Central):
 <dependency>
   <groupId>ai.aforo</groupId>
   <artifactId>ws-metering</artifactId>
-  <version>2.0.0</version>
+  <version>2.1.1</version>
 </dependency>
 ```
 
@@ -136,7 +136,7 @@ Dropped events keep their `idempotencyKey`, so storing them and re-sending later
 
 ## Billing model
 
-Default mode emits **one** `CONNECTION_OPENED` event on `openConnection` (`wsFrameType: OPEN`, metric `websocket_api.connection_opened`) and **one** `CONNECTION_CLOSED` event on `closeConnection` (metric `websocket_api.connection_closed`). A connection you never close is closed for you: after `connectionIdleTimeoutMs` without a frame (default 1 h; `ABNORMAL_CLOSURE`, metadata `closedBy: sdk_idle_timeout`), or by `close()` (`GOING_AWAY`, `closedBy: sdk_shutdown`). `openConnections()` returns how many are tracked. The CLOSE event carries the aggregated `messageCount` (frames in + out), `dataBytes`, `executionDurationMs`, `closeCode`, and a mapped `wsCloseReason`. Set `perFrameEvents(true)` to also emit one event per frame.
+Default mode emits **one** `CONNECTION_OPENED` event on `openConnection` (`wsFrameType: OPEN`, metric `websocket_api.connection_opened`) and **one** `CONNECTION_CLOSED` event on `closeConnection` (metric `websocket_api.connection_closed`). A connection you never close is closed for you: after `connectionIdleTimeoutMs` without a frame (default 1 h; `ABNORMAL_CLOSURE`, metadata `closedBy: sdk_idle_timeout`), or by `close()` (`GOING_AWAY`, `closedBy: sdk_shutdown`). A connection the idle sweep closed is tracked again when it sends its next frame (same id and customer, metadata `resumedAfterIdleSweep: true`, no second `CONNECTION_OPENED`), so its later frames, bytes and close are still metered. `openConnections()` returns how many are tracked. The CLOSE event carries the aggregated `messageCount` (frames in + out), `dataBytes`, `executionDurationMs`, `closeCode`, and a mapped `wsCloseReason`. Set `perFrameEvents(true)` to also emit one event per frame.
 
 Close codes map to descriptor reasons: `1000 → NORMAL_CLOSURE`, `1001 → GOING_AWAY`, `1002/1007 → PROTOCOL_ERROR`, `1003 → UNSUPPORTED_DATA`, `1006 → ABNORMAL_CLOSURE`, `1008 → POLICY_VIOLATION`, `1009 → MESSAGE_TOO_BIG`, `1011 → INTERNAL_ERROR`, codes ≥ 4000 → `IDLE_TIMEOUT`.
 

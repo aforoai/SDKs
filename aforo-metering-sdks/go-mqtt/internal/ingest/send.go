@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -25,6 +26,11 @@ type sendOutcome struct {
 	location   string  // the redirect target host (never the key)
 	status     int     // the last HTTP status seen, 0 for a network error
 	cause      string  // the last failure, for logs and OnError
+	// splitTo > 0: a 429 named an events-per-minute limit below the batch
+	// size; retry holds the batch to requeue in parts of at most splitTo,
+	// after wait.
+	splitTo int
+	wait    time.Duration
 }
 
 // encodeBatch builds {"events":[...]} from pre-serialized events.
@@ -82,20 +88,28 @@ func (c *Client) sendBatch(ctx context.Context, events []Event) sendOutcome {
 			}
 			mid := len(events) / 2
 			first := c.sendBatch(ctx, events[:mid])
-			if first.outage {
+			if first.outage || first.splitTo > 0 {
 				first.retry = append(first.retry, events[mid:]...)
 				return first
 			}
 			second := c.sendBatch(ctx, events[mid:])
 			second.sent += first.sent
 			second.rejected += first.rejected
-			second.retry = append(first.retry, second.retry...)
+			second.retry = append(append([]Event(nil), first.retry...), second.retry...)
 			return second
 		case status == http.StatusUnauthorized || status == http.StatusForbidden:
 			return sendOutcome{retry: events, outage: true, authStatus: status, status: status, cause: fmt.Sprintf("HTTP %d: API key wrong or revoked", status)}
 		case isRetryableStatus(status):
 			retryAfter, hasRetryAfter = ParseRetryAfter(header.Get("Retry-After"), c.cfg.Hooks.Now())
 			cause = fmt.Sprintf("HTTP %d", status)
+			if status == http.StatusTooManyRequests && len(events) > 1 {
+				// An API-key ingest limit (X-RateLimit-Limit, events per minute)
+				// below the batch size refuses the batch every time: split it.
+				if limit := rateLimitEvents(header.Get("X-RateLimit-Limit")); limit > 0 && limit < len(events) {
+					return sendOutcome{retry: events, status: status, cause: cause, splitTo: limit,
+						wait: c.retryDelay(attempt, retryAfter, hasRetryAfter)}
+				}
+			}
 		default:
 			msg := serverMessage(respBody)
 			c.logf("WARN: the ingestor rejected a batch of %d event(s) with HTTP %d: %s", len(events), status, msg)
@@ -110,6 +124,16 @@ func (c *Client) sendBatch(ctx context.Context, events []Event) sendOutcome {
 			return sendOutcome{retry: events, outage: true, status: status, cause: cause}
 		}
 	}
+}
+
+// rateLimitEvents reads X-RateLimit-Limit (events per minute); 0 when it is
+// missing or not a positive whole number.
+func rateLimitEvents(v string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 // isRetryableStatus: 408, 429 and every 5xx (not only 500/502/503/504).
@@ -190,12 +214,21 @@ func (c *Client) post(ctx context.Context, body []byte, gzipped bool) (int, http
 	return resp.StatusCode, resp.Header, respBody, nil
 }
 
-// scrubKey makes sure no error string carries the API key.
+// scrubKey makes sure no error string carries the API key, as it is or in
+// the escaped form %q would print.
 func scrubKey(err error, key string) error {
-	if key == "" || !strings.Contains(err.Error(), key) {
+	if key == "" {
 		return err
 	}
-	return errors.New(strings.ReplaceAll(err.Error(), key, "[REDACTED]"))
+	msg := err.Error()
+	out := strings.ReplaceAll(msg, key, "[REDACTED]")
+	if q := strconv.Quote(key); len(q) > 2 {
+		out = strings.ReplaceAll(out, q[1:len(q)-1], "[REDACTED]")
+	}
+	if out == msg {
+		return err
+	}
+	return errors.New(out)
 }
 
 type batchResponse struct {

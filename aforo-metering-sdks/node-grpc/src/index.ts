@@ -121,7 +121,7 @@ export interface AforoGrpcConfig {
  */
 export type DropReason = 'overflow' | 'retry_exhausted' | 'rejected' | 'invalid' | 'shutdown' | 'closed';
 
-const SDK_VERSION = '2.1.0';
+const SDK_VERSION = '2.1.1';
 /** Default top-level `productType` for this SDK. */
 export const DEFAULT_PRODUCT_TYPE = 'GRPC_API';
 /** usage-ingestor limits (IngestUsageEventRequest). */
@@ -336,7 +336,7 @@ export class AforoGrpcBilling {
       const start = Date.now();
       const customerId = this.customerOf(call);
       let messageCount = 0;
-      call.on('data', () => { messageCount++; });
+      countInbound(call, () => { messageCount++; });
 
       handler(call)
         .then((res) => {
@@ -360,7 +360,7 @@ export class AforoGrpcBilling {
       const start = Date.now();
       const customerId = this.customerOf(call);
       let messageCount = 0;
-      call.on('data', () => { messageCount++; });
+      countInbound(call, () => { messageCount++; });
       const origWrite = call.write.bind(call);
       call.write = ((chunk: Res): boolean => {
         messageCount++;
@@ -431,8 +431,8 @@ export class AforoGrpcBilling {
     const executionStatus = explicit.status ?? outcomeFromGrpcStatus(outcome.code);
     if (executionStatus) event.executionStatus = executionStatus;
 
-    // An event the ingestor would reject is not sent (one bad event fails its
-    // whole batch): it is dropped here with reason 'invalid', never thrown
+    // An event the ingestor would reject is not sent (the refusal would only
+    // show up on a background flush): it is dropped here with reason 'invalid', never thrown
     // into the RPC path.
     const invalid =
       (typeof customerId !== 'string' || !customerId.trim()
@@ -586,6 +586,22 @@ function resolveExplicitStatus<Call>(
     }
   }
   return opt;
+}
+
+/**
+ * Count each message grpc-js delivers into a client-stream / bidi call without
+ * reading the stream: grpc-js hands every inbound message to `call.push()`, so
+ * that is wrapped. A `data` listener would switch the stream to flowing mode
+ * before the handler runs, and a handler that awaits anything before reading
+ * would lose every message that arrived meanwhile.
+ */
+function countInbound(call: any, onMessage: () => void): void {
+  if (typeof call?.push !== 'function') return;
+  const origPush = call.push.bind(call);
+  call.push = (chunk: unknown, encoding?: unknown) => {
+    if (chunk !== null && chunk !== undefined) onMessage();
+    return origPush(chunk, encoding);
+  };
 }
 
 function errorCode(err: { code?: unknown } | undefined): number {

@@ -2,7 +2,7 @@
 
 Meter AI agent runs from Python: record each capability invocation and reasoning step as an `AI_AGENT` usage event, buffered and batched to Aforo. For agent runtimes such as LangChain, LlamaIndex, CrewAI, AutoGen and FastAPI-hosted agents. Python sibling of `@aforoai/agent-metering` (Node).
 
-**Version:** 1.0.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 1.1.1 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -76,7 +76,7 @@ The decorator needs to know who to bill. Give it one of:
 - `trust_customer_header=True` — bills the call's `customer_id` keyword argument. Only when that value comes from your own trusted code, not from an end user.
 - `default_customer_id` on the client — bills every call to that customer (single-customer deployments).
 
-With none of these, decorating raises `ValueError`. `agent_id` is read from the call's keyword arguments; a call without one is not sent (reason `invalid`). Before 1.0.0 a missing customer was billed to the `agent_id`, and a missing agent to `"unknown"`.
+With none of these, decorating raises `ValueError`. When you pass a `customer_resolver` and it raises or returns nothing, the call is not sent (reason `invalid`) even if the client has a `default_customer_id`: the default never stands in for a failed lookup. `agent_id` and `session_id` are read from the call's keyword arguments; a call without either is not sent (reason `invalid`) — the ingestor rejects an AI_AGENT event without a session. Before 1.0.0 a missing customer was billed to the `agent_id`, and a missing agent to `"unknown"`.
 
 The decorator times the handler, records one invocation when it finishes, and re-raises whatever the handler raised. Status: returned → `SUCCESS`; `TimeoutError` → `TIMEOUT`; any other exception → `ERROR`; `asyncio.CancelledError` / `KeyboardInterrupt` / `SystemExit` → `CANCELLED`. The handler must be `async def`.
 
@@ -100,6 +100,7 @@ The decorator times the handler, records one invocation when it finishes, and re
 | `on_error` | `Callable[[Exception], None]?` | logs at debug | Receives a `TransportError`; branch on `.kind`: `outage` / `auth` (events still queued and retried), `rejected` (the ingestor refused them; message carries its `errors[].message`), `shutdown`, `closed`. `.events` and `.status` say which events and which HTTP status. |
 | `on_drop` | `Callable[[list[dict], str], None]?` | `None` | Opt-in hook for events the SDK loses for good. |
 | `post_fn` | `PostFn?` | `None` (httpx) | Async `(url, headers, body) -> (status, body[, retry_after])` used instead of httpx, for tests. Runs on the sender thread. |
+| `compression` | `str` | `"gzip"` | `"gzip"` sends batches of 1 KiB or more with `Content-Encoding: gzip` (needs usage-ingestor wave 8 or later); `"none"` always sends plain JSON. Always off with `post_fn`, which receives the JSON as text. |
 
 ### Execution status
 
@@ -117,11 +118,13 @@ One background thread sends, one request at a time, over one pooled connection. 
 | `shutdown` | Still queued when `shutdown()` or the exit hook reached `shutdown_timeout_sec`. |
 | `closed` | Recorded after `shutdown()`. |
 | `rejected` | A non-retryable 4xx for the batch (`on_error` gets the ingestor's `errors[].message`), a batch that could not be JSON-encoded, or events the ingestor rejected individually in a `202`. For a `202`, only the events the response names by index are passed to the hook; if it names none, they are counted only. |
-| `invalid` | The SDK refused the event before queueing it: no customer (none passed and no `default_customer_id`), blank `capability_name` / `agent_id` (or `session_id` / `step_type` for a step), `agent_id` over 36 characters, `session_id`, `customer_id` or `capability_name` over 64 UTF-16 code units. Nothing passed to `record_*` or to the decorator is truncated. The one exception: a capability name that `wrap_capability_handler` reads from the wrapped call's `capability_name` kwarg is truncated to 64 and the event is still sent. The WARN names the field and limit; it is logged on the first occurrence and then every 1000th. |
+| `invalid` | The SDK refused the event before queueing it: no customer (none passed and no `default_customer_id`, or the decorator's `customer_resolver` found none), blank `capability_name` / `agent_id` / `session_id` (the ingestor requires a session on every AI_AGENT event; `step_type` too for a step), `agent_id` over 36 characters, `session_id`, `customer_id` or `capability_name` over 64 UTF-16 code units, `trace_id` over 128, a token count that is not a whole number (`None` counts as 0; `"84"` and `84.0` are accepted), `metadata` that is not a dict. Nothing passed to `record_*` or to the decorator is truncated. The one exception: a capability name that `wrap_capability_handler` reads from the wrapped call's `capability_name` kwarg is truncated to 64 and the event is still sent. The WARN names the field and limit; it is logged on the first occurrence and then every 1000th. |
 
 ## Wire format
 
-Each event carries top-level `customerId`, `metricName` (`ai_agent.capability_invocations` or `ai_agent.steps`), `quantity` 1, `occurredAt`, `idempotencyKey` (`agent:<uuid4>`, minted once when the event is created), `productType`, `agentId`, `sessionId`, `executionDurationMs`, optional `executionStatus`, and `metadata` with `capability_name` (snake_case — the key the ingestor maps to the per-capability billing dimension), token counts and `sdkVersion`.
+Each event carries top-level `customerId`, `metricName` (`ai_agent.capability_invocations` or `ai_agent.steps`), `quantity` 1, `occurredAt` (UTC, milliseconds, `Z`; always stamped by the SDK), `idempotencyKey` (`agent:<uuid4>`, minted once when the event is created), `productType`, `agentId`, `sessionId`, `traceId`, `executionDurationMs`, optional `executionStatus`, and `metadata` with `capability_name` (snake_case — the key the ingestor maps to the per-capability billing dimension), token counts and `sdkVersion`.
+
+`traceId` is how the ingestor groups an agent session's steps, tokens and cost. It is 32 lowercase hex characters, like `@aforoai/agent-metering` (Node): `record_*(..., trace_id=...)` if you pass one, otherwise `session_trace_id(product_id, customer_id, agent_id, session_id)`, so every process that records the same session sends the same one. Token counts go in `metadata.input_tokens` / `metadata.output_tokens`, the keys Node sends and the ingestor reads for COGS and session totals; `inputTokens`, `outputTokens` and `totalTokens` are still sent. An `execution_duration_ms` a Java `int` cannot hold (the ingestor stores `executionDurationMs` as one) is left off, the event is still sent, and one WARNING is logged per client.
 
 The endpoint path and body shape are checked against `contract/ingest-contract.json` by this package's tests.
 

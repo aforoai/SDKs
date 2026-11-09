@@ -2,7 +2,7 @@
 
 Track API usage events from any Python service and let Aforo handle buffering, batching, and retry — plus drop-in middleware for FastAPI, Django, and Flask that meters every request without touching your handlers.
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -72,7 +72,7 @@ Pass these as keyword args to `AforoClient(...)`, or build an `AforoOptions` and
 
 | Option | Type | Default | What it does |
 |---|---|---|---|
-| `api_key` | `str` | — (required) | Aforo API key, sent as `X-API-Key` on every batch. |
+| `api_key` | `str` | — (required) | Aforo API key, sent as `X-API-Key` on every batch. Surrounding whitespace (a trailing newline from a secret file) is stripped; a key that still contains whitespace, control or non-ASCII characters raises `ValueError`. |
 | `base_url` | `str` | `https://api.aforo.ai` | Ingestor host. `/v1/ingest/batch` is appended automatically. |
 | `product_type` | `str` | `"API"` | Top-level `productType` on every event (`API`, `AGENTIC_API`, `AI_AGENT`, `MCP_SERVER`, `GRPC_API`, `GRAPHQL_API`, `WEBSOCKET_API`, `MQTT_BROKER`); required by the production ingestor. Trimmed + upper-cased; override per event with `track(product_type=...)`. |
 | `flush_count` | `int` | `500` | Events per request, and the queue size that wakes the sender early (clamped to 1..1000, the ingestor's limit). A batch whose JSON body would exceed 4 MiB is split. |
@@ -84,12 +84,11 @@ Pass these as keyword args to `AforoClient(...)`, or build an `AforoOptions` and
 | `shutdown_timeout` | `float` | `5.0` | `shutdown()` flushes for at most this long; what is still queued is dropped with reason `shutdown`. |
 | `allow_insecure_http` | `bool` | `False` | Allow a plain `http://` `base_url` on a host other than localhost. |
 | `heartbeat_interval` | `float` | `30.0` | Seconds between session heartbeats (see `start_session`). |
-
 | `on_drop` | `callable?` | `None` | Opt-in hook `on_drop(events, reason)` for events the SDK loses. See [Dropped events](#dropped-events-dropped_count-on_drop). |
 | `on_error` | `callable?` | `None` | Opt-in hook for delivery problems. Receives an `aforo.TransportError`; branch on `.kind`: `outage` / `auth` (still queued, retried), `rejected`, `shutdown`, `closed`. `.events` and `.status` carry the events and HTTP status. |
 | `on_accepted` | `callable?` | `None` | Opt-in hook `on_accepted(body, events)` after every accepted batch, with the ingestor's response `data` (for example `killedSessionIds`). |
 
-Retry rules, fixed in the transport and not configurable beyond the values above: retry on network errors, timeouts, **every 5xx, 408, 429**; honor `Retry-After` in both forms (seconds or an HTTP date), capped at 60 s. After the last retry, or on **401/403** (logged at ERROR: the key is wrong or revoked), the batch goes back to the front of the queue and the sender pauses: a random time up to 5 s (never under 250 ms), the ceiling doubling up to 5 min while the outage lasts. A **3xx redirect** is never followed — the API key must not reach another host — and is handled like 401/403, with an ERROR naming the host it pointed to (fix `base_url`). Events the ingestor marks `retryable` inside a 2xx are re-sent with the same keys after the same backoff, at most `max_retries` times, then treated as an outage. `timeout` covers the whole request, including reading the response body. An event that cannot be turned into JSON (a cycle, `NaN`, an object JSON does not know) is dropped as `invalid` inside `track()` and never reaches a batch. A **413** splits the batch in half. Other 4xx are never retried: the batch is dropped with reason `rejected`. Batches of 1 KiB or more are sent with `Content-Encoding: gzip` (needs usage-ingestor wave 8 or later); `compression="none"` always sends plain JSON.
+Retry rules, fixed in the transport and not configurable beyond the values above: retry on network errors, timeouts, **every 5xx, 408, 429**; honor `Retry-After` in both forms (seconds or an HTTP date), capped at 60 s. After the last retry, or on **401/403** (logged at ERROR: the key is wrong or revoked), the batch goes back to the front of the queue and the sender pauses: a random time up to 5 s (never under 250 ms), the ceiling doubling up to 5 min while the outage lasts. A **3xx redirect** is never followed — the API key must not reach another host — and is handled like 401/403, with an ERROR naming the host it pointed to (fix `base_url`). Events the ingestor marks `retryable` inside a 2xx are re-sent with the same keys after the same backoff, at most `max_retries` times, then treated as an outage. `timeout` covers the whole request, including reading the response body. An event that cannot be turned into JSON (a cycle, `NaN`, an object JSON does not know) is dropped as `invalid` inside `track()` and never reaches a batch. A **413** splits the batch in half. A **429** that carries `X-RateLimit-Limit` (the API key's events per minute) below the batch's size puts the batch back at the head of the queue, in order, and sends it in parts of at most that many events. Other 4xx are never retried: the batch is dropped with reason `rejected`. Batches of 1 KiB or more are sent with `Content-Encoding: gzip` (needs usage-ingestor wave 8 or later); `compression="none"` always sends plain JSON.
 
 ### Reporting the request outcome (`execution_status`)
 
@@ -105,7 +104,7 @@ Retry rules, fixed in the transport and not configurable beyond the values above
 | `shutdown` | Still queued when `shutdown()` reached `shutdown_timeout`. |
 | `closed` | `track()` was called after `shutdown()`. |
 | `rejected` | The ingestor answered a non-retryable 4xx for the batch, or rejected individual events in a `202` (`failed` / `errors[]`). Only the events the response names by index are passed to the hook; if it names none, they are counted only. |
-| `invalid` | `track()` refused the event before queueing it: blank `customer_id` / `metric_name`, `quantity <= 0`, a malformed `occurred_at`, or a field over the ingestor's limit (`customerId` 64, `metricName` 255, `idempotencyKey` 255, `productType` 20, `quantity` 14 integer / 6 decimal digits, and the `extra_fields` limits in `aforo/limits.py`). Lengths count UTF-16 units, as the ingestor does (an emoji is 2). Never truncated or rounded. Also: a middleware request whose customer resolver returned nothing (counted, no event). The WARN is logged on the first occurrence and then every 1000th. |
+| `invalid` | `track()` refused the event before queueing it: blank `customer_id` / `metric_name`, `quantity <= 0`, an `occurred_at` without seconds or a zone (`datetime.utcnow().isoformat()` has none; `datetime.now(timezone.utc).isoformat()` works), a `metadata` that is not a dict, or a field over the ingestor's limit (`customerId` 64, `metricName` 255, `idempotencyKey` 255, `productType` 20, `quantity` 14 integer / 6 decimal digits, and the `extra_fields` limits in `aforo/limits.py`). Lengths count UTF-16 units, as the ingestor does (an emoji is 2). Never truncated or rounded. Also: a middleware request whose customer resolver returned nothing (counted, no event). The WARN is logged on the first occurrence and then every 1000th. |
 | `retry_exhausted` | Kept for compatibility; no longer reported (an outage requeues). |
 
 A failed session heartbeat is not a usage drop and is not counted.
@@ -114,12 +113,14 @@ A failed session heartbeat is not a usage drop and is not counted.
 
 Each adapter constructs its own `AforoClient` and emits one event per request.
 
-- **Metric:** `metric_name` — a fixed name or a callable; default `"api_calls"` (`aforo.DEFAULT_METRIC_NAME`). The metric must exist in your tenant's Aforo catalog: the ingestor rejects an unknown metric, and because it validates a batch as a whole, one rejected event fails every event in that batch.
+- **Metric:** `metric_name` — a fixed name or a callable; default `"api_calls"` (`aforo.DEFAULT_METRIC_NAME`). The metric must exist in your tenant's Aforo catalog: the ingestor rejects every event that names an unknown metric (each event is checked on its own, so the rest of the batch is still stored).
 - **Customer (required):** `customer_resolver` — `callable(request)` (FastAPI: the ASGI scope) returning the customer id from identity your service verified: the session, a JWT subject, an API-key lookup. Django ships `aforo.middleware.django.user_id_resolver` (the authenticated user's id). To read the `X-Customer-Id` header instead, pass `trust_customer_header=True` — the caller of your API controls that header, so do it only behind a gateway that sets it. With neither, the middleware raises `ValueError` at start-up. A request whose resolver returns nothing is served normally, not metered, and counted as an `invalid` drop. `customer_id` (a callable or one fixed id) still works as the old name of `customer_resolver`. The caller's `X-Api-Key` is never used.
 - **Product type:** `product_type` (Flask kwarg / `AFORO_PRODUCT_TYPE` config, Django `AFORO_PRODUCT_TYPE` setting, FastAPI kwarg) — default `"API"`.
 - Every event carries top-level `endpointPath` (path without query string), `httpMethod`, `statusCode` and `responseTimeMs`. A `quantity` resolving to `<= 0` is not metered.
 - `endpointPath` and `httpMethod` are read from the incoming request. A value over the ingestor's limit (512 / 16 characters, counted in UTF-16 code units) is truncated to the limit and the event is still sent; a WARNING is logged once per field per process. Fields you set yourself (`customer_id`, `metric_name`, `idempotency_key`, anything in `extra_fields`) are never truncated: an over-long one drops the event with reason `invalid`.
 - **CORS preflights** (`OPTIONS`) are never metered.
+- **`exclude_paths`** — each entry excludes that path and everything below it, on a path-segment boundary: `/health` covers `/health/db`, not `/healthcare`. Defaults: `/health`, `/ready`, `/metrics`, `/favicon.ico`, plus `/openapi.json` and `/docs` on FastAPI, `/admin` and `/static` on Django, `/static` on Flask. `exclude_paths=[]` meters every path.
+- **Errors:** a request whose handler raises is metered with `statusCode` 500 (FastAPI, Flask and Django alike); the exception is not swallowed. A customer resolver that raises is treated as "no customer": not metered, counted as an `invalid` drop.
 
 ```python
 # FastAPI / Starlette -- callables receive the ASGI scope
@@ -128,13 +129,15 @@ app.add_middleware(AforoMeteringMiddleware, api_key=os.environ["AFORO_API_KEY"],
                    customer_resolver=lambda scope: scope["user"].customer_id,  # set by your auth middleware
                    metric_name="api_calls", product_type="API")
 
-# Flask -- metric_name(request, response), customer_resolver(request); or AFORO_* config
+# Flask -- metric_name(request, response), customer_resolver(request); quantity / metadata are a
+# value or callable(request[, response]); flush_count / flush_interval / max_queue_size go to the client
 from flask import g
 from aforo.middleware.flask import AforoMetering
 AforoMetering(app, api_key=os.environ["AFORO_API_KEY"], metric_name="api_calls",
               customer_resolver=lambda req: g.current_user.customer_id)
 
-# Django settings.py -- AFORO_CUSTOMER_RESOLVER: callable(request) or its dotted path
+# Django settings.py -- AFORO_CUSTOMER_RESOLVER: callable(request) or its dotted path (a dotted path
+# that does not import raises ValueError at start-up; any other string is one fixed customer id)
 MIDDLEWARE = [..., "aforo.middleware.django.AforoMeteringMiddleware"]
 AFORO_API_KEY = os.environ["AFORO_API_KEY"]
 AFORO_CUSTOMER_RESOLVER = "aforo.middleware.django.user_id_resolver"

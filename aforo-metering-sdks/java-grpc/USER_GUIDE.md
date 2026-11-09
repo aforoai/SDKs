@@ -1,6 +1,6 @@
 # ai.aforo:grpc-metering — User Guide
 
-**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Java engineers running a `grpc-java` server who need per-RPC usage metering.
+**Version:** 2.1.1 · **Updated:** 2026-10-26 · **Audience:** Java engineers running a `grpc-java` server who need per-RPC usage metering.
 
 ## What you'll build
 
@@ -27,7 +27,7 @@ Add to your service's `pom.xml`:
 <dependency>
   <groupId>ai.aforo</groupId>
   <artifactId>grpc-metering</artifactId>
-  <version>2.0.0</version>
+  <version>2.1.1</version>
 </dependency>
 ```
 

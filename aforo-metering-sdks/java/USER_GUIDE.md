@@ -1,6 +1,6 @@
 # ai.aforo:metering — User Guide
 
-**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Java backend engineers wiring usage metering into a service (plain Java or Spring Boot 3.x).
+**Version:** 2.1.1 · **Updated:** 2026-10-26 · **Audience:** Java backend engineers wiring usage metering into a service (plain Java or Spring Boot 3.x).
 
 ## What you'll build
 
@@ -29,7 +29,7 @@ Then add the dependency to your service's `pom.xml`:
 <dependency>
   <groupId>ai.aforo</groupId>
   <artifactId>metering</artifactId>
-  <version>2.0.0</version>
+  <version>2.1.1</version>
 </dependency>
 ```
 
@@ -97,11 +97,11 @@ AforoServletFilter.CustomerIdResolver aforoCustomerIdResolver(AccountService acc
 - an `AforoClient` bean, closed in Spring's stop phase by `AforoClientLifecycle` (no JVM shutdown hook), and
 - `AforoServletFilter` mapped to `/*` at `order = Integer.MAX_VALUE` (runs last), in servlet web applications.
 
-The filter records one event per request **after** `filterChain.doFilter(...)` returns:
+The filter records one event per request **after** `filterChain.doFilter(...)` returns (an async request when it completes, with its final status; a request whose handler throws with status 500):
 
 - `metricName` = `aforo.metric-name` (default `api_calls`), or whatever an `AforoServletFilter.MetricNameResolver` bean returns for the request. The metric must exist in your tenant's Aforo catalog: the ingestor rejects events for an unknown metric, and they are dropped with reason `REJECTED`. (Earlier versions sent `"<METHOD> <normalized-path>"`, which no catalog contains.)
 - `quantity` = `1`, `metadata` = `{"gateway":"java-servlet","status":<httpStatus>}`, plus top-level `endpointPath` (matched route pattern, else the normalized path; no query string; at most 512 chars), `httpMethod`, `statusCode`, `responseTimeMs`, and `productType` (`AforoServletFilter.productType(...)`, else `aforo.product-type`, default `API`).
-- These paths are skipped by default: `/health`, `/ready`, `/metrics`, `/favicon.ico`, `/actuator`. `OPTIONS` (CORS preflight) requests are never metered.
+- These paths are skipped by default: `/health`, `/ready`, `/metrics`, `/favicon.ico`, `/actuator`, each with everything under it (`/health/live`), compared without the context path; `/healthcare` is metered. `OPTIONS` (CORS preflight) requests are never metered.
 
 > ⚠ The filter resolves the customer in this order: your `AforoServletFilter.CustomerIdResolver` bean; else the principal name (only with `aforo.use-principal-as-customer-id: true`); else the `aforo.customer-id-header` header (default `X-Customer-Id`) only with `aforo.trust-customer-header: true`. With none of the three the application fails to start. The header is set by whoever calls your API, so trust it only when a gateway in front of the app sets it. The caller's `X-Api-Key` is never used. A request with no customer is served normally; its event is not sent and is counted as `INVALID`.
 

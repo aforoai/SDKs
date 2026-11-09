@@ -36,12 +36,13 @@ off the event and the event is still sent (see ``normalize_execution_status``).
 from __future__ import annotations
 
 import logging
-import re
 import threading
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Optional
 
-#: Characters the ingestor accepts per string field (``@Size(max=...)``).
+#: Characters the ingestor accepts per string field (``@Size(max=...)``); the
+#: ``maxLength`` values of ``contract/ingest-contract.json`` -> ``schemas.ingestEvent``,
+#: except ``executionStatus`` (an unknown or over-long status is left off, not dropped).
 MAX_LENGTHS = {
     "customerId": 64,
     "metricName": 255,
@@ -62,6 +63,16 @@ MAX_LENGTHS = {
     "wsConnectionId": 64,
     "mqttTopic": 500,
     "mqttClientId": 128,
+    "parentStepId": 64,
+    "grpcStatusCode": 24,
+    "grpcCallType": 20,
+    "gqlOperationType": 20,
+    "wsDirection": 24,
+    "wsFrameType": 16,
+    "wsCloseReason": 32,
+    "mqttEventType": 24,
+    "sessionBoundary": 20,
+    "teamId": 36,
 }
 
 logger = logging.getLogger("aforo.limits")
@@ -104,12 +115,11 @@ def truncate_label(field: str, value: Any) -> Any:
 MAX_QUANTITY_INTEGER_DIGITS = 14
 MAX_QUANTITY_DECIMAL_PLACES = 6
 
-# ISO-8601 date-time, the shape Jackson reads into an Instant. The zone
-# designator is optional: an offset-less value is not provably rejected, and
-# falsely rejecting one would drop a billable event.
-_ISO_DATE_TIME = re.compile(
-    r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?([Zz]|[+-]\d{2}:?\d{2})?$"
-)
+# ISO-8601 instant, the shape Jackson reads into java.time.Instant: seconds and
+# a zone (Z or +HH:MM) are required. Jackson cannot read an offset-less value
+# such as datetime.utcnow().isoformat(), and that failure rejects the WHOLE
+# batch body (every event in it), so such an event is refused here instead.
+from ._transport.wire import ISO_INSTANT as _ISO_DATE_TIME  # noqa: E402
 
 
 def _length_error(field: str, value: Any) -> Optional[str]:
@@ -137,8 +147,10 @@ def _quantity_error(quantity: Any) -> Optional[str]:
     sign, digits, exponent = decimal.as_tuple()
     if not isinstance(exponent, int):
         return None  # NaN / Infinity — again not this check's job
+    # Counted as the server's @Digits counts a BigDecimal: integer digits =
+    # precision - scale, so an exponent counts (1e+16 has 17 integer digits).
     decimal_places = max(-exponent, 0)
-    integer_digits = len(digits) - decimal_places
+    integer_digits = len(digits) + exponent
     if integer_digits > MAX_QUANTITY_INTEGER_DIGITS:
         return (
             f"quantity {quantity} has {integer_digits} integer digits, exceeding the "
@@ -160,8 +172,9 @@ def _occurred_at_error(occurred_at: Any) -> Optional[str]:
         return None
     if not _ISO_DATE_TIME.match(str(occurred_at)):
         return (
-            f'occurred_at "{occurred_at}" is not an ISO-8601 timestamp '
-            '(expected e.g. "2026-03-01T14:30:00Z").'
+            f'occurred_at "{occurred_at}" is not an ISO-8601 instant with seconds and a zone '
+            '(expected e.g. "2026-03-01T14:30:00Z" or "2026-03-01T14:30:00+05:30"; '
+            'datetime.now(timezone.utc).isoformat() works).'
         )
     return None
 

@@ -2,6 +2,29 @@
 
 All notable changes to `aforo-metering` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [2.1.1] - 2026-11-09
+
+### Fixed
+- **An event that cannot be sent no longer stops the sender thread.** A string with a lone surrogate (what `json.loads` returns for `"\ud800"`) passed the JSON check, then failed to encode on the sender thread, which died: its batch was lost unreported and every later event stayed queued. It is now dropped as `invalid` when it is recorded, and the sender survives any unexpected error (the batch concerned is reported as `invalid`).
+- **Per-event `retryable` re-sends are encoded afresh.** The smaller re-sent body kept the first body's gzip flag and went out as plain JSON labelled `Content-Encoding: gzip`; the ingestor answered 400 and the events were dropped as `rejected`.
+- **An event the ingestor cannot read at all is refused when it is recorded.** usage-ingestor reads the whole batch body before it checks any one event, so such a value failed every event of the batch with 400. Now dropped as `invalid`: an `occurredAt` without seconds or a zone (`Z` or `+HH:MM`), a `metadata` / `trace` that is not an object, a `quantity` that is not a number, an object where a string belongs. An optional integer field out of the range the ingestor stores (for example `executionDurationMs` past 2^31 ms) is left off and the event kept.
+- **The API key is stripped and checked.** A key read with a trailing newline was sent raw: every request failed and the HTTP library's error, which quotes the header value, put the key into the WARNING log and `on_error`. Surrounding whitespace is now stripped; a key that still holds whitespace, control or non-ASCII characters raises `ValueError` (the key is not shown). Failure text and ingestor messages are redacted of the key before they are logged or passed to `on_error`.
+- **A `multiprocessing` child flushes at exit.** A forked child leaves with `os._exit()`, which skips `atexit`, so what it tracked in its last seconds was lost unreported. The client now also registers a multiprocessing exit finalizer, re-registered in each forked child.
+- **429 with a per-key limit below the batch size.** When the ingestor answers 429 with `X-RateLimit-Limit` (events per minute for the API key) lower than the batch's event count, the batch goes back to the head of the queue, in order, and is sent in parts of at most that many events; batches stay that small while the ingestor reports the limit. Otherwise 429 is retried as before.
+- **`occurred_at` must carry seconds and a zone.** `datetime.utcnow().isoformat()` (no zone) passed the check and made the ingestor reject the whole batch; it is now dropped as `invalid`. `datetime.now(timezone.utc).isoformat()` works. A non-dict `metadata` or `extra_fields` is dropped as `invalid` instead of failing the batch or raising.
+- **`quantity` written with an exponent is checked.** `1e16` was counted as one integer digit and passed; it has 17, as the ingestor counts it.
+- **All the ingestor's string limits are checked**, taken from `contract/ingest-contract.json`: `teamId`, `parentStepId`, `sessionBoundary` and the protocol labels were missing.
+- **`exclude_paths` match on path-segment boundaries** (all middlewares): `/health` excludes `/health` and `/health/db`, no longer `/healthcare/patients`; `/static` no longer excludes `/static-maps`.
+- **FastAPI / Starlette:** `/openapi.json` and `/docs` are excluded by default, as documented (the defaults never applied); `exclude_paths=[]` meters every path. A request whose handler raises is metered with `statusCode` 500, as Flask and Django already did; the exception still propagates.
+- **Flask** honours `quantity`, `metadata`, `flush_count`, `flush_interval` and `max_queue_size`; they were silently ignored, so `quantity=3` billed 1.
+- **Django:** an `AFORO_CUSTOMER_RESOLVER` / `AFORO_CUSTOMER_ID` value shaped like a dotted path that does not import raises `ValueError` at start-up. A typo used to bill every request to the literal string.
+- **A customer resolver that raises** is counted as an `invalid` drop (FastAPI, Flask, Django); it was logged at debug and not counted.
+
+## [2.1.0] - 2026-10-30
+
+### Changed
+- **Batches are gzip-compressed by default** (wave 8, G269): a body of 1 KiB or more is sent with `Content-Encoding: gzip`, compressed once and re-sent unchanged on every retry; smaller bodies go plain. Needs usage-ingestor wave 8 or later. `compression="none"` always sends plain JSON.
+
 ## [2.0.0] - 2026-10-26
 
 Breaking. Migration: give every middleware a `customer_resolver` (or set `trust_customer_header=True` to keep reading `X-Customer-Id`); stop catching `RuntimeError` from `track()` after shutdown; use `https://` for `base_url` (or `allow_insecure_http=True`).

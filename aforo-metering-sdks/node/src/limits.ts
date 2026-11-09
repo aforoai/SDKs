@@ -65,13 +65,14 @@ export const MAX_QUANTITY_DECIMAL_PLACES = 6;
 
 
 /**
- * ISO-8601 date-time, the shape Jackson can read into an `Instant`. The zone
- * designator is optional here: the ingestor's example values all carry `Z`, but
- * an offset-less value is not provably rejected, and falsely rejecting one
- * would drop a billable event.
+ * ISO-8601 instant, the shape the ingestor's Jackson can read into an
+ * `Instant`: seconds required, zone `Z` or `±HH:MM`. A value without a zone,
+ * without seconds, or with a colon-less offset (`+0530`) is not just refused:
+ * Jackson fails the whole request, so the ingestor answers 400 for every event
+ * in the batch (verified against usage-ingestor main, 2026-11-09).
  */
 const ISO_DATE_TIME =
-  /^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?([Zz]|[+-]\d{2}:?\d{2})?$/;
+  /^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d{1,9})?([Zz]|[+-]\d{2}:\d{2})$/;
 
 /** Fields whose length the ingestor caps, checked when the caller sets them. */
 type LengthCheckedField = keyof typeof MAX_LENGTHS;
@@ -177,10 +178,10 @@ function quantityError(quantity: number): string | null {
 
 function occurredAtError(occurredAt: string): string | null {
   if (!ISO_DATE_TIME.test(occurredAt)) {
-    return `occurredAt "${String(occurredAt).slice(0, 80)}" is not an ISO-8601 timestamp `
-      + '(expected e.g. "2026-03-01T14:30:00Z").';
+    return `occurredAt "${String(occurredAt).slice(0, 80)}" is not an ISO-8601 instant with seconds and a zone `
+      + '(expected e.g. "2026-03-01T14:30:00Z" or "2026-03-01T20:00:00+05:30").';
   }
-  if (Number.isNaN(Date.parse(occurredAt))) {
+  if (Number.isNaN(Date.parse(occurredAt.toUpperCase()))) {
     return `occurredAt "${String(occurredAt).slice(0, 80)}" is not a valid date.`;
   }
   return null;
@@ -209,6 +210,15 @@ export interface LimitCheckedEvent {
   wsConnectionId?: unknown;
   mqttTopic?: unknown;
   mqttClientId?: unknown;
+  /** Must be a plain object when present: anything else makes the ingestor refuse the whole batch. */
+  metadata?: unknown;
+}
+
+/** `{}`-style object: what the ingestor's `Map<String, Object> metadata` can bind. */
+function isPlainObject(value: unknown): boolean {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
 }
 
 /**
@@ -229,6 +239,12 @@ export function describeLimitViolation(event: LimitCheckedEvent): string | null 
 
   const quantityProblem = quantityError(event.quantity);
   if (quantityProblem) return quantityProblem;
+
+  if (event.metadata !== undefined && event.metadata !== null && !isPlainObject(event.metadata)) {
+    const kind = Array.isArray(event.metadata) ? 'an array' : typeof event.metadata;
+    return `metadata must be a plain object of key/value pairs (got ${kind}); the ingestor would refuse `
+      + 'the whole batch it is sent in.';
+  }
 
   return occurredAtError(event.occurredAt);
 }

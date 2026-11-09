@@ -12,7 +12,7 @@ import type { Principal } from '../types.js';
 import { readBody } from '../auth/ListenerGuard.js';
 import { SseParser, sseMessage } from '../util/sse.js';
 import { logger } from '../util/logger.js';
-import { upstreamDeadline, readCappedText, upstreamFailure, DEFAULT_UPSTREAM_TIMEOUT_MS } from '../util/upstream.js';
+import { upstreamDeadline, readCappedText, upstreamFailure, upstreamNeverAnswered, DEFAULT_UPSTREAM_TIMEOUT_MS } from '../util/upstream.js';
 import { BaseProxy } from './BaseProxy.js';
 
 /** Request headers passed to the upstream (never Authorization: the proxy's token is not the server's). */
@@ -91,8 +91,10 @@ export class StreamableHttpProxy extends BaseProxy {
     const finish = () => { if (ephemeral) this.sessionManager.endSession(sessionId); };
 
     let deadline: ReturnType<typeof upstreamDeadline> | undefined;
+    let tracked: Array<string | number> = [];
     try {
       const result = await this.handleClientMessage(body, sessionId, principal);
+      tracked = result.tracked;
       const echo = mcpSessionId ? { 'Mcp-Session-Id': mcpSessionId } : {};
 
       if (!result.forward) {
@@ -138,7 +140,10 @@ export class StreamableHttpProxy extends BaseProxy {
       // Regular JSON response (or an empty 202 for notifications).
       const responseBody = await readCappedText(upstreamRes);
       deadline.done();
-      this.handleServerMessage(responseBody, sessionId);
+      const answered = this.handleServerMessage(responseBody, sessionId);
+      // An HTTP error (e.g. 404 for an expired session) without a JSON-RPC answer:
+      // the server did not run those calls, so they are not billed.
+      if (!upstreamRes.ok) this.forgetUnanswered(sessionId, tracked, answered);
       const merged = result.response ? mergeResponses(responseBody, result.response) : undefined;
       res.writeHead(merged !== undefined ? 200 : upstreamRes.status, {
         'Content-Type': merged !== undefined ? 'application/json' : (contentType || 'application/json'),
@@ -149,6 +154,10 @@ export class StreamableHttpProxy extends BaseProxy {
       finish();
     } catch (err) {
       deadline?.done();
+      // The upstream gave no HTTP answer at all (refused, reset, unreachable): the
+      // calls never ran, so nothing is billed. A timeout or an over-large answer
+      // means they did reach the server; they stay waiting and are metered TIMEOUT.
+      if (upstreamNeverAnswered(err, deadline?.signal)) this.forgetUnanswered(sessionId, tracked);
       const failure = upstreamFailure(err, deadline?.signal);
       logger.error('POST proxy error', { error: (err as Error).message, status: failure.status });
       if (!res.headersSent) res.writeHead(failure.status, { 'Content-Type': 'application/json', ...cors });

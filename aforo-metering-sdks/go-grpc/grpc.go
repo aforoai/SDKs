@@ -39,7 +39,7 @@ import (
 	"github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc/v2/internal/ingest"
 )
 
-const sdkVersion = "2.1.0"
+const sdkVersion = "2.1.1"
 
 // Ingestor limits for the gRPC fields (IngestUsageEventRequest @Size).
 const (
@@ -209,7 +209,7 @@ func (b *Billing) record(ctx context.Context, method, callType string, messageCo
 }
 
 func (b *Billing) recordWithMeta(ctx context.Context, method, callType string, messageCount int, err error, durationMs int64, opts []EventOptions, extraMeta map[string]any) {
-	customerID := strings.TrimSpace(b.customer(ctx))
+	customerID, resolverErr := b.resolveCustomer(ctx)
 	statusLabel := "OK"
 	executionStatus := OutcomeFromGrpcCode(codes.OK)
 	if err != nil {
@@ -268,6 +268,8 @@ func (b *Billing) recordWithMeta(ctx context.Context, method, callType string, m
 	// dropped here (DropInvalid) instead of failing server-side unseen.
 	msg := ""
 	switch {
+	case resolverErr != "":
+		msg = resolverErr
 	case customerID == "":
 		// Not billed, but counted: a call without a resolved customer.
 		msg = "customerId is required (CustomerResolver returned nothing)"
@@ -294,6 +296,18 @@ func (b *Billing) recordWithMeta(ctx context.Context, method, callType string, m
 		return
 	}
 	b.push(event)
+}
+
+// resolveCustomer runs the resolver. A panic never reaches the RPC (grpc-go
+// does not recover interceptor panics, so it would end the process): it is
+// returned as the reason to drop the event as DropInvalid.
+func (b *Billing) resolveCustomer(ctx context.Context) (id, failure string) {
+	defer func() {
+		if r := recover(); r != nil {
+			id, failure = "", fmt.Sprintf("CustomerResolver panicked: %v", r)
+		}
+	}()
+	return strings.TrimSpace(b.customer(ctx)), ""
 }
 
 func (b *Billing) recordRPC(ctx context.Context, fullMethod, callType string, err error, messageCount int, start time.Time) {

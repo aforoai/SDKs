@@ -2,7 +2,7 @@
 
 Meter MQTT traffic into Aforo two ways: hook an Aedes broker you operate to meter every PUBLISH/SUBSCRIBE/CONNECT/DISCONNECT, or wrap an `mqtt.js` client to meter what it publishes and receives against a third-party broker (AWS IoT, HiveMQ Cloud, EMQ X Cloud).
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 | Mode | When to use | Entry point |
 |---|---|---|

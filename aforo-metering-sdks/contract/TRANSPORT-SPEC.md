@@ -87,9 +87,31 @@ makes the copies one implementation.
 | 2xx, `failed = 0` | done |
 | 2xx with `errors[]` | `retryable: true` events go back to the queue (keys kept); the rest → `onDrop("rejected")` |
 | 413 | split the batch in half and send each half; a single event that still gets 413 → `onDrop("rejected")` |
+| 429 with `X-RateLimit-Limit` below the batch's event count (batch of 2+ events) | split the batch into parts of at most that many events, put them back at the **head** of the queue in their original order (same keys), and send batches of at most that size from then on (see "Rate-limit split" below) |
 | 401, 403 | treated as an outage (below) and logged at ERROR once per breaker opening: the key is wrong or revoked, and a fixed key must not lose the queued usage |
 | other 4xx | `onDrop("rejected")`, no retry |
 | 408, 429, 5xx, network error, timeout | retry as above; after `maxRetries` → outage |
+
+### Rate-limit split (429 + `X-RateLimit-Limit`, review 2026-11-09)
+
+usage-ingestor's HARD per-key limit (`IngestRateLimiter.checkApiKeyPolicy`)
+refuses, with 429, any request whose event count would take the key's minute
+over `eventsPerMinute + burst`. A request with more events than that is refused
+even at the start of a fresh minute, so retrying it unchanged never succeeds:
+the batch would sit at the head of the queue for good and everything behind it
+would overflow. The refusal carries `X-RateLimit-Limit` (events per minute).
+
+- When a batch of more than one event gets 429 and `X-RateLimit-Limit` is a
+  positive whole number **below** the batch's event count: no retry. The batch
+  (and any part of it not sent yet) goes back to the head of the queue in its
+  original order with the same idempotency keys, and from then on the flusher
+  takes at most that many events per request. The drain continues at once.
+- Otherwise (one event, no header, an unreadable header, or a limit at or above
+  the batch size) a 429 is retried as today, honouring `Retry-After`.
+- The cap follows the server: after a 2xx, a new `X-RateLimit-Limit` below
+  `flushCount` replaces it, and a 2xx without the header clears it.
+- Nothing is dropped or counted by the split itself; overflow while re-queueing
+  is reported as `overflow`, as for every requeue.
 
 ### Outage: requeue and breaker (G267)
 
@@ -165,6 +187,7 @@ the cases below. These rules settle each one; every core has a test per rule.
 | Callbacks | `onDrop`, `onError`, `onAccepted` may call `flush()` or `close()` without deadlocking; exceptions they throw are caught and logged. `onError` gets a typed error with `kind` (`outage` \| `auth` \| `rejected` \| `shutdown` \| `closed`) in every language. |
 | 2xx with `errors[]` but `failed` missing or 0 | `errors[]` is authoritative: named events are rejected or requeued per their `retryable` flag. |
 | `Retry-After` | Delta-seconds may be fractional (`1.5`); an HTTP-date in the past means 0. |
+| 429 with `X-RateLimit-Limit` < batch size | Split into parts of at most that size, re-queued at the head in order; later batches capped at that size (see "Rate-limit split"). Never retried unchanged. |
 | Second `close()` | Returns the first close's result; never runs a second drain. |
 
 ## Testing against the mock ingestor (G312)

@@ -77,7 +77,7 @@ Zero quantities are skipped (never sent). Each event looks like this:
 }
 ```
 
-Tool-call and step events also carry `capabilityName`, `executionStatus`, `executionDurationMs` and `stepNumber`.
+Tool-call and step events also carry `capabilityName`, `executionStatus`, `executionDurationMs` and `stepNumber`. Both are ints on the ingestor: a `durationMs` that is negative, not finite or over 2147483647 is left off the event (one warning) and the event is still sent.
 
 **Idempotency keys** are deterministic: `<sessionId>:<n>`, where `n` counts the session's events. A retried batch re-sends the same keys, so the ingestor deduplicates it. The generated `sessionId` is a UUID; if you pass your own, it must be unique per run, or a later run's events are treated as duplicates. Each session gets one `traceId` (32 hex chars, generated unless you pass one).
 
@@ -125,7 +125,7 @@ Tool-call and step events also carry `capabilityName`, `executionStatus`, `execu
 |---|---|---|
 | `retrying` | Every attempt failed with a network error, timeout, 401, 403, 408, 429 or 5xx | **Kept** on the queue with their idempotency keys; the sender pauses (5 s, doubling with jitter up to 5 min) and re-sends them. `err.events` is empty, `err.willRetry === true`. |
 | `rejected` | Another 4xx for the whole batch (400, 422), or per-event errors in a 2xx answer | Dropped; `err.events` lists them. Per-event errors marked `retryable` are re-sent instead. |
-| `invalid` | Missing `customerId` / `agentId`, quantity ≤ 0, field too long | Never sent |
+| `invalid` | Missing `customerId` / `agentId`, quantity ≤ 0 or with more than 14 integer digits / 6 decimal places (round it first: `1/3` is refused, not rounded), field too long, `metadata` that is not a plain object | Never sent |
 | `overflow` | Queue above `maxBufferSize` | Oldest dropped |
 | `shutdown` | Still queued when `shutdown()` hit `shutdownTimeoutMs` | Dropped |
 | `closed` | Recorded after `shutdown()` | Dropped |

@@ -1,8 +1,8 @@
 # @aforoai/ws-metering
 
-Meter WebSocket connections into Aforo — open, close, bytes, frame counts, and duration — by wrapping a `ws` server, or by tracking any connection that exposes the standard WebSocket event surface (Fastify-WebSocket, Socket.io, Deno, Bun).
+Meter WebSocket connections into Aforo — open, close, bytes, frame counts, and duration — by wrapping a `ws` server, or by tracking a single `ws`-style socket (`@fastify/websocket` hands you one). `trackConnection()` needs the `ws` surface: `.on('message' | 'close' | 'error', …)` and `send(data, cb)` calling `cb` once the frame is written. The standard (WHATWG) `WebSocket` of browsers, Deno, Bun and Node 22 has no `.on()`, and a Socket.io socket emits `disconnect`, not `close`; neither works as is.
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -57,7 +57,7 @@ For frameworks that don't expose a `ws`-style server, track each socket directly
 billing.trackConnection(socket, { customerId: 'cust_001', metadata: { feed: 'market' } });
 ```
 
-By default the SDK emits two events per connection — `CONNECTION_OPENED` on connect and `CONNECTION_CLOSED` on close (the billing anchor, carrying aggregated sent/recv counts + bytes + duration). The open event uses `metricName: "websocket_api.connection_opened"` with `wsFrameType: "OPEN"`, the close event `websocket_api.connection_closed`, and per-frame events `websocket_api.message`. A connection still open at `shutdown()` is billed a `CONNECTION_CLOSED` (`GOING_AWAY`, `closedBy: "sdk_shutdown"`), and one with no frame for `connectionIdleTimeoutMs` (default 1 hour) is closed by a sweep (`ABNORMAL_CLOSURE`, `closedBy: "sdk_idle_timeout"`), so every billed open has a close. Events ship to `POST https://api.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
+By default the SDK emits two events per connection — `CONNECTION_OPENED` on connect and `CONNECTION_CLOSED` on close (the billing anchor, carrying aggregated sent/recv counts + bytes + duration). The open event uses `metricName: "websocket_api.connection_opened"` with `wsFrameType: "OPEN"`, the close event `websocket_api.connection_closed`, and per-frame events `websocket_api.message`. A connection still open at `shutdown()` is billed a `CONNECTION_CLOSED` (`GOING_AWAY`, `closedBy: "sdk_shutdown"`), and one with no frame for `connectionIdleTimeoutMs` (default 1 hour) is closed by a sweep (`ABNORMAL_CLOSURE`, `closedBy: "sdk_idle_timeout"`), so every billed open has a close. A swept connection that turns out to be alive is tracked again on its next frame: a new `CONNECTION_OPENED` (same `wsConnectionId`, `metadata.resumedAfterIdleSweep: true`) with fresh counters, closed as usual. Events ship to `POST https://api.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
 
 > **Per-frame metering is off by default.** Set `perFrameEvents: true` to emit one event per inbound and outbound frame — high volume, so size your batching accordingly. With it off, individual frames are still counted and rolled into the `CONNECTION_CLOSED` event.
 
@@ -73,7 +73,7 @@ By default the SDK emits two events per connection — `CONNECTION_OPENED` on co
 | `ingestorUrl` | `string` | — (required) | Ingestion base URL, `https://` (see `allowInsecureHttp`). SDK appends `/v1/ingest/batch`. Use `https://api.aforo.ai`. |
 | `productType` | `string` | `'WEBSOCKET_API'` | Aforo product type sent as top-level `productType` on every event (trimmed + uppercased; unknown values pass through). Override via `wrapServer(wss, { productType })` or `trackConnection(ws, { customerId, productType })`. |
 | `perFrameEvents` | `boolean` | `false` | Emit one event per frame (each direction). Off → frames are aggregated into the close event only. |
-| `connectionIdleTimeoutMs` | `number` | `3600000` | Close (and bill `CONNECTION_CLOSED` for) a connection with no frame for this long, so a socket that died without a close event is not tracked forever. Must be positive. |
+| `connectionIdleTimeoutMs` | `number` | `3600000` | Close (and bill `CONNECTION_CLOSED` for) a connection with no frame for this long, so a socket that died without a close event is not tracked forever. If it sends another frame it is tracked again (a new `CONNECTION_OPENED`). Must be positive. |
 | `allowInsecureHttp` | `boolean` | `false` | Accept a plain `http://` `ingestorUrl` on a non-local host. `https://` is required otherwise (plain http is fine for `localhost`, `127.0.0.1`, `::1`). |
 | `flushCount` | `number` | `500` | Events per request (max 1000). Reaching it wakes the background sender; recording an event never sends by itself. |
 | `flushIntervalMs` | `number` | `5000` | The background sender also runs this often. |
@@ -91,7 +91,7 @@ By default the SDK emits two events per connection — `CONNECTION_OPENED` on co
 |---|---|---|---|
 | `customerResolver` | `wrapServer` | `(req) => string \| undefined` | Required (or `trustCustomerHeader`). The Aforo customer id from identity your app verified on the upgrade request. Returning nothing: the connection is not metered and one `invalid` drop is counted; the connection itself is not affected. `extractCustomerId` is a deprecated alias. |
 | `trustCustomerHeader` | `wrapServer` | `boolean` | Bill the `x-customer-id` header of the upgrade request. Any client can send that header, so only turn this on behind a proxy you control that sets it. Default `false`; `wrapServer` throws when neither this nor `customerResolver` is given. |
-| `extractMetadata` | `wrapServer` | `(req) => Record<string, unknown> \| undefined` | Optional per-connection tags. |
+| `extractMetadata` | `wrapServer` | `(req) => Record<string, unknown> \| undefined` | Optional per-connection tags. If it throws, the error goes to `onError` and the connection is metered without metadata. |
 | `customerId` | `trackConnection` | `string` | Customer to attribute all traffic on this socket to. |
 | `metadata` | `trackConnection` | `Record<string, unknown>` | Optional per-connection tags. |
 | `productType` | both | `string` | Product type for this server's / socket's events. Default: the client-level `productType`. |

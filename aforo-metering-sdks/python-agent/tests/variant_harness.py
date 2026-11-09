@@ -33,4 +33,4 @@ def MAKE(url, *, api_key="test-key", timeout=None, shutdown_timeout=None, **kw):
 
 
 def EMIT(view, i, customer="cust_1"):  # noqa: N802
-    view.client.record_capability(f"cap_{i}", "agent_1", customer_id=customer)
+    view.client.record_capability(f"cap_{i}", "agent_1", customer_id=customer, session_id="sess_1")

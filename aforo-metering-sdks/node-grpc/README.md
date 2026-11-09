@@ -2,7 +2,7 @@
 
 Wrap your `@grpc/grpc-js` server handlers and get one Aforo usage event per RPC — unary, server-stream, client-stream, or bidi — with status code, call type, message count, and duration attached. Your handler logic stays untouched.
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -47,7 +47,9 @@ server.addService(UserServiceService, {
   getUser:     billing.wrapUnary('GetUser', async (call) => ({ id: call.request.getId(), name: 'Jane' })),
   listUsers:   billing.wrapServerStream('ListUsers', async (call) => { call.write({ id: '1' }); call.write({ id: '2' }); }),
   uploadBatch: billing.wrapClientStream('UploadBatch', async (call) => { let n = 0; for await (const _ of call) n++; return { accepted: n }; }),
-  chat:        billing.wrapBidiStream('Chat', async (call) => { for await (const m of call) call.write({ reply: `echo: ${m.text}` }); }),
+  // On a bidi call, iterate with destroyOnReturn: false. A plain `for await (… of call)` destroys the
+  // duplex stream when the loop ends, so grpc-js never sends the status and the call never completes.
+  chat:        billing.wrapBidiStream('Chat', async (call) => { for await (const m of call.iterator({ destroyOnReturn: false })) call.write({ reply: `echo: ${m.text}` }); call.end(); }),
 });
 
 // The SDK installs no signal handlers. Flush from your own:

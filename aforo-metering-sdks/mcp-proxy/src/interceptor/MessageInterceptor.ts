@@ -10,7 +10,7 @@ import { logger } from '../util/logger.js';
 /** Methods we meter (bill for tool invocations) */
 const METERED_METHODS = new Set(['tools/call']);
 
-/** Methods we track for analytics only (not billed) */
+/** Methods forwarded without metering. Not used for anything yet (no analytics events are sent for them). */
 const TRACKED_METHODS = new Set(['tools/list', 'resources/read', 'prompts/get']);
 
 /** Methods we completely ignore */
@@ -106,9 +106,12 @@ export function extractToolCall(msg: JsonRpcRequest): ParsedToolCall | null {
   if (msg.id == null) return null; // notifications have no id
 
   const params = msg.params as Record<string, unknown> | undefined;
-  const toolName = (params?.name as string) ?? 'unknown';
+  // Both come from the client and end up as string fields of the usage event. A
+  // non-string (an object, an array) would make the ingestor unable to read the
+  // whole batch, losing every other event in it, so only a string is used.
+  const toolName = typeof params?.name === 'string' && params.name.trim() ? params.name : 'unknown';
   const meta = params?._meta as Record<string, unknown> | undefined;
-  const agentId = (meta?.agent_id as string) ?? 'unknown';
+  const agentId = typeof meta?.agent_id === 'string' && meta.agent_id.trim() ? meta.agent_id.trim() : 'unknown';
   const customerId = typeof meta?.customer_id === 'string' && meta.customer_id.trim()
     ? meta.customer_id.trim() : undefined;
 

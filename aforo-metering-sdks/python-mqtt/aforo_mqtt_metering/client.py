@@ -32,7 +32,7 @@ from ._transport import (
 )
 from ._transport import policy as _policy
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 logger = logging.getLogger("aforo_mqtt_metering")
 
 # POST /v1/ingest/batch takes 1..1000 events per request.
@@ -293,6 +293,10 @@ class AforoMqttBilling:
         invalid = _customer_id_problem(customer_id)
         if invalid is None and event_type not in MQTT_EVENT_TYPES:
             invalid = f"mqttEventType must be one of {', '.join(MQTT_EVENT_TYPES)} (got {_clip(event_type)})"
+        if metadata is not None and not isinstance(metadata, dict):
+            if invalid is None:
+                invalid = f"metadata must be a dict (got {type(metadata).__name__})"
+            metadata = None
         # Topic and client id originate from the MQTT traffic: an over-long one
         # is cut to the ingestor's limit instead of losing the event. The key
         # below is built from the full values.
@@ -403,6 +407,10 @@ _UNSET: Any = object()
 #: ack. A full table drops the oldest entry unmetered (logged at debug).
 MAX_PENDING_PUBLISHES = 10_000
 
+#: paho's ``MQTT_ERR_NO_CONN``: not connected. For QoS 1/2 paho keeps the
+#: message and sends it once the client (re)connects, so it is not a refusal.
+_MQTT_ERR_NO_CONN = 4
+
 
 def _mqtt_username(client: Any) -> Optional[str]:
     value = getattr(client, "_username", None)
@@ -438,6 +446,13 @@ def _customer_source(client: Any, customer_id: Any, customer_resolver: Optional[
                 return None
         return resolve
     return lambda: clean_customer_id(_mqtt_username(client))
+
+
+def _rc_value(rc: Any) -> Optional[int]:
+    try:
+        return int(getattr(rc, "value", rc))
+    except (TypeError, ValueError):
+        return None
 
 
 def _rc_ok(rc: Any) -> bool:
@@ -484,7 +499,9 @@ def wrap_paho_client(
         CONNECT/DISCONNECT pair is billed for the flap.
       - PUBLISH after paho confirms it (``on_publish``: the broker's ack for
         QoS 1/2, the socket write for QoS 0). A publish paho refuses
-        (``rc != 0``) is not billed.
+        (``rc != 0``) is not billed; a QoS 1/2 publish made while
+        disconnected, which paho keeps and sends on reconnect, is billed when
+        the broker acks it.
       - SUBSCRIBE / UNSUBSCRIBE when requested; DELIVER per received message
         when ``emit_deliver_events=True``.
 
@@ -601,7 +618,11 @@ def wrap_paho_client(
             _push(**fields)  # not paho: the call returned without error
             return info
         if not _rc_ok(info.rc):
-            return info  # paho refused it: nothing was published
+            queued_offline = qos in (1, 2) and _rc_value(info.rc) == _MQTT_ERR_NO_CONN
+            if not queued_offline:
+                return info  # paho refused it: nothing was published
+            # Not connected: paho keeps a QoS 1/2 message and sends it on
+            # (re)connect; it is billed when the broker acks it (on_publish).
         with lock:
             if acked_early.pop(mid, False):
                 confirmed = True

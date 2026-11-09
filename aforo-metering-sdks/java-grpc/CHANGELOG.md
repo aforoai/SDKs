@@ -2,6 +2,19 @@
 
 All notable changes to `ai.aforo:grpc-metering` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [2.1.1] - 2026-11-09
+
+### Fixed (SDK review, 2026-11-09)
+- **An API key with surrounding whitespace is trimmed; one that still holds whitespace or a control character is refused at construction** (`IllegalArgumentException`, the key is never in the message). A key read from a secret file with a trailing newline used to stop every send and was logged in full at `SEVERE` on each attempt, from the JDK's "invalid header value" message; that message is no longer passed on.
+- **`close()` from an interrupted thread still drains** until the shutdown deadline, then restores the interrupt flag. It used to skip the drain and report the whole queue as `SHUTDOWN` within milliseconds.
+- **A 429 whose `X-RateLimit-Limit` is below the batch size splits the batch.** The events go back to the head of the queue in order and are sent in batches of at most that many after the `Retry-After` wait, instead of resending a batch the API key's per-minute limit can never accept until the queue overflowed.
+- **Every call is metered exactly once, with the status the caller saw.** A handler that throws (grpc-java closes the stream itself with `UNKNOWN`) is metered as `UNKNOWN` / `ERROR`; it was not metered. A call cancelled by the client or its deadline is metered as `CANCELLED` or `DEADLINE_EXCEEDED` / `TIMEOUT`, also when the handler finishes later and closes with `OK`; it was billed as `SUCCESS`.
+
+## [2.1.0] - 2026-10-30
+
+### Added
+- **Request compression (wave 8, G269).** Batch bodies of 1 KiB or more are sent with `Content-Encoding: gzip`; smaller bodies stay plain JSON. The body is compressed once and every retry resends the same bytes; the 4 MiB split is decided on the uncompressed JSON; a compression failure sends plain JSON. Needs usage-ingestor wave 8 or later (an older ingestor answers 400). Turn it off with `.compression("none")`.
+
 ## [2.0.0] - 2026-10-26
 
 Breaking. Moves onto the shared wave 5 transport core (contract/TRANSPORT-SPEC.md).

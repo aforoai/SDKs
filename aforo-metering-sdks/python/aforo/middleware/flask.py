@@ -9,8 +9,11 @@ from ..client import AforoClient
 from ._common import (
     DEFAULT_METRIC_NAME,
     NO_CUSTOMER,
+    call_flexible,
     customer_lookup,
     http_fields,
+    is_billable_quantity,
+    is_excluded,
     is_preflight,
     logger,
     resolve_metric_name,
@@ -53,7 +56,14 @@ class AforoMetering:
       ``callable(request, response) -> str``. Default ``"api_calls"``; it must
       name a metric in your Aforo catalog.
     * ``product_type`` / ``AFORO_PRODUCT_TYPE`` -- default ``"API"``.
-    * ``exclude_paths``, ``exclude_status_codes``.
+    * ``quantity`` -- a number or ``callable(request)`` / ``callable(request,
+      response)``; default 1. A quantity <= 0 is not metered.
+    * ``metadata`` -- a dict or ``callable(request)`` / ``callable(request,
+      response)`` returning one.
+    * ``exclude_paths`` (each covers the paths below it, on a segment boundary),
+      ``exclude_status_codes``.
+    * ``flush_count``, ``flush_interval``, ``max_queue_size``,
+      ``allow_insecure_http``, ``compression`` -- passed to the client.
 
     Every event carries ``endpointPath``, ``httpMethod``, ``statusCode`` and
     ``responseTimeMs``. ``OPTIONS`` requests are never metered.
@@ -62,7 +72,8 @@ class AforoMetering:
     def __init__(self, app: Optional[Any] = None, **kwargs) -> None:
         self._client: Optional[AforoClient] = None
         self._kwargs = kwargs
-        self._exclude_paths = kwargs.pop("exclude_paths", _DEFAULT_EXCLUDE)
+        exclude = kwargs.pop("exclude_paths", None)
+        self._exclude_paths = _DEFAULT_EXCLUDE if exclude is None else list(exclude)
         self._exclude_status_codes = kwargs.pop("exclude_status_codes", [])
         self._metric_name = kwargs.pop("metric_name", None)
         resolver = kwargs.pop("customer_resolver", None)
@@ -70,6 +81,8 @@ class AforoMetering:
         self._customer_resolver = resolver if resolver is not None else legacy
         self._trust_customer_header = kwargs.pop("trust_customer_header", None)
         self._product_type = kwargs.pop("product_type", None)
+        self._quantity = kwargs.pop("quantity", None)
+        self._metadata = kwargs.pop("metadata", None)
         self._customer = None
         if app is not None:
             self.init_app(app)
@@ -98,9 +111,12 @@ class AforoMetering:
         allow_http = self._kwargs.get("allow_insecure_http",
                                       bool(app.config.get("AFORO_ALLOW_INSECURE_HTTP", False)))
         compression = self._kwargs.get("compression", app.config.get("AFORO_COMPRESSION", "gzip"))
+        client_options = {name: self._kwargs[name]
+                          for name in ("flush_count", "flush_interval", "max_queue_size")
+                          if self._kwargs.get(name) is not None}
         self._client = AforoClient(
             api_key=api_key, base_url=base_url, product_type=self._product_type,
-            allow_insecure_http=allow_http, compression=compression,
+            allow_insecure_http=allow_http, compression=compression, **client_options,
         )
         app.before_request(self._before_request)
         app.after_request(self._after_request)
@@ -122,12 +138,21 @@ class AforoMetering:
 
             if is_preflight(request.method):
                 return response
-            if any(path.startswith(p) for p in self._exclude_paths):
+            if is_excluded(path, self._exclude_paths):
                 return response
             if status_code in self._exclude_status_codes:
                 return response
             if self._client is None or self._customer is None:
                 return response
+
+            if callable(self._quantity):
+                quantity = call_flexible(self._quantity, request, response)
+            elif self._quantity is not None:
+                quantity = self._quantity
+            else:
+                quantity = 1
+            if not is_billable_quantity(quantity):
+                return response  # the ingestor rejects quantity <= 0
 
             customer_id = self._customer(request)
             if not customer_id:
@@ -137,10 +162,14 @@ class AforoMetering:
             start = getattr(g, "_aforo_start", None)
             elapsed_ms = int((time.monotonic() - start) * 1000) if start is not None else None
 
+            metadata = (call_flexible(self._metadata, request, response) if callable(self._metadata)
+                        else self._metadata)
+
             self._client.track(
                 customer_id=customer_id,
                 metric_name=resolve_metric_name(self._metric_name, request, response),
-                quantity=1,
+                quantity=quantity,
+                metadata=metadata,
                 product_type=self._product_type,
                 extra_fields=http_fields(path, request.method, status_code, elapsed_ms),
             )

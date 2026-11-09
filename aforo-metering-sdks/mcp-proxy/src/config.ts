@@ -45,12 +45,14 @@ export function loadConfig(cliArgs: CliArgs): ProxyConfig {
   const aforo: AforoConfig = {
     tenantId:        envString('AFORO_TENANT_ID')        ?? cliArgs.aforo?.tenantId        ?? fileConfig.aforo?.tenantId        ?? '',
     productId:       envString('AFORO_PRODUCT_ID')       ?? cliArgs.aforo?.productId       ?? fileConfig.aforo?.productId       ?? '',
-    apiKey:          envString('AFORO_API_KEY')           ?? cliArgs.aforo?.apiKey           ?? fileConfig.aforo?.apiKey           ?? '',
+    // Trimmed: a key pasted with a trailing newline or space would be sent as is and refused.
+    apiKey:          String(envString('AFORO_API_KEY')    ?? cliArgs.aforo?.apiKey           ?? fileConfig.aforo?.apiKey           ?? '').trim(),
     ingestorUrl:     envString('AFORO_INGESTOR_URL')      ?? cliArgs.aforo?.ingestorUrl      ?? fileConfig.aforo?.ingestorUrl      ?? '',
     agentId:         envString('AFORO_AGENT_ID')          ?? cliArgs.aforo?.agentId          ?? fileConfig.aforo?.agentId,
     customerId:      envString('AFORO_CUSTOMER_ID')       ?? cliArgs.aforo?.customerId       ?? fileConfig.aforo?.customerId,
     trustClientCustomerId: envBool('AFORO_TRUST_CLIENT_CUSTOMER_ID') ?? cliArgs.aforo?.trustClientCustomerId ?? fileConfig.aforo?.trustClientCustomerId,
     allowInsecureHttp: envBool('AFORO_ALLOW_INSECURE_HTTP') ?? cliArgs.aforo?.allowInsecureHttp ?? fileConfig.aforo?.allowInsecureHttp,
+    compression:     normalizeCompression(envString('AFORO_COMPRESSION') ?? cliArgs.aforo?.compression ?? fileConfig.aforo?.compression),
     productType:     normalizeProductType(envString('AFORO_PRODUCT_TYPE') ?? cliArgs.aforo?.productType ?? fileConfig.aforo?.productType) ?? DEFAULT_PRODUCT_TYPE,
     quotaEnforcement: envBool('AFORO_QUOTA_ENFORCEMENT')  ?? cliArgs.aforo?.quotaEnforcement ?? fileConfig.aforo?.quotaEnforcement ?? DEFAULTS.quotaEnforcement,
     quotaTimeoutMs:  envInt('AFORO_QUOTA_TIMEOUT_MS')      ?? cliArgs.aforo?.quotaTimeoutMs    ?? fileConfig.aforo?.quotaTimeoutMs,
@@ -99,6 +101,9 @@ function validate(config: ProxyConfig): void {
   if (!config.aforo.ingestorUrl) throw new Error('aforo.ingestorUrl is required');
 
   assertIngestorUrl(config.aforo.ingestorUrl, config.aforo.allowInsecureHttp === true);
+  if (config.aforo.compression !== undefined && config.aforo.compression !== 'gzip' && config.aforo.compression !== 'none') {
+    throw new Error(`aforo.compression must be "gzip" or "none" (got ${String(config.aforo.compression)})`);
+  }
   if (config.aforo.quotaFailMode !== undefined && config.aforo.quotaFailMode !== 'open' && config.aforo.quotaFailMode !== 'closed') {
     throw new Error(`aforo.quotaFailMode must be "open" or "closed" (got ${String(config.aforo.quotaFailMode)})`);
   }
@@ -143,6 +148,13 @@ export function normalizeProductType(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
   return trimmed ? trimmed.toUpperCase() : undefined;
+}
+
+/** Trim + lowercase a compression setting; blank -> undefined (the default, gzip). Other values fail validation. */
+function normalizeCompression(value: unknown): AforoConfig['compression'] | undefined {
+  if (value === undefined || value === null) return undefined;
+  const text = String(value).trim().toLowerCase();
+  return (text || undefined) as AforoConfig['compression'] | undefined;
 }
 
 // ─── Env helpers ────────────────────────────────────────────────────────────

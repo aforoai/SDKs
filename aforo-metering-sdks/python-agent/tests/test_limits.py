@@ -19,7 +19,7 @@ from aforo_agent_metering.client import DEFAULT_INGESTOR_URL, MAX_LENGTHS
 
 def _client(**overrides: Any) -> AforoAgentClient:
     base: Dict[str, Any] = dict(
-        tenant_id="tenant_test", product_id="prod_ai_001", api_key="k",
+        tenant_id="tenant_test", product_id="prod_ai_001", api_key="sk_limits_test",
         ingestor_url="https://ingest.example.test", default_customer_id="cust_default",
         flush_interval_sec=3600.0,
     )
@@ -36,19 +36,21 @@ def test_default_host_is_the_public_api_gateway() -> None:
 def test_limits_mirror_the_server_dto() -> None:
     assert MAX_LENGTHS == {
         "customerId": 64, "metricName": 255, "idempotencyKey": 255, "productType": 20,
-        "agentId": 36, "sessionId": 64, "capabilityName": 64,
+        "agentId": 36, "sessionId": 64, "capabilityName": 64, "traceId": 128,
     }
 
 
 @pytest.mark.parametrize(
     "kwargs,needle",
     [
-        (dict(capability_name="", agent_id="a"), "capability_name"),
-        (dict(capability_name="c", agent_id=""), "agent_id"),
-        (dict(capability_name="c", agent_id="a" * 37), "agentId"),
-        (dict(capability_name="c" * 65, agent_id="a"), "capabilityName"),
+        (dict(capability_name="", agent_id="a", session_id="s"), "capability_name"),
+        (dict(capability_name="c", agent_id="", session_id="s"), "agent_id"),
+        (dict(capability_name="c", agent_id="a" * 37, session_id="s"), "agentId"),
+        (dict(capability_name="c" * 65, agent_id="a", session_id="s"), "capabilityName"),
         (dict(capability_name="c", agent_id="a", session_id="s" * 65), "sessionId"),
-        (dict(capability_name="c", agent_id="a", customer_id="x" * 65), "customerId"),
+        (dict(capability_name="c", agent_id="a", customer_id="x" * 65, session_id="s"), "customerId"),
+        (dict(capability_name="c", agent_id="a"), "session_id is required for AI_AGENT"),
+        (dict(capability_name="c", agent_id="a", session_id="  "), "session_id is required for AI_AGENT"),
     ],
 )
 def test_invalid_capability_event_is_dropped_not_raised(kwargs, needle, caplog) -> None:
@@ -72,7 +74,7 @@ def test_values_at_the_limit_are_accepted_and_not_truncated() -> None:
     event = client._buffer[0]
     assert event["agentId"] == "a" * 36 and event["customerId"] == "x" * 64
     assert event["metadata"]["capability_name"] == "c" * 64
-    assert event["metadata"]["sdkVersion"] == __version__ == "1.1.0"
+    assert event["metadata"]["sdkVersion"] == __version__ == "1.1.1"
 
 
 def test_invalid_step_is_dropped_not_raised() -> None:
@@ -90,21 +92,21 @@ def test_invalid_warning_is_throttled(caplog) -> None:
     client = _client()
     with caplog.at_level("WARNING", logger="aforo_agent_metering"):
         for _ in range(1000):
-            client.record_capability(capability_name="c", agent_id="")
+            client.record_capability(capability_name="c", agent_id="", session_id="sess_1")
     assert client.dropped_count == 1000
     assert caplog.text.count("Invalid event not sent") == 2  # 1st and 1000th
 
 
 def test_unknown_execution_status_is_not_an_invalid_event() -> None:
     client = _client()
-    client.record_capability(capability_name="c", agent_id="a", execution_status="bogus")
+    client.record_capability(capability_name="c", agent_id="a", execution_status="bogus", session_id="sess_1")
     assert len(client) == 1 and client.dropped_count == 0
 
 
 def test_product_type_default_option_and_per_event_override() -> None:
     client = _client(product_type=" agentic_api ")
-    client.record_capability(capability_name="c", agent_id="a")
-    client.record_capability(capability_name="c", agent_id="a", product_type="ai_agent")
+    client.record_capability(capability_name="c", agent_id="a", session_id="sess_1")
+    client.record_capability(capability_name="c", agent_id="a", product_type="ai_agent", session_id="sess_1")
     assert [e["productType"] for e in client._buffer] == ["AGENTIC_API", "AI_AGENT"]
     assert _client().product_type == "AI_AGENT"
 
@@ -133,7 +135,7 @@ async def test_flush_count_clamped_and_flush_sent_in_slices_of_1000() -> None:
     client = _client(flush_count=5000, post_fn=post)
     assert client.flush_count == 1000
     for _ in range(2500):
-        client.record_capability(capability_name="c", agent_id="a")
+        client.record_capability(capability_name="c", agent_id="a", session_id="sess_1")
     await client.flush()
     assert sum(sizes) == 2500 and max(sizes) <= 1000
     await client.shutdown()
@@ -152,13 +154,13 @@ async def test_partial_rejection_drops_only_the_named_events() -> None:
 
     client = _client(post_fn=post, on_drop=lambda evs, reason: drops.append((evs, reason)))
     for cap in ("a", "b", "c"):
-        client.record_capability(capability_name=cap, agent_id="agt")
+        client.record_capability(capability_name=cap, agent_id="agt", session_id="sess_1")
     await client.flush()
     assert client.dropped_count == 1
     assert [(e["metadata"]["capability_name"], r) for evs, r in drops for e in evs] == [("b", "rejected")]
 
-    client.record_capability(capability_name="d", agent_id="agt")
-    client.record_capability(capability_name="e", agent_id="agt")
+    client.record_capability(capability_name="d", agent_id="agt", session_id="sess_1")
+    client.record_capability(capability_name="e", agent_id="agt", session_id="sess_1")
     await client.flush()
     # The response did not say which event failed: counted, none named.
     assert client.dropped_count == 2 and len(drops) == 1
@@ -172,6 +174,6 @@ async def test_rejected_4xx_error_carries_the_ingestor_message() -> None:
         return 400, json.dumps({"errors": [{"index": 0, "message": "unknown metric"}]})
 
     client = _client(post_fn=post, on_error=errors.append)
-    client.record_capability(capability_name="c", agent_id="a")
+    client.record_capability(capability_name="c", agent_id="a", session_id="sess_1")
     await client.flush()
     assert "unknown metric" in str(errors[0]) and client.dropped_count == 1

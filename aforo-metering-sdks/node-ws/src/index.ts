@@ -10,8 +10,10 @@
  *                          connection is swept, or at shutdown
  *
  * Works with the `ws` library out of the box (wrap WebSocketServer), or use
- * trackConnection() directly for Fastify-WebSocket, Socket.io, Deno, Bun, or
- * anything else that exposes the standard WebSocket event surface.
+ * trackConnection() directly for one `ws`-style socket (@fastify/websocket
+ * hands you one). It needs `.on('message' | 'close' | 'error')` and
+ * `send(data, cb)`; the WHATWG WebSocket of browsers, Deno, Bun and Node 22
+ * (no `.on()`) and Socket.io sockets (`disconnect`, not `close`) don't fit.
  *
  * Usage:
  *   import { WebSocketServer } from 'ws';
@@ -175,7 +177,7 @@ export interface TrackConnectionOptions {
 
 type ExecutionStatusOption = TrackConnectionOptions['executionStatus'];
 
-/** Minimal WebSocket surface — matches `ws` WebSocket, Fastify socket, Deno, Bun. */
+/** Minimal WebSocket surface — matches a `ws` WebSocket (also what @fastify/websocket hands you). */
 interface MinimalWs {
   on(event: 'message', fn: (data: any, isBinary?: boolean) => void): void;
   on(event: 'close', fn: (code: number, reason: Buffer | string) => void): void;
@@ -190,7 +192,7 @@ interface MinimalWss {
   on(event: 'connection', fn: (ws: MinimalWs, req: any) => void): void;
 }
 
-const SDK_VERSION = '2.1.0';
+const SDK_VERSION = '2.1.1';
 /** Default for AforoWsConfig.connectionIdleTimeoutMs: one hour. */
 export const DEFAULT_CONNECTION_IDLE_TIMEOUT_MS = 60 * 60 * 1000;
 
@@ -335,7 +337,15 @@ export class AforoWsBilling {
       } catch (err) {
         this.reportError(new Error(`[aforo-ws] customerResolver threw: ${(err as Error)?.message ?? err}`));
       }
-      const metadata = options.extractMetadata?.(req);
+      // A throwing extractMetadata must not escape this listener: `ws` emits
+      // 'connection' from the HTTP server's 'upgrade' handler, so it would crash
+      // the process. The connection is metered without metadata instead.
+      let metadata: Record<string, unknown> | undefined;
+      try {
+        metadata = options.extractMetadata?.(req);
+      } catch (err) {
+        this.reportError(new Error(`[aforo-ws] extractMetadata threw (connection metered without metadata): ${(err as Error)?.message ?? err}`));
+      }
       const status = options.executionStatus;
       this.trackConnection(ws, {
         customerId: customerId ?? '',
@@ -388,17 +398,22 @@ export class AforoWsBilling {
       this.core.reportDrop([this.buildEvent(openEvent)], 'closed', 'connection opened after shutdown(); not metered');
       return () => {};
     }
-    const start = Date.now();
+    let start = Date.now();
     let sentCount = 0;
     let recvCount = 0;
     let sentBytes = 0;
     let recvBytes = 0;
-    let closed = false;
+    /**
+     * open: tracked. swept: the idle sweep billed a CONNECTION_CLOSED but the
+     * socket may still be alive; its next frame tracks it again. closed: the
+     * socket closed or errored, or shutdown() billed it; nothing more is billed.
+     */
+    let state: 'open' | 'swept' | 'closed' = 'open';
     const conn: OpenConnection = {
       lastActivity: start,
       close: (code, closedBy) => {
-        if (closed) return false;
-        closed = true;
+        if (state !== 'open') return false;
+        state = closedBy === 'sdk_idle_timeout' ? 'swept' : 'closed';
         this.connections.delete(connectionId);
         this.push({
           customerId: opts.customerId,
@@ -429,8 +444,29 @@ export class AforoWsBilling {
     // Emit CONNECTION_OPENED immediately
     this.push(openEvent);
 
+    /**
+     * A frame on a connection the idle sweep closed: the socket is alive after
+     * all, so track it again from now (a new CONNECTION_OPENED with fresh
+     * counters, same wsConnectionId) instead of letting its usage go unbilled.
+     * Returns whether the connection is tracked.
+     */
+    const ensureTracked = (): boolean => {
+      if (state === 'open') return true;
+      if (state === 'closed' || this.shutdownPromise) return false;
+      state = 'open';
+      start = Date.now();
+      sentCount = 0;
+      recvCount = 0;
+      sentBytes = 0;
+      recvBytes = 0;
+      conn.lastActivity = start;
+      this.connections.set(connectionId, conn);
+      this.push({ ...openEvent, metadata: { ...openEvent.metadata, resumedAfterIdleSweep: true } });
+      return true;
+    };
+
     ws.on('message', (data: any, isBinary?: boolean) => {
-      if (closed) return;
+      if (!ensureTracked()) return;
       conn.lastActivity = Date.now();
       recvCount++;
       const bytes = estimateBytes(data);
@@ -456,7 +492,7 @@ export class AforoWsBilling {
     // callback, if any, still runs with the same error.
     const origSend = ws.send.bind(ws);
     ws.send = (data: any, ...rest: any[]) => {
-      if (closed) return origSend(data, ...rest);
+      if (!ensureTracked()) return origSend(data, ...rest);
       conn.lastActivity = Date.now();
       const callerCb = typeof rest[rest.length - 1] === 'function' ? rest.pop() : undefined;
       const bytes = estimateBytes(data);
@@ -464,7 +500,7 @@ export class AforoWsBilling {
       const onSent = (err?: Error) => {
         // A frame accepted after the connection was reported closed is not
         // billed: the CONNECTION_CLOSED totals have already gone out.
-        if (!err && !closed) {
+        if (!err && state === 'open') {
           sentCount++;
           sentBytes += bytes;
           if (this.perFrameEvents) {
@@ -492,12 +528,16 @@ export class AforoWsBilling {
     // with whichever of the two arrives first (or the idle sweep / shutdown).
     ws.on('close', (code: number) => {
       // CONNECTION_CLOSED with aggregated counters — this is the billing anchor.
-      conn.close(code);
+      // A swept connection was billed by the sweep: its real close bills nothing more.
+      if (!conn.close(code)) state = 'closed';
     });
 
     ws.on('error', (err: Error) => {
-      if (closed) return;
-      closed = true;
+      if (state !== 'open') {
+        state = 'closed';
+        return;
+      }
+      state = 'closed';
       this.connections.delete(connectionId);
       this.push({
         customerId: opts.customerId,
@@ -552,8 +592,8 @@ export class AforoWsBilling {
     if (checked.problem) this.reportError(new Error(`[aforo-ws] ${checked.problem}`));
     if (checked.status) event.executionStatus = checked.status;
 
-    // An event the ingestor would reject is not sent (one bad event fails its
-    // whole batch): it is dropped here with reason 'invalid', never thrown
+    // An event the ingestor would reject is not sent (the refusal would only
+    // show up on a background flush): it is dropped here with reason 'invalid', never thrown
     // into the socket handlers.
     const invalid =
       tooLong('customerId', event.customerId, MAX_CUSTOMER_ID) ??

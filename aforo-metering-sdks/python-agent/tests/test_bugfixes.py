@@ -54,7 +54,7 @@ async def test_json_encoding_failure_fires_drop_hook_and_increments_counter() ->
     client.record_capability(
         capability_name="pricey_call",
         agent_id="agt_1",
-        metadata={"cost_estimate": Decimal("0.42")},
+        metadata={"cost_estimate": Decimal("0.42")}, session_id="sess_1",
     )
     await client.flush()
 
@@ -92,7 +92,7 @@ async def test_json_encoding_failure_does_not_raise_from_flush() -> None:
     client.record_capability(
         capability_name="x",
         agent_id="a",
-        metadata={"weird": Unencodable()},
+        metadata={"weird": Unencodable()}, session_id="sess_1",
     )
     # Must resolve, not raise.
     await client.flush()
@@ -111,7 +111,7 @@ async def test_json_encoding_failure_does_not_leave_events_in_buffer() -> None:
     client.record_capability(
         capability_name="x",
         agent_id="a",
-        metadata={"bad": Decimal("1.5")},
+        metadata={"bad": Decimal("1.5")}, session_id="sess_1",
     )
     # Wave 5: rejected when recorded, so it never enters the queue at all.
     assert len(client) == 0, "bad event must not linger in the buffer"
@@ -145,7 +145,7 @@ async def test_failing_custom_transport_never_leaks_an_unretrieved_exception(
     )
     try:
         with caplog.at_level("WARNING"):
-            client.record_capability(capability_name="x", agent_id="a")
+            client.record_capability(capability_name="x", agent_id="a", session_id="sess_1")
             await asyncio.get_running_loop().run_in_executor(None, wait_until, lambda: len(calls) >= 4)
             for _ in range(5):
                 await asyncio.sleep(0)
@@ -168,7 +168,7 @@ def test_record_without_a_running_loop_is_still_sent() -> None:
         return 202, ""
 
     client = _client(flush_count=1, post_fn=post)
-    client.record_capability(capability_name="x", agent_id="a")  # plain sync context
+    client.record_capability(capability_name="x", agent_id="a", session_id="sess_1")  # plain sync context
     wait_until(lambda: len(posted) == 1)
     assert len(client) == 0
     client.shutdown_sync()
@@ -179,7 +179,7 @@ def test_record_without_a_running_loop_leaks_no_coroutine_warning(
 ) -> None:
     """record_* never creates a coroutine, so nothing can be left un-awaited."""
     client = _client(flush_count=1)
-    client.record_capability(capability_name="x", agent_id="a")
+    client.record_capability(capability_name="x", agent_id="a", session_id="sess_1")
     client.shutdown_sync(timeout=0)
 
     import gc

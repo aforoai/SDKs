@@ -12,6 +12,7 @@ from ._common import (
     customer_lookup,
     http_fields,
     is_billable_quantity,
+    is_excluded,
     is_preflight,
     logger,
     resolve_metric_name,
@@ -75,7 +76,8 @@ class AforoMeteringMiddleware:
             allow_insecure_http=opts.allow_insecure_http,
             compression=opts.compression,
         )
-        self._exclude_paths = opts.exclude_paths or _DEFAULT_EXCLUDE
+        # None -> the defaults (health, metrics, docs); [] -> nothing excluded.
+        self._exclude_paths = _DEFAULT_EXCLUDE if opts.exclude_paths is None else list(opts.exclude_paths)
         self._exclude_status_codes = opts.exclude_status_codes
         self._metric_name_fn = opts.metric_name
         self._quantity_fn = opts.quantity
@@ -94,23 +96,37 @@ class AforoMeteringMiddleware:
         status_code = 200
         start = time.monotonic()
 
+        started = {"value": False}
+
         async def send_wrapper(message: dict) -> None:
             nonlocal status_code
             if message["type"] == "http.response.start":
                 status_code = message.get("status", 200)
+                started["value"] = True
             await send(message)
 
-        await self.app(scope, receive, send_wrapper)
-        elapsed_ms = int((time.monotonic() - start) * 1000)
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except Exception:
+            # The handler raised: the server answers 500 (unless a response had
+            # already started). That request is metered too, as Flask and
+            # Django do; the exception goes on unchanged.
+            if not started["value"]:
+                status_code = 500
+            self._record(scope, status_code, start)
+            raise
+        self._record(scope, status_code, start)
 
-        # After the response: record the event (never affects the response).
+    def _record(self, scope: dict, status_code: int, start: float) -> None:
+        """Record the event for one finished request (never affects the response)."""
+        elapsed_ms = int((time.monotonic() - start) * 1000)
         try:
             path = scope.get("path", "/")
             method = scope.get("method", "UNKNOWN")
 
             if is_preflight(method):
                 return
-            if any(path.startswith(p) for p in self._exclude_paths):
+            if is_excluded(path, self._exclude_paths):
                 return
             if status_code in self._exclude_status_codes:
                 return

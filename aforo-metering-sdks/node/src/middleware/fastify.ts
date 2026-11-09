@@ -1,7 +1,8 @@
 import { MiddlewareOptions } from '../types.js';
-import { isPreflight, resolveMetricName, httpMethodOf, middlewareClient, customerLookup, endpointPathFor } from './common.js';
-
-const DEFAULT_EXCLUDE_PATHS = ['/health', '/ready', '/metrics', '/favicon.ico'];
+import {
+  isPreflight, resolveMetricName, httpMethodOf, middlewareClient, customerLookup, endpointPathFor,
+  DEFAULT_EXCLUDE_PATHS, isExcludedPath, reportMeteringFailure,
+} from './common.js';
 
 /**
  * Fastify plugin that records one usage event per request in the
@@ -26,13 +27,12 @@ export async function fastifyPlugin(fastify: any, options: MiddlewareOptions) {
   const excludeStatusCodes = options.excludeStatusCodes ?? [];
 
   fastify.addHook('onResponse', (request: any, reply: any, done: any) => {
+    const path: string = request.url || '/';
+    const method: string = request.method || 'UNKNOWN';
+    const statusCode: number = reply.statusCode || 0;
     try {
-      const path: string = request.url || '/';
-      const method: string = request.method || 'UNKNOWN';
-      const statusCode: number = reply.statusCode || 0;
-
       if (isPreflight(method)) return done();
-      if (excludePaths.some((p: string) => path.startsWith(p))) return done();
+      if (isExcludedPath(path, excludePaths)) return done();
       if (excludeStatusCodes.includes(statusCode)) return done();
 
       const quantity = typeof options.quantity === 'function' ? options.quantity(request, reply) : options.quantity ?? 1;
@@ -54,8 +54,8 @@ export async function fastifyPlugin(fastify: any, options: MiddlewareOptions) {
         ...(typeof elapsed === 'number' ? { responseTimeMs: Math.round(elapsed) } : {}),
       }).catch((err) => console.debug(`[aforo] metering skipped: ${err?.message ?? err}`));
     } catch (err) {
-      // Never let metering affect the API.
-      console.debug(`[aforo] metering skipped: ${(err as Error)?.message ?? err}`);
+      // A metering function threw: counted as an 'invalid' drop. Never affects the API.
+      reportMeteringFailure(client, options, err, { path, method, statusCode });
     }
 
     done();

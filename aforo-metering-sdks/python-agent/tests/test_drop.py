@@ -56,7 +56,7 @@ async def test_network_failure_keeps_the_batch_and_shutdown_reports_it(
         shutdown_timeout_sec=0.2,
         on_drop=lambda events, reason: drops.append((events, reason)),
     )
-    client.record_capability(capability_name="search", agent_id="agent_1")
+    client.record_capability(capability_name="search", agent_id="agent_1", session_id="sess_1")
 
     with caplog.at_level("WARNING", logger="aforo_agent_metering"):
         assert await client.flush() == 1  # still queued, not dropped
@@ -86,7 +86,7 @@ async def test_5xx_outage_then_recovery_loses_nothing() -> None:
         post_fn=post_503_then_ok,
         on_drop=lambda events, reason: reasons.append(reason),
     )
-    client.record_capability(capability_name="search", agent_id="agent_1")
+    client.record_capability(capability_name="search", agent_id="agent_1", session_id="sess_1")
     await client.flush()  # 1 + 3 retries, then requeued
     assert client.dropped_count == 0
     await client.shutdown()  # sent again at shutdown, same body and key
@@ -108,7 +108,7 @@ async def test_4xx_response_drops_immediately_with_rejected_reason() -> None:
         on_drop=lambda events, reason: reasons.append(reason),
         on_error=lambda e: errors.append(e),
     )
-    client.record_capability(capability_name="search", agent_id="agent_1")
+    client.record_capability(capability_name="search", agent_id="agent_1", session_id="sess_1")
     await client.flush()
 
     assert client.dropped_count == 1
@@ -125,7 +125,7 @@ async def test_default_no_hook_still_counts_and_warns(
         return 400, ""
 
     client = _client(post_fn=post_400)
-    client.record_capability(capability_name="search", agent_id="agent_1")
+    client.record_capability(capability_name="search", agent_id="agent_1", session_id="sess_1")
 
     with caplog.at_level("WARNING", logger="aforo_agent_metering"):
         await client.flush()
@@ -143,7 +143,7 @@ async def test_raising_on_drop_never_breaks_flush() -> None:
         return 400, ""
 
     client = _client(post_fn=post_400, on_drop=bad_hook)
-    client.record_capability(capability_name="search", agent_id="agent_1")
+    client.record_capability(capability_name="search", agent_id="agent_1", session_id="sess_1")
     # Must not raise.
     await client.flush()
     assert client.dropped_count == 1
@@ -160,7 +160,7 @@ async def test_happy_path_no_drops_no_warns(caplog: pytest.LogCaptureFixture) ->
         post_fn=post_202,
         on_drop=lambda _e, reason: dropped.append(reason),
     )
-    client.record_capability(capability_name="search", agent_id="agent_1")
+    client.record_capability(capability_name="search", agent_id="agent_1", session_id="sess_1")
 
     with caplog.at_level("WARNING", logger="aforo_agent_metering"):
         await client.flush()
@@ -183,8 +183,8 @@ async def test_dropped_events_preserve_idempotency_keys() -> None:
         captured_events.extend(events)
 
     client = _client(post_fn=post_400, on_drop=hook)
-    client.record_capability(capability_name="a", agent_id="agent_1")
-    client.record_capability(capability_name="b", agent_id="agent_1")
+    client.record_capability(capability_name="a", agent_id="agent_1", session_id="sess_1")
+    client.record_capability(capability_name="b", agent_id="agent_1", session_id="sess_1")
     await client.flush()
 
     assert len(captured_events) == 2

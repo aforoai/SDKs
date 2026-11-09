@@ -22,12 +22,16 @@ is dedup-safe on the ingestor side.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import math
+import numbers
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Tuple
+from decimal import Decimal
+from typing import Any, Awaitable, Callable, Dict, List, Literal, Mapping, Optional, Tuple
 
 import httpx
 
@@ -39,7 +43,7 @@ from ._transport import (
 )
 from ._transport import policy as _policy
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 #: Async HTTP call signature accepted by ``post_fn``: (url, headers, body) ->
 #: (status, body_text) or (status, body_text, retry_after_header).
@@ -126,7 +130,14 @@ MAX_LENGTHS: Dict[str, int] = {
     "agentId": 36,
     "sessionId": 64,
     "capabilityName": 64,
+    "traceId": 128,
 }
+
+# The ingestor holds executionDurationMs in a Java ``Integer``. A value outside
+# that range (or not a number) fails JSON binding for the whole request, so it
+# is left off the event, which is still sent.
+_JAVA_INT_MIN = -(2 ** 31)
+_JAVA_INT_MAX = 2 ** 31 - 1
 
 DropReason = str  # 'overflow' | 'rejected' | 'invalid' | 'shutdown' | 'closed' | 'retry_exhausted'
 
@@ -200,8 +211,73 @@ def _too_long(field_name: str, value: Any) -> Optional[str]:
     )
 
 
+def _whole_number(value: Any) -> Optional[int]:
+    """``value`` as an int when it is a whole number (an int, an integral float
+    or ``Decimal``, or a string holding one), else None. ``bool`` is not one."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, numbers.Integral):
+            return int(value)
+        if isinstance(value, Decimal):  # a Number, but not a numbers.Real
+            return int(value) if value.is_finite() and value == value.to_integral_value() else None
+        if isinstance(value, numbers.Real):
+            as_float = float(value)
+            return int(as_float) if math.isfinite(as_float) and as_float.is_integer() else None
+        if isinstance(value, str):
+            text = value.strip()
+            try:
+                return int(text)
+            except ValueError:
+                as_float = float(text)
+                return int(as_float) if math.isfinite(as_float) and as_float.is_integer() else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return None
+
+
+def _token_count(name: str, value: Any) -> Tuple[int, Optional[str]]:
+    """A token count for the wire: ``None`` is 0, a whole number (or a string
+    holding one) is that int; anything else is a reason to drop the event."""
+    if value is None:
+        return 0, None
+    number = _whole_number(value)
+    if number is None:
+        return 0, f"{name} must be a whole number of tokens (got {str(value)[:40]!r})"
+    return number, None
+
+
+def _duration_ms(value: Any) -> Optional[int]:
+    """Milliseconds a Java ``int`` can hold, else None (a fractional value is
+    truncated, as the ingestor would)."""
+    if value is None or isinstance(value, bool):
+        return None
+    number = _whole_number(value)
+    if number is None:
+        try:
+            as_float = float(value) if isinstance(value, (numbers.Real, Decimal, str)) else math.nan
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(as_float):
+            return None
+        number = int(as_float)
+    return number if _JAVA_INT_MIN <= number <= _JAVA_INT_MAX else None
+
+
+def session_trace_id(product_id: str, customer_id: str, agent_id: str, session_id: str) -> str:
+    """The ``traceId`` every event of one agent session carries: 32 lowercase
+    hex characters, the format ``@aforoai/agent-metering`` (Node) uses. The
+    ingestor groups an AI_AGENT session's steps, tokens and cost by tenant +
+    ``traceId``. Derived from the session's product, customer, agent and
+    session id, so every process that records the same session sends the same
+    one."""
+    parts = "\x1f".join(str(p) for p in (product_id, customer_id, agent_id, session_id))
+    return hashlib.sha256(parts.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+
+
 def _utc_now_iso() -> str:
-    """ISO-8601 instant with a ``Z`` suffix, e.g. ``2026-09-22T10:00:00.000Z``."""
+    """ISO-8601 instant with seconds and a ``Z`` suffix, e.g.
+    ``2026-09-22T10:00:00.000Z``. The SDK always stamps ``occurredAt`` itself."""
     return (
         datetime.now(timezone.utc)
         .isoformat(timespec="milliseconds")
@@ -318,6 +394,7 @@ class AforoAgentClient:
         self.flush_interval_sec = flush_interval_sec
         self.max_retries = max_retries
         self.on_error = on_error or (lambda e: logger.debug("[aforo-agent] %s", e))
+        self._range_warned: set = set()
         via_post_fn = http_transport is None and post_fn is not None
         if via_post_fn:
             http_transport = _PostFnTransport(post_fn)
@@ -367,12 +444,13 @@ class AforoAgentClient:
         *,
         customer_id: Optional[str] = None,
         session_id: Optional[str] = None,
-        input_tokens: int = 0,
-        output_tokens: int = 0,
+        input_tokens: Any = 0,
+        output_tokens: Any = 0,
         execution_status: Optional[str] = "SUCCESS",
-        execution_duration_ms: int = 0,
+        execution_duration_ms: Any = 0,
         metadata: Optional[Dict[str, Any]] = None,
         product_type: Optional[str] = None,
+        trace_id: Optional[str] = None,
     ) -> None:
         """Record one AI_AGENT capability invocation.
 
@@ -383,29 +461,69 @@ class AforoAgentClient:
         ``customer_id`` (or the client's ``default_customer_id``) is the
         customer billed; the agent id is never used in its place.
 
+        ``session_id`` is required for an AI_AGENT event (the ingestor rejects
+        one without it). The event carries ``traceId`` = ``trace_id`` or, by
+        default, :func:`session_trace_id` of the session, so the ingestor
+        groups the session's steps, tokens and cost. ``input_tokens`` /
+        ``output_tokens``: ``None`` counts as 0, a whole number or a string
+        holding one is accepted. ``metadata`` must be a dict (any mapping).
+        ``execution_duration_ms`` that a Java ``int`` cannot hold is left off
+        (one WARNING per client); the event is still sent.
+
         Never raises for event content. An event the ingestor would reject
-        (blank ``capability_name`` / ``agent_id`` / customer, ``agent_id`` > 36
-        UTF-16 units, ``session_id`` / ``customer_id`` / ``capability_name`` > 64)
-        is not queued: it is counted in :attr:`dropped_count`, WARN-logged and
+        (blank ``capability_name`` / ``agent_id`` / customer, a blank
+        ``session_id`` on an AI_AGENT event, ``agent_id`` > 36 UTF-16 units,
+        ``session_id`` / ``customer_id`` / ``capability_name`` > 64, a token
+        count that is not a whole number, ``metadata`` that is not a dict) is
+        not queued: it is counted in :attr:`dropped_count`, WARN-logged and
         passed to ``on_drop`` with reason ``"invalid"``.
         """
-        event = self._build_event(
-            customer_id=self._customer(customer_id),
-            metric_name="ai_agent.capability_invocations",
-            agent_id=agent_id,
-            session_id=session_id,
-            capability_name=capability_name,
-            execution_status=execution_status,
-            execution_duration_ms=execution_duration_ms,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            extra_metadata=metadata,
-            product_type=product_type,
+        self._record_capability(
+            capability_name, agent_id, self._customer(customer_id),
+            session_id=session_id, input_tokens=input_tokens, output_tokens=output_tokens,
+            execution_status=execution_status, execution_duration_ms=execution_duration_ms,
+            metadata=metadata, product_type=product_type, trace_id=trace_id,
         )
-        problem = None
-        if _blank(capability_name):
-            problem = "capability_name is required (got blank)"
-        self._submit(event, problem or self._invalid_reason(event, capability_name))
+
+    def _record_capability(
+        self,
+        capability_name: Any,
+        agent_id: Any,
+        customer: str,
+        *,
+        session_id: Any,
+        input_tokens: Any,
+        output_tokens: Any,
+        execution_status: Any,
+        execution_duration_ms: Any,
+        metadata: Any,
+        product_type: Any,
+        trace_id: Any = None,
+    ) -> None:
+        """``record_capability`` with the customer already chosen (the
+        decorator passes "" when its resolver found none: no default)."""
+        metric = "ai_agent.capability_invocations"
+        try:
+            event, problem = self._build_event(
+                customer_id=customer,
+                metric_name=metric,
+                agent_id=agent_id,
+                session_id=session_id,
+                capability_name=capability_name,
+                execution_status=execution_status,
+                execution_duration_ms=execution_duration_ms,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                extra_metadata=metadata,
+                product_type=product_type,
+                trace_id=trace_id,
+            )
+            problem = (("capability_name is required (got blank)" if _blank(capability_name) else None)
+                       or self._invalid_reason(event, capability_name) or problem)
+        except Exception as exc:  # never raise into the agent for event content
+            self._drop_unbuildable(metric, customer, agent_id, session_id, exc)
+            return
+        self._submit(event, problem)
 
     def record_step(
         self,
@@ -415,46 +533,59 @@ class AforoAgentClient:
         *,
         customer_id: Optional[str] = None,
         capability_name: Optional[str] = None,
-        input_tokens: int = 0,
-        output_tokens: int = 0,
-        duration_ms: int = 0,
+        input_tokens: Any = 0,
+        output_tokens: Any = 0,
+        duration_ms: Any = 0,
         execution_status: Optional[str] = "SUCCESS",
         metadata: Optional[Dict[str, Any]] = None,
         product_type: Optional[str] = None,
+        trace_id: Optional[str] = None,
     ) -> None:
         """Record one step in an agent's reasoning loop.
 
         ``step_type`` is free-form (``THOUGHT`` / ``OBSERVATION`` /
         ``TOOL_CALL`` / ``FINAL_ANSWER`` are the common values). Steps
         with a ``capability_name`` fan out into per-capability billing
-        the same way :meth:`record_capability` does.
+        the same way :meth:`record_capability` does. ``traceId``, tokens,
+        ``metadata`` and ``duration_ms`` are handled as there.
 
         Never raises for event content: a blank ``agent_id`` /
         ``session_id`` / ``step_type`` / customer or an over-limit field is
         dropped with reason ``"invalid"``, as in :meth:`record_capability`.
         """
-        combined_meta: Dict[str, Any] = {"stepType": step_type}
-        if metadata:
-            combined_meta.update(metadata)
-        event = self._build_event(
-            customer_id=self._customer(customer_id),
-            metric_name="ai_agent.steps",
-            agent_id=agent_id,
-            session_id=session_id,
-            capability_name=capability_name,
-            execution_status=execution_status,
-            execution_duration_ms=duration_ms,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            extra_metadata=combined_meta,
-            product_type=product_type,
-        )
-        problem = None
-        if _blank(session_id):
-            problem = "session_id is required for a step (got blank)"
-        elif _blank(step_type):
-            problem = "step_type is required (got blank)"
-        self._submit(event, problem or self._invalid_reason(event, capability_name))
+        metric = "ai_agent.steps"
+        customer = self._customer(customer_id)
+        try:
+            if metadata is not None and not isinstance(metadata, Mapping):
+                combined_meta: Any = metadata  # _build_event reports it
+            else:
+                combined_meta = {"stepType": step_type}
+                if metadata:
+                    combined_meta.update(metadata)
+            event, problem = self._build_event(
+                customer_id=customer,
+                metric_name=metric,
+                agent_id=agent_id,
+                session_id=session_id,
+                capability_name=capability_name,
+                execution_status=execution_status,
+                execution_duration_ms=duration_ms,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                extra_metadata=combined_meta,
+                product_type=product_type,
+                trace_id=trace_id,
+            )
+            required = None
+            if _blank(session_id):
+                required = "session_id is required for a step (got blank)"
+            elif _blank(step_type):
+                required = "step_type is required (got blank)"
+            problem = required or self._invalid_reason(event, capability_name) or problem
+        except Exception as exc:  # never raise into the agent for event content
+            self._drop_unbuildable(metric, customer, agent_id, session_id, exc)
+            return
+        self._submit(event, problem)
 
     async def flush(self, timeout: Optional[float] = None) -> int:
         """Send everything queued now and wait for it, in a worker thread so
@@ -489,7 +620,13 @@ class AforoAgentClient:
         return self._core.dropped_count
 
     def __len__(self) -> int:
+        """Events queued right now."""
         return self._core.queue_size
+
+    def __bool__(self) -> bool:
+        # A client is always truthy: with only __len__, an idle client (empty
+        # queue) was falsy, so ``if client: client.record_...`` never recorded.
+        return True
 
     @property
     def _buffer(self) -> List[Dict[str, Any]]:
@@ -506,32 +643,47 @@ class AforoAgentClient:
         *,
         customer_id: str,
         metric_name: str,
-        agent_id: str,
-        session_id: Optional[str],
-        capability_name: Optional[str],
-        execution_status: Optional[str],
-        execution_duration_ms: int,
-        input_tokens: int,
-        output_tokens: int,
-        extra_metadata: Optional[Dict[str, Any]],
-        product_type: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        agent_id: Any,
+        session_id: Any,
+        capability_name: Any,
+        execution_status: Any,
+        execution_duration_ms: Any,
+        input_tokens: Any,
+        output_tokens: Any,
+        extra_metadata: Any,
+        product_type: Any = None,
+        trace_id: Any = None,
+    ) -> Tuple[Dict[str, Any], Optional[str]]:
+        """The wire event, and why it must not be sent (bad token counts or
+        metadata), else None. Field checks are :meth:`_invalid_reason`'s."""
+        problem: Optional[str] = None
+        inp, token_problem = _token_count("input_tokens", input_tokens)
+        out, output_problem = _token_count("output_tokens", output_tokens)
+        problem = token_problem or output_problem
+        if extra_metadata is not None and not isinstance(extra_metadata, Mapping):
+            problem = problem or (f"metadata must be a dict (got {type(extra_metadata).__name__})")
+            extra_metadata = None
+
         # Metadata carries both snake_case and camelCase capability_name.
         # The usage-ingestor extractor reads snake_case; camelCase is a
-        # courtesy for JS analytics consumers.
+        # courtesy for JS analytics consumers. Token counts are sent under
+        # the keys node-agent sends and the ingestor reads (input_tokens /
+        # output_tokens: COGS and session totals); the camelCase ones are kept.
         metadata: Dict[str, Any] = {
             "sdkLanguage": "python",
             "sdkVersion": __version__,
             "productId": self.product_id,
-            "inputTokens": input_tokens,
-            "outputTokens": output_tokens,
-            "totalTokens": input_tokens + output_tokens,
+            "input_tokens": inp,
+            "output_tokens": out,
+            "inputTokens": inp,
+            "outputTokens": out,
+            "totalTokens": inp + out,
         }
         if capability_name:
             metadata["capability_name"] = capability_name  # snake_case (extractor)
             metadata["capabilityName"] = capability_name  # camelCase (JS parity)
         if extra_metadata:
-            metadata.update(extra_metadata)
+            metadata.update(dict(extra_metadata))
 
         event: Dict[str, Any] = {
             "customerId": customer_id,
@@ -544,13 +696,24 @@ class AforoAgentClient:
             "productType": _normalize_product_type(product_type, self.product_type),
             "agentId": agent_id,
             "sessionId": session_id,
-            "executionDurationMs": execution_duration_ms,
             "metadata": metadata,
         }
+        if not _blank(session_id):
+            explicit = clean_customer_id(trace_id)
+            event["traceId"] = explicit or session_trace_id(
+                self.product_id, customer_id, clean_customer_id(agent_id) or "", str(session_id))
+        duration = _duration_ms(execution_duration_ms)
+        if duration is not None:
+            event["executionDurationMs"] = duration
+        elif execution_duration_ms is not None:
+            self._warn_once("executionDurationMs",
+                            "[aforo-agent] executionDurationMs %r is not a number a Java int can hold; the "
+                            "field is left off and the event is still sent. Logged once.",
+                            str(execution_duration_ms)[:40])
         status = normalize_execution_status(execution_status)
         if status is not None:
             event["executionStatus"] = status
-        return event
+        return event, problem
 
     @staticmethod
     def _invalid_reason(
@@ -560,8 +723,10 @@ class AforoAgentClient:
         if _blank(event.get("agentId")):
             return "agent_id is required for AI_AGENT (got blank)"
         if _blank(event.get("customerId")):
-            return ("customer_id is required: pass customer_id or set default_customer_id "
-                    "(the agent id is not used as the customer)")
+            return ("customer_id is required: pass customer_id or set default_customer_id, or have the "
+                    "decorator's customer_resolver return one (the agent id is not used as the customer)")
+        if event.get("productType") == DEFAULT_PRODUCT_TYPE and _blank(event.get("sessionId")):
+            return "session_id is required for AI_AGENT (the ingestor rejects an AI_AGENT event without one)"
         return (
             _too_long("agentId", event.get("agentId"))
             or _too_long("customerId", event.get("customerId"))
@@ -570,6 +735,7 @@ class AforoAgentClient:
             or _too_long("metricName", event.get("metricName"))
             or _too_long("productType", event.get("productType"))
             or _too_long("idempotencyKey", event.get("idempotencyKey"))
+            or _too_long("traceId", event.get("traceId"))
         )
 
     def _submit(self, event: Dict[str, Any], problem: Optional[str]) -> None:
@@ -578,6 +744,20 @@ class AforoAgentClient:
             self._core.report_drop([event], "invalid", detail=problem)
             return
         self._core.enqueue(event)
+
+    def _drop_unbuildable(self, metric_name: str, customer: str, agent_id: Any, session_id: Any,
+                          exc: Exception) -> None:
+        """An event whose content could not even be assembled: dropped as invalid."""
+        stub = {"customerId": customer, "metricName": metric_name, "agentId": agent_id, "sessionId": session_id}
+        self._core.report_drop([stub], "invalid",
+                               detail=f"the event could not be built ({type(exc).__name__}: {str(exc)[:80]})")
+
+    def _warn_once(self, field_name: str, message: str, *args: Any) -> None:
+        with _truncation_lock:
+            first = field_name not in self._range_warned
+            self._range_warned.add(field_name)
+        if first:
+            logger.warning(message, *args)
 
     def _safe_on_error(self, e: Exception) -> None:
         try:

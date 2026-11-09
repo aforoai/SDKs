@@ -1,7 +1,8 @@
 import { MiddlewareOptions } from '../types.js';
-import { isPreflight, resolveMetricName, httpMethodOf, middlewareClient, customerLookup, endpointPathFor } from './common.js';
-
-const DEFAULT_EXCLUDE_PATHS = ['/health', '/ready', '/metrics', '/favicon.ico'];
+import {
+  isPreflight, resolveMetricName, httpMethodOf, middlewareClient, customerLookup, endpointPathFor,
+  DEFAULT_EXCLUDE_PATHS, isExcludedPath, reportMeteringFailure,
+} from './common.js';
 
 /**
  * Express middleware that records one usage event per request.
@@ -28,13 +29,12 @@ export function expressMiddleware(options: MiddlewareOptions) {
     const startTime = Date.now();
 
     res.on('finish', () => {
+      const path: string = req.originalUrl || req.url || '/';
+      const method: string = req.method || 'UNKNOWN';
+      const statusCode: number = res.statusCode || 0;
       try {
-        const path: string = req.originalUrl || req.url || '/';
-        const method: string = req.method || 'UNKNOWN';
-        const statusCode: number = res.statusCode || 0;
-
         if (isPreflight(method)) return;
-        if (excludePaths.some((p: string) => path.startsWith(p))) return;
+        if (isExcludedPath(path, excludePaths)) return;
         if (excludeStatusCodes.includes(statusCode)) return;
 
         const quantity = typeof options.quantity === 'function' ? options.quantity(req, res) : options.quantity ?? 1;
@@ -54,8 +54,9 @@ export function expressMiddleware(options: MiddlewareOptions) {
           responseTimeMs: Date.now() - startTime,
         }).catch((err) => console.debug(`[aforo] metering skipped: ${err?.message ?? err}`));
       } catch (err) {
-        // Never let metering errors affect the API.
-        console.debug(`[aforo] metering skipped: ${(err as Error)?.message ?? err}`);
+        // A metering function threw (customerResolver, metricName, quantity, metadata):
+        // counted as an 'invalid' drop. Never affects the API.
+        reportMeteringFailure(client, options, err, { path, method, statusCode });
       }
     });
 

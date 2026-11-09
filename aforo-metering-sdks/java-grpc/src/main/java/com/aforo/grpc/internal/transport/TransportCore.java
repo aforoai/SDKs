@@ -199,7 +199,7 @@ public final class TransportCore<E> implements AutoCloseable {
     }
 
     /** Outcome of delivering one request body (after its retries). */
-    private enum Kind { DONE, TOO_LARGE, OUTAGE }
+    private enum Kind { DONE, TOO_LARGE, OUTAGE, RATE_SPLIT }
 
     private static final class Result {
         Kind kind = Kind.DONE;
@@ -213,7 +213,11 @@ public final class TransportCore<E> implements AutoCloseable {
         int redirectStatus;
         String redirectLocation;
         int lastStatus;
-        /** On an outage: the entries of this body that were not delivered, in order. */
+        /** RATE_SPLIT: the API key's events-per-minute limit, below the batch size. */
+        int rateLimit;
+        /** RATE_SPLIT: the 429's Retry-After header. */
+        String retryAfter;
+        /** On an outage or a rate split: the entries of this body that were not delivered, in order. */
         List<Entry<?>> unsent = List.of();
     }
 
@@ -268,6 +272,11 @@ public final class TransportCore<E> implements AutoCloseable {
     private long nextPassNotBefore;
     /** Events were put back (outage or retryable); send again as soon as the cooldown ends. */
     private boolean resumePending;
+    /**
+     * Largest batch the ingestor's rate limit lets through (R5): set when a 429 names an
+     * {@code X-RateLimit-Limit} below the batch size, cleared by a 2xx that names no lower limit.
+     */
+    private int batchCap = Integer.MAX_VALUE;
 
     public TransportCore(TransportConfig config, Encoder<E> encoder, DropHandler<E> dropHandler) {
         this(config, encoder, dropHandler, HttpSender.jdk(Math.min(TransportConfig.DEFAULT_CONNECT_TIMEOUT_MS,
@@ -606,7 +615,7 @@ public final class TransportCore<E> implements AutoCloseable {
         lastPassOutage = false;
         while (budget > 0) {
             if (pastDeadline()) break;
-            List<Entry<E>> batch = pollBatch(Math.min(config.flushCount, budget));
+            List<Entry<E>> batch = pollBatch(Math.min(Math.min(config.flushCount, batchCap), budget));
             if (batch.isEmpty()) break;
             budget -= batch.size();
             Result r;
@@ -624,6 +633,12 @@ public final class TransportCore<E> implements AutoCloseable {
             lost += r.dropped;
             if (r.kind == Kind.OUTAGE) {
                 lastPassOutage = true;
+                break;
+            }
+            if (r.kind == Kind.RATE_SPLIT) {
+                // Smaller batches go first, after the wait the 429 asked for.
+                nextPassNotBefore = timing.nowMillis() + retryDelay(0, r.retryAfter);
+                resumePending = true;
                 break;
             }
             if (r.requeuedRetryable) {
@@ -646,6 +661,20 @@ public final class TransportCore<E> implements AutoCloseable {
             total.sent += r.sent;
             total.dropped += r.dropped;
             total.requeuedRetryable |= r.requeuedRetryable;
+            if (r.kind == Kind.RATE_SPLIT) {
+                // The API key may report fewer events per minute than this batch holds: put it back in
+                // order; the next passes take at most that many events per request.
+                List<Entry<E>> unsent = new ArrayList<>(cast(r.unsent));
+                for (int q = p + 1; q < parts.size(); q++) unsent.addAll(parts.get(q));
+                requeueFront(unsent);
+                batchCap = r.rateLimit;
+                log.warning(prefix + " Ingestor answered 429 with a limit of " + r.rateLimit + " events per minute;"
+                        + " " + unsent.size() + " event(s) put back and sent in batches of at most " + r.rateLimit + ".");
+                total.kind = Kind.RATE_SPLIT;
+                total.rateLimit = r.rateLimit;
+                total.retryAfter = r.retryAfter;
+                return total;
+            }
             if (r.kind == Kind.OUTAGE) {
                 List<Entry<E>> unsent = new ArrayList<>(cast(r.unsent));
                 for (int q = p + 1; q < parts.size(); q++) unsent.addAll(parts.get(q));
@@ -688,10 +717,10 @@ public final class TransportCore<E> implements AutoCloseable {
         }
         int mid = part.size() / 2;
         Result left = sendSplitting(new ArrayList<>(part.subList(0, mid)));
-        if (left.kind == Kind.OUTAGE || left.retryCapReached) {
+        if (left.kind == Kind.OUTAGE || left.kind == Kind.RATE_SPLIT || left.retryCapReached) {
             // The right half was never sent: it goes back with the left half's outcome.
             List<Entry<?>> unsent = new ArrayList<>(left.unsent);
-            if (left.kind == Kind.OUTAGE) {
+            if (left.kind == Kind.OUTAGE || left.kind == Kind.RATE_SPLIT) {
                 unsent.addAll(part.subList(mid, part.size()));
                 left.unsent = unsent;
             } else {
@@ -762,6 +791,8 @@ public final class TransportCore<E> implements AutoCloseable {
                 int status = resp.status();
                 r.lastStatus = status;
                 if (status >= 200 && status < 300) {
+                    int limit = parseRateLimit(resp.rateLimitLimit());
+                    if (limit <= 0 || limit >= config.flushCount) batchCap = Integer.MAX_VALUE;
                     return accepted(part, resp.body());
                 }
                 if (status == 401 || status == 403) {
@@ -777,6 +808,17 @@ public final class TransportCore<E> implements AutoCloseable {
                 if (status == 413) {
                     r.kind = Kind.TOO_LARGE;
                     return r;
+                }
+                if (status == 429 && part.size() > 1) {
+                    int limit = parseRateLimit(resp.rateLimitLimit());
+                    if (limit > 0 && limit < part.size()) {
+                        // Resending the same batch can never fit the key's per-minute limit (R5).
+                        r.kind = Kind.RATE_SPLIT;
+                        r.rateLimit = limit;
+                        r.retryAfter = resp.retryAfter();
+                        r.unsent = new ArrayList<>(part);
+                        return r;
+                    }
                 }
                 boolean retryable = status == 408 || status == 429 || status >= 500;
                 if (!retryable) {
@@ -937,6 +979,17 @@ public final class TransportCore<E> implements AutoCloseable {
         } catch (DateTimeParseException e) {
             log.log(Level.FINE, prefix + " ignoring unreadable Retry-After: " + v, e);
             return -1;
+        }
+    }
+
+    /** {@code X-RateLimit-Limit} as a positive event count, or 0 when absent or unreadable. */
+    static int parseRateLimit(String value) {
+        if (value == null) return 0;
+        try {
+            long v = Long.parseLong(value.trim());
+            return v <= 0 ? 0 : (int) Math.min(v, Integer.MAX_VALUE);
+        } catch (NumberFormatException e) {
+            return 0;
         }
     }
 
@@ -1226,15 +1279,27 @@ public final class TransportCore<E> implements AutoCloseable {
         }
     }
 
+    /**
+     * Waits up to {@code millis} for the flusher to finish. An interrupt does not cut the wait
+     * short (close() from an interrupted thread must still drain until the shutdown deadline);
+     * the interrupt flag is restored before returning.
+     */
     private boolean awaitTermination(long millis) {
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(Math.max(0, millis));
+        boolean interrupted = false;
         try {
-            terminated.get(millis, java.util.concurrent.TimeUnit.MILLISECONDS);
-            return true;
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return false;
-        } catch (ExecutionException | java.util.concurrent.TimeoutException e) {
-            return false;
+            while (true) {
+                try {
+                    terminated.get(Math.max(0, deadline - System.nanoTime()), java.util.concurrent.TimeUnit.NANOSECONDS);
+                    return true;
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                } catch (ExecutionException | java.util.concurrent.TimeoutException e) {
+                    return false;
+                }
+            }
+        } finally {
+            if (interrupted) Thread.currentThread().interrupt();
         }
     }
 

@@ -21,7 +21,7 @@ import (
 	"github.com/aforoai/SDKs/aforo-metering-sdks/go-mqtt/v2/internal/ingest"
 )
 
-const sdkVersion = "2.1.0"
+const sdkVersion = "2.1.1"
 
 // Ingestor limits for the MQTT fields (IngestUsageEventRequest @Size).
 const (

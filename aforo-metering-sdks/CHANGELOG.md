@@ -5,6 +5,38 @@ released by git tag; their in-code `sdkVersion` constant is bumped here so
 events report the right version. Publishing is a DevOps step — merging to
 `main` does not release anything.
 
+## 2.1.1 — 2026-11-09 (full SDK review: no silent usage loss)
+
+All packages 2.1.0 → 2.1.1 (aforo-agent-metering 1.1.0 → 1.1.1). Patch release:
+every change fixes behaviour that lost, double-counted or misattributed usage,
+blocked the host app, or contradicted the docs. Each module's CHANGELOG lists its
+fixes; the cross-cutting ones:
+
+- **One bad event no longer costs the whole batch.** Every transport core now
+  drops, at record time, an event the ingestor cannot read: an `occurredAt`
+  without seconds or a `Z`/`±HH:MM` zone, `metadata` that is not an object. A
+  number too large for the ingestor's short/int field is left off and the event
+  kept. Before, the ingestor answered 400 for the request and every event in it
+  was lost. (usage-ingestor now also reads each batch event on its own.)
+- **429 below the batch size.** When `X-RateLimit-Limit` is smaller than the
+  batch, the batch is split to fit instead of being retried unchanged forever
+  ([TRANSPORT-SPEC](contract/TRANSPORT-SPEC.md), "Rate-limit split").
+- **API key hygiene.** The key is trimmed at construction; one that still holds
+  whitespace or control characters is refused without echoing it, and no log or
+  error message can contain it.
+- **Middleware.** `excludePaths` matches whole path segments (`/health` no
+  longer skips `/healthcare/...`); a resolver that throws drops the event as
+  `invalid` and counts it; requests that fail with an exception are metered.
+- **Protocols.** gRPC handlers no longer lose stream messages (Node) and failed
+  or cancelled calls bill their real status (Java); persisted GraphQL queries
+  and GET operations are metered; WebSocket connections closed by the idle
+  sweep are tracked again on their next frame.
+- **MCP and agents.** python-mcp's Quickstart meters as written and reads
+  `_meta` from the request, never the tool arguments; python-agent sends a
+  per-session `traceId` and snake_case token keys so the ingestor sees sessions
+  and tokens; mcp-proxy no longer corrupts multi-byte UTF-8, bills a failed
+  forward twice, or loses calls that reuse a JSON-RPC id.
+
 ## 2.1.0 — 2026-10-30 (wave 8: request compression, G269)
 
 All packages 2.0.0 → 2.1.0 (aforo-agent-metering 1.0.0 → 1.1.0); Go modules are released by tag (PUBLISHING.md).

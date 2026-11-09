@@ -2,7 +2,7 @@
 
 Meter MQTT client traffic — PUBLISH, SUBSCRIBE, UNSUBSCRIBE, CONNECT, DISCONNECT — by wrapping a `paho-mqtt` (sync) or `aiomqtt` (async) client. Use it when you connect to a third-party broker (AWS IoT, HiveMQ Cloud, EMQ X Cloud) and want to meter what your client sends and receives.
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 > For **broker-side** (server-level) metering, use the companion EMQ X Erlang plugin in `aforo-nextgen-docker/emqx-plugin-aforo-metering/`. This Python SDK is **client-side**.
 
@@ -82,7 +82,7 @@ Each metered event POSTs to `https://api.aforo.ai/v1/ingest/batch` with `X-API-K
 
 > **The customer comes from your own mapping.** Pass `customer_id` when you wrap the client, from your trusted device/account mapping, or `customer_resolver=callable(client)`. Billing the connection's MQTT username needs `trust_customer_header=True` — whoever configures the connection sets it. With none of the three, the wrapper raises `ValueError`. `tenant_id` is fixed from config and sent as a header.
 >
-> **What is billed:** CONNECT when the broker accepts the connection; DISCONNECT when you disconnect, or `reconnect_debounce_sec` (default 30 s) after a dropped connection that did not come back — a drop followed by a reconnect inside that window is one session, so network flaps do not create billable CONNECT/DISCONNECT pairs. PUBLISH is billed after paho confirms it (`on_publish`: the broker's ack for QoS 1/2, the socket write for QoS 0); a publish paho refuses is not billed. With aiomqtt, PUBLISH is billed after `publish()` returns.
+> **What is billed:** CONNECT when the broker accepts the connection; DISCONNECT when you disconnect, or `reconnect_debounce_sec` (default 30 s) after a dropped connection that did not come back — a drop followed by a reconnect inside that window is one session, so network flaps do not create billable CONNECT/DISCONNECT pairs. PUBLISH is billed after paho confirms it (`on_publish`: the broker's ack for QoS 1/2, the socket write for QoS 0); a publish paho refuses is not billed. A QoS 1/2 publish made while the client is disconnected, which paho keeps and sends on reconnect, is billed when the broker acks it. With aiomqtt, PUBLISH is billed after `publish()` returns.
 
 ## Configuration
 

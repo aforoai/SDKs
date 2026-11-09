@@ -2,6 +2,28 @@
 
 All notable changes to `@aforoai/mcp-proxy` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [2.1.1] - 2026-11-09
+
+### Fixed (SDK review, 2026-11-09)
+- **stdio no longer corrupts non-ASCII text.** Each pipe chunk was decoded on its own, so a UTF-8 character split across two chunks reached the other side as two U+FFFD characters (seen on a 560 KB result). Both directions now use a streaming UTF-8 decoder.
+- **A client can no longer make the ingestor refuse a whole batch.** A `tools/call` whose `params.name` or `_meta.agent_id` was an object or an array was copied into the event, the ingestor could not read the request, and every event in it (other customers' too) was rejected. Only strings are used now; anything else is billed as `"unknown"`.
+- **Calls the server never ran are not billed.** When the SSE / Streamable HTTP upstream refuses the connection or answers an HTTP error without a JSON-RPC response (e.g. 404 for an expired session), the POST's tool calls are forgotten. They used to be billed as `TIMEOUT` after the response timeout, so a client retry was billed twice. A timeout still meters `TIMEOUT`.
+- **A reused JSON-RPC id no longer hides calls.** Calls waiting under the same session + id are queued, and each is metered once; a reused id used to overwrite the earlier call, which was never billed.
+- **A client's `_meta.agent_id` is never a reason to drop the call.** Blank, non-string or over 36 characters: the call is billed as agent `"unknown"` (one warning). It used to be dropped as `invalid`, or sent blank and rejected by the ingestor.
+- **`notifications/cancelled` meters the call as `CANCELLED`** when the cancellation arrives. The server sends no response for it, so it used to be billed as `TIMEOUT` after the response timeout.
+- **`executionDurationMs` that does not fit the ingestor's int field** is left off the event (one warning); the event is still sent.
+- The API key is trimmed when it is read (env, CLI, config file or library config).
+
+### Added
+- `--compression` / `aforo.compression` / `AFORO_COMPRESSION` (`gzip` default, `none`), the opt-out every other Node SDK has.
+- A `Flushed events` debug line per accepted batch, as the USER_GUIDE's verification step describes.
+- A startup warning when `--api-key` is used with stdio: the spawned MCP server can read the proxy's command line. The docs now pass the key as `AFORO_API_KEY` only.
+
+### Docs
+- `--agent-id` is an operator override (it wins over `_meta.agent_id`, as it always has); the README and USER_GUIDE said it applied only when the traffic carried none.
+- The Claude Desktop example has a `customerId` (without one the proxy exits) and keeps the key in the host's `env` block.
+- `tools/list`, `resources/read` and `prompts/get` are forwarded, not "tracked for analytics".
+
 ## [2.0.0] - 2026-10-26
 
 ### Fixed (transport core, review of 2026-10-26)

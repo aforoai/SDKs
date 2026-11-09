@@ -28,8 +28,13 @@ verified), or the client's ``default_customer_id``;
 ``trust_customer_header=True`` instead bills the call's ``customer_id`` kwarg,
 which whoever calls the agent controls. With none of them, decorating raises
 ``ValueError``. A call with no customer still runs; its event is dropped as
-``"invalid"``. The agent id comes from the ``agent_id`` kwarg; a call without
-one is dropped as ``"invalid"`` too (there is no ``"unknown"`` agent).
+``"invalid"``. When you pass a ``customer_resolver`` and it raises or returns
+nothing, the event is dropped as ``"invalid"`` even if the client has a
+``default_customer_id``: that default never stands in for a failed lookup.
+The agent id comes from the ``agent_id`` kwarg; a call without one is dropped
+as ``"invalid"`` too (there is no ``"unknown"`` agent). The session comes from
+the ``session_id`` kwarg; an AI_AGENT call without one is dropped as
+``"invalid"`` (the ingestor rejects it).
 
 If the wrapped handler doesn't accept a fixed ``capability_name``, pass
 ``capability_name=None`` and set it via a ``capability_name`` kwarg on
@@ -79,6 +84,9 @@ def wrap_capability_handler(
     :class:`TypeError` at decoration time so a mismatch surfaces early
     instead of silently no-op'ing in production.
     """
+    # A resolver the caller passed: when it finds no customer the event is
+    # dropped, never billed to the client's default_customer_id.
+    strict_customer = customer_resolver is not None
     if customer_resolver is None and not trust_customer_header and client.default_customer_id:
         fixed = client.default_customer_id
         resolver: Optional[CustomerResolver] = lambda _args, _kwargs: fixed  # noqa: E731
@@ -138,13 +146,18 @@ def wrap_capability_handler(
                 # handler's return path (already ran + returned or
                 # raised at this point).
                 try:
-                    client.record_capability(
-                        capability_name=cap,
-                        agent_id=agent_id,
-                        customer_id=customer_id,
+                    customer = (customer_id or "") if strict_customer else client._customer(customer_id)
+                    client._record_capability(
+                        cap,
+                        agent_id,
+                        customer,
                         session_id=session_id,
+                        input_tokens=0,
+                        output_tokens=0,
                         execution_status=status,
                         execution_duration_ms=duration_ms,
+                        metadata=None,
+                        product_type=None,
                     )
                 except Exception:
                     logger.debug(

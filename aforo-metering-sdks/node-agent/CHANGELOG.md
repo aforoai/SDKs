@@ -2,6 +2,13 @@
 
 All notable changes to `@aforoai/agent-metering` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [2.1.1] - 2026-11-09
+
+### Fixed (SDK review, 2026-11-09)
+- **One bad `durationMs` no longer loses a whole batch.** `executionDurationMs` and `stepNumber` are Java ints on the ingestor; a value over 2147483647 made the request unreadable and every event in it (all sessions) was rejected. Such a value, a negative one or a non-finite one is now left off the event with one warning; the event is still sent.
+- **Quantity precision is checked when the event is recorded.** A quantity with more than 14 integer digits or 6 decimal places (for example `recordUsage('gpuHours', 1/3)`) is dropped as `invalid` at once, as contract/ingest-contract.json and the root README require, instead of being rejected later by the ingestor. Nothing is rounded.
+- `metadata` (and the deprecated `properties`) must be a plain object; anything else drops the event as `invalid` instead of being spread into odd keys. `occurredAt` is checked for seconds and a zone.
+
 ## [2.0.0] - 2026-10-26
 
 2.0.0 was never published, so the wave 5 changes below and the 2026-10-21 batch-contract rewrite (mirror PR aforoai/SDKs#58, next section) ship together as 2.0.0. Upgrade notes from 1.2.0 = both sections.

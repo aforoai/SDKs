@@ -4,7 +4,7 @@ Per-connection (and optionally per-frame) WebSocket metering for Go. Framework-a
 
 Record an outbound frame only after the write succeeds, so a frame the socket refused is not billed (the Node and Python SDKs, which wrap `send`, do this for you).
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 Reach for this when you bill WebSocket usage by connection (with duration, frame count, and byte totals) and want one open/close event pair per connection — with a per-frame mode for the cases where every message is billable.
 
@@ -15,7 +15,7 @@ Reach for this when you bill WebSocket usage by connection (with duration, frame
 go get github.com/aforoai/SDKs/aforo-metering-sdks/go-ws/v2
 ```
 
-The import path ends in `/v2` (version 2 changed the public API; see the [changelog](CHANGELOG.md)). Releases are git tags `aforo-metering-sdks/go-ws/v2.X.Y` on github.com/aforoai/SDKs. Until the `v2.0.0` tag exists, build against a local checkout with a `replace`:
+The import path ends in `/v2` (version 2 changed the public API; see the [changelog](CHANGELOG.md)). Releases are git tags `aforo-metering-sdks/go-ws/v2.X.Y` on github.com/aforoai/SDKs. Until the `v2.1.0` tag exists, build against a local checkout with a `replace`:
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
@@ -23,7 +23,7 @@ git clone https://github.com/aforoai/SDKs.git
 
 ```go
 // go.mod (your service)
-require github.com/aforoai/SDKs/aforo-metering-sdks/go-ws/v2 v2.0.0
+require github.com/aforoai/SDKs/aforo-metering-sdks/go-ws/v2 v2.1.1
 
 replace github.com/aforoai/SDKs/aforo-metering-sdks/go-ws/v2 => ../SDKs/aforo-metering-sdks/go-ws
 ```
@@ -42,6 +42,7 @@ With `gorilla/websocket`:
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
@@ -95,7 +96,7 @@ func main() {
 
 `Open` returns a connection id you must hold and pass to `RecordFrame` and `Close`. Pass the customer id your own authentication resolved; the SDK never reads it from the request. `Open` with an empty customer id returns `""`, tracks nothing and counts the event as `invalid`.
 
-> ⚠ Pair every `Open` with a `Close` — `defer billing.Close(connID, code)` right after `Open`. The `CONNECTION_CLOSED` event carries duration, frame count and byte totals. As a safety net, a connection with no activity for `ConnectionIdleTimeout` (default 1 h) is closed by the SDK (close reason `ABNORMAL_CLOSURE`, metadata `closedBy: "sdk_idle_timeout"`), and `Shutdown` closes every connection still open (`GOING_AWAY`, `closedBy: "sdk_shutdown"`), so totals are not lost and the connection map cannot grow without bound.
+> ⚠ Pair every `Open` with a `Close` — `defer billing.Close(connID, code)` right after `Open`. The `CONNECTION_CLOSED` event carries duration, frame count and byte totals. As a safety net, a connection with no activity for `ConnectionIdleTimeout` (default 1 h) is closed by the SDK (close reason `ABNORMAL_CLOSURE`, metadata `closedBy: "sdk_idle_timeout"`), and `Shutdown` closes every connection still open (`GOING_AWAY`, `closedBy: "sdk_shutdown"`), so totals are not lost and the connection map cannot grow without bound. A connection the sweep closed that sends another frame (within 24 × `ConnectionIdleTimeout`) is tracked again under the same id: no second `CONNECTION_OPENED` is sent, and its later events carry metadata `resumedAfterIdle: true`.
 
 `CONNECTION_OPENED` has its own frame type `OPEN` and metric `websocket_api.connection_opened` (before v2 it was sent as frame type `PING` with metric `websocket_api.message`). Make sure that metric exists in your Aforo catalog if you bill connections opened.
 
@@ -105,7 +106,7 @@ Product type: every event carries a top-level `productType` — `Config.ProductT
 connID := billing.Open(customerID, meta, wsmetering.EventOptions{ProductType: "AGENTIC_API"})
 ```
 
-How events are sent: every `Record`/`Open`/`Close` call appends to a bounded queue (`MaxQueueSize`, default 10 000) and returns; it never starts a goroutine or makes a request. One background sender per `Billing` posts `{"events":[...]}` to `/v1/ingest/batch` in batches of up to `FlushCount` (default 500, at most 1000), with `X-API-Key` and `User-Agent: aforo-go-ws/2.0.0`. Network errors, timeouts, `408`, `429` and `5xx` are retried with full-jitter backoff; `Retry-After` is honoured in both forms (seconds or HTTP date) up to 60 s. Each request, including reading the response body, is cut off at `Timeout`. Redirects are never followed (the API key must not reach another host): a `3xx` is logged at ERROR with the target host and handled like an outage. When retries run out — or the ingestor answers `401`/`403` or `3xx` — the batch goes back to the front of the queue with the same idempotency keys and the sender pauses (a random wait up to 5 s, doubling to 5 min, at least 250 ms); nothing is dropped and the ingestor deduplicates the resend. Events a `2xx` names in `errors[]` with `retryable: true` are resent after the same backoff, at most `MaxRetries` times, then handled as an outage. `413` splits the batch; any other `4xx` drops it as `rejected` and reports it via `OnError`. `Shutdown(ctx)` keeps sending — and retrying an unreachable ingestor — until the earlier of `ctx`'s deadline and `ShutdownTimeout` (5 s) and reports the rest as `shutdown` (see [Dropped events](#dropped-events)).
+How events are sent: every `Record`/`Open`/`Close` call appends to a bounded queue (`MaxQueueSize`, default 10 000) and returns; it never starts a goroutine or makes a request. One background sender per `Billing` posts `{"events":[...]}` to `/v1/ingest/batch` in batches of up to `FlushCount` (default 500, at most 1000), with `X-API-Key` and `User-Agent: aforo-go-ws/2.1.1`. Network errors, timeouts, `408`, `429` and `5xx` are retried with full-jitter backoff; `Retry-After` is honoured in both forms (seconds or HTTP date) up to 60 s. Each request, including reading the response body, is cut off at `Timeout`. Redirects are never followed (the API key must not reach another host): a `3xx` is logged at ERROR with the target host and handled like an outage. When retries run out — or the ingestor answers `401`/`403` or `3xx` — the batch goes back to the front of the queue with the same idempotency keys and the sender pauses (a random wait up to 5 s, doubling to 5 min, at least 250 ms); nothing is dropped and the ingestor deduplicates the resend. Events a `2xx` names in `errors[]` with `retryable: true` are resent after the same backoff, at most `MaxRetries` times, then handled as an outage. `413` splits the batch; any other `4xx` drops it as `rejected` and reports it via `OnError`. `Shutdown(ctx)` keeps sending — and retrying an unreachable ingestor — until the earlier of `ctx`'s deadline and `ShutdownTimeout` (5 s) and reports the rest as `shutdown` (see [Dropped events](#dropped-events)).
 
 ## Configuration
 

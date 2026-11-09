@@ -37,6 +37,13 @@ export interface ClientMessageResult {
    * response, or an array of them for a batch.
    */
   response?: string;
+  /**
+   * JSON-RPC ids of the `tools/call` requests in `raw` that are now waiting
+   * for a response. When forwarding fails without a JSON-RPC answer, pass
+   * them to {@link BaseProxy.forgetUnanswered} so nothing is billed for calls
+   * the server never ran.
+   */
+  tracked: Array<string | number>;
 }
 
 export abstract class BaseProxy {
@@ -64,18 +71,23 @@ export abstract class BaseProxy {
     if (this.guard) requireCustomerSource({ ...config.aforo, tokensMapCustomers: this.guard.tokensMapCustomers });
     else requireStdioCustomerSource(config.aforo, config.listen);
 
+    // Trimmed here as well as in loadConfig: a library caller builds ProxyConfig itself.
+    const apiKey = String(config.aforo.apiKey ?? '').trim();
+    if (!apiKey) throw new Error('aforo.apiKey is required');
+
     const client = new IngestorClient({
       baseUrl: config.aforo.ingestorUrl,
-      apiKey: config.aforo.apiKey,
+      apiKey,
       tenantId: config.aforo.tenantId,
       allowInsecureHttp: config.aforo.allowInsecureHttp,
     });
 
     this.buffer = new EventBuffer({
       baseUrl: config.aforo.ingestorUrl,
-      apiKey: config.aforo.apiKey,
+      apiKey,
       tenantId: config.aforo.tenantId,
       allowInsecureHttp: config.aforo.allowInsecureHttp,
+      compression: config.aforo.compression,
       flushCount: config.aforo.flushCount,
       flushIntervalMs: config.aforo.flushIntervalMs,
       maxQueueSize: config.aforo.maxQueueSize,
@@ -114,7 +126,7 @@ export abstract class BaseProxy {
     this.quota = new QuotaGuard({
       ingestorUrl: config.aforo.ingestorUrl,
       tenantId: config.aforo.tenantId,
-      apiKey: config.aforo.apiKey,
+      apiKey,
       enabled: config.aforo.quotaEnforcement ?? false,
       timeoutMs: config.aforo.quotaTimeoutMs,
       allowCacheMs: config.aforo.quotaAllowCacheMs,
@@ -145,26 +157,55 @@ export abstract class BaseProxy {
    */
   protected async handleClientMessage(raw: string, sessionId: string, principal?: Principal): Promise<ClientMessageResult> {
     const parsed = parseJsonRpc(raw);
-    if (!parsed) return { forward: true, raw };
+    if (!parsed) return { forward: true, raw, tracked: [] };
 
-    const denials = await Promise.all(parsed.messages.map((msg) => this.admitRequest(msg, sessionId, principal)));
+    const tracked: Array<string | number> = [];
+    const denials = await Promise.all(parsed.messages.map((msg) => this.admitRequest(msg, sessionId, principal, tracked)));
     const refused = denials.filter((d): d is JsonRpcResponse => d !== null);
-    if (refused.length === 0) return { forward: true, raw };
+    if (refused.length === 0) return { forward: true, raw, tracked };
 
     if (!parsed.batch) {
-      return { forward: false, raw, response: JSON.stringify(refused[0]) };
+      return { forward: false, raw, response: JSON.stringify(refused[0]), tracked };
     }
     const remaining = parsed.messages.filter((_m, i) => denials[i] === null);
     return {
       forward: remaining.length > 0,
       raw: remaining.length > 0 ? JSON.stringify(remaining) : raw,
       response: JSON.stringify(refused),
+      tracked,
     };
   }
 
+  /**
+   * Forwarding a client message produced no JSON-RPC answer for its calls (the
+   * upstream was unreachable, timed out, or answered an HTTP error): forget
+   * them, so a call the server never ran is not billed as TIMEOUT later.
+   */
+  protected forgetUnanswered(
+    sessionId: string,
+    tracked: ReadonlyArray<string | number>,
+    answered: ReadonlyArray<string | number> = [],
+  ): void {
+    const left = [...tracked];
+    for (const id of answered) {
+      const index = left.findIndex((t) => t === id);
+      if (index >= 0) left.splice(index, 1);
+    }
+    if (left.length > 0) this.tracker.forget(sessionId, left);
+  }
+
   /** Quota-check and track one message. Returns the refusal, or null to forward it. */
-  private async admitRequest(msg: JsonRpcMessage, sessionId: string, principal?: Principal): Promise<JsonRpcResponse | null> {
-    if (!isRequest(msg) || !isMeteredMethod(msg.method)) return null;
+  private async admitRequest(
+    msg: JsonRpcMessage, sessionId: string, principal: Principal | undefined, tracked: Array<string | number>,
+  ): Promise<JsonRpcResponse | null> {
+    if (!isRequest(msg)) return null;
+    if (msg.method === 'notifications/cancelled') {
+      // The server sends no response for a cancelled request: meter it as CANCELLED now.
+      const params = msg.params as { requestId?: unknown } | undefined;
+      this.tracker.trackCancellation(params?.requestId, sessionId);
+      return null;
+    }
+    if (!isMeteredMethod(msg.method)) return null;
     const toolCall = extractToolCall(msg as JsonRpcRequest);
     if (!toolCall) return null;
 
@@ -175,22 +216,26 @@ export abstract class BaseProxy {
     }
     // A call with no customer is not quota-checked; it runs and its event is dropped as `invalid`.
     this.tracker.trackRequest(toolCall, sessionId, principal, customerId);
+    tracked.push(toolCall.requestId);
     return null;
   }
 
   /**
    * Process a server-to-client message (single or batch). Always forwarded by
-   * the caller; telemetry is a side channel.
+   * the caller; telemetry is a side channel. Returns the ids of the tool
+   * calls it metered.
    */
-  protected handleServerMessage(raw: string, sessionId: string): void {
+  protected handleServerMessage(raw: string, sessionId: string): Array<string | number> {
+    const metered: Array<string | number> = [];
     const parsed = parseJsonRpc(raw);
-    if (!parsed) return;
+    if (!parsed) return metered;
     for (const msg of parsed.messages) {
       if (!isResponse(msg)) continue;
       const bytes = parsed.batch ? Buffer.byteLength(JSON.stringify(msg), 'utf-8') : Buffer.byteLength(raw, 'utf-8');
       const toolResponse = extractToolResponse(msg, bytes);
-      if (toolResponse) this.tracker.trackResponse(toolResponse, sessionId);
+      if (toolResponse && this.tracker.trackResponse(toolResponse, sessionId)) metered.push(toolResponse.requestId);
     }
+    return metered;
   }
 
   /**
