@@ -1,6 +1,6 @@
 # @aforoai/mcp-metering — User Guide
 
-**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** engineers who own an MCP server's source and want to meter `tools/call` invocations for Aforo billing.
+**Version:** 2.1.1 · **Updated:** 2026-10-26 · **Audience:** engineers who own an MCP server's source and want to meter `tools/call` invocations for Aforo billing.
 
 ## What you'll build
 
@@ -26,13 +26,13 @@ Install `2.0.0` or later. `1.0.0` on npm was built from an older copy of this co
 git clone https://github.com/aforoai/SDKs.git
 cd SDKs/aforo-metering-sdks/node-mcp
 npm install && npm run build
-npm pack        # produces aforo-mcp-metering-2.0.0.tgz
+npm pack        # produces aforoai-mcp-metering-2.1.1.tgz
 ```
 
 Then in your MCP server project:
 
 ```bash
-npm i /path/to/aforo-metering-sdks/node-mcp/aforo-mcp-metering-2.0.0.tgz
+npm i /path/to/aforo-metering-sdks/node-mcp/aforoai-mcp-metering-2.1.1.tgz
 ```
 
 ## Step 2 — Create the billing client

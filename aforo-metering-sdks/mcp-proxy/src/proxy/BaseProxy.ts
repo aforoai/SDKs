@@ -155,12 +155,17 @@ export abstract class BaseProxy {
    * refused call is removed from what goes to the server and answered by the
    * proxy. Non-JSON-RPC data passes through untouched.
    */
-  protected async handleClientMessage(raw: string, sessionId: string, principal?: Principal): Promise<ClientMessageResult> {
+  protected async handleClientMessage(
+    raw: string,
+    sessionId: string,
+    principal?: Principal,
+    meterSessionId: string = sessionId,
+  ): Promise<ClientMessageResult> {
     const parsed = parseJsonRpc(raw);
     if (!parsed) return { forward: true, raw, tracked: [] };
 
     const tracked: Array<string | number> = [];
-    const denials = await Promise.all(parsed.messages.map((msg) => this.admitRequest(msg, sessionId, principal, tracked)));
+    const denials = await Promise.all(parsed.messages.map((msg) => this.admitRequest(msg, sessionId, principal, tracked, meterSessionId)));
     const refused = denials.filter((d): d is JsonRpcResponse => d !== null);
     if (refused.length === 0) return { forward: true, raw, tracked };
 
@@ -197,6 +202,7 @@ export abstract class BaseProxy {
   /** Quota-check and track one message. Returns the refusal, or null to forward it. */
   private async admitRequest(
     msg: JsonRpcMessage, sessionId: string, principal: Principal | undefined, tracked: Array<string | number>,
+    meterSessionId: string,
   ): Promise<JsonRpcResponse | null> {
     if (!isRequest(msg)) return null;
     if (msg.method === 'notifications/cancelled') {
@@ -209,13 +215,13 @@ export abstract class BaseProxy {
     const toolCall = extractToolCall(msg as JsonRpcRequest);
     if (!toolCall) return null;
 
-    const customerId = this.tracker.resolveCustomerId(toolCall, sessionId, principal);
+    const customerId = this.tracker.resolveCustomerId(toolCall, meterSessionId, principal);
     if (customerId) {
       const deny = await this.quota.check(customerId, METRIC_NAME, toolCall.requestId);
       if (deny) return deny;
     }
     // A call with no customer is not quota-checked; it runs and its event is dropped as `invalid`.
-    this.tracker.trackRequest(toolCall, sessionId, principal, customerId);
+    this.tracker.trackRequest(toolCall, sessionId, principal, customerId, meterSessionId);
     tracked.push(toolCall.requestId);
     return null;
   }

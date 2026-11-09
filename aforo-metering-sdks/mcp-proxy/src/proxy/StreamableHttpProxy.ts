@@ -1,8 +1,11 @@
 /**
  * @file Streamable HTTP transport proxy.
  * HTTP server accepting POST/GET/DELETE, forwarding to the upstream MCP endpoint.
- * Uses the Mcp-Session-Id header for session scoping; a request without one
- * gets its own short-lived session.
+ * Uses the Mcp-Session-Id header for session scoping. A request without one
+ * (an upstream that issues no session ids) is matched to its own responses in
+ * a short-lived per-request scope, and its calls are metered in one stable
+ * proxy session per client token, so stateless traffic is not split into a
+ * new session per call.
  *
  * Client ──HTTP──► Proxy :3100/mcp ──HTTP──► Server :8080/mcp
  */
@@ -85,15 +88,19 @@ export class StreamableHttpProxy extends BaseProxy {
     if (body === null) return;
 
     const mcpSessionId = headerValue(req, 'mcp-session-id');
-    // No Mcp-Session-Id (e.g. initialize): this request is its own session, ended when it is answered.
+    // Responses are matched to calls within `sessionId`. Without Mcp-Session-Id (initialize, or an
+    // upstream that issues no session ids) that is this request alone, ended when it is answered, so
+    // two clients reusing a JSON-RPC id never get each other's answer.
     const sessionId = this.sessionManager.getOrCreate(mcpSessionId);
     const ephemeral = !mcpSessionId;
+    // The session stamped on events: the MCP session, else one stable proxy session per client token.
+    const meterSessionId = ephemeral ? this.sessionManager.getOrCreateStable(principal?.label ?? '') : sessionId;
     const finish = () => { if (ephemeral) this.sessionManager.endSession(sessionId); };
 
     let deadline: ReturnType<typeof upstreamDeadline> | undefined;
     let tracked: Array<string | number> = [];
     try {
-      const result = await this.handleClientMessage(body, sessionId, principal);
+      const result = await this.handleClientMessage(body, sessionId, principal, meterSessionId);
       tracked = result.tracked;
       const echo = mcpSessionId ? { 'Mcp-Session-Id': mcpSessionId } : {};
 

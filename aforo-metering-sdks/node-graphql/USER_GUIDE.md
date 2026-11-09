@@ -111,7 +111,7 @@ curl -s http://localhost:4000/graphql \
 The SDK records one event:
 - `metricName`: `graphql_api.operations`, `quantity`: 1
 - `gqlOperationType`: `QUERY`, `gqlOperationName`: `GetUser`
-- `gqlComplexity` / `gqlFieldCount` from the scorer (default `fieldCount + 5 × maxDepth`)
+- `gqlComplexity` / `gqlFieldCount` from the scorer (default `fieldCount + 5 × maxDepth` of the operation that runs, with each fragment counted at every spread at the depth where it is spread; other operations in the same document are not counted)
 - `gqlHasErrors`, `executionDurationMs`, and `dataBytes` when available
 
 ## Step 6 — Flush and verify it landed in Aforo

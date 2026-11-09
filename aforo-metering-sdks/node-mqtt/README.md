@@ -1,6 +1,6 @@
 # @aforoai/mqtt-metering
 
-Meter MQTT traffic into Aforo two ways: hook an Aedes broker you operate to meter every PUBLISH/SUBSCRIBE/CONNECT/DISCONNECT, or wrap an `mqtt.js` client to meter what it publishes and receives against a third-party broker (AWS IoT, HiveMQ Cloud, EMQ X Cloud).
+Meter MQTT traffic into Aforo two ways: hook an Aedes broker you operate to meter every client's CONNECT, PUBLISH, SUBSCRIBE, UNSUBSCRIBE and DISCONNECT, or wrap an `mqtt.js` client to meter its own CONNECT, PUBLISH, DISCONNECT and (opt-in) received messages against a third-party broker (AWS IoT, HiveMQ Cloud, EMQ X Cloud). See [What each mode meters](#what-each-mode-meters).
 
 **Version:** 2.1.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
@@ -79,7 +79,18 @@ billing.wrapMqttClient(client, { customerId: 'cust_acme_001' });
 
 Each event uses `metricName: "mqtt_broker.<event>"` (`mqtt_broker.publish`, `mqtt_broker.subscribe`, …) with `quantity: 1`, and carries `mqttTopic`, `mqttQos`, `mqttRetained`, `mqttClientId`, and `dataBytes`. Events ship to `POST https://api.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
 
-> **`DELIVER` (fan-out) events are dropped unless `emitDeliverEvents: true`.** This gate applies in **both** modes — client-mode inbound `message` deliveries and any broker delivery path are skipped by default because fan-out is high-volume. `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, `CONNECT`, and `DISCONNECT` are always metered.
+### What each mode meters
+
+| Event | Broker mode (`wrapAedesBroker`) | Client mode (`wrapMqttClient`) |
+|---|---|---|
+| `CONNECT` | Each client that connects. A client that comes back (or takes over its own session) within `reconnectDebounceMs` is not billed again. | This client connecting. A reconnect within `reconnectDebounceMs` is not billed again. |
+| `DISCONNECT` | A client leaving: at once for a DISCONNECT packet, else once `reconnectDebounceMs` passes without it coming back. | This client's connection ending: at once for `client.end()`, else once `reconnectDebounceMs` passes without a reconnect. |
+| `PUBLISH` | Every PUBLISH a client sends. Messages the broker publishes itself, with no client attached (such as `$SYS`), are not billed. | Every `publish()` / `publishAsync()` once mqtt.js reports it succeeded. |
+| `SUBSCRIBE` | One event per topic filter in each SUBSCRIBE packet. | **Not metered.** |
+| `UNSUBSCRIBE` | One event per topic filter in each UNSUBSCRIBE packet. | **Not metered.** |
+| `DELIVER` | **Not metered** — the broker hook does not see per-subscriber deliveries, whatever `emitDeliverEvents` says. | Each message this client receives, **only** with `emitDeliverEvents: true`. |
+
+Fan-out is billed only in client mode, and only when you turn it on, because it can be tens of thousands of events per second. Client mode meters what this one client does; subscriptions are free there because mqtt.js gives no broker acknowledgement the SDK could bill on (run the broker hook to bill them).
 
 ## Configuration
 
@@ -92,7 +103,7 @@ Each event uses `metricName: "mqtt_broker.<event>"` (`mqtt_broker.publish`, `mqt
 | `apiKey` | `string` | — (required) | Sent only as `X-API-Key: <apiKey>`; never logged or shown by `inspect()` / `JSON.stringify`. |
 | `ingestorUrl` | `string` | — (required) | Ingestion base URL, `https://` (see `allowInsecureHttp`). SDK appends `/v1/ingest/batch`. Use `https://api.aforo.ai`. |
 | `productType` | `string` | `'MQTT_BROKER'` | Aforo product type sent as top-level `productType` on every event (trimmed + uppercased; unknown values pass through). Override via `wrapAedesBroker(broker, { productType })` or `wrapMqttClient(client, { customerId, productType })`. |
-| `emitDeliverEvents` | `boolean` | `false` | Emit a `DELIVER` event per fan-out delivery. Off → `DELIVER` events are dropped (both modes). |
+| `emitDeliverEvents` | `boolean` | `false` | Client mode: emit a `DELIVER` event for each message the client receives. Off → received messages are not metered. Broker mode never meters deliveries. |
 | `allowInsecureHttp` | `boolean` | `false` | Accept a plain `http://` `ingestorUrl` on a non-local host. `https://` is required otherwise (plain http is fine for `localhost`, `127.0.0.1`, `::1`). |
 | `flushCount` | `number` | `500` | Events per request (max 1000). Reaching it wakes the background sender; recording an event never sends by itself. |
 | `flushIntervalMs` | `number` | `5000` | The background sender also runs this often. |
@@ -168,7 +179,8 @@ Step-by-step from install to a verified event in Aforo: [USER_GUIDE.md](USER_GUI
 
 ## What this doesn't cover
 
-- **Fan-out billing is opt-in.** `DELIVER` events are dropped unless `emitDeliverEvents: true`. Default metering counts the PUBLISH, not the per-subscriber fan-out.
+- **Fan-out billing is opt-in and client-side only.** A client's received messages are metered as `DELIVER` only with `emitDeliverEvents: true`; the broker hook never meters per-subscriber deliveries. Default metering counts the PUBLISH, not the fan-out.
+- **Client mode does not meter SUBSCRIBE or UNSUBSCRIBE.** Only the broker hook bills subscriptions.
 - **CONNECT/DISCONNECT have no MQTT topic.** Because the ingestor requires `mqttTopic`, they are sent with `$SYS/clients/<clientId>/connected` and `$SYS/clients/<clientId>/disconnected`. `$SYS/` is reserved for brokers, so these topics can't collide with a real one.
 - **Client-mode PUBLISH is billed after success.** `wrapMqttClient` meters a publish when mqtt.js reports it succeeded: on the broker's PUBACK/PUBCOMP for QoS 1/2, after the socket write for QoS 0. A publish that throws or whose callback gets an error is not billed. `publishAsync()` is covered too.
 - **Reconnects are one session.** mqtt.js reconnects on its own; a connection that comes back within `reconnectDebounceMs` (default 30 s) bills no new CONNECT and no DISCONNECT, and failed reconnect attempts bill nothing. A clean `client.end()` bills DISCONNECT at once. On the broker, the same rule applies per client id: a client that drops without a DISCONNECT packet and reconnects (or takes over its own session) inside the window is one session. `shutdown()` bills any DISCONNECT still waiting.

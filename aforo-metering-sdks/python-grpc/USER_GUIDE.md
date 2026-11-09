@@ -71,7 +71,7 @@ interceptor = AforoGrpcInterceptor(billing, customer_resolver=customer_for)
 
 ## Step 5 — Streaming RPCs
 
-The interceptor meters streaming RPCs on its own: one event when the stream ends, with `messageCount` = request messages read plus response messages sent. Call `record()` yourself only for calls that do not pass through the interceptor, for example:
+The interceptor meters streaming RPCs on its own: one event when the stream ends, with `messageCount` = request messages read plus response messages sent. A unary call is recorded with `messageCount` 1. Call `record()` yourself only for calls that do not pass through the interceptor, for example:
 
 ```python
 import time

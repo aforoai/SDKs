@@ -55,7 +55,7 @@ server.start()
 server.wait_for_termination()
 ```
 
-Every RPC is now metered — unary, server streaming, client streaming and bidirectional: one `grpc_api.rpc_calls` event per call when it ends, with `grpcStatusCode`, `grpcCallType`, `messageCount` (request messages read plus responses sent) and `executionDurationMs`, POSTed to `https://api.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
+Every RPC is now metered — unary, server streaming, client streaming and bidirectional: one `grpc_api.rpc_calls` event per call when it ends, with `grpcStatusCode`, `grpcCallType`, `messageCount` and `executionDurationMs`. `messageCount` is 1 for a unary call (as in the Node, Go and Java SDKs); for a streaming call it is the request messages read plus the response messages sent (a server stream of 3 responses is 4, a bidirectional stream of 3 in and 3 out is 6), POSTed to `https://api.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
 
 > ⚠ Events are sent to the ingestor's **`/v1/ingest/batch`** path as `{"events": [...]}`, at most 1000 events per request (larger buffers are split). Set `ingestor_url` to the host only — the SDK appends the path.
 
@@ -145,4 +145,4 @@ Install → add the interceptor → call an RPC → confirm the event in Aforo, 
 
 ## What this doesn't cover
 
-The interceptor only auto-meters **unary** RPCs — streaming RPCs need a manual `record()` (the SDK can't know when a stream ends or how many messages flowed). It meters per-call, not per-message, unless you pass `message_count`/`data_bytes` to `record()`. It doesn't enforce quotas or abort RPCs. Pricing and metric mapping live in the Aforo console.
+The interceptors meter one event per call — unary and all three streaming shapes — not one per message; a stream's messages are counted in `messageCount`. `dataBytes` is not measured by the interceptors (pass `data_bytes` to `record()` yourself). It doesn't enforce quotas or abort RPCs. Pricing and metric mapping live in the Aforo console.

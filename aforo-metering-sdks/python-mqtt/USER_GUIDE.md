@@ -40,7 +40,7 @@ All four arguments are required — the constructor raises `ValueError` if any i
 
 ## Step 3 — Wrap your MQTT client
 
-Wrap **before** you connect/publish so the SDK can hook the client's methods. `customer_id` is supplied here, once, for everything that client sends:
+Wrap **before** you connect/publish so the SDK can hook the client's methods. Your own `on_connect` / `on_publish` / `on_disconnect` / `on_message` can be set before or after wrapping: the metering hooks stay in place and call yours. `customer_id` is supplied here, once, for everything that client sends:
 
 **paho-mqtt (sync):**
 

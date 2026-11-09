@@ -18,7 +18,6 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -214,6 +213,13 @@ func (b *Billing) Middleware(next http.Handler) http.Handler {
 // OutcomeFromGraphQLResponse), falling back to the HTTP status (see
 // OutcomeFromHTTPStatus) when the body is not a GraphQL response or is larger
 // than 1 MiB. A handler can override it with SetExecutionStatus(r.Context(), …).
+//
+// gqlHasErrors is true when the response body carries GraphQL errors (the
+// statuses PARTIAL, ERROR and VALIDATION_FAILED above), also under HTTP 200,
+// or when the HTTP status is 400 or more.
+//
+// gqlComplexity and gqlFieldCount cover only the operation that runs
+// (operationName, else the first) and the fragments it spreads.
 func (b *Billing) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ops, tooLarge := b.readOperations(r)
@@ -243,13 +249,22 @@ func (b *Billing) middleware(next http.Handler) http.Handler {
 				fmt.Sprintf("request body larger than MaxRequestBodyBytes (%d); operation not read, request not metered", b.cfg.MaxRequestBodyBytes))
 			return
 		}
+		bodyOutcome := ""
+		if !recw.overflow {
+			bodyOutcome = OutcomeFromGraphQLResponse(recw.body.Bytes())
+		}
 		executionStatus := holder.get()
-		if executionStatus == "" && !recw.overflow {
-			executionStatus = OutcomeFromGraphQLResponse(recw.body.Bytes())
+		if executionStatus == "" {
+			executionStatus = bodyOutcome
 		}
 		if executionStatus == "" {
 			executionStatus = OutcomeFromHTTPStatus(recw.status)
 		}
+		// gqlHasErrors follows the response the client got: errors in the
+		// GraphQL body (PARTIAL, ERROR, VALIDATION_FAILED), also under HTTP
+		// 200, or an HTTP error status. A SetExecutionStatus override does not
+		// change it.
+		hasErrors := recw.status >= 400 || outcomeHasErrors(bodyOutcome)
 		elapsed := time.Since(start).Milliseconds()
 		for _, op := range ops {
 			if apqMiss(op, recw) {
@@ -257,7 +272,7 @@ func (b *Billing) middleware(next http.Handler) http.Handler {
 				// request is the one billed.
 				continue
 			}
-			b.recordOp(customerID, op, elapsed, recw.status >= 400, executionStatus, b.cfg.ProductType)
+			b.recordOp(customerID, op, elapsed, hasErrors, executionStatus, b.cfg.ProductType)
 		}
 	})
 }
@@ -385,7 +400,7 @@ func (b *Billing) recordOp(customerID string, op gqlRequest, durationMs int64, h
 	customerID = strings.TrimSpace(customerID)
 	query, operationName := op.Query, op.OperationName
 	opType, opName := detectOperation(query, operationName)
-	complexity, fieldCount := scoreComplexity(query)
+	complexity, fieldCount := scoreOperation(query, operationName)
 
 	now := time.Now().UTC()
 	// The key is built from the full operation name, before truncation.
@@ -486,31 +501,15 @@ func (r *responseRecorder) Write(p []byte) (int, error) {
 	return r.ResponseWriter.Write(p)
 }
 
-// fieldTokenRegex is compiled once; compiling per request on caller-supplied
-// text was a CPU cost the caller controlled.
-var fieldTokenRegex = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*\s*[(:{]?`)
-
 // detectOperation returns the type and name of the operation the request
 // runs: the one named operationName when the document holds it, else the
 // first operation. Comments, fragment definitions, strings and nested braces
 // are skipped, so "# note\nmutation M {…}" and "fragment F on T {…} mutation
 // M {…}" are mutations.
 func detectOperation(query, operationName string) (string, string) {
-	ops := operationsOf(query)
+	ops, _ := definitionsOf(query)
 	opType, opName := "QUERY", operationName
-	chosen := -1
-	if operationName != "" {
-		for i, op := range ops {
-			if op.name == operationName {
-				chosen = i
-				break
-			}
-		}
-	}
-	if chosen < 0 && len(ops) > 0 {
-		chosen = 0
-	}
-	if chosen >= 0 {
+	if chosen := chooseOperation(ops, operationName); chosen >= 0 {
 		opType = ops[chosen].typ
 		if opName == "" {
 			opName = ops[chosen].name
@@ -522,17 +521,45 @@ func detectOperation(query, operationName string) (string, string) {
 	return opType, opName
 }
 
-type opDef struct{ typ, name string }
+// chooseOperation returns the index of the operation named operationName,
+// else of the first operation, else -1.
+func chooseOperation(ops []opDef, operationName string) int {
+	if operationName != "" {
+		for i, op := range ops {
+			if op.name == operationName {
+				return i
+			}
+		}
+	}
+	if len(ops) > 0 {
+		return 0
+	}
+	return -1
+}
 
-// operationsOf lists the operation definitions of a GraphQL document, in
-// order. It is a single pass over the text: top-level keywords are read only
+// opDef is one operation definition. body is the byte range of its top-level
+// selection set ("{" through the matching "}"); body[1] is 0 while unknown.
+type opDef struct {
+	typ, name string
+	body      [2]int
+}
+
+// definitionsOf lists the operation definitions of a GraphQL document, in
+// order, and the selection-set byte range of each fragment definition by
+// name. It is a single pass over the text: top-level keywords are read only
 // outside selection sets, parentheses, strings and comments.
-func operationsOf(doc string) []opDef {
+func definitionsOf(doc string) ([]opDef, map[string][2]int) {
 	var ops []opDef
+	frags := map[string][2]int{}
 	braces, parens := 0, 0
-	pending := ""     // "op" after query/mutation/subscription, "fragment" after fragment
-	wantName := false // the next top-level name is the operation's name
-	afterAt := false  // the next name is a directive name
+	pending := ""         // "op" after query/mutation/subscription, "fragment" after fragment
+	wantName := false     // the next top-level name is the operation's name
+	wantFragName := false // the next top-level name is the fragment's name
+	afterAt := false      // the next name is a directive name
+	fragName := ""
+	open := -1 // index of the top-level "{" of the definition being read
+	openFrag := ""
+	openOp := -1
 	for i := 0; i < len(doc); {
 		c := doc[i]
 		switch {
@@ -549,12 +576,28 @@ func operationsOf(doc string) []opDef {
 				if pending == "" { // shorthand query: { field }
 					ops = append(ops, opDef{typ: "QUERY"})
 				}
-				pending, wantName = "", false
+				open, openOp, openFrag = i, -1, ""
+				if pending == "fragment" {
+					openFrag = fragName
+				} else {
+					openOp = len(ops) - 1
+				}
+				pending, wantName, wantFragName, fragName = "", false, false, ""
 			}
 			braces++
 		case c == '}':
 			if braces > 0 {
 				braces--
+				if braces == 0 && open >= 0 {
+					if openOp >= 0 {
+						ops[openOp].body = [2]int{open, i + 1}
+					} else if openFrag != "" {
+						if _, dup := frags[openFrag]; !dup {
+							frags[openFrag] = [2]int{open, i + 1}
+						}
+					}
+					open = -1
+				}
 			}
 		case c == '(':
 			parens++
@@ -564,7 +607,7 @@ func operationsOf(doc string) []opDef {
 				parens--
 			}
 		case c == '@':
-			afterAt, wantName = true, false
+			afterAt, wantName, wantFragName = true, false, false
 		case c == '_' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z':
 			j := i + 1
 			for j < len(doc) && (doc[j] == '_' || doc[j] >= 'A' && doc[j] <= 'Z' || doc[j] >= 'a' && doc[j] <= 'z' || doc[j] >= '0' && doc[j] <= '9') {
@@ -581,17 +624,210 @@ func operationsOf(doc string) []opDef {
 			case wantName:
 				ops[len(ops)-1].name = word
 				wantName = false
+			case wantFragName:
+				fragName = word
+				wantFragName = false
 			case pending == "" && (word == "query" || word == "mutation" || word == "subscription"):
 				ops = append(ops, opDef{typ: strings.ToUpper(word)})
 				pending, wantName = "op", true
 			case pending == "" && word == "fragment":
-				pending = "fragment"
+				pending, wantFragName = "fragment", true
 			}
 			continue
 		}
 		i++
 	}
-	return ops
+	return ops, frags
+}
+
+// maxScore is the largest gqlComplexity / gqlFieldCount the ingestor stores
+// (a Java int). Fragments spread inside fragments can multiply past it.
+const maxScore = 1<<31 - 1
+
+// scoreOperation returns (complexity, fieldCount) of the operation the
+// request runs (operationName's, else the first): complexity is
+// fieldCount + 5 × maxDepth. Only fields count: arguments, aliases,
+// directives, the operation keyword, its name and its variable definitions do
+// not. Other operations in the document and fragments it does not use are not
+// counted. Each fragment spread counts the fragment's fields where it is
+// spread (a fragment spread twice runs twice); inline fragments and spreads
+// add no depth. A fragment's size is worked out once, so nested spreads cost
+// linear time; a spread of an unknown fragment, or one that spreads itself,
+// counts nothing. Both numbers are capped at 2³¹−1. The same rules as the
+// Java, Python and Node SDKs.
+func scoreOperation(query, operationName string) (int, int) {
+	ops, frags := definitionsOf(query)
+	chosen := chooseOperation(ops, operationName)
+	if chosen < 0 || ops[chosen].body[1] == 0 {
+		return 0, 0
+	}
+	s := &scorer{doc: query, frags: frags, sizes: map[string][2]int64{}, inProgress: map[string]bool{}}
+	fields, depth, _ := s.selectionSet(ops[chosen].body[0])
+	return int(clampScore(fields + 5*depth)), int(fields)
+}
+
+func clampScore(n int64) int64 {
+	if n > maxScore {
+		return maxScore
+	}
+	return n
+}
+
+type scorer struct {
+	doc        string
+	frags      map[string][2]int
+	sizes      map[string][2]int64 // fragment name -> {fields, depth}
+	inProgress map[string]bool
+}
+
+// fragmentSize is the field count and depth of a fragment's selection set,
+// worked out once per fragment.
+func (s *scorer) fragmentSize(name string) (int64, int64) {
+	if known, ok := s.sizes[name]; ok {
+		return known[0], known[1]
+	}
+	span, ok := s.frags[name]
+	if !ok || s.inProgress[name] {
+		return 0, 0
+	}
+	s.inProgress[name] = true
+	f, d, _ := s.selectionSet(span[0])
+	delete(s.inProgress, name)
+	s.sizes[name] = [2]int64{f, d}
+	return f, d
+}
+
+// selectionSet measures the selection set whose "{" is at pos and returns
+// its field count, its depth and the position after its "}".
+func (s *scorer) selectionSet(pos int) (fields, depth int64, end int) {
+	tok, kind, next := gqlToken(s.doc, pos)
+	if kind != tokPunct || tok != "{" {
+		return 0, 0, pos
+	}
+	pos = next
+	for {
+		tok, kind, next = gqlToken(s.doc, pos)
+		switch {
+		case kind == tokEOF:
+			return fields, depth, next
+		case kind == tokPunct && tok == "}":
+			return fields, depth, next
+		case kind == tokPunct && tok == "...":
+			pos = next
+			tok, kind, next = gqlToken(s.doc, pos)
+			if kind == tokName && tok != "on" { // fragment spread
+				pos = s.skipDirectives(next)
+				f, d := s.fragmentSize(tok)
+				fields, depth = clampScore(fields+f), max(depth, d)
+				continue
+			}
+			if kind == tokName { // "on Type"
+				_, _, pos = gqlToken(s.doc, next)
+			}
+			pos = s.skipDirectives(pos)
+			if t, k, _ := gqlToken(s.doc, pos); k == tokPunct && t == "{" {
+				var f, d int64
+				f, d, pos = s.selectionSet(pos)
+				fields, depth = clampScore(fields+f), max(depth, d)
+			}
+		case kind == tokName: // a field, maybe aliased
+			pos = next
+			if t, k, n := gqlToken(s.doc, pos); k == tokPunct && t == ":" {
+				_, _, pos = gqlToken(s.doc, n) // the field name after the alias
+			}
+			pos = s.skipArguments(pos)
+			pos = s.skipDirectives(pos)
+			var f, d int64
+			if t, k, _ := gqlToken(s.doc, pos); k == tokPunct && t == "{" {
+				f, d, pos = s.selectionSet(pos)
+			}
+			fields, depth = clampScore(fields+1+f), max(depth, 1+d)
+		default: // not valid here: skip it
+			pos = next
+		}
+	}
+}
+
+// skipArguments skips a parenthesized list at pos, if there is one.
+func (s *scorer) skipArguments(pos int) int {
+	tok, kind, next := gqlToken(s.doc, pos)
+	if kind != tokPunct || tok != "(" {
+		return pos
+	}
+	level := 1
+	for pos = next; level > 0; {
+		tok, kind, next = gqlToken(s.doc, pos)
+		if kind == tokEOF {
+			return next
+		}
+		if kind == tokPunct && tok == "(" {
+			level++
+		} else if kind == tokPunct && tok == ")" {
+			level--
+		}
+		pos = next
+	}
+	return pos
+}
+
+// skipDirectives skips "@name(args)" directives at pos.
+func (s *scorer) skipDirectives(pos int) int {
+	for {
+		tok, kind, next := gqlToken(s.doc, pos)
+		if kind != tokPunct || tok != "@" {
+			return pos
+		}
+		_, _, pos = gqlToken(s.doc, next) // directive name
+		pos = s.skipArguments(pos)
+	}
+}
+
+const (
+	tokEOF = iota
+	tokName
+	tokPunct
+	tokOther // numbers, strings, variables' "$"
+)
+
+// gqlToken returns the GraphQL token at or after pos, its kind and the
+// position after it. Whitespace, commas and comments are skipped; strings
+// (including block strings) are one token.
+func gqlToken(doc string, pos int) (string, int, int) {
+	for pos < len(doc) {
+		c := doc[pos]
+		switch {
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ',' || c == 0xEF && strings.HasPrefix(doc[pos:], "\uFEFF"):
+			if c == 0xEF {
+				pos += 3
+			} else {
+				pos++
+			}
+		case c == '#':
+			for pos < len(doc) && doc[pos] != '\n' && doc[pos] != '\r' {
+				pos++
+			}
+		case c == '"':
+			end := skipString(doc, pos)
+			return doc[pos:end], tokOther, end
+		case c == '_' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z':
+			end := pos + 1
+			for end < len(doc) && (doc[end] == '_' || doc[end] >= 'A' && doc[end] <= 'Z' || doc[end] >= 'a' && doc[end] <= 'z' || doc[end] >= '0' && doc[end] <= '9') {
+				end++
+			}
+			return doc[pos:end], tokName, end
+		case c == '.' && strings.HasPrefix(doc[pos:], "..."):
+			return "...", tokPunct, pos + 3
+		case strings.IndexByte("{}():@!=[]|&$", c) >= 0:
+			return doc[pos : pos+1], tokPunct, pos + 1
+		default: // a number or a stray byte
+			end := pos + 1
+			for end < len(doc) && (doc[end] == '.' || doc[end] == '-' || doc[end] == '+' || doc[end] >= '0' && doc[end] <= '9' || doc[end] == 'e' || doc[end] == 'E') {
+				end++
+			}
+			return doc[pos:end], tokOther, end
+		}
+	}
+	return "", tokEOF, len(doc)
 }
 
 // skipString returns the index just past the string literal starting at i
@@ -618,29 +854,6 @@ func skipString(doc string, i int) int {
 		}
 	}
 	return len(doc)
-}
-
-// scoreComplexity = field_count + 5 * max_depth using a brace-balance approximation.
-// (Lightweight — for AST-accurate scoring use graphql-go's visitor.)
-func scoreComplexity(query string) (int, int) {
-	depth, maxDepth, fields := 0, 0, 0
-	for _, c := range query {
-		switch c {
-		case '{':
-			depth++
-			if depth > maxDepth {
-				maxDepth = depth
-			}
-		case '}':
-			if depth > 0 {
-				depth--
-			}
-		}
-	}
-	// Field count = approximation — count whitespace-separated identifiers inside braces.
-	// Good enough for billing scoring; SDK consumers can override via Record() with a precomputed value.
-	fields = len(fieldTokenRegex.FindAllStringIndex(query, -1))
-	return fields + 5*maxDepth, fields
 }
 
 func withSchemaVersion(m map[string]any, sv string) map[string]any {

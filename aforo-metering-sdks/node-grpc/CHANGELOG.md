@@ -15,6 +15,9 @@ All notable changes to `@aforoai/grpc-metering` are documented here. Format foll
 - `wrapClientStream` / `wrapBidiStream` count inbound messages by wrapping `call.push` instead of adding a `data` listener. The listener put the stream in flowing mode before the handler ran, so a handler that awaited anything before reading lost every message that arrived meanwhile (and was still billed for them).
 - README and USER_GUIDE show version 2.1.0.
 
+### Fixed (end-to-end test)
+- **A failing server-stream or bidi handler now sends its status to the client at once.** The wrapper ended the call with `call.destroy(err)`, after which grpc-js never sends a status: the client waited until its deadline (`DEADLINE_EXCEEDED`), or forever without one. It now emits the error the way grpc-js expects (`call.emit('error', err)`), so the client gets the handler's code and message immediately, as it does without the SDK. The usage event is unchanged: one event with that status and the messages counted so far.
+
 ## [2.0.0] - 2026-10-26
 
 Breaking. Migration: pass `customerResolver: (call) => …` (or `trustCustomerHeader: true` behind a proxy you control) to `new AforoGrpcBilling`, use an `https://` `ingestorUrl` (or `allowInsecureHttp: true`), and call `await billing.shutdown()` from your SIGTERM handler.

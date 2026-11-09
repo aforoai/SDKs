@@ -89,7 +89,7 @@ In the Aforo console, open the usage/events view for your tenant and filter by `
 
 ## Step 7 — Tune complexity scoring (optional)
 
-The default score is `field_count + 5 × max_depth`. Override it to match how you price:
+The default score is `field_count + 5 × max_depth` of the operation that runs (the one `operationName` names, else the document's first). Other operations in the same document, and fragments it does not use, are not counted; a fragment's fields count each place it is spread. Override it to match how you price:
 
 ```python
 billing = AforoGraphQlBilling(

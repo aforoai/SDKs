@@ -82,7 +82,7 @@ Every required field is validated at build time — a blank value throws `Illega
 
 ## Each event
 
-Emitted with `metricName = "graphql_api.operations"`, `quantity = 1`, `productType` (default `"GRAPHQL_API"`, see the `productType` option), plus: `gqlOperationType` (`QUERY` / `MUTATION` / `SUBSCRIPTION`), `gqlOperationName` (`anonymous` when unnamed), `gqlComplexity`, `gqlFieldCount`, `gqlHasErrors`, and `executionDurationMs`. `gqlHasErrors` is `true` when the result has a non-empty errors array **or** the execution threw.
+Emitted with `metricName = "graphql_api.operations"`, `quantity = 1`, `productType` (default `"GRAPHQL_API"`, see the `productType` option), plus: `gqlOperationType` (`QUERY` / `MUTATION` / `SUBSCRIPTION`), `gqlOperationName` (`anonymous` when unnamed), `gqlComplexity`, `gqlFieldCount`, `gqlHasErrors`, and `executionDurationMs`. `gqlHasErrors` is `true` when the result has a non-empty errors array **or** the execution threw. `gqlFieldCount` and `gqlComplexity` cover only the operation that runs (the one `operationName` selects, else the only one): other operations and unused fragments in the same document are not counted, and a fragment spread counts its fields where it is used.
 
 To plug in your own complexity number instead of the default formula, call `billing.record(customerId, query, operationName, durationMs, hasErrors)` directly — it parses the query and computes complexity itself, but you can bypass the `Instrumentation` entirely and shape events your way.
 

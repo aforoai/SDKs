@@ -7,7 +7,7 @@ Integration surfaces:
   - ASGI middleware (for graphql-core, Graphene-over-ASGI, Ariadne)
   - Low-level record() for custom servers
 
-Complexity scoring uses graphql-core's visit() on the parsed document:
+Complexity scoring walks the operation that runs (not the whole document):
   default score = field_count + 5 * max_depth
 """
 
@@ -26,8 +26,14 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 try:
-    from graphql import parse, Visitor, visit
-    from graphql.language.ast import DocumentNode, FieldNode, OperationDefinitionNode
+    from graphql import parse
+    from graphql.language.ast import (
+        DocumentNode,
+        FieldNode,
+        FragmentDefinitionNode,
+        InlineFragmentNode,
+        OperationDefinitionNode,
+    )
     HAS_GRAPHQL = True
 except ImportError:  # pragma: no cover
     HAS_GRAPHQL = False
@@ -287,25 +293,66 @@ def outcome_from_http_status(status: Optional[int]) -> Optional[str]:
     return None
 
 
+#: Largest value the ingestor stores for ``gqlComplexity`` / ``gqlFieldCount``
+#: (a Java ``int``). Nested fragment spreads can multiply past it.
+_MAX_JAVA_INT = 2**31 - 1
+
+
 def default_complexity_scorer(doc: "DocumentNode", operation_name: Optional[str] = None) -> Tuple[int, int]:
-    """Score = field_count + 5 * max_depth. Returns (complexity, field_count)."""
+    """``field_count + 5 * max_depth`` of the operation that runs. Returns
+    ``(complexity, field_count)``.
+
+    The operation that runs is ``operation_name``'s, else the document's first
+    (the same one the event is named after). Other operations in the document
+    are not counted, and neither are fragments it does not use. Each fragment
+    spread counts the fragment's fields where it is spread (a fragment spread
+    twice runs twice); inline fragments and spreads add no depth. A fragment's
+    size is worked out once, so nested spreads cost linear time; a spread of
+    an unknown fragment, or one that spreads itself (both invalid GraphQL),
+    counts nothing. Both numbers are capped at 2**31 - 1, the ingestor's
+    limit. Same rules as ``@aforoai/graphql-metering`` (Node).
+    """
     if not HAS_GRAPHQL:
         return 0, 0
+    op = _find_operation(doc, operation_name)
+    if op is None:
+        return 0, 0
+    fragments: Dict[str, Any] = {}
+    for d in doc.definitions:
+        if isinstance(d, FragmentDefinitionNode) and d.name.value not in fragments:
+            fragments[d.name.value] = d
+    measured: Dict[str, Tuple[int, int]] = {}
+    in_progress: set = set()
 
-    state = {"field_count": 0, "max_depth": 0, "depth": 0}
+    def fragment_size(name: str) -> Tuple[int, int]:
+        known = measured.get(name)
+        if known is not None:
+            return known
+        definition = fragments.get(name)
+        if definition is None or name in in_progress:
+            return 0, 0
+        in_progress.add(name)
+        size = measure(definition.selection_set)
+        in_progress.discard(name)
+        measured[name] = size
+        return size
 
-    class _Scorer(Visitor):
-        def enter_field(self, *_args, **_kwargs):  # type: ignore[override]
-            state["field_count"] += 1
-            state["depth"] += 1
-            if state["depth"] > state["max_depth"]:
-                state["max_depth"] = state["depth"]
+    def measure(selection_set: Any) -> Tuple[int, int]:
+        fields = depth = 0
+        for sel in getattr(selection_set, "selections", None) or ():
+            if isinstance(sel, FieldNode):
+                below_fields, below_depth = measure(sel.selection_set)
+                fields = min(_MAX_JAVA_INT, fields + 1 + below_fields)
+                depth = max(depth, 1 + below_depth)
+            else:
+                inner = (measure(sel.selection_set) if isinstance(sel, InlineFragmentNode)
+                         else fragment_size(sel.name.value))
+                fields = min(_MAX_JAVA_INT, fields + inner[0])
+                depth = max(depth, inner[1])
+        return fields, depth
 
-        def leave_field(self, *_args, **_kwargs):  # type: ignore[override]
-            state["depth"] -= 1
-
-    visit(doc, _Scorer())
-    return state["field_count"] + 5 * state["max_depth"], state["field_count"]
+    fields, depth = measure(op.selection_set)
+    return min(_MAX_JAVA_INT, fields + 5 * depth), fields
 
 
 class AforoGraphQlBilling:

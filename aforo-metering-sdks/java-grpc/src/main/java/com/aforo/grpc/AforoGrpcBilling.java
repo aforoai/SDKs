@@ -266,6 +266,33 @@ public final class AforoGrpcBilling implements AutoCloseable {
      */
     public void record(String method, String callType, String customerId, String status, long durationMs,
                        String executionStatus, String productTypeOverride) {
+        record(method, callType, customerId, status, durationMs, 1, executionStatus, productTypeOverride);
+    }
+
+    /**
+     * Record a single RPC with the number of messages it carried, for exact streaming counts:
+     * call it from your streaming handler with the messages received plus sent. The interceptor
+     * always reports 1 per call. {@code executionStatus} is derived from {@code status}, as in
+     * {@link #record(String, String, String, String, long)}.
+     *
+     * <pre>{@code
+     * billing.record("ListItems", "SERVER_STREAM", customerId, "OK", durationMs, received + sent);
+     * }</pre>
+     */
+    public void record(String method, String callType, String customerId, String status, long durationMs,
+                       int messageCount) {
+        record(method, callType, customerId, status, durationMs, messageCount, null, null);
+    }
+
+    /**
+     * Record a single RPC with its message count, an outcome status and a per-call
+     * {@code productType} override; {@code null}/blank {@code executionStatus} and
+     * {@code productTypeOverride} behave as in the overloads above. A negative
+     * {@code messageCount} is sent as 0. Otherwise as
+     * {@link #record(String, String, String, String, long, String, String)}.
+     */
+    public void record(String method, String callType, String customerId, String status, long durationMs,
+                       int messageCount, String executionStatus, String productTypeOverride) {
         String outcome = canonicalExecutionStatus(executionStatus);
         if (outcome == null) outcome = outcomeFromGrpcStatus(status);
 
@@ -280,7 +307,7 @@ public final class AforoGrpcBilling implements AutoCloseable {
         event.put("grpcService", serviceName);
         event.put("grpcMethod", boundedLabel("grpcMethod", method, MAX_GRPC_METHOD));
         event.put("grpcCallType", mapCallType(callType == null ? "" : callType.toUpperCase(java.util.Locale.ROOT)));
-        event.put("messageCount", 1);
+        event.put("messageCount", Math.max(0, messageCount));
         event.put("executionDurationMs", (int) Math.max(0, Math.min(durationMs, Integer.MAX_VALUE)));
         if (outcome != null) event.put("executionStatus", outcome);
 

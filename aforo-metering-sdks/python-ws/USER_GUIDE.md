@@ -134,7 +134,7 @@ Execution status (`executionStatus`, used by OUTCOME_BASED pricing) is described
 | `billing.dropped_count` is above 0 | Events were dropped: `invalid` (failed a client-side check, or no customer), `rejected` (ingestor refused them), `overflow` (queue full during an outage), `shutdown` (still queued at the shutdown deadline) or `closed` (sent after shutdown). An ingest outage alone does not drop events. | Read the WARNING log line for the reason; see [Dropped events](README.md#dropped-events). |
 | Events sent, none in console | Wrong `ingestor_url` host, or the metric isn't mapped to a rate plan. | Use `https://api.aforo.ai`; map `websocket_api.connection_closed` (and `websocket_api.connection_opened` / `.message` if you bill those) in Aforo. |
 | Event volume far higher than expected | `per_frame_events=True` emits one event per frame. | Switch back to default open+close unless you price per frame. |
-| `wsCloseReason` is `INTERNAL_ERROR` | An exception was raised inside the handler before a clean close. | Expected — fix the handler error; the close is still recorded. |
+| `wsCloseReason` is `INTERNAL_ERROR` | An exception other than the connection closing (`WebSocketDisconnect`, `ConnectionClosed`) was raised inside the handler. A client's normal close is `NORMAL_CLOSURE` (1000) or `GOING_AWAY` (1001). | Expected — fix the handler error; the close is still recorded. |
 
 ## What this guide does NOT cover
 

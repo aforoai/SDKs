@@ -13,6 +13,9 @@ All notable changes to `@aforoai/mqtt-metering` are documented here. Format foll
 
 - README and USER_GUIDE show version 2.1.0.
 
+### Fixed (end-to-end test)
+- **The README and USER_GUIDE say exactly what each mode meters.** Client mode (`wrapMqttClient`) meters CONNECT, PUBLISH, DISCONNECT and, with `emitDeliverEvents: true`, received messages as DELIVER; it never meters SUBSCRIBE or UNSUBSCRIBE. Broker mode (`wrapAedesBroker`) meters CONNECT, PUBLISH, SUBSCRIBE, UNSUBSCRIBE and DISCONNECT, and never DELIVER. The docs said SUBSCRIBE and UNSUBSCRIBE were "always metered" and that `emitDeliverEvents` applied to both modes. Behaviour is unchanged.
+
 ## [2.0.0] - 2026-10-26
 
 Breaking. Migration: give `wrapAedesBroker` a `customerResolver` (or `trustCustomerHeader: true` when your broker authenticates usernames), use an `https://` `ingestorUrl` (or `allowInsecureHttp: true`), and call `await billing.shutdown()` from your SIGTERM handler.

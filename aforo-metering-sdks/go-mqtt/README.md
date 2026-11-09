@@ -72,6 +72,7 @@ func main() {
 			billing.RecordConnect(customerID, clientID)
 		}).
 		SetConnectionLostHandler(func(c mqtt.Client, err error) {
+			// Called when the connection drops, not after your own Disconnect.
 			billing.RecordDisconnect(customerID, clientID)
 		})
 
@@ -87,7 +88,11 @@ func main() {
 	client.Publish("devices/001/status", 0, false, payload)
 	billing.RecordPublish(customerID, clientID, "devices/001/status", 0, false, int64(len(payload)))
 
-	time.Sleep(time.Hour)
+	time.Sleep(time.Hour) // your application runs
+
+	// A clean Disconnect does not call the ConnectionLostHandler: record it beside the call.
+	client.Disconnect(250)
+	billing.RecordDisconnect(customerID, clientID)
 }
 ```
 

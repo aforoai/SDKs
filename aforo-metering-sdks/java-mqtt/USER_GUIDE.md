@@ -63,6 +63,7 @@ client.setCallback(new MqttCallback() {
         billing.recordConnect("cust_acme_001", "device-001");
     }
     public void disconnected(MqttDisconnectResponse r) {
+        // Paho calls this when the broker or the network ends the session, not after your own disconnect().
         billing.recordDisconnect("cust_acme_001", "device-001");
     }
     public void messageArrived(String topic, MqttMessage msg) {
@@ -78,6 +79,10 @@ billing.recordSubscribe("cust_acme_001", "device-001", "sensors/+/temperature", 
 
 client.publish("devices/001/status", new MqttMessage("{\"online\": true}".getBytes()));
 billing.recordPublish("cust_acme_001", "device-001", "devices/001/status", 0, false, 17);
+
+// A clean disconnect does not reach disconnected(): record it beside the call.
+client.disconnect();
+billing.recordDisconnect("cust_acme_001", "device-001");
 ```
 
 > ⚠ Resolve `customerId` from your device-to-customer mapping (provisioning record, auth), not from the topic or payload — those are client-controlled. `recordDeliver` is silently a no-op unless you build with `emitDeliverEvents(true)`; inbound volume is high, so turn it on only if you bill per receipt.

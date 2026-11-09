@@ -12,6 +12,9 @@ All notable changes to `aforo-grpc-metering` are documented here. This project f
 - **A `multiprocessing` child flushes at exit.** A forked child leaves with `os._exit()`, which skips `atexit`, so what it tracked in its last seconds was lost unreported. The client now also registers a multiprocessing exit finalizer, re-registered in each forked child.
 - **429 with a per-key limit below the batch size.** When the ingestor answers 429 with `X-RateLimit-Limit` (events per minute for the API key) lower than the batch's event count, the batch goes back to the head of the queue, in order, and is sent in parts of at most that many events; batches stay that small while the ingestor reports the limit. Otherwise 429 is retried as before.
 
+### Fixed (end-to-end test)
+- **README: `messageCount` and the limits section match the interceptor.** A unary call is recorded with `messageCount` 1 (as in the Node, Go and Java SDKs); only streaming calls count request messages read plus response messages sent. The README defined it as read plus sent for every call, which implied 2 for unary. The "What this doesn't cover" section still said the interceptor only meters unary RPCs; it meters all four call shapes. Docs only; no code change.
+
 ## [2.1.0] - 2026-10-30
 
 ### Changed

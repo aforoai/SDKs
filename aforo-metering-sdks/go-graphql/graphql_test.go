@@ -1,6 +1,6 @@
 // Tests for graphqlmetering. Unique bits:
 //   - Regex-based operation detection (QUERY / MUTATION / SUBSCRIPTION)
-//   - Brace-balance complexity approximation
+//   - Field-count complexity scoring
 //   - HTTP middleware body capture path
 
 package graphqlmetering

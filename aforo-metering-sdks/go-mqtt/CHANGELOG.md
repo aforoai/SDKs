@@ -12,6 +12,9 @@ All notable changes to `mqtt-metering-go` are documented here. This project foll
 - `%#v` of the client no longer prints the API key.
 - README quickstart imports `context` (it did not compile).
 
+### Fixed (end-to-end test)
+- Docs: the quickstart and user guide record `DISCONNECT` next to a clean `client.Disconnect(...)`. paho calls the `ConnectionLostHandler` only when the connection drops, so the documented wiring missed every clean disconnect.
+
 ## [2.1.0]
 
 ### Changed

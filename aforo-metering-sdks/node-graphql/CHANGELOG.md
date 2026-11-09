@@ -16,6 +16,10 @@ All notable changes to `@aforoai/graphql-metering` are documented here. Format f
 - `billing.middleware()` meters GET operations (`?query=…&operationName=…`), not only POST bodies.
 - README and USER_GUIDE show version 2.1.0.
 
+### Fixed (end-to-end test)
+- **Complexity counts only the operation that runs.** `gqlComplexity` and `gqlFieldCount` counted every operation in the document, so `query A {…} mutation PickMe {…}` sent with `operationName: "PickMe"` was billed for A's fields too, in the Apollo plugin and the HTTP middleware alike. The default scorer now counts only the selected operation (the one the event is named after). Custom `complexityScorer`s already received the operation name and are unaffected.
+- **Fragment-heavy queries now score per spread, the same as the Java, Go and Python SDKs.** A fragment's fields count at every spread, at the depth where it is spread (spread depth plus the field's depth inside the fragment); before, each fragment definition counted once, from its own root, whether it was spread once, twice or not at all. `query Q { a: user { ...U } b: user { ...U } } fragment U on User { id profile { bio } }` now scores 8 fields / complexity 23 (was 5 / 15). Each fragment is still measured once, so scoring stays linear, and both numbers are capped at 2^31-1. Queries without fragments score as before.
+
 ## [2.0.0] - 2026-10-26
 
 Breaking. Migration: pass `customerResolver: (context) => …` (or `trustCustomerHeader: true` behind a proxy you control) to `new AforoGraphQlBilling`, use an `https://` `ingestorUrl` (or `allowInsecureHttp: true`), and call `await billing.shutdown()` from your SIGTERM handler.

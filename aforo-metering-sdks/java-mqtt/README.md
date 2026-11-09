@@ -46,6 +46,7 @@ client.setCallback(new MqttCallback() {
         billing.recordConnect("cust_acme_001", "device-001");
     }
     public void disconnected(MqttDisconnectResponse r) {
+        // Paho calls this when the broker or the network ends the session, not after your own disconnect().
         billing.recordDisconnect("cust_acme_001", "device-001");
     }
     public void messageArrived(String topic, MqttMessage msg) {
@@ -62,6 +63,10 @@ billing.recordSubscribe("cust_acme_001", "device-001", "sensors/+/temperature", 
 
 client.publish("devices/001/status", new MqttMessage("{\"online\": true}".getBytes()));
 billing.recordPublish("cust_acme_001", "device-001", "devices/001/status", 0, false, 17);
+
+// A clean disconnect does not reach disconnected(): record it beside the call.
+client.disconnect();
+billing.recordDisconnect("cust_acme_001", "device-001");
 ```
 
 Events POST to `<ingestorUrl>/v1/ingest/batch` as `{"events": [...]}` (at most 1000 events per request; larger flushes are split) with `X-API-Key: <apiKey>` and `X-Tenant-Id: <tenantId>`. The SDK keeps events in a bounded queue (10 000 by default; overflow evicts the oldest as `OVERFLOW`). One background thread sends them every 5 seconds or as soon as 500 are queued. Retries use full-jitter backoff and honour `Retry-After` (seconds or HTTP-date, up to 60 s). If the ingestor stays unreachable, the batch goes back to the queue with the same idempotency keys and is resent after a cooldown, so an outage loses nothing while the queue has room. `close()` keeps sending for up to `shutdownTimeoutMs` (5 s) and reports what is left as `SHUTDOWN`.

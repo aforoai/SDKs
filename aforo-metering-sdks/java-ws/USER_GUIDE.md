@@ -67,9 +67,17 @@ public void open(Session s) {
 
 @OnMessage
 public void incoming(String msg, Session s) {
-    billing.recordFrame(connectionId, "CLIENT_TO_SERVER", "TEXT", msg.length());
-    s.getAsyncRemote().sendText("echo: " + msg);
-    billing.recordFrame(connectionId, "SERVER_TO_CLIENT", "TEXT", msg.length() + 6);
+    billing.recordFrame(connectionId, "CLIENT_TO_SERVER", "TEXT", msg.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
+    String reply = "echo: " + msg;
+    try {
+        // Blocking send, one at a time per session: overlapping getAsyncRemote().sendText calls
+        // make Tomcat throw TEXT_FULL_WRITING when a client sends faster than replies go out.
+        s.getBasicRemote().sendText(reply);
+        // Recorded only after the send succeeded, so a refused frame is not billed.
+        billing.recordFrame(connectionId, "SERVER_TO_CLIENT", "TEXT", reply.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
+    } catch (java.io.IOException e) {
+        // Not sent, so not billed.
+    }
 }
 
 @OnClose

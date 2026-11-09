@@ -1,6 +1,6 @@
 # @aforoai/agent-metering — User Guide
 
-**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** engineers instrumenting an AI agent (Claude, GPT, LangChain, CrewAI, AutoGen, or a custom loop) for Aforo billing.
+**Version:** 2.1.1 · **Updated:** 2026-10-26 · **Audience:** engineers instrumenting an AI agent (Claude, GPT, LangChain, CrewAI, AutoGen, or a custom loop) for Aforo billing.
 
 ## What you'll build
 

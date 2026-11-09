@@ -10,6 +10,9 @@ All notable changes to `@aforoai/mcp-metering` are documented here. This project
 - **`executionDurationMs` that does not fit the ingestor's int field** (or is not finite) is left off the event with one warning; the event is still sent.
 - The API key is trimmed once at construction, so the heartbeat request (sent outside the transport core) carries the same key as usage batches.
 
+### Fixed (end-to-end test)
+- README and USER_GUIDE show version 2.1.1 (they said 2.0.0), and the `npm pack` file name `aforoai-mcp-metering-2.1.1.tgz`.
+
 ## [2.0.0] - 2026-10-26
 
 ### Fixed (transport core, review of 2026-10-26)

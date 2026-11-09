@@ -2,8 +2,10 @@
  * @file Session lifecycle management.
  * - stdio: 1 session per process lifetime
  * - SSE: 1 session per SSE connection
- * - Streamable HTTP: 1 session per Mcp-Session-Id header; a request without
- *   one gets its own short-lived session
+ * - Streamable HTTP: 1 session per Mcp-Session-Id header. A request without
+ *   one (an upstream that issues no session ids) is matched to its responses
+ *   in its own short-lived session, and its calls are metered in one stable
+ *   proxy session per client token (see getOrCreateStable)
  *
  * Sessions are capped and expire when idle (G306), so clients that never say
  * goodbye cannot grow the table without bound.
@@ -32,6 +34,8 @@ export class SessionManager {
   private readonly idleTimeoutMs: number;
   private readonly now: () => number;
   private primarySessionId: string | null = null;
+  /** Stable proxy session per client key (getOrCreateStable). Bounded by the number of client tokens. */
+  private readonly stableSessions = new Map<string, string>();
 
   constructor(transport: TransportType, options: SessionManagerOptions = {}) {
     this.transport = transport;
@@ -50,6 +54,20 @@ export class SessionManager {
     if (this.primarySessionId) return this.primarySessionId;
     this.primarySessionId = this.createSession(false);
     return this.primarySessionId;
+  }
+
+  /**
+   * The stable proxy session for traffic that carries no session of its own
+   * (Streamable HTTP requests without Mcp-Session-Id): one per `clientKey` —
+   * the client's token label, or '' when clients are not told apart — for the
+   * life of the proxy, like the stdio primary session.
+   */
+  getOrCreateStable(clientKey: string): string {
+    const known = this.stableSessions.get(clientKey);
+    if (known) return known;
+    const id = this.createSession(false);
+    this.stableSessions.set(clientKey, id);
+    return id;
   }
 
   /**

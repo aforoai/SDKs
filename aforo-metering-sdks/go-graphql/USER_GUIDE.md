@@ -76,7 +76,7 @@ The middleware, after your handler responds:
 - Finds the operation(s): POST JSON (a batch array gives one event each), POST `application/graphql`, GET `?query=`, or an Automatic Persisted Query hash. Requests with no operation pass through unmetered; a hash-only request answered with `PersistedQueryNotFound` is not billed (the client's resend is).
 - Reads at most `MaxRequestBodyBytes` (1 MiB) of the body and gives your handler the whole body. A larger body is not held in memory and not metered (counted as `invalid`).
 - Asks `CustomerResolver` for the customer; an empty answer is not billed and is counted as `invalid`.
-- Emits one event with the detected operation type/name, complexity, field count, `hasErrors` (response status ≥ 400), and duration.
+- Emits one event with the detected operation type/name, complexity and field count (of the operation that runs, plus the fragments it spreads), `hasErrors` (true when the GraphQL response carries errors, also under HTTP 200, or when the status is 400 or more), and duration.
 
 > ⚠ If another middleware ahead of this one reads the body without restoring it, the SDK sees no operation. Keep this wrapper close to the handler.
 
@@ -98,9 +98,9 @@ billing, _ := graphqlmetering.New(graphqlmetering.Config{
 })
 ```
 
-## Step 5 — Record an accurate complexity yourself (optional)
+## Step 5 — Record from your own executor (optional)
 
-The built-in scorer is approximate (`field_count + 5 × max_depth` from brace balance + identifier tokens). If you have an AST-accurate number, bypass the middleware's auto-scoring and call `Record` from your executor:
+The score is `field_count + 5 × max_depth` of the operation that runs: only fields count (not arguments, aliases, directives, the operation keyword, its name or its variables), other operations and unused fragments are not counted, and each fragment spread counts the fragment's fields where it is spread — the same numbers as the Java, Python and Node SDKs. Without the middleware, call `Record` from your executor; it scores the query you pass the same way:
 
 ```go
 billing.Record(
@@ -193,12 +193,11 @@ See [Execution status (outcome-based pricing)](README.md#execution-status-outcom
 | `New` returns an error | A required field (`TenantID`/`ProductID`/`APIKey`/`IngestorURL`) is empty | Set all four. There is no env auto-load. |
 | No events for some requests | No operation in the request, body over `MaxRequestBodyBytes`, or `CustomerResolver` returned `""` | The last two are counted as `invalid` in `DroppedCount()`; check authentication runs before this middleware. |
 | Resolvers receive an empty body | A body-draining middleware sits ahead of `Middleware` | Order so this wrapper reads/restores the body before others consume it. |
-| Complexity scores look off | Built-in scorer is a brace-balance approximation | Compute an exact score and pass it via `Record()`; the middleware path always uses the approximation. |
+| Complexity scores look off | The operation that ran is not the one scored | Send `operationName` with a multi-operation document; without it the first operation is scored. |
 | `OnError` reports "ingestor unavailable" | The ingestor is unreachable or answered `401`/`403` | Nothing is lost while the queue has room; verify `APIKey` and network access to `IngestorURL`. Events beyond `MaxQueueSize` are dropped as `overflow`. |
 | All operations record as `anonymous` | No `operationName` in the body and no named operation in the document | Send `operationName`, or name your operations (`query Foo {...}`). |
 
 ## What this guide does NOT cover
 
 - **Modeling GraphQL billing in Aforo.** Mapping `graphql_api.operations` (and the `gqlComplexity` field) to a rate plan is done in the Aforo console.
-- **AST-accurate complexity.** The SDK gives an approximation; exact scoring is your code via `Record()`.
 - **GraphQL subscriptions over WebSocket.** Use the `go-ws` SDK for long-lived WebSocket transports.

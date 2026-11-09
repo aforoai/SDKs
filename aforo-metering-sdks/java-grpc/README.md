@@ -98,7 +98,15 @@ The interceptor maps gRPC method types automatically:
 
 Each event carries `metricName = "grpc_api.rpc_calls"`, `quantity = 1`, `productType` (default `"GRPC_API"`, see the `productType` option), plus `grpcService`, `grpcMethod`, `grpcStatusCode` (the gRPC `Status.Code` name, e.g. `OK` / `UNAVAILABLE` / `DEADLINE_EXCEEDED`), `grpcCallType`, `messageCount`, and `executionDurationMs`.
 
-> ⚠ The interceptor emits `messageCount = 1` per call. For exact streaming message counts, call `billing.record(method, callType, customerId, status, durationMs)` directly inside your streaming handler instead of relying on the interceptor's default.
+> ⚠ The interceptor emits `messageCount = 1` per call. For exact streaming message counts, record the call yourself when the stream ends, passing the messages it carried (received + sent):
+>
+> ```java
+> billing.record("ListItems", "SERVER_STREAM", customerId, "OK", durationMs, received + sent);
+> // with an outcome status and a per-call productType:
+> billing.record("ListItems", "SERVER_STREAM", customerId, "OK", durationMs, received + sent, "PARTIAL", null);
+> ```
+>
+> Serve that service **without** the interceptor, or the call is billed twice: register it with `addService(streamingService)` and attach the interceptor to the others with `addService(ServerInterceptors.intercept(otherService, billing.interceptor()))` instead of `ServerBuilder.intercept(...)`. Record it through an `AforoGrpcBilling` built with that service's `serviceName`, since `grpcService` comes from the builder. A negative count is sent as 0.
 
 ## Execution status (outcome-based pricing)
 
@@ -153,6 +161,6 @@ Step-by-step from zero to a verified event in Aforo: see [USER_GUIDE.md](USER_GU
 
 ## What this doesn't cover
 
-- **Exact per-message streaming counts.** The interceptor counts one event per call. Call `record(...)` yourself for true message-level counts.
+- **Exact per-message streaming counts from the interceptor.** The interceptor counts one event per call with `messageCount = 1`. For true message counts, call `record(..., durationMs, messageCount)` yourself on a service served without the interceptor (see [Call types and each event](#call-types-and-each-event)).
 - **Client-side metering.** This is a `ServerInterceptor`. To meter outbound calls, attach it on the server you call, or use a different integration.
 - **Guaranteed delivery.** Events wait in an in-memory queue. A hard crash loses what is queued, and an overflow past `maxQueueSize` drops the oldest events (reported to `onDrop`). There is no on-disk spool. A `401` / `403` from the ingestor is treated as an outage and logged at `SEVERE`: fix the key and the queued events are delivered.

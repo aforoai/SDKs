@@ -15,6 +15,10 @@ All notable changes to `ai.aforo:metering` are documented here. This project fol
 - **Servlet filter: a `CustomerIdResolver` or `MetricNameResolver` that throws** drops the event as `INVALID` (counted, `onDrop`, a throttled `WARNING`); it was lost silently at `FINE`.
 - **Spring: `aforo.enabled=true` in an application without the servlet API** (WebFlux, workers) starts again; it failed with `NoClassDefFoundError: jakarta/servlet/Filter`.
 
+### Fixed (end-to-end test)
+- **Under Spring Boot, an unmatched URL is recorded with its own path.** Spring's static-resource handler maps the catch-all `/**`, which also answers every unmatched URL with 404, so all those requests were sent with `endpointPath = "/**"`. The filter now records the normalized request path (`/v1/missing/:id`) when the best-matching pattern is `/**`, as it already did when no handler matched.
+- Docs: how to get `onDrop` / `onError` under Spring Boot. The auto-configured client takes no hooks; declare your own `AforoClient` bean (with `registerShutdownHook(false)`) and the auto-configuration uses it.
+
 ## [2.1.0] - 2026-10-30
 
 ### Added

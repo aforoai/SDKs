@@ -13,6 +13,11 @@ All notable changes to `graphql-metering-go` are documented here. This project f
 - **Operation type read from the whole document.** A mutation after a comment or a fragment definition, or picked by `operationName` from a document with several operations, was sent as `QUERY`.
 - **A panicking `CustomerResolver`** drops the request's events as `invalid` (counted); the panic no longer reaches your server.
 
+### Fixed (end-to-end test)
+- **`gqlHasErrors` follows the GraphQL response, not only the HTTP status.** A 200 response carrying errors was sent with `gqlHasErrors: false` while its `executionStatus` said `PARTIAL` or `ERROR`. The flag is now `true` when the body carries errors (`PARTIAL`, `ERROR`, `VALIDATION_FAILED`) or the status is 400 or more, as in the Java SDK; `SetExecutionStatus` does not change it.
+- **Complexity and field count cover only the operation that runs.** The approximate scorer read the whole document, so a document holding several operations over-billed the one `operationName` selected. It now scores that operation's selection set plus the selection set of each fragment it spreads; other operations and unused fragments are not counted. The operation's keyword, name and variable definitions are no longer counted as fields either, so a named operation scores lower than before: `query Boom { boom hello }` is now 2 fields (complexity 7), was 4 (9).
+- **Complexity and field count match the Java, Python and Node SDKs.** The scorer counted every identifier token, so argument names, aliases, directive names and string contents were billed as fields: `{ createOrder(item: "cup") { id } }` scored 4 fields (complexity 14) instead of 2 (12). It now reads the GraphQL tokens and counts only fields; a fragment's size is worked out once, so nested spreads cost linear time, and both numbers are capped at 2³¹−1.
+
 ## [2.1.0]
 
 ### Changed

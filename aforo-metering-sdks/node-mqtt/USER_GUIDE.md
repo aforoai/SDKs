@@ -4,7 +4,7 @@
 
 ## What you'll build
 
-A metered MQTT pipeline: either a broker that emits an Aforo event for every client PUBLISH/SUBSCRIBE/CONNECT/DISCONNECT, or a client that meters what it publishes and (optionally) receives. By the end you'll have published a metered message and confirmed the event reached Aforo.
+A metered MQTT pipeline: either a broker that emits an Aforo event for every client CONNECT/PUBLISH/SUBSCRIBE/UNSUBSCRIBE/DISCONNECT, or a client that meters its own CONNECT/PUBLISH/DISCONNECT and (optionally) the messages it receives — client mode does not meter SUBSCRIBE or UNSUBSCRIBE. By the end you'll have published a metered message and confirmed the event reached Aforo.
 
 ## Prerequisites
 
@@ -85,7 +85,7 @@ client.on('connect', () => {
 
 ## Step 4 — Decide on DELIVER (fan-out) events
 
-By default, `DELIVER` events are **dropped** — in both modes — because fan-out (one publish → many subscribers, or a client receiving a stream) can be tens of thousands of events/sec. `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, `CONNECT`, and `DISCONNECT` are always metered.
+`DELIVER` events exist only in client mode: each message the wrapped client receives, and only with `emitDeliverEvents: true`, because a client receiving a stream can be tens of thousands of events/sec. The broker hook never meters per-subscriber deliveries. Broker mode always meters `CONNECT`, `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE` and `DISCONNECT`; client mode always meters `CONNECT`, `PUBLISH` and `DISCONNECT` (not `SUBSCRIBE` / `UNSUBSCRIBE`).
 
 Turn fan-out on only if your pricing needs per-delivery counts — and raise the batch ceiling:
 
@@ -93,7 +93,7 @@ Turn fan-out on only if your pricing needs per-delivery counts — and raise the
 new AforoMqttBilling({ /* … */, emitDeliverEvents: true, flushCount: 1000 });
 ```
 
-> ⚠ In client mode, inbound `message` events map to `DELIVER` — so without `emitDeliverEvents: true`, a subscribe-only client meters CONNECT/SUBSCRIBE/DISCONNECT but **no message events**. That's intentional; flip the flag if you bill on received messages.
+> ⚠ In client mode, inbound `message` events map to `DELIVER` — so without `emitDeliverEvents: true`, a subscribe-only client meters only CONNECT and DISCONNECT (its subscriptions are not metered either). That's intentional; flip the flag if you bill on received messages.
 
 ## Step 5 — Publish a metered message
 
@@ -137,7 +137,7 @@ new AforoMqttBilling({ /* … */, onError: (err) => myLogger.error('aforo mqtt f
 | `apiKey` | `string` | — (required) | Sent only as `X-API-Key: <apiKey>`. |
 | `ingestorUrl` | `string` | — (required) | Base URL, `https://`; SDK appends `/v1/ingest/batch`. |
 | `productType` | `string` | `'MQTT_BROKER'` | Top-level `productType` on every event (trimmed + uppercased; unknown values pass through). Override via `wrapAedesBroker(broker, { productType })` or `wrapMqttClient(client, { customerId, productType })`. |
-| `emitDeliverEvents` | `boolean` | `false` | Emit `DELIVER` (fan-out) events. Off → dropped, both modes. |
+| `emitDeliverEvents` | `boolean` | `false` | Client mode: emit a `DELIVER` event per received message. Off → not metered. Broker mode never meters deliveries. |
 | `allowInsecureHttp` | `boolean` | `false` | Accept a plain `http://` `ingestorUrl` on a non-local host. `https://` is required otherwise (plain http is fine for `localhost`, `127.0.0.1`, `::1`). |
 | `flushCount` | `number` | `500` | Events per request (max 1000). Reaching it wakes the background sender; recording an event never sends by itself. |
 | `flushIntervalMs` | `number` | `5000` | The background sender also runs this often. |
@@ -163,7 +163,7 @@ new AforoMqttBilling({ /* … */, onError: (err) => myLogger.error('aforo mqtt f
 | `wrapAedesBroker needs a customerResolver` at startup | 2.0 requires an explicit customer source | Pass `customerResolver`, or `trustCustomerHeader: true` when the broker authenticates usernames. |
 | `must use https://` at startup | `ingestorUrl` is plain http to a remote host | Use https, or `allowInsecureHttp: true` on a private network. |
 | Subscribe-only client meters nothing on receive | Inbound `message` maps to `DELIVER`, dropped by default | Set `emitDeliverEvents: true` if you bill on received messages. |
-| Publishes counted but fan-out missing | `DELIVER` events off | Set `emitDeliverEvents: true`. |
+| Publishes counted but fan-out missing | Client mode: `DELIVER` events off. Broker mode never meters fan-out. | Set `emitDeliverEvents: true` on the billing that wraps the receiving client. |
 | Events stop after a deploy | Process was killed before the queue was sent | Call `await billing.shutdown()` from your `SIGTERM`/`SIGINT` handler. |
 | `…/v1/ingest/batch/v1/ingest/batch` in logs | `ingestorUrl` already includes the path | Set `ingestorUrl` to the base host only. |
 | `mqttClientId` is `mqtt-client` for every client-mode event | No `clientId` configured and `client.options.clientId` unset | Pass `clientId` in the `wrapMqttClient` options, or set it on the mqtt.js connection. |
