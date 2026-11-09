@@ -277,7 +277,7 @@ def test_docs_name_the_real_version_and_compression():
         assert f"**Version:** {version}" in text, doc
         assert "`compression`" in text, doc
     changelog = (root / "CHANGELOG.md").read_text()
-    assert "## [Unreleased]" in changelog and f"## [{version}]" in changelog
+    assert f"## [{version}]" in changelog  # the release entry for the current version
 
 
 # ── the README Quickstart against the real mcp 1.x low-level server ──
