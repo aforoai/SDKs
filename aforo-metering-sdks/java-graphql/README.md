@@ -1,8 +1,8 @@
 # ai.aforo:graphql-metering
 
-Meter every GraphQL operation without touching your resolvers. Install one `Instrumentation` on your `graphql-java` schema and each query/mutation/subscription emits a billing event with AST-accurate complexity scoring (`field_count + 5 × max_depth`).
+Meter every GraphQL operation without touching your resolvers. Install one `Instrumentation` on your `graphql-java` schema and each query/mutation/subscription emits a billing event with AST-accurate complexity scoring (`field_count + 5 × max_depth`). The instrumentation reads the document graphql-java executes, so persisted queries (APQ), whose query text is only a marker, are metered too; an operation whose query cannot be read is counted as `INVALID`.
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -12,7 +12,7 @@ Intended (once published to Maven Central):
 <dependency>
   <groupId>ai.aforo</groupId>
   <artifactId>graphql-metering</artifactId>
-  <version>2.0.0</version>
+  <version>2.1.1</version>
 </dependency>
 ```
 

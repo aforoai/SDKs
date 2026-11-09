@@ -1,6 +1,6 @@
 # aforo-metering — User Guide
 
-**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Python backend engineers wiring usage metering into an existing service.
+**Version:** 2.1.1 · **Updated:** 2026-11-09 · **Audience:** Python backend engineers wiring usage metering into an existing service.
 
 ## What you'll build
 
@@ -89,13 +89,13 @@ assert result.failed == 0 and result.sent >= 1
 client.shutdown()   # drains the buffer; safe to call once
 ```
 
-`shutdown()` also runs at interpreter exit (`atexit`), so a clean exit flushes for you. It flushes for at most `shutdown_timeout` seconds (default 5); each request in that window uses the time left, and events still queued at the deadline go to `on_drop` with reason `"shutdown"`. Call it explicitly in long-lived processes where you can't rely on interpreter exit. A `SIGKILL` or hard crash skips `atexit` — queued events are lost. A client created before `fork()` (gunicorn `--preload`, multiprocessing) works in each child: the child gets its own queue and sender.
+`shutdown()` also runs at interpreter exit (`atexit`), so a clean exit flushes for you. It flushes for at most `shutdown_timeout` seconds (default 5); each request in that window uses the time left, and events still queued at the deadline go to `on_drop` with reason `"shutdown"`. Call it explicitly in long-lived processes where you can't rely on interpreter exit. A `SIGKILL` or hard crash skips `atexit` — queued events are lost. A client created before `fork()` (gunicorn `--preload`, multiprocessing) works in each child: the child gets its own queue and sender, and flushes when it exits (a `multiprocessing` child too, although it skips `atexit`).
 
 ## Step 7 (alternative) — Meter every request with middleware
 
 Skip per-call `track()` entirely. The middleware builds its own client and emits one event per request, against `metric_name` (default `"api_calls"`).
 
-> ⚠ The metric must exist in your Aforo catalog: the ingestor rejects unknown metrics, and one rejected event fails the whole batch. Earlier versions defaulted to `"<METHOD> <normalized_path>"`, which no catalog contains. Configure `metric_name` (FastAPI/Flask keyword, or `AFORO_METRIC_NAME` in Flask config / Django settings) as a fixed name or a callable.
+> ⚠ The metric must exist in your Aforo catalog: the ingestor rejects every event that names an unknown metric (the other events in the batch are still stored). Earlier versions defaulted to `"<METHOD> <normalized_path>"`, which no catalog contains. Configure `metric_name` (FastAPI/Flask keyword, or `AFORO_METRIC_NAME` in Flask config / Django settings) as a fixed name or a callable.
 
 **FastAPI / Starlette:**
 
@@ -133,7 +133,7 @@ Each request event carries top-level `productType`, `endpointPath` (path without
 
 > ⚠ Every middleware needs to know which customer to bill, from identity **your service verified**. Pass `customer_resolver` (FastAPI/Flask keyword, or `AFORO_CUSTOMER_RESOLVER` in Flask config / Django settings — a callable or its dotted path; Django has `aforo.middleware.django.user_id_resolver`). Reading the `X-Customer-Id` header instead needs `trust_customer_header=True` (`AFORO_TRUST_CUSTOMER_HEADER = True`): the caller of your API sets that header, so anyone could bill another customer unless your gateway overwrites it. With neither, the middleware raises `ValueError` when your app starts. A request whose resolver returns nothing is served normally, not metered, and counted in `dropped_count` as `invalid`. The caller's `X-Api-Key` is never used. `OPTIONS` (CORS preflight) requests are never metered.
 
-> ⚠ Default `exclude_paths` skip health/metrics/docs routes (`/health`, `/ready`, `/metrics`, `/favicon.ico`, plus `/openapi.json` and `/docs` on FastAPI, `/admin` and `/static` on Django, `/static` on Flask). Override `exclude_paths` to change this.
+> ⚠ Default `exclude_paths` skip health/metrics/docs routes (`/health`, `/ready`, `/metrics`, `/favicon.ico`, plus `/openapi.json` and `/docs` on FastAPI, `/admin` and `/static` on Django, `/static` on Flask). Each entry covers the path and everything below it on a path-segment boundary (`/health/db`, never `/healthcare`). Override `exclude_paths` to change this; `[]` meters every path. A request whose handler raises is metered with `statusCode` 500.
 
 ## Configuration reference
 
@@ -141,7 +141,7 @@ Each request event carries top-level `productType`, `endpointPath` (path without
 
 | Option | Type | Default | What it does |
 |---|---|---|---|
-| `api_key` | `str` | required | Aforo API key, sent to the ingestor as `X-API-Key`. |
+| `api_key` | `str` | required | Aforo API key, sent to the ingestor as `X-API-Key`. Surrounding whitespace is stripped; one that still contains whitespace or control characters raises `ValueError`. |
 | `base_url` | `str` | `https://api.aforo.ai` | Host only; `/v1/ingest/batch` is appended. |
 | `product_type` | `str` | `"API"` | Top-level `productType` on every event; trimmed + upper-cased, unknown values passed through. Override per event with `track(product_type=...)`. |
 | `flush_count` | `int` | `500` | Events per request and the queue size that wakes the sender (clamped to 1..1000). |
@@ -165,14 +165,14 @@ Each request event carries top-level `productType`, `endpointPath` (path without
 | `metric_name` | `str` | required | Metric you're metering. |
 | `quantity` | `float` | `1` | Amount of usage. |
 | `idempotency_key` | `str?` | random UUID v4 | Dedupe key. Omit it and each event gets its own unique key; pass one to opt into dedup. |
-| `occurred_at` | `str?` | now | ISO-8601 event time (UTC). |
+| `occurred_at` | `str?` | now | ISO-8601 instant with seconds and a zone, e.g. `2026-03-01T14:30:00Z` or `datetime.now(timezone.utc).isoformat()`. A value without a zone (`datetime.utcnow().isoformat()`) is dropped as `invalid`: the ingestor could not read it and would reject the whole batch. |
 | `metadata` | `dict?` | `None` | Arbitrary key/values stored with the event. |
 | `execution_status` | `str?` | `None` | Request outcome for OUTCOME_BASED pricing (`SUCCESS`, `TIMEOUT`, `ERROR`, …). Trimmed + upper-cased; an unknown value is logged and left off. |
 | `product_type` | `str?` | client's | Per-event `productType` override. |
 | `extra_fields` | `dict?` | `None` | Optional top-level ingest fields by their camelCase wire name (`agentId`, `sessionId`, `endpointPath`, …). |
 | `event` | `TrackEvent?` | `None` | Pass a `TrackEvent` instead of keyword args. |
 
-`MiddlewareOptions` (extra knobs for the framework adapters): `customer_resolver` (required unless `trust_customer_header=True`; `customer_id` is its old name), `trust_customer_header`, `product_type` (default `"API"`), `metric_name`, `quantity`, `metadata` (each a constant or a callable over the request/scope), `exclude_paths` (`list[str]`), `exclude_status_codes` (`list[int]`), plus `flush_count` / `flush_interval` / `max_queue_size` / `allow_insecure_http` forwarded to the client.
+`MiddlewareOptions` (extra knobs for the framework adapters): `customer_resolver` (required unless `trust_customer_header=True`; `customer_id` is its old name), `trust_customer_header`, `product_type` (default `"API"`), `metric_name`, `quantity`, `metadata` (each a constant or a callable over the request/scope; Flask callables may also take the response), `exclude_paths` (`list[str]`; `None` = the defaults, `[]` = none), `exclude_status_codes` (`list[int]`), plus `flush_count` / `flush_interval` / `max_queue_size` / `allow_insecure_http` forwarded to the client (FastAPI and Flask keywords; Django has the settings listed above).
 
 ### Session heartbeats
 

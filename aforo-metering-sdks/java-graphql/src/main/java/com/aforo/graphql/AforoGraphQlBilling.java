@@ -9,6 +9,7 @@ import graphql.execution.instrumentation.InstrumentationContext;
 import graphql.execution.instrumentation.InstrumentationState;
 import graphql.execution.instrumentation.SimpleInstrumentationContext;
 import graphql.execution.instrumentation.parameters.InstrumentationCreateStateParameters;
+import graphql.execution.instrumentation.parameters.InstrumentationExecuteOperationParameters;
 import graphql.execution.instrumentation.parameters.InstrumentationExecutionParameters;
 import graphql.language.Document;
 import graphql.language.Field;
@@ -54,7 +55,7 @@ import java.util.logging.Logger;
 public final class AforoGraphQlBilling implements AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(AforoGraphQlBilling.class.getName());
-    private static final String SDK_VERSION = "2.1.0";
+    private static final String SDK_VERSION = "2.1.1";
     private static final int MAX_IDEMPOTENCY_KEY = 255;
     /** Ingestor limit on {@code gqlOperationName}. */
     static final int MAX_GQL_OPERATION_NAME = 255;
@@ -135,21 +136,43 @@ public final class AforoGraphQlBilling implements AutoCloseable {
                 return new TimingState();
             }
 
+            /**
+             * Keeps the document graphql-java executes. With persisted queries (APQ) the query
+             * text is only a marker, so re-parsing {@code getQuery()} would meter nothing.
+             */
+            @Override
+            public InstrumentationContext<ExecutionResult> beginExecuteOperation(
+                    InstrumentationExecuteOperationParameters parameters, InstrumentationState state) {
+                if (state instanceof TimingState t && parameters.getExecutionContext() != null) {
+                    t.document = parameters.getExecutionContext().getDocument();
+                    t.operation = parameters.getExecutionContext().getOperationDefinition();
+                }
+                return SimpleInstrumentationContext.noOp();
+            }
+
             @Override
             public InstrumentationContext<ExecutionResult> beginExecution(InstrumentationExecutionParameters parameters,
                                                                           InstrumentationState state) {
-                ((TimingState) state).startMs = System.currentTimeMillis();
+                TimingState timing = state instanceof TimingState t ? t : new TimingState();
+                timing.startMs = System.currentTimeMillis();
                 return SimpleInstrumentationContext.whenCompleted((result, throwable) -> {
                     try {
-                        if (result == null) return;
+                        if (result == null && throwable == null) return;
                         String customerId = resolveCustomer(parameters);
 
-                        long durationMs = System.currentTimeMillis() - ((TimingState) state).startMs;
+                        long durationMs = System.currentTimeMillis() - timing.startMs;
                         boolean hasErrors = throwable != null
                                 || (result.getErrors() != null && !result.getErrors().isEmpty());
                         String outcome = throwable != null ? "ERROR" : outcomeFromGraphQlResult(result);
-                        record(customerId, parameters.getQuery(), parameters.getOperation(), durationMs, hasErrors,
-                                outcome);
+                        if (timing.document != null && timing.operation != null) {
+                            // The operation ran: meter the document graphql-java actually executed.
+                            recordOperation(customerId, timing.document, timing.operation, durationMs, hasErrors,
+                                    canonicalExecutionStatus(outcome), null);
+                        } else {
+                            // Refused before running (parse/validation): only the query text is known.
+                            record(customerId, parameters.getQuery(), parameters.getOperation(), durationMs, hasErrors,
+                                    outcome);
+                        }
                     } catch (Exception e) {
                         LOG.log(Level.FINE, "[aforo-graphql] instrumentation error", e);
                     }
@@ -202,11 +225,36 @@ public final class AforoGraphQlBilling implements AutoCloseable {
                        String executionStatus, String productTypeOverride) {
         if (query == null || query.isBlank()) return;
         String outcome = canonicalExecutionStatus(executionStatus);
+        Document doc;
+        OperationDefinition op;
         try {
-            Document doc = Parser.parse(query);
-            OperationDefinition op = findOperation(doc, operationName);
-            if (op == null) return;
+            doc = Parser.parse(query);
+            op = findOperation(doc, operationName);
+        } catch (Exception e) {
+            LOG.log(Level.FINE, "[aforo-graphql] could not parse the operation", e);
+            dropUnreadable(customerId, "the query could not be parsed (" + e.getClass().getSimpleName() + ")");
+            return;
+        }
+        if (op == null) {
+            dropUnreadable(customerId, "the query has no operation");
+            return;
+        }
+        recordOperation(customerId, doc, op, durationMs, hasErrors, outcome, productTypeOverride);
+    }
 
+    /** An operation that could not be read is counted and reported as INVALID, never silently lost. */
+    private void dropUnreadable(String customerId, String why) {
+        Map<String, Object> event = new HashMap<>();
+        event.put("customerId", customerId);
+        event.put("metricName", "graphql_api.operations");
+        event.put("productType", productType);
+        recordInvalid(event, "GraphQL operation not metered: " + why);
+    }
+
+    /** Meters one operation of an already parsed document. Never throws. */
+    private void recordOperation(String customerId, Document doc, OperationDefinition op, long durationMs,
+                                 boolean hasErrors, String outcome, String productTypeOverride) {
+        try {
             int[] fc = {0};
             int[] maxDepth = {0};
             int[] depth = {0};
@@ -486,7 +534,10 @@ public final class AforoGraphQlBilling implements AutoCloseable {
     }
 
     private static class TimingState implements InstrumentationState {
-        long startMs;
+        volatile long startMs;
+        /** The executed document and operation (set by beginExecuteOperation; absent when refused before running). */
+        volatile Document document;
+        volatile OperationDefinition operation;
     }
 
     /** The resolver's answer; a resolver that throws counts as no customer and never fails the operation. */

@@ -128,13 +128,17 @@ def test_rejected_event_leaves_buffered_events_alone():
 
 
 def test_extra_field_limits_mirror_the_server_dto():
-    assert MAX_LENGTHS == {
-        "customerId": 64, "metricName": 255, "idempotencyKey": 255, "productType": 20,
-        "traceId": 128, "spanId": 32, "sessionId": 64, "agentId": 36, "toolName": 64,
-        "capabilityName": 64, "subscriptionId": 64, "endpointPath": 512, "httpMethod": 16,
-        "grpcService": 255, "grpcMethod": 128, "gqlOperationName": 255,
-        "wsConnectionId": 64, "mqttTopic": 500, "mqttClientId": 128,
-    }
+    # Every maxLength in the contract's ingestEvent schema, except executionStatus
+    # (an unknown or over-long status is left off the event, not dropped).
+    import json
+    from pathlib import Path
+
+    contract = json.loads((Path(__file__).resolve().parents[2] / "contract" / "ingest-contract.json").read_text())
+    expected = {name: spec["maxLength"]
+                for name, spec in contract["schemas"]["ingestEvent"]["properties"].items()
+                if "maxLength" in spec and name != "executionStatus"}
+    assert MAX_LENGTHS == expected
+    assert MAX_LENGTHS["teamId"] == 36 and MAX_LENGTHS["parentStepId"] == 64
     drops = []
     client = _client(drops)
     client.track(**_valid(), extra_fields={"agentId": "a" * 36})

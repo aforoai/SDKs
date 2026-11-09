@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Mapping, Optional
 
 from ._transport import TransportCore
 from ._version import __version__
@@ -36,6 +36,10 @@ def _utc_now_iso() -> str:
 
 def _describe_invalid(event: ResolvedEvent) -> Optional[str]:
     """Why the ingestor would reject this event, or ``None`` if it would not."""
+    if event.metadata is not None and not isinstance(event.metadata, dict):
+        # The ingestor cannot read a non-object metadata at all, which fails
+        # every event of the batch it travels in.
+        return f"metadata must be a dict (got {type(event.metadata).__name__})"
     if event.customer_id is None or not str(event.customer_id).strip():
         return "customer_id is required (got blank)"
     if event.metric_name is None or not str(event.metric_name).strip():
@@ -300,6 +304,10 @@ class AforoClient:
             idempotency_key = generate_random_key()
 
         resolved_product_type = _normalize_product_type(product_type) or self._product_type
+        shape_problem = None
+        if extra_fields is not None and not isinstance(extra_fields, Mapping):
+            shape_problem = f"extra_fields must be a dict (got {type(extra_fields).__name__})"
+            extra_fields = None
 
         resolved = ResolvedEvent(
             customer_id=customer_id,
@@ -319,7 +327,7 @@ class AforoClient:
         # rather than raised: track() sits on request hot paths, and an
         # exception there turns a metering problem into a failed request.
         if not self._core.closed:
-            problem = _describe_invalid(resolved)
+            problem = shape_problem or _describe_invalid(resolved)
             if problem:
                 self._core.report_drop([resolved], "invalid", detail=problem)
                 return

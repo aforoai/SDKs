@@ -43,7 +43,7 @@ from ._transport import (
 )
 from ._transport import policy as _policy
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 logger = logging.getLogger("aforo_grpc_metering")
 
 # POST /v1/ingest/batch takes 1..1000 events per request.

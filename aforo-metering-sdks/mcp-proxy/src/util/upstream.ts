@@ -61,6 +61,17 @@ export async function readCappedText(res: Response, maxBytes: number = UPSTREAM_
   return Buffer.concat(chunks.map((c) => Buffer.from(c.buffer, c.byteOffset, c.byteLength))).toString('utf8');
 }
 
+/**
+ * True when a forward failed before the upstream answered at all (connection
+ * refused or reset, DNS failure): not a timeout and not an over-large answer.
+ * The upstream then never ran the message's tool calls.
+ */
+export function upstreamNeverAnswered(err: unknown, signal?: AbortSignal): boolean {
+  const reason = signal?.aborted ? signal.reason : undefined;
+  if (err instanceof UpstreamTimeoutError || reason instanceof UpstreamTimeoutError) return false;
+  return !(err instanceof UpstreamResponseTooLargeError);
+}
+
 /** HTTP status and body the proxy answers its client with when the upstream forward failed. */
 export function upstreamFailure(err: unknown, signal?: AbortSignal): { status: number; error: string } {
   const reason = signal?.aborted ? signal.reason : undefined;

@@ -2,6 +2,14 @@
 
 All notable changes to `@aforoai/mcp-metering` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [2.1.1] - 2026-11-09
+
+### Fixed (SDK review, 2026-11-09)
+- **A throwing `onError` can no longer break the host.** Every report goes through one guarded call: a throw is logged and ignored. Before, a throwing `onError` on a failed heartbeat became an unhandled rejection that ended the process, one on a bad `statusResolver` rejected the tool call and lost its usage, and one on a failing `customerResolver` stopped the tool from running.
+- **A client can no longer leave its own call unmetered through `_meta`.** A `_meta.agent_id` that is blank, not a string or over 36 characters is replaced by the `agentId` config (else `"unknown"`), and a `_meta.session_id` over 64 characters is left off the event (one warning each). Both used to drop the event as `invalid`. `recordToolInvocation` still drops explicit values over the limits.
+- **`executionDurationMs` that does not fit the ingestor's int field** (or is not finite) is left off the event with one warning; the event is still sent.
+- The API key is trimmed once at construction, so the heartbeat request (sent outside the transport core) carries the same key as usage batches.
+
 ## [2.0.0] - 2026-10-26
 
 ### Fixed (transport core, review of 2026-10-26)

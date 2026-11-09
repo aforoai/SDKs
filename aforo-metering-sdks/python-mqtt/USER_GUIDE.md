@@ -1,6 +1,6 @@
 # aforo-mqtt-metering — User Guide
 
-**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Python engineers running an MQTT client against a managed broker who need per-event billing.
+**Version:** 2.1.1 · **Updated:** 2026-11-09 · **Audience:** Python engineers running an MQTT client against a managed broker who need per-event billing.
 
 ## What you'll build
 

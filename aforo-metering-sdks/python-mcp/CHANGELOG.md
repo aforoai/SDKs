@@ -2,6 +2,25 @@
 
 All notable changes to `aforo-mcp-metering` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [2.1.1] - 2026-11-09
+
+Fixes from the 2026-11-09 SDK review.
+
+### Fixed
+- **The Quickstart metered nothing.** `mcp`'s `@server.call_tool()` calls a handler as `handler(name, arguments)`, so no `agent_id` kwarg ever arrived and every call was dropped as `invalid`. With no `agent_id` kwarg and no `agent_resolver` (or one that returns nothing), `agentId` is now the `clientInfo.name` the MCP client sent in `initialize`, read from `mcp`'s request context (cut to 36 characters). Without `mcp` or outside a request nothing changes: the event is dropped as `invalid`, and the first such drop is logged at ERROR with how to fix it. The README and user guide examples now run as written on the `mcp` 1.x low-level `Server`.
+- **`trust_customer_header` read `_meta` from the tool arguments.** MCP carries `_meta` in the request's `params`, which the handler never sees, so a gateway-set `params._meta.customer_id` was ignored while a `_meta` the caller wrote into the arguments was billed. `_meta` now comes from a `_meta` kwarg your server passes or from the request context's `params._meta`, never from `arguments`. `ToolCall` has a new `request_context` field.
+- **Sessions were not linked to tool calls.** A tool call (or `record_tool_invocation`) without a `session_id` is now recorded in the active session, so the ingestor counts it there and heartbeats reach a session that exists.
+- **`killedSessionIds` in a usage-batch response was ignored**, although the docs said it was read. It now stops the session and calls `on_session_killed`, on the event loop the session started on. A `transport_options={"on_accepted": ...}` hook still runs.
+- **Heartbeat telemetry.** Heartbeats carry `metadata.sdkLanguage` (the key the ingestor's heartbeat log reads; `sdk` is kept). `processMemoryMb` is megabytes on macOS too (`ru_maxrss` is bytes there, KiB on Linux).
+- **`executionDurationMs` out of Java `int` range** (or not a number) is left off the event, which is still sent; one WARNING per client. Such a value used to fail the ingestor's JSON binding for the whole batch.
+- `shutdown_sync()` from another thread cancels the heartbeat task on its own loop.
+- Docs: the README and user guide named version 2.0.0 and did not list `compression`.
+
+## [2.1.0] - 2026-10-30
+
+### Changed
+- **Batches are gzip-compressed by default** (wave 8, G269): a batch of 1 KiB or more is sent with `Content-Encoding: gzip`. Needs usage-ingestor wave 8 or later; pass `compression="none"` to always send plain JSON. Heartbeats are always sent plain.
+
 ## [2.0.0] - 2026-10-26
 
 **Breaking.** Read "Who is billed" in the README before upgrading.

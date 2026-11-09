@@ -58,19 +58,22 @@ def test_outage_then_recovery_loses_nothing_and_keeps_keys(mock_ingestor):
 
 @pytest.mark.parametrize("form", ["delta", "http-date"])
 def test_429_retry_after_both_forms(mock_ingestor, form):
+    # The wall clock is pinned to the whole second the HTTP-date is built from,
+    # so the expected wait is exact (an HTTP-date has whole-second precision).
+    base = float(int(time.time()))
     if form == "delta":
         header, expected = "2", 2.0
     else:
-        header = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=4), usegmt=True)
+        header = format_datetime(datetime.fromtimestamp(base, timezone.utc) + timedelta(seconds=4), usegmt=True)
         expected = 4.0
     mock_ingestor.faults({"status": 429, "retryAfter": header})
     waits = []
-    c = core(mock_ingestor.url, sleep=waits.append)
+    c = core(mock_ingestor.url, sleep=waits.append, wall_clock=lambda: base)
     c.enqueue(event(1))
     c.flush()
     c.close()
     assert mock_ingestor.state()["acceptedCount"] == 1
-    assert len(waits) == 1 and waits[0] == pytest.approx(expected, abs=1.1)
+    assert len(waits) == 1 and waits[0] == pytest.approx(expected, abs=0.01)
 
 
 def test_hung_response_times_out_and_is_retried(mock_ingestor):

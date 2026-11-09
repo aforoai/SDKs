@@ -26,12 +26,14 @@ Requires Node >= 18.
 **stdio** — wrap a CLI-launched MCP server. The proxy spawns the server as a child process and meters the JSON-RPC crossing its stdio. The sidecar bills one customer:
 
 ```bash
+export AFORO_API_KEY="sk_live_xxx"   # the key goes in the environment, never on the command line
 aforo-mcp-proxy --transport stdio \
   --command "npx" --arg -y --arg @modelcontextprotocol/server-filesystem --arg /tmp \
   --tenant tenant_smartai --product prod_mcp_fs --customer-id cust_acme \
-  --api-key "$AFORO_API_KEY" \
   --ingestor-url https://api.aforo.ai
 ```
+
+> ⚠ Pass the API key as `AFORO_API_KEY`, not `--api-key`. The proxy never passes `AFORO_*` variables to the MCP server it spawns, but a command line is readable by every local process, the spawned server included (`/proc/<pid>/cmdline`). The proxy logs a warning when `--api-key` is used with stdio.
 
 **SSE** — front a network MCP server. The proxy listens on `--port` and forwards to `--upstream`. Every client sends a bearer token; a tokens file maps each token to the customer it is billed to:
 
@@ -41,8 +43,7 @@ aforo-mcp-proxy --transport sse \
   --upstream http://localhost:8080/sse --port 3100 --host 127.0.0.1 \
   --auth-tokens-file /etc/aforo/proxy-tokens.json \
   --tenant tenant_smartai --product prod_mcp_fs \
-  --api-key "$AFORO_API_KEY" \
-  --ingestor-url https://api.aforo.ai
+  --ingestor-url https://api.aforo.ai          # AFORO_API_KEY from the environment
 ```
 
 Clients then send `Authorization: Bearer tok_7f3c9a1e5b2d4c6f`. **Streamable HTTP** — same shape as SSE, `--transport streamable-http`.
@@ -72,14 +73,15 @@ The proxy's bearer token is never forwarded to the MCP server.
 
 ### Claude Desktop / Cursor (stdio via a config file)
 
-Put the proxy in front of the server in the host's `mcpServers` block, with the proxy config in a JSON file:
+Put the proxy in front of the server in the host's `mcpServers` block, with the API key in the host's `env` block and the rest of the proxy config in a JSON file:
 
 ```json
 {
   "mcpServers": {
     "filesystem": {
       "command": "aforo-mcp-proxy",
-      "args": ["--config", "/path/to/aforo-proxy.json"]
+      "args": ["--config", "/path/to/aforo-proxy.json"],
+      "env": { "AFORO_API_KEY": "sk_live_xxx" }
     }
   }
 }
@@ -93,8 +95,8 @@ Put the proxy in front of the server in the host's `mcpServers` block, with the 
   "aforo": {
     "tenantId": "tenant_smartai",
     "productId": "prod_mcp_fs",
-    "apiKey": "sk_live_xxx",
     "ingestorUrl": "https://api.aforo.ai",
+    "customerId": "cust_acme",
     "agentId": "agent_claude_desktop",
     "productType": "MCP_SERVER",
     "quotaEnforcement": false,
@@ -103,7 +105,9 @@ Put the proxy in front of the server in the host's `mcpServers` block, with the 
 }
 ```
 
-> ⚠ In stdio mode the proxy owns the child's stdout. It parses newline-delimited JSON-RPC and only meters `tools/call`; everything else (`initialize`, `ping`, notifications) passes through untouched. If your server frames messages some other way, metering may miss calls — file the framing you use.
+The `customerId` (or another customer source) is required: without one the proxy exits at startup. Keep the key out of the config file: its path is on the proxy's command line, and the MCP server runs as the same user.
+
+> ⚠ In stdio mode the proxy owns the child's stdout. It parses newline-delimited JSON-RPC and only meters `tools/call` (a `notifications/cancelled` for a waiting call meters it as `CANCELLED`); everything else (`initialize`, `ping`, notifications) passes through untouched. If your server frames messages some other way, metering may miss calls — file the framing you use.
 
 ## Configuration
 
@@ -127,12 +131,13 @@ The proxy resolves each value with this precedence: **environment variable > CLI
 | `--health-file` | `healthFile` | `AFORO_HEALTH_FILE` | — | File the proxy rewrites every 10 s while serving and removes on shutdown, for container health checks. |
 | `--tenant` | `aforo.tenantId` | `AFORO_TENANT_ID` | — (required) | Aforo tenant scope. Sent as `X-Tenant-Id`. |
 | `--product` | `aforo.productId` | `AFORO_PRODUCT_ID` | — (required) | MCP_SERVER product the events bill against. |
-| `--api-key` | `aforo.apiKey` | `AFORO_API_KEY` | — (required) | `X-API-Key: <apiKey>`. |
+| `--api-key` | `aforo.apiKey` | `AFORO_API_KEY` | — (required) | `X-API-Key: <apiKey>` (trimmed). Use the env var: a command line is readable by the stdio child, and the proxy warns when `--api-key` is used with stdio. |
 | `--ingestor-url` | `aforo.ingestorUrl` | `AFORO_INGESTOR_URL` | — (required) | Base ingestor URL. The proxy appends `/v1/ingest/batch`. |
-| `--agent-id` | `aforo.agentId` | `AFORO_AGENT_ID` | — | Agent id override when the traffic doesn't carry `_meta.agent_id`. |
+| `--agent-id` | `aforo.agentId` | `AFORO_AGENT_ID` | — | Operator override: every call is billed to this agent id, whatever `_meta.agent_id` the client sends. Without it the client's `_meta.agent_id` is used when it is a non-blank string of at most 36 characters, else `"unknown"`. |
 | `--customer-id` | `aforo.customerId` | `AFORO_CUSTOMER_ID` | — | One customer billed for every tool call. Also the customer on session heartbeats (else the first call's customer, else `system`; heartbeats are never billed). |
 | `--trust-client-customer-id` | `aforo.trustClientCustomerId` | `AFORO_TRUST_CLIENT_CUSTOMER_ID` | `false` | Bill `params._meta.customer_id` as the client sends it. |
 | — | `aforo.customerResolver` | — | — | Library use only: decides the customer per call (see [Who is billed](#who-is-billed)). |
+| `--compression` | `aforo.compression` | `AFORO_COMPRESSION` | `gzip` | `gzip` sends usage batches of 1 KiB or more gzip-encoded (usage-ingestor wave 8 or later); `none` always sends plain JSON. |
 | `--allow-insecure-http` | `aforo.allowInsecureHttp` | `AFORO_ALLOW_INSECURE_HTTP` | `false` | Allow a plain `http://` ingestor URL on a host other than localhost / 127.0.0.1 / ::1. Otherwise it must be `https://`. |
 | — | `aforo.productType` | `AFORO_PRODUCT_TYPE` | `MCP_SERVER` | Top-level `productType` on every event (required by the ingestor). Trimmed and uppercased. |
 | — | `aforo.statusResolver` | — | — | Library use only: overrides the `executionStatus` decided for each tool call (see below). |
@@ -161,8 +166,10 @@ The proxy resolves each value with this precedence: **environment variable > CLI
 | Any other JSON-RPC error | `ERROR` |
 | No response within the response timeout | `TIMEOUT` (once) |
 | Still waiting when the proxy shuts down (SIGTERM/SIGINT) | `CANCELLED` (once, before the final flush) |
+| Cancelled by the client (`notifications/cancelled`) | `CANCELLED` (once, when the cancellation arrives) |
+| Never reached the server: the upstream refused the connection, or answered an HTTP error without a JSON-RPC response (SSE / Streamable HTTP) | not billed |
 
-A library `statusResolver` can override these. It must be synchronous and return one of the 11 canonical statuses (`SUCCESS`, `PARTIAL`, `TIMEOUT`, `ERROR`, `VALIDATION_FAILED`, `FAILED`, `FAILURE`, `CANCELLED`, `PENDING`, `BLOCKED`, `HITL_REQUIRED`); a Promise or any other value is logged and the default is used. Calls are matched to responses by session and JSON-RPC id, so two clients reusing id `1` are metered separately: Streamable HTTP keys sessions on `Mcp-Session-Id`, and in `sse` mode each SSE connection is its own session (a POST is matched to its connection by the message endpoint the server gave that connection). Every `tools/call` inside a JSON-RPC batch is metered and quota-checked; refused calls are removed from the batch and answered by the proxy. The proxy keeps at most 10 000 calls waiting for a response (the oldest past that is metered as `TIMEOUT`) and at most 10 000 open sessions (idle ones expire after an hour).
+A library `statusResolver` can override these. It must be synchronous and return one of the 11 canonical statuses (`SUCCESS`, `PARTIAL`, `TIMEOUT`, `ERROR`, `VALIDATION_FAILED`, `FAILED`, `FAILURE`, `CANCELLED`, `PENDING`, `BLOCKED`, `HITL_REQUIRED`); a Promise or any other value is logged and the default is used. Calls are matched to responses by session and JSON-RPC id, so two clients reusing id `1` are metered separately, and a client that reuses an id while the first call is still waiting has each call metered once (responses are matched in order): Streamable HTTP keys sessions on `Mcp-Session-Id`, and in `sse` mode each SSE connection is its own session (a POST is matched to its connection by the message endpoint the server gave that connection). Every `tools/call` inside a JSON-RPC batch is metered and quota-checked; refused calls are removed from the batch and answered by the proxy. The proxy keeps at most 10 000 calls waiting for a response (the oldest past that is metered as `TIMEOUT`) and at most 10 000 open sessions (idle ones expire after an hour).
 
 Each tool call's idempotency key is minted once, when its event is created, and reused by every flush retry.
 
@@ -173,7 +180,7 @@ A usage event the proxy loses is counted, WARN-logged, and — when the proxy is
 | `reason` | When |
 |---|---|
 | `rejected` | The ingestor refused the batch with a non-retryable 4xx (400, 422, ...), or refused these events individually inside a batch it otherwise accepted. Per-event errors marked `retryable` are re-sent instead. |
-| `invalid` | The tool call's event could not be sent: no customer for the call, `agentId` over 36 characters, `customerId` over 64, or `sessionId` over 64. The call is still forwarded to the MCP server. The WARN is logged for the first such call and then every 1000th. A `toolName` over 64 characters is not a drop: it is cut to 64 on the event and the call is metered (one WARN per label). |
+| `invalid` | The tool call's event could not be sent: no customer for the call, `customerId` over 64, or a `--agent-id` over 36 characters. The call is still forwarded to the MCP server. The WARN is logged for the first such call and then every 1000th. The tool name, agent id and session id a client sends are never a reason to drop: a `toolName` over 64 characters is cut to 64, a `_meta.agent_id` that is blank, not a string or over 36 characters is billed as `"unknown"` (one WARN), a non-string tool name as `"unknown"`, and an `Mcp-Session-Id` over 64 characters is replaced by a digest. |
 | `overflow` | The queue was full (`maxQueueSize`) during an outage; the oldest event made room. |
 | `shutdown` | Still queued when shutdown reached its deadline. |
 | `closed` | Produced after shutdown began. |
@@ -190,4 +197,4 @@ Step-by-step from install to a verified metered call: [USER_GUIDE.md](USER_GUIDE
 
 ## What this doesn't cover
 
-Metering happens in the proxy's observe path, so it never blocks a tool call — **except** when `--quota-enforcement` is on, which adds a pre-flight check (1 s deadline, ALLOW answers reused for 1 s) that **fails open** by default; set `--quota-fail-mode closed` to refuse calls the check cannot answer. Usage waits in memory during an outage (up to `maxQueueSize`); it is lost if the proxy dies before sending it, and there is no disk spool. The proxy meters `tools/call`; `tools/list`, `resources/read`, and `prompts/get` are tracked for analytics, and protocol chatter (`initialize`, `ping`, notifications) is ignored. It does not transform tool payloads, rewrite responses, or add auth to the upstream server.
+Metering happens in the proxy's observe path, so it never blocks a tool call — **except** when `--quota-enforcement` is on, which adds a pre-flight check (1 s deadline, ALLOW answers reused for 1 s) that **fails open** by default; set `--quota-fail-mode closed` to refuse calls the check cannot answer. Usage waits in memory during an outage (up to `maxQueueSize`); it is lost if the proxy dies before sending it, and there is no disk spool. The proxy meters `tools/call` only; `tools/list`, `resources/read`, `prompts/get` and protocol chatter (`initialize`, `ping`, notifications) are forwarded without being metered or recorded. It does not transform tool payloads, rewrite responses, or add auth to the upstream server.

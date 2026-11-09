@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { MiddlewareOptions } from '../types.js';
 import { truncateRequestLabel } from '../limits.js';
 import { AforoClient } from '../client.js';
@@ -7,9 +8,10 @@ import { normalizePath as heuristicNormalize } from '../path-normalizer.js';
  * Metric recorded for each request when `metricName` is not configured.
  *
  * It must exist in the tenant's Aforo metric catalog: the ingestor rejects an
- * unknown metric, and because it validates a batch as a whole, one such event
- * fails the entire batch with 400. The previous default, `"METHOD /path"`, is a
- * name no catalog contains, so every event failed out of the box.
+ * unknown metric. It checks each event on its own, so only that event is lost,
+ * and the refusal arrives on a background flush where no caller sees it. The
+ * previous default, `"METHOD /path"`, is a name no catalog contains, so every
+ * event failed out of the box.
  */
 export const DEFAULT_METRIC_NAME = 'api_calls';
 
@@ -106,4 +108,54 @@ export function endpointPathFor(options: MiddlewareOptions, rawPath: string, req
     out = heuristicNormalize(path, typeof routeTemplate === 'string' && routeTemplate ? routeTemplate : undefined);
   }
   return endpointPathOf(out);
+}
+
+/** Paths never metered unless `excludePaths` is given. */
+export const DEFAULT_EXCLUDE_PATHS: readonly string[] = Object.freeze(['/health', '/ready', '/metrics', '/favicon.ico']);
+
+/**
+ * Whether a request path (query string ignored) is excluded: equal to an entry
+ * or below it. `/health` excludes `/health` and `/health/live`, never
+ * `/healthcare/...`.
+ */
+export function isExcludedPath(rawPath: string, excludePaths: readonly string[]): boolean {
+  const path = String(rawPath ?? '/').split('?')[0] || '/';
+  return excludePaths.some((entry) => {
+    if (typeof entry !== 'string' || !entry) return false;
+    const p = entry.length > 1 ? entry.replace(/\/+$/, '') : entry;
+    return path === p || path.startsWith(p.endsWith('/') ? p : `${p}/`);
+  });
+}
+
+/**
+ * A request whose event could not be built because one of the caller's
+ * functions threw (customerResolver, metricName, quantity, metadata,
+ * normalizePath): counted and reported as an 'invalid' drop, like a resolver
+ * that returns nothing. The request itself is never affected.
+ */
+export function reportMeteringFailure(
+  client: AforoClient,
+  options: MiddlewareOptions,
+  err: unknown,
+  request: { path: string; method: string; statusCode: number },
+): void {
+  try {
+    const message = String((err as Error)?.message ?? err).slice(0, 200);
+    client.reportInvalid(
+      {
+        customerId: '',
+        metricName: typeof options?.metricName === 'string' && options.metricName ? options.metricName : DEFAULT_METRIC_NAME,
+        quantity: typeof options?.quantity === 'number' ? options.quantity : 1,
+        idempotencyKey: randomUUID(),
+        occurredAt: new Date().toISOString(),
+        productType: (options?.productType ?? '').trim().toUpperCase() || 'API',
+        endpointPath: endpointPathOf(request.path),
+        httpMethod: httpMethodOf(request.method),
+        statusCode: request.statusCode,
+      },
+      `a metering function threw, so the request was not metered: ${message}`,
+    );
+  } catch (reportErr) {
+    console.debug(`[aforo] metering skipped: ${(reportErr as Error)?.message ?? reportErr}`);
+  }
 }

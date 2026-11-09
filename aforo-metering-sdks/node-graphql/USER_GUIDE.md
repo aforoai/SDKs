@@ -1,6 +1,6 @@
 # @aforoai/graphql-metering — User Guide
 
-**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Node.js engineers running a GraphQL server (Apollo Server 4, `graphql-http`, or `express-graphql`) who need per-operation usage metered into Aforo.
+**Version:** 2.1.1 · **Updated:** 2026-10-26 · **Audience:** Node.js engineers running a GraphQL server (Apollo Server 4, `graphql-http`, or `express-graphql`) who need per-operation usage metered into Aforo.
 
 ## What you'll build
 
@@ -80,7 +80,7 @@ app.use(express.json());                       // body must be parsed first
 app.use('/graphql', billing.middleware(), createHandler({ schema }));
 ```
 
-> ⚠ The middleware reads `req.body.query`. If your body parser runs *after* `billing.middleware()`, `query` is `undefined` and nothing gets metered.
+> ⚠ The middleware reads `req.body.query` for POST and the `query` / `operationName` URL parameters for GET. If your body parser runs *after* `billing.middleware()`, a POST's `query` is `undefined` and it is not metered.
 
 ## Step 4 — Make sure each operation has a customer id
 

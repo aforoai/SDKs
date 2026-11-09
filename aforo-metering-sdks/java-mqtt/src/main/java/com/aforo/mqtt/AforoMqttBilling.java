@@ -28,7 +28,7 @@ import java.util.logging.Logger;
 public final class AforoMqttBilling implements AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(AforoMqttBilling.class.getName());
-    private static final String SDK_VERSION = "2.1.0";
+    private static final String SDK_VERSION = "2.1.1";
     private static final int MAX_IDEMPOTENCY_KEY = 255;
     /** Ingestor limits on the labels taken from the MQTT packet. */
     static final int MAX_MQTT_TOPIC = 500;

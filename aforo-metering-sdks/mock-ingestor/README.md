@@ -50,6 +50,7 @@ A fault:
 | `stallBody` | send 202 headers and the first bytes of the body, then nothing (the client's total deadline must fire) |
 | `dripMs` | send the 202 body one byte every `dripMs` ms (a per-read timeout never fires; a total deadline does) |
 | `perEvent` | `[{index, message, retryable}]` — a 202 that fails these events |
+| `rateLimit` | opt-in: only requests with **more** than this many events match (smaller ones skip the fault and do not use it up); they get 429 (or `status`) with `X-RateLimit-Limit: <rateLimit>`, like usage-ingestor's HARD per-key limit. Combine with `times: -1` |
 | `killedSessionIds` | `[string]` — a 202 whose `data.killedSessionIds` lists these sessions |
 
 `requests[]` records, per ingest request: path, `contentType`, `contentEncoding`,

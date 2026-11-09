@@ -62,7 +62,7 @@ aforo-mcp-proxy --transport stdio \
 
 (The four credentials come from the env you set in Step 2.)
 
-> ⚠ The child gets a short allowlist of the proxy's environment (`PATH`, `HOME`, locale, temp dirs, proxy and npm-cache settings) and never any `AFORO_*` variable, so a third-party server cannot read your Aforo key. Pass anything else it needs with `--pass-env NAME1,NAME2` or the config file's `env` block.
+> ⚠ The child gets a short allowlist of the proxy's environment (`PATH`, `HOME`, locale, temp dirs, proxy and npm-cache settings) and never any `AFORO_*` variable, so a third-party server cannot read your Aforo key from its environment. Give the key as `AFORO_API_KEY` only: a key passed with `--api-key` sits on the proxy's command line, which the child can read (`/proc/<pid>/cmdline`), and the proxy warns when you do that in stdio mode. Pass anything else it needs with `--pass-env NAME1,NAME2` or the config file's `env` block.
 
 > ⚠ stdio metering parses **newline-delimited** JSON-RPC. The proxy spawns the child, forwards its stderr to yours, and writes parsed messages to the client. If your server frames messages differently, calls can be missed — confirm metering on a known tool first (Step 4).
 
@@ -75,7 +75,8 @@ Point the host's `mcpServers` entry at the proxy with a config file:
   "mcpServers": {
     "filesystem": {
       "command": "aforo-mcp-proxy",
-      "args": ["--config", "/path/to/aforo-proxy.json"]
+      "args": ["--config", "/path/to/aforo-proxy.json"],
+      "env": { "AFORO_API_KEY": "sk_live_xxx" }
     }
   }
 }
@@ -89,7 +90,6 @@ Point the host's `mcpServers` entry at the proxy with a config file:
   "aforo": {
     "tenantId": "tenant_smartai",
     "productId": "prod_mcp_fs",
-    "apiKey": "sk_live_xxx",
     "ingestorUrl": "https://api.aforo.ai",
     "agentId": "agent_claude_desktop",
     "customerId": "cust_acme",
@@ -125,7 +125,7 @@ Trigger any `tools/call` through the client. With `--debug` the proxy logs each 
 aforo-mcp-proxy --transport stdio --command "npx" --arg -y --arg @modelcontextprotocol/server-filesystem --arg /tmp --debug
 ```
 
-You'll see a `Flushed events` log line with `accepted` / `duplicates` / `failed` counts once the buffer flushes (≤ `flushIntervalMs`, default 5s, or at `flushCount` events). `tools/list`, `resources/read`, and `prompts/get` are tracked but not billed; `initialize`, `ping`, and notifications are ignored.
+You'll see a `Flushed events` debug line with `events`, `accepted`, `duplicates` and `failed` counts for each batch the ingestor accepts (≤ `flushIntervalMs`, default 5s, or at `flushCount` events). Only `tools/call` is metered; `tools/list`, `resources/read`, `prompts/get`, `initialize`, `ping` and notifications are forwarded without being metered or recorded.
 
 > ⚠ If the traffic doesn't carry `_meta.agent_id`, usage attributes to `"unknown"` unless you set `--agent-id`. Set it so calls roll up under a real agent.
 
@@ -183,7 +183,8 @@ Precedence: **env var > CLI flag > config file > default.**
 | `--product` | `aforo.productId` | `AFORO_PRODUCT_ID` | — (required) | MCP_SERVER product. |
 | `--api-key` | `aforo.apiKey` | `AFORO_API_KEY` | — (required) | `X-API-Key: <apiKey>`. |
 | `--ingestor-url` | `aforo.ingestorUrl` | `AFORO_INGESTOR_URL` | — (required) | Base URL; proxy appends `/v1/ingest/batch` and `/api/v1/quota/check`. |
-| `--agent-id` | `aforo.agentId` | `AFORO_AGENT_ID` | — | Agent id override when traffic lacks `_meta.agent_id`. |
+| `--agent-id` | `aforo.agentId` | `AFORO_AGENT_ID` | — | Operator override: every call is billed to this agent id, whatever `_meta.agent_id` says. Without it, a usable `_meta.agent_id` (non-blank string, ≤ 36 chars) is used, else `"unknown"`. |
+| `--compression` | `aforo.compression` | `AFORO_COMPRESSION` | `gzip` | `none` sends usage batches as plain JSON (for an ingestor older than wave 8). |
 | `--customer-id` | `aforo.customerId` | `AFORO_CUSTOMER_ID` | — | One customer billed for every tool call; also the heartbeat customer. See the README for the other customer sources and the listener flags. |
 | — | `aforo.productType` | `AFORO_PRODUCT_TYPE` | `MCP_SERVER` | Top-level `productType` on every event (required by the ingestor). Trimmed and uppercased. |
 | `--quota-enforcement` | `aforo.quotaEnforcement` | `AFORO_QUOTA_ENFORCEMENT` | `false` | Pre-flight quota gate (1 s deadline; fail mode `--quota-fail-mode open\|closed`). |
@@ -209,7 +210,7 @@ Precedence: **env var > CLI flag > config file > default.**
 | Usage rolls up under agent `"unknown"` | Traffic carries no `_meta.agent_id` | Set `--agent-id` / `AFORO_AGENT_ID`. |
 | `Events dropped` in logs, `reason: rejected` | The ingestor refused the batch (non-retryable 4xx) or some of its events; the log carries the server's message | Check `apiKey` + `tenantId`, and fix what the message names (unknown metric, bad field). |
 | `Aforo ingestor unavailable` in logs | The ingestor was unreachable, or kept returning 401/403/5xx/408/429 | The usage stays queued and is re-sent; check connectivity to `ingestorUrl` and the API key. |
-| `Tool call not metered — invalid event dropped` in logs | The call's `agentId` (> 36 chars), `customerId` (> 64) or `sessionId` (> 64) exceeds the ingestor's limit | Shorten the value at its source. The call itself is still forwarded. |
+| `Dropped … invalid` in logs | No customer for the call, its `customerId` is over 64 characters, or `--agent-id` is over 36 | Fix the customer source or shorten `--agent-id`. The call itself is still forwarded. (A client's over-long `_meta.agent_id` is billed as `"unknown"` instead.) |
 | A failed tool call is billed as `ERROR`, a slow one as `TIMEOUT` | That is the default status mapping (see the README's "What each tool call is billed as") | Raise `AFORO_RESPONSE_TIMEOUT_MS` for long-running tools, or set `aforo.statusResolver` when embedding the proxy as a library. |
 | Quota enforcement never denies under load | The check failed open on timeout | Raise `--quota-timeout-ms`, or use `--quota-fail-mode closed`. |
 | stdio metering misses calls | Server uses non-newline JSON-RPC framing | Confirm metering on a known tool; report the framing your server uses. |

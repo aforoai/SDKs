@@ -60,6 +60,29 @@ final class EventLimits {
                 + " id bills the wrong thing.";
     }
 
+    /**
+     * {@code occurredAt} as the ingestor binds it: an ISO-8601 date-time with seconds and
+     * {@code Z} or a {@code ±HH:MM} offset. The ingestor reads the whole batch with one JSON
+     * binder, so a value it cannot read fails every event in the request, not only this one.
+     */
+    private static final java.util.regex.Pattern OCCURRED_AT = java.util.regex.Pattern.compile(
+            "\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,9})?(Z|[+-]\\d{2}:\\d{2})");
+
+    /** Why {@code occurredAt} would be refused, or null when the ingestor can read it. */
+    static String occurredAtViolation(String occurredAt) {
+        if (occurredAt == null) return null;
+        String problem = "occurredAt \"" + abbreviate(occurredAt) + "\" is not an ISO-8601 instant with seconds and"
+                + " Z or a +HH:MM offset (for example 2026-09-22T10:00:00Z). The ingestor would refuse the whole batch"
+                + " it travels in, so the event is not sent.";
+        if (!OCCURRED_AT.matcher(occurredAt).matches()) return problem;
+        try {
+            java.time.OffsetDateTime.parse(occurredAt);
+            return null;
+        } catch (java.time.format.DateTimeParseException e) {
+            return problem;
+        }
+    }
+
     /** At most ~80 characters of a value, for log messages. */
     static String abbreviate(String value) {
         if (value == null) return "null";

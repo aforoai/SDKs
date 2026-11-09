@@ -3,11 +3,11 @@
  * @file CLI entry point for aforo-mcp-proxy.
  *
  * Usage:
- *   aforo-mcp-proxy --transport stdio --command "npx" --arg -y --arg @mcp/server-fs --arg /tmp \
- *     --tenant tenant_abc --product prod_mcp_fs --api-key sk_live_xxx --customer-id cust_123
+ *   AFORO_API_KEY=sk_live_xxx aforo-mcp-proxy --transport stdio --command "npx" --arg -y --arg @mcp/server-fs --arg /tmp \
+ *     --tenant tenant_abc --product prod_mcp_fs --customer-id cust_123
  *
- *   aforo-mcp-proxy --transport sse --upstream http://localhost:8080/sse --port 3100 \
- *     --tenant tenant_abc --product prod_mcp_fs --api-key sk_live_xxx \
+ *   AFORO_API_KEY=sk_live_xxx aforo-mcp-proxy --transport sse --upstream http://localhost:8080/sse --port 3100 \
+ *     --tenant tenant_abc --product prod_mcp_fs \
  *     --auth-tokens-file /etc/aforo/proxy-tokens.json
  *
  *   aforo-mcp-proxy --config /path/to/aforo-proxy.json
@@ -48,12 +48,13 @@ program
   .option('--health-file <path>', 'File the proxy keeps fresh while serving, for container health checks')
   .option('--tenant <id>', 'Aforo tenant ID')
   .option('--product <id>', 'Aforo product ID')
-  .option('--api-key <key>', 'Aforo API key')
+  .option('--api-key <key>', 'Aforo API key. Prefer AFORO_API_KEY: any local process (the stdio child included) can read a command line')
   .option('--ingestor-url <url>', 'Aforo ingestor URL')
   .option('--agent-id <id>', 'Agent identifier override')
   .option('--customer-id <id>', 'Customer billed for every tool call (single-customer sidecar)')
   .option('--trust-client-customer-id', 'Bill the customer the MCP client names in _meta.customer_id (trusted clients only)')
   .option('--allow-insecure-http', 'Allow a plain http:// ingestor URL on a non-loopback host')
+  .option('--compression <mode>', 'Usage-batch compression: gzip (default) or none')
   .option('--quota-enforcement', 'Enable quota enforcement')
   .option('--quota-timeout-ms <ms>', 'Deadline for the pre-flight quota check (default 1000)')
   .option('--quota-fail-mode <mode>', 'open (default) or closed: what to do when the quota check cannot answer')
@@ -90,6 +91,7 @@ program
           customerId: opts.customerId,
           ...(opts.trustClientCustomerId ? { trustClientCustomerId: true } : {}),
           ...(opts.allowInsecureHttp ? { allowInsecureHttp: true } : {}),
+          ...(opts.compression ? { compression: opts.compression } : {}),
           ...(opts.quotaEnforcement ? { quotaEnforcement: true } : {}),
           quotaTimeoutMs: opts.quotaTimeoutMs ? parseInt(opts.quotaTimeoutMs, 10) : undefined,
           quotaFailMode: opts.quotaFailMode,
@@ -99,6 +101,12 @@ program
       };
 
       const config = loadConfig(cliArgs);
+      if (opts.apiKey !== undefined && config.transport === 'stdio') {
+        logger.warn(
+          '--api-key puts the Aforo API key on the proxy\'s command line, where the MCP server it spawns (and any '
+          + 'local process) can read it. Set AFORO_API_KEY in the environment instead; it is never passed to the child.',
+        );
+      }
 
       logger.info('Aforo MCP Proxy starting', {
         transport: config.transport,

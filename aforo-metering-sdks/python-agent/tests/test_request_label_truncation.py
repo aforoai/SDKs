@@ -50,14 +50,14 @@ async def test_over_long_capability_from_call_kwargs_is_truncated_and_sent(caplo
     client = _client(sent, on_drop=lambda evs, reason: drops.append(reason))
 
     @wrap_capability_handler(client, trust_customer_header=True)
-    async def dispatch(*, agent_id: str, capability_name: str) -> str:
+    async def dispatch(*, agent_id: str, session_id: str, capability_name: str) -> str:
         return "ok"
 
     first = "c" * 63 + ASTRAL + "x" * 40  # a cut at 64 would split the pair
     second = "c" * 64 + "y" * 40
     with caplog.at_level(logging.WARNING, logger="aforo_agent_metering"):
-        await dispatch(agent_id="agt_1", capability_name=first)
-        await dispatch(agent_id="agt_1", capability_name=second)
+        await dispatch(agent_id="agt_1", session_id="sess_1", capability_name=first)
+        await dispatch(agent_id="agt_1", session_id="sess_1", capability_name=second)
     await client.flush()
 
     assert len(sent) == 2 and drops == [] and client.dropped_count == 0
@@ -91,7 +91,7 @@ async def test_caller_set_values_still_drop_as_invalid() -> None:
 
     await fixed(agent_id="agt_1")
     await dispatch(agent_id="agt_1", customer_id="x" * 65, capability_name="c" * 100)
-    client.record_capability(capability_name="c" * 65, agent_id="agt_1")
+    client.record_capability(capability_name="c" * 65, agent_id="agt_1", session_id="sess_1")
     await client.flush()
 
     assert sent == [] and client.dropped_count == 3

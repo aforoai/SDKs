@@ -2,6 +2,24 @@
 
 All notable changes to `ai.aforo:metering` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [2.1.1] - 2026-11-09
+
+### Fixed (SDK review, 2026-11-09)
+- **An API key with surrounding whitespace is trimmed; one that still holds whitespace or a control character is refused at construction** (`IllegalArgumentException`, the key is never in the message). A key read from a secret file with a trailing newline used to stop every send and was logged in full at `SEVERE` on each attempt, from the JDK's "invalid header value" message; that message is no longer passed on.
+- **`close()` from an interrupted thread still drains** until the shutdown deadline, then restores the interrupt flag. It used to skip the drain and report the whole queue as `SHUTDOWN` within milliseconds.
+- **A 429 whose `X-RateLimit-Limit` is below the batch size splits the batch.** The events go back to the head of the queue in order and are sent in batches of at most that many after the `Retry-After` wait, instead of resending a batch the API key's per-minute limit can never accept until the queue overflowed.
+- **`occurredAt` is checked at `track()`.** It must be an ISO-8601 date-time with seconds and `Z` or a `+HH:MM` offset (for example `2026-09-22T10:00:00Z`); anything else is dropped as `INVALID`. The ingestor reads a batch with one JSON binder, so one unreadable `occurredAt` used to make it answer 400 and every event in that batch (other customers' too) was dropped as `REJECTED`.
+- **`statusCode` outside a Java `short` or `responseTimeMs` outside an `int`** (the ingestor's field types) is left off the event, which is still sent; one warning per field. Such a value also failed the whole batch.
+- **Servlet filter: async requests** (`DeferredResult`, `Callable`, `startAsync`) are metered when they complete, with the final status and duration; they were recorded when the handler returned, as status 200 and a few milliseconds. **A handler that throws** is metered with status 500 (the exception is rethrown); it was not metered at all. Only the REQUEST dispatch is metered, so an ASYNC or ERROR re-dispatch never counts a call twice.
+- **Servlet filter: excluded paths match whole segments** on the path without the context path: `/health` excludes `/health` and `/health/live`, not `/healthcare/...`; `/api/actuator/health` is excluded under context path `/api`. A plain string prefix silently left `/healthcare`, `/readyset`, `/metrics-api` unmetered.
+- **Servlet filter: a `CustomerIdResolver` or `MetricNameResolver` that throws** drops the event as `INVALID` (counted, `onDrop`, a throttled `WARNING`); it was lost silently at `FINE`.
+- **Spring: `aforo.enabled=true` in an application without the servlet API** (WebFlux, workers) starts again; it failed with `NoClassDefFoundError: jakarta/servlet/Filter`.
+
+## [2.1.0] - 2026-10-30
+
+### Added
+- **Request compression (wave 8, G269).** Batch bodies of 1 KiB or more are sent with `Content-Encoding: gzip`; smaller bodies stay plain JSON. The body is compressed once and every retry resends the same bytes; the 4 MiB split is decided on the uncompressed JSON; a compression failure sends plain JSON. Needs usage-ingestor wave 8 or later (an older ingestor answers 400). Turn it off with `.compression("none")` (Spring: `aforo.compression: none`).
+
 ## [2.0.0] - 2026-10-26
 
 Breaking. Wave 5 transport core (contract/TRANSPORT-SPEC.md) and customer identity.

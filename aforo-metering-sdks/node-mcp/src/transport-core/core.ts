@@ -21,10 +21,14 @@
  *     deadline per request that also covers reading the response body;
  *   - redirects are never followed (the API key must not reach another
  *     host): a 3xx keeps the batch queued and opens the breaker;
- *   - each event is serialized once, at enqueue: an event JSON cannot
- *     represent (BigInt, a cycle, NaN) is dropped there as 'invalid';
- *   - 413 splits the batch, 2xx per-event `retryable` failures are requeued,
- *     other 4xx are dropped as 'rejected';
+ *   - each event is checked and serialized once, at enqueue: an event JSON
+ *     cannot represent (BigInt, a cycle, NaN), an `occurredAt` without seconds
+ *     and a zone, or a `metadata` that is not a plain object is dropped there as
+ *     'invalid' (the ingestor would refuse the whole batch); an integer field
+ *     outside the ingestor's Java short/int/long range is left off the event;
+ *   - 413 splits the batch; a 429 whose X-RateLimit-Limit is below the batch's
+ *     event count re-queues it in parts of at most that size; 2xx per-event
+ *     `retryable` failures are requeued, other 4xx are dropped as 'rejected';
  *   - after the last retry (or on 401/403) the batch goes back to the front
  *     of the queue with its keys and a breaker pauses the flusher;
  *   - `shutdown()` drains until a deadline and reports leftovers as
@@ -106,7 +110,11 @@ export interface CoreLogger {
 export interface TransportCoreOptions<E extends CoreEvent> {
   /** Ingestor base URL. Must be https:// (plain http only for localhost, 127.0.0.1, ::1, or with allowInsecureHttp). */
   baseUrl: string;
-  /** Tenant API key, sent only as X-API-Key. Never logged, never in an error or onDrop payload. */
+  /**
+   * Tenant API key, sent only as X-API-Key. Never logged, never in an error or onDrop payload.
+   * Trimmed; the constructor throws (without echoing it) when it still contains whitespace,
+   * control or non-ASCII characters.
+   */
   apiKey: string;
   /** Allow plain http:// to a non-local host. Default false. */
   allowInsecureHttp?: boolean;
@@ -277,6 +285,87 @@ function serializeEvent(event: unknown): { json: string } | { error: string } {
     const e = err as { message?: string };
     return { error: `the event cannot be serialized to JSON (${String(e?.message ?? err).slice(0, 200)})` };
   }
+}
+
+/**
+ * The API key, trimmed. Throws when it is missing, or when it still contains
+ * whitespace, control or non-ASCII characters: fetch refuses such a header
+ * value on every request, with an error that quotes it. The key is never part
+ * of the message.
+ */
+export function checkApiKey(apiKey: unknown): string {
+  if (typeof apiKey !== 'string' || !apiKey.trim()) {
+    throw new Error('Aforo apiKey is required');
+  }
+  const key = apiKey.trim();
+  if (/[^\x21-\x7e]/.test(key)) {
+    throw new Error(
+      'Aforo apiKey contains whitespace, control or non-ASCII characters; check how it is loaded ' +
+        '(for example a line break inside an environment variable). The key itself is not shown.',
+    );
+  }
+  return key;
+}
+
+/**
+ * `occurredAt` as the ingestor's Jackson `Instant` reads it: seconds required,
+ * zone `Z` or `±HH:MM`. Anything else makes it refuse the whole batch with 400.
+ */
+const STRICT_INSTANT = /^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d{1,9})?([Zz]|[+-]\d{2}:\d{2})$/;
+
+/** True for `{}`-style objects: what the ingestor's `Map<String, Object> metadata` can bind. */
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/**
+ * Why the ingestor could not bind this event at all (and would answer 400 for
+ * the whole batch it travels in), or null. Only fields that are present are checked.
+ */
+export function eventShapeProblem(event: unknown): string | null {
+  const e = event as { occurredAt?: unknown; metadata?: unknown } | null;
+  if (!e || typeof e !== 'object') return null;
+  if (e.occurredAt !== undefined && (typeof e.occurredAt !== 'string' || !STRICT_INSTANT.test(e.occurredAt) || Number.isNaN(Date.parse(e.occurredAt.toUpperCase())))) {
+    return `occurredAt ${JSON.stringify(String(e.occurredAt).slice(0, 80))} is not an ISO-8601 instant with seconds and a zone (Z or ±HH:MM)`;
+  }
+  if (e.metadata !== undefined && e.metadata !== null && !isPlainObject(e.metadata)) {
+    return `metadata must be a plain object (got ${Array.isArray(e.metadata) ? 'an array' : typeof e.metadata})`;
+  }
+  return null;
+}
+
+/**
+ * Integer fields the ingestor holds as Java short / int / long
+ * (IngestUsageEventRequest). A value outside that range, or one that is not a
+ * finite number, makes Jackson refuse the whole batch.
+ */
+const SHORT = { min: -32768, max: 32767, type: 'short' } as const;
+const INT = { min: -2147483648, max: 2147483647, type: 'int' } as const;
+/** 2^63 - 1 is not a double; 2^63 - 1024 is the largest double below Long.MAX_VALUE. */
+const LONG = { min: -(2 ** 63), max: 2 ** 63 - 1024, type: 'long' } as const;
+export const INTEGER_FIELD_RANGES: Readonly<Record<string, { min: number; max: number; type: string }>> = Object.freeze({
+  statusCode: SHORT,
+  mqttQos: SHORT,
+  stepNumber: INT,
+  executionDurationMs: INT,
+  messageCount: INT,
+  gqlComplexity: INT,
+  gqlFieldCount: INT,
+  responseTimeMs: INT,
+  rateLimitRpm: INT,
+  rateLimitRpd: INT,
+  dataBytes: LONG,
+});
+
+/** `X-RateLimit-Limit` as a positive whole number, or undefined. */
+function parseRateLimit(value: string | null | undefined): number | undefined {
+  if (value === null || value === undefined) return undefined;
+  const text = String(value).trim();
+  if (!/^\d+$/.test(text)) return undefined;
+  const n = Number(text);
+  return Number.isSafeInteger(n) && n >= 1 ? n : undefined;
 }
 
 /** Resolves with `promise`, or rejects as soon as `signal` aborts (even if `promise` never settles). */
@@ -470,6 +559,7 @@ class EventDeque<E> {
 type SendOutcome =
   | { kind: 'done'; sent: number; failed: number; retryable: unknown[] }
   | { kind: 'split' }
+  | { kind: 'rate-limit-split'; limit: number }
   | { kind: 'outage'; status?: number; reason: string; redirectTo?: string }
   | { kind: 'deadline' };
 
@@ -577,15 +667,20 @@ export class TransportCore<E extends CoreEvent> {
   private eventsInHand = 0;
   private shutdownSettled = false;
   private exitKeepAlive: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Events per request the ingestor allows this API key per minute, learnt from
+   * a 429's X-RateLimit-Limit that was below the batch size. While set, batches
+   * are at most this big; a 2xx updates or clears it.
+   */
+  private rateLimitBatchCap: number | undefined;
+  /** Integer fields already reported as out of range (one WARN per field). */
+  private readonly rangeWarned = new Set<string>();
 
   constructor(options: TransportCoreOptions<E>) {
-    if (!options || typeof options.apiKey !== 'string' || !options.apiKey.trim()) {
-      throw new Error('Aforo apiKey is required');
-    }
+    const apiKey = checkApiKey(options?.apiKey);
     const base = checkBaseUrl(options.baseUrl, options.allowInsecureHttp === true);
     const path = options.path ?? CORE_DEFAULTS.path;
     this.url = base + (path.startsWith('/') ? path : `/${path}`);
-    const apiKey = options.apiKey;
     this.headers = {
       ...(options.headers ?? {}),
       ...(options.userAgent ? { 'User-Agent': options.userAgent } : {}),
@@ -647,10 +742,15 @@ export class TransportCore<E extends CoreEvent> {
   // ── Public API ───────────────────────────────────────────────────
 
   /**
-   * Queue an event. Never sends and never throws. The event is serialized
-   * now, so later changes to the object are not sent; one JSON cannot
-   * represent is reported through onDrop(…, 'invalid'). After shutdown the
-   * event is reported through onDrop(…, 'closed'). Returns false in both cases.
+   * Queue an event. Never sends and never throws. The event is checked and
+   * serialized now, so later changes to the object are not sent. One JSON
+   * cannot represent, or one the ingestor could not bind at all (an
+   * `occurredAt` without seconds and a zone, a `metadata` that is not a plain
+   * object), is reported through onDrop(…, 'invalid'): sent, it would make the
+   * ingestor refuse every event in its batch. An integer field outside the
+   * ingestor's Java range (see INTEGER_FIELD_RANGES) is removed from the event,
+   * which is still sent; one WARN per field. After shutdown the event is
+   * reported through onDrop(…, 'closed'). Returns false when it was not queued.
    */
   enqueue(event: E): boolean {
     if (this.closedFlag) {
@@ -663,6 +763,12 @@ export class TransportCore<E extends CoreEvent> {
       }
       return false;
     }
+    const shape = eventShapeProblem(event);
+    if (shape) {
+      this.recordDrop([event], 'invalid', `${shape}; the ingestor would refuse the whole batch`);
+      return false;
+    }
+    this.dropOutOfRangeIntegers(event);
     const encoded = serializeEvent(event);
     if ('error' in encoded) {
       this.recordDrop([event], 'invalid', encoded.error);
@@ -705,8 +811,11 @@ export class TransportCore<E extends CoreEvent> {
     if (this.shutdownPromise) return this.shutdownPromise;
     this.closedFlag = true;
     this.deadline = this.clock() + this.shutdownTimeoutMs;
+    // Deliberately NOT unref'd: it keeps the process alive until this shutdown
+    // settles (at most shutdownTimeoutMs; it is cleared as soon as the drain
+    // ends). Otherwise `await shutdown()` in a job with nothing else running is
+    // abandoned mid-retry and the queued usage is neither sent nor reported.
     this.deadlineTimer = setTimeout(() => this.stopController.abort(), this.shutdownTimeoutMs);
-    unref(this.deadlineTimer);
     this.wakeIdle();
     this.wakeBreaker();
     this.shutdownPromise = this.loop.then(() => {
@@ -896,7 +1005,7 @@ export class TransportCore<E extends CoreEvent> {
     try {
       while (this.queue.size > 0) {
         if (this.closedFlag && this.pastDeadline) break;
-        const batch = this.queue.take(this.flushCount);
+        const batch = this.queue.take(Math.min(this.flushCount, this.rateLimitBatchCap ?? this.flushCount));
         this.eventsInHand = batch.length;
         let stop: boolean;
         try {
@@ -929,6 +1038,20 @@ export class TransportCore<E extends CoreEvent> {
         continue;
       }
       const outcome = await this.sendWithRetry(chunk, body);
+      if (outcome.kind === 'rate-limit-split') {
+        // 429 with X-RateLimit-Limit below this batch: the key may never send a
+        // request this big, so retrying it as it is would block the queue for
+        // good. Put it back at the head, in order, and send parts of at most
+        // `limit` events from now on. Nothing is lost or counted twice.
+        if (this.rateLimitBatchCap !== outcome.limit) {
+          this.logger.warn(
+            `Aforo ingestor allows this API key ${outcome.limit} events per minute; sending batches of at most ${outcome.limit} events.`,
+          );
+        }
+        this.rateLimitBatchCap = outcome.limit;
+        this.requeue(([] as E[]).concat(chunk, ...pending));
+        return false;
+      }
       if (outcome.kind === 'split') {
         if (chunk.length === 1) {
           this.recordDrop(chunk, 'rejected', 'HTTP 413: a single event is larger than the ingestor accepts');
@@ -1077,6 +1200,15 @@ export class TransportCore<E extends CoreEvent> {
           return this.handleAccepted(response, chunk);
         }
         if (status === 413) return { kind: 'split' };
+        if (status === 429 && chunk.length > 1) {
+          // A HARD per-key limit refuses any request with more events than the
+          // key may send per minute, even in a fresh minute: split instead of retrying.
+          const limit = parseRateLimit(response.headers?.get?.('x-ratelimit-limit') ?? null);
+          if (limit !== undefined && limit < chunk.length) {
+            await this.discardBody(response);
+            return { kind: 'rate-limit-split', limit };
+          }
+        }
         if (isRedirect(status)) {
           return {
             kind: 'outage',
@@ -1163,6 +1295,11 @@ export class TransportCore<E extends CoreEvent> {
   }
 
   private async handleAccepted(response: CoreResponse, chunk: E[]): Promise<SendOutcome> {
+    if (this.rateLimitBatchCap !== undefined) {
+      // Follow the key's limit while the ingestor reports one; without it, send full batches again.
+      const limit = parseRateLimit(response.headers?.get?.('x-ratelimit-limit') ?? null);
+      this.rateLimitBatchCap = limit !== undefined && limit < this.flushCount ? limit : undefined;
+    }
     let body: any;
     try {
       body = unwrapEnvelope(await readJson(response));
@@ -1229,6 +1366,37 @@ export class TransportCore<E extends CoreEvent> {
     } catch (err) {
       this.logDebug(`error body is not JSON: ${errorText(err)}`);
       return undefined;
+    }
+  }
+
+  // ── Event checks ─────────────────────────────────────────────────
+
+  /**
+   * Remove integer fields the ingestor could not bind (outside its Java
+   * short/int/long range, or not a finite number): the event is still sent
+   * without them. One WARN per field per client.
+   */
+  private dropOutOfRangeIntegers(event: E): void {
+    const e = event as unknown as Record<string, unknown>;
+    if (!e || typeof e !== 'object') return;
+    for (const field of Object.keys(INTEGER_FIELD_RANGES)) {
+      if (!Object.prototype.hasOwnProperty.call(e, field)) continue;
+      const value = e[field];
+      if (value === undefined || value === null) continue;
+      const range = INTEGER_FIELD_RANGES[field];
+      if (typeof value === 'number' && Number.isFinite(value) && value >= range.min && value <= range.max) continue;
+      delete e[field];
+      if (!this.rangeWarned.has(field)) {
+        this.rangeWarned.add(field);
+        try {
+          this.logger.warn(
+            `${field} ${String(value).slice(0, 40)} does not fit the ingestor's ${range.type} field ` +
+              `(${range.min}..${range.max}); the field was left off and the event sent without it. Logged once per field.`,
+          );
+        } catch {
+          /* a logger must never break metering */
+        }
+      }
     }
   }
 

@@ -1,11 +1,17 @@
 """
 aforo-mcp-metering — Aforo MCP Server Metering SDK for Python
 
-Wraps MCP tool handlers to automatically meter tool invocations,
-track sessions, and enforce entitlements via Aforo's billing platform.
+Wraps MCP tool handlers to automatically meter tool invocations and
+track sessions for Aforo's billing platform. It does not enforce
+entitlements.
 
-Usage:
+Usage (``mcp`` 1.x low-level server):
+    import os
+    import mcp.types as types
+    from mcp.server.lowlevel import Server
     from aforo_mcp_metering import AforoMcpBilling
+
+    server = Server("my-tools")
 
     billing = AforoMcpBilling(
         tenant_id="tenant_smartai",
@@ -19,8 +25,9 @@ Usage:
     @server.call_tool()
     @billing.wrap_tool_handler
     async def handle_tool(name: str, arguments: dict):
-        # Your tool logic
-        return [TextContent(type="text", text=result)]
+        # Your tool logic. agentId is the MCP client's clientInfo.name
+        # unless an agent_id kwarg or agent_resolver gives one.
+        return [types.TextContent(type="text", text=result)]
 """
 
 from .client import (

@@ -11,16 +11,19 @@ from .core import ERROR_KINDS, FlushOutcome, TransportCore, TransportError, unwr
 from .identity import clean_customer_id, require_customer_source
 from .urls import validate_base_url
 from .utf16 import too_long, truncate_utf16, utf16_length
+from .wire import ISO_INSTANT, occurred_at_problem, wire_problem, without_unreadable_numbers
 from . import policy
 
 __all__ = [
     "ERROR_KINDS",
+    "ISO_INSTANT",
     "TransportError",
     "FlushOutcome",
     "TransportCore",
     "breaker_cooldown",
     "clean_customer_id",
     "full_jitter",
+    "occurred_at_problem",
     "parse_retry_after",
     "policy",
     "require_customer_source",
@@ -30,4 +33,6 @@ __all__ = [
     "unwrap_envelope",
     "utf16_length",
     "validate_base_url",
+    "wire_problem",
+    "without_unreadable_numbers",
 ]

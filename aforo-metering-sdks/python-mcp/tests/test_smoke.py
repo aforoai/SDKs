@@ -6,7 +6,7 @@ import pytest
 from aforo_mcp_metering import AforoMcpBilling
 from .mcp_fakes import use_fake_post
 
-CFG = dict(tenant_id="t", product_id="p", api_key="k", ingestor_url="https://ingestor.example",
+CFG = dict(tenant_id="t", product_id="p", api_key="sk_smoke_test", ingestor_url="https://ingestor.example",
            customer_resolver=lambda call: "cust_resolved")
 
 
@@ -171,7 +171,7 @@ def test_invalid_invocations_are_dropped_as_invalid_never_truncated(caplog):
     billing.record_tool_invocation("t" * 64, "a" * 36, session_id="s" * 64, customer_id="c" * 64)
     (ev,) = billing._buffer
     assert len(ev["toolName"]) == 64 and len(ev["agentId"]) == 36
-    assert ev["metadata"]["sdkVersion"] == "2.1.0"
+    assert ev["metadata"]["sdkVersion"] == "2.1.1"
     assert billing.dropped_count == 5
     billing.shutdown_sync(timeout=0)
 
@@ -264,7 +264,7 @@ def test_flush_posts_batch_contract_in_slices_of_1000():
         assert {u for u, _, _ in posts} == {"https://ingestor.example/v1/ingest/batch"}
         sizes = [len(b["events"]) for _, _, b in posts]
         assert sum(sizes) == 2500 and max(sizes) <= 1000
-        assert posts[0][1]["X-API-Key"] == "k"
+        assert posts[0][1]["X-API-Key"] == CFG["api_key"]
         assert "Authorization" not in posts[0][1]
         events = [e for _, _, b in posts for e in b["events"]]
         assert all("apiKey" not in e for e in events)

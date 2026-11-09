@@ -1,11 +1,14 @@
 import { MiddlewareOptions } from '../types.js';
-import { isPreflight, resolveMetricName, httpMethodOf, middlewareClient, customerLookup, endpointPathFor } from './common.js';
-
-const DEFAULT_EXCLUDE_PATHS = ['/health', '/ready', '/metrics', '/favicon.ico'];
+import {
+  isPreflight, resolveMetricName, httpMethodOf, middlewareClient, customerLookup, endpointPathFor,
+  DEFAULT_EXCLUDE_PATHS, isExcludedPath, reportMeteringFailure,
+} from './common.js';
 
 /**
- * Koa middleware that records one usage event per request, after `await next()`.
- * Metering never throws into the request.
+ * Koa middleware that records one usage event per request once `await next()`
+ * settles, including when a later middleware throws (`ctx.throw(404)`, a
+ * crash: metered with the status Koa answers). Metering never throws into the
+ * request and never changes Koa's error handling.
  *
  * ```typescript
  * import { AforoClient } from '@aforoai/metering';
@@ -32,17 +35,12 @@ export function koaMiddleware(options: MiddlewareOptions) {
   const excludePaths = options.excludePaths ?? DEFAULT_EXCLUDE_PATHS;
   const excludeStatusCodes = options.excludeStatusCodes ?? [];
 
-  const handler = async function aforoMeteringMiddleware(ctx: any, next: any) {
-    const startTime = Date.now();
-    await next();
-
+  const meter = (ctx: any, statusCode: number, startTime: number) => {
+    const path: string = ctx.path || ctx.url || '/';
+    const method: string = ctx.method || 'UNKNOWN';
     try {
-      const path: string = ctx.path || ctx.url || '/';
-      const method: string = ctx.method || 'UNKNOWN';
-      const statusCode: number = ctx.status || 0;
-
       if (isPreflight(method)) return;
-      if (excludePaths.some((p: string) => path.startsWith(p))) return;
+      if (isExcludedPath(path, excludePaths)) return;
       if (excludeStatusCodes.includes(statusCode)) return;
 
       const quantity =
@@ -61,9 +59,33 @@ export function koaMiddleware(options: MiddlewareOptions) {
         responseTimeMs: Date.now() - startTime,
       }).catch((err) => console.debug(`[aforo] metering skipped: ${err?.message ?? err}`));
     } catch (err) {
-      // Never let metering affect the API.
-      console.debug(`[aforo] metering skipped: ${(err as Error)?.message ?? err}`);
+      // A metering function threw: counted as an 'invalid' drop. Never affects the API.
+      reportMeteringFailure(client, options, err, { path, method, statusCode });
+    }
+  };
+
+  const handler = async function aforoMeteringMiddleware(ctx: any, next: any) {
+    const startTime = Date.now();
+    let failed = false;
+    let thrown: unknown;
+    try {
+      await next();
+    } catch (err) {
+      failed = true;
+      thrown = err;
+      throw err; // Koa's error handling is untouched
+    } finally {
+      // Metered on success AND when a downstream middleware throws (ctx.throw(404), a crash):
+      // the error answer is a served request, as with Express and Fastify.
+      meter(ctx, failed ? errorStatus(thrown) : ctx.status || 0, startTime);
     }
   };
   return Object.assign(handler, { client });
+}
+
+/** The status Koa answers for a thrown error: its 4xx/5xx `status` / `statusCode`, otherwise 500. */
+function errorStatus(err: unknown): number {
+  const e = err as { status?: unknown; statusCode?: unknown } | null;
+  const status = typeof e?.status === 'number' ? e.status : typeof e?.statusCode === 'number' ? e.statusCode : undefined;
+  return status !== undefined && status >= 400 && status < 600 ? status : 500;
 }

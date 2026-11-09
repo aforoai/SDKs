@@ -1,6 +1,6 @@
 # grpc-metering-go — User Guide
 
-**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Go engineers metering a gRPC server with server interceptors.
+**Version:** 2.1.1 · **Updated:** 2026-10-26 · **Audience:** Go engineers metering a gRPC server with server interceptors.
 
 ## What you'll build
 
@@ -16,7 +16,7 @@ A gRPC server that emits one Aforo billing event per RPC — service, method, gR
 
 ## Step 1 — Add the module
 
-The import path ends in `/v2` (version 2 changed the public API; see the [changelog](CHANGELOG.md)). Releases are git tags `aforo-metering-sdks/go-grpc/v2.X.Y` on github.com/aforoai/SDKs. Until the `v2.0.0` tag exists, build against a local checkout with a `replace`:
+The import path ends in `/v2` (version 2 changed the public API; see the [changelog](CHANGELOG.md)). Releases are git tags `aforo-metering-sdks/go-grpc/v2.X.Y` on github.com/aforoai/SDKs. Until the `v2.1.0` tag exists, build against a local checkout with a `replace`:
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
@@ -24,7 +24,7 @@ git clone https://github.com/aforoai/SDKs.git
 
 ```go
 // go.mod (your service)
-require github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc/v2 v2.0.0
+require github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc/v2 v2.1.1
 
 replace github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc/v2 => ../SDKs/aforo-metering-sdks/go-grpc
 ```
@@ -97,7 +97,7 @@ billing, _ := grpcmetering.New(grpcmetering.Config{
 })
 ```
 
-Calls where the resolver returns `""` are served as usual but not billed; each is counted as `invalid` in `DroppedCount()`. `TrustCustomerHeader: true` instead bills the customer named in the `x-customer-id` metadata — your callers control metadata, so use it only behind a proxy that sets it and strips client values.
+Calls where the resolver returns `""` or panics are served as usual but not billed; each is counted as `invalid` in `DroppedCount()`. `TrustCustomerHeader: true` instead bills the customer named in the `x-customer-id` metadata — your callers control metadata, so use it only behind a proxy that sets it and strips client values.
 
 ## Step 5 — Streaming RPCs are counted for you
 
@@ -122,7 +122,7 @@ X-API-Key: <AFORO_API_KEY>
 X-Tenant-Id: tenant_acme
 Content-Type: application/json
 
-{"events":[{"customerId":"…","metricName":"grpc_api.rpc_calls","quantity":1,"occurredAt":"…","idempotencyKey":"grpc:…","productType":"GRPC_API","grpcService":"acme.v1.UserService","grpcMethod":"GetUser","grpcStatusCode":"OK","grpcCallType":"UNARY","messageCount":1,"executionDurationMs":2,"metadata":{"sdkVersion":"1.0.0","productId":"prod_grpc_user_svc"}}]}
+{"events":[{"customerId":"…","metricName":"grpc_api.rpc_calls","quantity":1,"occurredAt":"…","idempotencyKey":"grpc:…","productType":"GRPC_API","grpcService":"acme.v1.UserService","grpcMethod":"GetUser","grpcStatusCode":"OK","grpcCallType":"UNARY","messageCount":1,"executionDurationMs":2,"metadata":{"sdkVersion":"2.1.1","productId":"prod_grpc_user_svc"}}]}
 ```
 
 > ⚠ Drops are WARN-logged through the standard `log` package and counted in `DroppedCount()`; the reason for a failed flush is only reported to `OnError`. If nothing lands, set `OnError: func(err error){ log.Println("aforo:", err) }` to surface marshal failures, retry-exhausted drops and ingestor rejections (including `errors[].message`).

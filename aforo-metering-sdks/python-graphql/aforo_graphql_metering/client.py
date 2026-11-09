@@ -43,7 +43,7 @@ from ._transport import (
 )
 from ._transport import policy as _policy
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 logger = logging.getLogger("aforo_graphql_metering")
 
 # POST /v1/ingest/batch takes 1..1000 events per request.
@@ -726,7 +726,8 @@ def asgi_middleware(
     """
     ASGI middleware that meters POST requests to the configured GraphQL
     path. Works with any ASGI-native GraphQL server (graphql-core HTTP,
-    Graphene-ASGI, Ariadne, custom).
+    Graphene-ASGI, Ariadne, custom). A batched request (a JSON array of
+    operations) is metered one event per operation.
 
     The customer: ``customer_resolver(scope)`` (e.g. the user your auth
     middleware put on the scope), or the billing client's
@@ -770,24 +771,39 @@ def asgi_middleware(
         except (UnicodeDecodeError, ValueError):
             logger.debug("[aforo-graphql] request body is not JSON; not metered")
             return
-        query = parsed.get("query") if isinstance(parsed, dict) else None
-        if not query:
+        # A batched request (a JSON array of operations, as Apollo's
+        # BatchHttpLink sends) is metered one event per operation.
+        batched = isinstance(parsed, list)
+        operations = [op for op in (parsed if batched else [parsed])
+                      if isinstance(op, dict) and op.get("query")]
+        if not operations:
             return
         headers_map = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
         customer_id = customer({"request": _HeadersShim(headers_map), "scope": scope})
         if not customer_id:
-            billing.report_invalid("no customer for a GraphQL request (the customer resolver returned nothing)")
+            billing._core.report_drop([], "invalid", count=len(operations),
+                                      detail="no customer for a GraphQL request (the customer resolver "
+                                             "returned nothing)")
             return
-        billing.record(
-            customer_id=customer_id,
-            query=query,
-            operation_name=parsed.get("operationName"),
-            duration_ms=duration_ms,
-            has_errors=status >= 400,
-            execution_status=_resolve_explicit_status(execution_status_resolver, scope),
-            result=_parse_result_body(result) if result is not None else None,
-            http_status=status,
-        )
+        explicit = _resolve_explicit_status(execution_status_resolver, scope)
+        results = _parse_result_body(result, allow_list=batched) if result is not None else None
+        for index, op in enumerate(operations if not batched else parsed):
+            if not isinstance(op, dict) or not op.get("query"):
+                continue
+            if batched:
+                op_result = results[index] if isinstance(results, list) and index < len(results) else None
+            else:
+                op_result = results
+            billing.record(
+                customer_id=customer_id,
+                query=op["query"],
+                operation_name=op.get("operationName"),
+                duration_ms=duration_ms,
+                has_errors=status >= 400,
+                execution_status=explicit,
+                result=op_result if isinstance(op_result, dict) else None,
+                http_status=status,
+            )
 
     def factory(app):
         async def mw(scope, receive, send):
@@ -873,15 +889,18 @@ def asgi_middleware(
     return factory
 
 
-def _parse_result_body(chunks: List[bytes]) -> Optional[Dict[str, Any]]:
-    """Parse a captured response body as a GraphQL result; None if it isn't one."""
+def _parse_result_body(chunks: List[bytes], allow_list: bool = False) -> Any:
+    """Parse a captured response body as a GraphQL result (or, for a batched
+    request, a list of results); None if it isn't one."""
     if not chunks:
         return None
     try:
         parsed = json.loads(b"".join(chunks).decode("utf-8"))
     except Exception:
         return None
-    return parsed if isinstance(parsed, dict) else None
+    if isinstance(parsed, dict) or (allow_list and isinstance(parsed, list)):
+        return parsed
+    return None
 
 
 class _HeadersShim:

@@ -1,6 +1,6 @@
 # aforo-grpc-metering — User Guide
 
-**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Python engineers running a gRPC server who need per-RPC billing.
+**Version:** 2.1.1 · **Updated:** 2026-11-09 · **Audience:** Python engineers running a gRPC server who need per-RPC billing.
 
 ## What you'll build
 

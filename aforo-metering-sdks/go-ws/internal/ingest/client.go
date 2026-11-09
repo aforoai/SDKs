@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 )
 
 // Event is one queued usage event.
@@ -68,6 +69,7 @@ type Client struct {
 	dropped     atomic.Int64
 	throttled   sync.Map // DropReason → *atomic.Int64, for throttled log lines
 	breakerOpen atomic.Bool
+	rangeWarned sync.Map // field name → struct{}: integer fields already WARN-logged as out of range
 
 	// Flusher-only state.
 	holdUntil     time.Time
@@ -75,6 +77,13 @@ type Client struct {
 	softRetries   int
 	authErrLogged bool
 	lastResult    FlushResult
+	// A 429 whose X-RateLimit-Limit is below the batch size splits the batch:
+	// the next splitLeft events at the head of the queue go out in batches of
+	// at most splitCap. lastTakeCapped is how many events the last batch took
+	// under that cap (they count again if they are requeued).
+	splitCap       int
+	splitLeft      int
+	lastTakeCapped int
 }
 
 type flushReply struct {
@@ -84,8 +93,12 @@ type flushReply struct {
 
 // New validates cfg, applies defaults and starts the flusher goroutine.
 func New(cfg Config) (*Client, error) {
-	if strings.TrimSpace(cfg.APIKey) == "" {
+	cfg.APIKey = strings.TrimSpace(cfg.APIKey)
+	if cfg.APIKey == "" {
 		return nil, fmt.Errorf("aforo: API key is required")
+	}
+	if err := checkAPIKey(cfg.APIKey); err != nil {
+		return nil, err
 	}
 	if err := ValidateBaseURL(cfg.BaseURL, cfg.AllowInsecureHTTP); err != nil {
 		return nil, err
@@ -114,21 +127,49 @@ func New(cfg Config) (*Client, error) {
 	return c, nil
 }
 
+// checkAPIKey refuses a key (already trimmed) that holds whitespace or a
+// control character: net/http would refuse it on every request. The error
+// never contains the key.
+func checkAPIKey(key string) error {
+	for _, r := range key {
+		if unicode.IsSpace(r) || unicode.IsControl(r) || r == unicode.ReplacementChar {
+			return fmt.Errorf("aforo: API key contains whitespace or a control character; check how it is loaded (the key is not shown)")
+		}
+	}
+	return nil
+}
+
 // String never prints the API key.
 func (c *Client) String() string {
 	return fmt.Sprintf("ingest.Client{url:%q, apiKey:%s}", c.url, RedactKey(c.cfg.APIKey))
 }
 
+// GoString never prints the API key (%#v).
+func (c *Client) GoString() string { return c.String() }
+
 // Enqueue adds an event. It never blocks on the network and never starts a
 // goroutine. After Close it reports the event as DropClosed and returns
 // ErrClosed.
 func (c *Client) Enqueue(e Event) error {
-	var evicted []Event
+	evicted, err := c.TryEnqueue(e)
+	if err != nil {
+		c.Report([]Event{e}, DropClosed)
+		return err
+	}
+	c.Report(evicted, DropOverflow)
+	return nil
+}
+
+// TryEnqueue is Enqueue without the reporting: the events the queue evicted
+// to make room are handed back, and after Close the event is not reported. A
+// caller that holds its own lock uses it and calls Report(evicted,
+// DropOverflow) (or Report([]Event{e}, DropClosed)) after releasing that
+// lock, so OnDrop and OnError never run under it.
+func (c *Client) TryEnqueue(e Event) (evicted []Event, err error) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		c.Report([]Event{e}, DropClosed)
-		return ErrClosed
+		return nil, ErrClosed
 	}
 	c.queue = append(c.queue, e)
 	if over := len(c.queue) - c.cfg.MaxQueueSize; over > 0 {
@@ -136,16 +177,13 @@ func (c *Client) Enqueue(e Event) error {
 	}
 	full := len(c.queue) >= c.cfg.FlushCount
 	c.mu.Unlock()
-	if len(evicted) > 0 {
-		c.Report(evicted, DropOverflow)
-	}
 	if full {
 		select {
 		case c.wake <- struct{}{}:
 		default: // already awake or about to be
 		}
 	}
-	return nil
+	return evicted, nil
 }
 
 // Flush asks the flusher to send everything queued and waits for it. It never
@@ -256,9 +294,10 @@ func (c *Client) Report(events []Event, reason DropReason) {
 		n := v.(*atomic.Int64).Add(int64(len(events)))
 		if n == int64(len(events)) || n/1000 != (n-int64(len(events)))/1000 {
 			c.logf("WARN: dropped %d event(s) — %s (%d %s so far, %d dropped in total).", len(events), reason, n, reason, total)
-			if reason == DropClosed {
-				c.reportError(KindClosed, 0, events, "event tracked after the client was closed (%d so far)", n)
-			}
+		}
+		if reason == DropClosed {
+			// OnError hears of every track-after-close; only the log is throttled.
+			c.reportError(KindClosed, 0, events, "event tracked after the client was closed (%d so far)", n)
 		}
 	default:
 		c.logf("WARN: dropped %d event(s) — %s (%d dropped in total).", len(events), reason, total)
@@ -382,7 +421,12 @@ func (c *Client) takeBatch() []Event {
 	}
 	size := len(`{"events":[]}`)
 	n := 0
-	for n < len(c.queue) && n < c.cfg.FlushCount {
+	limit := c.cfg.FlushCount
+	capped := c.splitLeft > 0
+	if capped && c.splitCap < limit {
+		limit = c.splitCap
+	}
+	for n < len(c.queue) && n < limit {
 		add := len(c.queue[n].Body) + 1
 		if n > 0 && size+add > c.cfg.TargetBodyBytes {
 			break
@@ -390,7 +434,33 @@ func (c *Client) takeBatch() []Event {
 		size += add
 		n++
 	}
+	c.lastTakeCapped = 0
+	if capped {
+		c.lastTakeCapped = n
+		if c.splitLeft -= n; c.splitLeft <= 0 {
+			c.splitLeft, c.splitCap = 0, 0
+		}
+	}
 	return c.popFrontLocked(n)
+}
+
+// requeueBatch puts events of the batch just sent back at the front. Events
+// that were taken under a 429 split cap stay under it.
+func (c *Client) requeueBatch(events []Event) {
+	if len(events) == 0 {
+		return
+	}
+	if c.lastTakeCapped > 0 {
+		back := len(events)
+		if back > c.lastTakeCapped {
+			back = c.lastTakeCapped
+		}
+		if c.splitLeft == 0 {
+			c.splitCap = c.lastTakeCapped
+		}
+		c.splitLeft += back
+	}
+	c.requeueFront(events)
 }
 
 // requeueFront puts events back at the front with their keys. If that
@@ -482,8 +552,27 @@ func (c *Client) drain(ctx context.Context, shutdown bool) (res FlushResult, err
 		out := c.sendBatch(ctx, batch)
 		res.Sent += out.sent
 		res.Rejected += out.rejected
-		if out.outage {
+		if out.splitTo > 0 && !out.outage {
+			// 429 with an events-per-minute limit below the batch size: the
+			// batch could never pass as it is. Put it back at the head, to go
+			// out in order in parts of at most that size, and wait as for a 429.
 			c.requeueFront(out.retry)
+			if c.splitLeft == 0 || out.splitTo < c.splitCap {
+				c.splitCap = out.splitTo
+			}
+			c.splitLeft += len(out.retry)
+			c.logf("WARN: the ingestor answered HTTP 429 with an ingest limit of %d event(s) per minute; %d event(s) requeued to go out in batches of at most %d.", out.splitTo, len(out.retry), out.splitTo)
+			if shutdown {
+				if c.cfg.Hooks.Sleep(ctx, out.wait) != nil {
+					return res, ErrIngestUnavailable
+				}
+				continue
+			}
+			c.holdUntil = c.cfg.Hooks.Now().Add(out.wait)
+			return res, nil
+		}
+		if out.outage {
+			c.requeueBatch(out.retry)
 			if shutdown {
 				// Keep trying until the shutdown deadline.
 				if c.cfg.Hooks.Sleep(ctx, c.retryDelay(outageAttempt, 0, false)) != nil {
@@ -504,7 +593,7 @@ func (c *Client) drain(ctx context.Context, shutdown bool) (res FlushResult, err
 		// The ingestor asked for these events again (errors[].retryable):
 		// resend with the same keys after the normal backoff, at most
 		// MaxRetries times, then treat it as an outage.
-		c.requeueFront(out.retry)
+		c.requeueBatch(out.retry)
 		c.markReachable()
 		c.softRetries++
 		if c.softRetries > c.cfg.MaxRetries && !shutdown {

@@ -67,12 +67,12 @@ class AforoOptions:
     then are dropped with reason ``shutdown``."""
 
     allow_insecure_http: bool = False
+    """Allow a plain ``http://`` base_url on a host other than localhost."""
 
     compression: str = "gzip"
     """``"gzip"`` (default): batches of 1 KiB or more are sent with
     ``Content-Encoding: gzip`` (wave 8, G269; needs usage-ingestor wave 8 or
     later). ``"none"``: always plain JSON."""
-    """Allow a plain ``http://`` base_url on a host other than localhost."""
 
     on_drop: Optional[Callable[[list["ResolvedEvent"], DropReason], None]] = None
     """OPT-IN hook invoked with events the SDK is about to lose permanently
@@ -223,9 +223,11 @@ class MiddlewareOptions:
     trust_customer_header: bool = False
     """Read the customer from the ``X-Customer-Id`` header. The caller of your API
     controls that header, so only turn this on behind a gateway that sets it."""
-    exclude_paths: list[str] = field(
-        default_factory=lambda: ["/health", "/ready", "/metrics", "/favicon.ico"]
-    )
+    exclude_paths: Optional[list[str]] = None
+    """Paths not metered, each matched with everything below it on a path-segment
+    boundary (``/health`` covers ``/health/db``, not ``/healthcare``). ``None``:
+    the middleware's defaults (``/health``, ``/ready``, ``/metrics``,
+    ``/favicon.ico``, ``/openapi.json``, ``/docs``); ``[]``: nothing excluded."""
     exclude_status_codes: list[int] = field(default_factory=list)
     metadata: Optional[Callable] = None
     flush_count: int = 500

@@ -1,6 +1,6 @@
 # @aforoai/metering — User Guide
 
-**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Node/TypeScript engineers wiring usage metering into an API or service.
+**Version:** 2.1.1 · **Updated:** 2026-10-26 · **Audience:** Node/TypeScript engineers wiring usage metering into an API or service.
 
 ## What you'll build
 
@@ -21,9 +21,9 @@ Install `2.0.0` or later. `1.0.0` on npm was built from an older copy of this co
 git clone https://github.com/aforoai/SDKs.git
 cd SDKs/aforo-metering-sdks/node
 npm install && npm run build
-npm pack            # -> aforo-metering-2.0.0.tgz
+npm pack            # -> aforo-metering-2.1.1.tgz
 cd /path/to/your-app
-npm i /path/to/SDKs/aforo-metering-sdks/node/aforo-metering-2.0.0.tgz
+npm i /path/to/SDKs/aforo-metering-sdks/node/aforo-metering-2.1.1.tgz
 ```
 
 ## Step 2 — Create the client once
@@ -47,7 +47,7 @@ await aforo.track({ customerId: 'cust_123', metricName: 'api_calls', quantity: 1
 
 > `track()` returns immediately — it puts the event on a bounded queue and one background sender ships batches (every 5 s, or as soon as 500 events are waiting). It never starts a request itself, so a slow or down ingestor never slows your handler. During an outage events stay queued (up to `maxQueueSize`) and are sent when the ingestor is back.
 >
-> `track()` never throws. After `shutdown()` the event is counted and reported with reason `'closed'`. An event the ingestor would reject (blank `customerId` / `metricName`, `quantity <= 0`, a field over the server's size limit, a malformed `occurredAt`) is not sent: it is counted in `aforo.droppedCount`, WARN-logged, and passed to `onDrop` with reason `'invalid'`.
+> `track()` never throws. After `shutdown()` the event is counted and reported with reason `'closed'`. An event the ingestor would reject (blank `customerId` / `metricName`, `quantity <= 0`, a field over the server's size limit, an `occurredAt` without seconds and a zone such as `Z` or `+05:30`, a `metadata` that is not a plain object) is not sent: it is counted in `aforo.droppedCount`, WARN-logged, and passed to `onDrop` with reason `'invalid'`.
 
 To bill by outcome, pass `executionStatus` (one of `SUCCESS`, `PARTIAL`, `TIMEOUT`, `ERROR`, `VALIDATION_FAILED`, `FAILED`, `FAILURE`, `CANCELLED`, `PENDING`, `BLOCKED`, `HITL_REQUIRED`). An unknown value is logged and left off; the event is still sent.
 
@@ -77,13 +77,13 @@ app.use(expressMiddleware({
   client: aforo,
   customerResolver: (req) => req.user?.aforoCustomerId,  // required: identity your app verified
   metricName: 'api_calls',                                // default; or (req, res) => string. Must exist in your Aforo catalog
-  excludePaths: ['/health', '/metrics'],                  // these are the defaults
+  excludePaths: ['/health', '/ready', '/metrics', '/favicon.ico'], // the defaults; '/health' also skips '/health/live', never '/healthcare'
 }));
 ```
 
 > The middleware fires on `res.on('finish')` — after the response is flushed to the client — so it adds no latency.
 >
-> **Who is billed.** `customerResolver` is required: return the Aforo customer id from identity your app authenticated (session, verified JWT subject, API-key lookup). Creating the middleware without it throws. When it returns nothing for a request, the event is dropped with reason `'invalid'` and counted; the request is never blocked. To bill the `X-Customer-Id` header instead, pass `trustCustomerHeader: true` — only safe when a proxy you control sets that header, because any caller can send it. The caller's `X-Api-Key` header is never used.
+> **Who is billed.** `customerResolver` is required: return the Aforo customer id from identity your app authenticated (session, verified JWT subject, API-key lookup). Creating the middleware without it throws. When it returns nothing for a request, or throws, the event is dropped with reason `'invalid'` and counted; the request is never blocked. To bill the `X-Customer-Id` header instead, pass `trustCustomerHeader: true` — only safe when a proxy you control sets that header, because any caller can send it. The caller's `X-Api-Key` header is never used.
 >
 > `OPTIONS` (CORS preflight) requests are never metered, nor are requests whose quantity is `<= 0`. Each event carries top-level `endpointPath`, `httpMethod`, `statusCode`, `responseTimeMs` and `productType`. `endpointPath` is the route template when the framework has one, otherwise the path with ids collapsed (`/users/123` → `/users/:id`); pass `normalizePath: false` to send the raw path.
 >

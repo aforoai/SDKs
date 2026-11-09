@@ -32,7 +32,7 @@ from ._transport import (
 )
 from ._transport import policy as _policy
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 logger = logging.getLogger("aforo_ws_metering")
 
 # POST /v1/ingest/batch takes 1..1000 events per request.
@@ -345,6 +345,11 @@ class AforoWsBilling:
         if invalid is not None:
             partial = {**partial, "customerId": partial.get("customerId"),
                        "wsConnectionId": partial.get("wsConnectionId") or ""}
+        extra_meta = partial.get("metadata")
+        if extra_meta is not None and not isinstance(extra_meta, dict):
+            if invalid is None:
+                invalid = f"metadata must be a dict (got {type(extra_meta).__name__})"
+            extra_meta = None
         now = datetime.now(timezone.utc)
         frame_type = str(partial.get("wsFrameType") or "TEXT").upper()
         if frame_type not in WS_FRAME_TYPES:
@@ -372,7 +377,7 @@ class AforoWsBilling:
                 "wsCloseReason", str(close_reason), MAX_WS_CLOSE_REASON_LEN, self._truncation_warned,
             ) if close_reason else None,
             metadata={
-                **(partial.get("metadata") or {}),
+                **(extra_meta or {}),
                 "sdkVersion": __version__,
                 "productId": self.product_id,
             },
@@ -447,6 +452,15 @@ class AforoWsBilling:
         else:
             self._core.report_drop([ev], "closed", detail="connection opened after shutdown()")
         return False
+
+    def _retrack(self, conn_id: str, close: Callable[[str, str], None]) -> bool:
+        """Track again a connection the idle sweep closed, now that it carries
+        traffic again. False after ``shutdown()``."""
+        with self._connections_lock:
+            if self._shutting_down or self._core.closed:
+                return False
+            self._connections[conn_id] = _OpenConnection(close, self._now())
+            return True
 
     def _touch(self, conn_id: str) -> None:
         now = self._now()
@@ -545,6 +559,95 @@ def _customer_for(websocket: Any, customer_id: Any, customer_resolver: Optional[
     return clean_customer_id(_handshake_header(websocket, "x-customer-id"))
 
 
+class _Segment:
+    """Counters of one tracked connection, reported on CONNECTION_CLOSED.
+
+    The idle sweep closes a connection that saw no traffic for a while and
+    reports what it carried. If the connection carries traffic again it is
+    tracked again (``resume``), and the next CONNECTION_CLOSED reports only what
+    came after the sweep, so nothing is counted twice."""
+
+    def __init__(self, billing: "AforoWsBilling", connection_id: str) -> None:
+        self.billing = billing
+        self.connection_id = connection_id
+        self.start = time.monotonic()
+        self.sent = self.recv = self.sent_bytes = self.recv_bytes = 0
+        self._base = (0, 0, 0, 0)
+        self._base_start = self.start
+        self.swept = False
+        self.resumed = False
+
+    def resume(self, close: Callable[[str, str], None]) -> None:
+        """Before a frame is counted: track the connection again if the idle
+        sweep closed it (R8)."""
+        if self.swept and self.billing._retrack(self.connection_id, close):
+            self.swept = False
+            self.resumed = True
+            self._base = (self.sent, self.recv, self.sent_bytes, self.recv_bytes)
+            self._base_start = time.monotonic()
+
+    def closed_fields(self, closed_by: Optional[str]) -> Dict[str, Any]:
+        sent = self.sent - self._base[0]
+        recv = self.recv - self._base[1]
+        sent_bytes = self.sent_bytes - self._base[2]
+        recv_bytes = self.recv_bytes - self._base[3]
+        fields = {
+            "sentCount": sent, "recvCount": recv, "sentBytes": sent_bytes, "recvBytes": recv_bytes,
+            "messageCount": sent + recv, "dataBytes": sent_bytes + recv_bytes,
+            "executionDurationMs": int((time.monotonic() - self._base_start) * 1000),
+        }
+        if closed_by == "sdk_idle_timeout":
+            self.swept = True
+        return fields
+
+    def elapsed_ms(self) -> int:
+        return int((time.monotonic() - self.start) * 1000)
+
+
+def _closed_event(seg: _Segment, close_reason: str, closed_by: Optional[str], customer_id: Any,
+                  product_type: Optional[str], metadata: Optional[Dict[str, Any]],
+                  execution_status: Optional[str]) -> Dict[str, Any]:
+    f = seg.closed_fields(closed_by)
+    meta: Dict[str, Any] = {
+        "event": "CONNECTION_CLOSED",
+        "sentCount": f["sentCount"], "recvCount": f["recvCount"],
+        "sentBytes": f["sentBytes"], "recvBytes": f["recvBytes"],
+        **(metadata or {}),
+    }
+    if closed_by:
+        meta["closedBy"] = closed_by
+    if seg.resumed:
+        meta["resumedAfterIdle"] = True
+    return {
+        "executionStatus": normalize_execution_status(execution_status),
+        "customerId": customer_id,
+        "productType": product_type,
+        "wsConnectionId": seg.connection_id,
+        "wsDirection": "SERVER_TO_CLIENT",
+        "wsFrameType": "CLOSE",
+        "wsCloseReason": close_reason,
+        "messageCount": f["messageCount"],
+        "dataBytes": f["dataBytes"],
+        "executionDurationMs": f["executionDurationMs"],
+        "metadata": meta,
+    }
+
+
+def _frame_event(seg: _Segment, customer_id: Any, product_type: Optional[str], direction: str,
+                 frame_type: str, size: int, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "customerId": customer_id,
+        "productType": product_type,
+        "wsConnectionId": seg.connection_id,
+        "wsDirection": direction,
+        "wsFrameType": frame_type,
+        "messageCount": 1,
+        "dataBytes": size,
+        "executionDurationMs": seg.elapsed_ms(),
+        "metadata": metadata,
+    }
+
+
 # ── `websockets` library integration ─────────────────────────────
 
 async def track_websockets_connection(
@@ -572,6 +675,10 @@ async def track_websockets_connection(
     the CONNECTION_CLOSED event carries it. Without one, no status is sent.
     Frame and CONNECTION_OPENED events carry no status.
 
+    A connection the idle sweep closed is tracked again when it carries its
+    next frame; its next CONNECTION_CLOSED reports only the traffic after the
+    sweep (``metadata.resumedAfterIdle``).
+
     Usage:
         async def handler(websocket):
             customer_id = customer_for_token(websocket.request.headers["Authorization"])
@@ -586,58 +693,50 @@ async def track_websockets_connection(
         def __init__(self):
             self.connection_id = str(uuid.uuid4())
             self.execution_status = execution_status
-            self.start = time.monotonic()
-            self.sent = 0
-            self.recv = 0
-            self.sent_bytes = 0
-            self.recv_bytes = 0
+            self._seg = _Segment(billing, self.connection_id)
+            self.start = self._seg.start
             # Wrap send/recv if present
             self._orig_send = getattr(websocket, "send", None)
             self._orig_recv = getattr(websocket, "recv", None)
+            seg = self._seg
 
             if self._orig_send is not None:
                 async def _send(data):
                     # Billed only once the send returns without raising: a
                     # frame the socket refuses is not counted.
+                    seg.resume(self._emit_closed)
                     billing._touch(self.connection_id)
                     result = await self._orig_send(data)
-                    self.sent += 1
-                    self.sent_bytes += _byte_len(data)
+                    seg.sent += 1
+                    seg.sent_bytes += _byte_len(data)
                     if billing.per_frame_events:
-                        billing.push({
-                            "customerId": customer_id,
-                            "productType": product_type,
-                            "wsConnectionId": self.connection_id,
-                            "wsDirection": "SERVER_TO_CLIENT",
-                            "wsFrameType": "BINARY" if isinstance(data, (bytes, bytearray)) else "TEXT",
-                            "messageCount": 1,
-                            "dataBytes": _byte_len(data),
-                            "executionDurationMs": int((time.monotonic() - self.start) * 1000),
-                            "metadata": metadata,
-                        })
+                        billing.push(_frame_event(
+                            seg, customer_id, product_type, "SERVER_TO_CLIENT",
+                            "BINARY" if isinstance(data, (bytes, bytearray)) else "TEXT",
+                            _byte_len(data), metadata))
                     return result
                 websocket.send = _send  # type: ignore[attr-defined]
 
             if self._orig_recv is not None:
                 async def _recv():
                     data = await self._orig_recv()
-                    self.recv += 1
-                    self.recv_bytes += _byte_len(data)
+                    seg.resume(self._emit_closed)
+                    seg.recv += 1
+                    seg.recv_bytes += _byte_len(data)
                     billing._touch(self.connection_id)
                     if billing.per_frame_events:
-                        billing.push({
-                            "customerId": customer_id,
-                            "productType": product_type,
-                            "wsConnectionId": self.connection_id,
-                            "wsDirection": "CLIENT_TO_SERVER",
-                            "wsFrameType": "BINARY" if isinstance(data, (bytes, bytearray)) else "TEXT",
-                            "messageCount": 1,
-                            "dataBytes": _byte_len(data),
-                            "executionDurationMs": int((time.monotonic() - self.start) * 1000),
-                            "metadata": metadata,
-                        })
+                        billing.push(_frame_event(
+                            seg, customer_id, product_type, "CLIENT_TO_SERVER",
+                            "BINARY" if isinstance(data, (bytes, bytearray)) else "TEXT",
+                            _byte_len(data), metadata))
                     return data
                 websocket.recv = _recv  # type: ignore[attr-defined]
+
+        # Counters, kept readable as attributes for callers and tests.
+        sent = property(lambda self: self._seg.sent)
+        recv = property(lambda self: self._seg.recv)
+        sent_bytes = property(lambda self: self._seg.sent_bytes)
+        recv_bytes = property(lambda self: self._seg.recv_bytes)
 
         async def __aenter__(self):
             self._tracked = billing._open(self.connection_id, {
@@ -661,27 +760,8 @@ async def track_websockets_connection(
             self._emit_closed("NORMAL_CLOSURE" if exc is None else "INTERNAL_ERROR", None)
 
         def _emit_closed(self, close_reason: str, closed_by: Optional[str]) -> None:
-            meta: Dict[str, Any] = {
-                "event": "CONNECTION_CLOSED",
-                "sentCount": self.sent, "recvCount": self.recv,
-                "sentBytes": self.sent_bytes, "recvBytes": self.recv_bytes,
-                **(metadata or {}),
-            }
-            if closed_by:
-                meta["closedBy"] = closed_by
-            billing.push({
-                "executionStatus": normalize_execution_status(self.execution_status),
-                "customerId": customer_id,
-                "productType": product_type,
-                "wsConnectionId": self.connection_id,
-                "wsDirection": "SERVER_TO_CLIENT",
-                "wsFrameType": "CLOSE",
-                "wsCloseReason": close_reason,
-                "messageCount": self.sent + self.recv,
-                "dataBytes": self.sent_bytes + self.recv_bytes,
-                "executionDurationMs": int((time.monotonic() - self.start) * 1000),
-                "metadata": meta,
-            })
+            billing.push(_closed_event(self._seg, close_reason, closed_by, customer_id, product_type,
+                                       metadata, self.execution_status))
 
     return _Tracker()
 
@@ -707,6 +787,12 @@ async def track_starlette_websocket(
     ``execution_status`` or ``ctx.execution_status`` when set, and no status
     otherwise.
 
+    Every data frame is counted, whichever method moves it (``send_text``,
+    ``send_json``, ``receive_bytes``, ``iter_json``, ...): the helper wraps the
+    connection's ``send`` / ``receive``, which all of them go through. An
+    object without them is metered through its ``send_text`` /
+    ``send_bytes`` / ``receive_text`` / ``receive_bytes``.
+
     Usage:
         @app.websocket("/ws")
         async def ws_handler(ws: WebSocket, user: User = Depends(current_user)):
@@ -718,70 +804,84 @@ async def track_starlette_websocket(
     """
     customer_id = _customer_for(websocket, customer_id, customer_resolver, trust_customer_header,
                                 "track_starlette_websocket")
-    # Starlette's WebSocket exposes receive_text/receive_bytes/send_text/send_bytes
-    # rather than send/recv — adapt:
     connection_id = str(uuid.uuid4())
-    start = time.monotonic()
-    counters = {"sent": 0, "recv": 0, "sent_bytes": 0, "recv_bytes": 0}
+    seg = _Segment(billing, connection_id)
+    holder: Dict[str, Any] = {}
 
-    for attr, direction in [
-        ("send_text", "SERVER_TO_CLIENT"),
-        ("send_bytes", "SERVER_TO_CLIENT"),
-    ]:
-        orig = getattr(websocket, attr, None)
-        if orig is None:
-            continue
+    def _emit(close_reason: str, closed_by: Optional[str]) -> None:
+        holder["ctx"]._emit_closed(close_reason, closed_by)
 
-        async def _wrapped(data, _orig=orig, _attr=attr, _direction=direction):
-            # Billed only once the send returns without raising.
-            billing._touch(connection_id)
-            result = await _orig(data)
-            counters["sent"] += 1
-            counters["sent_bytes"] += _byte_len(data)
-            if billing.per_frame_events:
-                billing.push({
-                    "customerId": customer_id,
-                    "productType": product_type,
-                    "wsConnectionId": connection_id,
-                    "wsDirection": _direction,
-                    "wsFrameType": "BINARY" if _attr == "send_bytes" else "TEXT",
-                    "messageCount": 1,
-                    "dataBytes": _byte_len(data),
-                    "executionDurationMs": int((time.monotonic() - start) * 1000),
-                    "metadata": metadata,
-                })
+    def _count(direction: str, frame_type: str, size: int) -> None:
+        if direction == "SERVER_TO_CLIENT":
+            seg.sent += 1
+            seg.sent_bytes += size
+        else:
+            seg.recv += 1
+            seg.recv_bytes += size
+        if billing.per_frame_events:
+            billing.push(_frame_event(seg, customer_id, product_type, direction, frame_type, size, metadata))
+
+    orig_send = getattr(websocket, "send", None)
+    orig_receive = getattr(websocket, "receive", None)
+    if callable(orig_send) and callable(orig_receive):
+        # Starlette: every helper (send_text, send_json, receive_bytes,
+        # iter_json, ...) goes through the ASGI-level send / receive.
+        async def _send(message, _orig=orig_send):
+            frame = isinstance(message, dict) and message.get("type") == "websocket.send"
+            if frame:
+                # Billed only once the send returns without raising.
+                seg.resume(_emit)
+                billing._touch(connection_id)
+            result = await _orig(message)
+            if frame:
+                if message.get("bytes") is not None:
+                    _count("SERVER_TO_CLIENT", "BINARY", _byte_len(message.get("bytes")))
+                else:
+                    _count("SERVER_TO_CLIENT", "TEXT", _byte_len(message.get("text")))
             return result
 
-        setattr(websocket, attr, _wrapped)
+        async def _receive(_orig=orig_receive):
+            message = await _orig()
+            if isinstance(message, dict) and message.get("type") == "websocket.receive":
+                seg.resume(_emit)
+                if message.get("bytes") is not None:
+                    _count("CLIENT_TO_SERVER", "BINARY", _byte_len(message.get("bytes")))
+                else:
+                    _count("CLIENT_TO_SERVER", "TEXT", _byte_len(message.get("text")))
+                billing._touch(connection_id)
+            return message
 
-    for attr, direction, frame in [
-        ("receive_text", "CLIENT_TO_SERVER", "TEXT"),
-        ("receive_bytes", "CLIENT_TO_SERVER", "BINARY"),
-    ]:
-        orig = getattr(websocket, attr, None)
-        if orig is None:
-            continue
+        websocket.send = _send  # type: ignore[attr-defined]
+        websocket.receive = _receive  # type: ignore[attr-defined]
+    else:
+        for attr, frame in [("send_text", "TEXT"), ("send_bytes", "BINARY")]:
+            orig = getattr(websocket, attr, None)
+            if orig is None:
+                continue
 
-        async def _wrapped(_orig=orig, _direction=direction, _frame=frame):
-            data = await _orig()
-            counters["recv"] += 1
-            counters["recv_bytes"] += _byte_len(data)
-            billing._touch(connection_id)
-            if billing.per_frame_events:
-                billing.push({
-                    "customerId": customer_id,
-                    "productType": product_type,
-                    "wsConnectionId": connection_id,
-                    "wsDirection": _direction,
-                    "wsFrameType": _frame,
-                    "messageCount": 1,
-                    "dataBytes": _byte_len(data),
-                    "executionDurationMs": int((time.monotonic() - start) * 1000),
-                    "metadata": metadata,
-                })
-            return data
+            async def _wrapped_send(data, _orig=orig, _frame=frame):
+                # Billed only once the send returns without raising.
+                seg.resume(_emit)
+                billing._touch(connection_id)
+                result = await _orig(data)
+                _count("SERVER_TO_CLIENT", _frame, _byte_len(data))
+                return result
 
-        setattr(websocket, attr, _wrapped)
+            setattr(websocket, attr, _wrapped_send)
+
+        for attr, frame in [("receive_text", "TEXT"), ("receive_bytes", "BINARY")]:
+            orig = getattr(websocket, attr, None)
+            if orig is None:
+                continue
+
+            async def _wrapped_receive(_orig=orig, _frame=frame):
+                data = await _orig()
+                seg.resume(_emit)
+                _count("CLIENT_TO_SERVER", _frame, _byte_len(data))
+                billing._touch(connection_id)
+                return data
+
+            setattr(websocket, attr, _wrapped_receive)
 
     class _AsyncCtx:
         def __init__(self):
@@ -804,29 +904,12 @@ async def track_starlette_websocket(
             self._emit_closed("NORMAL_CLOSURE" if exc is None else "INTERNAL_ERROR", None)
 
         def _emit_closed(self, close_reason: str, closed_by: Optional[str]) -> None:
-            meta: Dict[str, Any] = {
-                "event": "CONNECTION_CLOSED",
-                "sentCount": counters["sent"], "recvCount": counters["recv"],
-                "sentBytes": counters["sent_bytes"], "recvBytes": counters["recv_bytes"],
-                **(metadata or {}),
-            }
-            if closed_by:
-                meta["closedBy"] = closed_by
-            billing.push({
-                "executionStatus": normalize_execution_status(self.execution_status),
-                "customerId": customer_id,
-                "productType": product_type,
-                "wsConnectionId": connection_id,
-                "wsDirection": "SERVER_TO_CLIENT",
-                "wsFrameType": "CLOSE",
-                "wsCloseReason": close_reason,
-                "messageCount": counters["sent"] + counters["recv"],
-                "dataBytes": counters["sent_bytes"] + counters["recv_bytes"],
-                "executionDurationMs": int((time.monotonic() - start) * 1000),
-                "metadata": meta,
-            })
+            billing.push(_closed_event(seg, close_reason, closed_by, customer_id, product_type,
+                                       metadata, self.execution_status))
 
-    return _AsyncCtx()
+    ctx = _AsyncCtx()
+    holder["ctx"] = ctx
+    return ctx
 
 
 def _byte_len(data: Any) -> int:

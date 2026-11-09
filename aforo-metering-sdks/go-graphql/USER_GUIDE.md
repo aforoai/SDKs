@@ -1,6 +1,6 @@
 # graphql-metering-go — User Guide
 
-**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Go engineers metering a GraphQL-over-HTTP server (gqlgen, graphql-go, or a custom handler).
+**Version:** 2.1.1 · **Updated:** 2026-10-26 · **Audience:** Go engineers metering a GraphQL-over-HTTP server (gqlgen, graphql-go, or a custom handler).
 
 ## What you'll build
 
@@ -16,7 +16,7 @@ A GraphQL server that emits one Aforo billing event per operation — type, name
 
 ## Step 1 — Add the module
 
-The import path ends in `/v2` (version 2 changed the public API; see the [changelog](CHANGELOG.md)). Releases are git tags `aforo-metering-sdks/go-graphql/v2.X.Y` on github.com/aforoai/SDKs. Until the `v2.0.0` tag exists, build against a local checkout with a `replace`:
+The import path ends in `/v2` (version 2 changed the public API; see the [changelog](CHANGELOG.md)). Releases are git tags `aforo-metering-sdks/go-graphql/v2.X.Y` on github.com/aforoai/SDKs. Until the `v2.1.0` tag exists, build against a local checkout with a `replace`:
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
@@ -24,7 +24,7 @@ git clone https://github.com/aforoai/SDKs.git
 
 ```go
 // go.mod (your service)
-require github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql/v2 v2.0.0
+require github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql/v2 v2.1.1
 
 replace github.com/aforoai/SDKs/aforo-metering-sdks/go-graphql/v2 => ../SDKs/aforo-metering-sdks/go-graphql
 ```
@@ -129,7 +129,7 @@ X-API-Key: <AFORO_API_KEY>
 X-Tenant-Id: tenant_acme
 Content-Type: application/json
 
-{"events":[{"customerId":"…","metricName":"graphql_api.operations","quantity":1,"occurredAt":"…","idempotencyKey":"gql:…","productType":"GRAPHQL_API","gqlOperationType":"QUERY","gqlOperationName":"…","gqlComplexity":12,"gqlFieldCount":7,"gqlHasErrors":false,"executionDurationMs":3,"metadata":{"sdkVersion":"1.0.0","productId":"prod_graphql_unified_gateway"}}]}
+{"events":[{"customerId":"…","metricName":"graphql_api.operations","quantity":1,"occurredAt":"…","idempotencyKey":"gql:…","productType":"GRAPHQL_API","gqlOperationType":"QUERY","gqlOperationName":"…","gqlComplexity":12,"gqlFieldCount":7,"gqlHasErrors":false,"executionDurationMs":3,"metadata":{"sdkVersion":"2.1.1","productId":"prod_graphql_unified_gateway"}}]}
 ```
 
 > ⚠ Drops are WARN-logged through the standard `log` package and counted in `DroppedCount()`; the reason for a failed flush is only reported to `OnError`. If nothing lands, set `OnError: func(err error){ log.Println("aforo:", err) }` to surface marshal failures, retry-exhausted drops and ingestor rejections (including `errors[].message`).

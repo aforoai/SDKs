@@ -1,6 +1,6 @@
 # aforo-ws-metering — User Guide
 
-**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Python engineers serving WebSocket connections who need connection- or frame-level billing.
+**Version:** 2.1.1 · **Updated:** 2026-11-09 · **Audience:** Python engineers serving WebSocket connections who need connection- or frame-level billing.
 
 ## What you'll build
 

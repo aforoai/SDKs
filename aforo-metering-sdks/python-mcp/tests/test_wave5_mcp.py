@@ -94,13 +94,15 @@ def test_trusting_meta_customer_id_is_an_explicit_opt_in():
         async def tool(name, arguments, **kwargs):
             return "ok"
 
-        await tool("search", {"_meta": {"customer_id": "cust_meta"}}, agent_id="agent_1")
+        # _meta the host passes (the request's params._meta); never a _meta in the tool arguments
+        await tool("search", {}, agent_id="agent_1", _meta={"customer_id": "cust_meta"})
+        await tool("search", {"_meta": {"customer_id": "cust_spoof"}}, agent_id="agent_1")  # ignored
         await tool("search", {}, agent_id="agent_1")  # no customer: still served, dropped as invalid
         await billing.shutdown()
 
     asyncio.run(main())
     assert [e["customerId"] for e in _events(server)] == ["cust_meta"]
-    assert billing.dropped_count == 1
+    assert billing.dropped_count == 2
 
 
 def test_no_unknown_agent_or_customer_defaults():

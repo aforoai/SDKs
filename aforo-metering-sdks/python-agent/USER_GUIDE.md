@@ -1,6 +1,6 @@
 # aforo-agent-metering — User Guide
 
-**Version:** 1.0.0 · **Updated:** 2026-10-26 · **Audience:** Python engineers running an AI agent who need per-capability billing.
+**Version:** 1.1.1 · **Updated:** 2026-11-09 · **Audience:** Python engineers running an AI agent who need per-capability billing.
 
 ## What you'll build
 
@@ -45,7 +45,7 @@ client.record_capability(
     capability_name="summarize_url",
     agent_id="agt_001",          # ≤ 36 characters
     customer_id="cust_42",       # ≤ 64; defaults to default_customer_id
-    session_id="sess_1",         # ≤ 64
+    session_id="sess_1",         # required, ≤ 64
     input_tokens=320,
     output_tokens=84,
     execution_status="SUCCESS",
@@ -53,7 +53,7 @@ client.record_capability(
 )
 ```
 
-`record_capability` is synchronous and only queues the event; it works with or without a running event loop. It does not raise for event content: an event with no customer, or a blank or over-limit field, is not sent, is counted in `client.dropped_count`, and reaches `on_drop` with reason `"invalid"`.
+`record_capability` is synchronous and only queues the event; it works with or without a running event loop. It does not raise for event content: an event with no customer, no `session_id` (the ingestor rejects an AI_AGENT event without one), a blank or over-limit field, a token count that is not a whole number (`None` counts as 0) or `metadata` that is not a dict is not sent, is counted in `client.dropped_count`, and reaches `on_drop` with reason `"invalid"`. Every event of a session carries the same `traceId` (32 hex characters, derived from the session; pass `trace_id=` to set your own), which is how Aforo groups the session's steps, tokens and cost.
 
 Or wrap the handler and let the SDK time it and derive the status:
 
@@ -69,9 +69,9 @@ async def summarize_url(url: str, *, agent_id: str, session_id: str):
     ...
 ```
 
-The decorator needs a customer source: `customer_resolver(args, kwargs)`, or `trust_customer_header=True` (bills the call's `customer_id` keyword argument — only when your own code sets it), or a `default_customer_id` on the client. With none, decorating raises `ValueError`.
+The decorator needs a customer source: `customer_resolver(args, kwargs)`, or `trust_customer_header=True` (bills the call's `customer_id` keyword argument — only when your own code sets it), or a `default_customer_id` on the client. With none, decorating raises `ValueError`. When a `customer_resolver` raises or returns nothing, that call's event is dropped as `invalid`; `default_customer_id` is not used in its place.
 
-> ⚠ The decorator reads `agent_id` and `session_id` from keyword arguments. Passed positionally they are not seen. A call with no `agent_id` still runs, but its event is dropped with reason `invalid` — nothing is billed to `"unknown"`.
+> ⚠ The decorator reads `agent_id` and `session_id` from keyword arguments. Passed positionally they are not seen. A call with no `agent_id` or no `session_id` still runs, but its event is dropped with reason `invalid` — nothing is billed to `"unknown"`.
 
 ## Step 4 — How events are sent
 
@@ -114,17 +114,18 @@ Events still queued at the deadline reach `on_drop` with reason `shutdown`. If y
 | `timeout_sec` | `float` | `10.0` | Per-request timeout. |
 | `shutdown_timeout_sec` | `float` | `5.0` | Time limit for `shutdown()` and the exit hook. |
 | `allow_insecure_http` | `bool` | `False` | Accept a non-localhost `http://` ingestor. |
+| `compression` | `str` | `"gzip"` | `"gzip"` sends batches of 1 KiB or more with `Content-Encoding: gzip` (needs usage-ingestor wave 8 or later); `"none"` always sends plain JSON. |
 | `on_error` | `Callable?` | logs at debug | Receives a `TransportError`; branch on `.kind`: `outage` / `auth` (events still queued and retried), `rejected` (the ingestor refused them; message carries its `errors[].message`), `shutdown`, `closed`. `.events` and `.status` say which events and which HTTP status. |
 | `on_drop` | `Callable[[list[dict], str], None]?` | `None` | Called with lost events; `reason` is `overflow`, `rejected`, `invalid`, `shutdown` or `closed`. |
 
-Methods: `record_capability(capability_name, agent_id, *, customer_id=None, session_id=None, input_tokens=0, output_tokens=0, execution_status="SUCCESS", execution_duration_ms=0, metadata=None, product_type=None)`, `record_step(agent_id, session_id, step_type, *, customer_id=None, capability_name=None, input_tokens=0, output_tokens=0, duration_ms=0, execution_status="SUCCESS", metadata=None, product_type=None)`, `flush()`, `flush_sync()`, `shutdown()`, `shutdown_sync()`, `dropped_count`. `start()` is kept and does nothing. `wrap_capability_handler(client, capability_name=None, *, customer_resolver=None, trust_customer_header=False)`.
+Methods: `record_capability(capability_name, agent_id, *, customer_id=None, session_id=None, input_tokens=0, output_tokens=0, execution_status="SUCCESS", execution_duration_ms=0, metadata=None, product_type=None, trace_id=None)`, `record_step(agent_id, session_id, step_type, *, customer_id=None, capability_name=None, input_tokens=0, output_tokens=0, duration_ms=0, execution_status="SUCCESS", metadata=None, product_type=None, trace_id=None)`, `flush()`, `flush_sync()`, `shutdown()`, `shutdown_sync()`, `dropped_count`. `start()` is kept and does nothing. `wrap_capability_handler(client, capability_name=None, *, customer_resolver=None, trust_customer_header=False)`.
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | `ValueError` when decorating | No customer source. | Pass `customer_resolver`, `trust_customer_header=True`, or set `default_customer_id`. |
-| `dropped_count` rises with reason `invalid`, no events | No customer (none passed, no `default_customer_id`) or no `agent_id`. | Pass both, or set `default_customer_id`. |
+| `dropped_count` rises with reason `invalid`, no events | No customer (none passed, no `default_customer_id`, or the decorator's `customer_resolver` found none), no `agent_id`, or no `session_id`. | Pass all three, or set `default_customer_id` for the customer. |
 | `dropped_count` rises, WARN "invalid event not sent" | Blank `capability_name` / `agent_id`, `agent_id` over 36 chars, or `session_id` / `customer_id` / `capability_name` over 64. | Fix the value at the source. The SDK does not truncate these. The one exception: a capability name over 64 that `wrap_capability_handler` reads from the wrapped call's `capability_name` kwarg is truncated to 64 and the event is still sent. |
 | Events stay queued, one ERROR "rejected the API key" | 401/403 — treated as an outage, so events are kept and retried. | Fix `api_key`; confirm it belongs to `tenant_id`. |
 | `on_drop` with `rejected` after a `202` | The ingestor rejected individual events (unknown metric, …); the WARN log carries each `errors[].message`. | Create the metric in the Aforo console or fix the event. |

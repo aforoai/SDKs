@@ -2,6 +2,22 @@
 
 All notable changes to `grpc-metering-go` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [2.1.1] - 2026-11-09
+
+### Fixed
+- **One out-of-range number no longer loses a whole batch.** The ingestor holds `statusCode` and `mqttQos` as 16-bit and `responseTimeMs`, `executionDurationMs`, `messageCount`, `gqlComplexity`, `gqlFieldCount` as 32-bit integers, and refused the whole request when one event carried a larger value, so every event batched with it was dropped as `rejected`. Such a field is now left off its event (one WARN per field) and the event is sent.
+- **API key checked at construction.** The key is trimmed; one that still holds whitespace or a control character is refused with an error that does not show it. Error text scrubbing also covers the escaped form of the key.
+- **429 with an ingest limit below the batch size.** When the ingestor answers `429` with `X-RateLimit-Limit` (events per minute) smaller than the batch, the batch goes back to the head of the queue in order, to be sent in parts of at most that size after the usual wait. Before, a batch larger than the key's limit was refused on every attempt.
+- **`OnError` hears of every event tracked after close** (`KindClosed`); only the WARN log is throttled.
+- `%#v` of the client no longer prints the API key.
+- **A panicking `CustomerResolver`** drops that call's event as `invalid` (counted) instead of panicking in the interceptor, which grpc-go does not recover.
+
+## [2.1.0]
+
+### Changed
+- **gzip (wave 8, G269).** Batch bodies of 1 KiB or more are sent with `Content-Encoding: gzip` by default; smaller ones go plain. It needs usage-ingestor wave 8 or later, which decodes gzip on the ingest endpoints. `Compression: "none"` turns it off. Every retry sends the same compressed bytes; a compression failure sends the JSON plain.
+- `User-Agent: aforo-go-grpc/2.1.0`. `VERSION`: 2.1.0.
+
 ## [2.0.0] - 2026-10-26
 
 **Breaking.** New import path `github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc/v2`. Migration: replace `CustomerExtractor` with `CustomerResolver` (the customer your auth interceptor authenticated), or set `TrustCustomerHeader: true` to keep reading `x-customer-id` metadata.

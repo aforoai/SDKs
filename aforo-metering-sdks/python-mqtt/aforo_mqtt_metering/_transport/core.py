@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import random
+import sys
 import threading
 import time
 import weakref
@@ -69,8 +70,15 @@ from .policy import (
     is_retry_status,
 )
 from .urls import validate_base_url
+from .wire import wire_problem, without_unreadable_numbers
 
 DropHook = Callable[[List[Any], str], None]
+
+#: Sent by usage-ingestor's per-API-key ingest limit (events per minute).
+RATE_LIMIT_HEADER = "x-ratelimit-limit"
+
+_REDACTED = "[redacted]"
+_MIN_REDACTED_KEY_LENGTH = 8
 
 _THROTTLED_REASONS = ("overflow", "invalid", "closed")
 
@@ -217,6 +225,14 @@ class TransportCore:
     ) -> None:
         if not isinstance(api_key, str) or not api_key.strip():
             raise ValueError("api_key is required")
+        # A key read from a file or a secret often ends in a newline. Sent raw,
+        # it fails every request, and the HTTP library's error quotes the header
+        # value -- the key -- into logs. Strip it; refuse one that still cannot
+        # travel in a header, without echoing it.
+        api_key = api_key.strip()
+        if any(ch.isspace() or not 0x21 <= ord(ch) <= 0x7E for ch in api_key):
+            raise ValueError("api_key contains whitespace, control or non-ASCII characters and cannot be "
+                             "sent in the X-API-Key header; check how it was read (the key is not shown)")
         if compression not in ("gzip", "none"):
             raise ValueError('compression must be "gzip" or "none"')
         self._gzip = compression == "gzip"
@@ -270,6 +286,13 @@ class TransportCore:
         self._start_flusher()
         if register_atexit:
             atexit.register(self._atexit_close)
+            # A multiprocessing child ends with os._exit(), which skips atexit;
+            # it runs multiprocessing's exit finalizers instead. A client built
+            # inside such a child (spawn / forkserver) registers one now; a
+            # client inherited through fork registers one in the child (see
+            # _reinit_after_fork). multiprocessing is never imported for this.
+            if _in_multiprocessing_child():
+                _register_exit_finalizer(self)
 
     # ── state ────────────────────────────────────────────────────────
 
@@ -300,6 +323,10 @@ class TransportCore:
         self._in_flight: Optional[List[_Entry]] = None
         self._abandoned = False
         self._pid = os.getpid()
+        # Events per request the ingestor's per-key rate limit allows, when it
+        # is below flush_count (read from X-RateLimit-Limit); None = no cap.
+        self._batch_cap: Optional[int] = None
+        self._left_off_logged: set = set()
 
     def _new_http_client(self) -> httpx.Client:
         limits = httpx.Limits(max_connections=4, max_keepalive_connections=2)
@@ -333,6 +360,10 @@ class TransportCore:
         self._http = self._new_http_client()
         if not was_closed:
             self._start_flusher()
+            if self._register_atexit:
+                # A forked multiprocessing child clears the exit finalizers it
+                # inherited, then runs the after-fork hooks: register ours from there.
+                _register_mp_after_fork(self)
 
     def __repr__(self) -> str:
         return f"TransportCore(name={self._name!r}, url={self._url!r})"
@@ -383,19 +414,32 @@ class TransportCore:
     def enqueue(self, item: Any) -> bool:
         """Queue one event. Never sends, never starts a thread, never raises.
 
-        The event is turned into JSON here, so one that cannot be (a cycle, a
-        NaN, an object JSON does not know) is dropped as ``"invalid"`` now and
-        never reaches a batch. An event tracked after ``close()`` is reported
-        as ``"closed"``. Both return False."""
+        The event is turned into UTF-8 JSON here, so one that cannot be (a
+        cycle, a NaN, an object JSON does not know, a lone surrogate) is dropped
+        as ``"invalid"`` now and never reaches a batch. So is one the ingestor
+        could not read at all, which would fail its whole batch (see
+        ``wire.wire_problem``); an optional integer field out of the range the
+        ingestor stores is left off and the event kept. An event tracked after
+        ``close()`` is reported as ``"closed"``. Dropped events return False."""
         if self._closed:
             self._drop_closed(item)
             return False
         try:
-            wire = json.dumps(self._serialize(item), separators=(",", ":"),
-                              ensure_ascii=False, allow_nan=False)
-        except Exception as exc:  # ValueError (cycle, NaN), TypeError, a to_dict() that raised
+            data = self._serialize(item)
+            problem = wire_problem(data)
+            if problem:
+                self.report_drop([item], "invalid", detail=problem)
+                return False
+            data, left_off = without_unreadable_numbers(data)
+            wire = json.dumps(data, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+            # A lone surrogate passes json.dumps(ensure_ascii=False) but cannot be
+            # sent; found here, it never reaches (and stops) the sender thread.
+            wire.encode("utf-8")
+        except Exception as exc:  # ValueError (cycle, NaN), TypeError, UnicodeEncodeError, a raising to_dict()
             self.report_drop([item], "invalid", detail=f"event is not JSON-serializable: {exc}")
             return False
+        if left_off:
+            self._log_left_off(left_off)
         entry = _Entry(item, wire)
         evicted = None
         with self._lock:
@@ -416,6 +460,14 @@ class TransportCore:
         if size >= self._flush_count and not self._wake.is_set():
             self._wake.set()
         return True
+
+    def _log_left_off(self, fields: Sequence[str]) -> None:
+        with self._lock:
+            new = [f for f in fields if f not in self._left_off_logged]
+            self._left_off_logged.update(new)
+        if new:
+            self._log.warning("[%s] %s out of the range the ingestor stores; the field was left off and the "
+                              "event is still sent. Logged once per field.", self._name, ", ".join(new))
 
     def _drop_closed(self, item: Any) -> None:
         if self._drop([item], "closed", None, None):
@@ -515,6 +567,9 @@ class TransportCore:
                 self._close_hard_deadline = time.monotonic() + budget
         if self._register_atexit:
             atexit.unregister(self._atexit_close)
+            finalizer = getattr(self, "_exit_finalizer", None)
+            if finalizer is not None:
+                finalizer.cancel()  # closed: nothing left for the exit hook to flush
         thread = self._thread
         if already:
             if thread is not threading.current_thread():
@@ -568,11 +623,11 @@ class TransportCore:
         ``data`` object on 2xx, else None. Never raises.
         """
         try:
-            body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+            body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
         except Exception as exc:
             self._log.debug("[%s] single post not JSON-serializable: %s", self._name, type(exc).__name__)
             return None
-        answer = self._exchange(body.encode("utf-8"), None, timeout)
+        answer = self._exchange(body, None, timeout)
         if answer.status is not None and 200 <= answer.status < 300:
             data = unwrap_envelope(answer.json())
             return data if isinstance(data, dict) else {}
@@ -606,44 +661,67 @@ class TransportCore:
             next_due = self._clock() + self._flush_interval
             resume = False  # set after a breaker pause: retry the requeued events right away
             while True:
-                # Cleared before the state is read, so a flush()/close() that
-                # lands after the read still ends the breaker pause below.
-                self._kick.clear()
-                with self._lock:
-                    closing = self._closed
-                    requested = self._flush_requested
-                    size = len(self._queue)
-                    breaker_wait = self._breaker_until - self._clock()
-                if closing:
-                    self._shutdown_drain()
-                    return
-                if breaker_wait > 0:
-                    if requested > self._flush_completed:
-                        # flush() while the breaker is open: one attempt now.
-                        self._wake.clear()
-                        self._drain(None, single_attempt=True)
-                        self._complete_flushes(requested)
+                try:
+                    # Cleared before the state is read, so a flush()/close() that
+                    # lands after the read still ends the breaker pause below.
+                    self._kick.clear()
+                    with self._lock:
+                        closing = self._closed
+                        requested = self._flush_requested
+                        size = len(self._queue)
+                        breaker_wait = self._breaker_until - self._clock()
+                    if closing:
+                        self._shutdown_drain()
+                        return
+                    if breaker_wait > 0:
+                        if requested > self._flush_completed:
+                            # flush() while the breaker is open: one attempt now.
+                            self._wake.clear()
+                            self._drain(None, single_attempt=True)
+                            self._complete_flushes(requested)
+                            continue
+                        self._breaker_sleep(breaker_wait)
+                        resume = True
                         continue
-                    self._breaker_sleep(breaker_wait)
-                    resume = True
-                    continue
-                now = self._clock()
-                due = now >= next_due
-                if not (due or resume or size >= self._flush_count or requested > self._flush_completed):
-                    self._wake.wait(max(0.0, next_due - now))
+                    now = self._clock()
+                    due = now >= next_due
+                    if not (due or resume or size >= self._flush_count or requested > self._flush_completed):
+                        self._wake.wait(max(0.0, next_due - now))
+                        self._wake.clear()
+                        continue
                     self._wake.clear()
-                    continue
-                self._wake.clear()
-                resume = False
-                if due:
-                    next_due = now + self._flush_interval
-                self._drain(None)
-                self._complete_flushes(requested)
-        except Exception:
-            self._log.exception("[%s] flusher stopped unexpectedly", self._name)
+                    resume = False
+                    if due:
+                        next_due = now + self._flush_interval
+                    self._drain(None)
+                    self._complete_flushes(requested)
+                except Exception:
+                    # The sender must outlive any one failure: if it stopped,
+                    # every later event would sit in the queue until overflow.
+                    self._log.exception("[%s] sender error; the sender keeps running", self._name)
+                    if self._closed:
+                        self._finish_close_after_error()
+                        return
+                    self._complete_flushes(self._flush_requested)
+                    self._interrupt.wait(1.0)  # no tight loop if the error repeats
         finally:
             self._thread_exited.set()
             with self._done:
+                self._done.notify_all()
+
+    def _finish_close_after_error(self) -> None:
+        """close() was draining when an error hit: report what is left so
+        nothing is lost unreported and close() callers are released."""
+        try:
+            if not self._abandoned:
+                self._report_leftovers()
+                self._close_http()
+        except Exception:
+            self._log.debug("[%s] reporting leftovers failed", self._name, exc_info=True)
+        finally:
+            self._close_done.set()
+            with self._done:
+                self._flush_completed = self._flush_requested
                 self._done.notify_all()
 
     def _complete_flushes(self, ticket: int) -> None:
@@ -654,7 +732,8 @@ class TransportCore:
 
     def _take_batch(self) -> List[_Entry]:
         with self._lock:
-            take = min(self._flush_count, len(self._queue))
+            limit = self._flush_count if self._batch_cap is None else min(self._flush_count, self._batch_cap)
+            take = min(limit, len(self._queue))
             return [self._queue.popleft() for _ in range(take)]
 
     def _drain(self, deadline: Optional[float], single_attempt: bool = False) -> bool:
@@ -670,8 +749,24 @@ class TransportCore:
             batch = self._take_batch()
             if not batch:
                 return True
-            if not self._send_group(batch, deadline, split_for_size=True, single_attempt=single_attempt):
+            try:
+                sent = self._send_group(batch, deadline, split_for_size=True, single_attempt=single_attempt)
+            except Exception as exc:
+                # Should not happen. Account for the batch (it is off the queue)
+                # instead of losing it, and let the sender carry on.
+                self._log.exception("[%s] sending a batch failed unexpectedly", self._name)
+                self._drop_unsendable(batch, exc)
                 return False
+            if not sent:
+                return False
+
+    def _drop_unsendable(self, batch: List[_Entry], exc: Exception) -> None:
+        with self._lock:
+            queued = {id(e) for e in self._queue}
+            self._in_flight = None
+        lost = [e.item for e in batch if id(e) not in queued]
+        if lost:
+            self.report_drop(lost, "invalid", detail=f"the SDK could not send it ({type(exc).__name__})")
 
     def _shutdown_drain(self) -> None:
         """After close(): keep sending, with jittered backoff between rounds,
@@ -802,7 +897,8 @@ class TransportCore:
                 chunks.append(chunk)
             return _Answer(resp.status_code, resp.headers, b"".join(chunks))
         except Exception as exc:  # httpx.HTTPError, OSError, or a client closed under us
-            return _Answer(failure=f"{type(exc).__name__}: {exc}")
+            # The failure text goes to logs and on_error: it must never carry the key.
+            return _Answer(failure=self._redact(f"{type(exc).__name__}: {exc}"))
         finally:
             if resp is not None:
                 try:
@@ -836,14 +932,16 @@ class TransportCore:
             status = answer.status
             failure = answer.failure
             if status is not None:
+                self._note_rate_limit(answer)
                 if 200 <= status < 300:
                     again = self._accepted(entries, answer)
                     if not again:
                         return True
                     # Per-event retryable: re-send those (same keys) after the
-                    # normal backoff, at most max_retries times.
+                    # normal backoff, at most max_retries times. The smaller
+                    # body is encoded afresh: the gzip flag must match its bytes.
                     entries = again
-                    body = self._body(entries)
+                    body, gzipped = self._encode(self._body(entries))
                     failure = f"{len(entries)} event(s) answered retryable"
                     status = None
                 elif status in SPLIT_STATUSES:
@@ -864,8 +962,15 @@ class TransportCore:
                 elif is_retry_status(status):
                     retry_after = parse_retry_after(answer.headers.get("retry-after"), self._wall_clock())
                     failure = f"HTTP {status}"
+                    limit = _rate_limit(answer) if status == 429 else None
+                    if limit is not None and len(entries) > limit:
+                        # The key may report fewer events a minute than this
+                        # batch holds: as one request it can never pass. Put it
+                        # back at the head, in order; batches are now taken at
+                        # most `limit` events at a time.
+                        return self._split_for_rate_limit(entries, limit, retry_after, deadline)
                 else:
-                    detail = f"HTTP {status}{_error_summary(answer)}"
+                    detail = self._redact(f"HTTP {status}{_error_summary(answer)}")
                     items = [e.item for e in entries]
                     self.report_drop(items, "rejected", detail=detail)
                     self._notify_error(TransportError("rejected", f"ingestor rejected a batch: {detail}",
@@ -882,6 +987,42 @@ class TransportCore:
                             self._name, failure, attempt + 1, self._max_retries, delay)
             self._sleep(delay)
             attempt += 1
+
+    def _redact(self, text: str) -> str:
+        """``text`` with the API key replaced, for anything logged or passed to a
+        hook. A key too short to be a real secret (test keys such as "k") is
+        left alone: replacing it would mangle ordinary words."""
+        key = self._api_key
+        if len(key) >= _MIN_REDACTED_KEY_LENGTH and key in text:
+            return text.replace(key, _REDACTED)
+        return text
+
+    def _note_rate_limit(self, answer: _Answer) -> None:
+        """Keep batches within the API key's per-minute event limit when the
+        ingestor reports one below ``flush_count``; lift the cap when it
+        reports a higher one, or accepts a batch without reporting one."""
+        limit = _rate_limit(answer)
+        with self._lock:
+            if limit is not None:
+                self._batch_cap = limit if limit < self._flush_count else None
+            elif answer.status is not None and 200 <= answer.status < 300:
+                self._batch_cap = None
+
+    def _split_for_rate_limit(self, entries: List[_Entry], limit: int, retry_after: Optional[float],
+                              deadline: Optional[float]) -> bool:
+        """429 for a batch larger than the key's per-minute limit: requeue it at
+        the head, in order, to be taken ``limit`` events at a time, and wait the
+        server's Retry-After (or the normal backoff) before going on. True when
+        the sender may go on sending."""
+        self._requeue_front(entries)
+        self._log.warning("[%s] Ingestor answered 429: this API key may report %d events a minute, fewer than "
+                          "the %d in this batch. The batch is requeued and sent in parts of at most %d.",
+                          self._name, limit, len(entries), limit)
+        delay = retry_delay(0, retry_after, self._rand, self._retry_base, self._retry_max_delay)
+        if deadline is not None and self._clock() + delay >= deadline:
+            return False
+        self._sleep(delay)
+        return not self._abandoned
 
     def _accepted(self, entries: List[_Entry], answer: _Answer) -> List[_Entry]:
         """2xx. Returns the events the ingestor answered ``retryable`` (to be
@@ -905,7 +1046,7 @@ class TransportCore:
                         continue
                     idx = err.get("index")
                     if len(messages) < 10:
-                        messages.append(f"[{idx}] {err.get('message')}")
+                        messages.append(self._redact(f"[{idx}] {err.get('message')}"))
                     if not isinstance(idx, int) or isinstance(idx, bool) or not 0 <= idx < count or idx in seen:
                         continue
                     seen.add(idx)
@@ -1013,6 +1154,56 @@ class TransportCore:
                 self.close()
         except Exception:
             self._log.debug("[%s] close at exit failed", self._name, exc_info=True)
+
+
+def _rate_limit(answer: _Answer) -> Optional[int]:
+    """Events per minute from ``X-RateLimit-Limit``, or None when absent or unreadable."""
+    raw = answer.headers.get(RATE_LIMIT_HEADER)
+    if raw is None:
+        return None
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _register_exit_finalizer(core: "TransportCore") -> None:
+    """Flush ``core`` from multiprocessing's exit function, which a
+    multiprocessing child runs instead of atexit (it leaves with os._exit)."""
+    try:
+        import multiprocessing.util as mp_util
+
+        core._exit_finalizer = mp_util.Finalize(None, core._atexit_close, exitpriority=10)
+    except Exception:
+        logging.getLogger("aforo.transport").debug("multiprocessing exit hook not registered", exc_info=True)
+
+
+def _mp_after_fork(core: "TransportCore") -> None:
+    # A forked multiprocessing child clears the finalizers it inherited before
+    # it runs the after-fork hooks, so register the exit flush again here.
+    _register_exit_finalizer(core)
+
+
+def _in_multiprocessing_child() -> bool:
+    mp = sys.modules.get("multiprocessing")
+    try:
+        return mp is not None and mp.parent_process() is not None
+    except Exception:
+        return False
+
+
+def _register_mp_after_fork(core: "TransportCore") -> None:
+    """In a freshly forked child: if this process is (or may become) a
+    multiprocessing child, have multiprocessing's after-fork hook register the
+    exit flush, after it has cleared the finalizers the child inherited."""
+    mp_util = sys.modules.get("multiprocessing.util")
+    if mp_util is None:
+        return  # not started by multiprocessing; atexit covers a normal exit
+    try:
+        mp_util.register_after_fork(core, _mp_after_fork)
+    except Exception:
+        logging.getLogger("aforo.transport").debug("multiprocessing after-fork hook not registered", exc_info=True)
 
 
 def _proxy_for(url: str, log: logging.Logger) -> Optional[str]:

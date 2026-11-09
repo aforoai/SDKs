@@ -2,7 +2,8 @@
  * The tool name is the name the client asked for (read off the tools/call
  * request by wrapToolHandler, or passed to recordToolInvocation). An over-long
  * one is truncated to the ingestor's limit (64) and the event is still sent.
- * The identity fields still drop the event as invalid.
+ * An over-long customerId still drops the event as invalid; a client's
+ * unusable agent_id / session_id falls back (see review-fixes.test.ts).
  */
 import { createHash } from 'node:crypto';
 import { AforoMcpBilling, truncateToLimit, type UsageEvent } from '../src/index';
@@ -132,15 +133,15 @@ describe('request-derived toolName', () => {
     expect(drops[1].events[0].customerId).toBe('c'.repeat(65));
   });
 
-  test('over-long customerId / agentId / sessionId from _meta still drop the event as invalid', async () => {
+  test('an over-long customerId from _meta still drops the event; an over-long agent_id falls back instead', async () => {
     await call('search', { agent_id: 'agent_1', customer_id: 'c'.repeat(65) });
     await call('search', { agent_id: 'a'.repeat(37) });
     await call('x'.repeat(300), { agent_id: 'agent_1', customer_id: 'c'.repeat(65) });
     await billing.flush();
 
-    expect(sent()).toHaveLength(0);
-    expect(drops.map((d) => d.reason)).toEqual(['invalid', 'invalid', 'invalid']);
+    expect(drops.map((d) => d.reason)).toEqual(['invalid', 'invalid']);
     expect(drops[0].events[0].customerId).toBe('c'.repeat(65));
-    expect(drops[1].events[0].agentId).toBe('a'.repeat(37));
+    // The client's 37-char agent_id is not a reason to lose the call (SDK review 2026-11-09).
+    expect(sent().map((e) => e.agentId)).toEqual(['unknown']);
   });
 });

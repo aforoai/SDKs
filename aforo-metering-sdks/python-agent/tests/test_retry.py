@@ -36,7 +36,7 @@ def _client(script, waits: List[float], rand: float = 0.0, **kw) -> Tuple[AforoA
                            "breaker_initial": 3600, "breaker_max": 3600},
         **kw,
     )
-    client.record_capability(capability_name="c", agent_id="a")
+    client.record_capability(capability_name="c", agent_id="a", session_id="sess_1")
     return client, calls
 
 

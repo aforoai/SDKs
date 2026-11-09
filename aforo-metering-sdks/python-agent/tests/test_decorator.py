@@ -229,11 +229,11 @@ async def _status_for(raise_exc: BaseException) -> str:
     client = _client(post_fn=post)
 
     @wrap_capability_handler(client, trust_customer_header=True, capability_name="c")
-    async def handler(*, agent_id: str) -> None:
+    async def handler(*, agent_id: str, session_id: str) -> None:
         raise raise_exc
 
     with pytest.raises(type(raise_exc)):
-        await handler(agent_id="agt_1")
+        await handler(agent_id="agt_1", session_id="sess_1")
     await client.flush()
     return json.loads(captured[0])["events"][0]["executionStatus"]
 

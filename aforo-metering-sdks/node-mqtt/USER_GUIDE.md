@@ -1,6 +1,6 @@
 # @aforoai/mqtt-metering — User Guide
 
-**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Node.js engineers running an Aedes MQTT broker, or an `mqtt.js` client against a third-party broker, who need MQTT usage metered into Aforo.
+**Version:** 2.1.1 · **Updated:** 2026-10-26 · **Audience:** Node.js engineers running an Aedes MQTT broker, or an `mqtt.js` client against a third-party broker, who need MQTT usage metered into Aforo.
 
 ## What you'll build
 

@@ -89,42 +89,46 @@ public class AforoMeteringAutoConfiguration {
                 AforoMeteringProperties props,
                 ObjectProvider<AforoServletFilter.MetricNameResolver> metricNameResolver,
                 ObjectProvider<AforoServletFilter.CustomerIdResolver> customerIdResolver) {
-            return AforoMeteringAutoConfiguration.filterRegistration(client, props,
+            return filterRegistration(client, props,
                     metricNameResolver.getIfAvailable(), customerIdResolver.getIfAvailable());
         }
-    }
 
-    /**
-     * Builds the filter registration; throws {@link IllegalStateException} when there is no
-     * customer source (no resolver bean, {@code use-principal-as-customer-id} and
-     * {@code trust-customer-header} both off).
-     */
-    static FilterRegistrationBean<AforoServletFilter> filterRegistration(
-            AforoClient client, AforoMeteringProperties props,
-            AforoServletFilter.MetricNameResolver metricNameResolver,
-            AforoServletFilter.CustomerIdResolver customerIdResolver) {
-        if (customerIdResolver == null && !props.isUsePrincipalAsCustomerId() && !props.isTrustCustomerHeader()) {
-            throw new IllegalStateException("aforo.enabled=true but the servlet filter has no way to know the"
-                    + " customer of a request. Declare an AforoServletFilter.CustomerIdResolver bean that reads it"
-                    + " from your authentication, set aforo.use-principal-as-customer-id=true when the principal"
-                    + " name is the Aforo customer id, or set aforo.trust-customer-header=true to read "
-                    + props.getCustomerIdHeader() + " (only when a gateway in front of the app sets it).");
+        // Kept inside this nested class: a method on the outer class whose signature names
+        // servlet types makes Spring fail to introspect the auto-configuration in an
+        // application without the servlet API (WebFlux, workers) -- NoClassDefFoundError.
+        /**
+         * Builds the filter registration; throws {@link IllegalStateException} when there is no
+         * customer source (no resolver bean, {@code use-principal-as-customer-id} and
+         * {@code trust-customer-header} both off).
+         */
+        static FilterRegistrationBean<AforoServletFilter> filterRegistration(
+                AforoClient client, AforoMeteringProperties props,
+                AforoServletFilter.MetricNameResolver metricNameResolver,
+                AforoServletFilter.CustomerIdResolver customerIdResolver) {
+            if (customerIdResolver == null && !props.isUsePrincipalAsCustomerId() && !props.isTrustCustomerHeader()) {
+                throw new IllegalStateException("aforo.enabled=true but the servlet filter has no way to know the"
+                        + " customer of a request. Declare an AforoServletFilter.CustomerIdResolver bean that reads it"
+                        + " from your authentication, set aforo.use-principal-as-customer-id=true when the principal"
+                        + " name is the Aforo customer id, or set aforo.trust-customer-header=true to read "
+                        + props.getCustomerIdHeader() + " (only when a gateway in front of the app sets it).");
+            }
+            AforoServletFilter.Builder builder = AforoServletFilter.builder(client)
+                    .metricName(props.getMetricName())
+                    .customerIdHeader(props.getCustomerIdHeader())
+                    .trustCustomerHeader(props.isTrustCustomerHeader())
+                    .usePrincipalAsCustomerId(props.isUsePrincipalAsCustomerId())
+                    // The client is a Spring bean; AforoClientLifecycle closes it.
+                    .closeClientOnDestroy(false);
+            if (metricNameResolver != null) builder.metricNameResolver(metricNameResolver);
+            if (customerIdResolver != null) builder.customerIdResolver(customerIdResolver);
+
+            FilterRegistrationBean<AforoServletFilter> registration = new FilterRegistrationBean<>();
+            registration.setFilter(builder.build());
+            registration.addUrlPatterns("/*");
+            registration.setOrder(Integer.MAX_VALUE); // Run last
+            registration.setName("aforoMeteringFilter");
+            return registration;
         }
-        AforoServletFilter.Builder builder = AforoServletFilter.builder(client)
-                .metricName(props.getMetricName())
-                .customerIdHeader(props.getCustomerIdHeader())
-                .trustCustomerHeader(props.isTrustCustomerHeader())
-                .usePrincipalAsCustomerId(props.isUsePrincipalAsCustomerId())
-                // The client is a Spring bean; AforoClientLifecycle closes it.
-                .closeClientOnDestroy(false);
-        if (metricNameResolver != null) builder.metricNameResolver(metricNameResolver);
-        if (customerIdResolver != null) builder.customerIdResolver(customerIdResolver);
-
-        FilterRegistrationBean<AforoServletFilter> registration = new FilterRegistrationBean<>();
-        registration.setFilter(builder.build());
-        registration.addUrlPatterns("/*");
-        registration.setOrder(Integer.MAX_VALUE); // Run last
-        registration.setName("aforoMeteringFilter");
-        return registration;
     }
+
 }

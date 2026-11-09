@@ -1,6 +1,6 @@
 # aforo-graphql-metering — User Guide
 
-**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Python engineers running a GraphQL server who need per-operation billing.
+**Version:** 2.1.1 · **Updated:** 2026-11-09 · **Audience:** Python engineers running a GraphQL server who need per-operation billing.
 
 ## What you'll build
 

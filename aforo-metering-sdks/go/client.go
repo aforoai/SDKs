@@ -13,7 +13,7 @@ import (
 )
 
 // sdkVersion is sent in the User-Agent header; keep it equal to VERSION.
-const sdkVersion = "2.1.0"
+const sdkVersion = "2.1.1"
 
 // AforoClient is the main entry point for the Aforo metering SDK.
 //
@@ -90,6 +90,18 @@ func trackEvents(events []ingest.Event) []TrackEvent {
 // String never prints the API key.
 func (c *AforoClient) String() string { return "metering.AforoClient{" + c.tp.String() + "}" }
 
+// GoString never prints the API key (%#v).
+func (c *AforoClient) GoString() string { return c.String() }
+
+// reportInvalid drops an event refused before Track (for example a resolver
+// that panicked): counted, WARN-logged and handed to OnDrop as DropInvalid.
+func (c *AforoClient) reportInvalid(event TrackEvent, cause error) {
+	if event.IdempotencyKey == "" {
+		event.IdempotencyKey = generateRandomKey()
+	}
+	c.tp.ReportInvalid(ingest.Event{Key: event.IdempotencyKey, Ref: event}, cause.Error())
+}
+
 // Track enqueues a usage event for batched delivery. It never blocks on the
 // network and never starts a goroutine.
 //
@@ -118,6 +130,15 @@ func (c *AforoClient) Track(event TrackEvent) error {
 	productType := normalizeProductType(event.ProductType)
 	if productType == "" {
 		productType = c.productType
+	}
+	// statusCode is a Java short and responseTimeMs an int on the ingestor; a
+	// value that does not fit would fail the whole batch, so it is left off
+	// (WARN-logged once) and the event is kept.
+	if !c.tp.FitInt("statusCode", int64(event.StatusCode)) {
+		event.StatusCode = 0
+	}
+	if !c.tp.FitInt("responseTimeMs", event.ResponseTimeMs) {
+		event.ResponseTimeMs = 0
 	}
 	resolved := resolvedEvent{
 		CustomerID:      event.CustomerID,

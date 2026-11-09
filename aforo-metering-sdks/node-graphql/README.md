@@ -2,7 +2,7 @@
 
 Meter every GraphQL operation — query, mutation, subscription — with AST-derived complexity scoring, and ship the usage events to Aforo without touching your resolvers. Drops in as an Apollo Server 4 plugin or an Express/`graphql-http` middleware.
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -76,11 +76,11 @@ const billing = new AforoGraphQlBilling({
 });
 
 const app = express();
-app.use(express.json()); // billing.middleware() reads req.body.query — body must be parsed first
+app.use(express.json()); // billing.middleware() reads req.body.query (POST) or ?query= (GET) — parse the body first
 app.use('/graphql', billing.middleware(), createHandler({ schema }));
 ```
 
-> The middleware lets the response go out first: `res.end` sends it, and the body is parsed and the operation recorded on the next turn of the event loop (`setImmediate`). The Apollo plugin does the same after `willSendResponse`. Metering never blocks or fails the request; an error in the metering path is reported through `onError`.
+> The middleware lets the response go out first: `res.end` sends it, and the body is parsed and the operation recorded on the next turn of the event loop (`setImmediate`). The Apollo plugin does the same after `willSendResponse`. Metering never blocks or fails the request; an error in the metering path is reported through `onError`. The middleware meters POST operations (`req.body.query`) and GET operations (`?query=…&operationName=…`). The Apollo plugin reads the query Apollo resolved, so automatic persisted queries (a hash-only request, on by default in Apollo Server 4) are metered too.
 
 Every recorded operation emits one event with `metricName: "graphql_api.operations"`, `quantity: 1`, and the operation's type/name/complexity/field-count attached. Ships to `POST https://api.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`.
 

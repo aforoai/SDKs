@@ -116,7 +116,7 @@ export interface AforoGraphQlConfig {
  */
 export type DropReason = 'overflow' | 'retry_exhausted' | 'rejected' | 'invalid' | 'shutdown' | 'closed';
 
-const SDK_VERSION = '2.1.0';
+const SDK_VERSION = '2.1.1';
 /** Default top-level `productType` for this SDK. */
 export const DEFAULT_PRODUCT_TYPE = 'GRAPHQL_API';
 /** usage-ingestor limits (IngestUsageEventRequest). */
@@ -347,8 +347,8 @@ export class AforoGraphQlBilling {
       outcomeFromHttpStatus(args.httpStatus);
     if (executionStatus) event.executionStatus = executionStatus;
 
-    // An event the ingestor would reject is not sent (one bad event fails its
-    // whole batch): it is dropped here with reason 'invalid', never thrown
+    // An event the ingestor would reject is not sent (the refusal would only
+    // show up on a background flush): it is dropped here with reason 'invalid', never thrown
     // into the request path.
     const invalid =
       (!event.customerId.trim()
@@ -420,8 +420,9 @@ export class AforoGraphQlBilling {
         const parts = captured;
         setImmediate(() => {
           try {
-            const body = req.body ?? {};
-            const query = body.query as string | undefined;
+            // POST: the parsed JSON body. GET (graphql-http, express-graphql): the query string.
+            const params = operationParams(req);
+            const query = params.query;
             if (!query) return;
             let explicit: string | undefined;
             try {
@@ -432,7 +433,7 @@ export class AforoGraphQlBilling {
             this.record({
               customerId: this.customerFor(req),
               query,
-              operationName: body.operationName,
+              operationName: params.operationName,
               durationMs,
               hasErrors: res.statusCode >= 400,
               responseBytes,
@@ -537,13 +538,16 @@ export function aforoApolloPlugin(billing: AforoGraphQlBilling, options: AforoAp
           // what it needs, and parsing/queueing runs on the next turn.
           let snapshot: (() => void) | undefined;
           try {
-            const query = rc.request?.query as string | undefined;
+            // `source` is the resolved query text; `request.query` is empty for an
+            // automatic-persisted-query hit (only the hash is sent), which is on by
+            // default in Apollo Server 4.
+            const query = (rc.source ?? rc.request?.query) as string | undefined;
             if (!query) return;
             const contextValue = rc.contextValue ?? rc.context ?? {};
             const result = rc.response?.body?.singleResult ?? rc.response?.body?.initialResult;
             const errors = (result?.errors || rc.errors) ?? [];
             const durationMs = Date.now() - start;
-            const operationName = rc.request?.operationName;
+            const operationName = rc.request?.operationName ?? rc.operationName;
             const httpStatus = rc.response?.http?.status;
             snapshot = () => {
               let explicit: string | undefined;
@@ -585,6 +589,33 @@ export function aforoApolloPlugin(billing: AforoGraphQlBilling, options: AforoAp
         },
       };
     },
+  };
+}
+
+/**
+ * The GraphQL parameters of an HTTP request: the parsed JSON body when it
+ * carries a `query`, otherwise the URL's query string (GET operations, as
+ * graphql-http and express-graphql serve them). Empty when there is neither.
+ */
+function operationParams(req: any): { query?: string; operationName?: string } {
+  const body = req?.body;
+  if (body && typeof body === 'object' && typeof body.query === 'string') {
+    return { query: body.query, operationName: typeof body.operationName === 'string' ? body.operationName : undefined };
+  }
+  let q: any = req?.query;
+  if (!q || typeof q !== 'object' || typeof q.query !== 'string') {
+    try {
+      const sp = new URL(String(req?.originalUrl ?? req?.url ?? ''), 'http://localhost').searchParams;
+      q = { query: sp.get('query') ?? undefined, operationName: sp.get('operationName') ?? undefined };
+    } catch {
+      return {};
+    }
+  }
+  const query = Array.isArray(q.query) ? q.query[0] : q.query;
+  const operationName = Array.isArray(q.operationName) ? q.operationName[0] : q.operationName;
+  return {
+    query: typeof query === 'string' && query ? query : undefined,
+    operationName: typeof operationName === 'string' && operationName ? operationName : undefined,
   };
 }
 

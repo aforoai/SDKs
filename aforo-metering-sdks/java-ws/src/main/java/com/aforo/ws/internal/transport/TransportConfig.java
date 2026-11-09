@@ -68,7 +68,8 @@ public final class TransportConfig {
             throw new IllegalArgumentException("baseUrl is required");
         }
         this.ingestUri = ingestUri(b.baseUrl, b.allowInsecureHttp);
-        this.apiKey = b.apiKey;
+        this.apiKey = checkedApiKey(b.apiKey);
+        for (Map.Entry<String, String> h : b.extraHeaders.entrySet()) checkHeader(h.getKey(), h.getValue());
         this.extraHeaders = Collections.unmodifiableMap(new LinkedHashMap<>(b.extraHeaders));
         this.userAgent = b.userAgent;
         this.flushCount = Math.max(1, Math.min(b.flushCount, MAX_EVENTS_PER_REQUEST));
@@ -90,6 +91,40 @@ public final class TransportConfig {
         this.threadName = b.threadName;
         this.loggerName = b.loggerName;
         this.logPrefix = b.logPrefix;
+    }
+
+    /**
+     * The key with surrounding whitespace removed (a key read from a secret file often ends
+     * in a newline). A key that still holds whitespace or a control character cannot be sent
+     * as a header: refused here, and the message never contains the key.
+     */
+    static String checkedApiKey(String apiKey) {
+        String key = apiKey.trim();
+        for (int i = 0; i < key.length(); i++) {
+            char c = key.charAt(i);
+            if (Character.isWhitespace(c) || Character.isISOControl(c) || Character.isSpaceChar(c)) {
+                throw new IllegalArgumentException("apiKey contains whitespace or a control character (at position "
+                        + (i + 1) + " of " + key.length() + "); check how the key is loaded");
+            }
+        }
+        return key;
+    }
+
+    /** A header the HTTP client would refuse at send time is refused here instead; the value is never echoed. */
+    static void checkHeader(String name, String value) {
+        if (name.isEmpty()) throw new IllegalArgumentException("header name is empty");
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (c <= 32 || c >= 127 || "()<>@,;:\\\"/[]?={}".indexOf(c) >= 0) {
+                throw new IllegalArgumentException("header name \"" + name + "\" is not a valid HTTP token");
+            }
+        }
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if ((c < 32 && c != '\t') || c == 127) {
+                throw new IllegalArgumentException("header " + name + " has a control character in its value");
+            }
+        }
     }
 
     /**

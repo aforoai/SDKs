@@ -2,6 +2,17 @@
 
 All notable changes to `@aforoai/mqtt-metering` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com); this package adheres to [SemVer](https://semver.org).
 
+## [2.1.1] - 2026-11-09
+
+### Fixed (transport core, review of 2026-11-09)
+- **One unreadable event no longer loses its whole batch.** usage-ingestor binds a batch as typed fields, so an `occurredAt` without seconds or a zone (`2026-03-01T14:30:00`, `…T14:30Z`, `…+0530`) or a `metadata` that is not a plain object made it answer 400 for the entire request, and every event in it was dropped as `rejected`. Such an event is now dropped alone, as `invalid`, when it is recorded.
+- **Integer fields outside the ingestor's range are left off the event** (`statusCode` beyond a Java short, `responseTimeMs` / `executionDurationMs` / `messageCount` / `gqlComplexity` beyond an int, `dataBytes` beyond a long, or not a finite number). The event is still sent; one WARN per field. Before, one such value failed the whole batch with 400.
+- **429 with `X-RateLimit-Limit` below the batch size splits the batch.** A key with a hard limit under the batch size (default 500 events) can never send that request, so it was retried at the head of the queue forever while everything behind it overflowed. The batch now goes back to the head in order and is sent in parts of at most that many events (contract/TRANSPORT-SPEC.md, "Rate-limit split").
+- **`shutdown()` keeps the process alive until it settles** (at most `shutdownTimeoutMs`). With `flushOnExit: false`, a job awaiting `shutdown()` during an outage exited mid-retry and the queued usage was neither sent nor reported as `shutdown`.
+- **The API key is trimmed**, and construction throws when it still contains whitespace, control or non-ASCII characters (fetch would refuse every request with an error quoting the key). The message never contains the key.
+
+- README and USER_GUIDE show version 2.1.0.
+
 ## [2.0.0] - 2026-10-26
 
 Breaking. Migration: give `wrapAedesBroker` a `customerResolver` (or `trustCustomerHeader: true` when your broker authenticates usernames), use an `https://` `ingestorUrl` (or `allowInsecureHttp: true`), and call `await billing.shutdown()` from your SIGTERM handler.

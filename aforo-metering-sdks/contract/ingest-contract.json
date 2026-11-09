@@ -569,10 +569,10 @@
       "recommended": {
         "User-Agent": "aforo-<module>/<version>"
       },
-      "forbidden": [
+      "setByTransportOnly": [
         "Content-Encoding"
       ],
-      "notes": "The API key goes in X-API-Key only — never in the URL, the body, logs, repr/toString or error messages."
+      "notes": "The API key goes in X-API-Key only — never in the URL, the body, logs, repr/toString or error messages. Content-Encoding is set by the transport core when it gzips a body (see compression) and can never be set through a caller's extra headers."
     },
     "batch": {
       "maxEvents": 1000,

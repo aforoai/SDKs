@@ -2,7 +2,7 @@
 
 Meter WebSocket traffic — connection duration, message counts, and bytes — by wrapping a connection from the `websockets` library or a FastAPI/Starlette `WebSocket` route. One open + one close event per connection by default, or one event per frame.
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -82,7 +82,7 @@ async def ws_handler(ws: WebSocket):
             await ws.send_text(f"echo: {data}")
 ```
 
-Events POST to `https://api.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`. The tracker counts sent/received messages and bytes by wrapping the connection's `send`/`recv`, and emits a close event with `messageCount`, `dataBytes`, and `executionDurationMs` when the `async with` block exits.
+Events POST to `https://api.aforo.ai/v1/ingest/batch` with `X-API-Key: <api_key>` and `X-Tenant-Id: <tenant_id>`. The tracker counts sent/received messages and bytes by wrapping the connection's `send`/`recv` (Starlette: its ASGI `send`/`receive`, so `send_json`, `receive_json` and `iter_json` frames count too), and emits a close event with `messageCount`, `dataBytes`, and `executionDurationMs` when the `async with` block exits. A connection the idle sweep closed is tracked again when it carries its next frame; its next close event reports only the traffic after the sweep (`metadata.resumedAfterIdle`).
 
 > ⚠ Events are sent to the ingestor's **`/v1/ingest/batch`** path as `{"events": [...]}`, at most 1000 events per request (larger buffers are split). Set `ingestor_url` to the host only — the SDK appends the path.
 

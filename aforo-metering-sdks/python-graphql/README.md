@@ -2,7 +2,7 @@
 
 Meter every GraphQL operation with AST-accurate complexity scoring — one Aforo event per query/mutation, via a Strawberry extension or an ASGI middleware that works with any GraphQL server.
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -73,7 +73,7 @@ Works with Ariadne, graphql-core HTTP, Graphene-ASGI, and custom ASGI GraphQL se
 
 > `tenant_id` is fixed from your config and sent as a header — never read from a caller-controlled value. **The customer must come from identity you verified:** pass `customer_resolver=` to `strawberry_extension` (called with Strawberry's context) or `asgi_middleware` (called with the ASGI scope), or `customer_id_extractor=` to `AforoGraphQlBilling`. Reading the `x-customer-id` header needs `trust_customer_header=True`, because the client sets it. With neither, the integration raises `ValueError` when you build it. An operation whose resolver returns nothing runs normally, is not metered, and is counted in `dropped_count` as `invalid`.
 >
-> The ASGI middleware keeps at most `max_request_body_bytes` (default 1 MiB) of the request body to read the query, and parses and scores it on its own pool of `meter_workers` threads (default 2), never on the event loop and never on your application's default executor; `billing.shutdown()` stops the pool. A bigger request is served normally and counted as `invalid` (not metered). The Strawberry extension reuses the document Strawberry already parsed.
+> The ASGI middleware keeps at most `max_request_body_bytes` (default 1 MiB) of the request body to read the query, and parses and scores it on its own pool of `meter_workers` threads (default 2), never on the event loop and never on your application's default executor; `billing.shutdown()` stops the pool. A bigger request is served normally and counted as `invalid` (not metered). A batched request (a JSON array of operations) is metered one event per operation. The Strawberry extension reuses the document Strawberry already parsed.
 
 ## Configuration
 

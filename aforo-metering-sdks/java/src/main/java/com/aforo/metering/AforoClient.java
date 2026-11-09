@@ -37,7 +37,7 @@ import java.util.logging.Logger;
 public class AforoClient implements AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(AforoClient.class.getName());
-    static final String SDK_VERSION = "2.1.0";
+    static final String SDK_VERSION = "2.1.1";
 
     private final TransportCore<ResolvedEvent> core;
     private final String productType;
@@ -46,6 +46,8 @@ public class AforoClient implements AutoCloseable {
     // Kept so close() can deregister — otherwise every client leaks a JVM
     // shutdown hook (and stays reachable through it) for the process lifetime.
     private final Thread shutdownHook;
+    /** One warning per field when a number is dropped for being outside the ingestor's type (R3). */
+    private final java.util.Set<String> rangeWarned = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     public AforoClient(AforoOptions options) {
         this(options, null, null);
@@ -156,7 +158,8 @@ public class AforoClient implements AutoCloseable {
                 event.getQuantity(), idempotencyKey, occurredAt,
                 event.getMetadata(), event.getExecutionStatus(), eventProductType,
                 event.getEndpointPath(), event.getHttpMethod(),
-                event.getStatusCode(), event.getResponseTimeMs());
+                inRange("statusCode", event.getStatusCode(), Short.MIN_VALUE, Short.MAX_VALUE),
+                inRange("responseTimeMs", event.getResponseTimeMs(), Integer.MIN_VALUE, Integer.MAX_VALUE));
 
         if (!core.isClosed()) {
             String violation = describeViolation(resolved);
@@ -166,6 +169,22 @@ public class AforoClient implements AutoCloseable {
             }
         }
         core.track(resolved);
+    }
+
+    /**
+     * {@code value} when the ingestor's field type ({@code statusCode} is a Java {@code short},
+     * {@code responseTimeMs} an {@code int}) can hold it, else {@code null}: the field is left off
+     * and the event is still sent, because an out-of-range number fails the ingestor's reading of
+     * the whole batch. Warns once per field.
+     */
+    @SuppressWarnings("unchecked")
+    private <N extends Number> N inRange(String field, N value, long min, long max) {
+        if (value == null || (value.longValue() >= min && value.longValue() <= max)) return value;
+        if (rangeWarned.add(field)) {
+            LOG.warning("[aforo] " + field + " " + value + " is outside the ingestor's range (" + min + " to " + max
+                    + "); the field is left off and the event is still sent. Later occurrences are not logged.");
+        }
+        return null;
     }
 
     /** The first ingestor constraint this event breaks, or {@code null} when it would be accepted. */
@@ -180,8 +199,9 @@ public class AforoClient implements AutoCloseable {
             return "quantity must be a finite number > 0, got " + e.getQuantity()
                     + " (metric=" + EventLimits.abbreviate(e.getMetricName()) + ")";
         }
-        return EventLimits.describeViolation(e.getCustomerId(), e.getMetricName(),
+        String limits = EventLimits.describeViolation(e.getCustomerId(), e.getMetricName(),
                 e.getIdempotencyKey(), e.getProductType(), e.getQuantity());
+        return limits != null ? limits : EventLimits.occurredAtViolation(e.getOccurredAt());
     }
 
     /**

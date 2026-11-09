@@ -17,7 +17,7 @@ import { readBody } from '../auth/ListenerGuard.js';
 import { BoundedMap } from '../util/BoundedMap.js';
 import { SseParser, sseMessage } from '../util/sse.js';
 import { logger } from '../util/logger.js';
-import { upstreamDeadline, readCappedText, upstreamFailure, DEFAULT_UPSTREAM_TIMEOUT_MS } from '../util/upstream.js';
+import { upstreamDeadline, readCappedText, upstreamFailure, upstreamNeverAnswered, DEFAULT_UPSTREAM_TIMEOUT_MS } from '../util/upstream.js';
 import { BaseProxy } from './BaseProxy.js';
 
 interface Connection {
@@ -183,8 +183,10 @@ export class SseProxy extends BaseProxy {
     if (body === null) return;
 
     let deadline: ReturnType<typeof upstreamDeadline> | undefined;
+    let tracked: Array<string | number> = [];
     try {
       const result = await this.handleClientMessage(body, sessionId, principal);
+      tracked = result.tracked;
       // Calls the proxy refused are answered on the client's stream, like every response.
       if (result.response && !connection.res.writableEnded) connection.res.write(sseMessage(result.response));
       if (!result.forward) {
@@ -202,7 +204,10 @@ export class SseProxy extends BaseProxy {
       const responseBody = await readCappedText(upstreamRes);
       deadline.done();
       // A server may answer on the POST itself; meter that too.
-      this.handleServerMessage(responseBody, sessionId);
+      const answered = this.handleServerMessage(responseBody, sessionId);
+      // A 2xx means the answers come on the SSE stream. An HTTP error means the
+      // server did not take the message: its unanswered calls are not billed.
+      if (!upstreamRes.ok) this.forgetUnanswered(sessionId, tracked, answered);
       res.writeHead(upstreamRes.status, {
         'Content-Type': upstreamRes.headers.get('content-type') ?? 'application/json',
         ...cors,
@@ -210,6 +215,10 @@ export class SseProxy extends BaseProxy {
       res.end(responseBody);
     } catch (err) {
       deadline?.done();
+      // The upstream gave no HTTP answer at all (refused, reset, unreachable): the
+      // calls never ran, so nothing is billed. A timeout or an over-large answer
+      // means they did reach the server; they stay waiting and are metered TIMEOUT.
+      if (upstreamNeverAnswered(err, deadline?.signal)) this.forgetUnanswered(sessionId, tracked);
       const failure = upstreamFailure(err, deadline?.signal);
       logger.error('POST proxy error', { error: (err as Error).message, status: failure.status });
       if (!res.headersSent) res.writeHead(failure.status, { 'Content-Type': 'application/json', ...cors });

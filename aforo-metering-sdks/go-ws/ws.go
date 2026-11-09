@@ -22,7 +22,7 @@ import (
 	"github.com/aforoai/SDKs/aforo-metering-sdks/go-ws/v2/internal/ingest"
 )
 
-const sdkVersion = "2.1.0"
+const sdkVersion = "2.1.1"
 
 // DefaultConnectionIdleTimeout is how long a connection may go without Open,
 // RecordFrame or Close activity before the SDK closes it itself (see
@@ -54,7 +54,9 @@ type Config struct {
 	// ABNORMAL_CLOSURE and metadata closedBy "sdk_idle_timeout"), so a
 	// connection your code never closed does not stay in memory. Default 1h.
 	// A negative value is refused by New: without the sweep the connection
-	// map could grow without bound.
+	// map could grow without bound. A swept connection that sends another
+	// frame within 24 × ConnectionIdleTimeout is tracked again under the same
+	// id (its later events carry metadata resumedAfterIdle: true).
 	ConnectionIdleTimeout time.Duration
 
 	HTTPClient *http.Client // optional; you keep ownership
@@ -82,6 +84,9 @@ type Billing struct {
 	tp  *ingest.Client
 
 	connections sync.Map // map[string]*ConnectionState
+	// swept holds connections the idle sweep closed (map[string]*sweptConn),
+	// so their next frame tracks them again.
+	swept sync.Map
 	// lifecycle orders Open against Shutdown: Open holds it for reading while
 	// it registers a connection and queues its OPEN; Shutdown takes it for
 	// writing to set shuttingDown. An Open is therefore either finished
@@ -103,6 +108,14 @@ type ConnectionState struct {
 	bytes        atomic.Int64
 	lastActivity atomic.Int64 // unix millis
 	metadata     map[string]any
+}
+
+// sweptConn is what is kept of a connection the idle sweep closed.
+type sweptConn struct {
+	customerId  string
+	productType string
+	metadata    map[string]any
+	sweptAtMs   int64
 }
 
 // New validates cfg and starts the background sender (and the idle-connection
@@ -175,17 +188,27 @@ func (b *Billing) Open(customerID string, metadata map[string]any, opts ...Event
 		metadata:    metadata,
 	}
 	state.lastActivity.Store(now.UnixMilli())
+	// Built and serialized before taking the lifecycle lock: no callback
+	// (OnError, OnDrop) may run while Open holds it, because a callback may
+	// call Shutdown, which takes it for writing.
+	open, ok := b.encode(withExecutionStatus(b.connEvent(state, connID, "OPEN", "SERVER_TO_CLIENT", 0, 0, 0, "", merge(metadata, map[string]any{"event": "CONNECTION_OPENED"})), executionStatusFor(opts)))
+	if !ok {
+		return "" // dropped as invalid (cannot be serialized); not tracked
+	}
 	b.lifecycle.RLock()
-	defer b.lifecycle.RUnlock()
 	if b.shuttingDown {
+		b.lifecycle.RUnlock()
 		// During or after Shutdown: reported as DropClosed, never tracked or sent.
-		ev := b.connEvent(state, connID, "OPEN", "SERVER_TO_CLIENT", 0, 0, 0, "", metadata)
-		key, _ := ev["idempotencyKey"].(string)
-		b.tp.Report([]ingest.Event{{Key: key, Ref: ev}}, ingest.DropClosed)
+		b.tp.Report([]ingest.Event{open}, ingest.DropClosed)
 		return ""
 	}
 	b.connections.Store(connID, state)
-	b.push(withExecutionStatus(b.connEvent(state, connID, "OPEN", "SERVER_TO_CLIENT", 0, 0, 0, "", merge(metadata, map[string]any{"event": "CONNECTION_OPENED"})), executionStatusFor(opts)))
+	evicted, err := b.tp.TryEnqueue(open)
+	b.lifecycle.RUnlock()
+	if err != nil {
+		b.tp.Report([]ingest.Event{open}, ingest.DropClosed)
+	}
+	b.tp.Report(evicted, ingest.DropOverflow)
 	return connID
 }
 
@@ -206,7 +229,11 @@ func (b *Billing) RecordFrame(connID, direction, frameType string, bytes int64) 
 func (b *Billing) RecordFrameWithOptions(connID, direction, frameType string, bytes int64, opts EventOptions) {
 	v, ok := b.connections.Load(connID)
 	if !ok {
-		return
+		// A connection the idle sweep closed is tracked again.
+		b.resume(connID)
+		if v, ok = b.connections.Load(connID); !ok {
+			return
+		}
 	}
 	s := v.(*ConnectionState)
 	s.frames.Add(1)
@@ -232,12 +259,40 @@ func (b *Billing) CloseWithOptions(connID string, closeCode int, opts EventOptio
 	b.closeConn(connID, closeCode, "", opts)
 }
 
+// resume tracks a connection the idle sweep closed again, from now: no new
+// CONNECTION_OPENED is sent, and its later events carry resumedAfterIdle.
+func (b *Billing) resume(connID string) {
+	v, ok := b.swept.LoadAndDelete(connID)
+	if !ok {
+		return
+	}
+	t := v.(*sweptConn)
+	nowMs := b.now().UnixMilli()
+	state := &ConnectionState{
+		customerId:  t.customerId,
+		productType: t.productType,
+		startMs:     nowMs,
+		metadata:    merge(t.metadata, map[string]any{"resumedAfterIdle": true}),
+	}
+	state.lastActivity.Store(nowMs)
+	b.lifecycle.RLock()
+	defer b.lifecycle.RUnlock()
+	if b.shuttingDown {
+		return
+	}
+	b.connections.LoadOrStore(connID, state)
+}
+
 // closeConn emits CONNECTION_CLOSED once per connection; closedBy names an
-// SDK-initiated close ("sdk_shutdown", "sdk_idle_timeout").
-func (b *Billing) closeConn(connID string, closeCode int, closedBy string, opts EventOptions) {
+// SDK-initiated close ("sdk_shutdown", "sdk_idle_timeout"). It returns the
+// closed connection's state, or nil when it was not tracked.
+func (b *Billing) closeConn(connID string, closeCode int, closedBy string, opts EventOptions) *ConnectionState {
 	v, loaded := b.connections.LoadAndDelete(connID)
 	if !loaded {
-		return
+		if closedBy == "" {
+			b.swept.Delete(connID) // closed by your code after the idle sweep
+		}
+		return nil
 	}
 	s := v.(*ConnectionState)
 	durationMs := b.now().UnixMilli() - s.startMs
@@ -254,6 +309,7 @@ func (b *Billing) closeConn(connID string, closeCode int, closedBy string, opts 
 	meta := merge(s.metadata, extra)
 	b.push(withExecutionStatus(b.connEvent(s, connID, "CLOSE", "SERVER_TO_CLIENT",
 		int(s.frames.Load()), s.bytes.Load(), durationMs, reason, meta), opts.ExecutionStatus))
+	return s
 }
 
 func (b *Billing) connEvent(s *ConnectionState, connID, frameType, direction string, frames int, bytesAmt, durationMs int64, closeReason string, metadata map[string]any) map[string]any {
@@ -348,14 +404,28 @@ func (b *Billing) sweepLoop() {
 	}
 }
 
-// sweepIdle closes connections idle longer than ConnectionIdleTimeout.
+// sweepIdle closes connections idle longer than ConnectionIdleTimeout and
+// remembers them, so a later frame tracks them again; what it remembers is
+// forgotten after 24 × ConnectionIdleTimeout.
 func (b *Billing) sweepIdle(now time.Time) int {
+	nowMs := now.UnixMilli()
 	cutoff := now.Add(-b.cfg.ConnectionIdleTimeout).UnixMilli()
 	n := 0
 	b.connections.Range(func(k, v any) bool {
-		if v.(*ConnectionState).lastActivity.Load() <= cutoff {
-			b.closeConn(k.(string), 1006, "sdk_idle_timeout", EventOptions{})
+		if s := v.(*ConnectionState); s.lastActivity.Load() <= cutoff {
+			// Remembered first, so a frame arriving while it is closed finds it.
+			b.swept.Store(k, &sweptConn{customerId: s.customerId, productType: s.productType, metadata: s.metadata, sweptAtMs: nowMs})
+			if b.closeConn(k.(string), 1006, "sdk_idle_timeout", EventOptions{}) == nil {
+				b.swept.Delete(k) // your code closed it first
+			}
 			n++
+		}
+		return true
+	})
+	forget := now.Add(-24 * b.cfg.ConnectionIdleTimeout).UnixMilli()
+	b.swept.Range(func(k, v any) bool {
+		if v.(*sweptConn).sweptAtMs <= forget {
+			b.swept.Delete(k)
 		}
 		return true
 	})

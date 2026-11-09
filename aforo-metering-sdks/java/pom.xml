@@ -6,7 +6,7 @@
 
     <groupId>ai.aforo</groupId>
     <artifactId>metering</artifactId>
-    <version>2.1.0</version>
+    <version>2.1.1</version>
     <packaging>jar</packaging>
 
     <name>Aforo Metering SDK</name>
@@ -89,6 +89,13 @@
             <groupId>org.springframework</groupId>
             <artifactId>spring-test</artifactId>
             <version>6.2.19</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- A real servlet container for the async / error-dispatch filter tests -->
+        <dependency>
+            <groupId>org.apache.tomcat.embed</groupId>
+            <artifactId>tomcat-embed-core</artifactId>
+            <version>10.1.49</version>
             <scope>test</scope>
         </dependency>
         <dependency>

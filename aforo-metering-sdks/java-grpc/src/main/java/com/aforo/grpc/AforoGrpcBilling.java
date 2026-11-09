@@ -3,7 +3,10 @@ package com.aforo.grpc;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.aforo.grpc.internal.transport.TransportConfig;
 import com.aforo.grpc.internal.transport.TransportCore;
+import io.grpc.Context;
+import io.grpc.Deadline;
 import io.grpc.ForwardingServerCall;
+import io.grpc.ForwardingServerCallListener;
 import io.grpc.Metadata;
 import io.grpc.ServerCall;
 import io.grpc.ServerCallHandler;
@@ -14,6 +17,7 @@ import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
 import java.util.logging.Level;
@@ -49,7 +53,7 @@ import java.util.logging.Logger;
 public final class AforoGrpcBilling implements AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(AforoGrpcBilling.class.getName());
-    private static final String SDK_VERSION = "2.1.0";
+    private static final String SDK_VERSION = "2.1.1";
     private static final int MAX_IDEMPOTENCY_KEY = 255;
     /** Ingestor limit on {@code grpcMethod}. */
     static final int MAX_GRPC_METHOD = 128;
@@ -124,7 +128,12 @@ public final class AforoGrpcBilling implements AutoCloseable {
             + " token), or trustCustomerHeader(true) to read the x-customer-id metadata; only do that when a"
             + " proxy in front of the server sets it, because callers can otherwise bill usage to any customer.";
 
-    /** Returns a {@link ServerInterceptor} that meters every call. */
+    /**
+     * Returns a {@link ServerInterceptor} that meters every call exactly once: when the server
+     * closes it, when its handler throws (grpc-java then closes the stream itself with
+     * {@code UNKNOWN}, bypassing {@code ServerCall.close}), or when it is cancelled
+     * ({@code DEADLINE_EXCEEDED} once the call's deadline has passed, else {@code CANCELLED}).
+     */
     public ServerInterceptor interceptor() {
         return new ServerInterceptor() {
             @Override
@@ -135,26 +144,83 @@ public final class AforoGrpcBilling implements AutoCloseable {
                 String method = fullMethod.contains("/") ? fullMethod.substring(fullMethod.lastIndexOf('/') + 1) : fullMethod;
                 String callType = mapCallType(call.getMethodDescriptor().getType().name());
                 String customerId = resolveCustomer(call, headers);
+                AtomicBoolean recorded = new AtomicBoolean();
+                java.util.function.Consumer<Status.Code> recordOnce = code -> {
+                    if (!recorded.compareAndSet(false, true)) return;
+                    try {
+                        record(method, callType, customerId, code.name(), System.currentTimeMillis() - start,
+                                outcomeFromGrpcStatus(code));
+                    } catch (RuntimeException e) {
+                        // Metering must never affect the call.
+                        LOG.log(Level.FINE, "[aforo-grpc] metering failed for " + method, e);
+                    }
+                };
 
                 ForwardingServerCall.SimpleForwardingServerCall<ReqT, RespT> wrapped =
                         new ForwardingServerCall.SimpleForwardingServerCall<>(call) {
                             @Override
                             public void close(Status status, Metadata trailers) {
                                 try {
-                                    record(method, callType, customerId, status.getCode().name(),
-                                            System.currentTimeMillis() - start,
-                                            outcomeFromGrpcStatus(status.getCode()));
-                                } catch (RuntimeException e) {
-                                    // Metering must never keep the call from closing.
-                                    LOG.log(Level.FINE, "[aforo-grpc] metering failed for " + method, e);
+                                    // A handler that finishes after the caller gave up still closes with
+                                    // its own status; the caller saw the cancellation, so that is billed.
+                                    recordOnce.accept(isCancelled() ? cancellationCode() : status.getCode());
                                 } finally {
                                     super.close(status, trailers);
                                 }
                             }
                         };
-                return next.startCall(wrapped, headers);
+                ServerCall.Listener<ReqT> delegate;
+                try {
+                    delegate = next.startCall(wrapped, headers);
+                } catch (RuntimeException | Error e) {
+                    recordOnce.accept(Status.Code.UNKNOWN);
+                    throw e;
+                }
+                return new ForwardingServerCallListener.SimpleForwardingServerCallListener<>(delegate) {
+                    @Override
+                    public void onMessage(ReqT message) {
+                        try {
+                            super.onMessage(message);
+                        } catch (RuntimeException | Error e) {
+                            recordOnce.accept(Status.Code.UNKNOWN);
+                            throw e;
+                        }
+                    }
+
+                    @Override
+                    public void onHalfClose() {
+                        try {
+                            super.onHalfClose();
+                        } catch (RuntimeException | Error e) {
+                            recordOnce.accept(Status.Code.UNKNOWN);
+                            throw e;
+                        }
+                    }
+
+                    @Override
+                    public void onReady() {
+                        try {
+                            super.onReady();
+                        } catch (RuntimeException | Error e) {
+                            recordOnce.accept(Status.Code.UNKNOWN);
+                            throw e;
+                        }
+                    }
+
+                    @Override
+                    public void onCancel() {
+                        recordOnce.accept(cancellationCode());
+                        super.onCancel();
+                    }
+                };
             }
         };
+    }
+
+    /** DEADLINE_EXCEEDED when the current call's deadline has passed, else CANCELLED. */
+    private static Status.Code cancellationCode() {
+        Deadline deadline = Context.current().getDeadline();
+        return deadline != null && deadline.isExpired() ? Status.Code.DEADLINE_EXCEEDED : Status.Code.CANCELLED;
     }
 
     /**

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from typing import Any, Callable, Optional
 
@@ -12,6 +13,7 @@ from ._common import (
     NO_CUSTOMER,
     customer_lookup,
     http_fields,
+    is_excluded,
     is_preflight,
     logger,
     resolve_metric_name,
@@ -39,17 +41,26 @@ def _header_customer(request: Any) -> Optional[str]:
     return request.META.get("HTTP_X_CUSTOMER_ID")
 
 
-def _load(value: Any) -> Any:
-    """Allow a dotted path in settings (``"myapp.billing.customer_for"``). A
-    string that does not import is kept as one fixed customer id."""
-    if isinstance(value, str) and "." in value:
+#: ``package.module.attribute``: every part a Python identifier.
+_DOTTED_PATH = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$")
+
+
+def _load(value: Any, setting: str) -> Any:
+    """Allow a dotted path in settings (``"myapp.billing.customer_for"``).
+
+    A value shaped like a dotted path must import: a typo would otherwise
+    bill every request to the literal string. Raises ValueError at start-up.
+    Any other string (``"cust_42"``) is one fixed customer id."""
+    if isinstance(value, str) and _DOTTED_PATH.match(value.strip()):
         from django.utils.module_loading import import_string
 
         try:
-            return import_string(value)
-        except ImportError:
-            logger.debug("aforo: %r is not an importable resolver; using it as a fixed customer id", value)
-            return value
+            return import_string(value.strip())
+        except ImportError as exc:
+            raise ValueError(
+                f"aforo.middleware.django: settings.{setting} = {value!r} looks like a dotted path to a "
+                f"customer resolver but does not import ({exc}). Fix the path, or pass a callable."
+            ) from exc
     return value
 
 
@@ -88,11 +99,13 @@ class AforoMeteringMiddleware:
         self._product_type = resolve_product_type(
             getattr(settings, "AFORO_PRODUCT_TYPE", os.environ.get("AFORO_PRODUCT_TYPE"))
         )
+        setting = "AFORO_CUSTOMER_RESOLVER"
         resolver = getattr(settings, "AFORO_CUSTOMER_RESOLVER", None)
         if resolver is None:
+            setting = "AFORO_CUSTOMER_ID"
             resolver = getattr(settings, "AFORO_CUSTOMER_ID", None)
         self._customer = customer_lookup(
-            _load(resolver),
+            _load(resolver, setting),
             bool(getattr(settings, "AFORO_TRUST_CUSTOMER_HEADER", False)),
             _header_customer,
             integration="aforo.middleware.django.AforoMeteringMiddleware (settings.AFORO_CUSTOMER_RESOLVER)",
@@ -121,7 +134,7 @@ class AforoMeteringMiddleware:
 
             if is_preflight(request.method):
                 return response
-            if any(path.startswith(p) for p in self._exclude_paths):
+            if is_excluded(path, self._exclude_paths):
                 return response
             if status_code in self._exclude_status_codes:
                 return response

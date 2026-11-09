@@ -5,6 +5,9 @@ import com.aforo.metering.AforoOptions;
 import com.aforo.metering.PathNormalizer;
 import com.aforo.metering.RequestLabels;
 import com.aforo.metering.TrackEvent;
+import jakarta.servlet.AsyncEvent;
+import jakarta.servlet.AsyncListener;
+import jakarta.servlet.DispatcherType;
 import jakarta.servlet.Filter;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.FilterConfig;
@@ -26,15 +29,19 @@ import java.util.logging.Logger;
  * Servlet filter that captures API usage events after each request.
  *
  * <p>Runs AFTER {@code filterChain.doFilter()} returns — the response has
- * already been committed, so this adds zero latency to the API call.</p>
+ * already been committed, so this adds zero latency to the API call. An async
+ * request (DeferredResult, Callable, {@code startAsync}) is metered when it
+ * completes, with its final status and duration. A request whose handler throws
+ * is metered with status 500 and the exception is rethrown. Only the REQUEST
+ * dispatch is metered, so an ASYNC or ERROR re-dispatch never counts twice.</p>
  *
  * <h2>Metric</h2>
  * Each request is recorded against {@link Builder#metricName(String) a fixed metric}
  * (default {@value #DEFAULT_METRIC_NAME}) or the result of a
  * {@link Builder#metricNameResolver(MetricNameResolver) resolver}. The metric must exist
- * in the tenant's Aforo catalog: the ingestor rejects unknown metrics, and
- * because it validates a batch as a whole, one such event fails the entire
- * batch. The old default, {@code "METHOD /path"}, is a name no catalog contains.
+ * in the tenant's Aforo catalog: the ingestor rejects each event that names an
+ * unknown metric (events are checked one by one, so the rest of the batch is
+ * stored). The old default, {@code "METHOD /path"}, is a name no catalog contains.
  *
  * <h2>Customer</h2>
  * The customer id must come from an identity you trust. Build the filter with a
@@ -86,13 +93,19 @@ public class AforoServletFilter implements Filter {
     private static final List<String> DEFAULT_EXCLUDE_PATHS = List.of(
             "/health", "/ready", "/metrics", "/favicon.ico", "/actuator");
 
-    /** Derives the metric name for a request. Returning null/blank uses the fixed metric name. */
+    /**
+     * Derives the metric name for a request. Returning null/blank uses the fixed metric name.
+     * A resolver that throws drops that request's event as INVALID (counted, never thrown).
+     */
     @FunctionalInterface
     public interface MetricNameResolver {
         String resolve(HttpServletRequest request, HttpServletResponse response);
     }
 
-    /** Derives the Aforo customer id for a request from your authentication. Null/blank: the event is dropped as INVALID. */
+    /**
+     * Derives the Aforo customer id for a request from your authentication. Null/blank, or an
+     * exception: the event is dropped as INVALID and counted; the request is served as usual.
+     */
     @FunctionalInterface
     public interface CustomerIdResolver {
         String resolve(HttpServletRequest request);
@@ -145,7 +158,12 @@ public class AforoServletFilter implements Filter {
             this.client = client;
         }
 
-        /** Path prefixes never metered. Default: /health, /ready, /metrics, /favicon.ico, /actuator. */
+        /**
+         * Paths never metered. Default: /health, /ready, /metrics, /favicon.ico, /actuator. Each
+         * entry {@code p} matches {@code p} and everything under {@code p + "/"}, on the path
+         * without the context path: {@code /health} excludes {@code /health/live}, not
+         * {@code /healthcare}.
+         */
         public Builder excludePaths(List<String> excludePaths) {
             this.excludePaths = excludePaths == null ? List.of() : excludePaths;
             return this;
@@ -243,43 +261,179 @@ public class AforoServletFilter implements Filter {
     public void doFilter(ServletRequest servletRequest, ServletResponse servletResponse,
                          FilterChain filterChain) throws IOException, ServletException {
 
-        long startNanos = System.nanoTime();
-        filterChain.doFilter(servletRequest, servletResponse);
-        long responseTimeMs = (System.nanoTime() - startNanos) / 1_000_000L;
+        // Only the first (REQUEST) pass of a request is metered: an ASYNC or ERROR re-dispatch
+        // through this filter is the same billable call and must not be counted again.
+        if (!(servletRequest instanceof HttpServletRequest req)
+                || !(servletResponse instanceof HttpServletResponse res)
+                || !isRequestDispatch(req) || !shouldMeter(req)) {
+            filterChain.doFilter(servletRequest, servletResponse);
+            return;
+        }
 
-        // After response — capture event (non-blocking, fire-and-forget)
+        long startNanos = System.nanoTime();
         try {
-            if (!(servletRequest instanceof HttpServletRequest req)
-                    || !(servletResponse instanceof HttpServletResponse res)) {
+            filterChain.doFilter(servletRequest, servletResponse);
+        } catch (IOException | ServletException | RuntimeException | Error e) {
+            // The handler failed: the container answers 500 (unless the response was already sent).
+            int status = res.isCommitted() ? res.getStatus() : HttpServletResponse.SC_INTERNAL_SERVER_ERROR;
+            meter(req, res, startNanos, status, resolveCustomerSafely(req));
+            throw e;
+        }
+
+        if (isAsyncStarted(req)) {
+            // The handler returned but the response is written later (DeferredResult, Callable,
+            // startAsync): meter when the exchange completes, with its real status and duration.
+            // The customer is resolved now, on the request thread, where the caller's security
+            // context still is.
+            Resolved customer = resolveCustomerSafely(req);
+            try {
+                req.getAsyncContext().addListener(new CompletionListener(req, res, startNanos, customer));
+                return;
+            } catch (RuntimeException e) {
+                LOG.log(java.util.logging.Level.FINE, "[aforo] could not watch the async request; metering it now", e);
+                meter(req, res, startNanos, res.getStatus(), customer);
+                return;
+            }
+        }
+        meter(req, res, startNanos, res.getStatus(), resolveCustomerSafely(req));
+    }
+
+    /** Meters an async request once, when it completes (after a timeout or an error too). */
+    private final class CompletionListener implements AsyncListener {
+        private final HttpServletRequest req;
+        private final HttpServletResponse res;
+        private final long startNanos;
+        private final Resolved customer;
+        private final java.util.concurrent.atomic.AtomicBoolean done = new java.util.concurrent.atomic.AtomicBoolean();
+
+        CompletionListener(HttpServletRequest req, HttpServletResponse res, long startNanos, Resolved customer) {
+            this.req = req;
+            this.res = res;
+            this.startNanos = startNanos;
+            this.customer = customer;
+        }
+
+        @Override
+        public void onComplete(AsyncEvent event) {
+            if (done.compareAndSet(false, true)) meter(req, res, startNanos, res.getStatus(), customer);
+        }
+
+        @Override public void onTimeout(AsyncEvent event) { }
+        @Override public void onError(AsyncEvent event) { }
+
+        @Override
+        public void onStartAsync(AsyncEvent event) {
+            // A re-dispatch started async again: listeners must re-register to hear the end.
+            if (event.getAsyncContext() != null) event.getAsyncContext().addListener(this);
+        }
+    }
+
+    /** The customer id, or why the resolver could not give one. */
+    private record Resolved(String customerId, String failure) { }
+
+    private Resolved resolveCustomerSafely(HttpServletRequest req) {
+        try {
+            return new Resolved(extractCustomerId(req), null);
+        } catch (RuntimeException e) {
+            return new Resolved(null, "customerIdResolver threw " + e.getClass().getName());
+        }
+    }
+
+    /** Records one event; never throws. A resolver failure is counted as an INVALID drop. */
+    private void meter(HttpServletRequest req, HttpServletResponse res, long startNanos, int status, Resolved customer) {
+        long responseTimeMs = (System.nanoTime() - startNanos) / 1_000_000L;
+        try {
+            String path = req.getRequestURI();
+            String metric;
+            String failure = customer.failure();
+            try {
+                metric = resolveMetricName(req, res);
+            } catch (RuntimeException e) {
+                metric = null;
+                if (failure == null) failure = "metricNameResolver threw " + e.getClass().getName();
+            }
+            if (failure != null) {
+                // Counted and reported by the client as INVALID (no customer / no metric), never thrown.
+                warnResolverFailure(failure);
+                client.track(TrackEvent.builder(customer.customerId(), metric).quantity(1).build());
                 return;
             }
 
-            // CORS preflights are browser protocol, not billable calls, and carry
-            // no credentials -- so they never have a customer.
-            if ("OPTIONS".equalsIgnoreCase(req.getMethod())) return;
-
-            String path = req.getRequestURI();
-
-            // Check exclusions
-            if (excludePaths.stream().anyMatch(path::startsWith)) return;
-
             // A request with no customer is reported (INVALID) by the client, never blocked.
-            String customerId = extractCustomerId(req);
-
-            client.track(TrackEvent.builder(customerId, resolveMetricName(req, res))
+            client.track(TrackEvent.builder(customer.customerId(), metric)
                     .quantity(1)
                     .productType(productType)
                     .endpointPath(endpointPath(req, path))
                     .httpMethod(bounded("httpMethod", req.getMethod(), MAX_HTTP_METHOD_LENGTH))
-                    .statusCode(res.getStatus())
+                    .statusCode(status)
                     .responseTimeMs(responseTimeMs)
-                    .metadata(Map.of("gateway", "java-servlet", "status", res.getStatus()))
+                    .metadata(Map.of("gateway", "java-servlet", "status", status))
                     .build());
-
         } catch (Exception e) {
             // Never let metering affect the API, but log for debugging
-            java.util.logging.Logger.getLogger(AforoServletFilter.class.getName())
-                    .log(java.util.logging.Level.FINE, "Metering capture failed", e);
+            LOG.log(java.util.logging.Level.FINE, "Metering capture failed", e);
+        }
+    }
+
+    private final java.util.concurrent.atomic.AtomicLong resolverFailures = new java.util.concurrent.atomic.AtomicLong();
+
+    private void warnResolverFailure(String failure) {
+        long n = resolverFailures.incrementAndGet();
+        if (n == 1 || n % 1000 == 0) {
+            LOG.warning("[aforo] " + failure + "; the request was served and its event is dropped as INVALID ("
+                    + n + " so far).");
+        }
+    }
+
+    /**
+     * An excluded path {@code p} matches the path itself or anything under {@code p + "/"},
+     * compared on the path inside the application (the context path removed): {@code /health}
+     * excludes {@code /health} and {@code /health/live}, not {@code /healthcare}.
+     */
+    private boolean isExcluded(HttpServletRequest req, String requestUri) {
+        if (requestUri == null) return false;
+        String path = requestUri;
+        String contextPath = req.getContextPath();
+        if (contextPath != null && !contextPath.isEmpty() && path.startsWith(contextPath)) {
+            path = path.substring(contextPath.length());
+            if (path.isEmpty()) path = "/";
+        }
+        for (String p : excludePaths) {
+            if (p == null || p.isEmpty()) continue;
+            String prefix = p.endsWith("/") ? p : p + "/";
+            if (path.equals(prefix.substring(0, prefix.length() - 1)) || path.startsWith(prefix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** OPTIONS and excluded paths are never metered (and their customer is never resolved). */
+    private boolean shouldMeter(HttpServletRequest req) {
+        try {
+            // CORS preflights are browser protocol, not billable calls, and carry
+            // no credentials -- so they never have a customer.
+            if ("OPTIONS".equalsIgnoreCase(req.getMethod())) return false;
+            return !isExcluded(req, req.getRequestURI());
+        } catch (RuntimeException e) {
+            return true;
+        }
+    }
+
+    private static boolean isRequestDispatch(HttpServletRequest req) {
+        try {
+            DispatcherType type = req.getDispatcherType();
+            return type == null || type == DispatcherType.REQUEST;
+        } catch (RuntimeException e) {
+            return true;
+        }
+    }
+
+    private static boolean isAsyncStarted(HttpServletRequest req) {
+        try {
+            return req.isAsyncStarted();
+        } catch (RuntimeException e) {
+            return false;
         }
     }
 

@@ -2,7 +2,7 @@
 
 Server interceptors that meter every gRPC call — unary and streaming — and ship one billing event per RPC to Aforo. Service, method, gRPC status code, call type, and duration are captured for you; streaming handlers can report exact message counts manually.
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 Reach for this when you bill a gRPC service per call (or per status/method tier) and want the interceptors to do the counting, with a `Record()` escape hatch for streaming RPCs where you care about the exact number of messages sent.
 
@@ -13,7 +13,7 @@ Reach for this when you bill a gRPC service per call (or per status/method tier)
 go get github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc/v2
 ```
 
-The import path ends in `/v2` (version 2 changed the public API; see the [changelog](CHANGELOG.md)). Releases are git tags `aforo-metering-sdks/go-grpc/v2.X.Y` on github.com/aforoai/SDKs. Until the `v2.0.0` tag exists, build against a local checkout with a `replace`:
+The import path ends in `/v2` (version 2 changed the public API; see the [changelog](CHANGELOG.md)). Releases are git tags `aforo-metering-sdks/go-grpc/v2.X.Y` on github.com/aforoai/SDKs. Until the `v2.1.0` tag exists, build against a local checkout with a `replace`:
 
 ```bash
 git clone https://github.com/aforoai/SDKs.git
@@ -21,7 +21,7 @@ git clone https://github.com/aforoai/SDKs.git
 
 ```go
 // go.mod (your service)
-require github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc/v2 v2.0.0
+require github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc/v2 v2.1.1
 
 replace github.com/aforoai/SDKs/aforo-metering-sdks/go-grpc/v2 => ../SDKs/aforo-metering-sdks/go-grpc
 ```
@@ -73,7 +73,7 @@ func main() {
 }
 ```
 
-Each call emits one event with `metricName` `"grpc_api.rpc_calls"`. The customer comes from `CustomerResolver`, which you write from identity your server authenticated. `New` returns `ErrNoCustomerResolver` without a resolver unless you set `TrustCustomerHeader: true`, which bills the customer named in the `x-customer-id` metadata (or `CustomerMetadataKey`) — your callers control metadata, so use it only behind a proxy that sets it and strips client values. A call whose resolver returns `""` is served as usual but not billed: it is counted as `invalid`.
+Each call emits one event with `metricName` `"grpc_api.rpc_calls"`. The customer comes from `CustomerResolver`, which you write from identity your server authenticated. `New` returns `ErrNoCustomerResolver` without a resolver unless you set `TrustCustomerHeader: true`, which bills the customer named in the `x-customer-id` metadata (or `CustomerMetadataKey`) — your callers control metadata, so use it only behind a proxy that sets it and strips client values. A call whose resolver returns `""`, or panics, is served as usual but not billed: it is counted as `invalid` (the panic never reaches the RPC).
 
 Unary calls record `messageCount = 1`. Streams record the messages they actually carried: `messageCount` is received + sent, and metadata adds `messagesReceived` and `messagesSent`.
 
@@ -84,7 +84,7 @@ billing.Record(ctx, "GetUser", "UNARY", 1, err, durationMs,
 	grpcmetering.EventOptions{ProductType: "AGENTIC_API"})
 ```
 
-How events are sent: every `Record`/`Open`/`Close` call appends to a bounded queue (`MaxQueueSize`, default 10 000) and returns; it never starts a goroutine or makes a request. One background sender per `Billing` posts `{"events":[...]}` to `/v1/ingest/batch` in batches of up to `FlushCount` (default 500, at most 1000), with `X-API-Key` and `User-Agent: aforo-go-grpc/2.0.0`. Network errors, timeouts, `408`, `429` and `5xx` are retried with full-jitter backoff; `Retry-After` is honoured in both forms (seconds or HTTP date) up to 60 s. Each request, including reading the response body, is cut off at `Timeout`. Redirects are never followed (the API key must not reach another host): a `3xx` is logged at ERROR with the target host and handled like an outage. When retries run out — or the ingestor answers `401`/`403` or `3xx` — the batch goes back to the front of the queue with the same idempotency keys and the sender pauses (a random wait up to 5 s, doubling to 5 min, at least 250 ms); nothing is dropped and the ingestor deduplicates the resend. Events a `2xx` names in `errors[]` with `retryable: true` are resent after the same backoff, at most `MaxRetries` times, then handled as an outage. `413` splits the batch; any other `4xx` drops it as `rejected` and reports it via `OnError`. `Shutdown(ctx)` keeps sending — and retrying an unreachable ingestor — until the earlier of `ctx`'s deadline and `ShutdownTimeout` (5 s) and reports the rest as `shutdown` (see [Dropped events](#dropped-events)).
+How events are sent: every `Record`/`Open`/`Close` call appends to a bounded queue (`MaxQueueSize`, default 10 000) and returns; it never starts a goroutine or makes a request. One background sender per `Billing` posts `{"events":[...]}` to `/v1/ingest/batch` in batches of up to `FlushCount` (default 500, at most 1000), with `X-API-Key` and `User-Agent: aforo-go-grpc/2.1.1`. Network errors, timeouts, `408`, `429` and `5xx` are retried with full-jitter backoff; `Retry-After` is honoured in both forms (seconds or HTTP date) up to 60 s. Each request, including reading the response body, is cut off at `Timeout`. Redirects are never followed (the API key must not reach another host): a `3xx` is logged at ERROR with the target host and handled like an outage. When retries run out — or the ingestor answers `401`/`403` or `3xx` — the batch goes back to the front of the queue with the same idempotency keys and the sender pauses (a random wait up to 5 s, doubling to 5 min, at least 250 ms); nothing is dropped and the ingestor deduplicates the resend. Events a `2xx` names in `errors[]` with `retryable: true` are resent after the same backoff, at most `MaxRetries` times, then handled as an outage. `413` splits the batch; any other `4xx` drops it as `rejected` and reports it via `OnError`. `Shutdown(ctx)` keeps sending — and retrying an unreachable ingestor — until the earlier of `ctx`'s deadline and `ShutdownTimeout` (5 s) and reports the rest as `shutdown` (see [Dropped events](#dropped-events)).
 
 ## Configuration
 

@@ -2,7 +2,7 @@
 
 Track API usage from any Java service and let Aforo handle batching, retry, and delivery. Drop in a Spring Boot servlet filter to meter every request automatically, or call `AforoClient.track(...)` by hand when you decide what counts.
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -12,7 +12,7 @@ Intended (once published to Maven Central):
 <dependency>
   <groupId>ai.aforo</groupId>
   <artifactId>metering</artifactId>
-  <version>2.0.0</version>
+  <version>2.1.1</version>
 </dependency>
 ```
 
@@ -79,7 +79,7 @@ AforoServletFilter.CustomerIdResolver aforoCustomerIdResolver() {
 
 Without a `CustomerIdResolver` bean, `aforo.use-principal-as-customer-id: true` (the principal name is the Aforo customer id) or `aforo.trust-customer-header: true` (a gateway in front of the app sets `X-Customer-Id`), the application fails to start with a message saying so.
 
-The filter runs **after** the response is committed, so metering adds no latency to the API call. It records `aforo.metric-name` (default `api_calls`) or the result of an `AforoServletFilter.MetricNameResolver` bean. It resolves the customer from your `AforoServletFilter.CustomerIdResolver` bean, else the principal name when `aforo.use-principal-as-customer-id: true`, else the `X-Customer-Id` header (`aforo.customer-id-header`) only when `aforo.trust-customer-header: true`. The caller's `X-Api-Key` header is never used — it is a secret, not a customer id. A request with no customer is served as usual; its event is not sent and is reported as `INVALID`. `OPTIONS` (CORS preflight) requests are skipped. Outside Spring, build the filter with `AforoServletFilter.builder(client).customerIdResolver(...).build()`; `build()` throws when no customer source is set. Each event also carries top-level `endpointPath` (the matched route pattern, else the normalized path, without query string, at most 512 chars), `httpMethod`, `statusCode`, `responseTimeMs`, and `productType` (`AforoServletFilter.productType(...)`, else the client default).
+The filter runs **after** the response is committed, so metering adds no latency to the API call. An async request (`DeferredResult`, `Callable`, `startAsync`) is metered when it completes, with its final status and duration; a request whose handler throws is metered with status 500 (the exception still propagates). Only the first (REQUEST) dispatch is metered, so an ASYNC or ERROR re-dispatch never counts twice. It records `aforo.metric-name` (default `api_calls`) or the result of an `AforoServletFilter.MetricNameResolver` bean. It resolves the customer from your `AforoServletFilter.CustomerIdResolver` bean, else the principal name when `aforo.use-principal-as-customer-id: true`, else the `X-Customer-Id` header (`aforo.customer-id-header`) only when `aforo.trust-customer-header: true`. The caller's `X-Api-Key` header is never used — it is a secret, not a customer id. A request with no customer, or whose resolver throws, is served as usual; its event is not sent and is reported as `INVALID`. `OPTIONS` (CORS preflight) requests are skipped. Outside Spring, build the filter with `AforoServletFilter.builder(client).customerIdResolver(...).build()`; `build()` throws when no customer source is set. Each event also carries top-level `endpointPath` (the matched route pattern, else the normalized path, without query string, at most 512 chars), `httpMethod`, `statusCode`, `responseTimeMs`, and `productType` (`AforoServletFilter.productType(...)`, else the client default).
 
 > ⚠ The metric must exist in your tenant's Aforo catalog: the ingestor rejects events for an unknown metric, and they are dropped with reason `REJECTED` (see [Dropped events](#dropped-events)). Earlier versions recorded `"<METHOD> <normalized-path>"`, which no catalog contains.
 
@@ -91,14 +91,14 @@ The filter runs **after** the response is committed, so metering adds no latency
 
 | Option | Type | Default | What it does |
 |---|---|---|---|
-| `apiKey` | `String` | *(required)* | Sent as `X-API-Key: <apiKey>`. Blank throws `IllegalArgumentException`. |
+| `apiKey` | `String` | *(required)* | Sent as `X-API-Key: <apiKey>`. Surrounding whitespace (a trailing newline from a secret file) is trimmed. Blank, or whitespace / a control character inside the key, throws `IllegalArgumentException` (the message never contains the key). |
 | `baseUrl(...)` | `String` | `https://api.aforo.ai` | Ingestion host. The SDK appends `/v1/ingest/batch`. Must be `https://`; plain `http://` is accepted for `localhost`, `127.0.0.1` and `::1`, or with `allowInsecureHttp(true)`. |
 | `allowInsecureHttp(...)` | `boolean` | `false` | Accept a plain `http://` base URL on another host. The API key travels in every request. |
 | `productType(...)` | `String` | `API` | Sent as top-level `productType` on every event (required by the ingestor): `API`, `AGENTIC_API`, `AI_AGENT`, `MCP_SERVER`, `GRPC_API`, `GRAPHQL_API`, `WEBSOCKET_API`, `MQTT_BROKER`. Trimmed and uppercased; unknown values are passed through. Override per event with `TrackEvent.builder(...).productType(...)`. |
 | `flushCount(...)` | `int` | `500` | Queued events that wake the background thread; also the batch size. Clamped to 1–1000 (the ingestor's batch limit). A batch whose body would pass 4 MiB is split. |
 | `flushIntervalMs(...)` | `long` | `5000` | Background flush cadence in ms. |
 | `maxQueueSize(...)` | `int` | `10000` | Queue capacity. When full, the oldest event is evicted and reported as dropped (`OVERFLOW`). |
-| `maxRetries(...)` | `int` | `3` | Retries per request on a network error, timeout, 408, 429 or 5xx. |
+| `maxRetries(...)` | `int` | `3` | Retries per request on a network error, timeout, 408, 429 or 5xx. A 429 whose `X-RateLimit-Limit` (events per minute) is below the batch size instead puts the batch back in order and sends it in batches of at most that many after the `Retry-After` wait. |
 | `retryBaseMs(...)` | `long` | `500` | Base of the full-jitter backoff: each wait is random between 0 and `min(30 s, base × 2^attempt)`. `Retry-After` (seconds or HTTP-date) is honoured, up to 60 s. |
 | `breakerCooldownMs(...)` | `long` | `5000` | Pause after a batch fails every retry (or gets 401/403); doubles with jitter up to 5 minutes. The batch stays queued. |
 | `registerShutdownHook(...)` | `boolean` | `true` | Close the client from a JVM shutdown hook. The Spring auto-configuration turns it off. |
@@ -157,7 +157,7 @@ long lost = client.droppedCount();
 | `SHUTDOWN` | Still queued when `close()` reached `shutdownTimeoutMs`. |
 | `CLOSED` | `track(...)` was called after `close()`. |
 | `RETRY_EXHAUSTED` | Kept for compatibility; an outage no longer drops events. |
-| `INVALID` | No customer for a filtered request, or the event would be refused by the ingestor and was never queued: blank `customerId` or `metricName`, `quantity <= 0` (or NaN / infinite), `customerId` over 64 characters, `metricName` or `idempotencyKey` over 255, `productType` over 20, a `quantity` with more than 14 integer digits or 6 decimal places. Nothing passed to `track(...)` is truncated or rounded. |
+| `INVALID` | No customer for a filtered request (or a resolver that threw), or the event would be refused by the ingestor and was never queued: blank `customerId` or `metricName`, `quantity <= 0` (or NaN / infinite), `customerId` over 64 characters, `metricName` or `idempotencyKey` over 255, `productType` over 20, a `quantity` with more than 14 integer digits or 6 decimal places, an `occurredAt` that is not an ISO-8601 date-time with seconds and `Z` or a `+HH:MM` offset (the ingestor would refuse the whole batch it travels in). Nothing passed to `track(...)` is truncated or rounded. A `statusCode` outside a Java `short` or a `responseTimeMs` outside an `int` is left off the event, which is still sent (one warning per field). |
 
 The servlet filter is the one exception to "nothing is truncated": `endpointPath` (512 characters) and `httpMethod` (16) come from the incoming request, so an over-long value is cut to the limit and the event is still sent, with one `WARNING` per label. The customer id and metric name are never cut.
 

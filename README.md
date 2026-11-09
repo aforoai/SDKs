@@ -4,7 +4,7 @@
 
 Meter your product's usage and send it to Aforo for billing — in code with a language SDK, or with zero code at your API gateway. Everything in this repo is what you install to get usage events flowing into Aforo.
 
-> **Distribution status:** the Node SDKs are on npm under `@aforoai/*`, the Python SDKs on PyPI as `aforo-*`, and the Go modules are tagged in this repo; the Java SDKs (`ai.aforo`) are not on Maven Central yet, and the gateway plugins ship as tagged GitHub Releases. Do not install `1.0.0` of any SDK — it predates `executionStatus` and the response-envelope fix. Each package README names the minimum version and the from-source steps. The integration model below is stable.
+> **Distribution status:** the Node SDKs are on npm under `@aforoai/*`, the Python SDKs on PyPI as `aforo-*`, and the Java SDKs on Maven Central as `ai.aforo:*`, and the Go modules are tagged in this repo; the gateway plugins ship as tagged GitHub Releases. Do not install `1.0.0` of any SDK — it predates `executionStatus` and the response-envelope fix. Each package README names the minimum version and the from-source steps. The integration model below is stable.
 
 ---
 

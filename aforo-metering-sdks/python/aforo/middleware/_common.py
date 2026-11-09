@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any, Callable, Optional, Union
 
@@ -10,15 +11,16 @@ from ..limits import truncate_label
 
 logger = logging.getLogger("aforo.middleware")
 
-NO_CUSTOMER = "no customer for this request (the customer resolver returned nothing)"
+NO_CUSTOMER = "no customer for this request (the customer resolver returned nothing or raised)"
 
 DEFAULT_METRIC_NAME = "api_calls"
 """Metric recorded per request when ``metric_name`` is not configured.
 
 It must exist in the tenant's Aforo metric catalog: the ingestor rejects an
-unknown metric, and because it validates a batch as a whole, one such event
-fails the entire batch with 400. The previous default, ``"METHOD /path"``, is a
-name no catalog contains, so every event failed out of the box.
+unknown metric. It checks each event on its own, so only that event is lost,
+and the refusal arrives on a background flush where no caller sees it. The
+previous default, ``"METHOD /path"``, is a name no catalog contains, so every
+event failed out of the box.
 """
 
 DEFAULT_PRODUCT_TYPE = "API"
@@ -67,11 +69,46 @@ def customer_lookup(
                             untrusted_source="the X-Customer-Id request header")
 
     def lookup(request: Any) -> Optional[str]:
-        if resolver is not None:
-            return clean_customer_id(resolver(request))
-        return clean_customer_id(header_reader(request))
+        # A resolver that raises means "no customer": the request is served,
+        # not metered, and counted as an ``invalid`` drop by the caller.
+        try:
+            if resolver is not None:
+                return clean_customer_id(resolver(request))
+            return clean_customer_id(header_reader(request))
+        except Exception:
+            logger.warning("aforo: %s: the customer resolver raised; the request is not metered "
+                           "and is counted as an invalid drop", integration, exc_info=True)
+            return None
 
     return lookup
+
+
+def is_excluded(path: str, prefixes: Any) -> bool:
+    """True when ``path`` is one of ``prefixes`` or lies below one of them, on a
+    path-segment boundary: ``/health`` excludes ``/health`` and ``/health/db``,
+    never ``/healthcare``."""
+    for prefix in prefixes or ():
+        if not isinstance(prefix, str) or not prefix:
+            continue
+        base = prefix.rstrip("/")
+        if not base:  # "/" excludes everything
+            return True
+        if path == base or path.startswith(base + "/"):
+            return True
+    return False
+
+
+def call_flexible(fn: Callable[..., Any], *args: Any) -> Any:
+    """Call ``fn`` with as many of ``args`` as it accepts (``fn(request)`` or
+    ``fn(request, response)``)."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return fn(*args)
+    if any(p.kind is p.VAR_POSITIONAL for p in params):
+        return fn(*args)
+    positional = [p for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+    return fn(*args[:max(1, len(positional))])
 
 
 def resolve_product_type(product_type: Optional[str]) -> str:
@@ -105,7 +142,7 @@ def http_fields(
 
 
 def is_billable_quantity(quantity: Any) -> bool:
-    """The ingestor rejects quantity <= 0 (and fails the whole batch), so skip it."""
+    """The ingestor rejects an event with quantity <= 0, so skip it."""
     try:
         return quantity is not None and not isinstance(quantity, bool) and float(quantity) > 0
     except (TypeError, ValueError):

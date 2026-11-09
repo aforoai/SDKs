@@ -1,6 +1,6 @@
 # ai.aforo:ws-metering — User Guide
 
-**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Java engineers running a WebSocket server (Jakarta WebSocket, Spring WebSocket, Netty, Undertow) who need connection/frame/byte metering.
+**Version:** 2.1.1 · **Updated:** 2026-10-26 · **Audience:** Java engineers running a WebSocket server (Jakarta WebSocket, Spring WebSocket, Netty, Undertow) who need connection/frame/byte metering.
 
 ## What you'll build
 
@@ -27,7 +27,7 @@ Add to your service's `pom.xml`:
 <dependency>
   <groupId>ai.aforo</groupId>
   <artifactId>ws-metering</artifactId>
-  <version>2.0.0</version>
+  <version>2.1.1</version>
 </dependency>
 ```
 

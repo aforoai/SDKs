@@ -33,7 +33,7 @@ import java.util.logging.Logger;
 public final class AforoWsBilling implements AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(AforoWsBilling.class.getName());
-    private static final String SDK_VERSION = "2.1.0";
+    private static final String SDK_VERSION = "2.1.1";
     private static final int MAX_IDEMPOTENCY_KEY = 255;
     /** Default top-level {@code productType}; override with {@link Builder#productType(String)}. */
     public static final String DEFAULT_PRODUCT_TYPE = "WEBSOCKET_API";
@@ -45,6 +45,13 @@ public final class AforoWsBilling implements AutoCloseable {
     private final boolean perFrameEvents;
 
     private final ConcurrentHashMap<String, ConnectionState> active = new ConcurrentHashMap<>();
+    /**
+     * Connections the idle sweep closed, so their next frame can track them again (R8). Bounded:
+     * the oldest is forgotten past {@link #MAX_SWEPT_REMEMBERED}. Guarded by itself.
+     */
+    private final java.util.LinkedHashMap<String, ConnectionState> swept = new java.util.LinkedHashMap<>();
+    /** How many idle-swept connections are remembered for resumption. */
+    static final int MAX_SWEPT_REMEMBERED = 10_000;
     private final BiConsumer<java.util.List<Map<String, Object>>, DropReason> onDrop;
     private final java.util.function.Consumer<MeteringError> onError;
     private final BiConsumer<Map<String, Object>, java.util.List<Map<String, Object>>> onAccepted;
@@ -181,6 +188,7 @@ public final class AforoWsBilling implements AutoCloseable {
                             String executionStatus) {
         if (connectionId == null) return;
         ConnectionState s = active.get(connectionId);
+        if (s == null) s = resumeSwept(connectionId);
         if (s == null) return;
         s.frames.incrementAndGet();
         s.bytes.addAndGet(bytes);
@@ -211,11 +219,52 @@ public final class AforoWsBilling implements AutoCloseable {
         closeTracked(connectionId, closeCode, null, executionStatus);
     }
 
+    /**
+     * A frame on a connection the idle sweep closed while the socket stayed open: track it again
+     * from now, so its frames and bytes are metered and its eventual close is reported. No second
+     * CONNECTION_OPENED is sent (the connection was opened once); the events after resumption
+     * carry metadata {@code resumedAfterIdleSweep: true}.
+     */
+    private ConnectionState resumeSwept(String connectionId) {
+        lifecycle.readLock().lock();
+        try {
+            if (closing) return null;
+            ConnectionState old;
+            synchronized (swept) {
+                old = swept.remove(connectionId);
+            }
+            if (old == null) return null;
+            Map<String, Object> meta = new HashMap<>(old.metadata == null ? Map.of() : old.metadata);
+            meta.put("resumedAfterIdleSweep", true);
+            ConnectionState fresh = new ConnectionState(old.customerId, clock.getAsLong(), meta);
+            ConnectionState raced = active.putIfAbsent(connectionId, fresh);
+            return raced != null ? raced : fresh;
+        } finally {
+            lifecycle.readLock().unlock();
+        }
+    }
+
     /** Emits CONNECTION_CLOSED once per connection; {@code closedBy} names an SDK-initiated close. */
     private void closeTracked(String connectionId, int closeCode, String closedBy, String executionStatus) {
         if (connectionId == null) return;
         ConnectionState s = active.remove(connectionId);
-        if (s == null) return;
+        if (s == null) {
+            // Closed by the app after the idle sweep already reported it: nothing more to resume.
+            synchronized (swept) {
+                swept.remove(connectionId);
+            }
+            return;
+        }
+        if ("sdk_idle_timeout".equals(closedBy)) {
+            synchronized (swept) {
+                swept.put(connectionId, s);
+                if (swept.size() > MAX_SWEPT_REMEMBERED) {
+                    java.util.Iterator<String> it = swept.keySet().iterator();
+                    it.next();
+                    it.remove();
+                }
+            }
+        }
         long durationMs = clock.getAsLong() - s.startMs;
         String reason = mapCloseReason(closeCode);
         Map<String, Object> meta = new HashMap<>(s.metadata == null ? Map.of() : s.metadata);

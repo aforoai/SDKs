@@ -121,6 +121,9 @@ func (c Config) GoString() string { return c.String() }
 // String never prints the API key.
 func (b *Billing) String() string { return "mqttmetering.Billing{" + b.cfg.String() + "}" }
 
+// GoString never prints the API key (%#v).
+func (b *Billing) GoString() string { return b.String() }
+
 // newTransport builds the transport core from Config. It enforces https
 // (http only for localhost, 127.0.0.1, ::1 or with AllowInsecureHTTP).
 func newTransport(cfg Config) (*ingest.Client, error) {
@@ -167,13 +170,26 @@ func (b *Billing) push(event map[string]any) {
 	if event == nil {
 		return
 	}
+	ev, ok := b.encode(event)
+	if !ok {
+		return
+	}
+	_ = b.tp.Enqueue(ev)
+}
+
+// encode checks and serializes a resolved event. An integer field that does
+// not fit the ingestor's short/int is left off (WARN-logged once per field):
+// sent as it is, it would fail the whole batch. An event that cannot be
+// serialized is dropped as DropInvalid and ok is false.
+func (b *Billing) encode(event map[string]any) (ingest.Event, bool) {
+	b.tp.FitIntFields(event)
 	key, _ := event["idempotencyKey"].(string)
 	body, err := json.Marshal(event)
 	if err != nil {
 		b.dropInvalid(event, "event cannot be serialized: "+err.Error())
-		return
+		return ingest.Event{}, false
 	}
-	_ = b.tp.Enqueue(ingest.Event{Key: key, Body: body, Ref: event})
+	return ingest.Event{Key: key, Body: body, Ref: event}, true
 }
 
 // Flush sends everything queued and waits, or until ctx ends. During an

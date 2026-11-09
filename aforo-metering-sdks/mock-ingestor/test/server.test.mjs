@@ -206,6 +206,22 @@ test('redirect, stalled-body and dripped-body faults', async () => {
   assert.equal((await state()).requests.at(-1).status, -3);
 });
 
+test('opt-in rateLimit fault: 429 + X-RateLimit-Limit only for requests over the limit', async () => {
+  await faults([{ rateLimit: 2, retryAfter: '1', times: -1 }]);
+  const big = await post([event(1), event(2), event(3)]);
+  assert.equal(big.status, 429);
+  assert.equal(big.headers.get('x-ratelimit-limit'), '2');
+  assert.equal(big.headers.get('retry-after'), '1');
+  const small = await post([event(1), event(2)]);
+  assert.equal(small.status, 202);
+  const s = await state();
+  assert.equal(s.acceptedCount, 2);
+  assert.equal(s.faultsRemaining, 1, 'an endless rateLimit fault stays queued');
+  await fetch(`${mock.url}/__control/faults`, { method: 'DELETE' });
+  // Without the fault nothing changes: a 3-event batch is accepted.
+  assert.equal((await post([event(4), event(5), event(6)])).status, 202);
+});
+
 test('maxInFlight records concurrent ingest requests', async () => {
   await faults([{ delayMs: 100, times: 3 }]);
   await Promise.all([post([event(1)]), post([event(2)]), post([event(3)])]);

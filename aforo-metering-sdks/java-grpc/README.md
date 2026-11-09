@@ -1,8 +1,8 @@
 # ai.aforo:grpc-metering
 
-Meter every RPC on a `grpc-java` server without editing your service implementations. Add one `ServerInterceptor` and each call — unary or streaming — emits a billing event with timing, status code, and call type.
+Meter every RPC on a `grpc-java` server without editing your service implementations. Add one `ServerInterceptor` and each call — unary or streaming — emits one billing event with timing, status code, and call type: also a call whose handler throws (metered as `UNKNOWN`) and one the client cancelled or let time out (metered as `CANCELLED` or `DEADLINE_EXCEEDED`, even when the handler later closes it with `OK`).
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -12,7 +12,7 @@ Intended (once published to Maven Central):
 <dependency>
   <groupId>ai.aforo</groupId>
   <artifactId>grpc-metering</artifactId>
-  <version>2.0.0</version>
+  <version>2.1.1</version>
 </dependency>
 ```
 

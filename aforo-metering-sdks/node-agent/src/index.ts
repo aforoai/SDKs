@@ -289,7 +289,7 @@ export interface AgentEventInput {
 
 const DEFAULT_ENDPOINT = 'https://api.aforo.ai/v1/ingest/batch';
 const DEFAULT_PRODUCT_TYPE = 'AI_AGENT';
-const SDK_VERSION = '2.1.0';
+const SDK_VERSION = '2.1.1';
 /** IngestUsageEventRequest @Size limits. */
 const LIMITS = {
   customerId: 64,
@@ -305,6 +305,39 @@ const LIMITS = {
 
 function clip(value: unknown): string {
   return String(value).slice(0, 80);
+}
+
+/** Largest value of a Java int: `executionDurationMs` and `stepNumber` are ints on the ingestor. */
+const MAX_JAVA_INT = 2_147_483_647;
+/** IngestUsageEventRequest `@Digits(integer = 14, fraction = 6)` on quantity. */
+const QUANTITY_INTEGER_DIGITS = 14;
+const QUANTITY_FRACTION_DIGITS = 6;
+/** ISO-8601 instant with seconds and a zone (`Z` or `±HH:MM`), as the ingestor's Instant parser needs. */
+const OCCURRED_AT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/** Why caller-supplied metadata cannot be sent, or undefined when it is absent or a plain object. */
+function metadataProblem(value: unknown, field = 'metadata'): string | undefined {
+  if (value === undefined || value === null || isPlainObject(value)) return undefined;
+  return `${field} must be a plain object (got ${Array.isArray(value) ? 'an array' : typeof value})`;
+}
+
+/**
+ * The integer and fraction digit counts the ingestor sees for a JSON number,
+ * the way Java's BigDecimal reads it (precision - scale, scale).
+ */
+function quantityDigits(value: number): { integer: number; fraction: number } | null {
+  const m = /^(\d+)(?:\.(\d+))?(?:e([+-]?\d+))?$/i.exec(JSON.stringify(value));
+  if (!m) return null;
+  const fractionText = m[2] ?? '';
+  const unscaled = (m[1] + fractionText).replace(/^0+/, '') || '0';
+  const scale = fractionText.length - Number(m[3] ?? 0);
+  return { integer: unscaled.length - scale, fraction: Math.max(0, scale) };
 }
 
 function cryptoObj(): { randomUUID?: () => string; getRandomValues?: (a: Uint8Array) => Uint8Array } | undefined {
@@ -352,6 +385,8 @@ export class AgentSession {
   private seq = 0;
   private steps = 0;
   private ended = false;
+  /** @internal Set when startSession's metadata is not a plain object: every event is dropped as invalid. */
+  metadataProblem?: string;
 
   /** @internal — use {@link AforoAgent.startSession}. */
   constructor(
@@ -398,16 +433,19 @@ export class AgentSession {
       stepNumber,
       parentStepId: options.parentStepId,
     };
-    const meta = { ...(options.stepKind ? { stepKind: options.stepKind } : {}), ...(options.metadata || {}) };
-    this.client.enqueue(this, this.client.metricNames.steps, 1, { ...common, metadata: meta });
+    const problem = metadataProblem(options.metadata);
+    const userMeta = problem ? {} : (options.metadata || {});
+    const meta = { ...(options.stepKind ? { stepKind: options.stepKind } : {}), ...userMeta };
+    this.client.enqueue(this, this.client.metricNames.steps, 1, { ...common, metadata: meta, metadataProblem: problem });
     if (options.stepKind === 'TOOL_CALL') {
-      this.client.enqueue(this, this.client.metricNames.toolCalls, 1, { ...common, metadata: meta });
+      this.client.enqueue(this, this.client.metricNames.toolCalls, 1, { ...common, metadata: meta, metadataProblem: problem });
     }
     if (options.inputTokens || options.outputTokens) {
       this.client.enqueue(this, this.client.metricNames.tokens, (options.inputTokens || 0) + (options.outputTokens || 0), {
         capabilityName: options.capabilityName,
         stepNumber,
-        metadata: this.tokenMeta(options.modelName, options.inputTokens, options.outputTokens, undefined, options.metadata),
+        metadata: this.tokenMeta(options.modelName, options.inputTokens, options.outputTokens, undefined, userMeta),
+        metadataProblem: problem,
       });
     }
   }
@@ -427,9 +465,11 @@ export class AgentSession {
     outputTokens: number,
     options: RecordTokensOptions = {},
   ): Promise<void> {
+    const problem = metadataProblem(options.metadata);
     this.client.enqueue(this, this.client.metricNames.tokens, (inputTokens || 0) + (outputTokens || 0), {
       capabilityName: options.capabilityName,
-      metadata: this.tokenMeta(model, inputTokens, outputTokens, options.provider, options.metadata),
+      metadata: this.tokenMeta(model, inputTokens, outputTokens, options.provider, problem ? {} : options.metadata),
+      metadataProblem: problem,
     });
   }
 
@@ -445,7 +485,8 @@ export class AgentSession {
       capabilityName: options.capabilityName,
       executionStatus: options.executionStatus === undefined ? undefined : this.client.normalizeStatus(options.executionStatus),
       durationMs: options.durationMs,
-      metadata: options.metadata || {},
+      metadata: metadataProblem(options.metadata) ? {} : (options.metadata || {}),
+      metadataProblem: metadataProblem(options.metadata),
     });
   }
 
@@ -457,23 +498,25 @@ export class AgentSession {
   async end(options: EndSessionOptions = {}): Promise<FlushResult> {
     if (this.ended) return this.client.flush();
     this.ended = true;
+    const problem = metadataProblem(options.metadata);
     const meta = {
       stepCount: this.steps,
       ...(options.taskCompleted !== undefined ? { taskCompleted: options.taskCompleted } : {}),
       ...(options.errorMessage ? { errorMessage: String(options.errorMessage).slice(0, 500) } : {}),
-      ...(options.metadata || {}),
+      ...(problem ? {} : (options.metadata || {})),
     };
     if (options.taskCompleted) {
-      this.client.enqueue(this, this.client.metricNames.tasksCompleted, 1, { metadata: meta });
+      this.client.enqueue(this, this.client.metricNames.tasksCompleted, 1, { metadata: meta, metadataProblem: problem });
     }
     if (options.executionMinutes) {
-      this.client.enqueue(this, this.client.metricNames.executionMinutes, options.executionMinutes, { metadata: meta });
+      this.client.enqueue(this, this.client.metricNames.executionMinutes, options.executionMinutes, { metadata: meta, metadataProblem: problem });
     }
     this.client.enqueue(this, this.client.metricNames.sessions, 1, {
       executionStatus: options.taskCompleted === false ? 'FAILED' : 'SUCCESS',
       durationMs: Date.now() - this.startedAt,
       sessionBoundary: 'SESSION_END',
       metadata: meta,
+      metadataProblem: problem,
     });
     return this.client.flush();
   }
@@ -514,6 +557,8 @@ interface EnqueueExtras {
   parentStepId?: string;
   sessionBoundary?: 'SESSION_END';
   metadata: Record<string, unknown>;
+  /** Set when the caller's metadata was not a plain object: the event is dropped as invalid. */
+  metadataProblem?: string;
 }
 
 /**
@@ -528,6 +573,8 @@ export class AforoAgent {
   private readonly core: TransportCore<IngestEvent>;
   private readonly productType: string;
   private readonly logger: AforoLogger | null;
+  /** Warnings already logged (one per key for the life of the client). */
+  private readonly warned = new Set<string>();
 
   constructor(private readonly config: AforoAgentConfig) {
     if (!config || !config.apiKey) throw new Error('AforoAgent: apiKey is required');
@@ -577,12 +624,13 @@ export class AforoAgent {
   startSession(options: StartSessionOptions = {}): AgentSession {
     const agentId = (options.agentId ?? this.config.agentId ?? '').trim();
     const customerId = (options.customerId ?? this.config.customerId ?? '').trim();
+    const sessionMetaProblem = metadataProblem(options.metadata, 'startSession metadata');
     const meta: Record<string, unknown> = {
       ...(options.framework ? { framework: options.framework } : {}),
       ...(this.config.productId ? { productId: this.config.productId } : {}),
-      ...(options.metadata || {}),
+      ...(sessionMetaProblem ? {} : (options.metadata || {})),
     };
-    return new AgentSession(
+    const session = new AgentSession(
       this,
       agentId,
       options.sessionId || genSessionId(),
@@ -594,6 +642,8 @@ export class AforoAgent {
       options.modelName,
       meta,
     );
+    if (sessionMetaProblem) session.metadataProblem = sessionMetaProblem;
+    return session;
   }
 
   /**
@@ -618,10 +668,10 @@ export class AforoAgent {
       metadata: {
         ...(this.config.productId ? { productId: this.config.productId } : {}),
         ...(partial.eventType ? { eventType: partial.eventType } : {}),
-        ...(partial.properties || {}),
+        ...(metadataProblem(partial.properties) ? {} : (partial.properties || {})),
       },
     };
-    this.push(event);
+    this.push(event, metadataProblem(partial.properties, 'properties'));
   }
 
   /** @internal Build, validate and queue one event for a session. */
@@ -640,15 +690,40 @@ export class AforoAgent {
       ...(session.subscriptionId ? { subscriptionId: session.subscriptionId } : {}),
       ...(extras.capabilityName && extras.capabilityName.trim() ? { capabilityName: extras.capabilityName.trim() } : {}),
       ...(extras.executionStatus ? { executionStatus: extras.executionStatus } : {}),
-      ...(typeof extras.durationMs === 'number' && Number.isFinite(extras.durationMs) && extras.durationMs >= 0
-        ? { executionDurationMs: Math.round(extras.durationMs) }
-        : {}),
-      ...(extras.stepNumber !== undefined ? { stepNumber: extras.stepNumber } : {}),
+      ...this.intField('executionDurationMs', extras.durationMs),
+      ...this.intField('stepNumber', extras.stepNumber),
       ...(extras.parentStepId ? { parentStepId: extras.parentStepId } : {}),
       ...(extras.sessionBoundary ? { sessionBoundary: extras.sessionBoundary } : {}),
       metadata: { ...session.baseMetadata(), ...extras.metadata },
     };
-    this.push(event);
+    this.push(event, extras.metadataProblem ?? session.metadataProblem);
+  }
+
+  /**
+   * An int field of the ingestor (`executionDurationMs`, `stepNumber` are Java
+   * ints). A value it cannot hold would make the whole batch unreadable, so a
+   * negative, non-finite or over-2147483647 value is left off the event (the
+   * event is still sent) and logged once per field.
+   */
+  private intField(field: 'executionDurationMs' | 'stepNumber', value: unknown): Record<string, number> {
+    if (value === undefined || value === null) return {};
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      const n = Math.round(value);
+      if (n >= 0 && n <= MAX_JAVA_INT) return { [field]: n };
+    }
+    this.warnOnce(field, `${field} ${clip(value)} is not a whole number from 0 to ${MAX_JAVA_INT} (the ingestor's int field); `
+      + 'it is left off the event and the event is still sent. Logged once.');
+    return {};
+  }
+
+  private warnOnce(key: string, message: string): void {
+    if (this.warned.has(key)) return;
+    this.warned.add(key);
+    try {
+      this.logger?.warn(`[aforo-agent] ${message}`);
+    } catch {
+      /* a logger must never break metering */
+    }
   }
 
   /** @internal Trim/upper-case a status; blank → SUCCESS; unknown → dropped with a warning. */
@@ -692,8 +767,8 @@ export class AforoAgent {
     return this.core.queued;
   }
 
-  private push(event: IngestEvent): void {
-    const problem = describeInvalidEvent(event);
+  private push(event: IngestEvent, metadataError?: string): void {
+    const problem = metadataError ?? describeInvalidEvent(event);
     if (problem) {
       // Counted, logged (throttled) and reported by the core like every drop.
       this.core.reportDrop([event], 'invalid', `event "${clip(event.metricName)}" is invalid: ${problem}`);
@@ -747,6 +822,15 @@ function describeInvalidEvent(ev: IngestEvent): string | null {
   if (typeof ev.quantity !== 'number' || !Number.isFinite(ev.quantity) || ev.quantity <= 0) {
     return `quantity must be a number > 0 (got ${clip(ev.quantity)})`;
   }
+  const digits = quantityDigits(ev.quantity);
+  if (!digits || digits.integer > QUANTITY_INTEGER_DIGITS || digits.fraction > QUANTITY_FRACTION_DIGITS) {
+    return `quantity ${clip(ev.quantity)} has more than ${QUANTITY_INTEGER_DIGITS} integer digits or `
+      + `${QUANTITY_FRACTION_DIGITS} decimal places (the ingestor's limit); round it before recording`;
+  }
+  if (typeof ev.occurredAt !== 'string' || !OCCURRED_AT.test(ev.occurredAt)) {
+    return `occurredAt must be an ISO-8601 instant with seconds and a zone (got ${clip(ev.occurredAt)})`;
+  }
+  if (!isPlainObject(ev.metadata)) return 'metadata must be a plain object';
   for (const [field, max] of Object.entries(LIMITS)) {
     const v = (ev as unknown as Record<string, unknown>)[field];
     if (typeof v === 'string' && v.length > max) return `${field} "${clip(v)}" exceeds ${max} chars`;

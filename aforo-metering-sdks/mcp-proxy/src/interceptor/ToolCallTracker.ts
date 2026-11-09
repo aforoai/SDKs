@@ -10,7 +10,7 @@ import type { ParsedToolCall, ParsedToolResponse } from './MessageInterceptor.js
 import { generateIdempotencyKey, truncateToLimit } from '../util/idempotency.js';
 import { logger } from '../util/logger.js';
 import { PROXY_VERSION } from '../version.js';
-import { makeCustomerDecision, requireCustomerSource } from '../identity/customer.js';
+import { makeCustomerDecision, nonBlank, requireCustomerSource } from '../identity/customer.js';
 
 const STALE_CALL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 /** Most tool calls waiting for a response at once (G306). */
@@ -20,6 +20,10 @@ const MAX_CUSTOMER_ID = 64;
 const MAX_AGENT_ID = 36;
 const MAX_TOOL_NAME = 64;
 const MAX_SESSION_ID = 64;
+/** executionDurationMs is a Java int on the ingestor. */
+const MAX_JAVA_INT = 2_147_483_647;
+/** Agent id when neither the operator nor the client names a usable one. */
+const UNKNOWN_AGENT = 'unknown';
 
 /** Shorten an offending value for a log line. */
 function clip(value: unknown): string {
@@ -85,9 +89,17 @@ export interface ToolCallTrackerConfig {
 }
 
 export class ToolCallTracker {
-  /** Keyed by session + JSON-RPC id: ids are only unique within one client's
-   * session, so two sessions both sending id 1 must not overwrite each other. */
-  private readonly inFlight = new Map<string, InFlightCall>();
+  /**
+   * Every call waiting for its response, by a unique token, in arrival order
+   * (the first entry is the oldest). Calls are matched to responses by
+   * session + JSON-RPC id (`waiting`): ids are only unique within one
+   * client's session, and a client may even reuse an id while the first call
+   * is still running, so each session + id holds a FIFO queue of tokens and
+   * every call is metered exactly once.
+   */
+  private readonly inFlight = new Map<string, { key: string; call: InFlightCall }>();
+  private readonly waiting = new Map<string, string[]>();
+  private nextToken = 0;
   private readonly buffer: EventBuffer;
   private readonly heartbeat: HeartbeatEmitter;
   private readonly tenantId: string;
@@ -135,6 +147,62 @@ export class ToolCallTracker {
     return `${sessionId}\u0000${typeof requestId}:${requestId}`;
   }
 
+  /** Queue a waiting call under its session + id. */
+  private add(key: string, call: InFlightCall): void {
+    const token = `${key}\u0001${++this.nextToken}`;
+    this.inFlight.set(token, { key, call });
+    const queue = this.waiting.get(key);
+    if (queue) queue.push(token);
+    else this.waiting.set(key, [token]);
+  }
+
+  /** Take one waiting call for a session + id: the oldest (`'first'`) or the newest (`'last'`). */
+  private take(key: string, which: 'first' | 'last' = 'first'): InFlightCall | undefined {
+    const queue = this.waiting.get(key);
+    if (!queue || queue.length === 0) return undefined;
+    const token = which === 'first' ? queue.shift()! : queue.pop()!;
+    if (queue.length === 0) this.waiting.delete(key);
+    const entry = this.inFlight.get(token);
+    this.inFlight.delete(token);
+    return entry?.call;
+  }
+
+  /** Remove one waiting call by its token (stale sweep, cap, shutdown). */
+  private remove(token: string): InFlightCall | undefined {
+    const entry = this.inFlight.get(token);
+    if (!entry) return undefined;
+    this.inFlight.delete(token);
+    const queue = this.waiting.get(entry.key);
+    if (queue) {
+      const index = queue.indexOf(token);
+      if (index >= 0) queue.splice(index, 1);
+      if (queue.length === 0) this.waiting.delete(entry.key);
+    }
+    return entry.call;
+  }
+
+  /**
+   * The agent a call is billed to. The operator's `--agent-id` wins (it is
+   * the documented override); otherwise the client's `_meta.agent_id` when it
+   * is a usable string, else "unknown". A client value that is blank, not a
+   * string or over the ingestor's 36 characters falls back instead of
+   * dropping the call, so a client cannot leave its own call unmetered.
+   */
+  private resolveAgentId(call: ParsedToolCall): string {
+    const override = nonBlank(this.agentIdOverride);
+    if (override) return override;
+    const claimed = nonBlank(call.agentId);
+    if (!claimed) return UNKNOWN_AGENT;
+    if (claimed.length > MAX_AGENT_ID) {
+      if (!this.truncationWarned.has('clientAgentId')) {
+        this.truncationWarned.add('clientAgentId');
+        logger.warn(`_meta.agent_id was longer than the ingestor's ${MAX_AGENT_ID} characters; the call is metered as agent "${UNKNOWN_AGENT}" (logged once)`);
+      }
+      return UNKNOWN_AGENT;
+    }
+    return claimed;
+  }
+
   /**
    * Customer billed for a call, or undefined when no configured source names
    * one (the call then runs and its event is dropped as `invalid`). Order:
@@ -145,7 +213,7 @@ export class ToolCallTracker {
     const meta = call.meta ?? (call.customerId ? { customer_id: call.customerId } : undefined);
     return this.decideCustomer({
       toolName: call.toolName,
-      agentId: this.agentIdOverride ?? call.agentId,
+      agentId: this.resolveAgentId(call),
       sessionId,
       requestId: call.requestId,
       ...(meta ? { meta } : {}),
@@ -162,16 +230,18 @@ export class ToolCallTracker {
    * name); the idempotency key is derived from the full name.
    *
    * Returns false when the call's event would be rejected by the ingestor --
-   * agentId over 36 chars, customerId over 64 or sessionId over 64. The call
+   * no customer, a configured agentId over 36 chars, customerId over 64 or
+   * sessionId over 64 (a client's unusable `_meta.agent_id` falls back to the
+   * configured agent id or "unknown" instead). The call
    * is still tracked so its outcome is known, but when it completes its event
    * is not buffered or sent: it is counted as dropped, WARN-logged and passed
    * to onDrop with reason 'invalid'. Never throws.
    */
   trackRequest(call: ParsedToolCall, sessionId: string, principal?: Principal, resolvedCustomerId?: string): boolean {
-    const agentId = this.agentIdOverride ?? call.agentId;
+    const agentId = this.resolveAgentId(call);
     const customerId = resolvedCustomerId ?? this.resolveCustomerId(call, sessionId, principal) ?? '';
 
-    const toolName = this.requestLabel('toolName', call.toolName, MAX_TOOL_NAME);
+    const toolName = this.requestLabel('toolName', typeof call.toolName === 'string' && call.toolName ? call.toolName : 'unknown', MAX_TOOL_NAME);
 
     const problems: string[] = [];
     if (!customerId) problems.push('no customer: the configured customer source named none for this call');
@@ -180,11 +250,11 @@ export class ToolCallTracker {
     if (sessionId.length > MAX_SESSION_ID) problems.push(`sessionId "${clip(sessionId)}" exceeds ${MAX_SESSION_ID} chars`);
     const invalid = problems.length > 0 ? problems.join(', ') : undefined;
 
-    const key = ToolCallTracker.key(sessionId, call.requestId);
-    this.inFlight.delete(key);
-    this.inFlight.set(key, {
+    // A reused id joins the queue for that session + id: the earlier call keeps
+    // waiting and is metered when its own response arrives.
+    this.add(ToolCallTracker.key(sessionId, call.requestId), {
       toolName,
-      keyToolName: call.toolName,
+      keyToolName: typeof call.toolName === 'string' ? call.toolName : toolName,
       agentId,
       customerId,
       startTime: Date.now(),
@@ -214,10 +284,10 @@ export class ToolCallTracker {
    */
   private enforceInFlightCap(now: number = Date.now()): void {
     while (this.inFlight.size > this.maxInFlight) {
-      const oldest = this.inFlight.entries().next();
+      const oldest = this.inFlight.keys().next();
       if (oldest.done) return;
-      const [key, call] = oldest.value;
-      this.inFlight.delete(key);
+      const call = this.remove(oldest.value);
+      if (!call) return;
       logger.warn('Too many tool calls waiting for a response; metering the oldest as TIMEOUT', {
         maxInFlight: this.maxInFlight, requestId: call.requestId,
       });
@@ -253,11 +323,8 @@ export class ToolCallTracker {
    * Returns true if matched, false if response doesn't correspond to a tracked call.
    */
   trackResponse(response: ParsedToolResponse, sessionId: string): boolean {
-    const key = ToolCallTracker.key(sessionId, response.requestId);
-    const call = this.inFlight.get(key);
+    const call = this.take(ToolCallTracker.key(sessionId, response.requestId));
     if (!call) return false;
-
-    this.inFlight.delete(key);
 
     const durationMs = Date.now() - call.startTime;
     // hasError without an error object (older callers) still counts as a
@@ -266,6 +333,38 @@ export class ToolCallTracker {
     const status = this.resolveStatus(response.result, error);
     this.emit(call, sessionId, status, durationMs, response.responseBytes);
     return true;
+  }
+
+  /**
+   * The client cancelled a call (`notifications/cancelled`). The MCP spec says
+   * the server sends no response for it, so it is metered now as CANCELLED
+   * (once: a response that still arrives no longer matches). Returns false
+   * when no such call is waiting.
+   */
+  trackCancellation(requestId: unknown, sessionId: string): boolean {
+    if (typeof requestId !== 'string' && typeof requestId !== 'number') return false;
+    const call = this.take(ToolCallTracker.key(sessionId, requestId));
+    if (!call) return false;
+    this.emit(call, sessionId, 'CANCELLED', Date.now() - call.startTime);
+    return true;
+  }
+
+  /**
+   * The upstream never got or never answered a forwarded message (network
+   * error, timeout, or an HTTP error without a JSON-RPC response). Its calls
+   * did not run, so they are forgotten and nothing is billed for them; each
+   * id drops the call most recently tracked for it. Returns how many were
+   * forgotten.
+   */
+  forget(sessionId: string, requestIds: ReadonlyArray<string | number>): number {
+    let forgotten = 0;
+    for (const id of requestIds) {
+      if (this.take(ToolCallTracker.key(sessionId, id), 'last')) forgotten++;
+    }
+    if (forgotten > 0) {
+      logger.warn('The MCP server did not answer a forwarded request; its tool calls are not metered', { forgotten });
+    }
+    return forgotten;
   }
 
   private resolveStatus(result: unknown, error: JsonRpcError | undefined): string {
@@ -312,7 +411,7 @@ export class ToolCallTracker {
       agentId: call.agentId,
       sessionId,
       executionStatus: status,
-      executionDurationMs: durationMs,
+      ...this.durationField(durationMs),
       metadata: {
         productId: this.productId,
         transport: this.transport,
@@ -343,6 +442,20 @@ export class ToolCallTracker {
   }
 
   /**
+   * `executionDurationMs` is a Java int on the ingestor; a value it cannot hold
+   * (a response timeout set past ~24.8 days) would make the whole batch
+   * unreadable, so it is left off the event, which is still sent. Logged once.
+   */
+  private durationField(durationMs: number): { executionDurationMs?: number } {
+    if (Number.isFinite(durationMs) && durationMs >= 0 && durationMs <= MAX_JAVA_INT) return { executionDurationMs: Math.round(durationMs) };
+    if (!this.truncationWarned.has('executionDurationMs')) {
+      this.truncationWarned.add('executionDurationMs');
+      logger.warn('executionDurationMs does not fit the ingestor\'s int field; it is left off the event (logged once)', { durationMs });
+    }
+    return {};
+  }
+
+  /**
    * Get session summary stats for the SESSION_END event.
    */
   getStats(): { toolCallCount: number; errorCount: number; totalDurationMs: number } {
@@ -361,9 +474,9 @@ export class ToolCallTracker {
   shutdown(): void {
     clearInterval(this.cleanupTimer);
     const now = Date.now();
-    for (const [key, call] of this.inFlight) {
-      this.inFlight.delete(key);
-      this.emit(call, call.sessionId ?? '', 'CANCELLED', now - call.startTime);
+    for (const token of Array.from(this.inFlight.keys())) {
+      const call = this.remove(token);
+      if (call) this.emit(call, call.sessionId ?? '', 'CANCELLED', now - call.startTime);
     }
   }
 
@@ -374,10 +487,10 @@ export class ToolCallTracker {
    * metered twice.
    */
   cleanupStale(now: number = Date.now()): void {
-    for (const [key, call] of this.inFlight) {
+    for (const [token, { call }] of Array.from(this.inFlight)) {
       if (now - call.startTime > this.staleCallTimeoutMs) {
         logger.warn('No response for tool call; metering it as TIMEOUT', { requestId: call.requestId, toolName: call.toolName });
-        this.inFlight.delete(key);
+        this.remove(token);
         const timeoutMarker: JsonRpcError = { code: MCP_REQUEST_TIMEOUT, message: 'no response from MCP server' };
         this.emit(call, call.sessionId ?? '', this.resolveStatus(undefined, timeoutMarker), now - call.startTime);
       }

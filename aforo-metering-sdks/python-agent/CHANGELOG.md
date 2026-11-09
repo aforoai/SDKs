@@ -2,6 +2,25 @@
 
 All notable changes to `aforo-agent-metering` are documented here. This project follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [1.1.1] - 2026-11-09
+
+Fixes from the 2026-11-09 SDK review.
+
+### Fixed
+- **An AI_AGENT event without `session_id` is dropped as `invalid` before it is queued.** The ingestor requires `session_id` on every AI_AGENT event and rejected such an event on a background flush, so `record_capability(...)` without a session, or a decorated call without a `session_id` kwarg, lost its usage as `rejected`. Other product types (a per-event `product_type`) are unchanged.
+- **Token counts never raise.** `input_tokens=None` or `output_tokens="84"` raised `TypeError` out of `record_capability` / `record_step`. `None` now counts as 0 and a whole number (also as a float or a string) is accepted; anything else drops the event as `invalid`. Any other content error while building an event is dropped as `invalid` too: `record_*` never raises for event content.
+- **A decorator `customer_resolver` that raises or returns nothing no longer bills `default_customer_id`.** The event is dropped as `invalid`, as the log line already said. Without a resolver, `default_customer_id` still applies.
+- **Sessions and tokens reach the ingestor.** Every event with a session carries `traceId` (32 lowercase hex, the Node SDK's format): `trace_id=` if given, else `session_trace_id(product_id, customer_id, agent_id, session_id)`, which is exported. The ingestor groups an AI_AGENT session by `traceId` and never saw Python sessions before. Token counts are also sent as `metadata.input_tokens` / `metadata.output_tokens`, the keys Node sends and the ingestor's COGS and session totals read; the camelCase keys stay.
+- **`metadata` must be a dict** (any mapping); anything else drops the event as `invalid`. A list of pairs used to be accepted.
+- **`executionDurationMs` out of Java `int` range** (or not a number) is left off the event, which is still sent; one WARNING per client. Such a value used to fail the ingestor's JSON binding for the whole batch.
+- **An idle client is truthy.** It defined only `__len__`, so a client with an empty queue was falsy and `if client: client.record_...` never recorded.
+- Docs: the README and user guide named version 1.0.0, `setup.cfg` said 1.0.0, and `compression` was not listed.
+
+## [1.1.0] - 2026-10-30
+
+### Changed
+- **Batches are gzip-compressed by default** (wave 8, G269): a batch of 1 KiB or more is sent with `Content-Encoding: gzip`. Needs usage-ingestor wave 8 or later; pass `compression="none"` to always send plain JSON. A `post_fn` always gets plain JSON text.
+
 ## [1.0.0] - 2026-10-26
 
 **Breaking.**

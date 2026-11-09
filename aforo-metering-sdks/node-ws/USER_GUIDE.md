@@ -1,6 +1,6 @@
 # @aforoai/ws-metering — User Guide
 
-**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** Node.js engineers running a WebSocket server (`ws`, Fastify-WebSocket, Socket.io, Deno, Bun) who need per-connection usage metered into Aforo.
+**Version:** 2.1.1 · **Updated:** 2026-10-26 · **Audience:** Node.js engineers running a WebSocket server on `ws` or `@fastify/websocket` who need per-connection usage metered into Aforo.
 
 ## What you'll build
 
@@ -140,7 +140,7 @@ new AforoWsBilling({ /* … */, onError: (err) => myLogger.error('aforo ws flush
 | `ingestorUrl` | `string` | — (required) | Base URL, `https://`; SDK appends `/v1/ingest/batch`. |
 | `productType` | `string` | `'WEBSOCKET_API'` | Top-level `productType` on every event (trimmed + uppercased; unknown values pass through). Override via `wrapServer(wss, { productType })` or `trackConnection(ws, { customerId, productType })`. |
 | `perFrameEvents` | `boolean` | `false` | One event per frame vs. aggregate-on-close only. |
-| `connectionIdleTimeoutMs` | `number` | `3600000` | Close a connection with no frame for this long (`ABNORMAL_CLOSURE`, `closedBy: "sdk_idle_timeout"`). |
+| `connectionIdleTimeoutMs` | `number` | `3600000` | Close a connection with no frame for this long (`ABNORMAL_CLOSURE`, `closedBy: "sdk_idle_timeout"`). Its next frame, if any, tracks it again with a new `CONNECTION_OPENED` (`metadata.resumedAfterIdleSweep: true`). |
 | `allowInsecureHttp` | `boolean` | `false` | Accept a plain `http://` `ingestorUrl` on a non-local host. `https://` is required otherwise (plain http is fine for `localhost`, `127.0.0.1`, `::1`). |
 | `flushCount` | `number` | `500` | Events per request (max 1000). Reaching it wakes the background sender; recording an event never sends by itself. |
 | `flushIntervalMs` | `number` | `5000` | The background sender also runs this often. |
@@ -153,7 +153,7 @@ new AforoWsBilling({ /* … */, onError: (err) => myLogger.error('aforo ws flush
 | `onDrop` | `(events, reason) => void` | none | Receives events lost for good. See [Dropped events](#dropped-events). |
 | `customerResolver` | `(req) => string \| undefined` | — (`wrapServer`, required unless `trustCustomerHeader`) | The customer from identity you verified on the upgrade request. `extractCustomerId` is a deprecated alias. |
 | `trustCustomerHeader` | `boolean` | `false` (`wrapServer`) | Bill the `x-customer-id` upgrade header. Only behind a proxy you control. |
-| `extractMetadata` | `(req) => Record<string, unknown> \| undefined` | `undefined` (`wrapServer`) | Optional per-connection tags. |
+| `extractMetadata` | `(req) => Record<string, unknown> \| undefined` | `undefined` (`wrapServer`) | Optional per-connection tags. A throw is reported through `onError`; the connection is metered without metadata. |
 
 ## Troubleshooting
 

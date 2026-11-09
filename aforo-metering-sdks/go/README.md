@@ -2,7 +2,7 @@
 
 A zero-dependency Go metering client for Aforo. You call `Track` when a billable event happens (or wrap your `http.Handler`), and the client queues, batches and sends usage to Aforo's ingestor in the background.
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 Use it when your Go service knows who the customer is and what to count, and you want the SDK to own queueing, batching, retries and shutdown. Version 2 changes the public API; the [changelog](CHANGELOG.md) lists the migration steps.
 
@@ -12,11 +12,11 @@ Use it when your Go service knows who the customer is and what to count, and you
 go get github.com/aforoai/SDKs/aforo-metering-sdks/go/v2
 ```
 
-The import path ends in `/v2`. Releases are git tags `aforo-metering-sdks/go/v2.X.Y` on [github.com/aforoai/SDKs](https://github.com/aforoai/SDKs). Until the `v2.0.0` tag exists, build against a local checkout with a `replace`:
+The import path ends in `/v2`. Releases are git tags `aforo-metering-sdks/go/v2.X.Y` on [github.com/aforoai/SDKs](https://github.com/aforoai/SDKs). Until the `v2.1.0` tag exists, build against a local checkout with a `replace`:
 
 ```go
 // go.mod (your service)
-require github.com/aforoai/SDKs/aforo-metering-sdks/go/v2 v2.0.0
+require github.com/aforoai/SDKs/aforo-metering-sdks/go/v2 v2.1.1
 
 replace github.com/aforoai/SDKs/aforo-metering-sdks/go/v2 => ../SDKs/aforo-metering-sdks/go
 ```
@@ -65,11 +65,13 @@ func main() {
 }
 ```
 
-`NewClient` returns an error when `APIKey` is blank or `BaseURL` is not `https://`. Plain `http://` is accepted for `localhost`, `127.0.0.1` and `::1`, or anywhere with `AllowInsecureHTTP: true`.
+`NewClient` returns an error when `APIKey` is blank or `BaseURL` is not `https://`. The key is trimmed; a key that still holds whitespace or a control character is refused (the error does not show it). Plain `http://` is accepted for `localhost`, `127.0.0.1` and `::1`, or anywhere with `AllowInsecureHTTP: true`.
 
 Every event carries a top-level `productType` (required by the ingestor): `TrackEvent.ProductType` if set, else `Options.ProductType`, else `"API"`. Values are trimmed and upper-cased.
 
-`Track` returns an error wrapping `metering.ErrInvalidEvent` — and queues nothing — when `CustomerID` or `MetricName` is blank, `Quantity` is negative/NaN/Inf, `OccurredAt` is not RFC 3339, or a field exceeds the ingestor's limit. A zero `Quantity` means "unset" and becomes `1`.
+`Track` returns an error wrapping `metering.ErrInvalidEvent` — and queues nothing — when `CustomerID` or `MetricName` is blank, `Quantity` is negative/NaN/Inf, `OccurredAt` is not RFC 3339 with seconds and a zone (`Z` or `±HH:MM`), or a field exceeds the ingestor's limit.
+
+> ⚠ **`Quantity: 0` is sent as `1`.** Go cannot tell a `Quantity` you left out from one you set to `0`, so both mean one unit. If the amount is zero (no tokens used, nothing sent), do not call `Track` at all.
 
 ## Meter every HTTP request
 
@@ -92,7 +94,7 @@ Chi takes the same middleware: `r.Use(mw)`. `ChiMiddleware(client, opts)` is the
 
 `NewMiddleware` returns `metering.ErrNoCustomerResolver` when you set neither `CustomerResolver` nor `TrustCustomerHeader`. `TrustCustomerHeader: true` bills the customer named in the `X-Customer-Id` header (or `CustomerIDHeader`). The caller of your API controls that header, so turn it on only when a trusted proxy sets it and strips any value the client sent.
 
-A request whose resolver returns an empty string is still served, but not billed: the event is dropped as `invalid` and counted in `DroppedCount()`. `OPTIONS` requests and the excluded paths (`/health`, `/ready`, `/metrics`, `/favicon.ico` by default) are not metered and not counted.
+A request whose resolver returns an empty string, or whose `CustomerResolver` or `MetricNameFunc` panics, is still served, but not billed: the event is dropped as `invalid` and counted in `DroppedCount()`; the panic does not reach your server. `OPTIONS` requests and the excluded paths (`/health`, `/ready`, `/metrics`, `/favicon.ico` by default) are not metered and not counted. An excluded path covers itself and everything under it: `/health` skips `/health` and `/health/live`, never `/healthcare`.
 
 Each event carries `endpointPath` (normalized, no query string), `httpMethod`, `statusCode` and `responseTimeMs`. The middleware's response writer passes `Flush` and `Hijack` through and implements `Unwrap`, so server-sent events, WebSocket upgrades and `http.ResponseController` keep working.
 
@@ -127,7 +129,7 @@ Each event carries `endpointPath` (normalized, no query string), `httpMethod`, `
 | `CustomerIDHeader` | `string` | `X-Customer-Id` | Header read when `TrustCustomerHeader` is on. |
 | `MetricName` | `string` | `api_calls` | Metric recorded per request. Must exist in your Aforo catalog. |
 | `MetricNameFunc` | `func(*http.Request) string` | `nil` | Per-request metric; an empty result falls back to `MetricName`. |
-| `ExcludePaths` | `[]string` | `/health`, `/ready`, `/metrics`, `/favicon.ico` | Path prefixes to skip. Your list replaces the defaults. |
+| `ExcludePaths` | `[]string` | `/health`, `/ready`, `/metrics`, `/favicon.ico` | Paths to skip, each with everything under it (`/health` skips `/health/live`, not `/healthcare`). Your list replaces the defaults. |
 | `ExcludeStatusCode` | `[]int` | none | Response statuses to skip. |
 | `ProductType` | `string` | the client's | Top-level `productType` on metered requests. |
 
@@ -141,7 +143,7 @@ Each event carries `endpointPath` (normalized, no query string), `httpMethod`, `
 - A `2xx` answer can refuse single events in `errors[]`: those marked `retryable` are resent after the normal backoff, at most `MaxRetries` times and then handled as an outage; the others are dropped as `rejected`. `errors[]` counts even when `failed` is missing or 0.
 - `Flush(ctx)` asks the sender to send everything now and waits, and makes one attempt even while the sender is pausing after an outage. During an outage it returns `ErrIngestUnavailable`; the events stay queued.
 - `Close(ctx)` stops accepting events and sends until the earlier of `ctx`'s deadline and `ShutdownTimeout`. An unreachable ingestor is retried with backoff until the deadline, and each request in that window is cut off at it. Events still queued then are reported as `shutdown` and `Close` returns an error wrapping `ErrShutdownIncomplete`. A second `Close` returns the first one's result.
-- Requests send `Content-Type: application/json`, `X-API-Key` and `User-Agent: aforo-go/2.0.0`, and, for batches of 1 KiB or more, `Content-Encoding: gzip` (needs usage-ingestor wave 8 or later; `Compression: "none"` turns it off).
+- Requests send `Content-Type: application/json`, `X-API-Key` and `User-Agent: aforo-go/2.1.1`, and, for batches of 1 KiB or more, `Content-Encoding: gzip` (needs usage-ingestor wave 8 or later; `Compression: "none"` turns it off).
 
 ## Dropped events
 
@@ -156,7 +158,7 @@ Each event carries `endpointPath` (normalized, no query string), `httpMethod`, `
 | `DropClosed` (`closed`) | `Track` was called after `Close`; `Track` also returns `ErrClientClosed`. |
 | `DropRetryExhausted` (`retry_exhausted`) | Kept for compatibility; v2 requeues instead of dropping. |
 
-Field limits mirror the ingestor: `CustomerID` 64, `MetricName` 255, `IdempotencyKey` 255, `ProductType` 20, `EndpointPath` 512, `HTTPMethod` 16 characters; `Quantity` at most 14 integer digits and 6 decimal places. The middleware truncates `endpointPath` and `httpMethod` (they come from the request) instead of dropping the event; values you pass to `Track` are never truncated.
+Field limits mirror the ingestor: `CustomerID` 64, `MetricName` 255, `IdempotencyKey` 255, `ProductType` 20, `EndpointPath` 512, `HTTPMethod` 16 characters; `Quantity` at most 14 integer digits and 6 decimal places. `StatusCode` (a 16-bit field on the ingestor, up to 32767) and `ResponseTimeMs` (32-bit, up to 2147483647) outside that range are left off the event, with one WARN per field, and the event is still sent: the ingestor would refuse the whole batch over one such number. The middleware truncates `endpointPath` and `httpMethod` (they come from the request) instead of dropping the event; values you pass to `Track` are never truncated.
 
 Idempotency keys are minted once, when `Track` queues the event (a random UUID unless you set `IdempotencyKey`). Every resend carries the same key.
 

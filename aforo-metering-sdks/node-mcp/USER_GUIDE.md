@@ -78,7 +78,7 @@ server.setRequestHandler(
 
 The wrapper sets `executionStatus`: `SUCCESS` for a normal result, `ERROR` for a result with `isError: true` or a thrown error, `TIMEOUT` for a `TimeoutError` or MCP error code `-32001`. Pass `{ statusResolver }` as the second argument to decide it yourself (see the [README](README.md#execution-status-and-dropped-events)).
 
-A tool invocation the ingestor would reject (no customer, blank tool name, `agentId` over 36 characters, `customerId` or `sessionId` over 64) is not sent and does not throw: it is counted in `billing.droppedCount`, WARN-logged, and passed to `onDrop` with reason `'invalid'`. A tool name over 64 characters is cut to 64 and the event is still sent.
+A tool invocation the ingestor would reject (no customer, blank tool name, or an `agentId` over 36 characters / `customerId` or `sessionId` over 64 passed to `recordToolInvocation`) is not sent and does not throw: it is counted in `billing.droppedCount`, WARN-logged, and passed to `onDrop` with reason `'invalid'`. The tool name, agent id and session id the client sends never drop a wrapped call: a tool name over 64 characters is cut to 64, an unusable `_meta.agent_id` (blank, not a string, over 36 characters) is replaced by the `agentId` config (else `"unknown"`), and a `_meta.session_id` over 64 characters is left off the event.
 
 ## Step 4 — Manage the session (optional but recommended)
 
@@ -175,10 +175,10 @@ If you see that batch hit `/v1/ingest/batch`, the wrapper is wired correctly. Po
 | `customerResolver` | `(request, extra) => string \| undefined \| Promise<…>` | unset | Customer per call from authenticated identity. |
 | `customerId` | `string` | unset | One customer for every call; also the heartbeat customer. |
 | `trustCustomerHeader` | `boolean` | `false` | Bill `params._meta.customer_id` as the client sends it. |
-| `agentId` | `string` | `"unknown"` | Agent id when a call has no `_meta.agent_id`. |
+| `agentId` | `string` | `"unknown"` | Agent id when a call has no usable `_meta.agent_id` (missing, blank, not a string, over 36 characters). |
 | `heartbeatIntervalMs` | `number` | `30000` | Interval between session heartbeats. |
 | `heartbeatEnabled` | `boolean` | `true` | Send session heartbeats while a session is active. |
-| `onError` | `(err) => void` | `console.error` | Called when the ingestor becomes unreachable (events kept), on rejected events, on a shutdown that left events behind, a bad `statusResolver` / `customerResolver`, and failed heartbeats. Delivery reports are a `CoreTransportError`: branch on `err.kind` (`outage`, `auth`, `rejected`, `shutdown`, `closed`) and read `err.events`, not the message. |
+| `onError` | `(err) => void` | `console.error` | Called when the ingestor becomes unreachable (events kept), on rejected events, on a shutdown that left events behind, a bad `statusResolver` / `customerResolver`, and failed heartbeats. Delivery reports are a `CoreTransportError`: branch on `err.kind` (`outage`, `auth`, `rejected`, `shutdown`, `closed`) and read `err.events`, not the message; the other reports are plain `Error`s, so check `err instanceof CoreTransportError` first. A throwing `onError` is logged and ignored: it never reaches the tool call. |
 | `onDrop` | `(events, reason) => void` | unset | Called with usage events the SDK is about to lose (`rejected`, `invalid`, `overflow`, `shutdown`, `closed`). Dropped events are also counted in `billing.droppedCount` and WARN-logged. |
 | `onSessionKilled` | `(sessionId, reason) => void` | unset | Fired when a heartbeat or usage-batch response lists the active session as killed. A throw goes to `onError`. |
 
