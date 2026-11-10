@@ -10,6 +10,9 @@ All notable changes to `ai.aforo:graphql-metering` are documented here. This pro
 - **A 429 whose `X-RateLimit-Limit` is below the batch size splits the batch.** The events go back to the head of the queue in order and are sent in batches of at most that many after the `Retry-After` wait, instead of resending a batch the API key's per-minute limit can never accept until the queue overflowed.
 - **Persisted queries (APQ) are metered.** The instrumentation reads the document graphql-java executes instead of re-parsing the query text, which for a persisted query is only a marker; those operations were silently not metered. An operation whose query cannot be read is counted and reported as `INVALID` instead of being lost at `FINE`.
 
+### Fixed (end-to-end test)
+- **Complexity and field count cover only the operation that runs.** They were counted over the whole document, so a document holding several operations over-billed the one `operationName` selected: `query A { users { id } } mutation PickMe { createOrder(item: "cup") { id } }` run as `PickMe` was sent with `gqlFieldCount` 4 and `gqlComplexity` 14 instead of 2 and 12. Unused fragments are no longer counted, and a fragment spread counts its fields where it is used, at the spread's depth.
+
 ## [2.1.0] - 2026-10-30
 
 ### Added

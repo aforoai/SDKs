@@ -448,6 +448,64 @@ def _customer_source(client: Any, customer_id: Any, customer_resolver: Optional[
     return lambda: clean_customer_id(_mqtt_username(client))
 
 
+# ── paho callback hooks ──────────────────────────────────────────
+
+#: The paho callbacks the wrapper meters through.
+_METERED_CALLBACKS = ("on_connect", "on_disconnect", "on_message", "on_publish")
+
+
+def _class_swappable(client: Any) -> bool:
+    """True when ``client.__class__`` can be pointed at a subclass: the
+    attribute is the plain ``object`` slot (a ``unittest.mock`` object
+    overrides it) and the class is an ordinary Python class."""
+    for klass in type(client).__mro__:
+        if "__class__" in klass.__dict__:
+            return klass is object
+    return False
+
+
+def _install_callback_hooks(client: Any, hooks: Dict[str, Callable[..., Any]]) -> Dict[str, Any]:
+    """Keep the metering hooks on ``client`` however the app sets its callbacks.
+
+    paho reads every callback through its property (``self.on_connect`` and so
+    on, in 1.x and 2.x alike), and the app sets it the same way, typically
+    after wrapping (``client.on_message = handler``). Plain assignment would
+    replace the hook and silently stop metering. So the client's class is
+    swapped for a one-off subclass whose properties return the hook to paho
+    and store what the app assigns; each hook calls the app's current callback.
+
+    Returns the app callbacks (name -> callable or None), read live by the
+    hooks. A client whose class cannot be swapped (a ``Mock``, a builtin type)
+    gets plain attributes, as before: there the app must set its callbacks
+    before wrapping.
+    """
+    app: Dict[str, Any] = {name: getattr(client, name, None) for name in hooks}
+    if _class_swappable(client):
+        base = type(client)
+
+        def _prop(name: str) -> property:
+            def fget(_self: Any) -> Any:
+                return hooks[name]
+
+            def fset(_self: Any, func: Any) -> None:
+                app[name] = func
+
+            return property(fget, fset, doc=f"paho {name}; metered by aforo_mqtt_metering")
+
+        namespace: Dict[str, Any] = {name: _prop(name) for name in hooks}
+        namespace.update(__slots__=(), __module__=base.__module__, __qualname__=base.__qualname__,
+                         _aforo_metered_callbacks=app)
+        try:
+            client.__class__ = type(base.__name__, (base,), namespace)
+            return app
+        except TypeError:
+            logger.debug("[aforo-mqtt] could not hook %s callbacks; assigning them", base.__name__,
+                         exc_info=True)
+    for name, hook in hooks.items():
+        setattr(client, name, hook)
+    return app
+
+
 def _rc_value(rc: Any) -> Optional[int]:
     try:
         return int(getattr(rc, "value", rc))
@@ -486,6 +544,11 @@ def wrap_paho_client(
     """
     Attach metering callbacks to a paho-mqtt client *before* calling .connect().
 
+    Your own ``on_connect`` / ``on_disconnect`` / ``on_message`` /
+    ``on_publish`` may be set before or after wrapping, and changed any time:
+    the metering hooks stay in place and call yours (paho 1.x and 2.x).
+    Reading ``client.on_publish`` (and the others) returns the metering hook.
+
     The customer: ``customer_id`` (resolved by your own auth), or
     ``customer_resolver=callable(client) -> str | None``, or
     ``trust_customer_header=True`` to bill the connection's MQTT username.
@@ -523,10 +586,6 @@ def wrap_paho_client(
         cid = cid.decode("utf-8")
     cid = cid or "paho-client"
 
-    orig_on_connect = getattr(client, "on_connect", None)
-    orig_on_disconnect = getattr(client, "on_disconnect", None)
-    orig_on_message = getattr(client, "on_message", None)
-    orig_on_publish = getattr(client, "on_publish", None)
     orig_publish = client.publish
     orig_subscribe = client.subscribe
     orig_unsubscribe = client.unsubscribe
@@ -556,8 +615,9 @@ def wrap_paho_client(
                 timer.cancel()
             if not flap:
                 _push(topic="", qos=0, retained=False, event_type="CONNECT")
-        if orig_on_connect:
-            return orig_on_connect(c, userdata, flags, rc, *args, **kwargs)
+        app_cb = app_callbacks.get("on_connect")
+        if app_cb:
+            return app_cb(c, userdata, flags, rc, *args, **kwargs)
 
     def _on_disconnect(c, userdata, *args, **kwargs):  # type: ignore[no-untyped-def]
         # paho 1.x: (client, userdata, rc); 2.x: (client, userdata, flags, rc, properties)
@@ -577,8 +637,9 @@ def wrap_paho_client(
                 if previous is not None:
                     previous.cancel()
                 timer.start()
-        if orig_on_disconnect:
-            return orig_on_disconnect(c, userdata, *args, **kwargs)
+        app_cb = app_callbacks.get("on_disconnect")
+        if app_cb:
+            return app_cb(c, userdata, *args, **kwargs)
 
     def _on_message(c, userdata, msg):  # type: ignore[no-untyped-def]
         _push(
@@ -588,8 +649,9 @@ def wrap_paho_client(
             event_type="DELIVER",
             data_bytes=len(msg.payload) if msg.payload else 0,
         )
-        if orig_on_message:
-            return orig_on_message(c, userdata, msg)
+        app_cb = app_callbacks.get("on_message")
+        if app_cb:
+            return app_cb(c, userdata, msg)
 
     def _on_publish(c, userdata, mid, *args, **kwargs):  # type: ignore[no-untyped-def]
         with lock:
@@ -601,13 +663,16 @@ def wrap_paho_client(
         reason = args[0] if args else None
         if fields is not None and _rc_ok(reason):
             _push(**fields)
-        if orig_on_publish:
-            return orig_on_publish(c, userdata, mid, *args, **kwargs)
+        app_cb = app_callbacks.get("on_publish")
+        if app_cb:
+            return app_cb(c, userdata, mid, *args, **kwargs)
 
-    client.on_connect = _on_connect
-    client.on_disconnect = _on_disconnect
-    client.on_message = _on_message
-    client.on_publish = _on_publish
+    # The hooks stay in place when the app sets a callback later (normal paho
+    # style); each calls the app's callback current at that moment.
+    app_callbacks = _install_callback_hooks(client, {
+        "on_connect": _on_connect, "on_disconnect": _on_disconnect,
+        "on_message": _on_message, "on_publish": _on_publish,
+    })
 
     def _publish(topic, payload=None, qos=0, retain=False, **kwargs):  # type: ignore[no-untyped-def]
         fields = {"topic": topic, "qos": qos, "retained": retain, "event_type": "PUBLISH",

@@ -2,7 +2,7 @@
 
 A sidecar that meters an MCP server you can't modify. It sits between the client and the server, watches the JSON-RPC traffic, and bills each `tools/call` to Aforo — over stdio, SSE, or Streamable HTTP. Use it when you don't own the MCP server's source (or don't want to change it) and the gateway-plugin path doesn't fit.
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -169,7 +169,7 @@ The proxy resolves each value with this precedence: **environment variable > CLI
 | Cancelled by the client (`notifications/cancelled`) | `CANCELLED` (once, when the cancellation arrives) |
 | Never reached the server: the upstream refused the connection, or answered an HTTP error without a JSON-RPC response (SSE / Streamable HTTP) | not billed |
 
-A library `statusResolver` can override these. It must be synchronous and return one of the 11 canonical statuses (`SUCCESS`, `PARTIAL`, `TIMEOUT`, `ERROR`, `VALIDATION_FAILED`, `FAILED`, `FAILURE`, `CANCELLED`, `PENDING`, `BLOCKED`, `HITL_REQUIRED`); a Promise or any other value is logged and the default is used. Calls are matched to responses by session and JSON-RPC id, so two clients reusing id `1` are metered separately, and a client that reuses an id while the first call is still waiting has each call metered once (responses are matched in order): Streamable HTTP keys sessions on `Mcp-Session-Id`, and in `sse` mode each SSE connection is its own session (a POST is matched to its connection by the message endpoint the server gave that connection). Every `tools/call` inside a JSON-RPC batch is metered and quota-checked; refused calls are removed from the batch and answered by the proxy. The proxy keeps at most 10 000 calls waiting for a response (the oldest past that is metered as `TIMEOUT`) and at most 10 000 open sessions (idle ones expire after an hour).
+A library `statusResolver` can override these. It must be synchronous and return one of the 11 canonical statuses (`SUCCESS`, `PARTIAL`, `TIMEOUT`, `ERROR`, `VALIDATION_FAILED`, `FAILED`, `FAILURE`, `CANCELLED`, `PENDING`, `BLOCKED`, `HITL_REQUIRED`); a Promise or any other value is logged and the default is used. Calls are matched to responses by session and JSON-RPC id, so two clients reusing id `1` are metered separately, and a client that reuses an id while the first call is still waiting has each call metered once (responses are matched in order): Streamable HTTP keys sessions on `Mcp-Session-Id` (a request without one, as from a server that issues no session ids, is matched only to its own response, and its calls are metered in one stable proxy session per client token — one per proxy when clients share a token or none — instead of a new session per call), and in `sse` mode each SSE connection is its own session (a POST is matched to its connection by the message endpoint the server gave that connection). Every `tools/call` inside a JSON-RPC batch is metered and quota-checked; refused calls are removed from the batch and answered by the proxy. The proxy keeps at most 10 000 calls waiting for a response (the oldest past that is metered as `TIMEOUT`) and at most 10 000 open sessions (idle ones expire after an hour).
 
 Each tool call's idempotency key is minted once, when its event is created, and reused by every flush retry.
 

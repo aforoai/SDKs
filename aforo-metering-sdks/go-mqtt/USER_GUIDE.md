@@ -71,8 +71,16 @@ opts := mqtt.NewClientOptions().
 		billing.RecordConnect("cust_acme_001", "device-001")
 	}).
 	SetConnectionLostHandler(func(c mqtt.Client, err error) {
+		// Called when the connection drops, not after your own Disconnect.
 		billing.RecordDisconnect("cust_acme_001", "device-001")
 	})
+```
+
+paho calls the `ConnectionLostHandler` only when the connection drops. On a clean shutdown, record the disconnect beside the call:
+
+```go
+client.Disconnect(250)
+billing.RecordDisconnect("cust_acme_001", "device-001")
 ```
 
 ## Step 4 — Record subscribe / publish at the call sites

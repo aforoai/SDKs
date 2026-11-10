@@ -31,6 +31,23 @@ fixes; the cross-cutting ones:
   or cancelled calls bill their real status (Java); persisted GraphQL queries
   and GET operations are metered; WebSocket connections closed by the idle
   sweep are tracked again on their next frame.
+- **Found by the end-to-end run against a real usage-ingestor** (every package,
+  33 framework setups; all stored exactly the expected rows):
+  - python-mqtt: callbacks the app sets *after* `wrap_paho_client` no longer
+    replace the SDK's hooks, which had silently stopped all metering.
+  - GraphQL complexity in all four languages counts only the operation that
+    runs, with a fragment's fields counted at each spread. The same document now
+    scores the same in every SDK (Java and Node used to bill every operation in
+    the document).
+  - node-grpc: a failing server-stream or bidi handler sends its status at once
+    (the client used to hang until its deadline).
+  - python-ws stores the real close reason; go-graphql sets `gqlHasErrors` from
+    the response body; the Java filter on Spring stops recording `/**`; java-grpc
+    can record exact stream message counts; mcp-proxy gives session-less
+    upstreams one stable session per client.
+- **Shutdown reporting (docs).** A batch still in flight when the shutdown
+  deadline passes is reported as `shutdown` although the ingestor may have
+  stored it; the README and TRANSPORT-SPEC now say so. Re-sending is safe.
 - **MCP and agents.** python-mcp's Quickstart meters as written and reads
   `_meta` from the request, never the tool arguments; python-agent sends a
   per-session `traceId` and snake_case token keys so the ingestor sees sessions

@@ -321,7 +321,7 @@ export class AforoGrpcBilling {
         })
         .catch((err: Error & { code?: number }) => {
           this.record(method, 'SERVER_STREAM', customerId, { call, code: errorCode(err), error: err }, options, messageCount, Date.now() - start);
-          call.destroy(err);
+          failStream(call, err);
         });
     };
   }
@@ -374,7 +374,7 @@ export class AforoGrpcBilling {
         })
         .catch((err: Error & { code?: number }) => {
           this.record(method, 'BIDI_STREAM', customerId, { call, code: errorCode(err), error: err }, options, messageCount, Date.now() - start);
-          call.destroy(err);
+          failStream(call, err);
         });
     };
   }
@@ -602,6 +602,27 @@ function countInbound(call: any, onMessage: () => void): void {
     if (chunk !== null && chunk !== undefined) onMessage();
     return origPush(chunk, encoding);
   };
+}
+
+/**
+ * End a server-stream or bidi call with the handler's error, the way grpc-js
+ * expects: its server streams listen for 'error', turn it into the call's
+ * status (the error's `code` and `details`/`message`) and send it. Destroying
+ * the stream instead stops grpc-js from ever sending the status, so the client
+ * waits until its deadline (forever without one). destroy() stays as the
+ * fallback for a stream that is already destroyed or has no 'error' listener
+ * (not a grpc-js server stream), where emitting would throw.
+ */
+function failStream(call: any, err: unknown): void {
+  try {
+    if (!call?.destroyed && typeof call?.listenerCount === 'function' && call.listenerCount('error') > 0) {
+      call.emit('error', err);
+      return;
+    }
+  } catch {
+    // fall through to destroy
+  }
+  call?.destroy?.(err);
 }
 
 function errorCode(err: { code?: unknown } | undefined): number {

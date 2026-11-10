@@ -15,6 +15,9 @@ All notable changes to `aforo-ws-metering` are documented here. This project fol
 - **A connection the idle sweep closed is tracked again when it carries its next frame.** Its next `CONNECTION_CLOSED` reports only the traffic after the sweep (`metadata.resumedAfterIdle: true`), so nothing is counted twice.
 - `push()` with a non-dict `metadata` is dropped as `invalid` instead of raising `TypeError`.
 
+### Fixed (end-to-end test)
+- **The close reason is the connection's real close code.** With the README's FastAPI loop (`while True: await ws.receive_text()`), every normal client disconnect was stored as `wsCloseReason` `INTERNAL_ERROR`, because the loop ends with `WebSocketDisconnect` and any exception counted as a handler failure. Both helpers now map the real code through `WS_CLOSE_REASONS`: `WebSocketDisconnect.code` or the close code seen on the ASGI channel (Starlette/FastAPI), the received close frame or the connection's `close_code` (`websockets`). 1000 is `NORMAL_CLOSURE`, 1001 `GOING_AWAY` (it ends `async for` without an exception, so it was `NORMAL_CLOSURE` before), a dropped socket `ABNORMAL_CLOSURE`, a code outside the map `NORMAL_CLOSURE`. Only another exception raised inside the handler is `INTERNAL_ERROR`.
+
 ## [2.1.0] - 2026-10-30
 
 ### Changed

@@ -10,6 +10,9 @@ All notable changes to `ai.aforo:grpc-metering` are documented here. This projec
 - **A 429 whose `X-RateLimit-Limit` is below the batch size splits the batch.** The events go back to the head of the queue in order and are sent in batches of at most that many after the `Retry-After` wait, instead of resending a batch the API key's per-minute limit can never accept until the queue overflowed.
 - **Every call is metered exactly once, with the status the caller saw.** A handler that throws (grpc-java closes the stream itself with `UNKNOWN`) is metered as `UNKNOWN` / `ERROR`; it was not metered. A call cancelled by the client or its deadline is metered as `CANCELLED` or `DEADLINE_EXCEEDED` / `TIMEOUT`, also when the handler finishes later and closes with `OK`; it was billed as `SUCCESS`.
 
+### Fixed (end-to-end test)
+- **Streaming handlers can report the real message count.** The README told you to call `record(...)` for exact streaming counts, but no overload took a count and every event carried `messageCount = 1`. New overloads `record(method, callType, customerId, status, durationMs, messageCount)` and `record(..., durationMs, messageCount, executionStatus, productType)` send the count you pass (a negative count is sent as 0). The README and user guide now say to serve such a service without the interceptor, so the call is not billed twice.
+
 ## [2.1.0] - 2026-10-30
 
 ### Added

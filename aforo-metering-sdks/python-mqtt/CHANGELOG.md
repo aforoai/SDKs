@@ -14,6 +14,9 @@ All notable changes to `aforo-mqtt-metering` are documented here. This project f
 - **A QoS 1/2 publish made while disconnected is billed when the broker acks it.** paho answers `MQTT_ERR_NO_CONN`, keeps the message and sends it on reconnect; the wrapper treated that as a refusal and never billed it. A QoS 0 publish refused that way is still not billed.
 - `push()` with a non-dict `metadata` is dropped as `invalid` instead of raising `TypeError`.
 
+### Fixed (end-to-end test)
+- **Callbacks set after `wrap_paho_client` no longer turn metering off.** Assigning `on_connect`, `on_publish`, `on_disconnect` or `on_message` after wrapping (normal paho style) replaced the wrapper's hooks: CONNECT, PUBLISH, DISCONNECT and DELIVER were silently not metered and nothing was counted as dropped. The hooks now stay in place and call the app's callback, whenever it was set or changed (paho 1.x and 2.x callback APIs): the wrapped client's class is swapped for a one-off subclass whose callback properties store the app's callback. Reading `client.on_publish` returns the metering hook. A client whose class cannot be swapped (a `Mock`, a builtin type) keeps the old plain attributes. `wrap_aiomqtt_client` hooks no callbacks and was not affected.
+
 ## [2.1.0] - 2026-10-30
 
 ### Changed

@@ -1,6 +1,6 @@
 # @aforoai/mcp-proxy — User Guide
 
-**Version:** 2.0.0 · **Updated:** 2026-10-26 · **Audience:** operators metering an MCP server they don't own the source of — stdio (Claude Desktop / Cursor), SSE, or Streamable HTTP.
+**Version:** 2.1.1 · **Updated:** 2026-10-26 · **Audience:** operators metering an MCP server they don't own the source of — stdio (Claude Desktop / Cursor), SSE, or Streamable HTTP.
 
 ## What you'll build
 

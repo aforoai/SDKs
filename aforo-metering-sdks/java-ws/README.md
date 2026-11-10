@@ -32,6 +32,8 @@ Java 17+. `jakarta.websocket:jakarta.websocket-api` 2.1+ is a `provided` peer de
 import com.aforo.ws.AforoWsBilling;
 import jakarta.websocket.*;
 import jakarta.websocket.server.ServerEndpoint;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 
@@ -55,12 +57,17 @@ public class FeedSocket {
 
     @OnMessage
     public void incoming(String msg, Session s) {
-        billing.recordFrame(connectionId, "CLIENT_TO_SERVER", "TEXT", msg.length());
+        billing.recordFrame(connectionId, "CLIENT_TO_SERVER", "TEXT", msg.getBytes(StandardCharsets.UTF_8).length);
         String reply = "echo: " + msg;
-        // Record the outbound frame once it was sent, so a refused frame is not billed.
-        s.getAsyncRemote().sendText(reply, result -> {
-            if (result.isOK()) billing.recordFrame(connectionId, "SERVER_TO_CLIENT", "TEXT", reply.length());
-        });
+        try {
+            // Blocking send: one send at a time per session. Overlapping getAsyncRemote().sendText
+            // calls (a client sending faster than replies go out) make Tomcat throw TEXT_FULL_WRITING.
+            s.getBasicRemote().sendText(reply);
+            // Record the outbound frame once it was sent, so a refused frame is not billed.
+            billing.recordFrame(connectionId, "SERVER_TO_CLIENT", "TEXT", reply.getBytes(StandardCharsets.UTF_8).length);
+        } catch (IOException e) {
+            // Not sent, so not billed; the container closes the session and @OnClose records the close.
+        }
     }
 
     @OnClose

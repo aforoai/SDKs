@@ -24,6 +24,10 @@ All notable changes to `@aforoai/mcp-proxy` are documented here. This project fo
 - The Claude Desktop example has a `customerId` (without one the proxy exits) and keeps the key in the host's `env` block.
 - `tools/list`, `resources/read` and `prompts/get` are forwarded, not "tracked for analytics".
 
+### Fixed (end-to-end test)
+- **Streamable HTTP traffic without `Mcp-Session-Id` is one session, not one per call.** In front of a server that issues no session ids, every POST was its own session: each event carried a new `sessionId`, and the heartbeat followed a session that had already ended. Such calls are now metered in one stable proxy session per client token (one per proxy when clients share a token or none). Each request is still matched only to its own response, so clients that reuse JSON-RPC ids concurrently keep their own statuses. Requests that carry `Mcp-Session-Id` keep that session, as before.
+- README and USER_GUIDE show version 2.1.1.
+
 ## [2.0.0] - 2026-10-26
 
 ### Fixed (transport core, review of 2026-10-26)

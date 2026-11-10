@@ -126,6 +126,62 @@ WS_CLOSE_REASONS: Dict[int, str] = {
     1012: "GOING_AWAY",
 }
 
+def _close_reason_for_code(code: Any) -> Optional[str]:
+    """The ``wsCloseReason`` label for a WebSocket close code, via
+    :data:`WS_CLOSE_REASONS`. A code outside the map (an application code
+    such as 4401, or 1013) is ``NORMAL_CLOSURE``, as in the Node SDK. ``None``
+    when ``code`` is not a number."""
+    if code is None or isinstance(code, bool):
+        return None
+    try:
+        value = int(code)
+    except (TypeError, ValueError):
+        return None
+    return WS_CLOSE_REASONS.get(value, "NORMAL_CLOSURE")
+
+
+def _is_close_exception(exc: Any) -> bool:
+    """True for the exception a WebSocket library raises because the
+    connection closed (``websockets.ConnectionClosed*``, Starlette/FastAPI
+    ``WebSocketDisconnect``): a close, not a failure of the handler. Matched by
+    class name so neither library has to be installed."""
+    return any(k.__name__ in ("ConnectionClosed", "WebSocketDisconnect") for k in type(exc).__mro__)
+
+
+def _close_code_from_exception(exc: Any) -> Optional[int]:
+    """The close code carried by a close exception: websockets' received close
+    frame, else the one it sent, else 1006 (the connection dropped without a
+    close frame); Starlette's ``WebSocketDisconnect.code``. The frames are read
+    first: ``websockets`` (10+) deprecates ``ConnectionClosed.code`` and warns."""
+    has_frames = hasattr(exc, "rcvd") or hasattr(exc, "sent")
+    for frame in (getattr(exc, "rcvd", None), getattr(exc, "sent", None)):
+        frame_code = getattr(frame, "code", None)
+        if frame_code is not None:
+            try:
+                return int(frame_code)
+            except (TypeError, ValueError):
+                continue
+    if not has_frames:
+        code = getattr(exc, "code", None)
+        if isinstance(code, int) and not isinstance(code, bool):
+            return code
+    return 1006
+
+
+def _close_reason(exc: Any, observed_code: Optional[int]) -> str:
+    """``wsCloseReason`` for a tracked connection when its block exits.
+
+    A close exception (the peer closed, or the socket dropped) reports the
+    real close code. Any other exception means the handler failed:
+    ``INTERNAL_ERROR``. With no exception, the close code seen on the
+    connection is used, else ``NORMAL_CLOSURE`` (the handler finished)."""
+    if exc is not None:
+        if not _is_close_exception(exc):
+            return "INTERNAL_ERROR"
+        return _close_reason_for_code(_close_code_from_exception(exc)) or "NORMAL_CLOSURE"
+    return _close_reason_for_code(observed_code) or "NORMAL_CLOSURE"
+
+
 WS_DIRECTIONS = ("CLIENT_TO_SERVER", "SERVER_TO_CLIENT")
 WS_FRAME_TYPES = ("OPEN", "TEXT", "BINARY", "PING", "PONG", "CLOSE")
 
@@ -757,7 +813,11 @@ async def track_websockets_connection(
                 websocket.recv = self._orig_recv  # type: ignore[attr-defined]
             if not billing._unregister(self.connection_id) and getattr(self, "_tracked", False):
                 return  # the idle sweep or shutdown() already reported it
-            self._emit_closed("NORMAL_CLOSURE" if exc is None else "INTERNAL_ERROR", None)
+            # The real close code: from the close exception, else from the
+            # connection (websockets sets close_code once it is closed; a 1001
+            # ends `async for` without an exception).
+            code = getattr(websocket, "close_code", None)
+            self._emit_closed(_close_reason(exc, code if isinstance(code, int) else None), None)
 
         def _emit_closed(self, close_reason: str, closed_by: Optional[str]) -> None:
             billing.push(_closed_event(self._seg, close_reason, closed_by, customer_id, product_type,
@@ -807,6 +867,7 @@ async def track_starlette_websocket(
     connection_id = str(uuid.uuid4())
     seg = _Segment(billing, connection_id)
     holder: Dict[str, Any] = {}
+    close_seen: Dict[str, Any] = {}  # first close code seen on the ASGI channel
 
     def _emit(close_reason: str, closed_by: Optional[str]) -> None:
         holder["ctx"]._emit_closed(close_reason, closed_by)
@@ -827,6 +888,9 @@ async def track_starlette_websocket(
         # Starlette: every helper (send_text, send_json, receive_bytes,
         # iter_json, ...) goes through the ASGI-level send / receive.
         async def _send(message, _orig=orig_send):
+            if isinstance(message, dict) and message.get("type") == "websocket.close":
+                # The server closes first: ASGI's default code is 1000.
+                close_seen.setdefault("code", message.get("code") or 1000)
             frame = isinstance(message, dict) and message.get("type") == "websocket.send"
             if frame:
                 # Billed only once the send returns without raising.
@@ -842,6 +906,9 @@ async def track_starlette_websocket(
 
         async def _receive(_orig=orig_receive):
             message = await _orig()
+            if isinstance(message, dict) and message.get("type") == "websocket.disconnect":
+                # The client closed (or dropped): ASGI's default code is 1005.
+                close_seen.setdefault("code", message.get("code") or 1005)
             if isinstance(message, dict) and message.get("type") == "websocket.receive":
                 seg.resume(_emit)
                 if message.get("bytes") is not None:
@@ -901,7 +968,10 @@ async def track_starlette_websocket(
         async def __aexit__(self, exc_type, exc, tb):
             if not billing._unregister(connection_id) and getattr(self, "_tracked", False):
                 return  # the idle sweep or shutdown() already reported it
-            self._emit_closed("NORMAL_CLOSURE" if exc is None else "INTERNAL_ERROR", None)
+            # WebSocketDisconnect (the README's `while True: receive_text()`
+            # loop ends with one) carries the client's close code; only another
+            # exception is a handler failure.
+            self._emit_closed(_close_reason(exc, close_seen.get("code")), None)
 
         def _emit_closed(self, close_reason: str, closed_by: Optional[str]) -> None:
             billing.push(_closed_event(seg, close_reason, closed_by, customer_id, product_type,

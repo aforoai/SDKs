@@ -1,10 +1,10 @@
 # graphql-metering-go
 
-Per-operation GraphQL metering for Go servers. Wrap your `/graphql` HTTP handler (gqlgen, graphql-go, or anything that speaks the GraphQL-over-HTTP POST shape) and Aforo gets one billing event per operation — operation type, name, an approximate complexity score, error flag, and duration — batched and retried in the background.
+Per-operation GraphQL metering for Go servers. Wrap your `/graphql` HTTP handler (gqlgen, graphql-go, or anything that speaks the GraphQL-over-HTTP POST shape) and Aforo gets one billing event per operation — operation type, name, a complexity score, error flag, and duration — batched and retried in the background.
 
 **Version:** 2.1.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
-Reach for this when you bill GraphQL by the operation (or by complexity tier) and want the type/name/complexity extracted for you at the HTTP boundary, or when you already compute an accurate complexity score and just want a clean `Record()` to ship it.
+Reach for this when you bill GraphQL by the operation (or by complexity tier) and want the type/name/complexity extracted for you at the HTTP boundary, or when you run your own executor and want a clean `Record()` to ship each operation.
 
 ## Install
 
@@ -79,7 +79,7 @@ The customer comes from `CustomerResolver`, which you write from your own authen
 
 > ⚠ The middleware reads at most `MaxRequestBodyBytes` (default 1 MiB) of the body to find the operation, then gives your handler the whole body, unchanged. A larger body is passed through without being held in memory and is not metered (counted as `invalid`). The response writer passes `Flush` and `Hijack` through, so subscriptions over SSE or WebSocket keep working.
 
-Manual recording — when you compute an accurate complexity yourself:
+Manual recording — from your own executor (the SDK scores the query you pass):
 
 ```go
 billing.Record(customerID, query, operationName, durationMs, hasErrors)
@@ -135,6 +135,8 @@ OUTCOME_BASED rate plans weight each operation by its `executionStatus`.
 
 The middleware derives it from the response body (`OutcomeFromGraphQLResponse`): no errors → `SUCCESS`, errors with data → `PARTIAL`, errors with `"data": null` (failed during execution) → `ERROR`, errors with no `data` key (parse or validation failure) → `VALIDATION_FAILED`. When the body isn't a single GraphQL response (or is over 1 MiB) it falls back to the HTTP status (`OutcomeFromHTTPStatus`): 2xx/3xx `SUCCESS`, 408/504 `TIMEOUT`, 499 `CANCELLED`, 400/422 `VALIDATION_FAILED`, 401/403/429 `BLOCKED`, other 4xx/5xx `ERROR`. A handler can set its own value with `SetExecutionStatus(r.Context(), "...")`, which always wins.
 
+`gqlHasErrors` follows the same response: it is `true` when the body carries GraphQL errors (`PARTIAL`, `ERROR` or `VALIDATION_FAILED` above), also when the server answered HTTP 200, or when the HTTP status is 400 or more. `SetExecutionStatus` does not change it.
+
 `Record` sends no status unless you pass one. For manual recording, pass `EventOptions` (to `Record` or `RecordWithOptions`):
 
 ```go
@@ -170,7 +172,7 @@ Idempotency keys are minted once, when the event is recorded. Every retry and ev
 
 ## What this doesn't cover
 
-- **Complexity is approximate by default.** The built-in scorer is `field_count + 5 × max_depth` from a brace-balance + identifier-token count — good enough for tiering, not AST-accurate. For exact scoring, compute it yourself (e.g. graphql-go's visitor) and pass it via `Record()`.
+- **Custom complexity weights.** The score is `field_count + 5 × max_depth` of the operation that runs: only fields count (not arguments, aliases, directives, the operation keyword, its name or its variables), other operations and unused fragments are not counted, and each fragment spread counts the fragment's fields where it is spread — the same numbers as the Java, Python and Node SDKs. It is fixed; for a different weighting, price on `gqlFieldCount` or meter with your own events.
 - **No GraphQL subscriptions over WebSocket.** This meters GraphQL-over-HTTP POST. For long-lived WebSocket transports use the `go-ws` SDK.
 - **No delivery guarantee on crash.** Events live in memory until sent; a hard crash loses the queue. `Shutdown(ctx)` sends what is left on graceful exit, bounded by `ShutdownTimeout`. The library installs no signal handler.
 - **Customer identity.** The SDK does not decode JWTs; your `CustomerResolver` returns the customer.

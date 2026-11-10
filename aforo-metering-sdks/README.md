@@ -70,7 +70,7 @@ An event the SDK cannot deliver is counted (`droppedCount`), logged as a warning
 | Reason | When |
 |---|---|
 | `overflow` | The buffer was full; the oldest event was evicted. |
-| `shutdown` | Still queued when `shutdown` / `close` reached its deadline (`shutdownTimeout`, default 5 s). |
+| `shutdown` | Still queued, or still in flight, when `shutdown` / `close` reached its deadline (`shutdownTimeout`, default 5 s). A batch that was in flight may already have been stored: the request is abandoned, not refused. Re-recording those events is safe, because they keep their idempotency keys and the ingestor stores each key once. |
 | `closed` | Recorded after the client was shut down. Nothing is thrown. |
 | `retry_exhausted` | Kept for compatibility; with requeue-on-outage it is only reported when requeue is impossible. |
 | `rejected` | The ingestor refused the batch with a non-retryable 4xx, or refused individual events in an otherwise accepted batch. |

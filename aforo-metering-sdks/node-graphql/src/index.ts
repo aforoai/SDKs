@@ -37,7 +37,7 @@ import { TransportCore, CoreDropReason } from './transport-core/core';
 
 /** What onError receives for delivery problems: branch on `kind`, read `events`. */
 export { CoreTransportError, type CoreErrorKind } from './transport-core/core';
-import { parse, visit, Kind, type OperationDefinitionNode, type DocumentNode } from 'graphql';
+import { parse, Kind, type OperationDefinitionNode, type DocumentNode, type FragmentDefinitionNode, type SelectionSetNode } from 'graphql';
 
 export interface AforoGraphQlConfig {
   tenantId: string;
@@ -87,7 +87,11 @@ export interface AforoGraphQlConfig {
   shutdownTimeoutMs?: number;
   /** Send queued events on the process 'beforeExit' event (default true). */
   flushOnExit?: boolean;
-  /** Override the complexity scorer. Default: fieldCount + 5 × depth. */
+  /**
+   * Override the complexity scorer. Receives the parsed document and the name of the
+   * operation that runs. Default: fieldCount + 5 × depth of that operation, with each
+   * fragment counted at every spread; other operations in the document are not counted.
+   */
   complexityScorer?: (doc: DocumentNode, operationName?: string) => { complexity: number; fieldCount: number };
   /** Events per request (default 500, max 1000). Reaching it wakes the background sender. */
   flushCount?: number;
@@ -621,23 +625,62 @@ function operationParams(req: any): { query?: string; operationName?: string } {
 
 // ── Default complexity scorer ─────────────────────────────────────
 
-export function defaultComplexityScorer(doc: DocumentNode, _operationName?: string) {
-  let fieldCount = 0;
-  let maxDepth = 0;
-  let currentDepth = 0;
-  visit(doc, {
-    Field: {
-      enter() {
-        fieldCount++;
-        currentDepth++;
-        if (currentDepth > maxDepth) maxDepth = currentDepth;
-      },
-      leave() {
-        currentDepth--;
-      },
-    },
-  });
-  return { complexity: fieldCount + 5 * maxDepth, fieldCount };
+/** Largest value either score takes (a Java int, as in the other SDKs and the ingestor). */
+const MAX_SCORE = 2_147_483_647;
+const capped = (n: number) => Math.min(n, MAX_SCORE);
+
+/**
+ * `fieldCount + 5 × maxDepth` of the operation that runs: `operationName`'s
+ * operation, else the document's first (the same one the event is named
+ * after). Other operations in the document, and fragments only they use, are
+ * not counted. A fragment's fields count at every spread, at the depth where
+ * it is spread (spread depth plus the field's depth inside the fragment);
+ * inline fragments add no depth. Arguments, aliases, directives and variables
+ * are not counted. Each fragment is measured once, so scoring stays linear;
+ * a spread of an unknown fragment, or one that spreads itself (both invalid
+ * GraphQL), counts nothing. Both numbers are capped at 2^31-1. This is the
+ * rule the Java, Go and Python SDKs use.
+ */
+export function defaultComplexityScorer(doc: DocumentNode, operationName?: string) {
+  const op = findOperation(doc, operationName);
+  if (!op) return { complexity: 0, fieldCount: 0 };
+  const fragments = new Map<string, FragmentDefinitionNode>();
+  for (const d of doc.definitions) {
+    if (d.kind === Kind.FRAGMENT_DEFINITION && !fragments.has(d.name.value)) fragments.set(d.name.value, d);
+  }
+  type Size = { fields: number; depth: number };
+  const measured = new Map<string, Size>();
+  const inProgress = new Set<string>();
+  const fragmentSize = (name: string): Size => {
+    const known = measured.get(name);
+    if (known) return known;
+    const def = fragments.get(name);
+    if (!def || inProgress.has(name)) return { fields: 0, depth: 0 };
+    inProgress.add(name);
+    const size = measure(def.selectionSet);
+    inProgress.delete(name);
+    measured.set(name, size);
+    return size;
+  };
+  /** Fields in a selection set, and its depth (1 for a set of leaf fields). */
+  function measure(set: SelectionSetNode | undefined): Size {
+    let fields = 0;
+    let depth = 0;
+    for (const sel of set?.selections ?? []) {
+      if (sel.kind === Kind.FIELD) {
+        const below = measure(sel.selectionSet);
+        fields = capped(fields + 1 + below.fields);
+        depth = Math.max(depth, capped(1 + below.depth));
+      } else {
+        const inner = sel.kind === Kind.INLINE_FRAGMENT ? measure(sel.selectionSet) : fragmentSize(sel.name.value);
+        fields = capped(fields + inner.fields);
+        depth = Math.max(depth, inner.depth);
+      }
+    }
+    return { fields, depth };
+  }
+  const { fields, depth } = measure(op.selectionSet);
+  return { complexity: capped(fields + 5 * depth), fieldCount: fields };
 }
 
 /**

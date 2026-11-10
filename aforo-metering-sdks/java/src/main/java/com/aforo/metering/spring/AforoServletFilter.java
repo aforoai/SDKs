@@ -437,13 +437,25 @@ public class AforoServletFilter implements Filter {
         }
     }
 
-    /** Route pattern when Spring MVC matched one, else the normalized path; no query, capped. */
+    /**
+     * Route pattern when Spring MVC matched a route, else the normalized path; no query, capped.
+     * The catch-all {@code /**} (Spring Boot's static-resource handler, which also answers every
+     * unmatched URL with 404) is not a route: the normalized request path is recorded instead, so
+     * unrelated URLs are not all reported as one endpoint.
+     */
     private String endpointPath(HttpServletRequest req, String path) {
         Object pattern = req.getAttribute(BEST_MATCHING_PATTERN_ATTRIBUTE);
-        String normalized = PathNormalizer.normalize(path, pattern instanceof String s ? s : null);
+        String route = pattern instanceof String s && !isCatchAllPattern(s) ? s : null;
+        String normalized = PathNormalizer.normalize(path, route);
         int q = normalized.indexOf('?');
         if (q >= 0) normalized = normalized.substring(0, q);
         return bounded("endpointPath", normalized, MAX_ENDPOINT_PATH_LENGTH);
+    }
+
+    /** {@code /**} (or {@code **}): matches every path, so it names no endpoint. */
+    static boolean isCatchAllPattern(String pattern) {
+        String p = pattern.trim();
+        return p.equals("/**") || p.equals("**");
     }
 
     /** A request-derived label cut to the ingestor's limit; warns once per label. */

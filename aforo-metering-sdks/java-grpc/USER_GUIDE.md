@@ -99,12 +99,26 @@ Runtime.getRuntime().addShutdownHook(new Thread(billing::close));
 
 ## Step 6 — (Streaming only) count messages exactly
 
-The interceptor emits `messageCount = 1` per call. For real per-message counts on a streaming method, skip the interceptor's default and record yourself:
+The interceptor emits `messageCount = 1` per call. For real per-message counts on a streaming method, serve that service without the interceptor and record the call yourself when the stream ends, with the messages it carried:
 
 ```java
-// inside your StreamObserver.onNext / onCompleted
-billing.record("ListUsers", "SERVER_STREAM", customerId, "OK", durationMs);
+// One billing per service: grpcService on each event is the builder's serviceName.
+AforoGrpcBilling feedBilling = AforoGrpcBilling.newBuilder()
+        /* ...same options as billing... */
+        .serviceName("acme.v1.FeedService")
+        .build();
+
+// The streaming service is served without the interceptor, so a call is not billed twice.
+ServerBuilder.forPort(50051)
+        .addService(new FeedServiceImpl(feedBilling))
+        .addService(ServerInterceptors.intercept(new UserServiceImpl(), billing.interceptor()))
+        .build().start();
+
+// Inside FeedServiceImpl, when the stream completes:
+feedBilling.record("ListUsers", "SERVER_STREAM", customerId, "OK", durationMs, received + sent);
 ```
+
+`record(method, callType, customerId, status, durationMs, messageCount, executionStatus, productType)` also sets an outcome status and a per-call product type (`null` for either uses the default). A negative count is sent as 0.
 
 ## Configuration reference
 
@@ -139,7 +153,7 @@ billing.record("ListUsers", "SERVER_STREAM", customerId, "OK", durationMs);
 | `Ingestor unreachable after retries; N event(s) put back in the queue` in logs | Network error, timeout, 5xx, 408 or 429 on every attempt | Check connectivity to `ingestorUrl`. Nothing is lost while the queue has room; events still queued when `close()` hits its deadline go to `onDrop` as `SHUTDOWN`. |
 | `ingestor returned 4xx — not retrying` or `Dropped N event(s) — REJECTED` in logs | Bad key, unknown metric, or an event the ingestor refused; a 4xx other than 408/429 is sent once | Verify the key + `X-Tenant-Id`; ensure the `grpc_api.rpc_calls` metric exists in Aforo. The log line carries the ingestor's `errors[].message`. |
 | `Dropping invalid event: ...` in logs, `droppedCount()` grows | The event breaks an ingestor field limit (`DropReason.INVALID`) and was not sent | The message names the field, the limit and the value. See [Dropped events](README.md#dropped-events). |
-| Streaming calls all show `messageCount = 1` | The interceptor counts one event per call, not per message | Call `billing.record(...)` inside the streaming handler for exact counts. |
+| Streaming calls all show `messageCount = 1` | The interceptor counts one event per call, not per message | Serve the streaming service without the interceptor and call `billing.record(..., durationMs, messageCount)` when the stream ends (Step 6). |
 | `grpcStatusCode` is `UNKNOWN` for errors you expected to classify | Your handler threw a raw exception rather than setting a `Status` | Map errors to gRPC `Status` codes in your service; the SDK reports whatever code the call closes with. |
 
 ## What this guide does NOT cover

@@ -11,17 +11,22 @@ import graphql.execution.instrumentation.SimpleInstrumentationContext;
 import graphql.execution.instrumentation.parameters.InstrumentationCreateStateParameters;
 import graphql.execution.instrumentation.parameters.InstrumentationExecuteOperationParameters;
 import graphql.execution.instrumentation.parameters.InstrumentationExecutionParameters;
+import graphql.language.Definition;
 import graphql.language.Document;
 import graphql.language.Field;
-import graphql.language.NodeTraverser;
+import graphql.language.FragmentDefinition;
+import graphql.language.FragmentSpread;
+import graphql.language.InlineFragment;
 import graphql.language.OperationDefinition;
+import graphql.language.Selection;
+import graphql.language.SelectionSet;
 import graphql.parser.Parser;
-import graphql.util.TraversalControl;
-import graphql.util.TraverserContext;
 
 import java.time.Instant;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
@@ -255,26 +260,8 @@ public final class AforoGraphQlBilling implements AutoCloseable {
     private void recordOperation(String customerId, Document doc, OperationDefinition op, long durationMs,
                                  boolean hasErrors, String outcome, String productTypeOverride) {
         try {
-            int[] fc = {0};
-            int[] maxDepth = {0};
-            int[] depth = {0};
-            // doc.accept() by itself only fires on the Document node (not its children).
-            // Use NodeTraverser to recursively walk into Field nodes; enter/leave track depth.
-            new NodeTraverser().depthFirst(new graphql.language.NodeVisitorStub() {
-                @Override
-                public TraversalControl visitField(Field node, TraverserContext<graphql.language.Node> context) {
-                    if (context.getPhase() == TraverserContext.Phase.ENTER) {
-                        fc[0]++;
-                        depth[0]++;
-                        if (depth[0] > maxDepth[0]) maxDepth[0] = depth[0];
-                    } else if (context.getPhase() == TraverserContext.Phase.LEAVE) {
-                        depth[0]--;
-                    }
-                    return TraversalControl.CONTINUE;
-                }
-            }, doc);
-
-            int complexity = fc[0] + 5 * maxDepth[0];
+            int[] measured = measure(doc, op);
+            int complexity = (int) Math.min(MAX_SCORE, measured[0] + 5L * measured[1]);
             String opType = op.getOperation().name(); // QUERY, MUTATION, SUBSCRIPTION
             String opName = op.getName() != null ? op.getName() : "anonymous";
 
@@ -289,7 +276,7 @@ public final class AforoGraphQlBilling implements AutoCloseable {
             event.put("gqlOperationType", opType);
             event.put("gqlOperationName", boundedLabel("gqlOperationName", opName, MAX_GQL_OPERATION_NAME));
             event.put("gqlComplexity", complexity);
-            event.put("gqlFieldCount", fc[0]);
+            event.put("gqlFieldCount", measured[0]);
             event.put("gqlHasErrors", hasErrors);
             event.put("executionDurationMs", (int) Math.max(0, Math.min(durationMs, Integer.MAX_VALUE)));
             if (outcome != null) event.put("executionStatus", outcome);
@@ -372,6 +359,75 @@ public final class AforoGraphQlBilling implements AutoCloseable {
         LOG.warning("[aforo-graphql] Ignoring unknown executionStatus \"" + normalized + "\" — expected one of "
                 + new java.util.TreeSet<>(ALLOWED_EXECUTION_STATUSES) + "; the event is sent without it.");
         return null;
+    }
+
+    /** Largest {@code gqlComplexity} / {@code gqlFieldCount} the ingestor stores; nested spreads can multiply past it. */
+    static final long MAX_SCORE = Integer.MAX_VALUE;
+
+    /**
+     * Field count and depth of {@code op}, the operation that runs. Only fields count: arguments,
+     * aliases, directives and variable definitions do not. Other operations in the document and
+     * fragments it does not use are not counted. Each fragment spread counts the fragment's fields where
+     * it is spread (a fragment spread twice runs twice); inline fragments and spreads add no depth. A
+     * fragment's size is worked out once, so nested spreads cost linear time; a spread of an unknown
+     * fragment, or one that spreads itself, counts nothing. Both numbers are capped at 2^31 - 1. The
+     * same rules as the Go, Python and Node SDKs.
+     *
+     * @return {fieldCount, maxDepth}
+     */
+    static int[] measure(Document doc, OperationDefinition op) {
+        Map<String, FragmentDefinition> fragments = new HashMap<>();
+        for (Definition<?> d : doc.getDefinitions()) {
+            if (d instanceof FragmentDefinition f) fragments.putIfAbsent(f.getName(), f);
+        }
+        long[] size = new Measurer(fragments).measure(op.getSelectionSet());
+        return new int[] {(int) size[0], (int) Math.min(size[1], MAX_SCORE)};
+    }
+
+    private static final class Measurer {
+        private final Map<String, FragmentDefinition> fragments;
+        private final Map<String, long[]> sizes = new HashMap<>();
+        private final Set<String> inProgress = new HashSet<>();
+
+        Measurer(Map<String, FragmentDefinition> fragments) {
+            this.fragments = fragments;
+        }
+
+        /** {fields, depth} of a selection set. */
+        long[] measure(SelectionSet set) {
+            long fields = 0, depth = 0;
+            if (set == null) return new long[] {0, 0};
+            for (Selection<?> s : set.getSelections()) {
+                long[] inner;
+                if (s instanceof Field f) {
+                    long[] below = measure(f.getSelectionSet());
+                    fields = Math.min(MAX_SCORE, fields + 1 + below[0]);
+                    depth = Math.max(depth, 1 + below[1]);
+                    continue;
+                } else if (s instanceof InlineFragment inline) {
+                    inner = measure(inline.getSelectionSet());
+                } else if (s instanceof FragmentSpread spread) {
+                    inner = fragmentSize(spread.getName());
+                } else {
+                    continue;
+                }
+                fields = Math.min(MAX_SCORE, fields + inner[0]);
+                depth = Math.max(depth, inner[1]);
+            }
+            return new long[] {fields, depth};
+        }
+
+        /** A fragment's {fields, depth}, worked out once. */
+        private long[] fragmentSize(String name) {
+            long[] known = sizes.get(name);
+            if (known != null) return known;
+            FragmentDefinition def = fragments.get(name);
+            if (def == null || !inProgress.add(name)) return new long[] {0, 0};
+            long[] size = measure(def.getSelectionSet());
+            inProgress.remove(name);
+            sizes.put(name, size);
+            return size;
+        }
     }
 
     private OperationDefinition findOperation(Document doc, String operationName) {

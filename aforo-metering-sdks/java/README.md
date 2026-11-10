@@ -79,7 +79,7 @@ AforoServletFilter.CustomerIdResolver aforoCustomerIdResolver() {
 
 Without a `CustomerIdResolver` bean, `aforo.use-principal-as-customer-id: true` (the principal name is the Aforo customer id) or `aforo.trust-customer-header: true` (a gateway in front of the app sets `X-Customer-Id`), the application fails to start with a message saying so.
 
-The filter runs **after** the response is committed, so metering adds no latency to the API call. An async request (`DeferredResult`, `Callable`, `startAsync`) is metered when it completes, with its final status and duration; a request whose handler throws is metered with status 500 (the exception still propagates). Only the first (REQUEST) dispatch is metered, so an ASYNC or ERROR re-dispatch never counts twice. It records `aforo.metric-name` (default `api_calls`) or the result of an `AforoServletFilter.MetricNameResolver` bean. It resolves the customer from your `AforoServletFilter.CustomerIdResolver` bean, else the principal name when `aforo.use-principal-as-customer-id: true`, else the `X-Customer-Id` header (`aforo.customer-id-header`) only when `aforo.trust-customer-header: true`. The caller's `X-Api-Key` header is never used — it is a secret, not a customer id. A request with no customer, or whose resolver throws, is served as usual; its event is not sent and is reported as `INVALID`. `OPTIONS` (CORS preflight) requests are skipped. Outside Spring, build the filter with `AforoServletFilter.builder(client).customerIdResolver(...).build()`; `build()` throws when no customer source is set. Each event also carries top-level `endpointPath` (the matched route pattern, else the normalized path, without query string, at most 512 chars), `httpMethod`, `statusCode`, `responseTimeMs`, and `productType` (`AforoServletFilter.productType(...)`, else the client default).
+The filter runs **after** the response is committed, so metering adds no latency to the API call. An async request (`DeferredResult`, `Callable`, `startAsync`) is metered when it completes, with its final status and duration; a request whose handler throws is metered with status 500 (the exception still propagates). Only the first (REQUEST) dispatch is metered, so an ASYNC or ERROR re-dispatch never counts twice. It records `aforo.metric-name` (default `api_calls`) or the result of an `AforoServletFilter.MetricNameResolver` bean. It resolves the customer from your `AforoServletFilter.CustomerIdResolver` bean, else the principal name when `aforo.use-principal-as-customer-id: true`, else the `X-Customer-Id` header (`aforo.customer-id-header`) only when `aforo.trust-customer-header: true`. The caller's `X-Api-Key` header is never used — it is a secret, not a customer id. A request with no customer, or whose resolver throws, is served as usual; its event is not sent and is reported as `INVALID`. `OPTIONS` (CORS preflight) requests are skipped. Outside Spring, build the filter with `AforoServletFilter.builder(client).customerIdResolver(...).build()`; `build()` throws when no customer source is set. Each event also carries top-level `endpointPath` (the matched route pattern, else the normalized path, without query string, at most 512 chars; Spring's catch-all `/**`, which also answers unmatched URLs, is not a route, so those requests record their normalized path), `httpMethod`, `statusCode`, `responseTimeMs`, and `productType` (`AforoServletFilter.productType(...)`, else the client default).
 
 > ⚠ The metric must exist in your tenant's Aforo catalog: the ingestor rejects events for an unknown metric, and they are dropped with reason `REJECTED` (see [Dropped events](#dropped-events)). Earlier versions recorded `"<METHOD> <normalized-path>"`, which no catalog contains.
 
@@ -149,6 +149,21 @@ AforoClient client = new AforoClient(new AforoOptions(apiKey)
 
 long lost = client.droppedCount();
 ```
+
+With Spring Boot, the auto-configured client has no `onDrop` / `onError` (hooks are not properties): drops are only counted and logged. To receive them, declare your own `AforoClient` bean. The auto-configuration backs off, the filter records into your client, and Spring's stop phase still closes it:
+
+```java
+@Bean
+AforoClient aforoClient(@Value("${aforo.api-key}") String apiKey) {
+    return new AforoClient(new AforoOptions(apiKey)
+            .baseUrl("https://api.aforo.ai")
+            .registerShutdownHook(false) // Spring's stop phase closes the client
+            .onDrop((events, reason) -> deadLetter.save(events, reason))
+            .onError(err -> log.warn("aforo {}: {}", err.kind(), err.message())));
+}
+```
+
+Your bean replaces the auto-configured client, so the client properties (`aforo.base-url`, `aforo.flush-count`, `aforo.allow-insecure-http`, ...) no longer apply: set them on `AforoOptions`. The filter properties (`aforo.metric-name`, `aforo.trust-customer-header`, ...) still apply.
 
 | `DropReason` | When |
 |---|---|

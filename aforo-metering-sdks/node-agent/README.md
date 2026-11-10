@@ -2,7 +2,7 @@
 
 Meter an AI agent's runs in Aforo: open a session, record steps, tool calls and tokens, end the session. Events are buffered and sent in batches to the Aforo usage ingestor (`POST https://api.aforo.ai/v1/ingest/batch`, header `X-API-Key`). No runtime dependencies.
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -15,7 +15,7 @@ If `2.0.0` is not on npm yet, install from source:
 ```bash
 git clone https://github.com/aforoai/SDKs.git
 cd SDKs/aforo-metering-sdks/node-agent
-npm install && npm run build && npm pack   # aforoai-agent-metering-2.0.0.tgz
+npm install && npm run build && npm pack   # aforoai-agent-metering-2.1.1.tgz
 ```
 
 Requires Node >= 18 (built-in `fetch`). On older Node, pass `fetchImpl`.

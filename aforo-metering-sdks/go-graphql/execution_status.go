@@ -60,6 +60,12 @@ func OutcomeFromGraphQLResponse(body []byte) string {
 	return "ERROR"
 }
 
+// outcomeHasErrors reports whether an OutcomeFromGraphQLResponse result means
+// the response carried GraphQL errors.
+func outcomeHasErrors(outcome string) bool {
+	return outcome == "PARTIAL" || outcome == "ERROR" || outcome == "VALIDATION_FAILED"
+}
+
 // OutcomeFromHTTPStatus derives an execution status from the HTTP status of
 // a GraphQL response when the body is not available:
 //

@@ -128,6 +128,9 @@ breaker. Re-sending is safe because the ingestor deduplicates on
   `shutdownTimeout` (default 5 s). Each request in that window uses
   `min(timeout, time left)`; retries and breaker waits never run past the deadline.
 - Events still queued at the deadline → `onDrop(events, "shutdown")` and counted.
+  A batch still in flight at the deadline is abandoned and reported the same
+  way, although the ingestor may already have stored it; the outcome is unknown,
+  so `shutdown` can over-count. Re-sending is safe (same idempotency keys).
 - `track()` after close does not throw: the event is counted and reported as
   `onDrop([event], "closed")` (Go also returns `ErrClientClosed`).
 - Libraries do not install signal handlers. Where a language offers a process

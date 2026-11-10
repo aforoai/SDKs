@@ -153,9 +153,9 @@ func (c *countingReader) Read(p []byte) (int, error) {
 // G278: the field regex is compiled once (no allocation-heavy compile per call).
 func TestScoreComplexityDoesNotCompilePerCall(t *testing.T) {
 	q := "query Q { a b c { d e } }"
-	allocs := testing.AllocsPerRun(50, func() { scoreComplexity(q) })
+	allocs := testing.AllocsPerRun(50, func() { scoreOperation(q, "") })
 	if allocs > 20 {
-		t.Fatalf("scoreComplexity allocates %.0f objects per call; the regex must be compiled once", allocs)
+		t.Fatalf("scoreOperation allocates %.0f objects per call; scoring must not compile or build per-call state beyond a few maps", allocs)
 	}
 }
 

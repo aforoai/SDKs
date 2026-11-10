@@ -2,7 +2,7 @@
 
 Wrap your MCP server's tool handlers so every `tools/call` is metered for billing, with session tracking, without changing your tool logic. Use it when you own the MCP server source and want metering inline, not a sidecar.
 
-**Version:** 2.0.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.1.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -15,8 +15,8 @@ npm i @aforoai/mcp-metering
 > git clone https://github.com/aforoai/SDKs.git
 > cd SDKs/aforo-metering-sdks/node-mcp
 > npm install && npm run build
-> npm pack        # produces aforo-mcp-metering-2.0.0.tgz
-> # then in your MCP server: npm i /path/to/aforo-mcp-metering-2.0.0.tgz
+> npm pack        # produces aforoai-mcp-metering-2.1.1.tgz
+> # then in your MCP server: npm i /path/to/aforoai-mcp-metering-2.1.1.tgz
 > ```
 
 Requires Node >= 18 (uses the built-in `fetch` and `AbortSignal.timeout`).

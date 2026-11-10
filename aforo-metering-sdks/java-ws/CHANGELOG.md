@@ -10,6 +10,9 @@ All notable changes to `ai.aforo:ws-metering` are documented here. This project 
 - **A 429 whose `X-RateLimit-Limit` is below the batch size splits the batch.** The events go back to the head of the queue in order and are sent in batches of at most that many after the `Retry-After` wait, instead of resending a batch the API key's per-minute limit can never accept until the queue overflowed.
 - **A connection closed by the idle sweep is tracked again by its next frame** (same connection id and customer, metadata `resumedAfterIdleSweep: true`; no second `CONNECTION_OPENED`). Its frames and bytes were silently ignored, and never counted as dropped, after the sweep.
 
+### Fixed (end-to-end test)
+- Docs: the Jakarta quickstart and user guide send replies with `getBasicRemote().sendText(...)` and record the outbound frame after it succeeded. The `getAsyncRemote()` version made Tomcat throw `IllegalStateException` (`TEXT_FULL_WRITING`) when a client sent faster than the replies went out. Frame sizes are now counted in UTF-8 bytes.
+
 ## [2.1.0] - 2026-10-30
 
 ### Added

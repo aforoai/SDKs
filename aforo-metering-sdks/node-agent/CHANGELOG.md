@@ -9,6 +9,9 @@ All notable changes to `@aforoai/agent-metering` are documented here. This proje
 - **Quantity precision is checked when the event is recorded.** A quantity with more than 14 integer digits or 6 decimal places (for example `recordUsage('gpuHours', 1/3)`) is dropped as `invalid` at once, as contract/ingest-contract.json and the root README require, instead of being rejected later by the ingestor. Nothing is rounded.
 - `metadata` (and the deprecated `properties`) must be a plain object; anything else drops the event as `invalid` instead of being spread into odd keys. `occurredAt` is checked for seconds and a zone.
 
+### Fixed (end-to-end test)
+- README and USER_GUIDE show version 2.1.1 (they said 2.0.0).
+
 ## [2.0.0] - 2026-10-26
 
 2.0.0 was never published, so the wave 5 changes below and the 2026-10-21 batch-contract rewrite (mirror PR aforoai/SDKs#58, next section) ship together as 2.0.0. Upgrade notes from 1.2.0 = both sections.

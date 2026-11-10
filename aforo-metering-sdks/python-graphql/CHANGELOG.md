@@ -13,6 +13,9 @@ All notable changes to `aforo-graphql-metering` are documented here. This projec
 - **429 with a per-key limit below the batch size.** When the ingestor answers 429 with `X-RateLimit-Limit` (events per minute for the API key) lower than the batch's event count, the batch goes back to the head of the queue, in order, and is sent in parts of at most that many events; batches stay that small while the ingestor reports the limit. Otherwise 429 is retried as before.
 - **Batched requests are metered.** `asgi_middleware` skipped a POST whose body is a JSON array of operations (Apollo's BatchHttpLink) without metering or counting it. Each operation is now one event, with its own result's execution status; with no customer, each is counted as an `invalid` drop.
 
+### Fixed (end-to-end test)
+- **Complexity counts only the operation that runs.** The default scorer walked the whole document, so a request carrying several operations, or fragments it does not use, billed `gqlComplexity` / `gqlFieldCount` for all of them. It now scores `operationName`'s operation, else the first. A fragment counts where it is spread (twice if spread twice); inline fragments and spreads add no depth; unknown or self-referencing spreads count nothing. Fragment sizes are worked out once (linear time), and both numbers are capped at 2^31 - 1, the ingestor's limit. Same rules as the Node SDK.
+
 ## [2.1.0] - 2026-10-30
 
 ### Changed

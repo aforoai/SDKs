@@ -286,7 +286,11 @@ export interface InFlightCall {
   customerId: string;
   startTime: number;
   requestId: string | number;
-  /** Session the call ran in — needed to meter a call that never gets a response. */
+  /**
+   * Session stamped on the call's event (and used to meter a call that never gets a
+   * response). Usually the session its response is matched in; for a Streamable HTTP
+   * request without Mcp-Session-Id it is the stable proxy session instead.
+   */
   sessionId?: string;
   /** Set when the call's event would be rejected by the ingestor; it is dropped as 'invalid' instead of sent. */
   invalid?: string;

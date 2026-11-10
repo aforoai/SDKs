@@ -9,6 +9,9 @@ All notable changes to `ai.aforo:mqtt-metering` are documented here. This projec
 - **`close()` from an interrupted thread still drains** until the shutdown deadline, then restores the interrupt flag. It used to skip the drain and report the whole queue as `SHUTDOWN` within milliseconds.
 - **A 429 whose `X-RateLimit-Limit` is below the batch size splits the batch.** The events go back to the head of the queue in order and are sent in batches of at most that many after the `Retry-After` wait, instead of resending a batch the API key's per-minute limit can never accept until the queue overflowed.
 
+### Fixed (end-to-end test)
+- Docs: the quickstart and user guide record `DISCONNECT` next to a clean `client.disconnect()`. Paho calls `disconnected(...)` only when the broker or the network ends the session, so the documented wiring missed every clean disconnect.
+
 ## [2.1.0] - 2026-10-30
 
 ### Added

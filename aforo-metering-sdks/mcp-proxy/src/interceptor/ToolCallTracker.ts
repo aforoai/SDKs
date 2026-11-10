@@ -236,10 +236,19 @@ export class ToolCallTracker {
    * is still tracked so its outcome is known, but when it completes its event
    * is not buffered or sent: it is counted as dropped, WARN-logged and passed
    * to onDrop with reason 'invalid'. Never throws.
+   *
+   * `sessionId` scopes matching the call to its response; `meterSessionId`
+   * (default: the same) is the session stamped on its event and heartbeats.
    */
-  trackRequest(call: ParsedToolCall, sessionId: string, principal?: Principal, resolvedCustomerId?: string): boolean {
+  trackRequest(
+    call: ParsedToolCall,
+    sessionId: string,
+    principal?: Principal,
+    resolvedCustomerId?: string,
+    meterSessionId: string = sessionId,
+  ): boolean {
     const agentId = this.resolveAgentId(call);
-    const customerId = resolvedCustomerId ?? this.resolveCustomerId(call, sessionId, principal) ?? '';
+    const customerId = resolvedCustomerId ?? this.resolveCustomerId(call, meterSessionId, principal) ?? '';
 
     const toolName = this.requestLabel('toolName', typeof call.toolName === 'string' && call.toolName ? call.toolName : 'unknown', MAX_TOOL_NAME);
 
@@ -247,7 +256,7 @@ export class ToolCallTracker {
     if (!customerId) problems.push('no customer: the configured customer source named none for this call');
     if (agentId.length > MAX_AGENT_ID) problems.push(`agentId "${clip(agentId)}" exceeds ${MAX_AGENT_ID} chars`);
     if (customerId.length > MAX_CUSTOMER_ID) problems.push(`customerId "${clip(customerId)}" exceeds ${MAX_CUSTOMER_ID} chars`);
-    if (sessionId.length > MAX_SESSION_ID) problems.push(`sessionId "${clip(sessionId)}" exceeds ${MAX_SESSION_ID} chars`);
+    if (meterSessionId.length > MAX_SESSION_ID) problems.push(`sessionId "${clip(meterSessionId)}" exceeds ${MAX_SESSION_ID} chars`);
     const invalid = problems.length > 0 ? problems.join(', ') : undefined;
 
     // A reused id joins the queue for that session + id: the earlier call keeps
@@ -259,7 +268,7 @@ export class ToolCallTracker {
       customerId,
       startTime: Date.now(),
       requestId: call.requestId,
-      sessionId,
+      sessionId: meterSessionId,
       ...(invalid ? { invalid } : {}),
     });
     this.enforceInFlightCap();
@@ -271,7 +280,7 @@ export class ToolCallTracker {
 
     // Auto-start the session (and its heartbeats) on the first tool call
     if (!this.heartbeat.activeSessionId) {
-      this.heartbeat.startSession(sessionId, customerId);
+      this.heartbeat.startSession(meterSessionId, customerId);
     }
 
     logger.debug('Tool call started', { toolName, requestId: call.requestId });
@@ -331,7 +340,7 @@ export class ToolCallTracker {
     // JSON-RPC error response.
     const error = response.error ?? (response.hasError ? { code: -32603, message: 'JSON-RPC error' } : undefined);
     const status = this.resolveStatus(response.result, error);
-    this.emit(call, sessionId, status, durationMs, response.responseBytes);
+    this.emit(call, call.sessionId ?? sessionId, status, durationMs, response.responseBytes);
     return true;
   }
 
@@ -345,7 +354,7 @@ export class ToolCallTracker {
     if (typeof requestId !== 'string' && typeof requestId !== 'number') return false;
     const call = this.take(ToolCallTracker.key(sessionId, requestId));
     if (!call) return false;
-    this.emit(call, sessionId, 'CANCELLED', Date.now() - call.startTime);
+    this.emit(call, call.sessionId ?? sessionId, 'CANCELLED', Date.now() - call.startTime);
     return true;
   }
 
