@@ -2,7 +2,14 @@
   "script": "delivery",
   "base": {
     "vars": {
-      "aforoPendingText": "{\"events\": [{\"metricName\": \"api_calls\", \"idempotencyKey\": \"k1\", \"quantity\": 1}, {\"metricName\": \"mcp_server.tool_invocations\", \"idempotencyKey\": \"k2\", \"quantity\": 1}, {\"metricName\": \"tokens\", \"idempotencyKey\": \"k3\", \"quantity\": 5}]}",
+      "aforoBatch": {
+        "text": "{\"events\": [{\"metricName\": \"api_calls\", \"idempotencyKey\": \"k1\", \"quantity\": 1}, {\"metricName\": \"mcp_server.tool_invocations\", \"idempotencyKey\": \"k2\", \"quantity\": 1}, {\"metricName\": \"tokens\", \"idempotencyKey\": \"k3\", \"quantity\": 5}]}",
+        "counts": [
+          0,
+          1,
+          2
+        ]
+      },
       "aforoIngestResponse": null,
       "aforoAttempt": 1,
       "aforoJitter": 0.5,
@@ -232,7 +239,7 @@
       "name": "HTTP 401: the ingestor refused the batch, logged with the body, not re-sent",
       "expect": {
         "retryText": null,
-        "refusedLog": "[aforo-metering] USAGE EVENT REFUSED (permanent, not retried): the ingestor refused the batch (HTTP 401; check aforo-api-key and aforo-endpoint): {\"error\":\"bad key\"}"
+        "refusedLog": "[aforo-metering] USAGE EVENT REFUSED (permanent, not retried): the ingestor refused the batch of 3 event(s) (HTTP 401; check aforo-api-key and aforo-endpoint): {\"error\":\"bad key\"}"
       },
       "vars": {
         "aforoIngestResponse": {
@@ -257,7 +264,7 @@
       "name": "HTTP 301 (wrong URL): refused, not re-sent",
       "expect": {
         "retryText": null,
-        "refusedLog": "[aforo-metering] USAGE EVENT REFUSED (permanent, not retried): the ingestor refused the batch (HTTP 301; check aforo-api-key and aforo-endpoint): "
+        "refusedLog": "[aforo-metering] USAGE EVENT REFUSED (permanent, not retried): the ingestor refused the batch of 3 event(s) (HTTP 301; check aforo-api-key and aforo-endpoint): "
       },
       "vars": {
         "aforoIngestResponse": {
@@ -532,6 +539,140 @@
           "status": 202,
           "text": "{\"success\": true, \"data\": {\"accepted\": 3, \"failed\": 0, \"errors\": []}}"
         }
+      }
+    },
+    {
+      "name": "whole-batch retry keeps every event's put-back count, in order",
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 503,
+          "text": ""
+        }
+      },
+      "expect": {
+        "retryCounts": [
+          0,
+          1,
+          2
+        ],
+        "retryText.#json.events.#length": 3
+      }
+    },
+    {
+      "name": "a partial retry keeps the put-back count of the events it re-sends",
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 202,
+          "text": "{\"success\": true, \"data\": {\"accepted\": 1, \"failed\": 2, \"errors\": [{\"index\": 1, \"message\": \"x\", \"retryable\": true}, {\"index\": 2, \"message\": \"y\", \"retryable\": true}]}}"
+        }
+      },
+      "expect": {
+        "retryCounts": [
+          1,
+          2
+        ],
+        "retryText.#json.events.0.idempotencyKey": "k2",
+        "retryText.#json.events.1.idempotencyKey": "k3"
+      }
+    },
+    {
+      "name": "a re-sent event is the same event: its idempotencyKey does not change",
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 202,
+          "text": "{\"data\": {\"errors\": [{\"index\": 0, \"message\": \"x\", \"retryable\": true}]}}"
+        }
+      },
+      "expect": {
+        "retryText.#json": {
+          "events": [
+            {
+              "metricName": "api_calls",
+              "idempotencyKey": "k1",
+              "quantity": 1
+            }
+          ]
+        },
+        "retryCounts": [
+          0
+        ]
+      }
+    },
+    {
+      "name": "permanent rejects are not re-sent, so they are never put back",
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 202,
+          "text": "{\"data\": {\"errors\": [{\"index\": 0, \"message\": \"Unknown metric\", \"retryable\": false}, {\"index\": 1, \"message\": \"bad\", \"retryable\": false}, {\"index\": 2, \"message\": \"bad\", \"retryable\": false}]}}"
+        }
+      },
+      "expect": {
+        "retryText": null,
+        "retryCounts": [],
+        "retryDelayMs": 0
+      }
+    },
+    {
+      "name": "a refused batch (401) is not re-sent, so it is never put back",
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 401,
+          "text": "{}"
+        }
+      },
+      "expect": {
+        "retryText": null,
+        "retryCounts": []
+      }
+    },
+    {
+      "name": "an error index named twice, out of range, negative or fractional re-sends each real event once",
+      "vars": {
+        "aforoIngestResponse": {
+          "status": 202,
+          "text": "{\"data\": {\"errors\": [{\"index\": 1, \"message\": \"x\", \"retryable\": true}, {\"index\": 1, \"message\": \"x\", \"retryable\": true}, {\"index\": 7, \"message\": \"x\", \"retryable\": true}, {\"index\": -1, \"message\": \"x\", \"retryable\": true}, {\"index\": 0.5, \"message\": \"x\", \"retryable\": true}]}}"
+        }
+      },
+      "expect": {
+        "retryText.#json.events.#length": 1,
+        "retryText.#json.events.0.idempotencyKey": "k2",
+        "retryCounts": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "a batch without counts re-sends with count 0",
+      "vars": {
+        "aforoBatch": {
+          "text": "{\"events\": [{\"metricName\": \"api_calls\", \"idempotencyKey\": \"k1\", \"quantity\": 1}, {\"metricName\": \"mcp_server.tool_invocations\", \"idempotencyKey\": \"k2\", \"quantity\": 1}, {\"metricName\": \"tokens\", \"idempotencyKey\": \"k3\", \"quantity\": 5}]}",
+          "counts": null
+        },
+        "aforoIngestResponse": {
+          "status": 500,
+          "text": ""
+        }
+      },
+      "expect": {
+        "retryCounts": [
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "name": "nothing claimed (no batch): nothing to re-send",
+      "vars": {
+        "aforoBatch": null,
+        "aforoIngestResponse": {
+          "status": 500,
+          "text": ""
+        }
+      },
+      "expect": {
+        "retryText": null,
+        "retryCounts": []
       }
     }
   ]

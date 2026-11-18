@@ -5,7 +5,7 @@
  * The billing logic (the DataWeave scripts) is executed by
  * dataweave.test.cjs with the DataWeave CLI. This file checks everything
  * around it that a Mule runtime would otherwise be needed for:
- *   1. the package: pom (mule-policy, 3.1.3 = VERSION, public repositories
+ *   1. the package: pom (mule-policy, 3.2.0 = VERSION, public repositories
  *      only), mule-artifact.json, the policy definition (every MC3 property,
  *      defaults, the secret marked sensitive)
  *   2. the template agrees with the definition: every property is read
@@ -13,7 +13,9 @@
  *      Handlebars (no property ever reaches DataWeave source text)
  *   3. template.xml is well-formed XML and the flow is in the right order:
  *      identity, quota check, refusal without execute-next, key removal,
- *      execute-next, metering in async; every variable read is written
+ *      execute-next, metering in async; every variable read is written;
+ *      a delivery claims pending entries by removing them, and only then
+ *      sends them
  *   4. the outbound calls: URLs, headers, timeouts, validators, targets
  *   5. the two METER BLOCK copies are identical
  *   6. the docs name every property
@@ -62,12 +64,13 @@ const MC3 = [
     'identity-cache-ttl-s', 'identity-negative-ttl-s', 'identity-stale-ttl-s', 'identity-fail-open',
     'product-type', 'default-metric', 'metric-mappings', 'quantity-header', 'agent-id', 'trace-id-header',
     'status-outcomes', 'exclude-paths', 'exclude-status-codes',
-    'quota-enabled', 'quota-check-url', 'quota-timeout-ms', 'quota-fail-open'
+    'quota-enabled', 'quota-check-url', 'quota-timeout-ms', 'quota-fail-open',
+    'pending-max-entries', 'pending-ttl-s'
 ];
 
 // ── 1. Package ───────────────────────────────────────────────────────
 const VERSION = read('VERSION').trim();
-eq('VERSION', VERSION, '3.1.3');
+eq('VERSION', VERSION, '3.2.0');
 check('pom packaging is mule-policy', pom.indexOf('<packaging>mule-policy</packaging>') !== -1);
 eq('pom artifactId/version',
     (pom.match(/<artifactId>aforo-metering<\/artifactId>\s*<version>([^<]+)<\/version>/) || [])[1], VERSION);
@@ -123,9 +126,12 @@ declared.forEach(function (n) {
 });
 [['identity-cache-ttl-s', 'int', '60'], ['identity-negative-ttl-s', 'int', '10'], ['identity-stale-ttl-s', 'int', '900'],
     ['identity-fail-open', 'boolean', 'false'], ['quota-enabled', 'boolean', 'false'], ['quota-timeout-ms', 'int', '1500'],
-    ['quota-fail-open', 'boolean', 'true'], ['key-header', 'string', 'x-api-key'], ['product-type', 'string', 'API']].forEach(function (t) {
+    ['quota-fail-open', 'boolean', 'true'], ['key-header', 'string', 'x-api-key'], ['product-type', 'string', 'API'],
+    ['pending-max-entries', 'int', '10000'], ['pending-ttl-s', 'int', '900']].forEach(function (t) {
     eq(t[0] + ' type/default', [props[t[0]].type, props[t[0]].defaultValue], [t[1], t[2]]);
 });
+eq('pending-max-entries range', [props['pending-max-entries'].minimumValue, props['pending-max-entries'].maximumValue], ['100', '100000']);
+eq('pending-ttl-s range', [props['pending-ttl-s'].minimumValue, props['pending-ttl-s'].maximumValue], ['60', '86400']);
 
 // ── 2. Template <-> definition ───────────────────────────────────────
 function pascal(name) {
@@ -138,10 +144,21 @@ declared.forEach(function (n) {
 });
 {
     const tokens = template.match(/\{\{[^}]*\}\}\}?/g) || [];
-    const allowed = ['{{{policyId}}}', '{{#if encrypted}}', '{{/if}}'].concat(declared.map(function (n) { return '{{' + n + '}}'; }));
+    // The pending store's size and lifetime are the only properties rendered outside a
+    // set-variable: an object store's attributes cannot be expressions. Each has a default
+    // for an empty property, so the rendered attribute is always a number.
+    const allowed = ['{{{policyId}}}', '{{#if encrypted}}', '{{/if}}', '{{#if pending-max-entries}}', '{{#if pending-ttl-s}}', '{{else}}']
+        .concat(declared.map(function (n) { return '{{' + n + '}}'; }));
     const unknown = tokens.filter(function (t) { return allowed.indexOf(t) === -1; });
     eq('only known Handlebars tokens (properties double-braced, never triple)', unknown, []);
-    eq('{{#if encrypted}} and {{/if}} balance', count(template, '{{#if encrypted}}'), count(template, '{{/if}}'));
+    eq('{{#if ...}} and {{/if}} balance', count(template, '{{#if '), count(template, '{{/if}}'));
+    eq('one {{#if encrypted}} block', count(template, '{{#if encrypted}}'), 1);
+    check('the pending store takes its size and lifetime from the properties, with the defaults when empty',
+        xmlOnly.indexOf('maxEntries="{{#if pending-max-entries}}{{pending-max-entries}}{{else}}10000{{/if}}"') !== -1 &&
+        xmlOnly.indexOf('entryTtl="{{#if pending-ttl-s}}{{pending-ttl-s}}{{else}}900{{/if}}" entryTtlUnit="SECONDS"') !== -1);
+    check('the config script uses the same defaults and the definition\'s ranges',
+        template.indexOf('pendingMaxEntries: bounded(vars.aforoPropPendingMaxEntries, 10000, 100, 100000)') !== -1 &&
+        template.indexOf('pendingTtlS: bounded(vars.aforoPropPendingTtlS, 900, 60, 86400)') !== -1);
     const cdata = template.match(/<!\[CDATA\[[\s\S]*?\]\]>/g) || [];
     check('no Handlebars inside any CDATA (DataWeave never sees a raw property)',
         cdata.every(function (c) { return c.indexOf('{{') === -1; }));
@@ -243,14 +260,23 @@ const pos = {
     strip: template.indexOf('method="removeAll(Object)"'),
     next: next,
     events: template.indexOf('// aforo-script: events'),
+    backlog: template.indexOf('// aforo-script: backlog'),
     async: template.indexOf('<async maxConcurrency="16">'),
-    delivery: template.indexOf('// aforo-script: delivery')
+    claim: template.indexOf('// aforo-script: claim'),
+    batch: template.indexOf('// aforo-script: batch'),
+    delivery: template.indexOf('// aforo-script: delivery'),
+    putBack: template.indexOf('// aforo-script: put-back')
 };
 Object.keys(pos).forEach(function (k) { check('template has ' + k, pos[k] !== -1); });
 const order = ['config', 'request', 'identityLookup', 'introspect', 'identityDecide', 'quotaLookup', 'quotaCall', 'quotaDecide', 'reject', 'strip', 'next'];
 check('order: config, request, identity, quota check, refusal, key removal, execute-next',
     order.every(function (k, i) { return i === 0 || pos[order[i - 1]] < pos[k]; }), order.map(function (k) { return k + '@' + pos[k]; }).join(' '));
 check('the quota check runs before execute-next', pos.quotaCall < next);
+{
+    const meter = ['next', 'events', 'backlog', 'async', 'claim', 'batch', 'delivery', 'putBack'];
+    check('order after the API: events, backlog count, async, claim, batch, delivery, put-back',
+        meter.every(function (k, i) { return i === 0 || pos[meter[i - 1]] < pos[k]; }), meter.map(function (k) { return k + '@' + pos[k]; }).join(' '));
+}
 check('metering (events, delivery) only after execute-next',
     template.indexOf('// aforo-script: events') > next && template.indexOf('<async') > next &&
     template.indexOf('url="#[vars.aforoCfg.endpoint]"') > next);
@@ -344,10 +370,10 @@ function headerNames(r) {
     eq('ingest call in each meter copy', ingest.length, 2);
     ingest.forEach(function (r) {
         eq('ingest headers (X-API-Key only, no Bearer, no tenant)', headerNames(r), ['Content-Type', 'X-API-Key']);
-        check('ingest sends the pending entry', r.indexOf('<http:body><![CDATA[#[vars.aforoPendingText]]]></http:body>') !== -1);
+        check('ingest sends the claimed batch', r.indexOf('<http:body><![CDATA[#[vars.aforoBatch.text]]]></http:body>') !== -1);
     });
 }
-check('delivery: 3 attempts, re-send only what the pending entry holds',
+check('delivery: 3 attempts, re-send only what is still unsent',
     count(template, '<foreach collection="#[[1, 2, 3]]" counterVariableName="aforoAttempt">') === 2 &&
     count(template, '<raise-error type="AFORO:DELIVERY_RETRY"') === 2 &&
     count(template, 'millisBetweenRetries="2000"') === 0);
@@ -365,11 +391,91 @@ check('delivery: whole-batch retry on no answer, 408, 429 and every 5xx (TRANSPO
     template.indexOf('RETRY_STATUSES') === -1);
 check('delivery: no answer is caught on the ingest call only (connectivity, timeout)',
     count(template, '<on-error-continue type="HTTP:CONNECTIVITY, HTTP:TIMEOUT" logException="false">') === 2);
-check('delivery is bounded: 16 at once, 1000 waiting',
+check('delivery is bounded: 16 at once, pending-max-entries waiting',
     count(template, '<async maxConcurrency="16">') === 2 &&
-    count(template, '<when expression="#[1000 > sizeOf(vars.aforoPendingKeys default [])]">') === 2);
+    count(template, '<when expression="#[vars.aforoCfg.pendingMaxEntries > vars.aforoBacklog.count]">') === 2 &&
+    count(template, "USAGE DROPPED: the pending store is full") === 2);
+
+// ── 4b. Claiming pending entries (G362) ──────────────────────────────
+// Batching under load rests on these: a delivery sends an entry only after its own
+// os:remove of that entry's key succeeded, and no key is ever written twice.
+{
+    const PENDING = 'objectStore="{{{policyId}}}-aforo-pending"';
+    const esc = function (s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); };
+    const HANDLER = '\\s*<error-handler>\\s*(?:<!--[^>]*-->\\s*)?<on-error-continue type="ANY" logException="false"/>\\s*</error-handler>\\s*</try>';
+    const stores = xmlOnly.match(new RegExp('<os:store key="[^"]*" ' + esc(PENDING) + '>', 'g')) || [];
+    eq('the pending store is written in two ways only: the call\'s request id, and a new key per put-back entry',
+        stores.slice().sort(), [
+            '<os:store key="#[\'pb-\' ++ uuid()]" ' + PENDING + '>', '<os:store key="#[\'pb-\' ++ uuid()]" ' + PENDING + '>',
+            '<os:store key="#[vars.aforoReq.requestId]" ' + PENDING + '>', '<os:store key="#[vars.aforoReq.requestId]" ' + PENDING + '>'
+        ]);
+    eq('a call stores its events as the events script wrote them',
+        count(xmlOnly, '<os:store key="#[vars.aforoReq.requestId]" ' + PENDING + '>\n' ), 2);
+    const removes = xmlOnly.match(new RegExp('<os:remove key="[^"]*" ' + esc(PENDING) + '/>', 'g')) || [];
+    eq('entries leave the pending store only through a claim', removes.slice().sort(), [
+        '<os:remove key="#[vars.aforoOtherKey]" ' + PENDING + '/>', '<os:remove key="#[vars.aforoOtherKey]" ' + PENDING + '/>',
+        '<os:remove key="#[vars.aforoReq.requestId]" ' + PENDING + '/>', '<os:remove key="#[vars.aforoReq.requestId]" ' + PENDING + '/>'
+    ]);
+    eq('own entry: removed first, counted as claimed only when the remove succeeded',
+        (code.match(new RegExp('<try>\\s*' + esc('<os:remove key="#[vars.aforoReq.requestId]" ' + PENDING + '/>') + '\\s*' +
+            esc('<set-variable variableName="aforoClaimed" value="#[[vars.aforoOwnText]]"/>') + HANDLER, 'g')) || []).length, 2);
+    eq('another entry: removed first, added to the batch only when the remove succeeded',
+        (template.match(new RegExp('<try>\\s*' + esc('<os:remove key="#[vars.aforoOtherKey]" ' + PENDING + '/>') + '\\s*' +
+            esc('<set-variable variableName="aforoClaimed" value="#[vars.aforoClaimed ++ [vars.aforoOtherText]]"/>') + '\\s*' +
+            esc('<set-variable variableName="aforoClaim" value="#[vars.aforoClaimNext]"/>') + HANDLER, 'g')) || []).length, 2);
+    eq('nothing else adds to what a delivery sends', count(xmlOnly, 'variableName="aforoClaimed"'), 6);
+    eq('the claimed text is read before the remove, from the same key',
+        count(xmlOnly, '<os:retrieve key="#[vars.aforoReq.requestId]" ' + PENDING + ' target="aforoOwnText">') +
+        count(xmlOnly, '<os:retrieve key="#[vars.aforoOtherKey]" ' + PENDING + ' target="aforoOtherText">'), 4);
+    eq('the request body is built from the claimed entries only',
+        count(template, 'var texts = (if (vars.aforoClaimed is Array) vars.aforoClaimed else []) filter ($ is String)'), 2);
+
+    // Per copy: one key listing on the call path (behind the backlog script), one in the delivery.
+    eq('two key listings per meter copy', count(xmlOnly, '<os:retrieve-all-keys ' + PENDING + ' target="aforoPendingKeys"/>'), 4);
+    const b = sync.blocks(template);
+    const copy = template.slice(b.s1, b.e1);
+    const asyncAt = copy.indexOf('<async maxConcurrency="16">');
+    const lists = [];
+    for (let i = copy.indexOf('<os:retrieve-all-keys'); i !== -1; i = copy.indexOf('<os:retrieve-all-keys', i + 1)) lists.push(i);
+    check('the call path lists keys only when the backlog script asks for it',
+        lists.length === 2 && lists[0] < asyncAt &&
+        /<when expression="#\[vars\.aforoBacklog\.list\]">\s*<os:retrieve-all-keys/.test(copy.slice(0, asyncAt)));
+    check('the delivery lists keys only after it claimed its own entry, and walks at most 500 of them',
+        lists.length === 2 && lists[1] > asyncAt &&
+        copy.indexOf('<when expression="#[not isEmpty(vars.aforoClaimed)]">') > asyncAt &&
+        copy.indexOf('<when expression="#[not isEmpty(vars.aforoClaimed)]">') < lists[1] &&
+        copy.indexOf('if (sizeOf(ks) > 500) ks[0 to 499] else ks') > lists[1] &&
+        copy.indexOf('<foreach collection="#[vars.aforoOtherKeys]">') > lists[1]);
+    check('the caps are 500 events and 1,000,000 characters per request',
+        template.indexOf('var MAX_EVENTS = 500') !== -1 && template.indexOf('var MAX_CHARS = 1000000') !== -1);
+
+    // Between the first attempt and the end of the attempts the store is not touched:
+    // the claimed events live in the delivery's variables.
+    const attempts = copy.slice(copy.indexOf('<foreach collection="#[[1, 2, 3]]"'), copy.indexOf('<raise-error type="AFORO:DELIVERY_RETRY"'));
+    check('no object store call during the attempts', attempts.length > 0 && attempts.indexOf('<os:') === -1);
+    check('after each attempt the batch is what is still unsent',
+        attempts.indexOf('<set-variable variableName="aforoBatch" value="#[{text: vars.aforoDelivery.retryText, counts: vars.aforoDelivery.retryCounts}]"/>') !== -1);
+
+    // What is left after the last attempt goes back under new keys, from the error handler.
+    const handler = copy.slice(copy.indexOf('<raise-error type="AFORO:DELIVERY_RETRY"'), copy.indexOf('USAGE DROPPED: the pending store is full'));
+    check('undelivered events are put back by the delivery\'s error handler, for any error',
+        /<error-handler>\s*(?:<!--[\s\S]*?-->\s*)?<on-error-continue type="ANY" logException="false">\s*<set-variable variableName="aforoFailReason"/.test(handler) &&
+        handler.indexOf('// aforo-script: put-back') !== -1 &&
+        handler.indexOf('<foreach collection="#[vars.aforoPutBack.entries]">') !== -1 &&
+        handler.indexOf("<os:store key=\"#['pb-' ++ uuid()]\" " + PENDING + '>') > handler.indexOf('// aforo-script: put-back'));
+    check('put-backs are bounded: 3 per event, entries of at most 50 events',
+        template.indexOf('var MAX_PUT_BACKS = 3') !== -1 && template.indexOf('var CHUNK = 50') !== -1);
+    check('a failed put-back is logged, never raised', handler.indexOf('USAGE LOST (') !== -1);
+    check('a delivery that finds nothing to claim past pending-ttl-s warns that usage may have expired',
+        copy.indexOf("<when expression=\"#[(vars.aforoNowMs - vars.aforoEndMs) >= (vars.aforoCfg.pendingTtlS * 1000)]\">") > asyncAt &&
+        copy.indexOf('USAGE MAY HAVE EXPIRED') > asyncAt && copy.indexOf("key=\"#['warn|pending-expired']\"") > asyncAt);
+    check('idempotency keys are minted in the events script only (Rule #21)',
+        count(template, 'idempotencyKey: ') === 6 && count(template, 'idempotencyKey: 255,') === 2 &&
+        count(template, 'idempotencyKey: requestId,') === 2 &&
+        count(template, 'idempotencyKey: "mcp:" ++ cfg.tenantId ++ ":" ++ requestId ++ ":" ++ ((i + 1) as String) ++ ":" ++ tool,') === 2);
+}
 check('the transient ingest error text matches the ingestor', template.indexOf('var TRANSIENT = "The event could not be stored"') !== -1);
-check('warnings are throttled to one a minute per kind', count(template, '>= 60000]">') === 5);
+check('warnings are throttled to one a minute per kind', count(template, '>= 60000]">') === 7);
 
 // ── 5. METER BLOCK copies ────────────────────────────────────────────
 {
@@ -388,11 +494,17 @@ check('warnings are throttled to one a minute per kind', count(template, '>= 600
     declared.forEach(function (n) {
         check('USER_GUIDE.md documents ' + n, guide.indexOf('`' + n + '`') !== -1);
     });
-    ['401', '403', '429', '503', 'X-Aforo-Agent-Id', 'X-Aforo-Session-Id', 'X-Aforo-Trace-Id', 'X-Aforo-Quantity', 'Mcp-Session-Id', '60 s'].forEach(function (t) {
+    ['401', '403', '429', '503', 'X-Aforo-Agent-Id', 'X-Aforo-Session-Id', 'X-Aforo-Trace-Id', 'X-Aforo-Quantity', 'Mcp-Session-Id', '60 s',
+        'pending-max-entries', 'pending-ttl-s', 'restart', '500 events'].forEach(function (t) {
         check('README.md mentions ' + t, readme.indexOf(t) !== -1);
     });
     check('README names the jar this version builds', readme.indexOf('aforo-metering-' + VERSION + '-mule-policy.jar') !== -1);
     check('CHANGELOG has the ' + VERSION + ' entry', read('CHANGELOG.md').indexOf('## [' + VERSION + ']') !== -1);
+    check('the user guide says what a restart loses', /restart/i.test(guide) && guide.indexOf('pending-max-entries') !== -1);
+    ['USAGE NOT DELIVERED', 'USAGE DROPPED after 3 put-backs', 'USAGE DROPPED: the pending store is full', 'USAGE MAY HAVE EXPIRED', 'USAGE LOST'].forEach(function (l) {
+        check('USER_GUIDE.md explains the log line ' + l, guide.indexOf(l) !== -1);
+        check('the template logs ' + l, template.indexOf(l.replace('after 3 put-backs', 'after ')) !== -1);
+    });
 }
 
 console.log('\nMuleSoft policy structure checks: ' + passed + ' passed, ' + failed + ' failed');

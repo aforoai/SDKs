@@ -2,9 +2,9 @@
 
 An AWS Lambda function that subscribes to API Gateway CloudWatch access logs, parses each entry, and batch-POSTs usage events to Aforo. It runs off the log stream asynchronously, so it adds nothing to your request path.
 
-**Version:** 2.5.2 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.6.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
-> Version lives in [`package.json`](package.json) (`"version": "2.5.2"`). It matches the version stated here and in the changelog.
+> Version lives in [`package.json`](package.json) (`"version": "2.6.0"`). It matches the version stated here and in the changelog.
 
 ## Install
 
@@ -212,6 +212,7 @@ Step by step from `sam deploy` to a verified event in Aforo: [USER_GUIDE.md](USE
 ## What this doesn't cover
 
 - **Blocking a request.** This Lambda runs after the response was served. For quota or margin enforcement, deploy `authorizer.js` (needs `AFORO_TENANT_ID` since 2.5.0) / `margin-guard.js` as an API Gateway Lambda Authorizer (see [AUTHORIZER.md](AUTHORIZER.md)).
+- **Scopes per route on `key-authorizer.js`.** Since 2.6.0 `authorizer.js` can require scopes per method and path (`AFORO_ROUTE_SCOPES`) and check the token's audience (`AFORO_JWT_AUDIENCE`); both are off until you set them, and the route map needs per-method authorizer caching — see [AUTHORIZER.md](AUTHORIZER.md#scopes-per-route-aforo_route_scopes). `key-authorizer.js` has neither: a key or JWT it accepts can call every route on the stage.
 - **Routes with only an API Gateway API key.** A usage-plan key alone gives no customer identity this function will use (the key value is a secret). Put an Aforo authorizer on the route (`key-authorizer.js` accepts the customer's Aforo key directly), or use IAM authorization.
 - **Outages longer than the retry window.** `MaximumEventAgeInSeconds: 21600` bounds async retries at 6 hours; past that the record goes to the failure queue (SAM deploy) or is lost (one-click deploy, which has no queue).
 - **gRPC, GraphQL, WebSocket.** An access log does not carry the fields those product types need.
@@ -223,4 +224,4 @@ Step by step from `sam deploy` to a verified event in Aforo: [USER_GUIDE.md](USE
 npm test
 ```
 
-Runs `tests/authorizer.test.js` (JWT authorizer: tenant pin and required issuer, revocation fails closed, TLS + AUTH, stage-scoped Allow, JWKS refetch limit), `tests/guards.test.js` (`margin-guard.js`, `preflight-quota.js`), `../aws-cloudformation/tests/templates.test.cjs`, `tests/agent-mcp.test.js` (AI_AGENT / MCP events from proxy records), `tests/metering-proxy.test.js`, `tests/key-authorizer.test.js`, `tests/key-authorizer-jwt.test.js`, `tests/handler.test.js` (delivery, EMF metrics, key stability across redelivery, AGENTIC_API detection, compound `correlationId`, execution status) and `tests/contract.test.js` (wire contract against a local capture server: auth header, identity, metric mappings and precedence, `PRODUCT_TYPE`, `Retry-After`, deadline).
+Runs `tests/authorizer.test.js` (JWT authorizer: tenant pin and required issuer, revocation fails closed, TLS + AUTH, stage-scoped Allow, JWKS refetch limit, scopes per route with a per-method Allow, audience), `tests/guards.test.js` (`margin-guard.js`, `preflight-quota.js`), `../aws-cloudformation/tests/templates.test.cjs`, `tests/agent-mcp.test.js` (AI_AGENT / MCP events from proxy records), `tests/metering-proxy.test.js`, `tests/key-authorizer.test.js`, `tests/key-authorizer-jwt.test.js`, `tests/handler.test.js` (delivery, EMF metrics, key stability across redelivery, AGENTIC_API detection, compound `correlationId`, execution status) and `tests/contract.test.js` (wire contract against a local capture server: auth header, identity, metric mappings and precedence, `PRODUCT_TYPE`, `Retry-After`, deadline).

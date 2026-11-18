@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Runs tests/dataweave.test.cjs with the open-source DataWeave CLI.
+# Runs tests/dataweave.test.cjs, then tests/flow.test.cjs, with the open-source
+# DataWeave CLI.
 #
 # The CLI ships as a linux-x86_64 native binary: it is downloaded once
 # (pinned version, SHA-256 checked) into $AFORO_DW_CACHE (default
@@ -35,4 +36,4 @@ exec docker run --rm --platform linux/amd64 \
     -v "$plugins":/src -v "$cache":/opt/dw:ro \
     -e DW_BIN=/opt/dw/bin/dw -e DW_HOME=/tmp/dw-home -e DW_DEBUG="${DW_DEBUG:-}" \
     -w /src node:22-bookworm-slim \
-    sh -c 'mkdir -p /tmp/dw-home && node mulesoft/tests/dataweave.test.cjs'
+    sh -c 'mkdir -p /tmp/dw-home && node mulesoft/tests/dataweave.test.cjs && node mulesoft/tests/flow.test.cjs'

@@ -4,6 +4,16 @@ This monorepo ships five gateway metering plugins (Kong, Apigee, AWS Lambda, Azu
 
 ## Unreleased
 
+### MuleSoft 3.2.0: batching under load and put-back of undelivered usage (G362)
+
+- Under load, usage waiting behind the 16 running deliveries goes out in one request of up to 500 events; under light traffic one call still sends one request.
+- Usage that fails 3 delivery attempts is put back and sent by a later call (same idempotency keys), dropped after 3 put-backs.
+- Two new optional properties: `pending-max-entries` (default 10000) and `pending-ttl-s` (default 900). Pending usage lives in worker memory and is lost on a runtime restart, redeploy or policy re-apply. Not yet verified on a live Anypoint org. Details: `mulesoft/CHANGELOG.md` 3.2.0.
+
+### AWS Lambda 2.6.0: JWT authorizer enforces scopes per route and can check the audience (G341, G326)
+
+- `authorizer.js`: optional `AFORO_ROUTE_SCOPES` (JSON map `"METHOD /path"` → required scopes); a token without the route's scopes is denied, a map that is not valid denies everything, and with a map the Allow names the called method ARN only (use a `REQUEST` authorizer cached per method and path, or TTL 0). Optional `AFORO_JWT_AUDIENCE` / `AFORO_JWT_AUDIENCE_ALLOW_MISSING`, same meaning as Kong's `jwt_audience` / `jwt_audience_allow_missing`; turn it on only after organization-service mints `aud`. Both off by default. `key-authorizer.js` is unchanged and has no route scopes. Not run on a live stage. Details: `aws-lambda/CHANGELOG.md` 2.6.0.
+
 ### Wave 6 live test fixes (Apigee 3.1.3, MuleSoft 3.1.3)
 
 - Apigee: both shared flows import and deploy on a real org. `AforoMeteringPublish` reads `projects/{...}/topics/{...}`, from KVM `pubsub_topic` split by the flow, and the five ServiceCallouts read `https://{...HostPath}`. An `http://` URL is refused, never upgraded. `aforo-metering` needs a deployment service account in every delivery mode; the docs say so now.

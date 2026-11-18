@@ -1,0 +1,364 @@
+{
+  "script": "put-back",
+  "base": {
+    "vars": {
+      "aforoBatch": {
+        "text": "{\"events\":[{\"metricName\":\"api_calls\",\"idempotencyKey\":\"k1\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"mcp_server.tool_invocations\",\"idempotencyKey\":\"k2\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"k3\",\"quantity\":5,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"}]}",
+        "counts": [
+          0,
+          1,
+          3
+        ]
+      },
+      "aforoClaimed": [],
+      "aforoFailReason": "the ingestor answered HTTP 503",
+      "aforoReq": {
+        "requestId": "req-1"
+      }
+    }
+  },
+  "cases": [
+    {
+      "name": "each event goes back with its count raised by one; an event already put back 3 times is dropped",
+      "expect": {
+        "entries.#length": 2,
+        "entries.0.#json": {
+          "events": [
+            {
+              "metricName": "api_calls",
+              "idempotencyKey": "k1",
+              "quantity": 1,
+              "customerId": "cust-1",
+              "occurredAt": "2026-10-22T07:26:13.125Z"
+            }
+          ],
+          "putBacks": 1
+        },
+        "entries.1.#json": {
+          "events": [
+            {
+              "metricName": "mcp_server.tool_invocations",
+              "idempotencyKey": "k2",
+              "quantity": 1,
+              "customerId": "cust-1",
+              "occurredAt": "2026-10-22T07:26:13.125Z"
+            }
+          ],
+          "putBacks": 2
+        },
+        "putBack": 2,
+        "dropped": 1,
+        "log": "[aforo-metering] USAGE NOT DELIVERED (the ingestor answered HTTP 503): 2 event(s) put back for a later call's delivery, 1 dropped",
+        "droppedLog": "[aforo-metering] USAGE DROPPED after 3 put-backs: tokens k3"
+      }
+    },
+    {
+      "name": "first failure: everything goes back with count 1, keys unchanged",
+      "vars": {
+        "aforoBatch": {
+          "counts": [
+            0,
+            0,
+            0
+          ]
+        }
+      },
+      "expect": {
+        "entries.#length": 1,
+        "entries.0.#json": {
+          "events": [
+            {
+              "metricName": "api_calls",
+              "idempotencyKey": "k1",
+              "quantity": 1,
+              "customerId": "cust-1",
+              "occurredAt": "2026-10-22T07:26:13.125Z"
+            },
+            {
+              "metricName": "mcp_server.tool_invocations",
+              "idempotencyKey": "k2",
+              "quantity": 1,
+              "customerId": "cust-1",
+              "occurredAt": "2026-10-22T07:26:13.125Z"
+            },
+            {
+              "metricName": "tokens",
+              "idempotencyKey": "k3",
+              "quantity": 5,
+              "customerId": "cust-1",
+              "occurredAt": "2026-10-22T07:26:13.125Z"
+            }
+          ],
+          "putBacks": 1
+        },
+        "putBack": 3,
+        "dropped": 0,
+        "droppedLog": null,
+        "log": "[aforo-metering] USAGE NOT DELIVERED (the ingestor answered HTTP 503): 3 event(s) put back for a later call's delivery"
+      }
+    },
+    {
+      "name": "120 events go back as entries of at most 50",
+      "vars": {
+        "aforoBatch": {
+          "text": "{\"events\":[{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n0\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n1\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n2\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n3\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n4\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n5\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n6\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n7\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n8\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n9\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n10\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n11\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n12\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n13\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n14\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n15\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n16\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n17\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n18\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n19\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n20\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n21\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n22\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n23\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n24\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n25\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n26\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n27\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n28\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n29\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n30\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n31\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n32\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n33\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n34\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n35\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n36\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n37\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n38\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n39\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n40\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n41\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n42\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n43\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n44\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n45\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n46\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n47\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n48\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n49\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n50\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n51\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n52\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n53\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n54\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n55\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n56\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n57\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n58\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n59\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n60\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n61\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n62\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n63\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n64\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n65\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n66\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n67\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n68\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n69\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n70\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n71\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n72\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n73\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n74\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n75\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n76\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n77\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n78\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n79\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n80\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n81\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n82\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n83\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n84\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n85\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n86\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n87\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n88\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n89\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n90\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n91\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n92\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n93\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n94\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n95\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n96\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n97\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n98\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n99\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n100\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n101\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n102\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n103\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n104\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n105\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n106\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n107\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n108\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n109\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n110\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n111\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n112\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n113\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n114\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n115\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n116\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n117\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n118\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"api_calls\",\"idempotencyKey\":\"n119\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"}]}",
+          "counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      },
+      "expect": {
+        "entries.#length": 3,
+        "entries.0.#json.events.#length": 50,
+        "entries.1.#json.events.#length": 50,
+        "entries.2.#json.events.#length": 20,
+        "entries.0.#json.events.0.idempotencyKey": "n0",
+        "entries.2.#json.events.19.idempotencyKey": "n119",
+        "putBack": 120
+      }
+    },
+    {
+      "name": "missing counts read as 0",
+      "vars": {
+        "aforoBatch": {
+          "counts": null
+        }
+      },
+      "expect": {
+        "entries.#length": 1,
+        "entries.0.#json.putBacks": 1,
+        "putBack": 3
+      }
+    },
+    {
+      "name": "everything was delivered before the failure: nothing goes back",
+      "vars": {
+        "aforoBatch": {
+          "text": null,
+          "counts": []
+        },
+        "aforoClaimed": [
+          "{\"events\":[{\"metricName\":\"api_calls\",\"idempotencyKey\":\"k1\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"mcp_server.tool_invocations\",\"idempotencyKey\":\"k2\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"k3\",\"quantity\":5,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"}]}"
+        ],
+        "aforoFailReason": "script error"
+      },
+      "expect": {
+        "entries": [],
+        "putBack": 0,
+        "dropped": 0,
+        "droppedLog": null,
+        "log": "[aforo-metering] USAGE NOT DELIVERED (script error): request req-1 had nothing left to put back"
+      }
+    },
+    {
+      "name": "the delivery failed before it built a batch: every claimed entry goes back, counts kept",
+      "vars": {
+        "aforoBatch": null,
+        "aforoClaimed": [
+          "{\"events\":[{\"metricName\":\"api_calls\",\"idempotencyKey\":\"own\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"}]}",
+          "{\"events\":[{\"metricName\":\"api_calls\",\"idempotencyKey\":\"old-1\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"}],\"putBacks\":2}",
+          "{\"events\":[{\"metricName\":\"api_calls\",\"idempotencyKey\":\"old-2\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"}],\"putBacks\":3}",
+          "not json"
+        ]
+      },
+      "expect": {
+        "entries.#length": 2,
+        "entries.0.#json": {
+          "events": [
+            {
+              "metricName": "api_calls",
+              "idempotencyKey": "own",
+              "quantity": 1,
+              "customerId": "cust-1",
+              "occurredAt": "2026-10-22T07:26:13.125Z"
+            }
+          ],
+          "putBacks": 1
+        },
+        "entries.1.#json": {
+          "events": [
+            {
+              "metricName": "api_calls",
+              "idempotencyKey": "old-1",
+              "quantity": 1,
+              "customerId": "cust-1",
+              "occurredAt": "2026-10-22T07:26:13.125Z"
+            }
+          ],
+          "putBacks": 3
+        },
+        "putBack": 2,
+        "dropped": 1,
+        "droppedLog": "[aforo-metering] USAGE DROPPED after 3 put-backs: api_calls old-2"
+      }
+    },
+    {
+      "name": "more than 20 dropped events: the first 20 are named",
+      "vars": {
+        "aforoBatch": {
+          "text": "{\"events\":[{\"metricName\":\"tokens\",\"idempotencyKey\":\"z0\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z1\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z2\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z3\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z4\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z5\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z6\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z7\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z8\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z9\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z10\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z11\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z12\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z13\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z14\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z15\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z16\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z17\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z18\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z19\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z20\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z21\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z22\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z23\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"},{\"metricName\":\"tokens\",\"idempotencyKey\":\"z24\",\"quantity\":1,\"customerId\":\"cust-1\",\"occurredAt\":\"2026-10-22T07:26:13.125Z\"}]}",
+          "counts": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        }
+      },
+      "expect": {
+        "entries": [],
+        "dropped": 25,
+        "droppedLog": "[aforo-metering] USAGE DROPPED after 3 put-backs: tokens z0 | tokens z1 | tokens z2 | tokens z3 | tokens z4 | tokens z5 | tokens z6 | tokens z7 | tokens z8 | tokens z9 | tokens z10 | tokens z11 | tokens z12 | tokens z13 | tokens z14 | tokens z15 | tokens z16 | tokens z17 | tokens z18 | tokens z19 | and 5 more"
+      }
+    },
+    {
+      "name": "no reason given",
+      "vars": {
+        "aforoFailReason": null
+      },
+      "expect": {
+        "log": "[aforo-metering] USAGE NOT DELIVERED (unknown error): 2 event(s) put back for a later call's delivery, 1 dropped"
+      }
+    }
+  ]
+}

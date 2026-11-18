@@ -4,6 +4,27 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versioning: [SemVer](htt
 
 This function ships on the Aforo gateway-plugins line; the whole repo is versioned and tagged together. The version lives in `package.json`. Entries below are the AWS-Lambda-specific slice of each repo release (see the parent `aforo-gateway-plugins/CHANGELOG.md` for the cross-plugin picture).
 
+## [2.6.0] - not yet released
+
+`authorizer.js` only. Both settings are off until you set them; with neither set the authorizer behaves as in 2.5.2. Not run on a live API Gateway stage.
+
+### Added
+- **Scopes per route (G341).** `authorizer.js` passed the token's scopes on in the context and checked none of them, so any token of the workspace could call every route on the stage. New optional `AFORO_ROUTE_SCOPES`: a JSON object mapping `"METHOD /path"` to one scope or an array of scopes, all required. Segments may be `{param}` or `*` (one segment) and, last only, `{param+}` or `**` (the rest); the method may be `ANY` / `*`; the key `"*"` is the default for routes no other entry matches. The path compared is the one the client called (from the method ARN), segment by segment; the most specific matching entry wins. A token without a required scope is denied with `error: INSUFFICIENT_SCOPE`. A route no entry matches needs no scope, as before, unless `"*"` is set.
+- **A map that is not valid denies every request** (`error: ROUTE_SCOPES_INVALID`) and logs the reason once per container and value. A method ARN without a readable method and path, or a path with a `.` / `..` segment or an encoded slash, is denied (`ROUTE_UNKNOWN`) when a map is set.
+- **Per-method Allow when a map is set.** The Allow then names the called method ARN, not the stage, so a cached Allow for one route cannot open another route that needs a different scope. Without a map the Allow stays stage-wide. `authorizer.js` now also accepts a `REQUEST` authorizer event (token from the `Authorization` header), because per-method caching needs identity sources a `TOKEN` authorizer does not have.
+- **Audience check (G326).** New optional `AFORO_JWT_AUDIENCE` (comma-separated): when set, the token's `aud` (a string or an array) must name one of them, else `error: INVALID_AUDIENCE`. `AFORO_JWT_AUDIENCE_ALLOW_MISSING=true` accepts a token with no `aud`, never one with a wrong `aud`. Unset: no check, one warning per container. Same names and meaning as the Kong plugin's `jwt_audience` / `jwt_audience_allow_missing`.
+- Tests: `tests/authorizer.test.js` 52 → 135 (required scope present / missing, the Allow's resource, path parameters and wildcards, specificity, the `"*"` default, unmapped routes, no map, twelve invalid maps, REQUEST events, revocation with a map, every audience case).
+
+### Not changed
+- `key-authorizer.js` has the same gap and is not touched here: no route → scope map, a stage-wide Allow, `scopes` and `aud` not read. Recorded in AUTHORIZER.md and the README.
+- `template.yaml` does not create `authorizer.js` or its API Gateway authorizer, so the result TTL and identity sources are documented (AUTHORIZER.md), not enforced.
+
+#### Upgrade from 2.5.2
+
+1. Nothing to do if you set neither variable.
+2. Before setting `AFORO_ROUTE_SCOPES`: switch the API Gateway authorizer to `REQUEST` with identity sources `method.request.header.Authorization,context.httpMethod,context.path` and a result TTL of 60 s or less, or set a `TOKEN` authorizer's TTL to 0, then redeploy the stage. With a `TOKEN` authorizer and a TTL above 0, the second route a token calls gets 403 until the TTL runs out. Expect more authorizer invocations: one cached result per token, method and path.
+3. Before setting `AFORO_JWT_AUDIENCE`: organization-service must mint `aud`. Set it together with `AFORO_JWT_AUDIENCE_ALLOW_MISSING=true`, wait for tokens without `aud` to expire, then remove `AFORO_JWT_AUDIENCE_ALLOW_MISSING`.
+
 ## [2.5.2] - not yet released
 
 Fixes from the second wave 6 review. Not deployed to AWS.

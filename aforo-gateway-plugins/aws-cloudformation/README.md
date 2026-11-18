@@ -2,7 +2,7 @@
 
 Two CloudFormation templates: a cross-account role that lets Aforo read your Amazon API Gateway configuration and, if you allow it, install Aforo's metering Lambda and run Gateway Orchestration and push ingestion; and a policy that blocks deletion of monetized API Gateway resources.
 
-**Version:** 3.2.0 (not yet released) · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 3.2.1 (not yet released) · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## When to reach for this
 
@@ -79,7 +79,7 @@ Output: `PolicyArn`.
 
 ## Tests
 
-`node aws-cloudformation/tests/templates.test.cjs` (also run by `cd aws-lambda && npm test`). It reads the template text, and resolves the role template for given parameters (`tests/cfn.cjs`, no npm packages) to check that `AllowGatewayOrchestration=false` grants exactly what 3.1.0 granted, that every call organization-service's AWS adapters make is allowed with `true`, and that the calls listed above stay refused. `cfn-lint` 1.58.0 passes on 3.2.0 (it was not run for 3.0.0 or 3.1.0). None of this has run in a live AWS account.
+`node aws-cloudformation/tests/templates.test.cjs` (also run by `cd aws-lambda && npm test`). It reads the template text, and resolves the role template for given parameters (`tests/cfn.cjs`, no npm packages) to check that `AllowGatewayOrchestration=false` grants exactly what 3.1.0 granted, that every call organization-service's AWS adapters make is allowed with `true`, and that the calls listed above stay refused. `cfn-lint` 1.58.0 passes on 3.2.0 (it was not run for 3.0.0 or 3.1.0); 3.2.1 was checked with `aws cloudformation validate-template` and deployed. The Wave 6 test plan ran it live (W6.2, 2026-11-11/12): 3.2.0 refused the tag-on-create of usage plans and API keys, which 3.2.1 grants; with 3.2.1 a role-only connection provisions, suspends, throttles and polls by the role alone.
 
 ## What this doesn't cover
 

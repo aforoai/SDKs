@@ -36,48 +36,7 @@ const TEMPLATE = path.join(DIR, 'aforo-metering/src/main/mule/template.xml');
 const FIXTURES = path.join(__dirname, 'fixtures');
 const DW = process.env.DW_BIN || 'dw';
 
-function scriptsOf(xml) {
-    const out = {};
-    const re = /<!\[CDATA\[(%dw 2\.0\n\/\/ aforo-script: ([a-z-]+)\n[\s\S]*?)\]\]>/g;
-    let m;
-    while ((m = re.exec(xml)) !== null) {
-        if (out[m[2]] !== undefined && out[m[2]] !== m[1]) {
-            throw new Error('two different copies of script ' + m[2]);
-        }
-        out[m[2]] = m[1];
-    }
-    return out;
-}
-
-// Script text -> driver text evaluating it once per case.
-function driverOf(name, script) {
-    const lines = script.split('\n');
-    const sep = lines.indexOf('---');
-    if (sep === -1) throw new Error(name + ': no top-level "---" line');
-    const head = lines.slice(1, sep);
-    const body = lines.slice(sep + 1);
-    const imports = head.filter(function (l) { return /^import /.test(l); });
-    const decls = head.filter(function (l) { return !/^import /.test(l) && !/^output /.test(l); });
-    if (head.filter(function (l) { return /^output /.test(l); }).length !== 1) {
-        throw new Error(name + ': expected exactly one output directive');
-    }
-    return ['%dw 2.0']
-        .concat(imports)
-        .concat(['output application/json', 'fun aforoRun(vars, attributes, payload) = do {'])
-        .concat(decls.map(function (l) { return l === '' ? '' : '  ' + l; }))
-        .concat(['  ---'])
-        .concat(body.map(function (l) { return l === '' ? '' : '  ' + l; }))
-        .concat([
-            '}',
-            '---',
-            'cases map ((c) -> do {',
-            '  var r = dw::Runtime::try(() -> write(aforoRun(c.vars default {}, c.attributes default {}, c.payload), "application/json"))',
-            '  ---',
-            '  if (r.success) {ok: true, result: read(r.result, "application/json")} else {ok: false, error: r.error.message default "error"}',
-            '})',
-        ])
-        .join('\n');
-}
+const { scriptsOf, driverOf } = require('./dw-runner.cjs');
 
 function at(obj, p) {
     let cur = obj;

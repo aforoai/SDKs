@@ -303,6 +303,20 @@ Resources:
                     - !Sub
                       - 'arn:${AWS::Partition}:apigateway:${Region}::/apikeys'
                       - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                # The tags organization-service sends with CreateUsagePlan and CreateApiKey.
+                # AWS authorises tagging on create as apigateway:PUT on the new resource's
+                # /tags/<URL-encoded ARN>, so without this every create was refused (3.2.1).
+                # Only usage plans and API keys; no other resource's tags.
+                - Sid: TagNewUsagePlansAndKeys
+                  Effect: Allow
+                  Action: apigateway:PUT
+                  Resource:
+                    - !Sub
+                      - 'arn:${AWS::Partition}:apigateway:${Region}::/tags/arn%3A${AWS::Partition}%3Aapigateway%3A${Region}%3A%3A%2Fusageplans%2F*'
+                      - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                    - !Sub
+                      - 'arn:${AWS::Partition}:apigateway:${Region}::/tags/arn%3A${AWS::Partition}%3Aapigateway%3A${Region}%3A%3A%2Fapikeys%2F*'
+                      - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
                 # UpdateUsagePlan (quota, throttle, stages, add/remove keys) and UpdateApiKey
                 # (enable, disable, name).
                 - Sid: UpdateUsagePlansAndKeys

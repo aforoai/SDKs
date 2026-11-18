@@ -4,6 +4,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [Unreleased]
 
+## [3.2.1] — not yet released
+
+### `aforo-apigateway-role.yaml`
+
+- **Fix: with `AllowGatewayOrchestration=true` a role-only connection could not create anything.** organization-service sends `tags` with CreateUsagePlan and CreateApiKey, and AWS authorises tagging on create as `apigateway:PUT` on the new resource's tags (`arn:aws:apigateway:<region>::/tags/<URL-encoded ARN>`). 3.2.0 did not grant it, so every provision got AWS 403 even with the opt-in on. Found in the first live run (Wave 6 test plan W6.2 T-6.2.8 step 4a, 2026-11-11). New statement `TagNewUsagePlansAndKeys` in `AforoGatewayOrchestration`: `apigateway:PUT` on the tags of usage plans and API keys in `ApiGatewayRegion` only; tagging REST APIs, stages or anything else stays refused, and `PUT /restapis/*` stays refused. With `AllowGatewayOrchestration=false` nothing changes (still identical to 3.1.0).
+
+### Upgrade from 3.2.0
+
+Update the stack with the 3.2.1 template and the same parameters (CloudFormation → Update → Replace current template). Only stacks with `AllowGatewayOrchestration=true` gain the statement.
+
 ## [3.2.0] — not yet released
 
 ### `aforo-apigateway-role.yaml`

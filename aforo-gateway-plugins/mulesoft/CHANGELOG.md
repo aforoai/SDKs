@@ -4,6 +4,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [Unreleased]
 
+## [3.2.0] — 2026-11-13
+
+Batching under load and put-back of undelivered usage (architecture re-check gap G362). Two new optional properties. Not yet verified on a live Anypoint org.
+
+Decisions (Jay, 13 Nov 2026): batch only under load, no fixed size or age batching (a Mule policy has no timer); no Anypoint MQ mode, the pending store stays in memory.
+
+### Changed
+- **A delivery sends what is waiting, not only its own call's events.** Each call still stores its events under its request id and starts a delivery. The delivery claims that entry and any other unclaimed pending entry, up to 500 events and 1,000,000 characters (the ingest contract's default batch and its 4 MiB body target), and posts them in one request. Under light load nothing else is waiting, so the request is the call's own, byte for byte as before. Under load the calls queued behind the 16 running deliveries go out together and their own deliveries find nothing to do.
+- **Claim by remove.** A delivery sends an entry only after its own `os:remove` of that key succeeded. The ObjectStore connector (1.2.2) runs `remove` under a per-key lock and raises `OS:KEY_NOT_FOUND` for a missing key, so two deliveries cannot both own an entry. Keys are write-once: a call's request id, or a new `pb-<uuid>` per put-back entry.
+- **Undelivered events are put back.** After the third attempt, events that are still retryable go back to the pending store for a later call's delivery (entries of at most 50 events, each with a put-back count). After 3 put-backs an event is dropped with `USAGE DROPPED after 3 put-backs`. An unexpected delivery error puts back everything the delivery had claimed. Permanent rejects and refused batches are logged and dropped as before. Idempotency keys are minted in the `events` script only and never change on a resend or a put-back.
+- **The pending store is configurable**: `pending-max-entries` (default 10000, was a fixed 1000-call backlog) and `pending-ttl-s` (default 900, was 5 minutes). The store stays `persistent="false"`.
+- **No key listing on every call.** The call path reuses a count of the pending store taken less than 1 s ago (by a call or a delivery) and lists the keys itself only when that count is older or the store is four fifths full. The delivery lists the keys once, after it claimed its own entry, to find the others, and walks at most 500 of them. The store is no longer written during the attempts.
+- New warnings: `USAGE MAY HAVE EXPIRED` (a delivery started later than `pending-ttl-s` after its call), `USAGE LOST` (a put-back failed). `USAGE NOT DELIVERED` now says how many events were put back; `USAGE DROPPED: the pending store is full` names the count and the limit.
+
+### Fixed
+- An ingestor error entry with a negative, fractional, repeated or out-of-range `index` could re-send the wrong event or the same event twice within a request. Such entries are ignored.
+
+### Known limits
+- A restart loses the pending store (at most `pending-max-entries` calls' usage) and what the running deliveries hold (at most 16 × 500 events). No persistent or Anypoint MQ mode.
+- Put-back events wait for the next call's delivery. On an API that goes quiet they wait until traffic returns, or expire after `pending-ttl-s`.
+- An expiry or a `maxEntries` trim inside the object store leaves no log line; `USAGE MAY HAVE EXPIRED` is inferred from a delivery's start time.
+- One call's events are never split: an MCP batch with more than 500 tool calls is sent whole.
+- Tests: `policy.test.cjs` structure checks, DataWeave scripts and the new `flow.test.cjs` scenarios; counts are in the pull request. Nothing was run on a Mule runtime.
+
 ## [3.1.3] — 2026-10-30
 
 Fix from the wave 6 live test (F8). Configuration properties unchanged. Not yet verified on a live Anypoint org.
