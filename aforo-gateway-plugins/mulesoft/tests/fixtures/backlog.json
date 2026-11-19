@@ -1,0 +1,113 @@
+{
+  "script": "backlog",
+  "base": {
+    "vars": {
+      "aforoCfg": {
+        "pendingMaxEntries": 10000
+      },
+      "aforoEndMs": 1761609600000,
+      "aforoPendingSeen": ""
+    }
+  },
+  "cases": [
+    {
+      "name": "no count yet: the call lists the keys",
+      "expect": {
+        "list": true,
+        "count": 0
+      }
+    },
+    {
+      "name": "a count 500 ms old is reused: no listing on this call",
+      "vars": {
+        "aforoPendingSeen": "1761609599500|7"
+      },
+      "expect": {
+        "list": false,
+        "count": 7
+      }
+    },
+    {
+      "name": "a count 999 ms old is still reused",
+      "vars": {
+        "aforoPendingSeen": "1761609599001|0"
+      },
+      "expect": {
+        "list": false,
+        "count": 0
+      }
+    },
+    {
+      "name": "a count 1 s old is stale: list again",
+      "vars": {
+        "aforoPendingSeen": "1761609599000|7"
+      },
+      "expect": {
+        "list": true,
+        "count": 7
+      }
+    },
+    {
+      "name": "four fifths full: every call counts, however fresh the last count",
+      "vars": {
+        "aforoPendingSeen": "1761609599990|8000"
+      },
+      "expect": {
+        "list": true,
+        "count": 8000
+      }
+    },
+    {
+      "name": "just under four fifths: the fresh count is reused",
+      "vars": {
+        "aforoPendingSeen": "1761609599990|7999"
+      },
+      "expect": {
+        "list": false,
+        "count": 7999
+      }
+    },
+    {
+      "name": "the limit follows pending-max-entries",
+      "vars": {
+        "aforoCfg": {
+          "pendingMaxEntries": 100
+        },
+        "aforoPendingSeen": "1761609599990|80"
+      },
+      "expect": {
+        "list": true,
+        "count": 80
+      }
+    },
+    {
+      "name": "a count from the future (clock moved back) is not trusted",
+      "vars": {
+        "aforoPendingSeen": "1761609605000|3"
+      },
+      "expect": {
+        "list": true
+      }
+    },
+    {
+      "name": "an unreadable count is not trusted",
+      "vars": {
+        "aforoPendingSeen": "yesterday|many"
+      },
+      "expect": {
+        "list": true,
+        "count": 0
+      }
+    },
+    {
+      "name": "a value that is not text is not trusted",
+      "vars": {
+        "aforoPendingSeen": 12345
+      },
+      "expect": {
+        "list": true,
+        "count": 0
+      }
+    }
+  ]
+}

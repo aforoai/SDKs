@@ -51,7 +51,17 @@ const orchestrationPolicy = ROLE.slice(ROLE.indexOf('PolicyName: AforoGatewayOrc
 const outsideOrchestration = noComments(ROLE.replace(orchestrationPolicy, ''));
 assert(orchestrationPolicy.length > 0 && !/apigateway:(POST|PUT|PATCH|DELETE)\b|(Action:|-) '?apigateway:\*/.test(outsideOrchestration),
     'no API Gateway write actions outside the opt-in AforoGatewayOrchestration policy');
-assert(!/apigateway:PUT\b|(Action:|-) '?apigateway:\*/.test(roleCode), 'no apigateway:PUT or apigateway:* action anywhere');
+// PUT replaces whole resources (PUT /restapis/{id}). The one PUT allowed (3.2.1) is the tag-on-create
+// of new usage plans and API keys, inside the opt-in policy.
+const tagStmt = statement('TagNewUsagePlansAndKeys');
+assert(tagStmt && orchestrationPolicy.includes(tagStmt), 'TagNewUsagePlansAndKeys sits in the opt-in AforoGatewayOrchestration policy');
+assert(!/apigateway:PUT\b|(Action:|-) '?apigateway:\*/.test(noComments(ROLE.replace(tagStmt, ''))),
+    'no apigateway:PUT or apigateway:* action anywhere else');
+const tagArns = [...tagStmt.matchAll(/'arn:\$\{AWS::Partition\}:apigateway:\$\{Region\}::(\/[^']*)'/g)].map((m) => m[1]);
+assert(JSON.stringify(tagArns) === JSON.stringify([
+    '/tags/arn%3A${AWS::Partition}%3Aapigateway%3A${Region}%3A%3A%2Fusageplans%2F*',
+    '/tags/arn%3A${AWS::Partition}%3Aapigateway%3A${Region}%3A%3A%2Fapikeys%2F*']),
+    `PUT only on the tags of usage plans and API keys (got ${tagArns.join(' ')})`);
 assert(/ApiGatewayRegion:/.test(ROLE) && /UseStackRegion: !Equals \[!Ref ApiGatewayRegion, ''\]/.test(ROLE),
     'region parameter, empty = stack region');
 assert(/MeteringInstall: !Equals \[!Ref AllowMeteringInstall, 'true'\]/.test(ROLE), 'metering install (writes) is a separate, optional policy');
@@ -141,6 +151,17 @@ for (const AllowMeteringInstall of ['true', 'false']) {
 assert(combos === 36 && identical === combos,
     `resolved resources and outputs identical to 3.1.0 for all ${combos} parameter combinations (${identical} identical)`);
 
+/**
+ * The resource AWS authorises a tag-on-create against: apigateway:PUT on /tags/ + the new
+ * resource's URL-encoded ARN, with '*' for the id it does not have yet. Seen live (W6.2
+ * T-6.2.8 step 4a): ".../tags/arn%3Aaws%3Aapigateway%3Aus-east-1%3A%3A%2Fusageplans%2F*".
+ */
+function tagsOf(R, path) {
+    return `arn:aws:apigateway:${R}::/tags/` + encodeURIComponent(`arn:aws:apigateway:${R}::${path}`);
+}
+assert(tagsOf('us-east-1', '/usageplans/*') === 'arn:aws:apigateway:us-east-1::/tags/arn%3Aaws%3Aapigateway%3Aus-east-1%3A%3A%2Fusageplans%2F*',
+    'tagsOf() builds the resource string AWS reported in the live AccessDenied');
+
 const off = cfn.resolve(NEW, { ExternalId: EXT });
 for (const [action, resource] of [
     ['apigateway:POST', 'arn:aws:apigateway:us-east-1::/usageplans'],
@@ -148,6 +169,7 @@ for (const [action, resource] of [
     ['apigateway:GET', 'arn:aws:apigateway:us-east-1::/usageplans/p1/keys'],
     ['cloudwatch:GetMetricData', '*'],
     ['firehose:CreateDeliveryStream', `arn:aws:firehose:us-east-1:${ACCT}:deliverystream/aforo-gateway-1234abcd`],
+    ['apigateway:PUT', tagsOf('us-east-1', '/usageplans/*')],
 ]) {
     assert(!cfn.allows(stmts(off), action, resource), `off: ${action} ${resource.replace(/^arn:aws:[a-z]+:[^:]*:[^:]*:/, '')} not allowed`);
 }
@@ -160,6 +182,8 @@ function adapterCalls(R, logGroup) {
     const lg = `arn:aws:logs:${R}:${ACCT}:log-group:${logGroup}`;
     return [
         ['CreateUsagePlan', 'apigateway:POST', ag('/usageplans')],
+        ['CreateUsagePlan tags', 'apigateway:PUT', tagsOf(R, '/usageplans/*')],
+        ['CreateApiKey tags', 'apigateway:PUT', tagsOf(R, '/apikeys/*')],
         ['GetUsagePlan', 'apigateway:GET', ag('/usageplans/p1')],
         ['GetUsagePlans ?keyId=', 'apigateway:GET', ag('/usageplans')],
         ['UpdateUsagePlan', 'apigateway:PATCH', ag('/usageplans/p1')],
@@ -188,7 +212,7 @@ for (const [label, params, R] of [
 ]) {
     const on = cfn.resolve(NEW, { ExternalId: EXT, AllowGatewayOrchestration: 'true', FirehoseBackupBucketArn: BUCKET, ...params });
     const missing = adapterCalls(R, `/aws/apigateway/a1/prod`).filter(([, a, r]) => !cfn.allows(stmts(on), a, r)).map(([n]) => n);
-    assert(missing.length === 0, `${label}: all 19 adapter calls allowed${missing.length ? ' (denied: ' + missing.join(', ') + ')' : ''}`);
+    assert(missing.length === 0, `${label}: all 21 adapter calls allowed${missing.length ? ' (denied: ' + missing.join(', ') + ')' : ''}`);
     const passFirehose = cfn.allows(stmts(on), 'iam:PassRole', `arn:aws:iam::${ACCT}:role/AforoFirehoseDeliveryRole`,
         { 'iam:PassedToService': 'firehose.amazonaws.com' });
     const passLogs = cfn.allows(stmts(on), 'iam:PassRole', `arn:aws:iam::${ACCT}:role/AforoLogsToFirehoseRole`,
@@ -206,6 +230,9 @@ for (const [what, action, resource, context] of [
     ['GET /apikeys in another region', 'apigateway:GET', 'arn:aws:apigateway:eu-west-1::/apikeys/k1'],
     ['POST /usageplans in another region', 'apigateway:POST', 'arn:aws:apigateway:eu-west-1::/usageplans'],
     ['PUT /restapis/a1 (replace an API)', 'apigateway:PUT', 'arn:aws:apigateway:us-east-1::/restapis/a1'],
+    ['tag a REST API', 'apigateway:PUT', tagsOf('us-east-1', '/restapis/a1')],
+    ['tag a stage', 'apigateway:PUT', tagsOf('us-east-1', '/restapis/a1/stages/prod')],
+    ['tag a usage plan in another region', 'apigateway:PUT', tagsOf('eu-west-1', '/usageplans/*')],
     ['DELETE /restapis/a1', 'apigateway:DELETE', 'arn:aws:apigateway:us-east-1::/restapis/a1'],
     ['a Firehose stream not named aforo-gateway-*', 'firehose:DeleteDeliveryStream', `arn:aws:firehose:us-east-1:${ACCT}:deliverystream/orders`],
     ['firehose:PutRecord as Aforo', 'firehose:PutRecord', `arn:aws:firehose:us-east-1:${ACCT}:deliverystream/aforo-gateway-1234abcd`],

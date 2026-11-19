@@ -1,11 +1,11 @@
-# MuleSoft policy 3.1.3 — live contract checklist
+# MuleSoft policy 3.2.0 — live contract checklist
 
-`dataweave.test.cjs` runs the policy's DataWeave under the DataWeave CLI and `policy.test.cjs` checks the template's structure. Neither runs a Mule runtime: custom policies need the Enterprise runtime with API Gateway. Run this checklist on a **test API instance** before rolling 3.0.0 out, and after any runtime upgrade.
+`dataweave.test.cjs` runs the policy's DataWeave under the DataWeave CLI, `flow.test.cjs` runs delivery scenarios on those scripts with a stand-in store and ingestor, and `policy.test.cjs` checks the template's structure. None runs a Mule runtime: custom policies need the Enterprise runtime with API Gateway. Run this checklist on a **test API instance** before rolling 3.0.0 out, and after any runtime upgrade.
 
 ## Setup
 
 - A test API instance (a basic-endpoint proxy is enough) whose upstream echoes the request headers and can be told which response headers and status to return, e.g. a small mock that answers `X-Aforo-*` headers from query parameters.
-- `aforo-metering` 3.1.3 applied with `aforo-endpoint`, `aforo-api-key` (scope `usage:ingest`), `aforo-tenant-id` and `aforo-product-id` for a test product; `quota-enabled: true`.
+- `aforo-metering` 3.2.0 applied with `aforo-endpoint`, `aforo-api-key` (scope `usage:ingest`), `aforo-tenant-id` and `aforo-product-id` for a test product; `quota-enabled: true`.
 - Keys from Aforo: `KEY` (subscribed to the product), `KEY_OTHER` (active, another product), `KEY_NONE` (active, `productIds: []`), `KEY_REVOKED`, and for an AI_AGENT / MCP product an agent client secret (48 lowercase hex).
 - Access to the tenant's ingested events in Aforo and to the runtime's log.
 
@@ -58,4 +58,22 @@
 | 27 | ingestor refuses connections for about 1 s, then up | events arrive (retried after a random 0–1 s, then 0–2 s wait), no duplicates (same idempotency keys) |
 | 27b | ingestor answers 429 with `Retry-After: 5`, then 202 | the next attempt is about 5 s later (not sooner); events arrive once |
 | 27c | ingestor answers 202 with an error `"retryable": true` for one event | only that event is re-sent; `"retryable": false` events are logged as refused |
-| 28 | ingestor down for minutes under load | `USAGE NOT DELIVERED (<reason>)`, then `USAGE DROPPED: 1000 calls' usage is already waiting` at most once a minute; API latency unaffected |
+| 28 | ingestor down for minutes under load | `USAGE NOT DELIVERED (<reason>): N event(s) put back …` per failed delivery, later `USAGE DROPPED after 3 put-backs: …`, and with a small `pending-max-entries` (100) `USAGE DROPPED: the pending store is full` at most once a minute; API latency unaffected |
+
+## Batching and put-back (3.2.0)
+
+Set the runtime's log level for the policy to DEBUG for these: each delivery logs `delivering N event(s) from M pending entr(y|ies)`. Count the requests at the ingestor (or a mock in front of it).
+
+| # | Setup | Expect |
+|---|---|---|
+| 29 | light load: one call a second for a minute | 60 ingest requests, each with one event; every DEBUG line says `1 event(s) from 1 pending entry`; each body is `{"events":[<the call's event>]}` |
+| 30 | load: 200 concurrent calls for 30 s against an ingest mock that takes 2 s to answer 202 | far fewer ingest requests than calls; DEBUG lines with `N event(s) from M pending entries`, N up to 500 and never more; every call's `idempotencyKey` (its gateway request id) arrives exactly once across all requests |
+| 31 | as 30, then compare with Aforo | events in Aforo = metered calls; no duplicates, none missing |
+| 32 | ingest mock answers 503 for 60 s under steady traffic (5 calls a second), then 202 | `USAGE NOT DELIVERED (the ingestor answered HTTP 503): N event(s) put back …`; after recovery the put-back events arrive with their original `idempotencyKey`s, each once; nothing dropped while the outage is shorter than 4 failed deliveries |
+| 33 | ingest mock answers 202 with one event `"retryable": false` and one `"retryable": true` on every attempt | the first is logged `USAGE EVENT REFUSED` once and never sent again; the second is re-sent 3 times, put back, and sent again by a later call |
+| 34 | ingest mock answers 503 for 10 minutes under steady traffic | `USAGE DROPPED after 3 put-backs: <metric> <key> …` naming events from the start of the outage |
+| 35 | `pending-max-entries: 100`, ingest mock that never answers, 50 calls a second | `USAGE DROPPED: the pending store is full (N entries waiting, pending-max-entries 100)` once a minute; API latency unaffected; the worker's heap stays flat |
+| 36 | `pending-ttl-s: 60`, ingest mock that never answers, steady traffic for 5 minutes | `USAGE MAY HAVE EXPIRED: a delivery started N s after its call, past pending-ttl-s (60 s)` at most once a minute |
+| 37 | apply the policy with `pending-max-entries` and `pending-ttl-s` left empty, then with 2500 and 120 | the policy deploys both times (the object store attributes render as numbers); with 2500 the limit in line 35's message is 2500 |
+| 38 | restart the worker while the ingest mock is down and usage is waiting | the waiting usage is gone after the restart (expected: the store is in memory); calls after the restart are metered |
+| 39 | two workers behind one load balancer, as 30 | each worker batches its own calls; every `idempotencyKey` still arrives exactly once |

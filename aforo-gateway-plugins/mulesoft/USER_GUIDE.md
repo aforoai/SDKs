@@ -1,6 +1,6 @@
 # Aforo for MuleSoft — User Guide
 
-**Version:** 3.1.3 · **Updated:** 2026-10-30 · **Audience:** engineers who own an API in Anypoint API Manager and sell it through Aforo.
+**Version:** 3.2.0 · **Updated:** 2026-11-13 · **Audience:** engineers who own an API in Anypoint API Manager and sell it through Aforo.
 
 Normally you do none of this by hand: when you connect your Anypoint org in Aforo and deploy an Aforo product to an API instance, Aforo publishes the policy to your Exchange and applies it with the right configuration. This guide explains what that does, how to do it manually, and how to check it.
 
@@ -46,13 +46,15 @@ The policy reads only these. Aforo's deploy sets them per API instance; in API M
 | `quota-check-url` | origin of `aforo-endpoint` + `/api/v1/quota/check` | Where quota is checked. |
 | `quota-timeout-ms` | `1500` (100–10000) | Quota check timeout. |
 | `quota-fail-open` | `true` | When the quota check fails: `true` lets the call through, `false` answers 503. |
+| `pending-max-entries` | `10000` (100–100000) | How many calls' usage may wait for delivery in the worker's memory. Past it new usage is dropped (`USAGE DROPPED: the pending store is full`). Also the most a restart can lose from the waiting usage. About 1 KB of heap per entry. |
+| `pending-ttl-s` | `900` (60–86400) | How long usage may wait before the runtime discards it. Usage a failed delivery puts back starts a new lifetime. |
 
 Values are rendered into the policy as text. A value must not contain `${` (Mule would read it as a property placeholder).
 
 ## 4. Install by hand
 
-1. **Build** the jar ([README → Build](README.md#build)), or take `aforo-metering-3.1.3-mule-policy.jar` from the release.
-2. **Publish** it to your Exchange as a policy: groupId = your Anypoint organization id, assetId `aforo-metering`, version `3.1.3`, with `aforo-metering.yaml` as the `policy-definition`. Either `./mvnw deploy -Danypoint.org.id=<org id>` from `aforo-metering/`, or Exchange → Publish new asset → Policy, uploading both files.
+1. **Build** the jar ([README → Build](README.md#build)), or take `aforo-metering-3.2.0-mule-policy.jar` from the release.
+2. **Publish** it to your Exchange as a policy: groupId = your Anypoint organization id, assetId `aforo-metering`, version `3.2.0`, with `aforo-metering.yaml` as the `policy-definition`. Either `./mvnw deploy -Danypoint.org.id=<org id>` from `aforo-metering/`, or Exchange → Publish new asset → Policy, uploading both files.
 3. **Apply** it in API Manager → your API instance → Policies → Add policy → *Aforo Usage Metering*, filling in the properties above. Put it **first** in the policy order (it is the API's authentication). If browsers call the API, apply MuleSoft's CORS policy before it.
 4. **Map** the product in Aforo (Aforo's deploy records the API instance id against the product).
 
@@ -93,6 +95,16 @@ Publish 3.1.0 as a new version of the asset and update the policy on each API in
 - Events the ingestor marks `"retryable": true` are re-sent; `"retryable": false` events are dropped even if their message says "could not be stored".
 - The log line for lost usage is now `USAGE NOT DELIVERED (<reason>)`.
 
+**From 3.1.3 to 3.2.0:** publish and apply 3.2.0. Two optional properties are new, `pending-max-entries` and `pending-ttl-s`; leaving them empty gives the defaults. What changes:
+
+- Under light traffic nothing: one call, one request, sent at once.
+- Under load, usage waiting behind the 16 running deliveries goes out in one request of up to 500 events instead of one request per call.
+- Usage a delivery could not send after 3 attempts is no longer lost at once. It goes back to the pending store and a later call's delivery sends it, with the same idempotency keys; after 3 put-backs it is dropped.
+- More usage can wait: 10000 calls for up to 15 minutes by default, instead of 1000 calls for 5 minutes. Budget about 10 MB of heap, or lower `pending-max-entries`.
+- The `USAGE NOT DELIVERED` and `USAGE DROPPED` log lines changed; see [Troubleshooting](#8-troubleshooting).
+
+**What a restart loses.** Pending usage lives in the worker's memory. A runtime restart, a redeploy of the API or re-applying the policy loses the usage that was waiting (at most `pending-max-entries` calls) and the usage the running deliveries held (at most 16 × 500 events). Normally that is a few seconds of traffic. If you plan a restart during an Aforo outage, expect to lose what is waiting. The policy has no persistent or Anypoint MQ mode.
+
 **From 3.1.2:** publish and apply 3.1.3; properties are unchanged. On `MCP_SERVER`, a POST whose body the policy does not read (chunked, or over 1 MiB) used to bill nothing. It now bills one `tools/call` with `toolName: unknown`, and the quota check covers it.
 
 ## 8. Troubleshooting
@@ -108,9 +120,13 @@ All log lines start with `[aforo-metering]`.
 | `quota check unavailable (…): failing OPEN` | quota not enforced while the check fails |
 | `could not remove the x-api-key header before the upstream` | the runtime refused the request rewrite; the call still went through, with the header |
 | `USAGE EVENT REFUSED (permanent, not retried): <metric> <key>: <reason>` | the ingestor rejected an event (unknown metric, unknown customer, missing field) |
-| `USAGE NOT DELIVERED (<reason>)` | the ingestor did not take the batch after 3 attempts (or the delivery failed); that usage is lost |
-| `USAGE DROPPED: 1000 calls' usage is already waiting` | the backlog is full (ingestor down or slow) |
+| `USAGE NOT DELIVERED (<reason>): N event(s) put back for a later call's delivery` | the ingestor did not take those events in 3 attempts (or the delivery failed). Nothing is lost yet: the next call's delivery sends them again, with the same keys |
+| `USAGE DROPPED after 3 put-backs: <metric> <key> \| …` | those events failed in 4 deliveries in a row and are lost. The ingestor has been unreachable or refusing them for minutes |
+| `USAGE DROPPED: the pending store is full (N entries waiting, pending-max-entries M)` | new usage is being dropped: the ingestor is down or slower than the traffic. Raise `pending-max-entries` if the worker has the memory |
+| `USAGE MAY HAVE EXPIRED: a delivery started N s after its call, past pending-ttl-s` | deliveries are queueing for longer than usage is kept. The runtime gives no notice when an entry expires, so this is the only sign. Check the ingestor; raise `pending-ttl-s` |
+| `USAGE LOST (<reason>; then the put-back failed: …)` | a delivery failed and its events could not be written back to the pending store |
+| `could not look for other waiting usage (…); delivering this call alone` | the key listing failed; the call's own usage is still sent |
 | `events skipped: unusable X-Aforo-… response header` | your API sent a header Aforo cannot use (too long, control characters) |
 | `metric-mappings rule … skipped` | the rule has no `metricName` or uses an unsupported Lua pattern |
 
-Repeating warnings (introspection, quota, backlog) are logged at most once a minute.
+Repeating warnings (introspection, quota, pending store full, usage that may have expired) are logged at most once a minute.

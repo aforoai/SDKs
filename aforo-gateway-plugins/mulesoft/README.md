@@ -2,11 +2,11 @@
 
 One custom policy, **`aforo-metering`**, that Aforo applies to an API instance in Anypoint API Manager. On every call it checks the end customer's **Aforo API key**, refuses a customer whose hard limit is used up (**429**), lets the call through, and sends the call's usage to Aforo after the response. Your API needs no Aforo code.
 
-**Version:** 3.1.3 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 3.2.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 Target: **Mule 4 runtimes as API gateways** (CloudHub, CloudHub 2.0, Runtime Fabric, hybrid), Mule 4.4 or later, Java 8, 11 or 17. Flex Gateway is not covered (it needs a separate PDK policy).
 
-> **Not verified on a live Anypoint org yet.** The billing logic runs under the open-source DataWeave CLI against 179 cases, and the template's structure is checked statically (see [Tests](#tests)). See [What only a live runtime can prove](#what-only-a-live-runtime-can-prove).
+> **Not verified on a live Anypoint org yet.** The billing logic runs under the open-source DataWeave CLI against its fixture cases, and the template's structure is checked statically (see [Tests](#tests)). See [What only a live runtime can prove](#what-only-a-live-runtime-can-prove).
 
 ## What Aforo deploys
 
@@ -14,7 +14,7 @@ Aforo's organization service does this when you connect your Anypoint org and de
 
 | What | Where | Notes |
 |---|---|---|
-| Policy asset `aforo-metering` **3.1.3** | your org's Exchange, groupId = your **Anypoint organization id** | the jar `aforo-metering-3.1.3-mule-policy.jar` plus its definition [`aforo-metering.yaml`](aforo-metering/aforo-metering.yaml) (classifier `policy-definition`) |
+| Policy asset `aforo-metering` **3.2.0** | your org's Exchange, groupId = your **Anypoint organization id** | the jar `aforo-metering-3.2.0-mule-policy.jar` plus its definition [`aforo-metering.yaml`](aforo-metering/aforo-metering.yaml) (classifier `policy-definition`) |
 | The policy, applied to each API instance | API Manager, per API instance (and environment) | with the [configuration properties](USER_GUIDE.md#configuration-properties) for the Aforo product it sells: `aforo-product-id`, `product-type`, metrics, quota |
 | The product ↔ API instance mapping | Aforo, `gateway_product_meterings` | provider `mulesoft`, `gateway_resource_id` = the API instance id |
 
@@ -96,18 +96,29 @@ Every event carries `customerId`, `metricName`, `quantity`, `idempotencyKey` (a 
   - an error with `"retryable": true` is transient: only those events are re-sent (from an ingestor that does not send the flag, a message starting "The event could not be stored" counts as retryable);
   - any other per-event error is permanent: logged (`USAGE EVENT REFUSED`) and dropped;
   - no answer (connection error, 10 s timeout), 408, 429 or any 5xx: the whole batch is re-sent;
-  - any other status (401, 403, other 4xx, a redirect): logged (`USAGE EVENT REFUSED`, with the status) and dropped. A wrong or revoked `aforo-api-key` therefore loses usage until it is fixed; the policy has no durable queue to hold it.
+  - any other status (401, 403, other 4xx, a redirect): logged (`USAGE EVENT REFUSED`, with the status and the number of events) and dropped. A wrong or revoked `aforo-api-key` therefore loses usage until it is fixed; the policy has no durable queue to hold it.
   - up to 3 attempts. The wait before attempt 2 is a random 0–1 s, before attempt 3 a random 0–2 s (full jitter, base 500 ms, cap 30 s), or the ingestor's `Retry-After` (seconds or an HTTP date) when that is longer, at most 60 s. The wait runs on the runtime's scheduler (an `until-successful` timed by the delivery script) and holds no thread. The idempotency keys never change, so a copy that did land is deduplicated, never billed twice.
-- One delivery per API call, carrying that call's events (one, or one per tool call in an MCP batch). A Mule 4 custom policy has no scheduler or flush timer, so calls are not collected into larger batches. The pending usage of each call is held in an in-memory object store entry (`persistent="false"`, per worker) only while its delivery runs: it is the retry state and the backlog count, not a durable queue.
-- At most 16 deliveries run at once per policy instance and at most 1000 calls' usage waits; past that the usage is dropped with a `USAGE DROPPED` warning (once a minute). A worker restart loses usage that was still waiting. The policy does not split a batch on 413 (one call's events are far below the ingestor's size limit).
-- Warnings that could repeat on every call (introspection or quota unavailable, backlog full) are logged once a minute.
+- **Batching happens only under load.** Each call stores its events in an in-memory object store (the pending store) under its request id, and starts a delivery. A delivery takes its own call's events and whatever else is waiting unclaimed, up to **500 events** and 1,000,000 characters, and sends them in one request.
+  - Light traffic: nothing else is waiting, so a call's usage goes out at once in its own request, byte for byte the request 3.1.x sent.
+  - Under load: at most 16 deliveries run at once. The calls queued behind them are picked up together by the next delivery that starts, and their own deliveries then find nothing to do. Fewer, larger requests go out and the queue drains faster.
+  - There is no "every N calls or T seconds" batch. A Mule 4 custom policy has no timer, so the last events of a quiet API would wait for the next call.
+  - 500 is the ingest contract's default batch size (the endpoint accepts 1000); 1,000,000 characters keeps the body under the contract's 4 MiB target even at 4 bytes a character. An MCP call's events stay together, so one call with more than 500 tool calls is still sent whole.
+- **No entry is sent by two deliveries.** A delivery owns a pending entry only when its own `os:remove` of that key succeeds: the ObjectStore connector runs `remove` under a per-key lock and raises `OS:KEY_NOT_FOUND` when the key is gone, so of two deliveries racing for one entry exactly one gets it and the other skips it. Keys are written once and never rewritten (a put-back gets a new key), so what the owner read just before the remove is what the entry held.
+- **A failed delivery puts its events back.** Events still unsent after the third attempt (or when a delivery fails unexpectedly) go back to the pending store for a later call's delivery, with the same idempotency keys. Each event counts its put-backs; after 3 it is dropped with `USAGE DROPPED after 3 put-backs`, having been through 4 deliveries of up to 3 attempts. Permanently rejected events and refused batches are never put back. Put-back events wait for the next call: on an API that then goes quiet they are sent when traffic returns, or expire.
+- **Limits.** At most 16 deliveries run at once per policy instance, and at most `pending-max-entries` calls' usage waits (default 10000); past that new usage is dropped with a `USAGE DROPPED: the pending store is full` warning. Waiting usage older than `pending-ttl-s` (default 900 s) is discarded by the runtime; a put-back starts a new lifetime. The policy does not split a batch on 413.
+- **What a restart loses.** The pending store is in memory (`persistent="false"`, per worker): no usage survives a runtime restart, a redeploy of the API, or a policy change that re-applies the policy. Lost at that moment: the events waiting in the pending store (at most `pending-max-entries` calls' usage) and the events the running deliveries have claimed (at most 16 × 500). In normal operation both are a few seconds of traffic; during an ingestor outage they grow towards those limits. A persistent store or Anypoint MQ is not offered: CloudHub bills persistent object stores per operation.
+- Warnings that could repeat on every call (introspection or quota unavailable, pending store full, usage that may have expired) are logged once a minute.
+
+Sizing the defaults: a delivery ends within about 45 s when the ingestor does not answer (three 10 s timeouts and two jittered waits), or 150 s when it keeps sending the longest `Retry-After`. Usage therefore waits at most a few such rounds before it is sent or put back with a new lifetime, well inside 900 s. One call's entry is about 1 KB, so 10000 entries hold about 10 MB of heap and cover, for example, 100 calls a second through a 100 s ingestor outage. Raise `pending-max-entries` for more traffic or longer outages if the worker has the memory.
+
+The pending store's size is counted from a key listing, since the ObjectStore has no size operation. A call does not list on every request: it reuses a count taken less than 1 s ago by any call or delivery, unless the store is four fifths full. Between two counts a burst can pass `pending-max-entries` by up to a second of traffic; the store's own `maxEntries` then discards the oldest entries without a log line.
 
 ## Build
 
 ```bash
 cd aforo-gateway-plugins/mulesoft/aforo-metering
 docker run --rm -v "$PWD":/src -v "$HOME/.m2":/root/.m2 -w /src eclipse-temurin:17 ./mvnw -B -ntp clean package
-# -> target/aforo-metering-3.1.3-mule-policy.jar
+# -> target/aforo-metering-3.2.0-mule-policy.jar
 ```
 
 Everything resolves from MuleSoft's public repository (`repository.mulesoft.org/releases`) and Maven Central: no Anypoint or Nexus EE credentials. The policy bundles the HTTP connector 1.10.3, the ObjectStore connector 1.2.2, the Java module 1.2.16 and the secure configuration property module 1.2.7. `./mvnw deploy -Danypoint.org.id=<org id>` publishes the jar and the definition to your Exchange (credentials in `~/.m2/settings.xml`, server id `exchange-server`).
@@ -119,12 +130,14 @@ From `aforo-gateway-plugins/`:
 ```bash
 # Structure: package, definition <-> template, flow order, outbound calls, docs
 docker run --rm -v "$PWD":/src -w /src node:22 node mulesoft/tests/policy.test.cjs
-# Billing logic: the template's 8 DataWeave scripts under the DataWeave CLI 2.12.3
+# Billing logic: the template's DataWeave scripts under the DataWeave CLI 2.12.3,
+# then the delivery scenarios built on them (needs Docker)
 mulesoft/tests/run-dataweave.sh
 ```
 
 - `dataweave.test.cjs` reads the scripts straight out of `template.xml` (the only copy) and runs them against [`tests/fixtures/`](tests/fixtures): configuration parsing and Lua patterns, the key and its hash, identity and cache decisions (fresh, stale, negative, `expiresAt`, failures, fail-open), quota decisions, the events of all four product types with MCP batches and protocol messages, and the ingestor's 202 handling.
-- `policy.test.cjs` checks what the CLI cannot: every property is declared and read exactly once, no property ever reaches DataWeave source text, the quota check and the key removal come before `execute-next`, a refusal never reaches `execute-next`, every variable read is written, the outbound calls' URLs and headers, and that the two copies of the metering block are identical.
+- `flow.test.cjs` runs delivery scenarios with the same scripts and an in-memory stand-in for the pending store and the ingestor: one call sends one unchanged request; waiting calls go out in one request with their own keys; two deliveries stepped through 63 interleavings never send the same event; failed events are put back and sent once by a later call; permanent rejects are not put back; the 500-event cap. The order of steps is restated in JavaScript, and `policy.test.cjs` pins the XML to that order.
+- `policy.test.cjs` checks what the CLI cannot: a delivery adds an entry to its request only after its own `os:remove` of that entry succeeded, the pending store is written under two kinds of key only, the store is not touched during the attempts, every property is declared and read exactly once, no property ever reaches DataWeave source text, the quota check and the key removal come before `execute-next`, a refusal never reaches `execute-next`, every variable read is written, the outbound calls' URLs and headers, and that the two copies of the metering block are identical.
 - [`tests/policy-contract.md`](tests/policy-contract.md) is the checklist for a test API on a live runtime.
 
 ## What only a live runtime can prove
@@ -135,6 +148,8 @@ There is no Mule 4 runtime that runs a custom policy offline: policies need the 
 - **Key removal**: `propagateMessageTransformations="true"` on `http-policy:source` and the Java module rebuilding `HttpRequestAttributes` without the header (what MuleSoft's own `http-transform:remove-headers` does). If the runtime refuses it, the call still goes through, with the header, and the policy logs `could not remove the x-api-key header`.
 - **Refusals**: the listener building the 401/403/429/503 response from `HttpPolicyResponseAttributes`.
 - That an API error (APIkit 404, 5xx) reaches the policy's `on-error-propagate` with the error response's status, and that propagating it leaves the client's response unchanged.
+- That the gateway's Handlebars renders the pending store's `{{#if}}…{{else}}…{{/if}}` attributes (checked here with Handlebars.js only; the gateway uses its own implementation).
+- Batching under real load: that calls queue behind `async maxConcurrency="16"`, that a queued call's entry is claimed by an earlier delivery, and the `OS:KEY_NOT_FOUND` claim under real concurrency (read from the ObjectStore connector 1.2.2's code, not run).
 - Object store, `async maxConcurrency`, `foreach` and `until-successful` behaviour (the retry wait relies on `millisBetweenRetries` being read as an expression on entry, which Mule 4.4+ does); per-worker caches on multi-worker deployments.
 - How a 1.10.3 HTTP connector in the policy coexists with your application's own HTTP connector version.
 

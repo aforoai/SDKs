@@ -1,6 +1,6 @@
 # Aforo AWS CloudFormation Templates — User Guide
 
-**Version:** 3.2.0 (not yet released) · **Updated:** 2026-10-28 · **Audience:** AWS account owners connecting Amazon API Gateway to Aforo.
+**Version:** 3.2.1 (not yet released) · **Updated:** 2026-11-12 · **Audience:** AWS account owners connecting Amazon API Gateway to Aforo.
 
 ## What you'll build
 
@@ -53,7 +53,7 @@ What `AllowGatewayOrchestration=true` adds to the role, in `ApiGatewayRegion` on
 
 | For | Permission |
 |---|---|
-| Usage plans and API keys (create, change quota/throttle/keys, enable/disable, delete) | `apigateway:POST` on `/usageplans`, `/usageplans/*/keys`, `/apikeys`; `PATCH` and `DELETE` on `/usageplans/*`, `/apikeys/*` |
+| Usage plans and API keys (create, change quota/throttle/keys, enable/disable, delete) | `apigateway:POST` on `/usageplans`, `/usageplans/*/keys`, `/apikeys`; `PATCH` and `DELETE` on `/usageplans/*`, `/apikeys/*`; `PUT` on the tags of new usage plans and API keys (`/tags/<usage plan or API key ARN>`, the tags Aforo sets when it creates them) |
 | Reading the keys Aforo manages (enforcement status, key list of a plan) | `apigateway:GET` on `/apikeys/*`, `/usageplans/*/keys` — these return key values. Listing every key (`GET /apikeys`) stays denied. |
 | Pull ingestion | `cloudwatch:GetMetricData` (no resource-level permissions, so `*`) |
 | Push ingestion | Firehose create/describe/update/delete on `deliverystream/aforo-gateway-*`; `logs:PutSubscriptionFilter` / `DeleteSubscriptionFilter` on API Gateway log groups; `iam:PassRole` of one role to Firehose and one to CloudWatch Logs |

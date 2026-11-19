@@ -1,7 +1,9 @@
 /**
  * Tests for authorizer.js (JWT TOKEN authorizer): revocation over Redis
- * fails closed (G340), the Allow policy covers one stage (G341), and an
- * unknown kid refetches the JWKS at most once per 30 s (G343).
+ * fails closed (G340), the Allow policy covers one stage (G341), an unknown
+ * kid refetches the JWKS at most once per 30 s (G343), scopes are enforced per
+ * route with a per-method Allow (G341, AFORO_ROUTE_SCOPES), and the audience
+ * check (G326, AFORO_JWT_AUDIENCE).
  * Run with: node tests/authorizer.test.js
  *
  * The JWKS is served by a local HTTP server and Redis is a local TCP (or,
@@ -310,6 +312,245 @@ async function run() {
     assertEquals(effect(p), 'Deny', 'only the exact value "true" disables the check');
     delete process.env.AFORO_JWT_ISSUER_CHECK_DISABLED;
     process.env.AFORO_JWT_ISSUER = ISS;
+
+    // ── Route scopes (G341) ──
+    console.log('\nG341: scopes are enforced per route (AFORO_ROUTE_SCOPES)');
+    delete process.env.REDIS_HOST;
+    const STAGE = 'arn:aws:execute-api:us-east-1:123456789012:abc123/prod';
+    const arn = (method, path) => `${STAGE}/${method}${path}`;
+    const callAt = (tok, methodArn) => auth.handler({ authorizationToken: `Bearer ${tok}`, methodArn });
+    const setMap = (map) => {
+        T.reset();
+        if (map === undefined) delete process.env.AFORO_ROUTE_SCOPES;
+        else process.env.AFORO_ROUTE_SCOPES = typeof map === 'string' ? map : JSON.stringify(map);
+    };
+    const errors = [];
+    const realError = console.error;
+    const captureErrors = () => { errors.length = 0; console.error = (...a) => errors.push(a.join(' ')); };
+    const releaseErrors = () => { console.error = realError; };
+
+    setMap({
+        'GET /v1/items': 'items:read',
+        'POST /v1/items': ['items:write'],
+        'GET /v1/items/{id}': 'items:read',
+        'DELETE /v1/items/{id}': ['items:write', 'items:delete'],
+        'GET /v1/items/export': 'items:export',
+        'ANY /v1/admin/**': 'admin',
+        'GET /v1/admin/health': [],
+        '* /v1/reports/*/download': 'reports:read reports:download',
+    });
+
+    p = await callAt(token({ scopes: 'items:read' }), arn('GET', '/v1/items'));
+    assertEquals(effect(p), 'Allow', 'required scope present (string claim) → Allow');
+    assertEquals(resource(p), arn('GET', '/v1/items'), 'the Allow names only the called method ARN');
+    assertEquals(p.policyDocument.Statement.length, 1, 'one statement, no stage wildcard');
+    assertEquals(p.context.scopes, 'items:read', 'scopes still passed on in the context');
+
+    p = await callAt(token({ scopes: ['items:read', 'other'] }), arn('GET', '/v1/items'));
+    assertEquals(effect(p), 'Allow', 'required scope present (array claim) → Allow');
+
+    p = await callAt(token({ scopes: 'items:read' }), arn('POST', '/v1/items'));
+    assertEquals(effect(p), 'Deny', 'scope for another method on the same path → Deny');
+    assertEquals(p.context.error, 'INSUFFICIENT_SCOPE', 'Deny says INSUFFICIENT_SCOPE');
+    assertEquals(resource(p), arn('POST', '/v1/items'), 'Deny covers the called method');
+
+    p = await callAt(token({ scopes: undefined }), arn('GET', '/v1/items'));
+    assertEquals(effect(p), 'Deny', 'token without scopes on a mapped route → Deny');
+    p = await callAt(token({ scopes: 'items:reader' }), arn('GET', '/v1/items'));
+    assertEquals(effect(p), 'Deny', 'a scope that only starts like the required one → Deny');
+
+    p = await callAt(token({ scopes: 'items:write' }), arn('DELETE', '/v1/items/42'));
+    assertEquals(effect(p), 'Deny', 'one of two required scopes → Deny (all are required)');
+    p = await callAt(token({ scopes: 'items:delete items:write' }), arn('DELETE', '/v1/items/42'));
+    assertEquals(effect(p), 'Allow', 'both required scopes → Allow');
+
+    console.log('\nG341: path parameters and wildcards');
+    p = await callAt(token({ scopes: 'items:read' }), arn('GET', '/v1/items/42'));
+    assertEquals(effect(p), 'Allow', '{id} matches one real segment (/v1/items/42)');
+    assertEquals(resource(p), arn('GET', '/v1/items/42'), 'the Allow names the real path, not the template');
+    p = await callAt(token({ scopes: 'items:read' }), arn('GET', '/v1/items/42/owners'));
+    assertEquals(effect(p), 'Allow', '{id} does not match two segments: /v1/items/42/owners is not in the map');
+    p = await callAt(token({ scopes: 'items:read' }), arn('GET', '/v1/items/export'));
+    assertEquals(effect(p), 'Deny', 'a literal entry wins over {id}: /v1/items/export needs items:export');
+    p = await callAt(token({ scopes: 'items:export' }), arn('GET', '/v1/items/export'));
+    assertEquals(effect(p), 'Allow', 'the literal entry\'s scope → Allow');
+    p = await callAt(token({ scopes: 'items:read' }), arn('GET', '/v1/items/42/'));
+    assertEquals(effect(p), 'Allow', 'a trailing slash does not change the route');
+    p = await callAt(token({ scopes: 'x' }), arn('GET', '/v1//items'));
+    assertEquals(effect(p), 'Deny', 'a doubled slash does not skip the entry');
+
+    p = await callAt(token({ scopes: 'x' }), arn('PUT', '/v1/admin/users/7/roles'));
+    assertEquals(effect(p), 'Deny', '** covers the rest of the path, ANY covers every method');
+    p = await callAt(token({ scopes: 'x' }), arn('GET', '/v1/admin'));
+    assertEquals(effect(p), 'Deny', '** also covers the prefix itself (/v1/admin)');
+    p = await callAt(token({ scopes: 'admin' }), arn('PUT', '/v1/admin/users/7/roles'));
+    assertEquals(effect(p), 'Allow', 'admin scope → Allow under /v1/admin');
+    p = await callAt(token({ scopes: 'x' }), arn('GET', '/v1/admin/health'));
+    assertEquals(effect(p), 'Allow', 'a more specific entry with [] needs no scope');
+    p = await callAt(token({ scopes: 'x' }), arn('POST', '/v1/admin/health'));
+    assertEquals(effect(p), 'Deny', 'that entry is GET only; POST falls back to ANY /v1/admin/**');
+
+    p = await callAt(token({ scopes: 'reports:read' }), arn('GET', '/v1/reports/2026-10/download'));
+    assertEquals(effect(p), 'Deny', '* matches one segment; a space-separated value requires every scope');
+    p = await callAt(token({ scopes: 'reports:download reports:read' }), arn('GET', '/v1/reports/2026-10/download'));
+    assertEquals(effect(p), 'Allow', 'both scopes → Allow');
+    p = await callAt(token({ scopes: 'x' }), arn('GET', '/v1/Items'));
+    assertEquals(effect(p), 'Allow', 'paths are case-sensitive: /v1/Items is not /v1/items');
+
+    console.log('\nG341: routes not in the map, and the "*" default');
+    p = await callAt(token({ scopes: undefined }), arn('GET', '/v1/status'));
+    assertEquals(effect(p), 'Allow', 'route not in the map → Allow as today (no scope needed)');
+    assertEquals(resource(p), arn('GET', '/v1/status'), 'with a map, even an unmapped route\'s Allow is per method');
+
+    setMap({ 'GET /v1/items': 'items:read', '*': 'api:access' });
+    p = await callAt(token({ scopes: 'items:read' }), arn('GET', '/v1/status'));
+    assertEquals(effect(p), 'Deny', '"*" default: an unmapped route needs the default scope');
+    p = await callAt(token({ scopes: 'api:access' }), arn('GET', '/v1/status'));
+    assertEquals(effect(p), 'Allow', 'default scope present → Allow');
+    p = await callAt(token({ scopes: 'items:read' }), arn('GET', '/v1/items'));
+    assertEquals(effect(p), 'Allow', 'a mapped route uses its own entry, not the default');
+    p = await callAt(token({ scopes: 'api:access' }), arn('GET', '/v1/items'));
+    assertEquals(effect(p), 'Deny', 'the default scope does not open a mapped route');
+    p = await callAt(token({ scopes: 'api:access' }), `${STAGE}/GET/`);
+    assertEquals(effect(p), 'Allow', 'the root path is a route too');
+
+    p = await callAt(token({ scopes: 'api:access items:read' }), arn('GET', '/v1/public/../items'));
+    assertEquals(effect(p), 'Deny', 'a path with a ".." segment → Deny');
+    assertEquals(p.context.error, 'ROUTE_UNKNOWN', 'Deny says ROUTE_UNKNOWN');
+    p = await callAt(token({ scopes: 'api:access items:read' }), arn('GET', '/v1/public%2Fitems'));
+    assertEquals(effect(p), 'Deny', 'an encoded slash in a segment → Deny');
+    p = await callAt(token({ scopes: 'api:access' }), 'not-an-arn');
+    assertEquals(effect(p), 'Deny', 'a method ARN that cannot be read → Deny');
+
+    console.log('\nG341: no map → the stage-wide Allow is unchanged');
+    setMap(undefined);
+    p = await callAt(token({ scopes: undefined }), arn('GET', '/v1/items'));
+    assertEquals(effect(p), 'Allow', 'no map, no scopes → Allow');
+    assertEquals(resource(p), `${STAGE}/*`, 'no map → Allow covers the stage');
+    setMap('   ');
+    p = await callAt(token(), arn('GET', '/v1/items'));
+    assertEquals(resource(p), `${STAGE}/*`, 'a blank value is "no map"');
+
+    console.log('\nG341: a map that is not valid denies everything');
+    for (const [bad, why] of [
+        ['{"GET /v1/items": "items:read"', 'broken JSON'],
+        ['["GET /v1/items"]', 'an array, not an object'],
+        ['"items:read"', 'a string, not an object'],
+        ['{"GET /v1/items": 5}', 'a scope that is not a string'],
+        ['{"GET /v1/items": ""}', 'an empty scope string'],
+        ['{"GET /v1/items": ["a b"]}', 'a scope with a space inside an array'],
+        ['{"/v1/items": "a"}', 'no method'],
+        ['{"FETCH /v1/items": "a"}', 'an unknown method'],
+        ['{"GET v1/items": "a"}', 'a path without a leading slash'],
+        ['{"GET /v1/**/items": "a"}', '** in the middle'],
+        ['{"GET /v1/item{id}": "a"}', 'a wildcard mixed with text'],
+        ['{"GET /v1/items/{id}": "a", "GET /v1/items/{other}": "b"}', 'two entries for the same routes'],
+    ]) {
+        setMap(bad);
+        captureErrors();
+        p = await callAt(token({ scopes: 'items:read a b' }), arn('GET', '/v1/status'));
+        const first = errors.length;
+        await callAt(token({ scopes: 'items:read a b' }), arn('GET', '/v1/items'));
+        releaseErrors();
+        assert(effect(p) === 'Deny' && p.context.error === 'ROUTE_SCOPES_INVALID', `${why} → Deny (ROUTE_SCOPES_INVALID), even for a route it does not name`);
+        if (why === 'broken JSON') {
+            assertEquals(first, 1, 'one error log for the bad value');
+            assert(errors[0].includes('AFORO_ROUTE_SCOPES is not valid'), 'the log names the setting');
+            assertEquals(errors.length, 1, 'not logged again on the next request');
+        }
+    }
+    setMap('{"GET /v1/items": "items:read"');
+    captureErrors();
+    p = await auth.handler({ authorizationToken: '', methodArn: arn('GET', '/v1/items') });
+    releaseErrors();
+    assertEquals(p.context.error, 'ROUTE_SCOPES_INVALID', 'an invalid map is reported before the token is looked at');
+
+    console.log('\nG341: REQUEST authorizer event (identity sources per method and path)');
+    setMap({ 'GET /v1/items': 'items:read' });
+    p = await auth.handler({
+        type: 'REQUEST', methodArn: arn('GET', '/v1/items'),
+        headers: { authorization: `Bearer ${token({ scopes: 'items:read' })}` },
+    });
+    assertEquals(effect(p), 'Allow', 'token read from the Authorization header of a REQUEST event');
+    p = await auth.handler({
+        type: 'REQUEST', methodArn: arn('GET', '/v1/items'),
+        headers: { Authorization: `Bearer ${token({ scopes: 'nope' })}` },
+    });
+    assertEquals(effect(p), 'Deny', 'REQUEST event without the scope → Deny');
+    p = await auth.handler({ type: 'REQUEST', methodArn: arn('GET', '/v1/items'), headers: {} });
+    assertEquals(p.context.error, 'NO_TOKEN', 'REQUEST event without the header → NO_TOKEN');
+
+    console.log('\nG341: revocation still applies with a map');
+    setMap({ 'GET /v1/items': 'items:read' });
+    useRedis();
+    process.env.AFORO_ROUTE_SCOPES = JSON.stringify({ 'GET /v1/items': 'items:read' });
+    redis.reply = (cmds) => cmds.map(() => '$1\r\n1\r\n').join('');
+    p = await callAt(token({ scopes: 'items:read' }), arn('GET', '/v1/items'));
+    assertEquals(p.context.error, 'TOKEN_REVOKED', 'a revoked token with the right scope → Deny');
+    delete process.env.REDIS_HOST;
+    setMap(undefined);
+
+    // ── Audience (G326) ──
+    console.log('\nG326: audience (AFORO_JWT_AUDIENCE)');
+    const warns = [];
+    const realWarn = console.warn;
+    const setAud = (aud, allowMissing) => {
+        T.reset();
+        if (aud === undefined) delete process.env.AFORO_JWT_AUDIENCE; else process.env.AFORO_JWT_AUDIENCE = aud;
+        if (allowMissing === undefined) delete process.env.AFORO_JWT_AUDIENCE_ALLOW_MISSING;
+        else process.env.AFORO_JWT_AUDIENCE_ALLOW_MISSING = allowMissing;
+    };
+
+    setAud('https://api.smartai.com, aforo-gateway');
+    p = await call(token({ aud: 'aforo-gateway' }));
+    assertEquals(effect(p), 'Allow', 'aud string names an accepted audience → Allow');
+    p = await call(token({ aud: ['other', 'https://api.smartai.com'] }));
+    assertEquals(effect(p), 'Allow', 'aud array names an accepted audience → Allow');
+    p = await call(token({ aud: 'someone-else' }));
+    assertEquals(effect(p), 'Deny', 'wrong aud (string) → Deny');
+    assertEquals(p.context.error, 'INVALID_AUDIENCE', 'Deny says INVALID_AUDIENCE');
+    p = await call(token({ aud: ['a', 'b'] }));
+    assertEquals(effect(p), 'Deny', 'wrong aud (array) → Deny');
+    p = await call(token({ aud: 'aforo-gateway-2' }));
+    assertEquals(effect(p), 'Deny', 'aud must equal an accepted audience, not start with one');
+    p = await call(token());
+    assertEquals(effect(p), 'Deny', 'no aud → Deny');
+    assertEquals(p.context.error, 'INVALID_AUDIENCE', 'missing aud also says INVALID_AUDIENCE');
+    for (const [odd, what] of [[[], 'an empty array'], ['', 'an empty string'], [42, 'a number'], [{ a: 1 }, 'an object']]) {
+        p = await call(token({ aud: odd }));
+        assertEquals(effect(p), 'Deny', `aud that is ${what} → Deny`);
+    }
+
+    setAud('aforo-gateway', 'true');
+    p = await call(token());
+    assertEquals(effect(p), 'Allow', 'ALLOW_MISSING=true: no aud → Allow');
+    p = await call(token({ aud: 'someone-else' }));
+    assertEquals(effect(p), 'Deny', 'ALLOW_MISSING=true: wrong aud → still Deny');
+    p = await call(token({ aud: [] }));
+    assertEquals(effect(p), 'Deny', 'ALLOW_MISSING=true: an empty aud array is not "missing" → Deny');
+    p = await call(token({ aud: 'aforo-gateway' }));
+    assertEquals(effect(p), 'Allow', 'ALLOW_MISSING=true: right aud → Allow');
+    setAud('aforo-gateway', 'yes');
+    p = await call(token());
+    assertEquals(effect(p), 'Deny', 'only the exact value "true" allows a missing aud');
+    setAud('aforo-gateway', 'false');
+    p = await call(token());
+    assertEquals(effect(p), 'Deny', 'ALLOW_MISSING=false: no aud → Deny');
+
+    setAud(undefined);
+    console.warn = (...a) => warns.push(a.join(' '));
+    p = await call(token({ aud: 'anything' }));
+    const p2 = await call(token());
+    console.warn = realWarn;
+    assert(effect(p) === 'Allow' && effect(p2) === 'Allow', 'AFORO_JWT_AUDIENCE unset → aud is not checked');
+    assertEquals(warns.filter((w) => w.includes('AFORO_JWT_AUDIENCE is not set')).length, 1, 'unset → warned once per container, not per request');
+    setAud(' , ');
+    p = await call(token({ aud: 'anything' }));
+    assertEquals(effect(p), 'Allow', 'a value with no audience in it counts as unset');
+    setAud(undefined, 'true');
+    p = await call(token({ aud: 'anything' }));
+    assertEquals(effect(p), 'Allow', 'ALLOW_MISSING alone (no audience list) checks nothing');
+    setAud(undefined);
 
     jwksServer.close();
     redisServer.close();

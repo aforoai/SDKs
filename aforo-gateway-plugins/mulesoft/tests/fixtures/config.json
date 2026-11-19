@@ -64,7 +64,9 @@
         "quotaFailOpen": true,
         "quotaCacheTtlMs": 1000,
         "problems": [],
-        "warnings": []
+        "warnings": [],
+        "pendingMaxEntries": 10000,
+        "pendingTtlS": 900
       }
     },
     {
@@ -277,6 +279,50 @@
         "problems": [],
         "introspectUrl": "http://localhost:8081/introspect",
         "quotaUrl": ""
+      }
+    },
+    {
+      "name": "pending store: size and lifetime as set",
+      "vars": {
+        "aforoPropPendingMaxEntries": "=2500",
+        "aforoPropPendingTtlS": "=120"
+      },
+      "expect": {
+        "pendingMaxEntries": 2500,
+        "pendingTtlS": 120
+      }
+    },
+    {
+      "name": "pending store: values outside the range are clamped",
+      "vars": {
+        "aforoPropPendingMaxEntries": "=5",
+        "aforoPropPendingTtlS": "=999999"
+      },
+      "expect": {
+        "pendingMaxEntries": 100,
+        "pendingTtlS": 86400
+      }
+    },
+    {
+      "name": "pending store: an upper size and a lower lifetime are clamped too",
+      "vars": {
+        "aforoPropPendingMaxEntries": "=5000000",
+        "aforoPropPendingTtlS": "=1"
+      },
+      "expect": {
+        "pendingMaxEntries": 100000,
+        "pendingTtlS": 60
+      }
+    },
+    {
+      "name": "pending store: empty or unreadable values fall back to the defaults",
+      "vars": {
+        "aforoPropPendingMaxEntries": "=",
+        "aforoPropPendingTtlS": "=ten minutes"
+      },
+      "expect": {
+        "pendingMaxEntries": 10000,
+        "pendingTtlS": 900
       }
     }
   ]
