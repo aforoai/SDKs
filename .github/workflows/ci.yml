@@ -309,7 +309,7 @@ jobs:
           PY
 
   # G032 (2026-11-21): dependency CVE scan (Trivy) + Semgrep SAST. Same steps, versions and gate
-  # variables (TRIVY_GATE / SEMGREP_GATE) as aforo-nextgen-common frontend-security.yml @125e779,
+  # variables (TRIVY_GATE / SEMGREP_GATE) as aforo-nextgen-common frontend-security.yml @47a4c7c,
   # copied in because this public repo cannot call a workflow in a private repo.
   security-dependencies:
     name: dependencies (trivy)
@@ -332,12 +332,41 @@ jobs:
         run: |
           TRIVY="$RUNNER_TEMP/trivy"
           if [ ! -e "$LOCKFILE" ]; then echo "::error::lockfile or directory $LOCKFILE not found"; exit 1; fi
+          # One network scan, saved as JSON; the report and the gate are built from it
+          # offline with `trivy convert`. A scan ERROR (exit != 0, e.g. Maven Central
+          # 429 Too Many Requests while resolving pom.xml parents/BOMs) is retried and
+          # is never reported as "vulnerabilities found".
+          scan() { "$TRIVY" fs --quiet --scanners vuln --ignore-unfixed --ignorefile "" \
+                   --format json --output trivy.json "$@" "$LOCKFILE" 2> trivy-err.txt; }
+          PARTIAL=""
+          for wait in 60 120 0; do
+            if scan; then break; fi
+            cat trivy-err.txt
+            if [ "$wait" = 0 ]; then
+              # Maven Central still refuses this runner: scan without remote lookups so
+              # every lockfile is still checked, and say clearly that it is partial.
+              echo "::warning::Trivy could not reach the remote package repositories; rescanning with --offline-scan (pom.xml dependencies from parent POMs/BOMs may be missed)"
+              if scan --offline-scan; then PARTIAL=1; break; fi
+              cat trivy-err.txt
+              { echo "### Dependency scan did not complete"; echo '```'; cat trivy-err.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+              if [ "$GATE" = enforce ]; then echo "::error::Trivy scan failed (a scan error, not a vulnerability result)"; exit 1; fi
+              echo "::warning::Trivy scan failed (a scan error, not a vulnerability result; TRIVY_GATE is not 'enforce')"
+              exit 0
+            fi
+            echo "Trivy scan error; retrying in ${wait}s"
+            sleep "$wait"
+          done
+          "$TRIVY" convert --quiet --ignorefile "" --severity HIGH,CRITICAL --format table trivy.json | tee trivy-report.txt
+          if [ -n "$PARTIAL" ]; then
+            { echo "### Partial dependency scan (--offline-scan)"; echo "Remote package repositories were unreachable; pom.xml dependencies inherited from parent POMs/BOMs may be missing."; } >> "$GITHUB_STEP_SUMMARY"
+          fi
           IGNORE=""
-          if [ -f .trivyignore ]; then IGNORE="--ignorefile .trivyignore"; fi
-          "$TRIVY" fs --quiet --scanners vuln --ignore-unfixed --severity HIGH,CRITICAL "$LOCKFILE" | tee trivy-report.txt
-          # shellcheck disable=SC2086
-          if ! "$TRIVY" fs --quiet --scanners vuln --ignore-unfixed --severity "$SEVERITY" \
-               $IGNORE --exit-code 1 "$LOCKFILE" > trivy-gate.txt; then
+          if [ -f .trivyignore ]; then IGNORE=.trivyignore; fi
+          RC=0
+          "$TRIVY" convert --quiet --ignorefile "$IGNORE" --severity "$SEVERITY" \
+            --exit-code 3 --format table --output trivy-gate.txt trivy.json || RC=$?
+          if [ "$RC" != 0 ] && [ "$RC" != 3 ]; then echo "::error::trivy convert failed (exit $RC)"; exit 1; fi
+          if [ "$RC" = 3 ]; then
             { echo "### Unaccepted fixable $SEVERITY vulnerabilities in $LOCKFILE"; echo '```'; cat trivy-gate.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
             if [ "$GATE" = enforce ]; then echo "::error::unaccepted fixable $SEVERITY vulnerabilities"; exit 1; fi
             echo "::warning::unaccepted fixable $SEVERITY vulnerabilities (TRIVY_GATE is not 'enforce')"
@@ -346,7 +375,9 @@ jobs:
         if: always()
         with:
           name: trivy-dependencies-${{ github.sha }}
-          path: trivy-report.txt
+          path: |
+            trivy-report.txt
+            trivy.json
           if-no-files-found: ignore
           retention-days: 30
 
