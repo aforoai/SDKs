@@ -308,12 +308,20 @@ jobs:
           sys.exit(1 if fail else 0)
           PY
 
+  # G032 (2026-11-21): dependency CVE scan (Trivy, every lockfile in the repo) + Semgrep SAST,
+  # same shared workflow and gate variables (TRIVY_GATE / SEMGREP_GATE) as the services and frontends.
+  security:
+    uses: aforoai/aforo-nextgen-common/.github/workflows/frontend-security.yml@125e779e588bfd4ba3c0e9bd17a5155fb2d9cdfa # aforo-nextgen-common main
+    with:
+      lockfile: .
+      semgrep-configs: p/owasp-top-ten p/typescript p/javascript p/python p/java p/golang p/dockerfile
+
   ci-success:
     name: CI success
     # One stable check to require in branch protection — green only if every
     # blocking job above passed.
     if: always()
-    needs: [contract, go, node, python, java, kong-lua, kong-busted, gateway-plugin-tests, gateway-config, emqx-erlang]
+    needs: [contract, go, node, python, java, kong-lua, kong-busted, gateway-plugin-tests, gateway-config, emqx-erlang, security]
     runs-on: ubuntu-latest
     steps:
       - name: Verify required jobs succeeded
