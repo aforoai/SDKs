@@ -308,12 +308,83 @@ jobs:
           sys.exit(1 if fail else 0)
           PY
 
+  # G032 (2026-11-21): dependency CVE scan (Trivy) + Semgrep SAST. Same steps, versions and gate
+  # variables (TRIVY_GATE / SEMGREP_GATE) as aforo-nextgen-common frontend-security.yml @125e779,
+  # copied in because this public repo cannot call a workflow in a private repo.
+  security-dependencies:
+    name: dependencies (trivy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Trivy 0.76.1 (checksum-verified)
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/trivy.tgz" https://github.com/aquasecurity/trivy/releases/download/v0.76.1/trivy_0.76.1_Linux-64bit.tar.gz
+          echo "c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0  $RUNNER_TEMP/trivy.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/trivy.tgz" -C "$RUNNER_TEMP" trivy && rm "$RUNNER_TEMP/trivy.tgz"
+      - name: Scan the lockfile
+        env:
+          LOCKFILE: '.'
+          SEVERITY: ${{ vars.TRIVY_FAIL_SEVERITY || 'HIGH,CRITICAL' }}
+          GATE: ${{ vars.TRIVY_GATE }}
+        run: |
+          TRIVY="$RUNNER_TEMP/trivy"
+          if [ ! -e "$LOCKFILE" ]; then echo "::error::lockfile or directory $LOCKFILE not found"; exit 1; fi
+          IGNORE=""
+          if [ -f .trivyignore ]; then IGNORE="--ignorefile .trivyignore"; fi
+          "$TRIVY" fs --quiet --scanners vuln --ignore-unfixed --severity HIGH,CRITICAL "$LOCKFILE" | tee trivy-report.txt
+          # shellcheck disable=SC2086
+          if ! "$TRIVY" fs --quiet --scanners vuln --ignore-unfixed --severity "$SEVERITY" \
+               $IGNORE --exit-code 1 "$LOCKFILE" > trivy-gate.txt; then
+            { echo "### Unaccepted fixable $SEVERITY vulnerabilities in $LOCKFILE"; echo '```'; cat trivy-gate.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            if [ "$GATE" = enforce ]; then echo "::error::unaccepted fixable $SEVERITY vulnerabilities"; exit 1; fi
+            echo "::warning::unaccepted fixable $SEVERITY vulnerabilities (TRIVY_GATE is not 'enforce')"
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: trivy-dependencies-${{ github.sha }}
+          path: trivy-report.txt
+          if-no-files-found: ignore
+          retention-days: 30
+
+  security-sast:
+    name: sast (semgrep)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: semgrep/semgrep:1.182.0@sha256:4a34048c04fef049f71665047f074cffb00cc3d89482f965a5cd151d589237af
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: semgrep
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GATE: ${{ vars.SEMGREP_GATE }}
+          CONFIGS: p/owasp-top-ten p/typescript p/javascript p/python p/java p/golang p/dockerfile
+          EXCLUDES: ''
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          MODE=""
+          if [ -n "$BASE_SHA" ]; then MODE="--error --baseline-commit $BASE_SHA"
+          elif [ "$GATE" = enforce ]; then MODE="--error"; fi
+          set -f  # exclude globs are passed to semgrep as-is, never expanded by the shell
+          ARGS=""
+          for c in $CONFIGS; do ARGS="$ARGS --config $c"; done
+          for e in $EXCLUDES; do ARGS="$ARGS --exclude $e"; done
+          # shellcheck disable=SC2086
+          semgrep scan --metrics off $ARGS --severity ERROR $MODE
+
   ci-success:
     name: CI success
     # One stable check to require in branch protection — green only if every
     # blocking job above passed.
     if: always()
-    needs: [contract, go, node, python, java, kong-lua, kong-busted, gateway-plugin-tests, gateway-config, emqx-erlang]
+    needs: [contract, go, node, python, java, kong-lua, kong-busted, gateway-plugin-tests, gateway-config, emqx-erlang, security-dependencies, security-sast]
     runs-on: ubuntu-latest
     steps:
       - name: Verify required jobs succeeded
