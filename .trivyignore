@@ -1,0 +1,14 @@
+# Accepted Trivy findings (G032). Each entry: why it is accepted, who, and when it expires.
+# Mirror of aforo-gateway-plugins/.trivyignore: Trivy reads only the repo-root file.
+# Trivy stops ignoring an entry after its exp: date, so it comes back for review.
+
+# CVE-2025-41249 spring-core 5.3.33 (HIGH), in aforo-gateway-plugins/mulesoft/aforo-metering via
+# org.mule.module:mule-java-module 1.2.13.
+# - No public fix for this module: 6.2.11 is Spring 6 (Mule 4 runs Spring 5), and
+#   mule-java-module 1.2.14+ needs spring-core 5.3.39-spring-framework-5.3.45, a
+#   MuleSoft-patched build served only by MuleSoft's EE repository (see that pom.xml).
+# - The policy runs inside the Mule runtime, which supplies its own Spring; the
+#   CVE is in annotation detection used by Spring Security method security
+#   (@EnableMethodSecurity), which this policy does not use.
+# Revisit when MuleSoft EE repository access is available. Accepted 2026-11-21 (eswarprasad).
+CVE-2025-41249 exp:2027-05-21

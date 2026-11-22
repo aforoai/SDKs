@@ -17,6 +17,10 @@ COPY --from=builder /app/dist/ dist/
 COPY --from=builder /app/node_modules/ node_modules/
 COPY package.json ./
 
+# Run as the image's built-in non-root user (uid 1000), not root (G032 / Semgrep
+# dockerfile.security.missing-user). The app only reads /app and binds a port > 1024.
+USER node
+
 # Default: HTTP transport on port 8080. Override with --transport / --port.
 EXPOSE 8080
 
