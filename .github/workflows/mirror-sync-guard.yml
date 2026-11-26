@@ -1,0 +1,96 @@
+name: Mirror sync guard
+
+# G318: aforo-metering-sdks/ and the four publish/release workflows are copied
+# here from the private source repo aforoai/aforo-metering-sdks by a sync PR
+# (PUBLISHING.md there). A change made to them directly in this repo is
+# overwritten by the next sync, so this check fails any PR that changes those
+# paths unless it is a sync PR, titled "sync: aforo-metering-sdks@<sha> ...".
+#
+# With the SDK_SOURCE_READ_TOKEN secret (fine-grained, contents:read on
+# aforoai/aforo-metering-sdks only) it also runs the source's
+# scripts/check-mirror-sync.sh, so a sync PR has to be an exact copy of the
+# source at <sha>. Without the secret (or on a fork / Dependabot PR) that step
+# says so and is skipped; the title check still runs.
+#
+# Required on main by the sdk-mirror-sync-lock ruleset. Fix a failure by making
+# the change in aforoai/aforo-metering-sdks and syncing it, not by retitling.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  mirror-sync-guard:
+    name: mirror-sync-guard
+    runs-on: ubuntu-latest
+    env:
+      HAS_TOKEN: ${{ secrets.SDK_SOURCE_READ_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: synced paths change only in a sync PR
+        id: paths
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          if [ "$EVENT" = pull_request ]; then
+            TITLE="$PR_TITLE"
+            RANGE="$BASE_SHA...$HEAD_SHA"
+          else
+            TITLE=$(git log -1 --format=%s "$AFTER")
+            if [ -z "$BEFORE" ] || [ "$BEFORE" = 0000000000000000000000000000000000000000 ]; then
+              RANGE="$AFTER^..$AFTER"
+            else
+              RANGE="$BEFORE..$AFTER"
+            fi
+          fi
+          SYNCED_RE='^(aforo-metering-sdks/|\.github/workflows/(publish-npm|publish-pypi|publish-maven|release)\.yml$)'
+          CHANGED=$(git diff --name-only "$RANGE" | grep -E "$SYNCED_RE" || true)
+          SHA=$(printf '%s\n' "$TITLE" | sed -nE 's/^sync: aforo-metering-sdks@([0-9a-f]{7,40})( .*)?$/\1/p')
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          if [ -z "$CHANGED" ]; then
+            echo "No synced path changed."
+            exit 0
+          fi
+          echo "Synced paths changed:"
+          printf '  %s\n' $CHANGED
+          if [ -n "$SHA" ]; then
+            echo "Sync from aforo-metering-sdks@$SHA: allowed."
+            exit 0
+          fi
+          echo "::error::These paths are synced from aforoai/aforo-metering-sdks and are overwritten by the next sync. Make the change there, then sync it (PUBLISHING.md in that repo). A sync PR is titled 'sync: aforo-metering-sdks@<sha> ...'."
+          exit 1
+
+      - name: skip the content check without the secret
+        if: steps.paths.outputs.sha != '' && env.HAS_TOKEN != 'true'
+        run: echo "::notice::SDK_SOURCE_READ_TOKEN is not available here; the sync PR is not compared with aforo-metering-sdks@${{ steps.paths.outputs.sha }}. Run scripts/check-mirror-sync.sh in the source repo before merging."
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.paths.outputs.sha != '' && env.HAS_TOKEN == 'true'
+        with:
+          repository: aforoai/aforo-metering-sdks
+          token: ${{ secrets.SDK_SOURCE_READ_TOKEN }}
+          path: .sdk-source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: sync PR is an exact copy of the source
+        if: steps.paths.outputs.sha != '' && env.HAS_TOKEN == 'true'
+        env:
+          MIRROR_SYNCED_SHA: ${{ steps.paths.outputs.sha }}
+        run: bash .sdk-source/scripts/check-mirror-sync.sh "$GITHUB_WORKSPACE"
