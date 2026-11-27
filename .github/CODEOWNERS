@@ -1,16 +1,8 @@
 # Code owners for aforoai/SDKs.
 # These owners are requested for review automatically on matching changes.
-# NOTE: create the @aforoai/sdk-maintainers team (or replace with real handles).
 
 # Everything, by default
 *                                   @aforoai/sdk-maintainers
-
-# Language SDKs
-/aforo-metering-sdks/node*/         @aforoai/sdk-maintainers
-/aforo-metering-sdks/mcp-proxy/     @aforoai/sdk-maintainers
-/aforo-metering-sdks/python*/       @aforoai/sdk-maintainers
-/aforo-metering-sdks/java*/         @aforoai/sdk-maintainers
-/aforo-metering-sdks/go*/           @aforoai/sdk-maintainers
 
 # Gateway + broker plugins
 /aforo-gateway-plugins/             @aforoai/sdk-maintainers
@@ -19,3 +11,17 @@
 # Release-critical: CI, release, versioning policy
 /.github/                           @aforoai/sdk-maintainers
 /VERSIONING.md                      @aforoai/sdk-maintainers
+
+# Synced from aforoai/aforo-metering-sdks (G318). Change these there and sync;
+# a direct edit here is overwritten by the next sync. Only @aforoai/sdk-sync
+# approves, and only sync PRs ("sync: aforo-metering-sdks@<sha> ...", checked by
+# the mirror-sync-guard workflow). Keep these lines last: the last match wins.
+/aforo-metering-sdks/                    @aforoai/sdk-sync
+/.github/workflows/publish-npm.yml       @aforoai/sdk-sync
+/.github/workflows/publish-pypi.yml      @aforoai/sdk-sync
+/.github/workflows/publish-maven.yml     @aforoai/sdk-sync
+/.github/workflows/release.yml           @aforoai/sdk-sync
+
+# The lock itself
+/.github/CODEOWNERS                      @aforoai/leads
+/.github/workflows/mirror-sync-guard.yml @aforoai/leads

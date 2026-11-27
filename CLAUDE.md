@@ -9,3 +9,9 @@
 - Protected files go in their own PR, separate from application code, for Jay's review: any `.github/workflows/**`, any `.env.production` / `.env.staging`, and in aforo-nextgen-docker every `docker-compose*.yml`, `deploy/**` and `scripts/**`.
 - Never approve, merge, enable auto-merge, or bypass a ruleset. A human other than the author approves.
 - Hotfix: branch `hotfix/<topic>`, PR labelled `hotfix`, any second engineer approves, `ci` green. Only if no second engineer can be reached, an org owner may add a temporary ruleset bypass; it is recorded in aforo-docs `incidents/` and the change is reviewed within 1 business day. Full procedure: aforo-docs `CLAUDE.md`, "Change control (SOC 2 CC8.1)".
+
+## Synced paths (G318)
+
+- `aforo-metering-sdks/**` and `.github/workflows/{publish-npm,publish-pypi,publish-maven,release}.yml` are copied from `aforoai/aforo-metering-sdks` by a sync PR. Never edit them here, not even for a security fix: make the change in the source repo and sync it (`scripts/sync-mirror.sh` there).
+- The `mirror-sync-guard` check fails a PR that touches those paths unless it is titled `sync: aforo-metering-sdks@<sha> ...`; they are owned by `@aforoai/sdk-sync` in CODEOWNERS.
+- Mirror-owned (edit here): `ci.yml`, `mirror-sync-guard.yml`, root docs, `aforo-gateway-plugins/`, `aforo-emqx-plugin/`.
