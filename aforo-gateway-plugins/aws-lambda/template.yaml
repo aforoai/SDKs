@@ -7,7 +7,9 @@ Description: >
   Optional: the aforo-metering-proxy Lambda integration for AI_AGENT /
   MCP_SERVER products (set UpstreamUrl or UpstreamFunction) and the
   aforo-key-authorizer (DeployKeyAuthorizer=true), which accepts both customer
-  keys (sk_live_/sk_test_) and Aforo client-credential JWTs.
+  keys (sk_live_/sk_test_) and Aforo client-credential JWTs; with
+  AuthorizerRestApiId the stack also creates its API Gateway authorizer
+  (REQUEST, cached per token, method and path, result TTL 60 s or less, 2.7.0).
   Aforo keys are read from AWS Secrets Manager, never from an environment
   variable (2.4.0).
 
@@ -71,6 +73,14 @@ Parameters:
       caller, and aforo-metering-proxy records. Set to an empty string to
       forward everything while debugging an access-log format.
     Default: '?"customerId" ?"caller" ?"aforoUsage"'
+  FailureAlarmTopicArn:
+    Type: String
+    Description: >-
+      Optional. SNS topic the failure-queue alarm notifies (alarm and recovery).
+      Empty: the alarm only changes state in the CloudWatch console.
+    AllowedPattern: '^$|^arn:aws[a-z-]*:sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]{1,256}$'
+    ConstraintDescription: must be empty or an SNS topic ARN
+    Default: ''
   LogRetentionDays:
     Type: Number
     Description: Days to keep the logs of the functions in this stack.
@@ -217,6 +227,46 @@ Parameters:
     Type: String
     Description: 'Authorizer - required iss claim.'
     Default: https://auth.aforo.ai
+  AuthorizerRestApiId:
+    Type: String
+    Description: >-
+      Authorizer (2.7.0): id of the REST API to create the aforo-key-authorizer
+      API Gateway authorizer on (REQUEST type, identity sources Authorization
+      header, context.httpMethod and context.path, result TTL
+      AuthorizerResultTtlSeconds). Attach it to your methods and redeploy the
+      stage. Leave empty to create your own; then keep its result TTL at 60 s
+      or less.
+    AllowedPattern: '^$|^[a-z0-9]{10}$'
+    ConstraintDescription: must be empty or a REST API id (10 lowercase letters and digits)
+    Default: ''
+  AuthorizerResultTtlSeconds:
+    Type: Number
+    Description: >-
+      Authorizer (2.7.0): how long API Gateway reuses one authorizer answer.
+      A revoked key or token keeps working for at most this long. 0 checks
+      every call. At most 60 (G341: the 840 s once recommended kept revoked
+      tokens valid for 14 minutes).
+    Default: 60
+    MinValue: 0
+    MaxValue: 60
+  AuthorizerPolicyResource:
+    Type: String
+    Description: >-
+      Authorizer (2.7.0): what an Allow covers. "method" (default) - the
+      called method ARN only. "stage" - every route on the stage, as before
+      2.7.0; ignored when AuthorizerRouteScopes is set. Keep "method" with the
+      authorizer this stack creates; "stage" is for a TOKEN authorizer you
+      created yourself with a result TTL above 0.
+    Default: method
+    AllowedValues: [method, stage]
+  AuthorizerRouteScopes:
+    Type: String
+    Description: >-
+      Authorizer (2.7.0): optional AFORO_ROUTE_SCOPES, a JSON object mapping
+      "METHOD /path" to the scope (or array of scopes) a key or JWT must
+      hold, e.g. {"GET /v1/items": "items:read", "*": "api:access"}. Empty
+      checks no scopes. A value that is not valid fails every call.
+    Default: ''
 
 Rules:
   # 2.4.0 removed the plaintext key parameters. Refuse them instead of
@@ -240,9 +290,12 @@ Conditions:
   HasUpstreamFunction: !Not [!Equals [!Ref UpstreamFunction, '']]
   DeployProxy: !Or [!Condition HasUpstreamUrl, !Condition HasUpstreamFunction]
   DeployAuthorizer: !Equals [!Ref DeployKeyAuthorizer, 'true']
+  HasAuthorizerRestApi: !Not [!Equals [!Ref AuthorizerRestApiId, '']]
+  CreateApiGatewayAuthorizer: !And [!Condition DeployAuthorizer, !Condition HasAuthorizerRestApi]
   HasTenantKeySecret: !Not [!Equals [!Ref AforoTenantKeySecretArn, '']]
   HasSecretsKmsKey: !Not [!Equals [!Ref SecretsKmsKeyArn, '']]
   HasReservedConcurrency: !Not [!Equals [!Ref ReservedConcurrency, '0']]
+  HasFailureAlarmTopic: !Not [!Equals [!Ref FailureAlarmTopicArn, '']]
 
 Resources:
   # A name of its own, not /aws/lambda/aforo-metering: Lambda created that one
@@ -303,8 +356,9 @@ Resources:
       # see index.js). When those retries ALSO exhaust, the failed
       # invocation record (containing the original compressed log payload)
       # lands in the OnFailure queue below instead of being discarded — the
-      # terminal loss becomes observable and replayable. Alarm on this
-      # queue's ApproximateNumberOfMessagesVisible > 0. A permanent 4xx is
+      # terminal loss becomes observable and replayable.
+      # AforoMeteringFailureAlarm fires on the queue's
+      # ApproximateNumberOfMessagesVisible > 0. A permanent 4xx is
       # dropped without a throw (EMF metric EventsRejected).
       EventInvokeConfig:
         MaximumRetryAttempts: 2
@@ -332,6 +386,37 @@ Resources:
           Value: 'true'
         - Key: purpose
           Value: metering-failure-dlq
+
+  # G336: a message in the failure queue is a batch of usage events that every retry
+  # failed to deliver; it is lost after 14 days unless replayed (README, "Replaying from
+  # the failure queue"). SQS publishes queue metrics every minute while the queue is
+  # active; an idle queue publishes none, which is not a failure (notBreaching).
+  AforoMeteringFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: aforo-metering-failures
+      AlarmDescription: >-
+        Usage events the aforo-metering function could not deliver after all retries
+        are waiting in the aforo-metering-failures SQS queue. Replay them within 14 days
+        (aforo-gateway-plugins aws-lambda README, "Replaying from the failure queue").
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt AforoMeteringFailureQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasFailureAlarmTopic, [!Ref FailureAlarmTopicArn], !Ref AWS::NoValue]
+      OKActions: !If [HasFailureAlarmTopic, [!Ref FailureAlarmTopicArn], !Ref AWS::NoValue]
+      Tags:
+        - Key: aforo-managed
+          Value: 'true'
+        - Key: purpose
+          Value: metering-failure-alarm
 
   AforoMeteringLogPermission:
     Type: AWS::Lambda::Permission
@@ -466,6 +551,8 @@ Resources:
           AFORO_TENANT_ID: !Ref AuthorizerTenantId
           AFORO_JWKS_URL: !Ref AforoJwksUrl
           AFORO_JWT_ISSUER: !Ref AforoJwtIssuer
+          AFORO_POLICY_RESOURCE: !Ref AuthorizerPolicyResource
+          AFORO_ROUTE_SCOPES: !Ref AuthorizerRouteScopes
       Tags:
         aforo-managed: 'true'
         purpose: authorizer
@@ -478,6 +565,22 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:*
+
+  # G341 (2.7.0): the API Gateway authorizer, so the result TTL is 60 s or
+  # less by default instead of whatever was typed into the console (the 840 s
+  # once recommended kept a revoked token working for 14 minutes). REQUEST
+  # with the method and path in the identity sources: the cache holds one
+  # answer per token, method and path, which the per-method Allow needs.
+  AforoKeyAuthorizerApiGatewayAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Condition: CreateApiGatewayAuthorizer
+    Properties:
+      Name: aforo-key-authorizer
+      RestApiId: !Ref AuthorizerRestApiId
+      Type: REQUEST
+      IdentitySource: method.request.header.Authorization,context.httpMethod,context.path
+      AuthorizerResultTtlInSeconds: !Ref AuthorizerResultTtlSeconds
+      AuthorizerUri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AforoKeyAuthorizerFunction.Arn}/invocations
 
 Outputs:
   FunctionArn:
@@ -492,18 +595,31 @@ Outputs:
   FailureQueueUrl:
     Description: >-
       SQS queue receiving failed invocation records after all retries
-      exhaust. Alarm on ApproximateNumberOfMessagesVisible > 0 — a
-      message here is a permanently-undelivered batch of usage events
-      (replayable for 14 days).
+      exhaust. AforoMeteringFailureAlarm fires on
+      ApproximateNumberOfMessagesVisible > 0 — a message here is a
+      permanently-undelivered batch of usage events (replayable for 14 days).
     Value: !Ref AforoMeteringFailureQueue
   FailureQueueArn:
     Description: ARN of the failure queue
     Value: !GetAtt AforoMeteringFailureQueue.Arn
+  FailureAlarmName:
+    Description: >-
+      CloudWatch alarm on the failure queue (ApproximateNumberOfMessagesVisible > 0).
+      Set FailureAlarmTopicArn to be notified.
+    Value: !Ref AforoMeteringFailureAlarm
   MeteringProxyFunctionArn:
     Condition: DeployProxy
     Description: Use as the API Gateway Lambda proxy integration (AWS_PROXY)
     Value: !GetAtt AforoMeteringProxyFunction.Arn
   KeyAuthorizerFunctionArn:
     Condition: DeployAuthorizer
-    Description: Use as the API Gateway TOKEN authorizer (identity source method.request.header.Authorization)
+    Description: >-
+      The authorizer function. Without AuthorizerRestApiId, create a REQUEST
+      authorizer with identity sources method.request.header.Authorization,
+      context.httpMethod, context.path and a result TTL of 60 s or less (or a
+      TOKEN authorizer with TTL 0). See AUTHORIZER.md.
     Value: !GetAtt AforoKeyAuthorizerFunction.Arn
+  KeyAuthorizerId:
+    Condition: CreateApiGatewayAuthorizer
+    Description: Id of the API Gateway authorizer this stack created. Attach it to your methods (CUSTOM authorization) and redeploy the stage.
+    Value: !Ref AforoKeyAuthorizerApiGatewayAuthorizer

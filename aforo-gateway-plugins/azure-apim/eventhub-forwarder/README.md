@@ -1,8 +1,8 @@
 # Aforo APIM Event Hub forwarder
 
-**Version:** 2.3.2 · Apache-2.0 · ships with `azure-apim` 2.3.2
+**Version:** 2.3.2 · Apache-2.0 · ships with `azure-apim` 2.3.2 and, unchanged, 2.4.0
 
-Use this when an ingest outage or a `429` must not cost you usage. In the default mode the APIM policy posts each event with `send-one-way-request`, which has no retry. In Event Hub mode the policy writes the event to Azure Event Hubs instead, and this Azure Function reads the hub, sends the events to the Aforo ingestor in batches, and moves its checkpoint only after the ingestor accepted them. While the ingestor is down, events wait in the hub (up to 7 days on the Standard tier) and are sent when it is back.
+Event Hub delivery is the default install since `azure-apim` 2.4.0 (G348); direct delivery is the opt-in. In direct mode the APIM policy posts each event with `send-one-way-request`, which has no retry, so an ingest outage, a 5xx or a `429` loses the event. In Event Hub mode the policy writes the event to Azure Event Hubs instead, and this Azure Function reads the hub, sends the events to the Aforo ingestor in batches, and moves its checkpoint only after the ingestor accepted them. While the ingestor is down, events wait in the hub (up to 7 days on the Standard tier) and are sent when it is back.
 
 ```
 APIM ──log-to-eventhub──► Event Hub ──trigger (batch)──► forwarder Function ──POST /v1/ingest/batch──► Aforo

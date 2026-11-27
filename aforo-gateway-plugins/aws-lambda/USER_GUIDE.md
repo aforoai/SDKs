@@ -1,6 +1,6 @@
 # aforo-metering-lambda — User Guide
 
-**Version:** 2.6.0 · **Updated:** 2026-11-13 · **Audience:** engineers running AWS API Gateway who want API usage metered into Aforo from CloudWatch access logs.
+**Version:** 2.7.1 · **Updated:** 2026-11-27 · **Audience:** engineers running AWS API Gateway who want API usage metered into Aforo from CloudWatch access logs.
 
 ## What you'll build
 
@@ -149,7 +149,7 @@ Deploy `key-authorizer.js` with `AFORO_TENANT_ID` set to your tenant id (see [AU
 
 With SAM, set `UpstreamUrl` (or `UpstreamFunction`) and `DeployKeyAuthorizer=true`, `AuthorizerTenantId=<tenant id>`, plus `AforoTenantKeySecretArn=<secret ARN>` to accept `sk_live_`/`sk_test_` customer keys (store the tenant key with `aws secretsmanager create-secret` first; without it the authorizer accepts JWTs only). The stack creates `aforo-metering-proxy`, its log group `/aws/lambda/aforo-metering-proxy`, and a subscription filter from that log group to `aforo-metering`. Then on your REST API, set each metered method (or `ANY /{proxy+}`) to:
 
-- Authorization: `CUSTOM`, the `aforo-key-authorizer` TOKEN authorizer (identity source `method.request.header.Authorization`).
+- Authorization: `CUSTOM`, the `aforo-key-authorizer` authorizer. Pass `AuthorizerRestApiId=<REST API id>` and the stack creates it (2.7.0): `REQUEST`, identity sources `method.request.header.Authorization,context.httpMethod,context.path`, result TTL 60 s (`AuthorizerResultTtlSeconds`, at most 60). Creating it yourself: use those settings, or a `TOKEN` authorizer with TTL 0; a `TOKEN` authorizer with a TTL above 0 answers 403 on the second route a client calls (see [AUTHORIZER.md](AUTHORIZER.md#safe-defaults-270-g341)).
 - Integration: Lambda proxy (`AWS_PROXY`) to `aforo-metering-proxy`.
 
 | Variable (proxy) | Default | |
@@ -227,7 +227,7 @@ Full env-var / SAM-parameter table is in [README.md](README.md#configuration). Y
 | `Aforo accepted the batch but rejected N event(s)` | An unregistered metric name, or a `customerId` that is not an Aforo customer | Register the metric / fix `METRIC_MAPPINGS` / `DEFAULT_METRIC`; check the JWT's `customer_id` claim. The log line lists each rejected event's reason. |
 | Events named `GET /v1/...` are rejected | `METRIC_NAME_PATTERN` is set (Aforo's one-click deploy sets it from the connection's metric pattern) | Clear it and use `METRIC_MAPPINGS` + `DEFAULT_METRIC`. |
 | A status you expected is missing | It is in `EXCLUDE_STATUS_CODES` | Set the list you want, or `none` to meter every status. |
-| `... not delivered (transient failure or Lambda deadline)` | Ingestor unreachable, 5xx/408/429 for the whole retry window | The invocation fails and Lambda retries it twice; after that the record is in the `aforo-metering-failures` SQS queue for 14 days (SAM deploy) — replay it as shown in the README. |
+| `... not delivered (transient failure or Lambda deadline)` | Ingestor unreachable, 5xx/408/429 for the whole retry window | The invocation fails and Lambda retries it twice; after that the record is in the failure queue for 14 days (`aforo-metering-failures` from SAM, `aforo-metering-<id>-failures` from the one-click install; its alarm fires) — replay it as shown in the README. |
 | `MCP_ENABLED=true` but no MCP events | Request body not present in the access log | API Gateway doesn't log bodies; use the metering proxy (AI Agent and MCP Server section). |
 | `Skipped: {"productType AI_AGENT missing agentId …":N}` | The authorizer context has no `agentId` | The client-credential JWT carries no `agent_id` claim, or the route uses a customer key. Client headers are never used as the agent id. |
 | Proxy calls answered but no events | Proxy log group not subscribed, or the subscription filter pattern is a JSON pattern | The SAM stack subscribes `/aws/lambda/aforo-metering-proxy` with the term pattern `"aforoUsage"`; check `aws logs describe-subscription-filters`. |
@@ -237,5 +237,5 @@ Full env-var / SAM-parameter table is in [README.md](README.md#configuration). Y
 
 - **The Lambda Authorizer** (`authorizer.js` + `AUTHORIZER.md` in this folder) — that's the real-time JWT validation + L2/L3 enforcement path, deployed separately as an API Gateway authorizer. This guide covers metering only.
 - **Access-log format design** beyond the minimum fields — your full `$context` format is your stage configuration.
-- **Delivery past the retry window.** 3 in-invocation attempts, then Lambda's async retry, then the SQS failure queue the SAM template creates (14 days). Aforo's one-click deploy has no failure queue. Alarms and replay are in the README.
+- **Delivery past the retry window.** 3 in-invocation attempts, then Lambda's async retry, then the SQS failure queue (14 days) with an alarm, from the SAM template or Aforo's one-click deploy. Alarms and replay are in the README.
 - **Live verification of the failure paths.** The 2.3.0 changelog records one live production run on 2026-10-16 of the happy path (REST stage → `key-authorizer.js` → access log → this function → ingestor). Retries, the async-retry window and the failure queue have not been exercised on a real stage; see the README's "What this doesn't cover".

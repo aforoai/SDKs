@@ -2,9 +2,9 @@
 
 An AWS Lambda function that subscribes to API Gateway CloudWatch access logs, parses each entry, and batch-POSTs usage events to Aforo. It runs off the log stream asynchronously, so it adds nothing to your request path.
 
-**Version:** 2.6.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.7.1 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
-> Version lives in [`package.json`](package.json) (`"version": "2.6.0"`). It matches the version stated here and in the changelog.
+> Version lives in [`package.json`](package.json) (`"version": "2.7.1"`). It matches the version stated here and in the changelog.
 
 ## Install
 
@@ -37,7 +37,7 @@ sam deploy --guided \
     ApiGatewayLogGroupName=/aws/apigateway/aforo-access-logs
 ```
 
-The template creates the function (arm64, reserved concurrency `ReservedConcurrency`, default 10; `0` reserves none), an IAM policy that lets it read only that secret, the `lambda:InvokeFunction` permission for CloudWatch Logs, a `SubscriptionFilter` on the named log group, the function's log group `/aforo/lambda/aforo-metering` (retention `LogRetentionDays`, default 14), and the SQS failure queue described under "Delivery".
+The template creates the function (arm64, reserved concurrency `ReservedConcurrency`, default 10; `0` reserves none), an IAM policy that lets it read only that secret, the `lambda:InvokeFunction` permission for CloudWatch Logs, a `SubscriptionFilter` on the named log group, the function's log group `/aforo/lambda/aforo-metering` (retention `LogRetentionDays`, default 14), and the SQS failure queue described under "Delivery" with an alarm on it (`FailureAlarmTopicArn`, optional, is notified).
 
 The subscription filter (`AccessLogFilterPattern`) forwards only lines that can bill: entries containing `customerId` or `caller`, and metering-proxy records (`aforoUsage`). Set it to `''` to forward every line while you debug an access-log format; lines without an identity are then counted as `no customerId` in the function's log.
 
@@ -47,19 +47,19 @@ If the secret is encrypted with a customer-managed KMS key, pass its ARN as `Sec
 
 In Aforo, open the AWS API Gateway connection and deploy metering. Using the IAM role from the connection's CloudFormation stack, Aforo:
 
-1. creates the function `aforo-metering-<connection id>` from `index.js` and `compound-metering.js`, with the connection's settings as environment variables;
-2. sets its async retry policy (2 retries, 6 hours);
-3. lets CloudWatch Logs invoke it for your access log group;
-4. adds a subscription filter on that log group.
+1. stores the Aforo API key in the Secrets Manager secret `aforo/metering/<function>`;
+2. creates the SQS failure queue `<function>-failures` (14 days) and the function's log group `/aws/lambda/<function>` with a retention (connection setting `meteringLogRetentionDays`, default 14);
+3. creates the function `aforo-metering-<connection id>` on arm64 from `index.js`, `compound-metering.js` and `aws-secret.js`, with the connection's settings as environment variables;
+4. sets its async retry policy (2 retries, 6 hours) with the failure queue as OnFailure destination, reserves concurrency (`meteringReservedConcurrency`, default 10; `0` reserves none; an account whose quota is too small to reserve from gets none, logged), and puts the CloudWatch alarm `<function>-failures` on the queue (`meteringAlarmTopicArn`, an SNS topic, optional);
+5. lets CloudWatch Logs invoke it for your access log group;
+6. adds a subscription filter on that log group.
 
-Deploying again updates the code only when it changed and always refreshes the settings it manages. Environment variables you added yourself (`METRIC_MAPPINGS`, `DEFAULT_METRIC`, `PRODUCT_TYPE`, `MCP_ENABLED`, …) are kept. Removing it deletes the filter, the permission and the function.
+Deploying again updates the code only when it changed (or the function is still on x86_64: the code is uploaded again with arm64) and always refreshes the settings it manages, so it also brings an older install to this shape. Environment variables you added yourself (`METRIC_MAPPINGS`, `DEFAULT_METRIC`, `PRODUCT_TYPE`, `MCP_ENABLED`, …) are kept. Removing it deletes the filter, the permission, the function, the secret (7-day recovery window) and, when it is empty, the failure queue and its alarm; a queue that still holds failed batches is kept for replay. The function's log group is left to its retention.
 
 Before you deploy:
 
-- **The connection's stack must grant the metering-install permissions.** The role template Aforo serves for the connection has an `AllowMeteringInstall` parameter; leave it at `true`. Stacks created before one-click metering are read-only — update the stack, and the deploy tells you which permission is missing if it isn't there. Since 3.0.0, `aws-cloudformation/aforo-apigateway-role.yaml` in this repo is the same template. Its subscription permission covers log groups starting with `/aws/apigateway/` or `API-Gateway-`; for any other access log group, update the stack with `AccessLogGroupPrefix=<log group name>`.
+- **The connection's stack must grant the metering-install permissions.** The role template Aforo serves for the connection has an `AllowMeteringInstall` parameter; leave it at `true`. Stacks created before one-click metering are read-only, and stacks older than `aws-cloudformation` 3.2.2 cannot create the failure queue — update the stack, and the deploy tells you which permission is missing if it isn't there. Since 3.0.0, `aws-cloudformation/aforo-apigateway-role.yaml` in this repo is the same template. Its subscription permission covers log groups starting with `/aws/apigateway/` or `API-Gateway-`; for any other access log group, update the stack with `AccessLogGroupPrefix=<log group name>`.
 - **Access logging must be on** for each stage you bill, writing to one log group, in the format below. Aforo does not change your stages. Put the log group's name in the connection's `accessLogGroup` setting (default `/aws/apigateway/aforo-access-logs`).
-
-The one-click install does not create the SQS failure queue. For that, use the SAM template.
 
 ### Access-log format
 
@@ -141,7 +141,7 @@ Batches are sent concurrently under one deadline taken from the Lambda's remaini
 |---|---|---|
 | In-handler retries | Network errors, 5xx, 408, 429 | 3 attempts, 1 s then 2 s backoff. On 429 the `Retry-After` header sets the wait; one longer than 30 s, or longer than the time left, ends the attempts. |
 | Lambda async retry | A batch still failing transiently — the handler **throws**, so the same log events are redelivered | 2 retries (`MaximumRetryAttempts: 2`), events up to 6 hours old |
-| OnFailure SQS queue (SAM template only) | Async retries also exhausted | Failed invocation record kept **14 days**, replayable |
+| OnFailure SQS queue (SAM template and one-click install) | Async retries also exhausted | Failed invocation record kept **14 days**, replayable |
 
 A **permanent rejection** — any 4xx other than 408/429 — is not retried and does not throw: the same bytes would get the same answer. The batch is dropped, the response body is logged, and `EventsRejected` is emitted. The same applies to individual events the ingestor rejects inside an accepted batch (read from `data.errors` in the `{success, data, meta}` response).
 
@@ -156,7 +156,7 @@ Custom metrics are written in CloudWatch Embedded Metric Format — no SDK, no e
 | `EventsFailedToSend` | Events in an invocation that ended in a transient failure. Emitted before each throw, so it fires while retries are still pending. |
 | `EventsRejected` | Events dropped after a permanent 4xx or a per-event rejection. Usually a wrong API key, an unregistered metric or an unknown customer. |
 | `EventsDroppedInvalidMetric` | Events whose resolved metric name was empty or over 255 characters. |
-| `ApproximateNumberOfMessagesVisible` on `aforo-metering-failures` | In-handler and async retries all exhausted; that batch is undelivered until you replay it. Alarm at `> 0`. |
+| `ApproximateNumberOfMessagesVisible` on `aforo-metering-failures` (one-click: `aforo-metering-<id>-failures`) | In-handler and async retries all exhausted; that batch is undelivered until you replay it. Both deploys create the alarm at `> 0` (`AforoMeteringFailureAlarm` / `<function>-failures`); give it an SNS topic to be notified. |
 | Lambda `Errors` | Each throw increments it. |
 
 ## Replaying from the failure queue
@@ -173,6 +173,8 @@ aws lambda invoke --function-name aforo-metering \
   --payload file://event.json /dev/null
 # delete the SQS message only after the replay invocation succeeds
 ```
+
+For a one-click install the function is `aforo-metering-<id>` and the queue URL comes from `aws sqs get-queue-url --queue-name aforo-metering-<id>-failures`.
 
 A replay rebuilds the same keys from the same log data, so replaying a batch that partly landed bills nothing twice.
 
@@ -212,9 +214,10 @@ Step by step from `sam deploy` to a verified event in Aforo: [USER_GUIDE.md](USE
 ## What this doesn't cover
 
 - **Blocking a request.** This Lambda runs after the response was served. For quota or margin enforcement, deploy `authorizer.js` (needs `AFORO_TENANT_ID` since 2.5.0) / `margin-guard.js` as an API Gateway Lambda Authorizer (see [AUTHORIZER.md](AUTHORIZER.md)).
-- **Scopes per route on `key-authorizer.js`.** Since 2.6.0 `authorizer.js` can require scopes per method and path (`AFORO_ROUTE_SCOPES`) and check the token's audience (`AFORO_JWT_AUDIENCE`); both are off until you set them, and the route map needs per-method authorizer caching — see [AUTHORIZER.md](AUTHORIZER.md#scopes-per-route-aforo_route_scopes). `key-authorizer.js` has neither: a key or JWT it accepts can call every route on the stage.
+- **An audience check on `key-authorizer.js`.** `authorizer.js` checks `aud` when `AFORO_JWT_AUDIENCE` is set (2.6.0); `key-authorizer.js` does not read it. Both authorizers enforce `AFORO_ROUTE_SCOPES` (`key-authorizer.js` since 2.7.0) and return a per-method Allow by default (2.7.0) — see [AUTHORIZER.md](AUTHORIZER.md#safe-defaults-270-g341).
+- **The result TTL of an authorizer you create yourself.** `template.yaml` creates the `key-authorizer.js` authorizer with a TTL of 60 s or less when given `AuthorizerRestApiId`; an authorizer created by hand or by other tooling keeps whatever TTL it was given, and a revoked key or token works until it expires. Keep it at 60 s or less.
 - **Routes with only an API Gateway API key.** A usage-plan key alone gives no customer identity this function will use (the key value is a secret). Put an Aforo authorizer on the route (`key-authorizer.js` accepts the customer's Aforo key directly), or use IAM authorization.
-- **Outages longer than the retry window.** `MaximumEventAgeInSeconds: 21600` bounds async retries at 6 hours; past that the record goes to the failure queue (SAM deploy) or is lost (one-click deploy, which has no queue).
+- **Outages longer than the retry window.** `MaximumEventAgeInSeconds: 21600` bounds async retries at 6 hours; past that the record goes to the failure queue, where it is kept 14 days.
 - **gRPC, GraphQL, WebSocket.** An access log does not carry the fields those product types need.
 - **A live run of the failure paths.** The suites run against a stubbed transport and a local HTTP server. The 2.3.0 changelog records one live production run of the happy path on 2026-10-16 (REST stage → `key-authorizer.js` → access log → `index.js` → ingestor); retries on a 5xx from the ingestor, the 6-hour async-retry window and the failure queue have not been exercised on a real stage.
 
@@ -224,4 +227,4 @@ Step by step from `sam deploy` to a verified event in Aforo: [USER_GUIDE.md](USE
 npm test
 ```
 
-Runs `tests/authorizer.test.js` (JWT authorizer: tenant pin and required issuer, revocation fails closed, TLS + AUTH, stage-scoped Allow, JWKS refetch limit, scopes per route with a per-method Allow, audience), `tests/guards.test.js` (`margin-guard.js`, `preflight-quota.js`), `../aws-cloudformation/tests/templates.test.cjs`, `tests/agent-mcp.test.js` (AI_AGENT / MCP events from proxy records), `tests/metering-proxy.test.js`, `tests/key-authorizer.test.js`, `tests/key-authorizer-jwt.test.js`, `tests/handler.test.js` (delivery, EMF metrics, key stability across redelivery, AGENTIC_API detection, compound `correlationId`, execution status) and `tests/contract.test.js` (wire contract against a local capture server: auth header, identity, metric mappings and precedence, `PRODUCT_TYPE`, `Retry-After`, deadline).
+Runs `tests/authorizer.test.js` (JWT authorizer: tenant pin and required issuer, revocation fails closed, TLS + AUTH, per-method Allow by default and `AFORO_POLICY_RESOURCE=stage`, JWKS refetch limit, scopes per route with a per-method Allow, audience), `tests/guards.test.js` (`margin-guard.js`, `preflight-quota.js`), `../aws-cloudformation/tests/templates.test.cjs`, `tests/agent-mcp.test.js` (AI_AGENT / MCP events from proxy records), `tests/metering-proxy.test.js`, `tests/key-authorizer.test.js`, `tests/key-authorizer-jwt.test.js`, `tests/handler.test.js` (delivery, EMF metrics, key stability across redelivery, AGENTIC_API detection, compound `correlationId`, execution status), `tests/key-authorizer-scopes.test.js` (2.7.0: per-method Allow, `AFORO_POLICY_RESOURCE`, route scopes for keys and JWTs, REQUEST events) and `tests/contract.test.js` (wire contract against a local capture server: auth header, identity, metric mappings and precedence, `PRODUCT_TYPE`, `Retry-After`, deadline).

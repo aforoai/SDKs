@@ -56,6 +56,25 @@
  *                          (at most once per 60s).
  *   JWKS_TIMEOUT_MS        default 3000.
  *   JWT_CLOCK_SKEW_SECONDS default 30. Leeway for exp / nbf / iat.
+ *   AFORO_ROUTE_SCOPES     optional (2.7.0). JSON object "METHOD /path" → one
+ *                          scope or an array of scopes, all required; same
+ *                          syntax and matching as authorizer.js (route-scopes.js).
+ *                          A JWT's scopes come from its `scopes` claim, a
+ *                          customer key's from the introspection answer's
+ *                          `scopes`. Missing a scope → Deny (403,
+ *                          INSUFFICIENT_SCOPE). Not valid → every call fails
+ *                          (500) until it is fixed.
+ *   AFORO_POLICY_RESOURCE  "method" (default since 2.7.0): an Allow covers the
+ *                          called method ARN only. "stage": the whole stage,
+ *                          as before 2.7.0; ignored while AFORO_ROUTE_SCOPES
+ *                          is set.
+ *
+ * API Gateway authorizer (template.yaml creates it when given a RestApiId):
+ * REQUEST type, identity sources method.request.header.Authorization,
+ * context.httpMethod and context.path, result TTL 60 s or less. A TOKEN
+ * authorizer works with TTL 0, or with AFORO_POLICY_RESOURCE=stage and a TTL
+ * of 60 s or less; with a per-method Allow and a TTL above 0 the next route a
+ * caller tries gets 403 until the TTL runs out. Both event types are accepted.
  */
 'use strict';
 
@@ -63,6 +82,15 @@ const https = require('https');
 const http = require('http');
 const crypto = require('crypto');
 const { createSecretSource } = require('./aws-secret');
+const {
+    routeScopeConfig,
+    requiredScopesFor,
+    tokenScopes,
+    policyResourceMode,
+    allowResource,
+} = require('./route-scopes');
+
+const LOG_LABEL = 'aforo-key-authorizer';
 
 const INTROSPECT_URL = process.env.AFORO_INTROSPECT_URL
     || 'https://api.aforo.ai/api/v1/customer-keys/introspect';
@@ -87,6 +115,7 @@ const JWKS_MIN_REFETCH_MS = 60000;
 // API Gateway context values are size-limited; keep the joined list sane.
 const MAX_SUBSCRIPTION_IDS_LENGTH = 1000;
 const MAX_CONTEXT_ID_LENGTH = 256;
+const MAX_SCOPES_LENGTH = 1000;
 
 // The shape pricing-service mints for BEARER customer keys.
 const KEY_PATTERN = /^sk_(live|test)_[0-9a-f]{32}$/;
@@ -103,6 +132,17 @@ function positiveInt(raw, fallback) {
 function nonNegativeInt(raw, fallback) {
     const n = parseInt(raw, 10);
     return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+/** The Authorization value: TOKEN event, else a REQUEST event's header. */
+function bearerValue(event) {
+    if (!event || typeof event !== 'object') return '';
+    if (typeof event.authorizationToken === 'string') return event.authorizationToken;
+    const headers = event.headers && typeof event.headers === 'object' ? event.headers : {};
+    for (const name of Object.keys(headers)) {
+        if (name.toLowerCase() === 'authorization' && typeof headers[name] === 'string') return headers[name];
+    }
+    return '';
 }
 
 /** The customer key from "Bearer <key>" or a bare key; null if not key-shaped. */
@@ -146,9 +186,11 @@ function introspect(key, tenantKey) {
     });
 }
 
-/** Allow policy for the whole stage, so API Gateway's cached answer covers every route. */
-function buildPolicy(info, methodArn) {
-    const [arnPrefix, stage] = String(methodArn).split('/');
+/**
+ * Allow policy. Covers the called method ARN (default since 2.7.0), or the
+ * whole stage with mode "stage" (AFORO_POLICY_RESOURCE=stage, no route map).
+ */
+function buildPolicy(info, methodArn, mode = 'method') {
     return {
         principalId: info.customerId,
         policyDocument: {
@@ -156,7 +198,7 @@ function buildPolicy(info, methodArn) {
             Statement: [{
                 Action: 'execute-api:Invoke',
                 Effect: 'Allow',
-                Resource: `${arnPrefix}/${stage}/*`,
+                Resource: allowResource(methodArn, mode),
             }],
         },
         // API Gateway context values must be strings, numbers or booleans.
@@ -166,8 +208,61 @@ function buildPolicy(info, methodArn) {
             subscriptionId: info.subscriptionId || '',
             productType: info.productType || '',
             authType: 'key',
+            scopes: joinScopes(scopesOf(info)),
         },
     };
+}
+
+/** Deny policy for the called method only (403). */
+function denyPolicy(principalId, methodArn, error) {
+    return {
+        principalId: principalId || 'aforo-user',
+        policyDocument: {
+            Version: '2012-10-17',
+            Statement: [{
+                Action: 'execute-api:Invoke',
+                Effect: 'Deny',
+                Resource: String(methodArn || ''),
+            }],
+        },
+        context: { error },
+    };
+}
+
+/** The scopes an introspection answer or verified JWT carries, as a list. */
+function scopesOf(info) {
+    return info ? tokenScopes({ scopes: info.scopes }) : [];
+}
+
+/** Space-join whole scopes up to MAX_SCOPES_LENGTH chars (context values are size-limited). */
+function joinScopes(scopes) {
+    let out = '';
+    for (const s of scopes) {
+        const next = out ? `${out} ${s}` : s;
+        if (next.length > MAX_SCOPES_LENGTH) break;
+        out = next;
+    }
+    return out;
+}
+
+/**
+ * The route scope check (AFORO_ROUTE_SCOPES). Returns null when the call may
+ * go on, else the Deny policy.
+ */
+function checkRouteScopes(routeScopes, info, methodArn) {
+    if (!routeScopes.configured) return null;
+    const required = requiredScopesFor(routeScopes, methodArn);
+    if (!required) {
+        console.warn(`${LOG_LABEL}: ROUTE_UNKNOWN — the method ARN has no readable method and path — denying`);
+        return denyPolicy(info.customerId, methodArn, 'ROUTE_UNKNOWN');
+    }
+    const held = new Set(scopesOf(info));
+    const missing = required.scopes.filter((s) => !held.has(s));
+    if (missing.length > 0) {
+        console.warn(`${LOG_LABEL}: INSUFFICIENT_SCOPE — route '${required.pattern}' needs '${missing.join(' ')}' — denying`);
+        return denyPolicy(info.customerId, methodArn, 'INSUFFICIENT_SCOPE');
+    }
+    return null;
 }
 
 async function lookup(key) {
@@ -304,12 +399,13 @@ async function verifyJwt(token, nowMs = Date.now()) {
             subscriptionIds: joinIds(subs, MAX_SUBSCRIPTION_IDS_LENGTH),
             agentId: claimString(claims.agent_id),
             productType: '',
+            scopes: tokenScopes(claims),
         },
         expMs: claims.exp * 1000,
     };
 }
 
-async function handleJwt(token, methodArn) {
+async function handleJwt(token, methodArn, routeScopes) {
     if (!TENANT_ID) {
         console.error('AFORO_TENANT_ID is not set; refusing every JWT.');
         throw new Error('Unauthorized');
@@ -333,7 +429,9 @@ async function handleJwt(token, methodArn) {
         if (cache.size >= MAX_CACHE_ENTRIES) cache.clear();
         cache.set(hash, { info, expires: Math.min(verified.expMs, Date.now() + CACHE_TTL_MS) });
     }
-    const policy = buildPolicy(info, methodArn);
+    const denied = checkRouteScopes(routeScopes, info, methodArn);
+    if (denied) return denied;
+    const policy = buildPolicy(info, methodArn, policyResourceMode(routeScopes, LOG_LABEL));
     policy.context.subscriptionIds = info.subscriptionIds || '';
     policy.context.agentId = info.agentId || '';
     policy.context.authType = 'jwt';
@@ -341,14 +439,21 @@ async function handleJwt(token, methodArn) {
 }
 
 async function handler(event) {
-    const jwt = extractJwt(event && event.authorizationToken);
-    if (jwt) return handleJwt(jwt, event.methodArn);
+    const methodArn = event && event.methodArn;
+    // A route → scope map that does not parse must not open the API.
+    const routeScopes = routeScopeConfig(LOG_LABEL);
+    if (routeScopes.error) {
+        throw new Error('Aforo authorizer is not configured'); // API Gateway answers 500
+    }
+    const authorization = bearerValue(event);
+    const jwt = extractJwt(authorization);
+    if (jwt) return handleJwt(jwt, methodArn, routeScopes);
 
     if (!TENANT_KEY.configured) {
         console.error('AFORO_TENANT_KEY_SECRET_ARN is not set; denying every call.');
         throw new Error('Aforo authorizer is not configured');
     }
-    const key = extractKey(event && event.authorizationToken);
+    const key = extractKey(authorization);
     if (!key) {
         throw new Error('Unauthorized'); // API Gateway answers 401
     }
@@ -364,7 +469,9 @@ async function handler(event) {
     if (!info || info.active !== true || !info.customerId) {
         throw new Error('Unauthorized');
     }
-    return buildPolicy(info, event.methodArn);
+    const denied = checkRouteScopes(routeScopes, info, methodArn);
+    if (denied) return denied;
+    return buildPolicy(info, methodArn, policyResourceMode(routeScopes, LOG_LABEL));
 }
 
 module.exports = {
@@ -372,6 +479,7 @@ module.exports = {
     extractKey,
     extractJwt,
     verifyJwt,
+    bearerValue,
     buildPolicy,
     _clearCache: () => cache.clear(),
     _resetJwks: ({ keepKeys = false } = {}) => {

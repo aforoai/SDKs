@@ -1039,6 +1039,51 @@ section('W6.3 review: JWT tenant binding', function () {
     check('jwt: references the Named Value aforo-tenant-id', code.indexOf('"{{aforo-tenant-id}}"') !== -1);
 });
 
+// G349: openid-config takes an OpenID discovery document, never a bare JWKS
+// URL (validate-jwt then has no keys and answers 401 to every request).
+section('G349 JWT keys from an OpenID discovery document', function () {
+    const t = readPolicy('jwt-validation-policy.xml');
+    const code = codeOf(t);
+    const configs = code.match(/<openid-config [^>]*\/>/g) || [];
+    eq('jwt: one openid-config', configs.length, 1);
+    eq('jwt: openid-config reads aforo-openid-config-url', configs[0], '<openid-config url="{{aforo-openid-config-url}}" />');
+    check('jwt: aforo-jwks-uri is referenced nowhere (comments included)', t.indexOf('{{aforo-jwks-uri}}') === -1);
+    check('jwt: no static issuer-signing-keys (they break on key rotation)', code.indexOf('issuer-signing-keys') === -1);
+    check('jwt: the issuer is still checked', code.indexOf('<issuer>{{aforo-jwt-issuer}}</issuer>') !== -1);
+    eq('jwt: references exactly its documented Named Values',
+        Array.from(new Set(code.match(/\{\{[^}]*\}\}/g) || [])).sort().join(' '),
+        '{{aforo-api-key}} {{aforo-jwt-issuer}} {{aforo-openid-config-url}} {{aforo-org-service-url}} {{aforo-tenant-id}}');
+    const docUrl = 'https://org.aforo.ai/.well-known/openid-configuration';
+    check('jwt header: names the discovery document URL', t.slice(0, t.indexOf('\n<fragment>')).indexOf(docUrl) !== -1);
+    const readme = fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8');
+    const guide = fs.readFileSync(path.join(__dirname, '..', 'USER_GUIDE.md'), 'utf8');
+    check('README: aforo-openid-config-url set to the discovery document',
+        readme.indexOf('`aforo-openid-config-url`') !== -1 && readme.indexOf(docUrl) !== -1);
+    check('user guide: creates aforo-openid-config-url with the discovery document',
+        guide.indexOf('nv aforo-openid-config-url "' + docUrl + '"') !== -1);
+    check('user guide: never asks for a JWKS URL in a Named Value', !/nv aforo-[a-z-]+ "[^"]*jwks\.json"/.test(guide) && guide.indexOf('nv aforo-jwks-uri') === -1);
+});
+
+// G348: the documented install is Event Hub delivery; direct is the opt-in.
+// The policy itself still sends directly unless told otherwise, so an
+// existing install keeps working (see 'G348 delivery mode').
+section('G348 Event Hub delivery is the documented default', function () {
+    const readme = fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8');
+    const install = readme.slice(readme.indexOf('## Install\n'), readme.indexOf('### APIM rules the files follow'));
+    const eh = install.indexOf('### Event Hub delivery (default)');
+    const direct = install.indexOf('### Direct delivery (opt-in)');
+    check('README install: Event Hub delivery comes first, as the default', eh !== -1 && direct !== -1 && eh < direct);
+    const ehSteps = install.slice(eh, direct);
+    check('README install: the default sets aforo-delivery-mode to eventhub', ehSteps.indexOf('<set-variable name="aforo-delivery-mode" value="eventhub" />') !== -1);
+    check('README install: the default includes aforo-metering-eventhub after aforo-metering',
+        ehSteps.indexOf('<include-fragment fragment-id="aforo-metering" />') !== -1
+        && ehSteps.indexOf('<include-fragment fragment-id="aforo-metering" />') < ehSteps.indexOf('<include-fragment fragment-id="aforo-metering-eventhub" />'));
+    check('README install: says the one-click deploy installs direct delivery', install.indexOf('It installs direct delivery') !== -1);
+    const guide = fs.readFileSync(path.join(__dirname, '..', 'USER_GUIDE.md'), 'utf8');
+    eq('user guide: both policy examples set eventhub mode', (guide.match(/<set-variable name="aforo-delivery-mode" value="eventhub" \/>/g) || []).length, 2);
+    eq('user guide: both policy examples include aforo-metering-eventhub', (guide.match(/<include-fragment fragment-id="aforo-metering-eventhub" \/>/g) || []).length, 2);
+});
+
 section('W6.3 review: cache keys are scoped to the API key', function () {
     const pf = readPolicy('preflight-quota-policy-fragment.xml');
     const mg = readPolicy('margin-guard-policy-fragment.xml');

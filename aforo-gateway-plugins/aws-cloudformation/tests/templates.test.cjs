@@ -1,8 +1,9 @@
 'use strict';
 /**
- * Checks for the two templates (G345, G346, G347, AllowGatewayOrchestration). No npm
- * packages: most checks read the text; the 3.2.0 checks resolve the role template for
- * given parameters with ./cfn.cjs and evaluate the resulting policies. Run with:
+ * Checks for the two templates (G345, G346, G347, AllowGatewayOrchestration, and the 3.2.2
+ * one-click hardening G336, G338, G339). No npm packages: most checks read the text; the
+ * 3.2.0+ checks resolve the role template for given parameters with ./cfn.cjs and evaluate
+ * the resulting policies. Run with:
  *   node aws-cloudformation/tests/templates.test.cjs
  */
 const fs = require('fs');
@@ -117,6 +118,7 @@ assert(/Effect: Deny/.test(DENY) && /aws:ResourceTag\/aforo-monetized/.test(DENY
 // ── 3.2.0: AllowGatewayOrchestration ─────────────────────────────────────────────
 const NEW = cfn.parse(ROLE);
 const OLD = cfn.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'aforo-apigateway-role-3.1.0.yaml'), 'utf8'));
+const V321 = cfn.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'aforo-apigateway-role-3.2.1.yaml'), 'utf8'));
 const EXT = '0b0e7c8e-6c1a-4c6e-9a8e-3a1f2b4c5d6e';
 const ACCT = '111122223333';
 const BUCKET = 'arn:aws:s3:::acme-aforo-firehose-backup';
@@ -125,6 +127,31 @@ const OWN_LOGS_ROLE = `arn:aws:iam::${ACCT}:role/acme-logs-to-firehose`;
 const stmts = (r) => cfn.roleStatements(r, 'AforoRole');
 const canonical = (v) => JSON.stringify(v, (k, x) => (x && typeof x === 'object' && !Array.isArray(x)
     ? Object.fromEntries(Object.keys(x).sort().map((key) => [key, x[key]])) : x));
+
+/**
+ * What 3.2.2 adds, and only with AllowMeteringInstall=true (G336, G338, G339): three statements
+ * in AforoMeteringInstall, two Lambda actions in MeteringFunction, and the execution role's
+ * AforoMeteringFailureQueue policy (whose Description names it). without322() removes exactly
+ * these from a resolved stack, so the comparisons below show nothing else changed.
+ */
+const ADDED_322_SIDS = ['MeteringFailureQueue', 'MeteringFailureAlarm', 'MeteringFunctionLogGroup'];
+const ADDED_322_LAMBDA = ['lambda:PutFunctionConcurrency', 'lambda:DeleteFunctionConcurrency'];
+const EXEC_DESCRIPTION_322 = ', sends to its failure queue';
+function without322(resources) {
+    const r = JSON.parse(JSON.stringify(resources));
+    for (const p of (r.AforoRole && r.AforoRole.Properties.Policies) || []) {
+        p.PolicyDocument.Statement = p.PolicyDocument.Statement
+            .filter((x) => !ADDED_322_SIDS.includes(x.Sid))
+            .map((x) => (x.Sid === 'MeteringFunction'
+                ? { ...x, Action: [].concat(x.Action).filter((a) => !ADDED_322_LAMBDA.includes(a)) } : x));
+    }
+    const exec = r.AforoMeteringExecutionRole;
+    if (exec) {
+        exec.Properties.Policies = exec.Properties.Policies.filter((p) => p.PolicyName !== 'AforoMeteringFailureQueue');
+        exec.Properties.Description = exec.Properties.Description.replace(EXEC_DESCRIPTION_322, '');
+    }
+    return r;
+}
 
 console.log('\n3.2.0: AllowGatewayOrchestration=false grants exactly what 3.1.0 granted');
 assert(/AllowGatewayOrchestration:\n {4}Type: String\n {4}Default: 'false'/.test(ROLE), 'AllowGatewayOrchestration defaults to false');
@@ -139,7 +166,8 @@ for (const AllowMeteringInstall of ['true', 'false']) {
                 const was = cfn.resolve(OLD, base);
                 const now = cfn.resolve(NEW, { ...base, ...extra });
                 combos++;
-                if (canonical(was.Resources) === canonical(now.Resources) && canonical(was.Outputs) === canonical(now.Outputs)) {
+                if (canonical(was.Resources) === canonical(without322(now.Resources))
+                    && canonical(was.Outputs) === canonical(now.Outputs)) {
                     identical++;
                 } else {
                     console.error('    differs for ' + JSON.stringify({ ...base, ...extra }));
@@ -149,7 +177,40 @@ for (const AllowMeteringInstall of ['true', 'false']) {
     }
 }
 assert(combos === 36 && identical === combos,
-    `resolved resources and outputs identical to 3.1.0 for all ${combos} parameter combinations (${identical} identical)`);
+    `resolved resources and outputs identical to 3.1.0 (apart from the 3.2.2 metering additions) for all ${combos} parameter combinations (${identical} identical)`);
+
+console.log('\n3.2.2: nothing changes but the metering-install additions (compared with 3.2.1)');
+let combos322 = 0;
+let same322 = 0;
+let meteringOffIdentical = 0;
+for (const AllowMeteringInstall of ['true', 'false']) {
+    for (const AllowGatewayOrchestration of ['true', 'false']) {
+        for (const ApiGatewayRegion of ['', '*', 'eu-west-1']) {
+            for (const AccessLogGroupPrefix of ['', 'acme/access-logs']) {
+                for (const extra of [{}, { FirehoseBackupBucketArn: BUCKET },
+                    { FirehoseRoleArn: OWN_FIREHOSE_ROLE, CloudWatchLogsRoleArn: OWN_LOGS_ROLE }]) {
+                    const params = { ExternalId: EXT, AllowMeteringInstall, AllowGatewayOrchestration, ApiGatewayRegion,
+                        AccessLogGroupPrefix, ...extra };
+                    const was = cfn.resolve(V321, params);
+                    const now = cfn.resolve(NEW, params);
+                    combos322++;
+                    if (canonical(was.Resources) === canonical(without322(now.Resources))
+                        && canonical(was.Outputs) === canonical(now.Outputs)) {
+                        same322++;
+                    } else {
+                        console.error('    differs for ' + JSON.stringify(params));
+                    }
+                    if (AllowMeteringInstall === 'false' && canonical(was.Resources) === canonical(now.Resources)) {
+                        meteringOffIdentical++;
+                    }
+                }
+            }
+        }
+    }
+}
+assert(combos322 === 72 && same322 === combos322,
+    `3.2.1 plus exactly the 3.2.2 additions, for all ${combos322} parameter combinations (${same322} match)`);
+assert(meteringOffIdentical === 36, `AllowMeteringInstall=false: identical to 3.2.1 (${meteringOffIdentical}/36)`);
 
 /**
  * The resource AWS authorises a tag-on-create against: apigateway:PUT on /tags/ + the new
@@ -293,6 +354,85 @@ for (const [p, v] of [['FirehoseBackupBucketArn', 'acme-bucket'], ['FirehoseRole
     try { cfn.resolve(NEW, { ExternalId: EXT, [p]: v }); } catch (e) { err = e.message; }
     assert(/fails AllowedPattern/.test(err), `${p}=${v} rejected by AllowedPattern`);
 }
+
+// ── 3.2.2: one-click metering hardening (G336, G338, G339) ──────────────────────
+console.log('\n3.2.2: the one-click install may create its failure queue, alarm, concurrency and log retention');
+const FN = 'aforo-metering-1234abcd';
+/** Every call organization-service's one-click install (deploy and remove) makes, as [what, action, resource, context]. */
+function meteringCalls(R, accessLogGroup) {
+    const fn = `arn:aws:lambda:${R}:${ACCT}:function:${FN}`;
+    const queue = `arn:aws:sqs:${R}:${ACCT}:${FN}-failures`;
+    const alarm = `arn:aws:cloudwatch:${R}:${ACCT}:alarm:${FN}-failures`;
+    const fnLogs = `arn:aws:logs:${R}:${ACCT}:log-group:/aws/lambda/${FN}`;
+    const secret = `arn:aws:secretsmanager:${R}:${ACCT}:secret:aforo/metering/${FN}-AbCdEf`;
+    const access = `arn:aws:logs:${R}:${ACCT}:log-group:${accessLogGroup}`;
+    return [
+        ['DescribeLogGroups', 'logs:DescribeLogGroups', '*'],
+        ...['DescribeSecret', 'CreateSecret', 'PutSecretValue', 'RestoreSecret', 'DeleteSecret', 'TagResource']
+            .map((a) => [a, `secretsmanager:${a}`, secret]),
+        ...['CreateQueue', 'GetQueueUrl', 'GetQueueAttributes', 'SetQueueAttributes', 'TagQueue', 'DeleteQueue']
+            .map((a) => [a, `sqs:${a}`, queue]),
+        ...['CreateLogGroup', 'PutRetentionPolicy', 'TagResource'].flatMap((a) => [
+            [`${a} (log group)`, `logs:${a}`, fnLogs], [`${a} (log group :*)`, `logs:${a}`, `${fnLogs}:*`]]),
+        ...['GetFunctionConfiguration', 'CreateFunction', 'UpdateFunctionCode', 'UpdateFunctionConfiguration',
+            'PutFunctionEventInvokeConfig', 'PutFunctionConcurrency', 'DeleteFunctionConcurrency', 'RemovePermission',
+            'AddPermission', 'DeleteFunction', 'TagResource'].map((a) => [a, `lambda:${a}`, fn]),
+        ['PassRole', 'iam:PassRole', `arn:aws:iam::${ACCT}:role/AforoMeteringExecutionRole`,
+            { 'iam:PassedToService': 'lambda.amazonaws.com' }],
+        ...['PutMetricAlarm', 'DeleteAlarms', 'TagResource'].map((a) => [a, `cloudwatch:${a}`, alarm]),
+        ['PutSubscriptionFilter', 'logs:PutSubscriptionFilter', access],
+        ['DeleteSubscriptionFilter', 'logs:DeleteSubscriptionFilter', access],
+    ];
+}
+for (const [label, params, R] of [
+    ['stack region', {}, 'us-east-1'],
+    ['ApiGatewayRegion=eu-west-1', { ApiGatewayRegion: 'eu-west-1' }, 'eu-west-1'],
+    ['ApiGatewayRegion=*', { ApiGatewayRegion: '*' }, 'ap-south-1'],
+    ['with AllowGatewayOrchestration=true', { AllowGatewayOrchestration: 'true' }, 'us-east-1'],
+]) {
+    const m = cfn.resolve(NEW, { ExternalId: EXT, ...params });
+    const calls = meteringCalls(R, '/aws/apigateway/orders-access');
+    const missing = calls.filter(([, a, r, c]) => !cfn.allows(stmts(m), a, r, c || {})).map(([n]) => n);
+    assert(missing.length === 0, `${label}: all ${calls.length} one-click calls allowed${missing.length ? ' (denied: ' + missing.join(', ') + ')' : ''}`);
+    const exec = cfn.roleStatements(m, 'AforoMeteringExecutionRole');
+    assert(cfn.allows(exec, 'sqs:SendMessage', `arn:aws:sqs:${R}:${ACCT}:${FN}-failures`),
+        `${label}: the execution role can send to the failure queue (OnFailure destination)`);
+}
+
+const m322 = cfn.resolve(NEW, { ExternalId: EXT });
+const exec322 = cfn.roleStatements(m322, 'AforoMeteringExecutionRole');
+for (const [what, action, resource] of [
+    ['read the failure queue', 'sqs:ReceiveMessage', `arn:aws:sqs:us-east-1:${ACCT}:${FN}-failures`],
+    ['send messages to the failure queue', 'sqs:SendMessage', `arn:aws:sqs:us-east-1:${ACCT}:${FN}-failures`],
+    ['purge the failure queue', 'sqs:PurgeQueue', `arn:aws:sqs:us-east-1:${ACCT}:${FN}-failures`],
+    ['create a queue not named aforo-metering-*', 'sqs:CreateQueue', `arn:aws:sqs:us-east-1:${ACCT}:orders-dlq`],
+    ['change another queue', 'sqs:SetQueueAttributes', `arn:aws:sqs:us-east-1:${ACCT}:orders-dlq`],
+    ['delete another queue', 'sqs:DeleteQueue', `arn:aws:sqs:us-east-1:${ACCT}:orders-dlq`],
+    ['create a queue in another region', 'sqs:CreateQueue', `arn:aws:sqs:eu-west-1:${ACCT}:${FN}-failures`],
+    ['put another alarm', 'cloudwatch:PutMetricAlarm', `arn:aws:cloudwatch:us-east-1:${ACCT}:alarm:orders-5xx`],
+    ['delete another alarm', 'cloudwatch:DeleteAlarms', `arn:aws:cloudwatch:us-east-1:${ACCT}:alarm:orders-5xx`],
+    ['change the retention of the API access logs', 'logs:PutRetentionPolicy', `arn:aws:logs:us-east-1:${ACCT}:log-group:/aws/apigateway/orders-access`],
+    ['change the retention of another function\'s logs', 'logs:PutRetentionPolicy', `arn:aws:logs:us-east-1:${ACCT}:log-group:/aws/lambda/orders`],
+    ['create another log group', 'logs:CreateLogGroup', `arn:aws:logs:us-east-1:${ACCT}:log-group:/aws/lambda/orders`],
+    ['delete the function\'s log group', 'logs:DeleteLogGroup', `arn:aws:logs:us-east-1:${ACCT}:log-group:/aws/lambda/${FN}`],
+    ['read the function\'s logs', 'logs:GetLogEvents', `arn:aws:logs:us-east-1:${ACCT}:log-group:/aws/lambda/${FN}:*`],
+    ['reserve concurrency on another function', 'lambda:PutFunctionConcurrency', `arn:aws:lambda:us-east-1:${ACCT}:function:orders`],
+]) {
+    assert(!cfn.allows(stmts(m322), action, resource), `metering on: Aforo cannot ${what}`);
+}
+assert(!cfn.allows(exec322, 'sqs:SendMessage', `arn:aws:sqs:us-east-1:${ACCT}:orders-dlq`),
+    'execution role cannot send to a queue not named aforo-metering-*');
+assert(!cfn.allows(exec322, 'sqs:ReceiveMessage', `arn:aws:sqs:us-east-1:${ACCT}:${FN}-failures`),
+    'execution role cannot read the failure queue');
+assert(!stmts(m322).some((x) => [].concat(x.Action).some((a) => /^(sqs|cloudwatch|logs):\*$/.test(a))),
+    'no sqs:*, cloudwatch:* or logs:* action');
+
+const off322 = cfn.resolve(NEW, { ExternalId: EXT, AllowMeteringInstall: 'false', AllowGatewayOrchestration: 'true',
+    FirehoseBackupBucketArn: BUCKET });
+const offAllowed = meteringCalls('us-east-1', '/aws/lambda/x').filter(([, a, r, c]) => /^(sqs|cloudwatch:(Put|Delete|Tag)|logs:(CreateLogGroup|PutRetentionPolicy|TagResource)|lambda:)/.test(a)
+    && cfn.allows(stmts(off322), a, r, c || {})).map(([n, a]) => `${n} ${a}`);
+assert(offAllowed.length === 0, `metering off: no queue, alarm, log group or Lambda call allowed${offAllowed.length ? ' (allowed: ' + offAllowed.join(', ') + ')' : ''}`);
+assert(!off322.Resources.AforoMeteringExecutionRole, 'metering off: no execution role');
 
 console.log(`\n── Results: ${passed} passed, ${failed} failed ──`);
 process.exit(failed ? 1 : 0);

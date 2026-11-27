@@ -5,11 +5,12 @@ Description: >-
   (REST and HTTP APIs, stages, authorizers, usage plans) in one region; it cannot read API
   key values. With AllowMeteringInstall = true it can also install Aforo's metering Lambda
   (functions named aforo-metering-*), store the Aforo API key it uses in Secrets Manager
-  (secrets named aforo/metering/*) and subscribe it to your API Gateway log groups; set it
-  to false to keep the role read-only. With AllowGatewayOrchestration = true (default
-  false) it can also manage API Gateway usage plans and API keys for Gateway Orchestration,
-  read API Gateway CloudWatch metrics, and create Kinesis Data Firehose streams named
-  aforo-gateway-* fed from your API Gateway log groups (push ingestion).
+  (secrets named aforo/metering/*), give it an SQS failure queue, an alarm and a log
+  retention, and subscribe it to your API Gateway log groups; set it to false to keep the
+  role read-only. With AllowGatewayOrchestration = true (default false) it can also manage
+  API Gateway usage plans and API keys for Gateway Orchestration, read API Gateway
+  CloudWatch metrics, and create Kinesis Data Firehose streams named aforo-gateway-* fed
+  from your API Gateway log groups (push ingestion).
 
 # Hosted publicly at the URL in aforo.aws.cfn-template-url (default
 # https://aforo-templates.s3.amazonaws.com/aws-apigateway-role.yaml). CloudFormation only
@@ -59,7 +60,8 @@ Parameters:
     Description: >-
       true lets Aforo's one-click metering create and remove a Lambda function named
       aforo-metering-*, the Secrets Manager secret aforo/metering/* holding its Aforo API
-      key, and its CloudWatch Logs subscription in this account. false keeps the role
+      key, its SQS failure queue and CloudWatch alarm (aforo-metering-*), its log group's
+      retention and its CloudWatch Logs subscription in this account. false keeps the role
       read-only; you then install the metering Lambda yourself.
   AllowGatewayOrchestration:
     Type: String
@@ -194,9 +196,10 @@ Resources:
                     - !Sub 'arn:${AWS::Partition}:apigateway:*::/usageplans/*/keys'
                   - !Sub 'arn:${AWS::Partition}:apigateway:*::/usageplans/*/keys/*'
         # One-click metering install (AwsApiGatewayProvisioningAdapter). Everything is
-        # limited to functions named aforo-metering-* and secrets named aforo/metering/*,
-        # and the only role Aforo can hand to Lambda is the execution role below. Aforo
-        # cannot create or change IAM roles, and cannot change API Gateway.
+        # limited to functions, queues and alarms named aforo-metering-*, the log groups
+        # /aws/lambda/aforo-metering-* and secrets named aforo/metering/*, and the only role
+        # Aforo can hand to Lambda is the execution role below. Aforo cannot create or
+        # change IAM roles, and cannot change API Gateway.
         - !If
           - MeteringInstall
           - PolicyName: AforoMeteringInstall
@@ -212,6 +215,8 @@ Resources:
                     - lambda:UpdateFunctionCode
                     - lambda:UpdateFunctionConfiguration
                     - lambda:PutFunctionEventInvokeConfig
+                    - lambda:PutFunctionConcurrency
+                    - lambda:DeleteFunctionConcurrency
                     - lambda:AddPermission
                     - lambda:RemovePermission
                     - lambda:DeleteFunction
@@ -234,6 +239,43 @@ Resources:
                     - secretsmanager:TagResource
                   Resource: !Sub
                     - 'arn:${AWS::Partition}:secretsmanager:${Region}:${AWS::AccountId}:secret:aforo/metering/*'
+                    - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                # 3.2.2 (G336): the function's OnFailure destination. A batch still failing
+                # after Lambda's async retries is kept here (14 days) instead of dropped.
+                # Aforo creates, tags and (only when it is empty) deletes the queue; it
+                # cannot read or send messages.
+                - Sid: MeteringFailureQueue
+                  Effect: Allow
+                  Action:
+                    - sqs:CreateQueue
+                    - sqs:GetQueueUrl
+                    - sqs:GetQueueAttributes
+                    - sqs:SetQueueAttributes
+                    - sqs:TagQueue
+                    - sqs:DeleteQueue
+                  Resource: !Sub
+                    - 'arn:${AWS::Partition}:sqs:${Region}:${AWS::AccountId}:aforo-metering-*'
+                    - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                # 3.2.2 (G336): an alarm when the failure queue holds a message.
+                - Sid: MeteringFailureAlarm
+                  Effect: Allow
+                  Action:
+                    - cloudwatch:PutMetricAlarm
+                    - cloudwatch:DeleteAlarms
+                    - cloudwatch:TagResource
+                  Resource: !Sub
+                    - 'arn:${AWS::Partition}:cloudwatch:${Region}:${AWS::AccountId}:alarm:aforo-metering-*'
+                    - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+                # 3.2.2 (G339): the function's own log group, created with a retention so its
+                # logs do not pile up forever. Aforo cannot read or delete it.
+                - Sid: MeteringFunctionLogGroup
+                  Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:PutRetentionPolicy
+                    - logs:TagResource
+                  Resource: !Sub
+                    - 'arn:${AWS::Partition}:logs:${Region}:${AWS::AccountId}:log-group:/aws/lambda/aforo-metering-*'
                     - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
                 - Sid: PassMeteringExecutionRole
                   Effect: Allow
@@ -412,15 +454,16 @@ Resources:
                   - !Ref AWS::NoValue
           - !Ref AWS::NoValue
 
-  # What the metering Lambda itself may do: write its own logs and read its Aforo API key
-  # from the aforo/metering/* secrets. Nothing else.
+  # What the metering Lambda itself may do: write its own logs, read its Aforo API key
+  # from the aforo/metering/* secrets and put a failed invocation on its aforo-metering-*
+  # failure queue (Lambda's OnFailure destination sends as the function's role). Nothing else.
   # The name is fixed by the external ID so Aforo can find the role without IAM read access.
   AforoMeteringExecutionRole:
     Type: AWS::IAM::Role
     Condition: MeteringInstall
     Properties:
       RoleName: !Sub 'aforo-metering-exec-${ExternalId}'
-      Description: Execution role of Aforo's metering Lambda (writes its own logs, reads its Aforo API key secret).
+      Description: Execution role of Aforo's metering Lambda (writes its own logs, reads its Aforo API key secret, sends to its failure queue).
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -455,6 +498,17 @@ Resources:
                 Action: secretsmanager:GetSecretValue
                 Resource: !Sub
                   - 'arn:${AWS::Partition}:secretsmanager:${Region}:${AWS::AccountId}:secret:aforo/metering/*'
+                  - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
+        # 3.2.2 (G336): Lambda delivers a failed async invocation to the OnFailure queue with
+        # the function's role, and refuses PutFunctionEventInvokeConfig without this.
+        - PolicyName: AforoMeteringFailureQueue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !Sub
+                  - 'arn:${AWS::Partition}:sqs:${Region}:${AWS::AccountId}:aforo-metering-*'
                   - Region: !If [UseStackRegion, !Ref 'AWS::Region', !Ref ApiGatewayRegion]
 
   # Push ingestion's two service roles, created when FirehoseBackupBucketArn is set with

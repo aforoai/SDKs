@@ -4,6 +4,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-11-25
+
+Fixes G349 and G348 from the 16 October architecture review. Not run on a live APIM instance or Azure subscription; the checks are `node azure-apim/tests/policy.test.cjs`, `node azure-arm-templates/tests/deny-policy.test.cjs` and `npm test` in `eventhub-forwarder/`.
+
+### Changed
+- **JWT keys come from an OpenID discovery document (G349). Breaking for `aforo-jwt-validation`.** The fragment reads the new Named Value `aforo-openid-config-url` instead of `aforo-jwks-uri`; set it to `https://org.aforo.ai/.well-known/openid-configuration`. `validate-jwt`'s `openid-config` accepts only a discovery document, while the docs asked for the bare JWKS URL and organization-service served no discovery document: with that setting APIM loaded no keys and answered 401 to every request. organization-service now serves the document (issuer `https://auth.aforo.ai`, `jwks_uri` `https://org.aforo.ai/.well-known/jwks.json`); `aforo-jwt-validation` needs that build. Keys are still never static: APIM follows `jwks_uri` and picks up a rotated key by `kid`. Upgrade: create `aforo-openid-config-url`, re-import `jwt-validation-policy.xml`, delete `aforo-jwks-uri`. APIM refuses to save the new fragment until the Named Value exists, so the old fragment runs until then. `aforo-jwt-issuer` stays `https://auth.aforo.ai`.
+- **Event Hub delivery is the default install (G348).** The README "Install" and the user guide now install `aforo-metering` together with `aforo-metering-eventhub`, the forwarder and `aforo-delivery-mode` = `eventhub`. Direct delivery (`send-one-way-request`: no retry, an ingest outage, 5xx or 429 loses the event) is the explicit opt-in. The policy files do not change behaviour: without `aforo-delivery-mode` = `eventhub` `aforo-metering` still sends directly, so existing installs keep working as they are. Aforo's one-click deploy still installs direct delivery; deploying the Event Hub stack from it is planned, not done.
+
 ## [2.3.2] - 2026-10-28
 
 Fixes from the second wave 6 review. Not run on a live APIM instance or Azure subscription. Redeploy the Event Hub forwarder; the policy files are unchanged except for the version.

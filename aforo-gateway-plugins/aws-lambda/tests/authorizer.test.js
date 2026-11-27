@@ -242,12 +242,25 @@ async function run() {
     try { T.parseRespReplies(Buffer.from('$3\r\nabcde\r\n')); } catch { threw = true; }
     assert(threw, 'bulk length mismatch throws');
 
-    console.log('\nG341: Allow covers one stage, Deny one method');
+    console.log('\nG341 (2.7.0): Allow covers the called method by default, Deny one method');
     T.reset();
     delete process.env.REDIS_HOST;
+    delete process.env.AFORO_POLICY_RESOURCE;
     p = await call(token());
-    assertEquals(resource(p), 'arn:aws:execute-api:us-east-1:123456789012:abc123/prod/*', 'Allow resource is the stage, not the whole API');
+    assertEquals(resource(p), METHOD_ARN, 'default Allow resource is the called method ARN, not the stage');
+    process.env.AFORO_POLICY_RESOURCE = 'stage';
+    p = await call(token());
+    assertEquals(resource(p), 'arn:aws:execute-api:us-east-1:123456789012:abc123/prod/*', 'AFORO_POLICY_RESOURCE=stage → Allow covers the stage (pre-2.7.0)');
     assert(!/:abc123\/\*$/.test(resource(p)), 'not every stage of the API');
+    process.env.AFORO_POLICY_RESOURCE = 'STAGE ';
+    p = await call(token());
+    assertEquals(resource(p), 'arn:aws:execute-api:us-east-1:123456789012:abc123/prod/*', 'AFORO_POLICY_RESOURCE is case- and space-insensitive');
+    for (const v of ['method', 'api', '*', '']) {
+        process.env.AFORO_POLICY_RESOURCE = v;
+        p = await call(token());
+        assertEquals(resource(p), METHOD_ARN, `AFORO_POLICY_RESOURCE=${JSON.stringify(v)} → method ARN`);
+    }
+    delete process.env.AFORO_POLICY_RESOURCE;
     p = await auth.handler({ authorizationToken: 'Bearer nope', methodArn: METHOD_ARN });
     assertEquals(resource(p), METHOD_ARN, 'Deny resource is the called method');
     assertEquals(T.stageArn('not-an-arn'), 'not-an-arn', 'unexpected methodArn shape kept as-is (narrow)');
@@ -422,14 +435,22 @@ async function run() {
     p = await callAt(token({ scopes: 'api:access' }), 'not-an-arn');
     assertEquals(effect(p), 'Deny', 'a method ARN that cannot be read → Deny');
 
-    console.log('\nG341: no map → the stage-wide Allow is unchanged');
+    console.log('\nG341: no map → no scope check; the Allow names the method (2.7.0) unless AFORO_POLICY_RESOURCE=stage');
     setMap(undefined);
     p = await callAt(token({ scopes: undefined }), arn('GET', '/v1/items'));
     assertEquals(effect(p), 'Allow', 'no map, no scopes → Allow');
-    assertEquals(resource(p), `${STAGE}/*`, 'no map → Allow covers the stage');
+    assertEquals(resource(p), arn('GET', '/v1/items'), 'no map → Allow covers the called method');
     setMap('   ');
     p = await callAt(token(), arn('GET', '/v1/items'));
-    assertEquals(resource(p), `${STAGE}/*`, 'a blank value is "no map"');
+    assertEquals(resource(p), arn('GET', '/v1/items'), 'a blank value is "no map"');
+    process.env.AFORO_POLICY_RESOURCE = 'stage';
+    p = await callAt(token(), arn('GET', '/v1/items'));
+    assertEquals(resource(p), `${STAGE}/*`, 'no map + AFORO_POLICY_RESOURCE=stage → Allow covers the stage');
+    setMap('{"GET /v1/items": "items:read"}');
+    p = await callAt(token({ scopes: 'items:read' }), arn('GET', '/v1/items'));
+    assertEquals(resource(p), arn('GET', '/v1/items'), 'a map overrides AFORO_POLICY_RESOURCE=stage: Allow covers the method');
+    delete process.env.AFORO_POLICY_RESOURCE;
+    setMap(undefined);
 
     console.log('\nG341: a map that is not valid denies everything');
     for (const [bad, why] of [

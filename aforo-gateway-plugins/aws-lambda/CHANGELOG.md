@@ -4,6 +4,49 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versioning: [SemVer](htt
 
 This function ships on the Aforo gateway-plugins line; the whole repo is versioned and tagged together. The version lives in `package.json`. Entries below are the AWS-Lambda-specific slice of each repo release (see the parent `aforo-gateway-plugins/CHANGELOG.md` for the cross-plugin picture).
 
+## [2.7.1] - not yet released
+
+`template.yaml` and documentation only; the function code is unchanged from 2.7.0. Not deployed to AWS.
+
+### Added
+- **Alarm on the failure queue (G336).** The template created the OnFailure queue `aforo-metering-failures` but no alarm, so a batch every retry failed to deliver sat there unnoticed until its 14 days ran out. New `AforoMeteringFailureAlarm` (`AWS::CloudWatch::Alarm`): `ApproximateNumberOfMessagesVisible` (Maximum, 5 minutes) `> 0` on the queue, `TreatMissingData: notBreaching` (an idle queue publishes no data points). Optional parameter `FailureAlarmTopicArn` (an SNS topic, default empty) receives the alarm and its recovery; new output `FailureAlarmName`.
+- Tests: `tests/template.test.js` +13 (retry policy and OnFailure destination, queue retention, the alarm's metric, threshold, missing-data handling, topic parameter, output).
+
+### Changed (documentation)
+- The one-click install in organization-service now creates the same failure queue (`aforo-metering-<id>-failures`) with its alarm, reserves concurrency (10), runs the function on arm64 and sets a 14-day retention on `/aws/lambda/aforo-metering-<id>` (G336, G338, G339). README and USER_GUIDE no longer say it has no failure queue. It needs the connection's stack at `aws-cloudformation` 3.2.2.
+
+#### Upgrade from 2.7.0
+1. `sam deploy` with the same parameters adds the alarm. Pass `FailureAlarmTopicArn=<topic ARN>` to be notified.
+
+## [2.7.0] - not yet released
+
+Authorizers safe by default (G341). Not run on a live API Gateway stage: the suites drive both handlers with TOKEN and REQUEST events, and `cfn-lint` validates the template.
+
+### Changed
+- **Breaking for a `TOKEN` authorizer with a result TTL above 0 — an Allow now covers the called method ARN by default**, in `authorizer.js` and `key-authorizer.js`, with or without `AFORO_ROUTE_SCOPES`. Before, without a route map, an Allow covered the whole stage (`arn:…:<apiId>/<stage>/*`), so one cached answer opened every route. A `TOKEN` authorizer caches by token alone, so with a TTL above 0 the second route a client calls now gets 403 until the TTL runs out. New `AFORO_POLICY_RESOURCE`: `method` (default) or `stage` (the pre-2.7.0 stage-wide Allow, one warning per container; ignored while `AFORO_ROUTE_SCOPES` is set).
+- **`template.yaml` creates the API Gateway authorizer** for `key-authorizer.js` when `AuthorizerRestApiId` is set (and `DeployKeyAuthorizer=true`): `REQUEST`, identity sources `method.request.header.Authorization,context.httpMethod,context.path`, result TTL `AuthorizerResultTtlSeconds` — default 60, `MaxValue` 60, so the stack cannot set the 840 s that once kept revoked tokens working 14 minutes. Output `KeyAuthorizerId`. New parameters `AuthorizerPolicyResource` (default `method`) and `AuthorizerRouteScopes` (default empty) set `AFORO_POLICY_RESOURCE` and `AFORO_ROUTE_SCOPES` on the function.
+- Route-scope parsing and matching moved from `authorizer.js` to the new `route-scopes.js`, shared by both authorizers. Hand-built zips must include it.
+- AUTHORIZER.md: the `key-authorizer.js` CLI example created a `TOKEN` authorizer with a 300 s TTL; it now creates a `REQUEST` authorizer with 60 s, as does the `authorizer.js` example. New section "Safe defaults".
+
+### Added
+- **Scopes per route in `key-authorizer.js`** (`AFORO_ROUTE_SCOPES`, same syntax and matching as `authorizer.js`). A customer key's scopes come from the introspection answer's `scopes` (pricing-service already returns them); a JWT's from its `scopes` claim. A missing scope → Deny for the called method (403, `error: INSUFFICIENT_SCOPE`); an unreadable method ARN → Deny (`ROUTE_UNKNOWN`); a map that is not valid → every call fails (500) until it is fixed, never Allow. The context gains `scopes`.
+- `key-authorizer.js` accepts `REQUEST` authorizer events (token from the `Authorization` header).
+- Tests: `tests/key-authorizer-scopes.test.js` (27), `tests/authorizer.test.js` 135 → 143, `tests/template.test.js` +19 (authorizer resource, TTL default and cap, identity sources, parameters). `npm test` all suites pass.
+
+### Not changed
+- **The TTL of an authorizer the template does not create.** The Lambda cannot see or shorten it; a revoked key or token keeps working until a cached Allow for that route expires. Authorizers created by hand, by other tooling, or without `AuthorizerRestApiId` keep the TTL they were given.
+- The Aforo one-click AWS install (organization-service) deploys the metering function only, no authorizer, so it sets neither the TTL nor `AFORO_ROUTE_SCOPES`.
+- `key-authorizer.js` still does not read `aud`.
+
+#### Upgrade from 2.6.0
+
+1. Hand-built zips: add `route-scopes.js`.
+2. Find your authorizer's type and TTL: `aws apigateway get-authorizers --rest-api-id <id>`.
+   - `REQUEST` with `context.httpMethod` and `context.path` in the identity sources, or any TTL of 0: nothing to do.
+   - `TOKEN` with a TTL above 0: before deploying 2.7.0, either switch to the `REQUEST` authorizer (SAM: pass `AuthorizerRestApiId`, attach `KeyAuthorizerId` to your methods, redeploy the stage), set its TTL to 0, or set `AFORO_POLICY_RESOURCE=stage` (SAM: `AuthorizerPolicyResource=stage`) and its TTL to 60 s or less. Otherwise clients that call more than one route get 403 on the second route for up to the TTL.
+3. Any TTL above 60: lower it to 60 or less (`aws apigateway update-authorizer --rest-api-id <id> --authorizer-id <id> --patch-operations op=replace,path=/authorizerResultTtlInSeconds,value=60`) and redeploy the stage.
+4. Expect more authorizer invocations with the per-method cache: one per token, method and path per TTL.
+
 ## [2.6.0] - not yet released
 
 `authorizer.js` only. Both settings are off until you set them; with neither set the authorizer behaves as in 2.5.2. Not run on a live API Gateway stage.

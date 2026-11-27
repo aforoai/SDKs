@@ -1,6 +1,6 @@
 # Aforo AWS CloudFormation Templates — User Guide
 
-**Version:** 3.2.1 (not yet released) · **Updated:** 2026-11-12 · **Audience:** AWS account owners connecting Amazon API Gateway to Aforo.
+**Version:** 3.2.2 (not yet released) · **Updated:** 2026-11-25 · **Audience:** AWS account owners connecting Amazon API Gateway to Aforo.
 
 ## What you'll build
 
@@ -128,6 +128,8 @@ To revoke access: `aws cloudformation delete-stack --region <region> --stack-nam
 | Import finds no APIs | The role is scoped to another region. | Redeploy with `ApiGatewayRegion=<your API region>`. |
 | One-click metering fails on `secretsmanager:DescribeSecret` / `CreateSecret` | The stack is older than 3.1.0, which added the Secrets Manager permissions. | Update the stack with the current template (same parameters), then deploy metering again. |
 | Metering Lambda logs `could not read AFORO_API_KEY_SECRET_ARN … AccessDeniedException` | The execution role predates 3.1.0, or the connection uses its own `meteringExecutionRoleArn`. | Update the stack; for your own role, allow `secretsmanager:GetSecretValue` on `aforo/metering/*`. |
+| One-click metering fails on `sqs:CreateQueue` | The stack is older than 3.2.2, which added the failure queue, alarm, log retention and concurrency permissions. | Update the stack with the current template (same parameters), then deploy metering again. |
+| One-click metering fails on `lambda:PutFunctionEventInvokeConfig` naming `SendMessage` | The connection uses its own `meteringExecutionRoleArn`, which may not send to the failure queue. | Allow that role `sqs:SendMessage` on `aforo-metering-*` queues, then deploy again. |
 | One-click metering fails on `logs:PutSubscriptionFilter` | The access log group is outside `/aws/apigateway/*` and `API-Gateway-*`. | Redeploy with `AccessLogGroupPrefix=<log group name>`. |
 | Monetized APIs can still be deleted | The deny policy is not attached, or the resource is not tagged. | Pass `AttachToRoles` / `AttachToUsers` / `AttachToGroups`; check the `aforo-monetized` tag. |
 | Usage plan or API key calls fail with `AccessDenied` on a role-only connection | `AllowGatewayOrchestration` is `false`, or the APIs are in another region. | Update the stack with `AllowGatewayOrchestration=true` (and `ApiGatewayRegion` if needed). |

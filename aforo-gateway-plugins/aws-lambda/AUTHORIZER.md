@@ -7,12 +7,28 @@ Two authorizers ship here. Both set `$context.authorizer.customerId`, which the 
 | Customer sends | The Aforo key issued when they subscribed: `Authorization: Bearer sk_live_…`, **or** (AI agents, MCP clients) an Aforo client-credential JWT | An Aforo JWT from `POST /oauth/token` (client credentials) |
 | Checked by | Keys: Aforo, per new key: `POST /api/v1/customer-keys/introspect` with your tenant key. JWTs: locally, RS256 against Aforo's JWKS, `iss` and `tenant_id` pinned | Locally, RS256 against Aforo's JWKS |
 | Rejects | Unknown, revoked or expired keys; keys of another tenant; keys with no ACTIVE subscription | Bad signature, expired, revoked `jti`, another workspace's token; optionally a wrong `aud` and a missing scope for the called route |
-| Scopes per route | Not checked: any accepted key or JWT can call every route on the stage | `AFORO_ROUTE_SCOPES` (2.6.0) |
-| Context | `customerId`, `keyId`, `subscriptionId`, `productType`, `authType`; JWTs add `subscriptionIds`, `agentId` | `customerId`, `tenantId`, `keyId`, `scopes`, … |
+| Scopes per route | `AFORO_ROUTE_SCOPES` (2.7.0): a key's scopes from the introspection answer, a JWT's from its `scopes` claim | `AFORO_ROUTE_SCOPES` (2.6.0) |
+| An Allow covers | The called method ARN (2.7.0); `AFORO_POLICY_RESOURCE=stage` for the whole stage | The called method ARN (2.7.0); `AFORO_POLICY_RESOURCE=stage` for the whole stage |
+| Context | `customerId`, `keyId`, `subscriptionId`, `productType`, `authType`, `scopes` (2.7.0); JWTs add `subscriptionIds`, `agentId` | `customerId`, `tenantId`, `keyId`, `scopes`, … |
+
+## Safe defaults (2.7.0, G341)
+
+Two settings decide how long and how widely one authorizer answer is reused:
+
+- **The API Gateway result TTL.** API Gateway reuses a cached Allow without calling the authorizer, so a revoked key or token keeps working until the cached answer expires. Nothing in the Lambda can shorten that; only the authorizer's `authorizerResultTtlInSeconds` can. Keep it at **60 s or less** (0 checks every call). This page once recommended 840 s, which kept a revoked token working for 14 minutes. `template.yaml` now creates the API Gateway authorizer for `key-authorizer.js` when you pass `AuthorizerRestApiId`, with `AuthorizerResultTtlSeconds` defaulting to 60 and capped at 60.
+- **What an Allow covers.** Since 2.7.0 both authorizers return an Allow for the called method ARN only (`arn:…:<apiId>/<stage>/GET/v1/items/42`), whether or not `AFORO_ROUTE_SCOPES` is set, so one cached answer never opens another route. Before 2.7.0 the Allow covered the whole stage (`arn:…:<apiId>/<stage>/*`) unless a route map was set.
+
+A per-method Allow needs a cache keyed by method and path: a `REQUEST` authorizer with identity sources `method.request.header.Authorization,context.httpMethod,context.path` and a TTL of 60 s or less (what the template creates), or a `TOKEN` authorizer with TTL 0. **A `TOKEN` authorizer with a TTL above 0 returns 403 on the second route a client calls** until the TTL runs out (API Gateway reuses the first route's policy, which does not name the second). To keep such an authorizer as it is, set `AFORO_POLICY_RESOURCE=stage` (template parameter `AuthorizerPolicyResource`): the Allow covers the stage again, as before 2.7.0, and the TTL must stay at 60 s or less. `AFORO_POLICY_RESOURCE=stage` is ignored while `AFORO_ROUTE_SCOPES` is set.
+
+| Variable | Default | |
+|---|---|---|
+| `AFORO_POLICY_RESOURCE` | `method` | `method`: an Allow covers the called method ARN. `stage`: the whole stage (pre-2.7.0; one warning per container). Any other value is read as `method`. Both authorizers. |
+
+Not enforced by this repo: the TTL of an authorizer you create yourself, and the API Gateway authorizers the Aforo one-click AWS install does not create (it deploys the metering function only).
 
 ## Customer-key authorizer (`key-authorizer.js`)
 
-A TOKEN authorizer. For a key it has not seen within `CACHE_TTL_MS`, it asks Aforo who owns it, authenticating with **your** tenant key (scope `usage:ingest`). Aforo answers `active: true` only for a key of your tenant that is not revoked or expired and is bound to an ACTIVE subscription; anything else gets 401. If Aforo cannot be reached the call is denied (500) and the failure is not cached. The customer key is never logged. No npm dependencies.
+A `REQUEST` (recommended, cached per token, method and path) or `TOKEN` authorizer; it reads the key from `authorizationToken` or the `Authorization` header. For a key it has not seen within `CACHE_TTL_MS`, it asks Aforo who owns it, authenticating with **your** tenant key (scope `usage:ingest`). Aforo answers `active: true` only for a key of your tenant that is not revoked or expired and is bound to an ACTIVE subscription; anything else gets 401. If Aforo cannot be reached the call is denied (500) and the failure is not cached. The customer key is never logged. No npm dependencies.
 
 | Variable | Default | |
 |---|---|---|
@@ -21,12 +37,14 @@ A TOKEN authorizer. For a key it has not seen within `CACHE_TTL_MS`, it asks Afo
 | `AFORO_INTROSPECT_URL` | `https://api.aforo.ai/api/v1/customer-keys/introspect` | |
 | `CACHE_TTL_MS` | `60000` | Per-container answer cache. A revoked key stops working after this plus the API Gateway result TTL. |
 | `INTROSPECT_TIMEOUT_MS` | `3000` | |
+| `AFORO_ROUTE_SCOPES` | — | 2.7.0. Same JSON map and matching as `authorizer.js` ([Scopes per route](#scopes-per-route-aforo_route_scopes)). A customer key's scopes are the `scopes` the introspection answer lists; a JWT's are its `scopes` claim. A missing scope → 403 (`error: INSUFFICIENT_SCOPE`), an unreadable method ARN → 403 (`ROUTE_UNKNOWN`), a map that is not valid → every call 500 until it is fixed. |
+| `AFORO_POLICY_RESOURCE` | `method` | 2.7.0. See [Safe defaults](#safe-defaults-270-g341). |
 
 ```bash
 aws secretsmanager create-secret --name aforo/tenant-key --secret-string "<your sk_live tenant key>"
 
-# aws-secret.js is required by key-authorizer.js.
-zip key-authorizer.zip key-authorizer.js aws-secret.js
+# aws-secret.js and route-scopes.js (2.7.0) are required by key-authorizer.js.
+zip key-authorizer.zip key-authorizer.js aws-secret.js route-scopes.js
 
 aws lambda create-function \
   --function-name aforo-key-authorizer \
@@ -44,13 +62,15 @@ aws iam put-role-policy \
   --policy-name aforo-tenant-key \
   --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"secretsmanager:GetSecretValue","Resource":"<secret ARN>"}]}'
 
+# REQUEST, cached per token + method + path, 60 s at most (G341).
+# With SAM, AuthorizerRestApiId=<API_ID> creates this for you.
 aws apigateway create-authorizer \
   --rest-api-id <API_ID> \
   --name aforo-customer-key \
-  --type TOKEN \
-  --identity-source method.request.header.Authorization \
+  --type REQUEST \
+  --identity-source "method.request.header.Authorization,context.httpMethod,context.path" \
   --authorizer-uri "arn:aws:apigateway:<REGION>:lambda:path/2015-03-31/functions/arn:aws:lambda:<REGION>:<ACCOUNT_ID>:function:aforo-key-authorizer/invocations" \
-  --authorizer-result-ttl-in-seconds 300
+  --authorizer-result-ttl-in-seconds 60
 
 aws lambda add-permission \
   --function-name aforo-key-authorizer \
@@ -91,7 +111,7 @@ The same `key-authorizer.js` accepts that token (`Authorization: Bearer eyJ…`)
 
 Revocation of an individual `jti` is not checked here (Aforo's tokens live 15 minutes); revoke the client to stop new tokens being minted.
 
-**Not checked here: scopes and `aud`.** `key-authorizer.js` has no route → scope map and returns a stage-wide Allow, so a key or JWT it accepts can call every route on the stage; it does not read the `scopes` or `aud` claims. If routes need different scopes, use `authorizer.js` with [`AFORO_ROUTE_SCOPES`](#scopes-per-route-aforo_route_scopes) for JWT callers. Bringing the same check to `key-authorizer.js` is open work (customer keys carry no scopes today, so it needs a decision on where a key's scopes come from).
+**Scopes (2.7.0), not `aud`.** With `AFORO_ROUTE_SCOPES` set, a JWT must hold the route's scopes in its `scopes` claim (a space-separated string or an array), exactly as in `authorizer.js`. Without it no scope is checked, and the Allow still covers only the called method. The `aud` claim is not read here; use `authorizer.js` with `AFORO_JWT_AUDIENCE` if you need it.
 
 | Variable | Default | |
 |---|---|---|
@@ -123,7 +143,7 @@ This keeps the deployment package tiny and eliminates supply-chain risk.
 5. Check jti blocklist in Redis: `jti:blocked:{jti}` — key exists = token revoked
 6. Check client-level revocation in Redis: `jti:client:{keyId}` — key exists = all tokens for this key revoked
 7. When `AFORO_ROUTE_SCOPES` is set: the token must hold every scope the called method and path need
-8. Return IAM `Allow` with JWT claims as authorizer context variables. Without `AFORO_ROUTE_SCOPES` the Allow covers the called method's stage (`arn:…:<apiId>/<stage>/*`); with it, the called method ARN only
+8. Return IAM `Allow` with JWT claims as authorizer context variables. The Allow covers the called method ARN only (2.7.0); with `AFORO_POLICY_RESOURCE=stage` and no `AFORO_ROUTE_SCOPES`, the called method's stage (`arn:…:<apiId>/<stage>/*`), as before 2.7.0
 
 On any failure, return IAM `Deny` for the called method (never throw — that would produce HTTP 500 instead of 403).
 
@@ -137,7 +157,7 @@ An unknown `kid` refetches the JWKS at most once per 30 s. If that refetch fails
 
 ## Scopes per route (`AFORO_ROUTE_SCOPES`)
 
-Set this when routes on one stage need different scopes, for example a read-only client that must not reach `DELETE /v1/items/{id}`. Without it, every token of your workspace can call every route on the stage and the scopes only travel on in `$context.authorizer.scopes` (the behaviour before 2.6.0, unchanged when the variable is unset).
+Set this when routes on one stage need different scopes, for example a read-only client that must not reach `DELETE /v1/items/{id}`. Without it, every token of your workspace can call every route on the stage and the scopes only travel on in `$context.authorizer.scopes`. `key-authorizer.js` reads the same variable since 2.7.0 (a customer key's scopes come from the introspection answer).
 
 The value is a JSON object. Each key is `"METHOD /path"`, each value is one scope or an array of scopes; the token must hold **all** of them.
 
@@ -191,6 +211,8 @@ Other denials this setting adds:
 The token's scopes are read as before: the `scopes` claim, a space-separated string or an array. A scope must equal the required one; `items:reader` does not satisfy `items:read`, and there are no scope wildcards.
 
 ### The cache changes when a map is set
+
+Since 2.7.0 this applies without a map too (see [Safe defaults](#safe-defaults-270-g341)), unless `AFORO_POLICY_RESOURCE=stage`.
 
 With a map, an Allow names the called method ARN only (`arn:…:<apiId>/<stage>/GET/v1/items/42`), never the stage. That is what stops a cached Allow for one route from opening another route that needs a different scope. It also means the cached result is only good for the route it was made for, so the cache key must include the method and the path. A `TOKEN` authorizer cannot do that: its key is the token alone. Pick one of these when you set `AFORO_ROUTE_SCOPES`:
 
@@ -273,7 +295,7 @@ A cached Allow outlives the change by at most the authorizer result TTL.
 
 ```bash
 cd aforo-gateway-plugins/aws-lambda
-zip -r authorizer.zip authorizer.js aws-secret.js
+zip -r authorizer.zip authorizer.js aws-secret.js route-scopes.js
 ```
 
 No `npm install` needed — zero dependencies.
@@ -309,23 +331,22 @@ and security group as your ElastiCache cluster.
 aws apigateway create-authorizer \
   --rest-api-id YOUR_API_ID \
   --name aforo-jwt-authorizer \
-  --type TOKEN \
+  --type REQUEST \
   --authorizer-uri "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:ACCOUNT:function:aforo-jwt-authorizer/invocations" \
-  --identity-source "method.request.header.Authorization" \
+  --identity-source "method.request.header.Authorization,context.httpMethod,context.path" \
   --authorizer-result-ttl-in-seconds 60
 ```
 
 **Caching TTL**: 60 s or less. API Gateway reuses a cached Allow without calling
 the authorizer, so a token revoked in Redis keeps working until its cached result
-expires. Before 2.5.0 this page recommended 840 s (14 minutes). The cached Allow
-covers one stage of one API; set the TTL to 0 if you need every call checked.
+expires. Before 2.5.0 this page recommended 840 s (14 minutes). Set the TTL to 0
+if you need every call checked.
 
-**With `AFORO_ROUTE_SCOPES` set, do not use this command as it stands.** The
-Allow then covers one method ARN, and a `TOKEN` authorizer caches by token
-alone: create a `REQUEST` authorizer with identity sources
-`method.request.header.Authorization,context.httpMethod,context.path` (TTL 60 s
-or less), or keep `TOKEN` with TTL 0. Commands and the reason:
-[The cache changes when a map is set](#the-cache-changes-when-a-map-is-set).
+**Why `REQUEST`:** since 2.7.0 an Allow covers one method ARN, and a `TOKEN`
+authorizer caches by token alone, so with a TTL above 0 the next route a client
+calls gets 403. A `TOKEN` authorizer still works with TTL 0, or with
+`AFORO_POLICY_RESOURCE=stage` (stage-wide Allow, pre-2.7.0) and a TTL of 60 s or
+less. See [Safe defaults](#safe-defaults-270-g341).
 
 ### Step 4 — Grant API Gateway Permission to Invoke Lambda
 
@@ -377,7 +398,7 @@ The authorizer calls the JWKS endpoint over HTTPS, Secrets Manager, and ElastiCa
 
 | | `index.js` | `authorizer.js` |
 |---|---|---|
-| Trigger | CloudWatch Logs subscription | API Gateway TOKEN authorizer |
+| Trigger | CloudWatch Logs subscription | API Gateway REQUEST (or TOKEN) authorizer |
 | Phase | Async post-response | Synchronous pre-request |
 | Can block requests | No | Yes (Allow/Deny) |
 | Purpose | Usage metering | JWT authentication |
@@ -387,20 +408,29 @@ Use both together: `authorizer.js` gates access, `index.js` meters usage.
 ## SAM / CloudFormation
 
 `template.yaml` deploys the metering function, the metering proxy and
-`key-authorizer.js`. It does not create `authorizer.js` or its API Gateway
-authorizer, so it cannot set the result TTL or the identity sources for you: the
-values above are yours to set. To add it to your own template, declare an
-`AWS::Serverless::Function` plus an `AWS::ApiGateway::Authorizer` with
-`AuthorizerResultTtlInSeconds: 60` (and, with `AFORO_ROUTE_SCOPES`,
-`Type: REQUEST` and `IdentitySource: method.request.header.Authorization,context.httpMethod,context.path`),
-mirroring the CLI steps above.
+`key-authorizer.js` (`DeployKeyAuthorizer=true`). Since 2.7.0, with
+`AuthorizerRestApiId=<your REST API id>` it also creates the API Gateway
+authorizer for `key-authorizer.js`: `Type: REQUEST`, identity sources
+`method.request.header.Authorization,context.httpMethod,context.path`,
+`AuthorizerResultTtlInSeconds` from `AuthorizerResultTtlSeconds` (default 60,
+at most 60). Attach it to your methods (output `KeyAuthorizerId`) and redeploy
+the stage. `AuthorizerPolicyResource` (default `method`) and
+`AuthorizerRouteScopes` set `AFORO_POLICY_RESOURCE` and `AFORO_ROUTE_SCOPES`.
+
+The template does not create `authorizer.js`. To add it to your own template,
+declare an `AWS::Serverless::Function` plus an `AWS::ApiGateway::Authorizer`
+with `Type: REQUEST`,
+`IdentitySource: method.request.header.Authorization,context.httpMethod,context.path`
+and `AuthorizerResultTtlInSeconds: 60` or less, mirroring
+`AforoKeyAuthorizerApiGatewayAuthorizer` in `template.yaml`.
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | Every call is 403 right after setting `AFORO_ROUTE_SCOPES`; log shows `AFORO_ROUTE_SCOPES is not valid` | The value does not parse (the log line gives the reason) | Fix the JSON; check it with the `node -e` line under [Scopes per route](#scopes-per-route-aforo_route_scopes). The next cold container, or the next value, is read again. |
-| The first route works, the next route with the same token is 403 for up to the TTL, with no authorizer log line | `TOKEN` authorizer with a TTL above 0 and a map: the first route's cached policy is reused | Switch to the `REQUEST` authorizer with the three identity sources, or set the TTL to 0. |
+| The first route works, the next route with the same token is 403 for up to the TTL, with no authorizer log line | `TOKEN` authorizer with a TTL above 0 and a per-method Allow (the 2.7.0 default, and always with a map): the first route's cached policy is reused | Switch to the `REQUEST` authorizer with the three identity sources (`AuthorizerRestApiId` in `template.yaml` creates it), or set the TTL to 0. Without a map, `AFORO_POLICY_RESOURCE=stage` restores the stage-wide Allow; keep the TTL at 60 s or less. |
+| `Cannot find module './route-scopes'` after upgrading to 2.7.0 | A hand-built zip without the new file | Zip `route-scopes.js` with the authorizer (and `aws-secret.js`). |
 | 403 with `error: INSUFFICIENT_SCOPE` on a route you thought was open | A broader entry (`ANY /v1/admin/**`, `"*"`) matches it | Add a more specific entry for that route with the scope it needs, or `[]` for none. |
 | A route needs no scope although the map lists it | The entry does not match the real path: different case, a missing segment, `{id}` where the path has two segments | Compare the entry with the path in the method ARN (API Gateway execution log); add `"*"` so unmatched routes still need a scope. |
 | Every call is 403 with `error: INVALID_AUDIENCE` after setting `AFORO_JWT_AUDIENCE` | Tokens carry no `aud` yet, or a different one | Set `AFORO_JWT_AUDIENCE_ALLOW_MISSING=true` until organization-service mints `aud`; compare the list with a decoded token's `aud`. |

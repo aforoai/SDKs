@@ -833,7 +833,7 @@ end
 
 local AforoMeteringHandler = {
     PRIORITY = 5,    -- Run after most other plugins
-    VERSION  = "2.8.2",
+    VERSION  = "2.8.3",
 }
 
 -- The event buffer and its delivery to the ingestor live in event-buffer.lua.
@@ -1431,14 +1431,53 @@ local function mapping_matches(path, rule)
     return false
 end
 
+-- Decoded mappings, per worker (2.8.3, G324). The JSON in shared memory used
+-- to be decoded on every metered request. Each worker now keeps the table it
+-- decoded together with the exact string it came from, per mappings key (so
+-- per tenant + mappings_url, like the shm entry), and decodes again only when
+-- the string in shm differs. The string is compared, not a timestamp: it is
+-- what every worker reads, so a rewrite, a refresh that fails to store, an
+-- eviction and a deleted key all look the same here as to a worker with no
+-- cache. When the key is gone the worker forgets its table too.
+--
+-- The cached rules are only ever read (metric_from_cached_mappings returns a
+-- metric name, never the table). An undecodable string is remembered as
+-- `false`, so it is not decoded again on every request either.
+local mappings_cache = {}          -- mappings key -> { raw = string, rules = table|false }
+local mappings_cache_size = 0
+local MAPPINGS_CACHE_MAX = 64      -- distinct plugin configs per worker; reset past this
+
+local function cached_mapping_rules(dict, key)
+    local raw = dict:get(key)
+    local entry = mappings_cache[key]
+    if type(raw) ~= "string" then
+        if entry then
+            mappings_cache[key] = nil
+            mappings_cache_size = mappings_cache_size - 1
+        end
+        return nil
+    end
+    if entry and entry.raw == raw then
+        return entry.rules or nil
+    end
+    local ok, rules = pcall(cjson.decode, raw)
+    if not ok or type(rules) ~= "table" then rules = false end
+    if not entry then
+        if mappings_cache_size >= MAPPINGS_CACHE_MAX then
+            mappings_cache, mappings_cache_size = {}, 0
+        end
+        mappings_cache_size = mappings_cache_size + 1
+    end
+    mappings_cache[key] = { raw = raw, rules = rules }
+    return rules or nil
+end
+
 local function metric_from_cached_mappings(conf, path)
     local dict = event_util.cache_dict()
     if not dict then return nil end
     if not conf.mappings_url or conf.mappings_url == "" then return nil end
-    local raw = dict:get(mappings_key(conf))
-    if not raw then return nil end
-    local ok, rules = pcall(cjson.decode, raw)
-    if not ok or type(rules) ~= "table" then return nil end
+    local rules = cached_mapping_rules(dict, mappings_key(conf))
+    if not rules then return nil end
     -- Catalog returns them already ordered; first match wins.
     for _, rule in ipairs(rules) do
         if mapping_matches(path, rule) then
@@ -2177,7 +2216,8 @@ function AforoMeteringHandler:access(conf)
     -- written and packaged in the rockspec but never called, so quotas and
     -- prepaid wallets were enforced only after the fact, at ingest -- by which
     -- point the upstream had already served the request. Off unless
-    -- preflight_quota_enabled; fail-open; see preflight-quota.lua.
+    -- preflight_quota_enabled; fail-open, except for customers the ingestor
+    -- reported as prepaid (2.8.3, G334); see preflight-quota.lua.
     --
     -- It checks the metrics the log phase will bill (see preflight_metrics),
     -- and nothing for a request that will not be billed: an MCP initialize

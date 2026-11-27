@@ -865,6 +865,86 @@ describe("aforo-metering handler", function()
             assert.equals("api_calls", buffered(B)[1].metricName)
         end)
 
+        -- G324 (2.8.3): each worker decodes the mappings JSON once and again
+        -- only when the string in shared memory changes. The cache is module
+        -- state that outlives a test, so each test uses its own tenant.
+        describe("decoded mappings cache (G324)", function()
+            local url = "http://catalog/internal/v1/metrics/gateway-mappings"
+            local function rules(metric)
+                return cjson.encode({ { matchType = "PREFIX", value = "/v1/accounts", metricName = metric } })
+            end
+            -- cjson.decode calls on `raw` (or on any mappings JSON) while fn runs.
+            local function decodes_of(raw, fn)
+                local orig, n = cjson.decode, 0
+                cjson.decode = function(s, ...)
+                    if type(s) == "string" and (s == raw or (raw == nil and s:find('"matchType"', 1, true))) then
+                        n = n + 1
+                    end
+                    return orig(s, ...)
+                end
+                local ok, err = pcall(fn)
+                cjson.decode = orig
+                assert(ok, err)
+                return n
+            end
+            local function metrics(c)
+                local out = {}
+                for i, e in ipairs(buffered(c)) do out[i] = e.metricName end
+                return out
+            end
+
+            it("decodes once across requests", function()
+                local c = conf({ tenant_id = "g324-once", mappings_url = url })
+                local raw = rules("m1")
+                dict:set(handler._mappings_key(c), raw)
+                assert.equals(1, decodes_of(raw, function()
+                    for i = 1, 5 do log(c, "c" .. i) end
+                end))
+                assert.same({ "m1", "m1", "m1", "m1", "m1" }, metrics(c))
+            end)
+
+            it("decodes again after the table in shared memory changes", function()
+                local c = conf({ tenant_id = "g324-change", mappings_url = url })
+                local key = handler._mappings_key(c)
+                dict:set(key, rules("m1"))
+                assert.equals(1, decodes_of(nil, function() log(c, "a"); log(c, "b") end))
+                dict:set(key, rules("m2"))                -- a refresh stored a new table
+                assert.equals(1, decodes_of(nil, function() log(c, "c"); log(c, "d") end))
+                assert.same({ "m1", "m1", "m2", "m2" }, metrics(c))
+            end)
+
+            it("copes with a missing, deleted or unreadable table", function()
+                local c = conf({ tenant_id = "g324-gone", mappings_url = url })
+                local key = handler._mappings_key(c)
+                log(c, "a")                               -- never fetched
+                dict:set(key, rules("m1"))
+                log(c, "b")
+                dict:delete(key)                          -- evicted or flushed
+                log(c, "c")
+                dict:set(key, "not json")
+                assert.equals(1, decodes_of("not json", function() log(c, "d"); log(c, "e") end))
+                dict:set(key, rules("m1"))                -- the same table as before the delete
+                log(c, "f")
+                assert.same({ "api_calls", "m1", "api_calls", "api_calls", "api_calls", "m1" }, metrics(c))
+            end)
+
+            it("keeps one table per tenant and mappings_url", function()
+                local A = conf({ tenant_id = "g324-a", mappings_url = url })
+                local B = conf({ tenant_id = "g324-b", mappings_url = url })
+                local A2 = conf({ tenant_id = "g324-a", mappings_url = url .. "?v=2" })
+                dict:set(handler._mappings_key(A), rules("metric_a"))
+                dict:set(handler._mappings_key(B), rules("metric_b"))
+                dict:set(handler._mappings_key(A2), rules("metric_a2"))
+                assert.equals(3, decodes_of(nil, function()
+                    for _ = 1, 3 do log(A, "a"); log(B, "b"); log(A2, "a2") end
+                end))
+                -- A and A2 share one event buffer (same endpoint, tenant and key).
+                assert.same({ "metric_a", "metric_a2", "metric_a", "metric_a2", "metric_a", "metric_a2" },
+                    metrics(A))
+                assert.same({ "metric_b", "metric_b", "metric_b" }, metrics(B))
+            end)
+        end)
+
         it("drops unusable client values instead of poisoning the batch", function()
             local c = conf()
             local orig = mock_kong.request.get_path

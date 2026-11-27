@@ -4,6 +4,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com); versioning follow
 
 ## [Unreleased]
 
+## [3.2.2] — not yet released
+
+### `aforo-apigateway-role.yaml`
+
+The one-click metering install (organization-service `AwsApiGatewayProvisioningAdapter`) now gives the function what `aws-lambda/template.yaml` already gives it: a failure queue with an alarm (G336), a reserved concurrency (G338), arm64 and a log retention (G339). With `AllowMeteringInstall=true` the role gains exactly these, all in the metering region; with `AllowMeteringInstall=false` the stack is identical to 3.2.1.
+
+- **Failure queue (G336).** Statement `MeteringFailureQueue`: `sqs:CreateQueue`, `GetQueueUrl`, `GetQueueAttributes`, `SetQueueAttributes`, `TagQueue`, `DeleteQueue` on `sqs:…:aforo-metering-*`. The install creates `aforo-metering-<id>-failures` (14 days, SSE) as the function's OnFailure destination; removing metering deletes it only when it is empty. Aforo cannot read, send or purge messages. The execution role `aforo-metering-exec-<ExternalId>` gets `sqs:SendMessage` on `aforo-metering-*` (policy `AforoMeteringFailureQueue`): Lambda delivers a failed invocation with the function's role and refuses the OnFailure destination without it.
+- **Failure alarm (G336).** Statement `MeteringFailureAlarm`: `cloudwatch:PutMetricAlarm`, `DeleteAlarms`, `TagResource` on `alarm:aforo-metering-*` (`ApproximateNumberOfMessagesVisible > 0` on the queue).
+- **Reserved concurrency (G338).** `lambda:PutFunctionConcurrency` and `lambda:DeleteFunctionConcurrency` in `MeteringFunction` (still `function:aforo-metering-*` only).
+- **Log retention (G339).** Statement `MeteringFunctionLogGroup`: `logs:CreateLogGroup`, `PutRetentionPolicy`, `TagResource` on `log-group:/aws/lambda/aforo-metering-*`, the function's own log group. No retention change on any other group (your access logs included), and no log reads or deletes. arm64 needs no permission (`lambda:UpdateFunctionCode` was already granted).
+- Tests: `tests/templates.test.cjs` resolves 3.2.1 (kept as `tests/fixtures/aforo-apigateway-role-3.2.1.yaml`) and 3.2.2 for 72 parameter combinations and checks that 3.2.2 is 3.2.1 plus exactly these additions; every call of the one-click deploy and remove (36) is allowed in four region set-ups; 17 calls that must stay refused are; with `AllowMeteringInstall=false` none of the new calls is allowed. 97 → 127 checks. `cfn-lint` 1.59.0 passes.
+
+### Upgrade from 3.2.1
+
+1. Update the stack with the 3.2.2 template and the same parameters (CloudFormation → Update → Replace current template). Upload the file to the template bucket first (`s3://aforo-templates/aws-apigateway-role.yaml`), since the one-click link loads it from there.
+2. Deploy metering again from Aforo. That creates the queue, alarm and log retention, reserves concurrency and moves the function to arm64. Until the stack is updated, a deploy stops at `sqs:CreateQueue` and leaves an installed function as it is.
+3. A connection with its own `meteringExecutionRoleArn`: allow that role `sqs:SendMessage` on `arn:<partition>:sqs:<region>:<account>:aforo-metering-*` first, or the deploy stops at `lambda:PutFunctionEventInvokeConfig`.
+
 ## [3.2.1] — not yet released
 
 ### `aforo-apigateway-role.yaml`
