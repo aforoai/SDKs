@@ -1,13 +1,15 @@
 <!--
   Aforo Metering — Event Hub delivery (fragment id: aforo-metering-eventhub)
 
-  OPTIONAL, since 2.3.0. Writes the usage event that aforo-metering built
-  (and the compound event aforo-compound-metering built) to Azure Event
-  Hubs instead of posting it to the ingestor from the gateway. A small Azure
-  Function (eventhub-forwarder/) reads the hub, sends batches to the
-  ingestor with retries, and moves its checkpoint only after the ingestor
-  answers 2xx. An ingest outage or a 429 therefore delays usage instead of
-  losing it (for as long as the hub keeps messages: 1 to 7 days).
+  Since 2.3.0; part of the default install since 2.4.0 (G348). Direct
+  delivery, without this fragment, is the opt-in. Writes the usage event
+  that aforo-metering built (and the compound event that
+  aforo-compound-metering built) to Azure Event Hubs instead of posting
+  it to the ingestor from the gateway. A small Azure Function
+  (eventhub-forwarder/) reads the hub, sends batches to the ingestor with
+  retries, and moves its checkpoint only after the ingestor answers 2xx.
+  An ingest outage or a 429 therefore delays usage instead of losing it
+  (for as long as the hub keeps messages: 1 to 7 days).
 
   Prerequisites:
     - an APIM logger with the id aforo-metering-logger, type azureEventHub

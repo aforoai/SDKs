@@ -59,9 +59,11 @@
  *                         no other entry matches; without it such a route
  *                         needs no scope. The most specific matching entry
  *                         wins. Not valid → every request is denied
- *                         (ROUTE_SCOPES_INVALID). When set, an Allow covers
- *                         the called method ARN only (see AUTHORIZER.md for
- *                         the cache settings this needs).
+ *                         (ROUTE_SCOPES_INVALID). Parsed by route-scopes.js.
+ *   AFORO_POLICY_RESOURCE — "method" (default since 2.7.0): an Allow covers
+ *                         the called method ARN only. "stage": an Allow
+ *                         covers the whole stage, as before 2.7.0; ignored
+ *                         while AFORO_ROUTE_SCOPES is set.
  *   REDIS_HOST          — ElastiCache Redis host for jti/client blocklist (optional;
  *                         unset = no revocation check, logged once per container)
  *   REDIS_PORT          — Redis port (default: 6379)
@@ -78,22 +80,18 @@
  * TLS failure, -NOAUTH / -WRONGPASS or any other error reply, a reply that is
  * not a bulk string), the token is denied.
  *
- * API Gateway Authorizer settings, without AFORO_ROUTE_SCOPES:
- *   Type:                 TOKEN
- *   Identity source:      method.request.header.Authorization
- *   Token validation:     ^Bearer\s.+  (optional — authorizer validates itself)
- *   Authorization caching: TTL 60 s or less (the Allow policy covers the
- *                         token's stage; a revoked token stays allowed for at
- *                         most the TTL)
- *
- * With AFORO_ROUTE_SCOPES the Allow covers one method ARN, so the cached
- * result must be per method and path:
+ * API Gateway Authorizer settings (the default per-method Allow, with or
+ * without AFORO_ROUTE_SCOPES; template.yaml creates this when given a
+ * RestApiId):
  *   Type:                 REQUEST
  *   Identity sources:     method.request.header.Authorization,
  *                         context.httpMethod, context.path
- *   Authorization caching: TTL 60 s or less — or keep TOKEN with TTL 0.
+ *   Authorization caching: TTL 60 s or less (a revoked token stays allowed
+ *                         for at most the TTL) — or TOKEN with TTL 0.
  *   A TOKEN authorizer with a TTL above 0 caches one route's policy per token:
  *   the next route called with that token gets 403 until the TTL runs out.
+ *   With AFORO_POLICY_RESOURCE=stage (no route map) a TOKEN authorizer with a
+ *   TTL of 60 s or less works as before 2.7.0.
  *
  * Downstream context variables (accessible via $context.authorizer.* in integrations):
  *   customerId, tenantId, keyId, scopes, environment, offeringIds
@@ -107,6 +105,17 @@ const crypto = require('crypto');
 const net   = require('net');
 const tls   = require('tls');
 const { createSecretSource } = require('./aws-secret');
+const {
+    routeScopeConfig,
+    parseRouteScopes,
+    parseMethodArn,
+    requiredScopesFor,
+    tokenScopes,
+    policyResourceMode,
+    stageArn,
+    allowResource,
+    _reset: resetRouteScopes,
+} = require('./route-scopes');
 
 // ────────────────────────────────────────────────────────────
 // JWKS cache — survives across warm Lambda invocations
@@ -354,184 +363,6 @@ function audienceError(message) {
     const err = new Error(message);
     err.code = 'INVALID_AUDIENCE';
     return err;
-}
-
-// ────────────────────────────────────────────────────────────
-// Route scopes (AFORO_ROUTE_SCOPES)
-// ────────────────────────────────────────────────────────────
-
-const ROUTE_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']);
-
-// Parsed once per container and per value of the variable.
-let routeScopesCache = { raw: null, config: null };
-
-/**
- * The route → scope map.
- *   { configured: false }                       variable unset or blank
- *   { configured: true, routes, fallback }      valid
- *   { configured: true, error }                 not valid — the caller denies
- * A value that does not parse is logged once, when it is first read.
- */
-function routeScopeConfig() {
-    const raw = process.env.AFORO_ROUTE_SCOPES;
-    if (routeScopesCache.config && routeScopesCache.raw === raw) return routeScopesCache.config;
-    let config;
-    if (raw === undefined || String(raw).trim() === '') {
-        config = { configured: false };
-    } else {
-        try {
-            config = { configured: true, ...parseRouteScopes(raw) };
-        } catch (err) {
-            config = { configured: true, error: err.message };
-            console.error(`Authorizer: AFORO_ROUTE_SCOPES is not valid — denying every request until it is fixed. ${err.message}`);
-        }
-    }
-    routeScopesCache = { raw, config };
-    return config;
-}
-
-/**
- * Parse AFORO_ROUTE_SCOPES. Throws on anything that is not a JSON object of
- * "METHOD /path" (or "*") → scope | scope[].
- *
- * @param {string} raw
- * @returns {{ routes: object[], fallback: string[] | null }}
- */
-function parseRouteScopes(raw) {
-    let parsed;
-    try {
-        parsed = JSON.parse(raw);
-    } catch (err) {
-        throw new Error(`It is not JSON (${err.message}).`);
-    }
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        throw new Error('It must be a JSON object such as {"GET /v1/items/{id}": "items:read"}.');
-    }
-    const routes = [];
-    const seen = new Set();
-    let fallback = null;
-    for (const [key, value] of Object.entries(parsed)) {
-        const scopes = parseRequiredScopes(key, value);
-        if (key.trim() === '*') {
-            fallback = scopes;
-            continue;
-        }
-        const m = key.trim().match(/^(\S+)\s+(\/\S*)$/);
-        if (!m) throw new Error(`Entry "${key}": expected "METHOD /path" or "*".`);
-        let method = m[1].toUpperCase();
-        if (method === 'ANY') method = '*';
-        if (method !== '*' && !ROUTE_METHODS.has(method)) {
-            throw new Error(`Entry "${key}": unknown method "${m[1]}".`);
-        }
-        const segments = m[2].split('/').filter(Boolean).map((seg, i, all) => {
-            if (seg === '**' || /^\{[^{}+]+\+\}$/.test(seg)) {
-                if (i !== all.length - 1) throw new Error(`Entry "${key}": "${seg}" is allowed only as the last segment.`);
-                return { kind: 'rest' };
-            }
-            if (seg === '*' || /^\{[^{}+]+\}$/.test(seg)) return { kind: 'one' };
-            if (/[{}*]/.test(seg)) throw new Error(`Entry "${key}": segment "${seg}" mixes text with a wildcard.`);
-            return { kind: 'literal', value: seg };
-        });
-        const canonical = `${method} /${segments.map((s) => (s.kind === 'literal' ? s.value : s.kind === 'one' ? '{}' : '{+}')).join('/')}`;
-        if (seen.has(canonical)) throw new Error(`Entry "${key}" matches the same routes as another entry.`);
-        seen.add(canonical);
-        routes.push({ pattern: canonical, method, segments, scopes });
-    }
-    return { routes, fallback };
-}
-
-/** A scope string (space-separated, like the claim) or an array of scopes. [] = no scope needed. */
-function parseRequiredScopes(key, value) {
-    if (typeof value === 'string') {
-        const scopes = value.split(/\s+/).filter(Boolean);
-        if (scopes.length === 0) throw new Error(`Entry "${key}": the scope is empty. Use [] for a route that needs no scope.`);
-        return scopes;
-    }
-    if (Array.isArray(value) && value.every((s) => typeof s === 'string' && s.trim() !== '' && !/\s/.test(s.trim()))) {
-        return value.map((s) => s.trim());
-    }
-    throw new Error(`Entry "${key}": the value must be a scope or an array of scopes.`);
-}
-
-/**
- * `arn:aws:execute-api:region:account:apiId/stage/METHOD/path` →
- * { method, segments }. The path is the one the client called (path parameters
- * hold their real values). Empty segments are dropped, so `/a//b/` is `/a/b`.
- * Returns null for anything else, and for a path with a `.` / `..` segment or
- * an encoded slash: the backend might read such a path as another route.
- */
-function parseMethodArn(methodArn) {
-    const parts = String(methodArn || '').split('/');
-    if (parts.length < 3 || !parts[0].startsWith('arn:') || !parts[1] || !parts[2]) return null;
-    const segments = [];
-    for (const rawSeg of parts.slice(3)) {
-        if (rawSeg === '') continue;
-        let seg = rawSeg;
-        try {
-            seg = decodeURIComponent(rawSeg);
-        } catch {
-            return null;
-        }
-        if (seg === '.' || seg === '..' || /[/\\]/.test(seg)) return null;
-        segments.push(seg);
-    }
-    return { method: parts[2].toUpperCase(), segments };
-}
-
-function routeMatches(route, method, segments) {
-    if (route.method !== '*' && route.method !== method) return false;
-    const pat = route.segments;
-    const rest = pat.length > 0 && pat[pat.length - 1].kind === 'rest';
-    const fixed = rest ? pat.length - 1 : pat.length;
-    if (rest ? segments.length < fixed : segments.length !== fixed) return false;
-    for (let i = 0; i < fixed; i++) {
-        if (pat[i].kind === 'literal' && pat[i].value !== segments[i]) return false;
-    }
-    return true;
-}
-
-// Higher is more specific: no more segments > literal > one segment > the rest.
-function segmentRank(seg) {
-    if (!seg) return 3;
-    return seg.kind === 'literal' ? 2 : seg.kind === 'one' ? 1 : 0;
-}
-
-/** > 0 when route a is more specific than route b. */
-function compareSpecificity(a, b) {
-    const n = Math.max(a.segments.length, b.segments.length);
-    for (let i = 0; i < n; i++) {
-        const d = segmentRank(a.segments[i]) - segmentRank(b.segments[i]);
-        if (d !== 0) return d;
-    }
-    return (a.method === '*' ? 0 : 1) - (b.method === '*' ? 0 : 1);
-}
-
-/**
- * The scopes the called route needs.
- * Returns { pattern, scopes } — scopes [] when no entry (and no "*" default)
- * covers the route — or null when the method ARN cannot be read.
- *
- * @param {{ routes: object[], fallback: string[] | null }} config
- * @param {string} methodArn
- */
-function requiredScopesFor(config, methodArn) {
-    const called = parseMethodArn(methodArn);
-    if (!called) return null;
-    let best = null;
-    for (const route of config.routes) {
-        if (!routeMatches(route, called.method, called.segments)) continue;
-        if (!best || compareSpecificity(route, best) > 0) best = route;
-    }
-    if (best) return { pattern: best.pattern, scopes: best.scopes };
-    if (config.fallback) return { pattern: '*', scopes: config.fallback };
-    return { pattern: '', scopes: [] };
-}
-
-/** The scopes claim as a list: a space-separated string or an array. */
-function tokenScopes(claims) {
-    if (Array.isArray(claims.scopes)) return claims.scopes.filter((s) => typeof s === 'string' && s !== '');
-    if (typeof claims.scopes === 'string') return claims.scopes.split(/\s+/).filter(Boolean);
-    return [];
 }
 
 /** The workspace this gateway serves (AFORO_TENANT_ID), or '' when unset. */
@@ -796,21 +627,20 @@ async function isClientRevoked(keyId) {
 /**
  * Build an API Gateway IAM policy document.
  *
- * Allow covers the stage of the called method (`arn:...:apiId/stage/*`), not
- * the whole API: a cached Allow for one stage is not reused on another.
- * With `perMethod` (AFORO_ROUTE_SCOPES is set) Allow covers the called method
- * ARN only, so a cached Allow for one route never allows another route that
- * needs a different scope.
- * Deny covers the called method only. Keep the authorizer result TTL at 60 s
- * or less; a revoked token stays allowed for at most that long.
+ * Allow covers the called method ARN (default since 2.7.0, and always when
+ * AFORO_ROUTE_SCOPES is set), so a cached Allow for one route never opens
+ * another route. With AFORO_POLICY_RESOURCE=stage and no route map, Allow
+ * covers the stage of the called method (`arn:...:apiId/stage/*`), as before
+ * 2.7.0. Deny covers the called method only. Keep the authorizer result TTL
+ * at 60 s or less; a revoked token stays allowed for at most that long.
  *
  * @param {'Allow'|'Deny'} effect
  * @param {string} resource  — the methodArn from the authorizer event
  * @param {object} [context] — key/value pairs passed to $context.authorizer.*
- * @param {{ perMethod?: boolean }} [opts]
+ * @param {{ mode?: 'method'|'stage' }} [opts]
  * @returns {object}  — IAM policy response
  */
-function buildPolicy(effect, resource, context, { perMethod = false } = {}) {
+function buildPolicy(effect, resource, context, { mode = 'method' } = {}) {
     return {
         principalId:    (context && context.customerId) || 'aforo-user',
         policyDocument: {
@@ -818,22 +648,11 @@ function buildPolicy(effect, resource, context, { perMethod = false } = {}) {
             Statement: [{
                 Action:   'execute-api:Invoke',
                 Effect:   effect,
-                Resource: effect === 'Allow' && !perMethod ? stageArn(resource) : String(resource || ''),
+                Resource: effect === 'Allow' ? allowResource(resource, mode) : String(resource || ''),
             }],
         },
         context: context || {},
     };
-}
-
-/**
- * `arn:aws:execute-api:region:account:apiId/stage/METHOD/path` →
- * `arn:aws:execute-api:region:account:apiId/stage/*`. Anything that does not
- * have that shape is returned unchanged (an exact, narrower resource).
- */
-function stageArn(methodArn) {
-    const arn = String(methodArn || '');
-    const m = arn.match(/^(arn:[^:]+:execute-api:[^:]+:\d{12}:[^/]+\/[^/]+)\//);
-    return m ? `${m[1]}/*` : arn;
 }
 
 // ────────────────────────────────────────────────────────────
@@ -943,7 +762,7 @@ exports.handler = async (event) => {
     };
 
     console.log(`Authorizer: Allow — customerId=${context.customerId} tenantId=${context.tenantId}`);
-    return buildPolicy('Allow', methodArn, context, { perMethod: routeScopes.configured });
+    return buildPolicy('Allow', methodArn, context, { mode: policyResourceMode(routeScopes) });
 };
 
 /** The Authorization value: TOKEN event, else a REQUEST event's header. */
@@ -977,7 +796,7 @@ module.exports._test = {
     checkAudience,
     reset() {
         warnedAudienceUnset = false;
-        routeScopesCache = { raw: null, config: null };
+        resetRouteScopes();
         jwksCache = null;
         jwksCacheExpiry = 0;
         jwksFetchErrorTime = 0;

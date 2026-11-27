@@ -2,7 +2,7 @@
 
 Two CloudFormation templates: a cross-account role that lets Aforo read your Amazon API Gateway configuration and, if you allow it, install Aforo's metering Lambda and run Gateway Orchestration and push ingestion; and a policy that blocks deletion of monetized API Gateway resources.
 
-**Version:** 3.2.1 (not yet released) · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 3.2.2 (not yet released) · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## When to reach for this
 
@@ -12,7 +12,7 @@ Use these when you run Amazon API Gateway and connect it to Aforo with a role in
 
 | Template | What it creates |
 |---|---|
-| `aforo-apigateway-role.yaml` | An IAM role Aforo's account can assume with your `ExternalId`. Read: API Gateway `GET` on REST APIs, HTTP APIs and usage plans in one region. Never: API key values, API Gateway writes, log reads. With `AllowMeteringInstall=true` (default): create and update Lambda functions named `aforo-metering-*`, write (not read) the Secrets Manager secrets `aforo/metering/*` that hold their Aforo API key, and subscribe them to API Gateway log groups; plus an execution role `aforo-metering-exec-<ExternalId>` that can only write its own logs and read `aforo/metering/*` secrets. With `AllowGatewayOrchestration=true` (default `false`): manage usage plans and API keys, read API Gateway CloudWatch metrics, create Firehose streams `aforo-gateway-*` fed from API Gateway log groups, and (with `FirehoseBackupBucketArn`) the two service roles that push ingestion needs. |
+| `aforo-apigateway-role.yaml` | An IAM role Aforo's account can assume with your `ExternalId`. Read: API Gateway `GET` on REST APIs, HTTP APIs and usage plans in one region. Never: API key values, API Gateway writes, log reads. With `AllowMeteringInstall=true` (default): create and update Lambda functions named `aforo-metering-*`, write (not read) the Secrets Manager secrets `aforo/metering/*` that hold their Aforo API key, give them an SQS failure queue, a CloudWatch alarm (both `aforo-metering-*`), a reserved concurrency and a retention on `/aws/lambda/aforo-metering-*`, and subscribe them to API Gateway log groups; plus an execution role `aforo-metering-exec-<ExternalId>` that can only write its own logs, read `aforo/metering/*` secrets and send to `aforo-metering-*` queues. With `AllowGatewayOrchestration=true` (default `false`): manage usage plans and API keys, read API Gateway CloudWatch metrics, create Firehose streams `aforo-gateway-*` fed from API Gateway log groups, and (with `FirehoseBackupBucketArn`) the two service roles that push ingestion needs. |
 | `aforo-monetized-deny-policy.yaml` | A managed policy `aforo-deny-delete-monetized-apis` that denies `apigateway:DELETE` on resources tagged `aforo-monetized=true`, optionally attached to the roles, users and groups you name. |
 
 ## Install
@@ -76,10 +76,11 @@ Output: `PolicyArn`.
 - Create or change IAM roles; the roles it can pass are the metering execution role (to Lambda) and, with `AllowGatewayOrchestration=true`, the push-ingestion Firehose role (to Firehose) and CloudWatch Logs role (to CloudWatch Logs).
 - Touch Firehose streams not named `aforo-gateway-*`, or put records into any stream itself.
 - Read the Aforo API key back: it can create, update, describe, delete and restore `aforo/metering/*` secrets, but has no `secretsmanager:GetSecretValue`. Only the execution role reads them.
+- Read, send or purge messages in the failure queue, touch queues or alarms not named `aforo-metering-*`, or change the retention of any log group but `/aws/lambda/aforo-metering-*` (3.2.2). Only the execution role sends to the queue, as Lambda's OnFailure destination.
 
 ## Tests
 
-`node aws-cloudformation/tests/templates.test.cjs` (also run by `cd aws-lambda && npm test`). It reads the template text, and resolves the role template for given parameters (`tests/cfn.cjs`, no npm packages) to check that `AllowGatewayOrchestration=false` grants exactly what 3.1.0 granted, that every call organization-service's AWS adapters make is allowed with `true`, and that the calls listed above stay refused. `cfn-lint` 1.58.0 passes on 3.2.0 (it was not run for 3.0.0 or 3.1.0); 3.2.1 was checked with `aws cloudformation validate-template` and deployed. The Wave 6 test plan ran it live (W6.2, 2026-11-11/12): 3.2.0 refused the tag-on-create of usage plans and API keys, which 3.2.1 grants; with 3.2.1 a role-only connection provisions, suspends, throttles and polls by the role alone.
+`node aws-cloudformation/tests/templates.test.cjs` (also run by `cd aws-lambda && npm test`). It reads the template text, and resolves the role template for given parameters (`tests/cfn.cjs`, no npm packages) to check that `AllowGatewayOrchestration=false` grants exactly what 3.1.0 granted, that every call organization-service's AWS adapters make is allowed with `true`, and that the calls listed above stay refused; since 3.2.2 also that 3.2.2 is 3.2.1 plus exactly the metering additions, and that every call of the one-click deploy and remove is allowed. `cfn-lint` 1.58.0 passes on 3.2.0 (it was not run for 3.0.0 or 3.1.0), 1.59.0 on 3.2.2 (not yet deployed); 3.2.1 was checked with `aws cloudformation validate-template` and deployed. The Wave 6 test plan ran it live (W6.2, 2026-11-11/12): 3.2.0 refused the tag-on-create of usage plans and API keys, which 3.2.1 grants; with 3.2.1 a role-only connection provisions, suspends, throttles and polls by the role alone.
 
 ## What this doesn't cover
 

@@ -1,9 +1,10 @@
 'use strict';
 /**
- * template.yaml checks for G337 (key in Secrets Manager), G338 (reserved
- * concurrency, batch size) and G339 (subscription filter, arm64, log
- * retention). cfn-lint validates the template's shape; these tests pin the
- * decisions. No YAML library (no npm packages), so the checks read the text.
+ * template.yaml checks for G336 (failure queue and its alarm), G337 (key in
+ * Secrets Manager), G338 (reserved concurrency, batch size) and G339
+ * (subscription filter, arm64, log retention). cfn-lint validates the
+ * template's shape; these tests pin the decisions. No YAML library (no npm
+ * packages), so the checks read the text.
  */
 const fs = require('fs');
 const path = require('path');
@@ -37,6 +38,33 @@ function paramDefault(name) {
     return v.startsWith("'") ? v.slice(1, -1).replace(/''/g, "'") : v;
 }
 const FUNCTIONS = ['AforoMeteringFunction', 'AforoMeteringProxyFunction', 'AforoKeyAuthorizerFunction'];
+
+console.log('\nG336: undeliverable batches go to the failure queue, and an alarm says so');
+const eventInvoke = block('EventInvokeConfig', 6);
+assert(/MaximumRetryAttempts: 2/.test(eventInvoke) && /MaximumEventAgeInSeconds: 21600/.test(eventInvoke),
+    'async retries: 2, up to 6 hours');
+assert(/OnFailure:\s*\n\s+Type: SQS\s*\n\s+Destination: !GetAtt AforoMeteringFailureQueue\.Arn/.test(eventInvoke),
+    'OnFailure destination is the failure queue');
+const queue = block('AforoMeteringFailureQueue');
+assert(/Type: AWS::SQS::Queue/.test(queue) && /MessageRetentionPeriod: 1209600/.test(queue), 'failure queue keeps messages 14 days');
+const alarm = block('AforoMeteringFailureAlarm');
+assert(/Type: AWS::CloudWatch::Alarm/.test(alarm), 'failure-queue alarm exists');
+assert(/Namespace: AWS\/SQS/.test(alarm) && /MetricName: ApproximateNumberOfMessagesVisible/.test(alarm),
+    'alarm watches ApproximateNumberOfMessagesVisible');
+assert(/- Name: QueueName\s*\n\s+Value: !GetAtt AforoMeteringFailureQueue\.QueueName/.test(alarm), 'alarm is on the failure queue');
+assert(/Threshold: 0\b/.test(alarm) && /ComparisonOperator: GreaterThanThreshold/.test(alarm) && /Statistic: Maximum/.test(alarm),
+    'alarm fires on more than 0 messages (Maximum)');
+assert(/TreatMissingData: notBreaching/.test(alarm), 'an idle queue (no data points) is not an alarm');
+assert(/AlarmActions: !If \[HasFailureAlarmTopic, \[!Ref FailureAlarmTopicArn\], !Ref AWS::NoValue\]/.test(alarm),
+    'alarm notifies FailureAlarmTopicArn when given');
+assert(paramDefault('FailureAlarmTopicArn') === '', 'FailureAlarmTopicArn is optional');
+{
+    const m = block('FailureAlarmTopicArn').match(/AllowedPattern: '([^']+)'/);
+    const re = new RegExp(m[1]);
+    assert(re.test('') && re.test('arn:aws:sns:eu-west-1:123456789012:aforo-alerts'), 'FailureAlarmTopicArn accepts empty or a topic ARN');
+    assert(!re.test('aforo-alerts') && !re.test('arn:aws:sqs:eu-west-1:123456789012:q'), 'FailureAlarmTopicArn refuses a name or another ARN');
+}
+assert(/Value: !Ref AforoMeteringFailureAlarm/.test(block('FailureAlarmName')), 'stack outputs the alarm name');
 
 console.log('\nG337: the Aforo key comes from Secrets Manager');
 const metering = block('AforoMeteringFunction');
@@ -151,6 +179,30 @@ assert(!matches(filterPattern, samples[8]), 'CLF lines (never billable) are filt
 assert(matches(block('AforoMeteringProxySubscriptionFilter').match(/FilterPattern: '(.*)'/)[1], samples[4]),
     'proxy filter still matches a prefixed proxy record');
 void zlib;
+
+console.log('\nG341 (2.7.0): the authorizer is safe by default');
+const apigwAuthorizer = block('AforoKeyAuthorizerApiGatewayAuthorizer');
+assert(/Type: AWS::ApiGateway::Authorizer/.test(apigwAuthorizer), 'the stack can create the API Gateway authorizer');
+assert(/Condition: CreateApiGatewayAuthorizer/.test(apigwAuthorizer), 'only with DeployKeyAuthorizer and AuthorizerRestApiId');
+assert(/CreateApiGatewayAuthorizer: !And \[!Condition DeployAuthorizer, !Condition HasAuthorizerRestApi\]/.test(T),
+    'CreateApiGatewayAuthorizer needs both');
+assert(/AuthorizerResultTtlInSeconds: !Ref AuthorizerResultTtlSeconds/.test(apigwAuthorizer), 'result TTL comes from the parameter');
+assert(paramDefault('AuthorizerResultTtlSeconds') === '60', 'result TTL defaults to 60 s');
+assert(/MaxValue: 60\b/.test(block('AuthorizerResultTtlSeconds')), 'result TTL cannot exceed 60 s (was 840 s recommended)');
+assert(/MinValue: 0\b/.test(block('AuthorizerResultTtlSeconds')), 'result TTL may be 0');
+assert(/Type: REQUEST/.test(apigwAuthorizer), 'REQUEST authorizer (the cache key can include the route)');
+assert(/IdentitySource: method\.request\.header\.Authorization,context\.httpMethod,context\.path/.test(apigwAuthorizer),
+    'cached per token, method and path, matching the per-method Allow');
+assert(/AuthorizerUri: !Sub arn:\$\{AWS::Partition\}:apigateway:\$\{AWS::Region\}:lambda:path\/2015-03-31\/functions\/\$\{AforoKeyAuthorizerFunction\.Arn\}\/invocations/.test(apigwAuthorizer),
+    'authorizer invokes aforo-key-authorizer');
+assert(/AllowedPattern: '\^\$\|\^\[a-z0-9\]\{10\}\$'/.test(block('AuthorizerRestApiId')), 'AuthorizerRestApiId is empty or an API id');
+assert(paramDefault('AuthorizerPolicyResource') === 'method', 'Allow covers the called method by default');
+assert(/AllowedValues: \[method, stage\]/.test(block('AuthorizerPolicyResource')), 'AuthorizerPolicyResource is method or stage');
+assert(/AFORO_POLICY_RESOURCE: !Ref AuthorizerPolicyResource/.test(authorizer), 'authorizer function gets AFORO_POLICY_RESOURCE');
+assert(/AFORO_ROUTE_SCOPES: !Ref AuthorizerRouteScopes/.test(authorizer), 'authorizer function gets AFORO_ROUTE_SCOPES');
+assert(paramDefault('AuthorizerRouteScopes') === '', 'no route map unless one is given');
+assert(/Condition: CreateApiGatewayAuthorizer/.test(block('KeyAuthorizerId')), 'KeyAuthorizerId output when the authorizer is created');
+assert(!/\b840\b/.test(T.replace(/^\s*#.*$/gm, '').replace(/840 s once recommended/g, '')), 'no 840 s TTL anywhere');
 
 console.log(`\n── Results: ${passed} passed, ${failed} failed ──`);
 process.exit(failed > 0 ? 1 : 0);

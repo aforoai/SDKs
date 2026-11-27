@@ -1628,6 +1628,191 @@ describe("2.8.0 hardening", function()
         end)
     end)
 
+    -- ── G334 (2.8.3): prepaid customers fail closed ───────────────
+    -- The ingestor's answer carries "prepaid" (usage-ingestor #142). The
+    -- plugin keeps the last true per tenant + customer; when the check then
+    -- cannot answer, that customer gets 503 even with fail-open on.
+    describe("pre-flight quota: prepaid customers fail closed (G334, 2.8.3)", function()
+        -- As Kong fills the schema defaults: fail-open on, prepaid fail-closed on.
+        local function pf(extra)
+            local c = conf({ preflight_quota_enabled = true,
+                             preflight_quota_url = "http://ingest/api/v1/quota/check",
+                             preflight_quota_fail_open = true,
+                             preflight_quota_prepaid_fail_closed = true,
+                             preflight_quota_cache_ttl_ms = 1000,
+                             preflight_quota_breaker_threshold = 5,
+                             preflight_quota_breaker_cooldown_s = 10 })
+            for k, v in pairs(extra or {}) do c[k] = v end
+            return c
+        end
+        local function answer(body) return { status = 200, body = body } end
+        -- True when the last exit was the quota-unavailable 503; clears it.
+        local function refused_503()
+            local e = K.response._exit
+            K.response._exit = nil
+            return e ~= nil and e.status == 503 and e.body.message == "Quota check unavailable"
+                and e.headers["Retry-After"] == "1"
+        end
+
+        before_each(function() ngx.shared.aforo_cache = ttl_dict() end)
+
+        it("refuses a prepaid customer with 503 on timeout and lets the others through", function()
+            local c = pf()
+            http_responses = { answer('{"decision":"ALLOW","prepaid":true}'),
+                               answer('{"decision":"ALLOW","prepaid":false}'),
+                               answer('{"decision":"ALLOW"}') }
+            assert.is_false(preflight.check(c, "cust-prepaid", "api_calls"))
+            assert.is_false(preflight.check(c, "cust-postpaid", "api_calls"))
+            assert.is_false(preflight.check(c, "cust-unknown", "api_calls"))
+
+            now = now + 2                                  -- past the 1 s ALLOW cache
+            http_responses = { { err = "timeout" }, { err = "timeout" }, { err = "timeout" },
+                               { err = "timeout" } }
+            assert.is_true(preflight.check(c, "cust-prepaid", "api_calls"))
+            assert.is_true(refused_503(), "a prepaid customer was let through during an outage")
+            -- Per customer: another metric of the same customer is refused too.
+            assert.is_true(preflight.check(c, "cust-prepaid", "sms_sent"))
+            assert.is_true(refused_503())
+            -- Postpaid, and never answered with the field: fail open as before.
+            assert.is_false(preflight.check(c, "cust-postpaid", "api_calls"))
+            assert.is_false(preflight.check(c, "cust-unknown", "api_calls"))
+            assert.is_nil(K.response._exit)
+            assert.equals(1, said("Prepaid customers are refused with 503"))
+        end)
+
+        it("refuses a prepaid customer on a non-200 and an unreadable answer too", function()
+            local c = pf({ preflight_quota_cache_ttl_ms = 0 })
+            http_responses = { answer('{"decision":"WARN","prepaid":true}'), { status = 500 },
+                               answer("<html>bad gateway</html>") }
+            assert.is_false(preflight.check(c, "cust-prepaid", "api_calls"))
+            assert.is_true(preflight.check(c, "cust-prepaid", "api_calls"))
+            assert.is_true(refused_503())
+            assert.is_true(preflight.check(c, "cust-prepaid", "api_calls"))
+            assert.is_true(refused_503())
+        end)
+
+        it("refuses a prepaid customer at once while the breaker is open, without calling", function()
+            local c = pf({ preflight_quota_breaker_threshold = 2, preflight_quota_cache_ttl_ms = 0 })
+            http_responses = { answer('{"decision":"ALLOW","prepaid":true}'),
+                               { err = "timeout" }, { status = 502 } }
+            preflight.check(c, "cust-prepaid", "api_calls")
+            assert.is_false(preflight.check(c, "other-1", "api_calls"))   -- unknown: open
+            assert.is_false(preflight.check(c, "other-2", "api_calls"))   -- breaker opens
+            assert.equals(3, #http_requests)
+
+            assert.is_true(preflight.check(c, "cust-prepaid", "api_calls"))
+            assert.is_true(refused_503())
+            assert.is_false(preflight.check(c, "other-3", "api_calls"))
+            assert.is_nil(K.response._exit)
+            assert.equals(3, #http_requests, "an open breaker still called the ingestor")
+            assert.equals(1, said("not calling it for", "refusing prepaid customers with 503"))
+        end)
+
+        it("learns the flag from DENY and the {data} envelope; false clears it, an absent field does not", function()
+            local c = pf({ preflight_quota_cache_ttl_ms = 0 })
+            local function outage_refuses(id)
+                http_responses = { { err = "timeout" } }
+                local answered = preflight.check(c, id, "api_calls")
+                return answered and refused_503()
+            end
+            http_responses = { answer('{"decision":"DENY","retryAfterMs":1000,"prepaid":true}') }
+            assert.is_true(preflight.check(c, "a", "api_calls"))           -- 429
+            K.response._exit = nil
+            assert.is_true(outage_refuses("a"))
+
+            http_responses = { answer('{"decision":"ALLOW"}') }               -- not known this time
+            assert.is_false(preflight.check(c, "a", "api_calls"))
+            assert.is_true(outage_refuses("a"), "an answer without the field cleared the flag")
+
+            http_responses = { answer('{"decision":"ALLOW","prepaid":false}') } -- moved to postpaid
+            assert.is_false(preflight.check(c, "a", "api_calls"))
+            assert.is_false(outage_refuses("a"))
+
+            http_responses = { answer('{"success":true,"data":{"decision":"ALLOW","prepaid":true}}') }
+            assert.is_false(preflight.check(c, "b", "api_calls"))
+            assert.is_true(outage_refuses("b"))
+            -- Only a JSON boolean counts.
+            http_responses = { answer('{"decision":"ALLOW","prepaid":"true"}') }
+            assert.is_false(preflight.check(c, "c", "api_calls"))
+            assert.is_false(outage_refuses("c"))
+        end)
+
+        it("keeps the flag per tenant, and for a week without a new answer", function()
+            local c = pf({ preflight_quota_cache_ttl_ms = 0 })
+            http_responses = { answer('{"decision":"ALLOW","prepaid":true}') }
+            preflight.check(c, "cust-1", "api_calls")
+            local other = pf({ preflight_quota_cache_ttl_ms = 0, tenant_id = "tenant-X" })
+            http_responses = { { err = "timeout" } }
+            assert.is_false(preflight.check(other, "cust-1", "api_calls"))
+            assert.is_nil(K.response._exit)
+
+            now = now + 6 * 86400
+            http_responses = { { err = "timeout" } }
+            assert.is_true(preflight.check(c, "cust-1", "api_calls"))
+            assert.is_true(refused_503())
+            now = now + 2 * 86400
+            http_responses = { { err = "timeout" } }
+            assert.is_false(preflight.check(c, "cust-1", "api_calls"))
+        end)
+
+        it("preflight_quota_prepaid_fail_closed = false lets prepaid customers through, as before 2.8.3", function()
+            local c = pf({ preflight_quota_prepaid_fail_closed = false, preflight_quota_cache_ttl_ms = 0 })
+            http_responses = { answer('{"decision":"ALLOW","prepaid":true}'), { err = "timeout" } }
+            preflight.check(c, "cust-prepaid", "api_calls")
+            assert.is_false(preflight.check(c, "cust-prepaid", "api_calls"))
+            assert.is_nil(K.response._exit)
+            assert.equals(1, said("Failing OPEN"))
+            assert.equals(0, said("except for customers known to be prepaid"))
+        end)
+
+        it("preflight_quota_fail_open = false still refuses everyone with 503 (unchanged)", function()
+            for _, prepaid_closed in ipairs({ true, false }) do
+                ngx.shared.aforo_cache = ttl_dict()
+                local c = pf({ preflight_quota_fail_open = false, preflight_quota_cache_ttl_ms = 0,
+                               preflight_quota_prepaid_fail_closed = prepaid_closed })
+                http_responses = { answer('{"decision":"ALLOW","prepaid":false}'),
+                                   { err = "timeout" }, { err = "timeout" } }
+                preflight.check(c, "cust-postpaid", "api_calls")
+                assert.is_true(preflight.check(c, "cust-postpaid", "api_calls"))
+                assert.is_true(refused_503())
+                assert.is_true(preflight.check(c, "cust-unknown", "api_calls"))
+                assert.is_true(refused_503())
+            end
+        end)
+
+        it("the access phase answers 503 for a prepaid customer and does not meter the call", function()
+            local c = pf({ exclude_status_codes = {} })
+            K.client._consumer = { custom_id = "cust-prepaid", username = "acme" }
+            http_responses = { answer('{"decision":"ALLOW","prepaid":true}') }
+            handler:access(c)
+            handler:log(c)
+            assert.is_nil(K.response._exit)
+            assert.equals(1, ngx.shared.aforo_buffer:llen(handler._buffer_key(c)))
+
+            now = now + 2
+            K.ctx.shared = {}
+            http_responses = { { err = "connection refused" } }
+            handler:access(c)
+            assert.equals(503, K.response._exit.status)
+            handler:log(c)
+            assert.equals(1, ngx.shared.aforo_buffer:llen(handler._buffer_key(c)),
+                "the refused request was buffered as billable usage")
+        end)
+
+        it("the schema turns it on by default", function()
+            local saved = package.loaded["kong.db.schema.typedefs"]
+            package.loaded["kong.db.schema.typedefs"] = { no_consumer = {}, protocols_http = {} }
+            package.loaded["schema"] = nil
+            local schema = require("schema")
+            package.loaded["kong.db.schema.typedefs"] = saved
+            package.loaded["schema"] = nil
+            local f = schema_field(schema, "preflight_quota_prepaid_fail_closed")
+            assert.equals("boolean", f.type)
+            assert.is_true(f.default)
+            assert.is_true(schema_field(schema, "preflight_quota_fail_open").default)
+        end)
+    end)
+
     -- ── G325 / G327: revocation Redis ──────────────────────────────
     describe("revocation Redis (G325, G327)", function()
         local function jwt_access(extra)
@@ -1973,7 +2158,7 @@ describe("2.8.0 hardening", function()
     -- ── G335: compound-metering is not packaged ────────────────────
     describe("package contents (G335)", function()
         it("ships only modules the plugin loads, and every listed file exists", function()
-            local f = assert(io.open("kong-plugin-aforo-metering-2.8.2-1.rockspec", "rb"))
+            local f = assert(io.open("kong-plugin-aforo-metering-2.8.3-1.rockspec", "rb"))
             local src = f:read("*all")
             f:close()
             assert.is_nil(src:find("compound%-metering%.lua"), "compound-metering is still packaged")

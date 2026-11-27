@@ -558,7 +558,7 @@ return {
                             type = "integer",
                             default = 300,
                             gt = 0,
-                            description = "Timeout for the quota check, in ms. This is on the request path (only on a cache miss); on timeout the request proceeds (see preflight_quota_fail_open). 300 allows for Kong-to-Aforo over the internet.",
+                            description = "Timeout for the quota check, in ms. This is on the request path (only on a cache miss); on timeout the fail mode applies (see preflight_quota_fail_open and preflight_quota_prepaid_fail_closed). 300 allows for Kong-to-Aforo over the internet.",
                         },
                     },
                     {
@@ -573,7 +573,17 @@ return {
                         preflight_quota_fail_open = {
                             type = "boolean",
                             default = true,
-                            description = "When the quota check errors, times out, answers non-200 or its circuit breaker is open, let the request through (true) or refuse it with 503 (false).",
+                            description = "When the quota check errors, times out, answers non-200 or its circuit breaker is open, let the request through (true) or refuse it with 503 (false). With true, customers known to be prepaid are still refused unless preflight_quota_prepaid_fail_closed is false.",
+                        },
+                    },
+                    -- 2.8.3 (G334). The ingestor's quota answer says whether
+                    -- the customer is prepaid; preflight-quota.lua keeps the
+                    -- last true per customer for the next outage.
+                    {
+                        preflight_quota_prepaid_fail_closed = {
+                            type = "boolean",
+                            default = true,
+                            description = "When the quota check cannot answer (error, timeout, non-200, open breaker), refuse with 503 a customer the ingestor last reported as prepaid (a wallet pays first), even when preflight_quota_fail_open is true. Other customers follow preflight_quota_fail_open. false applies preflight_quota_fail_open to everyone, as before 2.8.3.",
                         },
                     },
                     {
@@ -581,7 +591,7 @@ return {
                             type = "integer",
                             default = 5,
                             between = { 0, 1000 },
-                            description = "Consecutive quota-check failures that open the circuit breaker. While open, the check is not called and preflight_quota_fail_open applies at once. 0 turns the breaker off.",
+                            description = "Consecutive quota-check failures that open the circuit breaker. While open, the check is not called and the fail mode applies at once. 0 turns the breaker off.",
                         },
                     },
                     {

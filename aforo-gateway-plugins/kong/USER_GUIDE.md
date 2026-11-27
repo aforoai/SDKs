@@ -1,6 +1,6 @@
 # kong-plugin-aforo-metering — User Guide
 
-**Version:** 2.8.2 · **Updated:** 2026-10-28 · **Audience:** engineers running Kong Gateway (OSS, Enterprise or Kong Konnect data planes) who want API usage metered into Aforo.
+**Version:** 2.8.3 · **Updated:** 2026-11-25 · **Audience:** engineers running Kong Gateway (OSS, Enterprise or Kong Konnect data planes) who want API usage metered into Aforo.
 
 ## What you'll build
 
@@ -21,10 +21,10 @@ Not yet on LuaRocks, so build it from the rockspec in this folder:
 git clone https://github.com/aforoai/SDKs.git
 cd SDKs/aforo-gateway-plugins/kong
 luarocks install lua-resty-http
-luarocks make kong-plugin-aforo-metering-2.8.2-1.rockspec
+luarocks make kong-plugin-aforo-metering-2.8.3-1.rockspec
 ```
 
-`luarocks make` reads `kong-plugin-aforo-metering-2.8.2-1.rockspec` and installs the `handler`, `schema`, `rate-limit-enforce`, `margin-guard`, `preflight-quota`, `redis-util`, `event-buffer` and `event-util` modules under `kong.plugins.aforo-metering.*`.
+`luarocks make` reads `kong-plugin-aforo-metering-2.8.3-1.rockspec` and installs the `handler`, `schema`, `rate-limit-enforce`, `margin-guard`, `preflight-quota`, `redis-util`, `event-buffer` and `event-util` modules under `kong.plugins.aforo-metering.*`.
 
 Two things that will bite you if you skip them:
 
@@ -150,13 +150,15 @@ Configurable via `metric_header` / `quantity_header`; set either to `null` to di
 
 The pre-flight quota check, when on, checks the metric from steps 2-6: the response header does not exist yet when it runs.
 
+The same goes for the quantity. A numeric `quantity_source` is sent as the estimate; with `response_size` or `X-Aforo-Quantity` the check asks about 1 unit, so the last call before a quota runs out can overshoot it by the rest of its quantity. This is a known limitation: the ingestor still records the full quantity, and the next call is refused.
+
 Existing deployments that set a custom `metric_name_pattern` keep working unchanged.
 
 MCP tool calls use the metric above; gRPC, GraphQL and WebSocket events (`grpc_enabled`, `graphql_enabled`, `websocket_enabled`) use fixed names (`grpc_api.rpc_calls`, `graphql_api.operations`, `websocket_api.connection_opened`). The mappings apply to plain HTTP events.
 
 ### Fetching the rules from Aforo
 
-Set `mappings_url` to your catalog's gateway-mappings endpoint and the plugin reads the rules you declared on each metric, so a new metric needs no gateway change. The fetch runs in a background timer with `mappings_timeout_ms` (3 s); requests only read the cached table. One worker fetches at a time, a failed fetch is retried after `mappings_refresh_seconds`, and the last good table keeps being used.
+Set `mappings_url` to your catalog's gateway-mappings endpoint and the plugin reads the rules you declared on each metric, so a new metric needs no gateway change. The fetch runs in a background timer with `mappings_timeout_ms` (3 s); requests only read the cached table. One worker fetches at a time, a failed fetch is retried after `mappings_refresh_seconds`, and the last good table keeps being used. Each worker decodes the cached table once and keeps it until the table in shared memory changes (2.8.3; before, it was decoded on every request).
 
 
 ### What happens to a metric name Aforo does not know
@@ -461,6 +463,7 @@ See the full option table in [README.md](README.md#configuration). The three you
 | 503 `REVOCATION_CHECK_UNAVAILABLE`, log shows `MOVED` | `jwt_redis_host` is one node of a classic Redis Cluster; keys on other shards answer `MOVED` and the plugin does not follow redirects | Point `jwt_redis_host` at ElastiCache Serverless or a cluster proxy that routes per key. |
 | Rate limits not enforced, `[aforo-ratelimit]` error log shows `MOVED` | `rate_limit_redis_host` is one node of a multi-shard classic Redis Cluster; keys on other shards answer `MOVED`, the plugin does not follow redirects, and the check fails open | Point `rate_limit_redis_host` at ElastiCache Serverless, a cluster proxy that routes per command, or a single-shard Redis. |
 | Margin guard never refuses; log shows `Check failed: timeout` or `Pricing check failed N times in a row` | Pricing does not answer within `margin_guard_timeout_ms` (300 ms), and after 5 failures the breaker stops calling it for 10 s | Check `margin_guard_url` reachability; raise `margin_guard_timeout_ms` for a distant pricing host. The breaker settings are `margin_guard_breaker_threshold` / `margin_guard_breaker_cooldown_s`. |
+| Some customers get 503 `Quota check unavailable`, others pass; log says `Prepaid customers are refused with 503` | The pre-flight quota check cannot answer (timeout, error, non-200 or its breaker is open), and those customers were last reported prepaid by the ingestor (2.8.3) | Restore Kong's access to `preflight_quota_url` (check the key with `preflight_quota_api_key`, and the timeout). To let prepaid customers through during the outage instead, set `preflight_quota_prepaid_fail_closed: false`. |
 | Events buffer but never flush | `flush_count` not reached and `flush_interval_ms` not yet elapsed | Wait for the interval, lower `flush_count` to 1 for testing, or send more traffic. |
 | Flush logs `status=401` | Wrong `api_key` or `tenant_id` | Re-check the Aforo API key and tenant; both are sent on the flush (`X-API-Key` + `X-Tenant-Id`). |
 | Events land in Aforo with empty/missing customer | No Kong consumer bound and no JWT claim | Add an auth plugin (key-auth/JWT) with a consumer, or enable `jwt_validation_enabled`. |

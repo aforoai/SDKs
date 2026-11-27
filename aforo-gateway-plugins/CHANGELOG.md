@@ -4,6 +4,29 @@ This monorepo ships five gateway metering plugins (Kong, Apigee, AWS Lambda, Azu
 
 ## Unreleased
 
+### AWS one-click metering hardening: AWS Lambda 2.7.1, CloudFormation 3.2.2 (G336, G338, G339)
+
+- `aws-lambda/template.yaml`: CloudWatch alarm `AforoMeteringFailureAlarm` on the OnFailure queue (`ApproximateNumberOfMessagesVisible > 0`), optional SNS topic `FailureAlarmTopicArn`. Function code unchanged.
+- `aws-cloudformation/aforo-apigateway-role.yaml` 3.2.2: with `AllowMeteringInstall=true` the role may create the one-click function's failure queue and alarm (`aforo-metering-*`), reserve its concurrency and set the retention of `/aws/lambda/aforo-metering-*`; the execution role may send to `aforo-metering-*` queues. Identical to 3.2.1 with `AllowMeteringInstall=false`. organization-service's one-click install uses these to match the SAM template: failure queue + alarm, reserved concurrency 10, arm64, 14-day log retention. Existing stacks: update with the 3.2.2 template, then deploy metering again. Details: `aws-cloudformation/CHANGELOG.md` 3.2.2, `aws-lambda/CHANGELOG.md` 2.7.1.
+
+### Azure APIM 2.4.0: JWT keys from a discovery document, Event Hub delivery by default (G349, G348)
+
+- `aforo-jwt-validation` takes the new Named Value `aforo-openid-config-url` (organization-service's `https://org.aforo.ai/.well-known/openid-configuration`) instead of `aforo-jwks-uri`. `openid-config` needs a discovery document; with the bare JWKS URL the docs asked for, every request got 401. Needs the organization-service build that serves the document.
+- The documented install is Event Hub delivery (forwarder Function, retries, checkpoint after accept); direct `send-one-way-request` delivery is the opt-in. Policy behaviour is unchanged for existing installs. The one-click deploy still installs direct delivery. Not run on Azure.
+
+### Kong 2.8.3: prepaid customers fail closed; mappings decoded once per worker (G334, G324)
+
+- With `preflight_quota_enabled`, a customer the ingestor's quota answer last reported as `"prepaid": true` (usage-ingestor #142) is refused 503 `Quota check unavailable` while the check cannot answer (timeout, error, non-200, open breaker), even with `preflight_quota_fail_open = true`. Postpaid and not-yet-known customers are let through as before. The flag is kept per tenant and customer for 7 days in `aforo_cache`. New setting `preflight_quota_prepaid_fail_closed` (default `true`; `false` = 2.8.2 behaviour).
+- With `mappings_url`, each worker decodes the cached mappings once and again only when they change, instead of on every request.
+- Documented: a quantity from the response (`response_size`, `X-Aforo-Quantity`) is checked as 1, so one call can overshoot the quota. Not run on a live gateway. Details: `kong/CHANGELOG.md` 2.8.3.
+
+### AWS Lambda 2.7.0: authorizers safe by default (G341)
+
+- Both authorizers return an Allow for the called method ARN by default, not the whole stage; `AFORO_POLICY_RESOURCE=stage` restores the old stage-wide Allow. A `TOKEN` authorizer with a TTL above 0 then answers 403 on a client's second route: switch to `REQUEST` (method + path in the identity sources), TTL 0, or set `stage`.
+- `template.yaml` creates the `key-authorizer.js` API Gateway authorizer when given `AuthorizerRestApiId`: `REQUEST`, cached per token, method and path, result TTL default 60 s and capped at 60.
+- `key-authorizer.js` enforces `AFORO_ROUTE_SCOPES` (keys: introspection `scopes`; JWTs: `scopes` claim) and accepts `REQUEST` events. Route matching moved to `route-scopes.js` (hand-built zips must include it).
+- Not enforced: the TTL of an authorizer the template does not create. Not run on a live stage. Details: `aws-lambda/CHANGELOG.md` 2.7.0.
+
 ### MuleSoft 3.2.0: batching under load and put-back of undelivered usage (G362)
 
 - Under load, usage waiting behind the 16 running deliveries goes out in one request of up to 500 events; under light traffic one call still sends one request.

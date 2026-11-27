@@ -7,12 +7,22 @@
   aforo-context and aforo-margin-guard (both read the verified claims from
   aforo-jwt-payload).
 
-  Named Values this fragment references. All four must exist:
-    aforo-jwks-uri        — passed to openid-config, which expects an OpenID
-                            Connect discovery document
-                            (.../.well-known/openid-configuration) whose
-                            jwks_uri points at the keys, not a bare JWKS URL.
-    aforo-jwt-issuer      — expected issuer, e.g. https://auth.aforo.ai
+  Named Values this fragment references. All must exist:
+    aforo-openid-config-url — the issuer's OpenID Connect discovery
+                            document, passed to openid-config. For Aforo
+                            tokens:
+                            https://org.aforo.ai/.well-known/openid-configuration
+                            (organization-service). APIM reads jwks_uri
+                            from it, caches the keys for an hour and
+                            refetches when a token names an unknown kid,
+                            so a signing-key rotation needs no change
+                            here. Not a bare JWKS URL: openid-config then
+                            finds no keys and every request gets 401.
+                            Up to 2.3.2 this Named Value was aforo-jwks-uri
+                            and the docs asked for the JWKS URL (G349).
+    aforo-jwt-issuer      — the iss of Aforo tokens: https://auth.aforo.ai.
+                            An identifier, not a host: the discovery
+                            document on org.aforo.ai names this issuer.
     aforo-org-service-url — org-service base URL reachable from APIM, no
                             trailing slash. Used for the jti revocation
                             check. Up to 2.0.x this was hardcoded to a
@@ -76,9 +86,9 @@
 -->
 <fragment>
     <!--
-      validate-jwt performs RS256 signature verification using the JWKS URI.
-      APIM fetches and caches the JWKS automatically; the cache is refreshed
-      when a `kid` is not found (key rotation scenario).
+      validate-jwt performs RS256 signature verification with the keys named
+      by the discovery document's jwks_uri. APIM fetches and caches both; the
+      cache is refreshed when a `kid` is not found (key rotation scenario).
 
       clock-skew-seconds: 30s tolerance to handle slight server time drift.
       require-expiration-time: enforces the `exp` claim.
@@ -93,8 +103,8 @@
         clock-skew-seconds="30"
         output-token-variable-name="aforo-jwt">
 
-        <!-- JWKS-based RS256 key resolution -->
-        <openid-config url="{{aforo-jwks-uri}}" />
+        <!-- Keys from the issuer's OpenID discovery document (jwks_uri) -->
+        <openid-config url="{{aforo-openid-config-url}}" />
 
         <!-- Issuer validation -->
         <issuers>

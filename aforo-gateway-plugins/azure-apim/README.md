@@ -2,7 +2,7 @@
 
 Policy fragments that send one usage event to Aforo after each API response: standard API calls, AGENTIC_API calls (W3C `traceparent`) and MCP `tools/call` invocations. Optional fragments add JWT validation, a pre-flight quota check, margin guard and compound metering.
 
-**Version:** 2.3.2 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.4.0 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 2.2.0 merges two lines of work: the working repository (APIM-valid fragments, `executionStatus`, exclusions, frozen idempotency keys) and public release 2.1.0 (verified customer identity, metric mappings, `productType`). An install made from either one keeps working; see [CHANGELOG.md](CHANGELOG.md) for the two cases that need a line added.
 
@@ -18,8 +18,8 @@ Policy fragments that send one usage event to Aforo after each API response: sta
 | `preflight-quota-policy-fragment.xml` | `aforo-preflight` | inbound | Optional. |
 | `margin-guard-policy-fragment.xml` | `aforo-margin-guard` | inbound | Optional. |
 | `compound-metering-policy-fragment.xml` | `aforo-compound-metering` | outbound | Optional. |
-| `eventhub-delivery-policy-fragment.xml` | `aforo-metering-eventhub` | outbound, after `aforo-metering` (and `aforo-compound-metering`) | Optional (2.3.0). Event Hub delivery; needs the APIM logger `aforo-metering-logger`. |
-| `eventhub-forwarder/` | — | Azure Function | With Event Hub delivery. Reads the hub and sends to the ingestor. |
+| `eventhub-delivery-policy-fragment.xml` | `aforo-metering-eventhub` | outbound, after `aforo-metering` (and `aforo-compound-metering`) | Yes in the default install (Event Hub delivery, 2.4.0); not with direct delivery. Needs the APIM logger `aforo-metering-logger`. |
+| `eventhub-forwarder/` | — | Azure Function | Yes in the default install. Reads the hub and sends to the ingestor. |
 
 `policy-fragment.xml` (an older body registered under the same id `aforo-metering`; it sends no `executionStatus`) and `mcp-policy-fragment.xml` (a fragment that included another fragment, which APIM does not allow) are removed. If you imported `policy-fragment.xml`, replace it with `outbound-policy.xml`.
 
@@ -38,21 +38,57 @@ Policy fragments that send one usage event to Aforo after each API response: sta
 
 ## Install
 
+There are two delivery modes. **Event Hub delivery is the default install** (since 2.4.0, G348): the policy writes each event to Azure Event Hubs and the forwarder Function in `eventhub-forwarder/` sends it to the ingestor with retries, so an ingest outage, a 5xx or a 429 delays usage instead of losing it. **Direct delivery** is the opt-in: one fragment and no Azure resources besides APIM, but the policy posts each event with `send-one-way-request`, which has no retry and discards the answer, so an event is lost whenever the ingestor is unreachable or answers 5xx or 429. Choose direct only when that loss is acceptable.
+
+The policy files decide the mode from the context variable `aforo-delivery-mode`: `eventhub` for Event Hub delivery, anything else (or not set) for direct. An install made before 2.4.0 sets nothing and keeps sending directly.
+
+> Event Hub delivery has not run on Azure yet (see "What this does not cover"). Try it on a non-production instance first.
+
+### Event Hub delivery (default)
+
+1. Create the four Named Values above. `aforo-metering` references `aforo-endpoint` even in this mode, so all four must exist.
+2. Deploy the Event Hub namespace, the hub, the APIM logger `aforo-metering-logger` and the forwarder Function, and publish the forwarder code: `eventhub-forwarder/README.md`, "Install", steps 1 to 3.
+3. Create two policy fragments, each from the file's `<fragment>` line on (the comment block above that line is documentation and is not uploaded), format `rawxml`:
+   - `aforo-metering` from `outbound-policy.xml`;
+   - `aforo-metering-eventhub` from `eventhub-delivery-policy-fragment.xml`. APIM refuses to save it until the logger from step 2 exists.
+
+   Portal: **APIs → Policy fragments → Create**, paste, save. REST: `PUT .../policyFragments/<id>?api-version=2022-08-01` with `{"properties": {"format": "rawxml", "value": "<fragment>..."}}`. The format must be `rawxml`: the policy expressions contain raw `"`, `<` and `&&`, which the default `xml` format rejects. This applies to every file here (2.1.0 shipped entity-escaped files for `--format xml`; these are not).
+4. Set the mode and include both fragments in your API's (or the global) policy:
+
+```xml
+<inbound>
+    <base />
+    <set-variable name="aforo-delivery-mode" value="eventhub" />
+</inbound>
+<outbound>
+    <base />
+    <set-variable name="aforo-default-metric" value="api_calls" />
+    <include-fragment fragment-id="aforo-metering" />
+    <include-fragment fragment-id="aforo-metering-eventhub" />
+</outbound>
+```
+
+   The two lines go together. With `aforo-delivery-mode` set to `eventhub` and no `aforo-metering-eventhub` include, `aforo-metering` sends nothing and nothing writes to the hub.
+5. Call an API, then look for `aforo-forwarder: accepted=1` in the Function's logs.
+
+### Direct delivery (opt-in)
+
 1. Create the four Named Values.
-2. Create a policy fragment with the id `aforo-metering`. Its content is `outbound-policy.xml` **from the `<fragment>` line on** — the comment block above that line is documentation and is not uploaded.
-   - Portal: **APIs → Policy fragments → Create**, paste, save.
-   - REST: `PUT .../policyFragments/aforo-metering?api-version=2022-08-01` with `{"properties": {"format": "rawxml", "value": "<fragment>..."}}`. The format must be `rawxml`: the policy expressions contain raw `"`, `<` and `&&`, which the default `xml` format rejects. This applies to every file here (2.1.0 shipped entity-escaped files for `--format xml`; these are not).
-3. Include it in the outbound section of your API's (or the global) policy:
+2. Create the policy fragment `aforo-metering` from `outbound-policy.xml`, as in step 3 above.
+3. Include it in the outbound section, and leave `aforo-delivery-mode` unset (or set it to `direct` to make the choice visible):
 
 ```xml
 <outbound>
     <base />
+    <set-variable name="aforo-delivery-mode" value="direct" />
     <set-variable name="aforo-default-metric" value="api_calls" />
     <include-fragment fragment-id="aforo-metering" />
 </outbound>
 ```
 
-Aforo's one-click deploy (Integrations → Azure APIM → metering) does these steps and adds a second fragment, `aforo-metering-config`, that carries the settings below.
+### Aforo's one-click deploy
+
+Integrations → Azure APIM → metering uploads `outbound-policy.xml` as `aforo-metering`, adds a second fragment, `aforo-metering-config`, that carries the settings below, and includes both in the global outbound policy. **It installs direct delivery**: it does not create the Event Hub stack yet. Until it does, follow "Event Hub delivery" above on an instance where lost usage matters (the one-click fragments stay; add the forwarder, the `aforo-metering-eventhub` fragment and the two policy lines).
 
 ### APIM rules the files follow
 
@@ -195,7 +231,18 @@ The three below read **context variables**, like `aforo-metering`. Release 2.1.0
 
 All three use the same customer rule as `aforo-metering` (`aforo-customer-id`, else the subscription id, trimmed, at most 64 characters). To use the verified JWT's `customer_id`, include `aforo-context`, which sets `aforo-customer-id` from it; the JWT's `sub` is never used. Until 2.3.1 margin guard also read the JWT's `customer_id` / `sub` itself and had no length cap, so it could check a customer other than the one billed. None is sent or checked for `OPTIONS` or without a customer. Compound and preflight send `X-API-Key` from the context variable `aforo-api-key` when it exists, else from the Named Value `aforo-api-key`.
 
-`aforo-jwt-validation` references four Named Values, which must exist: `aforo-jwks-uri`, `aforo-jwt-issuer`, `aforo-org-service-url` (org-service base URL reachable from APIM, for the jti revocation check; it was a hardcoded docker-compose hostname before 2.1.0) and, since 2.3.0, `aforo-api-key` and `aforo-tenant-id` (each unless the context variable of the same name is set). The revocation check fails open after 2 seconds unless `aforo-jti-check-fallback` is `DENY` (then 503).
+`aforo-jwt-validation` references these Named Values, which must exist:
+
+| Named Value | Value for Aforo tokens |
+|---|---|
+| `aforo-openid-config-url` (2.4.0; was `aforo-jwks-uri`) | `https://org.aforo.ai/.well-known/openid-configuration` — organization-service's OpenID discovery document. `validate-jwt` reads `jwks_uri` from it, caches the keys for an hour and refetches when a token names an unknown `kid`, so a signing-key rotation needs no change in APIM. It must be a discovery document: `openid-config` does not accept a bare JWKS URL (with one it has no keys and answers 401 to every request). |
+| `aforo-jwt-issuer` | `https://auth.aforo.ai`, the `iss` of Aforo tokens. It is an identifier, not the host that serves the keys; the discovery document names the same issuer. |
+| `aforo-org-service-url` | organization-service base URL reachable from APIM, for the jti revocation check (it was a hardcoded docker-compose hostname before 2.1.0). |
+| `aforo-api-key`, `aforo-tenant-id` (2.3.0) | each unless the context variable of the same name is set. |
+
+The revocation check fails open after 2 seconds unless `aforo-jti-check-fallback` is `DENY` (then 503).
+
+Upgrading from 2.3.x: create `aforo-openid-config-url`, re-import `jwt-validation-policy.xml`, then delete `aforo-jwks-uri`. APIM refuses to save the new fragment while `aforo-openid-config-url` does not exist, so the old one keeps running until you do. A self-hosted issuer works the same way if it serves a discovery document whose `issuer` is the tokens' `iss` and whose `jwks_uri` names its keys.
 
 Tenant binding (2.3.0): every tenant's Aforo JWTs are signed with the same key, so the fragment also requires the token's `tenant_id` claim to equal `aforo-tenant-id`. A token without the claim, or for another tenant, gets 401 `{"error":"invalid_token","error_description":"TENANT_MISMATCH"}` (Kong's answer), and so does every token when the configured tenant is empty. The `X-Tenant-Id` sent upstream is always the configured tenant. Before 2.3.0 tenant A's token was accepted on tenant B's APIM, forwarded with `X-Tenant-Id: A`, and metered with B's key for A's customer.
 
@@ -215,7 +262,7 @@ Margin guard counts only no answer, a timeout, 408, 429 and 5xx as a breaker fai
 
 The Consumption tier has no built-in cache: configure an external Redis cache for the instance, otherwise every lookup misses and each request calls, as in 2.2.0.
 
-### Event Hub delivery (2.3.0)
+### Event Hub delivery (2.3.0; the default install since 2.4.0)
 
 `send-one-way-request` has no retry: an ingest 5xx or 429 loses that request's event. For delivery that survives an ingest outage, set `aforo-delivery-mode` to `eventhub` and include `aforo-metering-eventhub` (`eventhub-delivery-policy-fragment.xml`) after `aforo-metering` (and after `aforo-compound-metering` when you use it). The policy then writes each event to Event Hub with `log-to-eventhub`, and the forwarder Function in `eventhub-forwarder/` batches the events (up to 500 per request), retries with back-off and `Retry-After`, and moves its Event Hub checkpoint only after the ingestor accepts. Events wait in the hub (up to 7 days on the Standard tier) while the ingestor is down. Setup: `eventhub-forwarder/README.md`.
 
@@ -231,7 +278,7 @@ The Consumption tier has no built-in cache: configure an external Redis cache fo
 </outbound>
 ```
 
-Without `aforo-delivery-mode`, nothing changes: `aforo-metering` sends directly, as in 2.2.0, and needs no logger.
+Without `aforo-delivery-mode` (or with any value but `eventhub`), `aforo-metering` sends directly, as in 2.2.0, and needs no logger. That is direct delivery, the opt-in mode, and what Aforo's one-click deploy installs today.
 
 ### Streaming responses (2.3.0)
 
@@ -240,9 +287,10 @@ Without `aforo-delivery-mode`, nothing changes: `aforo-metering` sends directly,
 ## What this does not cover
 
 - The response body is never read by `aforo-metering`, so an MCP call that returns a JSON-RPC `error` inside a 2xx is classified from the HTTP status alone.
-- In the default direct mode there is no retry: `send-one-way-request` reports no failure. A request whose ingest call fails, or whose event the ingestor rejects (unknown metric, unknown customer), is not metered and APIM logs nothing. Retrying would mean `send-request`, which waits for the ingestor before the client gets its response. Use Event Hub delivery (above) when that matters.
+- In direct mode (the opt-in, and what Aforo's one-click deploy installs today) there is no retry: `send-one-way-request` reports no failure. A request whose ingest call fails, or whose event the ingestor rejects (unknown metric, unknown customer), is not metered and APIM logs nothing. Retrying would mean `send-request`, which waits for the ingestor before the client gets its response. Use Event Hub delivery (above) when that matters.
 - The revocation check calls org-service `GET /api/v1/public/gateway/token-status` and the margin guard calls pricing `GET /api/v1/margin-guard/quick-check`. Both are public endpoints authenticated by the Aforo API key (`X-API-Key`); each takes the tenant from the key. They need org-service and pricing builds that serve them (see the CHANGELOG 2.3.0); against older builds the checks get no answer and fail open, and the breakers keep that cheap.
-- `openid-config` in `aforo-jwt-validation` expects an OpenID Connect discovery document, not a bare JWKS URL. If Aforo serves only a JWKS for your tenant, `validate-jwt` loads no keys; confirm before you enable it.
+- `aforo-jwt-validation` needs an organization-service build that serves `/.well-known/openid-configuration` (G349). Against an older build that URL answers 403, `validate-jwt` has no keys and every request gets 401. Check it with `curl -s https://org.aforo.ai/.well-known/openid-configuration`: the answer must be JSON with `"issuer": "https://auth.aforo.ai"` and a `jwks_uri`.
+- Event Hub delivery has not run on Azure: the forwarder is tested against a mock ingestor and the ARM template is checked by reading. Its template runs the Function on Linux Consumption with Node 20, which reached end of life upstream on 30 April 2026; moving it to a supported Node version is open.
 - Metric mappings are not fetched from the catalog. Keep `aforo-metric-mappings` in step with it by hand or by automation.
 - Self-hosted and workspace gateways (see the rules table above).
 
@@ -336,7 +384,10 @@ Absent headers are emitted as `null` (no synthetic values).
 | Health checks are still metered | No entry is a prefix of the path, or a custom `aforo-exclude-paths` replaced the default. | Add the path; include `/health` again if you set your own list. |
 | A setting has no effect | The `set-variable` is after the `include-fragment`, or in a policy scope that runs later. | Move it above the include. |
 | Compound, preflight or margin guard stopped after upgrading from 2.1.0 | They read context variables now. | Add the `set-variable` lines from the CHANGELOG. |
-| APIM rejects the policy with "named value not found" | A referenced Named Value is missing. | `aforo-metering`: the four above. `aforo-context`: its five. `aforo-jwt-validation`: its three. |
+| APIM rejects the policy with "named value not found" | A referenced Named Value is missing. | `aforo-metering`: the four above. `aforo-context`: its five. `aforo-jwt-validation`: its five (`aforo-openid-config-url` since 2.4.0, no longer `aforo-jwks-uri`). |
+| APIM rejects `aforo-metering-eventhub`: logger not found | `aforo-metering-logger` does not exist yet. | Deploy the forwarder template first (`eventhub-forwarder/README.md`). |
+| Event Hub delivery: no messages in the hub | `aforo-delivery-mode` is not `eventhub`, or `aforo-metering-eventhub` is not included after `aforo-metering`. | Add both lines (Install, step 4). |
+| 401 on every request with `aforo-jwt-validation` | `aforo-openid-config-url` is a bare JWKS URL, organization-service does not serve the discovery document yet, or `aforo-jwt-issuer` is not the tokens' `iss`. | Use `https://org.aforo.ai/.well-known/openid-configuration` and `https://auth.aforo.ai`; see "What this does not cover". |
 | APIM rejects a fragment with an XML parse error | It was uploaded with format `xml`. | Use format `rawxml`, or paste it in the portal's fragment editor. |
 | APIM rejects the fragment with an error about `outbound` or a section element | A copy from before 2026-10-01 wrapped the statements in `<outbound>`. | Upload the current file, from the `<fragment>` line on. |
 | Every call bills at full weight on an OUTCOME_BASED plan | The removed `policy-fragment.xml` is still installed. | Re-import `outbound-policy.xml` under fragment id `aforo-metering`. |

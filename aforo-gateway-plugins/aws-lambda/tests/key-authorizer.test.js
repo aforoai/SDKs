@@ -68,8 +68,7 @@ async function run() {
     const p = await auth.handler({ authorizationToken: `Bearer ${VALID}`, methodArn: ARN });
     assertEquals(p.principalId, 'cust_1', 'principalId is the customer');
     assertEquals(p.policyDocument.Statement[0].Effect, 'Allow', 'Allow');
-    assertEquals(p.policyDocument.Statement[0].Resource,
-        'arn:aws:execute-api:us-east-1:123456789012:abc123/prod/*', 'resource wildcarded to the stage');
+    assertEquals(p.policyDocument.Statement[0].Resource, ARN, 'resource is the called method ARN, not the stage');
     assertEquals(p.context.customerId, 'cust_1', 'context.customerId');
     assertEquals(p.context.keyId, 'key_1', 'context.keyId');
     assertEquals(p.context.subscriptionId, 'sub_1', 'context.subscriptionId');

@@ -6,6 +6,23 @@ The Kong plugin has one version: the rockspec's. `handler.lua`'s `VERSION` const
 
 ## [Unreleased]
 
+## [2.8.3] — 2026-11-25
+
+Fixes from the 11 Nov 2026 architecture re-check (G324, G334). Redeploy the plugin. One new setting, on by default.
+
+### Changed (customers will notice)
+- **Prepaid customers fail closed when the pre-flight quota check cannot answer** (G334). The ingestor's `POST /api/v1/quota/check` answer carries `"prepaid"` (usage-ingestor #142, live since 2026-11-16): `true` when a wallet pays for the customer's usage first (a billable subscription on a PREPAID or HYBRID offering), `false` when every billable subscription is POSTPAID, left out when it does not know. The plugin keeps the last `true` per tenant and customer in `aforo_cache` for 7 days, refreshed by every answer that repeats it; `false` removes it and an answer without the field changes nothing. On a timeout, an error, a non-200, an unreadable answer or an open breaker, such a customer now gets the same **503** `{"message":"Quota check unavailable"}` with `Retry-After: 1` that `preflight_quota_fail_open = false` gives, even when `preflight_quota_fail_open` is `true`. Other customers, including one the plugin has no answer for yet, follow `preflight_quota_fail_open` as before. It is per customer, not per metric, because the ingestor decides it per customer. The new setting `preflight_quota_prepaid_fail_closed` (default `true`) set to `false` restores the 2.8.2 behaviour. Only matters with `preflight_quota_enabled`.
+- The schema gains that field. In hybrid mode or on Konnect, update the data planes to 2.8.3 before the control plane's copy of the schema, so no data plane is sent a field it does not know.
+
+### Fixed
+- **Metric mappings are decoded once per worker** (G324). With `mappings_url` set, the cached mappings JSON was read from shared memory and decoded on every metered request (and on every pre-flight check). Each worker now keeps the decoded table with the string it came from, per tenant and `mappings_url`, and decodes again only when the string in shared memory differs. A rewritten, evicted or deleted table is seen at once, as before; the cached table is only read, never handed out.
+
+### Docs
+- README and user guide: the pre-flight quota check asks about 1 unit when the quantity comes from the response (`response_size`, `X-Aforo-Quantity`), so the last call before a quota runs out can overshoot it by the rest of its quantity. A known limitation, now written down.
+
+### Tests
+- 13 new specs: mappings decoded once across requests, again after a change, a missing / deleted / unreadable table, one table per tenant and URL; prepaid refused 503 on timeout, non-200, unreadable answer and open breaker, postpaid and unknown customers still let through, the flag learned from DENY and the `{data}` envelope, cleared by `false`, kept by an answer without it, per tenant and for 7 days; `preflight_quota_prepaid_fail_closed = false`; `preflight_quota_fail_open = false` unchanged; a refused call not metered; the schema default. busted 383/383 on Lua 5.1 (as CI), on `kong:3.4` (LuaJIT 2.1), and on Kong Gateway 3.14.0.15 and 3.16.0.1.
+
 ## [2.8.2] — 2026-10-28
 
 Fixes from the second wave 6 review. Redeploy the plugin; no configuration change.

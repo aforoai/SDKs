@@ -62,7 +62,7 @@ async function run() {
     const token = sign(claims({ agent_id: 'agent-7' }));
     const p = await auth.handler({ authorizationToken: `Bearer ${token}`, methodArn: ARN });
     assertEquals(p.policyDocument.Statement[0].Effect, 'Allow', 'Allow');
-    assertEquals(p.policyDocument.Statement[0].Resource, 'arn:aws:execute-api:us-east-1:123456789012:abc123/prod/*', 'stage wildcard');
+    assertEquals(p.policyDocument.Statement[0].Resource, ARN, 'called method ARN (2.7.0), not the stage');
     assertEquals(p.principalId, 'cust-1', 'principalId = customer_id');
     assertEquals(p.context.customerId, 'cust-1', 'context.customerId');
     assertEquals(p.context.keyId, 'key-9', 'context.keyId');

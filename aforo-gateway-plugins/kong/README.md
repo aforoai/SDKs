@@ -2,7 +2,7 @@
 
 A Kong Gateway plugin that captures API usage events in Kong's `log` phase and batch-forwards them to Aforo for billing and analytics. Metering runs after the response is sent, so it adds no latency to the request path.
 
-**Version:** 2.8.2 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
+**Version:** 2.8.3 · Apache-2.0 · [Changelog](CHANGELOG.md) · [User guide](USER_GUIDE.md)
 
 ## Install
 
@@ -27,7 +27,7 @@ cd SDKs/aforo-gateway-plugins/kong
 luarocks install lua-resty-http
 
 # 3. Build + install the plugin from the rockspec in this folder
-luarocks make kong-plugin-aforo-metering-2.8.2-1.rockspec
+luarocks make kong-plugin-aforo-metering-2.8.3-1.rockspec
 ```
 
 Then tell Kong to load it and reserve the shared memory it uses. In `kong.conf`:
@@ -172,8 +172,10 @@ With `preflight_quota_enabled`, the access phase asks the ingestor's `POST /api/
 - It checks the metric(s) the call's events will be billed to (`metric_mappings`, central mappings, `default_metric`, the MCP tool-call metric). A call that will not be billed is not checked, so an MCP `initialize`, `tools/list` or `ping` is never refused.
 - `X-Aforo-Metric` and `X-Aforo-Quantity` come from the response and do not exist yet: the configured metric is checked, and the question is whether the quota is already used up. A metric the upstream renames is still enforced by the ingestor when the event arrives.
 - `estimatedQuantity` is a numeric `quantity_source`, else 1 (a quantity from the response is not known yet).
+- **Known limitation: a quantity from the response can overshoot the quota.** With `quantity_source = response_size` or an upstream `X-Aforo-Quantity`, the check asks about 1 unit, because the real quantity exists only after the upstream answers. A customer just under the limit is let through, and that one call can take them past it by the rest of its quantity (for example 1 unit left, a call billed 5,000 tokens). The ingestor still records the full quantity, and the next check is refused. Use a fixed numeric `quantity_source` when an overshoot of one call matters.
 - `DENY` answers 429 with `Retry-After` (whole seconds, at least 1), and the refused call is not metered. `WARN` lets the call through with `X-RateLimit-Warning`. `ALLOW` and `WARN` are cached for `preflight_quota_cache_ttl_ms`. A `DENY` is cached until its `retryAfterMs` (at most 60 s, 5 s when the answer has none) and answered from the cache with the remaining `Retry-After` (2.8.0; before, every refused request asked again). A top-up therefore unblocks within that wait.
 - Timeout (default 300 ms), error or non-200: the call goes through (fail-open), unless `preflight_quota_fail_open=false`, which answers 503.
+- **Prepaid customers fail closed** (2.8.3). The ingestor's answer says whether a wallet pays for the customer's usage first (`"prepaid": true` for a billable subscription on a PREPAID or HYBRID offering, `false` when all are POSTPAID, left out when it does not know). The plugin keeps the last `true` per tenant and customer in `aforo_cache` for 7 days, refreshed by every answer that repeats it; `false` removes it; an answer without the field changes nothing. While the check cannot answer (timeout, error, non-200, unreadable answer, open breaker), such a customer gets the same 503 `{"message":"Quota check unavailable"}` with `Retry-After: 1` as `preflight_quota_fail_open=false`, even when `preflight_quota_fail_open` is `true`. Everyone else is let through as before. It is per customer, not per metric, because the ingestor decides it per customer. A customer the plugin has never had an answer for is not known to be prepaid and is let through. `preflight_quota_prepaid_fail_closed=false` turns it off.
 - **Circuit breaker** (2.8.0): after `preflight_quota_breaker_threshold` (5) failures in a row the check is not called for `preflight_quota_breaker_cooldown_s` (10 s) and the fail mode applies at once, so an outage does not cost each request the full timeout. Then one request probes; success closes the breaker, failure opens it again. Shared by all workers, per quota-check URL and tenant. `0` turns it off.
 
 ## Configuration
@@ -188,7 +190,7 @@ Every option lives under `config.*`. `aforo_endpoint`, `api_key`, and `tenant_id
 | `product_type` | string | `API` | `productType` sent on every event (trimmed, upper-cased; unknown values passed through). See [Minimal config per product type](#minimal-config-per-product-type). MCP `tools/call` is always sent as `MCP_SERVER`; on an `MCP_SERVER` product only tool calls are metered. `AI_AGENT` takes `agentId` from `agent_id_header` / `agent_id` and `sessionId` from `session_id_header`. A request is `AGENTIC_API` only when this is set to it: a client's `traceparent` never changes the type (since 2.6.0). Events missing the fields their type requires are skipped and counted, not sent (one invalid event fails the whole batch). `GRPC_API` / `GRAPHQL_API` / `WEBSOCKET_API` come from detection (`grpc_enabled` etc.), not from this setting; `MQTT_BROKER` is not proxied by Kong. |
 | `default_metric` | string | `api_calls` | Metric used when nothing below matches. Must exist in your Aforo catalog. |
 | `metric_mappings` | array | — | Ordered `{path_pattern, method?, metric_name}` rules; first match wins. `path_pattern` is a Lua pattern (anchor with `^`). |
-| `mappings_url` | string | — | Aforo catalog gateway-mappings endpoint. When set, EXACT / PREFIX / CONTAINS rules are fetched in a background timer and cached; a failed refresh keeps the last table. |
+| `mappings_url` | string | — | Aforo catalog gateway-mappings endpoint. When set, EXACT / PREFIX / CONTAINS rules are fetched in a background timer and cached; a failed refresh keeps the last table. Each worker decodes the cached table once, and again only when it changes (2.8.3). |
 | `mappings_refresh_seconds` | number | `300` | Refresh interval until the endpoint returns its own `cacheTtlSeconds`. |
 | `mappings_timeout_ms` | number | `3000` | Timeout of the background fetch. Never on the request path. |
 | `metric_header` | string | `X-Aforo-Metric` | Upstream **response** header that names the metric for one request. Empty disables. |
@@ -245,7 +247,8 @@ Every option lives under `config.*`. `aforo_endpoint`, `api_key`, and `tenant_id
 | `preflight_quota_api_key` | string | `api_key` | Key sent as `X-API-Key` on the check. Set it only when the ingestor does not accept `api_key` for the check. Stored encrypted. |
 | `preflight_quota_timeout_ms` | integer | `300` | Timeout for the check, in ms (it is on the request path, on a cache miss). 300 allows for Kong-to-Aforo over the internet. |
 | `preflight_quota_cache_ttl_ms` | integer | `1000` | How long an `ALLOW` or `WARN` is cached per tenant/customer/metric. A `DENY` is cached until its `Retry-After` (at most 60 s). `0` disables both. |
-| `preflight_quota_fail_open` | boolean | `true` | On error, timeout, non-200 or an open breaker: let the request through (`true`) or answer 503 (`false`). |
+| `preflight_quota_fail_open` | boolean | `true` | On error, timeout, non-200 or an open breaker: let the request through (`true`) or answer 503 (`false`). With `true`, customers known to be prepaid still get 503 unless `preflight_quota_prepaid_fail_closed` is `false`. |
+| `preflight_quota_prepaid_fail_closed` | boolean | `true` | 2.8.3. On error, timeout, non-200 or an open breaker, answer 503 to a customer the ingestor last reported as prepaid, even with `preflight_quota_fail_open=true`. `false` applies `preflight_quota_fail_open` to everyone, as before 2.8.3. See [Pre-flight quota check](#pre-flight-quota-check). |
 | `preflight_quota_breaker_threshold` | integer | `5` | Failures in a row that open the quota-check circuit breaker. `0` turns it off. |
 | `preflight_quota_breaker_cooldown_s` | integer | `10` | Seconds the breaker stays open before one request probes again. |
 | `exclude_paths` | array | `["/health","/ready","/metrics"]` | Paths skipped from metering. An entry matches that path and anything below it: `/health` skips `/health` and `/health/live`, not `/healthcare`. |
@@ -290,4 +293,5 @@ Step-by-step from install to a verified event in Aforo: see [USER_GUIDE.md](USER
 - **JWT rate limiting needs pricing-service to publish policies by key id.** The plugin looks a JWT request's policy up under `ratelimit:policy:{tenantId}:keyid:{keyId}`. Until pricing-service writes that key next to `ratelimit:policy:{tenantId}:{keyHash}`, JWT requests find no policy and pass unlimited, as they did before 2.7.0.
 - **Revocation on a classic Redis Cluster needs a proxy.** The revocation lookup sends one `GET` per key (pipelined, one round trip), so ElastiCache Serverless and proxies that route each key to its shard work. The plugin does not follow `MOVED` redirects: pointed at one node of a classic cluster, it gets `MOVED` for keys on other shards, which fails closed (503) unless `jti_redis_fail_mode = open`. The key names (`jti:blocked:<jti>`, `jti:client:<id>`) are written by organization-service without a hash tag.
 - **Rate limiting on a classic Redis Cluster needs a proxy.** Every counter key of one check carries the hash tag `{tenant:scope}` (`ratelimit:count:{tenantId:scope}:{window}:{epochWindow}`, 2.8.1), so the one script's keys sit in one slot. That makes the check work on ElastiCache Serverless, on a proxy that routes each command to the shard that owns its keys, and on a single-shard or non-cluster Redis. The plugin does not follow `MOVED` redirects: pointed at one node of a multi-shard classic cluster, a policy lookup or counter script for keys on another shard gets `MOVED`, and the check fails open (logged at error level; HARD limits are not enforced). Before 2.8.1 the keys had no hash tag and every cluster refused the script with CROSSSLOT, which failed open the same way.
-- **Rate-limit, margin-guard and pre-flight quota enforcement need Redis / pricing-service / the ingestor reachable.** All fail open: a timeout or an unreachable dependency lets the request through rather than blocking it (the quota check can be made fail-closed with `preflight_quota_fail_open=false`).
+- **Rate-limit, margin-guard and pre-flight quota enforcement need Redis / pricing-service / the ingestor reachable.** All fail open: a timeout or an unreachable dependency lets the request through rather than blocking it. The quota check is the exception for customers the ingestor reported as prepaid, who get 503 (2.8.3, `preflight_quota_prepaid_fail_closed`), and can be made fail-closed for everyone with `preflight_quota_fail_open=false`.
+- **Pre-flight quota cannot see a quantity from the response.** With `quantity_source = response_size` or `X-Aforo-Quantity`, each call is checked as 1 unit, so the last call before the limit can overshoot it by the rest of its quantity. See [Pre-flight quota check](#pre-flight-quota-check).
